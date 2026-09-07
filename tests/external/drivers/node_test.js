@@ -124,6 +124,41 @@ async function main() {
       'SELECT count(*)::int AS n FROM node_sample_source ' +
       'TABLESAMPLE SYSTEM ($1) REPEATABLE ($2)', [0.0, 42.0]);
     line('system sample rows=' + emptySample.rows[0].n);
+
+    await c.query('DROP TABLE IF EXISTS node_persistence');
+    await c.query('DROP TABLE IF EXISTS node_unlogged');
+    await c.query('CREATE TABLE node_persistence (id integer)');
+    await c.query('INSERT INTO node_persistence VALUES (1)');
+    await c.query('CREATE UNLOGGED TABLE node_unlogged (id integer)');
+    await c.query('INSERT INTO node_unlogged VALUES ($1)', [7]);
+    await c.query('CREATE TEMP TABLE node_persistence (id integer) ON COMMIT PRESERVE ROWS');
+    await c.query('INSERT INTO node_persistence VALUES ($1), ($2)', [2, 3]);
+    const persistence = await c.query(
+      "SELECT (SELECT relpersistence FROM pg_class WHERE oid='node_persistence'::regclass) AS temp, " +
+      "(SELECT relpersistence FROM pg_class WHERE oid='public.node_persistence'::regclass) AS permanent, " +
+      "(SELECT relpersistence FROM pg_class WHERE oid='node_unlogged'::regclass) AS unlogged");
+    line(`persistence ${persistence.rows[0].temp}|${persistence.rows[0].permanent}|${persistence.rows[0].unlogged}`);
+    const other = new Client({ host, port, user: 'postgres', database: 'postgres', ssl: false });
+    await other.connect();
+    try {
+      const ownerRows = await c.query('SELECT id FROM node_persistence ORDER BY id');
+      const otherRows = await other.query('SELECT id FROM node_persistence ORDER BY id');
+      line(`temp isolation ${ownerRows.rows.map(r => r.id).join(',')}|${otherRows.rows.map(r => r.id).join(',')}`);
+      const otherTemp = await other.query(
+        "SELECT pg_my_temp_schema() AS oid, to_regclass('pg_temp.node_persistence') IS NULL AS missing");
+      line(`other temp ${otherTemp.rows[0].oid}|${otherTemp.rows[0].missing}`);
+    } finally {
+      await other.end();
+    }
+    await c.query('BEGIN');
+    await c.query('CREATE TEMP TABLE node_delete (id integer) ON COMMIT DELETE ROWS');
+    await c.query('CREATE TEMP TABLE node_drop (id integer) ON COMMIT DROP');
+    await c.query('INSERT INTO node_delete VALUES ($1)', [9]);
+    await c.query('INSERT INTO node_drop VALUES ($1)', [10]);
+    await c.query('COMMIT');
+    const commitState = await c.query(
+      "SELECT (SELECT count(*)::int FROM node_delete) AS deleted, to_regclass('node_drop') IS NULL AS dropped");
+    line(`on commit ${commitState.rows[0].deleted}|${commitState.rows[0].dropped}`);
   } finally {
     await c.end();
   }

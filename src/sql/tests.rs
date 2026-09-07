@@ -7039,6 +7039,9 @@ fn test_config(name: &str) -> Config {
     let mut config = Config::default_dev();
     config.data_dir = dir.to_str().unwrap().to_string();
     config.memtable_bytes = 1 << 20;
+    // Most tests exercise the historical resident-only mode so their exact
+    // fixed budgets remain meaningful. Dedicated spill tests opt in below.
+    config.temporary_spill_bytes = 0;
     config.max_connections = 8;
     config.max_tables = 8;
     config.max_large_objects = 64;
@@ -42313,7 +42316,7 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
         assert!(
-            String::from_utf8_lossy(&output).contains("0A000"),
+            !String::from_utf8_lossy(&output).contains("ERROR"),
             "{statement}: {}",
             String::from_utf8_lossy(&output)
         );
@@ -42328,6 +42331,798 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn relation_persistence_is_typed_session_scoped_and_transactional() {
+    let mut config = test_config("relation-persistence-session");
+    config.max_prepared_transactions = 1;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let first = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE TABLE persistence_shadow (id integer); \
+         INSERT INTO persistence_shadow VALUES (1); \
+         CREATE TEMP TABLE persistence_shadow (id integer) ON COMMIT PRESERVE ROWS; \
+         INSERT INTO persistence_shadow VALUES (2); \
+         CREATE INDEX persistence_shadow_idx ON persistence_shadow (id); \
+         CREATE TEMP SEQUENCE persistence_temp_seq START 9; \
+         SELECT id FROM persistence_shadow; \
+         SELECT to_regclass('persistence_shadow'), to_regclass('missing_relation') IS NULL; \
+         SELECT pg_my_temp_schema() <> 0, \
+                pg_is_other_temp_schema(pg_my_temp_schema()); \
+         SELECT relname, relpersistence FROM pg_class \
+          WHERE relname IN ('persistence_shadow', 'persistence_shadow_idx', 'persistence_temp_seq') \
+          ORDER BY relpersistence, relname",
+    );
+    assert_eq!(
+        data_rows(&first),
+        [
+            "2",
+            "persistence_shadow|t",
+            "t|f",
+            "persistence_shadow|p",
+            "persistence_shadow|t",
+            "persistence_shadow_idx|t",
+            "persistence_temp_seq|t",
+        ],
+        "{}",
+        String::from_utf8_lossy(&first)
+    );
+    let spellings = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE GLOBAL TEMPORARY TABLE persistence_global (id integer); \
+         CREATE LOCAL TEMP SEQUENCE persistence_local_seq; \
+         SELECT relname, relpersistence FROM pg_class \
+          WHERE relname IN ('persistence_global', 'persistence_local_seq') ORDER BY relname",
+    );
+    assert!(
+        String::from_utf8_lossy(&spellings)
+            .contains("GLOBAL is deprecated in temporary table creation"),
+        "{}",
+        String::from_utf8_lossy(&spellings)
+    );
+    assert_eq!(
+        data_rows(&spellings),
+        ["persistence_global|t", "persistence_local_seq|t"]
+    );
+    let temporary_defaults = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE ROLE persistence_temp_reader; \
+         ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO persistence_temp_reader; \
+         ALTER DEFAULT PRIVILEGES GRANT USAGE ON SEQUENCES TO persistence_temp_reader; \
+         CREATE TEMP TABLE persistence_temp_acl \
+           (id integer GENERATED ALWAYS AS IDENTITY); \
+         SELECT has_table_privilege( \
+                  'persistence_temp_reader', 'persistence_temp_acl', 'SELECT'), \
+                has_sequence_privilege( \
+                  'persistence_temp_reader', 'persistence_temp_acl_id_seq', 'USAGE')",
+    );
+    assert_eq!(
+        data_rows(&temporary_defaults),
+        ["t|t"],
+        "{}",
+        String::from_utf8_lossy(&temporary_defaults)
+    );
+    let unlogged_materialized = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE UNLOGGED MATERIALIZED VIEW persistence_unlogged_materialized AS SELECT 1",
+    );
+    let unlogged_materialized = String::from_utf8_lossy(&unlogged_materialized);
+    assert!(
+        unlogged_materialized.contains("0A000")
+            && unlogged_materialized.contains("materialized views cannot be unlogged"),
+        "{unlogged_materialized}"
+    );
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            11,
+            "SELECT pg_my_temp_schema() = 'pg_temp'::regnamespace",
+        )),
+        ["t"]
+    );
+    let inherited = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE TABLE persistence_inheritance_parent (id integer); \
+         CREATE TEMP TABLE persistence_inheritance_child (label text) \
+           INHERITS (persistence_inheritance_parent); \
+         INSERT INTO persistence_inheritance_child (id) VALUES (17); \
+         SELECT id FROM persistence_inheritance_parent",
+    );
+    assert_eq!(
+        data_rows(&inherited),
+        ["17"],
+        "{}",
+        String::from_utf8_lossy(&inherited)
+    );
+    let second = run_as(
+        &mut engine,
+        &mut budget,
+        12,
+        "SELECT id FROM persistence_shadow; \
+         SELECT count(*) FROM pg_class WHERE relname = 'persistence_shadow'; \
+         SELECT count(*) FROM pg_namespace WHERE nspname = 'pg_temp_11'; \
+         SELECT pg_is_other_temp_schema( \
+           (SELECT oid FROM pg_namespace WHERE nspname = 'pg_temp_11')); \
+         SELECT count(*) FROM persistence_inheritance_parent; \
+         SELECT to_regclass('persistence_global') IS NULL, \
+                to_regclass('pg_temp_11.persistence_global') IS NULL",
+    );
+    assert_eq!(data_rows(&second), ["1", "2", "1", "t", "0", "t|t"]);
+    let actions = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "BEGIN; \
+         CREATE TEMP TABLE persistence_delete (id integer) \
+           ON COMMIT DELETE ROWS TABLESPACE pg_default; \
+         CREATE TEMP TABLE persistence_drop (id integer) ON COMMIT DROP; \
+         INSERT INTO persistence_delete VALUES (1); \
+         INSERT INTO persistence_drop VALUES (1); \
+         COMMIT; \
+         SELECT count(*) FROM persistence_delete; \
+         SELECT count(*) FROM pg_class WHERE relname = 'persistence_drop'",
+    );
+    assert_eq!(data_rows(&actions), ["0", "0"]);
+    let temporary_routine = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE FUNCTION persistence_temp_count() RETURNS bigint LANGUAGE SQL \
+           RETURN (SELECT count(*) FROM persistence_shadow)",
+    );
+    assert!(
+        String::from_utf8_lossy(&temporary_routine)
+            .contains("routines depending on temporary relations are not supported"),
+        "{}",
+        String::from_utf8_lossy(&temporary_routine)
+    );
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            11,
+            "SELECT count(*) FROM pg_proc WHERE proname = 'persistence_temp_count'",
+        )),
+        ["0"]
+    );
+    let durable_prepare = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "BEGIN; INSERT INTO public.persistence_shadow VALUES (3); \
+         PREPARE TRANSACTION 'durable_only'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&durable_prepare).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&durable_prepare)
+    );
+    let durable_prepare = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "COMMIT PREPARED 'durable_only'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&durable_prepare).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&durable_prepare)
+    );
+    let durable_prepare = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "SELECT id FROM public.persistence_shadow ORDER BY id",
+    );
+    assert_eq!(
+        data_rows(&durable_prepare),
+        ["1", "3"],
+        "{}",
+        String::from_utf8_lossy(&durable_prepare)
+    );
+    let temporary_prepare = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "BEGIN; SELECT count(*) FROM persistence_delete; \
+         PREPARE TRANSACTION 'temporary_used'",
+    );
+    assert!(
+        String::from_utf8_lossy(&temporary_prepare)
+            .contains("cannot PREPARE a transaction that has operated on temporary objects"),
+        "{}",
+        String::from_utf8_lossy(&temporary_prepare)
+    );
+    engine.drop_connection(11);
+    let closed = run_as(
+        &mut engine,
+        &mut budget,
+        12,
+        "SELECT count(*) FROM pg_class WHERE relpersistence = 't'; \
+         SELECT id FROM persistence_shadow",
+    );
+    assert_eq!(data_rows(&closed), ["0", "1", "3"]);
+}
+
+#[test]
+fn unlogged_relations_preserve_clean_shutdown_and_reset_after_crash() {
+    let config = test_config("unlogged_clean_and_crash");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_rows (id integer); \
+         CREATE UNLOGGED TABLE transient_rows \
+           (id integer GENERATED ALWAYS AS IDENTITY, payload text); \
+         CREATE UNLOGGED SEQUENCE transient_seq START 40; \
+         INSERT INTO durable_rows VALUES (1); \
+         INSERT INTO transient_rows (payload) VALUES ('crash'); \
+         SELECT nextval('transient_seq'); \
+         BEGIN; \
+         CREATE UNLOGGED TABLE promoted_rows \
+           (id integer GENERATED ALWAYS AS IDENTITY, payload text); \
+         CREATE UNLOGGED SEQUENCE promoted_seq START 70; \
+         INSERT INTO promoted_rows (payload) VALUES ('made durable'); \
+         SELECT nextval('promoted_seq'); \
+         ALTER TABLE promoted_rows SET LOGGED; \
+         ALTER SEQUENCE promoted_seq SET LOGGED; \
+         COMMIT",
+    );
+    assert_eq!(data_rows(&created), ["40", "70"]);
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut crash_budget = Budget::new(1 << 28);
+    let mut crash = Engine::new(&config, &mut crash_budget).unwrap();
+    let reset = run_with(
+        &mut crash,
+        &mut crash_budget,
+        "SELECT count(*) FROM durable_rows; \
+         SELECT count(*) FROM transient_rows; \
+         SELECT nextval('transient_seq'); \
+         SELECT id, payload FROM promoted_rows; \
+         SELECT nextval('promoted_seq'); \
+         INSERT INTO transient_rows (payload) VALUES ('clean'); \
+         SELECT id, payload FROM transient_rows",
+    );
+    assert_eq!(
+        data_rows(&reset),
+        ["1", "0", "40", "1|made durable", "71", "1|clean"]
+    );
+    crash.commit_wal().unwrap();
+    crash.mark_clean_shutdown().unwrap();
+    drop(crash);
+
+    let mut clean_budget = Budget::new(1 << 28);
+    let mut clean = Engine::new(&config, &mut clean_budget).unwrap();
+    let preserved = run_with(
+        &mut clean,
+        &mut clean_budget,
+        "SELECT id, payload FROM transient_rows; SELECT nextval('transient_seq')",
+    );
+    assert_eq!(data_rows(&preserved), ["1|clean", "41"]);
+    drop(clean);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn relation_persistence_survives_object_store_cold_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("relation-persistence-object-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!(
+        "relation-persistence-object-{}-{sequence}",
+        std::process::id()
+    );
+    config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = 512 * 1024;
+    config.disk_cache_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE TABLE object_permanent (id integer); \
+         CREATE UNLOGGED TABLE object_unlogged \
+           (id integer GENERATED ALWAYS AS IDENTITY, payload text); \
+         CREATE TEMP TABLE object_temporary (id integer); \
+         INSERT INTO object_permanent VALUES (1); \
+         INSERT INTO object_unlogged (payload) VALUES ('reset on crash'); \
+         INSERT INTO object_temporary VALUES (3)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT count(*) FROM object_permanent; \
+         SELECT count(*) FROM object_unlogged; \
+         INSERT INTO object_unlogged (payload) VALUES ('after recovery'); \
+         SELECT id FROM object_unlogged; \
+         SELECT count(*) FROM pg_class WHERE relname = 'object_temporary'; \
+         SELECT relname, relpersistence FROM pg_class \
+          WHERE relname IN ('object_permanent', 'object_unlogged', 'object_unlogged_id_seq') \
+          ORDER BY relname",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1",
+            "0",
+            "1",
+            "0",
+            "object_permanent|p",
+            "object_unlogged|u",
+            "object_unlogged_id_seq|u",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("reused-spill-slot-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("reused-spill-slot-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.memtable_bytes = 64 * 1024;
+    config.table_rows = 512;
+    config.wal_buffer_bytes = 256 * 1024;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE retired_rows (id integer PRIMARY KEY, payload text)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    for batch in 0..5 {
+        let first = batch * 200 + 1;
+        let last = first + 199;
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO retired_rows \
+                 SELECT value, repeat('r', 200) \
+                 FROM generate_series({first}, {last}) AS g(value)"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    assert!(engine.checkpoint().unwrap());
+    let crate::storage::ResolvedRelation::Table(retired_slot) = engine
+        .storage
+        .resolve_relation(None, "retired_rows", 0)
+        .unwrap()
+    else {
+        panic!("retired table did not resolve")
+    };
+    assert!(engine.storage.spill_generation_count(retired_slot) > 0);
+    drop(engine);
+
+    // Match the production sequence that exposed this: the old generation is
+    // loaded from a manifest, then dropped and replaced before another crash.
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM retired_rows"
+        )),
+        ["1000"]
+    );
+    let crate::storage::ResolvedRelation::Table(recovered_retired_slot) = engine
+        .storage
+        .resolve_relation(None, "retired_rows", 0)
+        .unwrap()
+    else {
+        panic!("recovered retired table did not resolve")
+    };
+    assert_eq!(recovered_retired_slot, retired_slot);
+    assert!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(retired_slot)
+            > 0
+    );
+
+    let dropped = run_with(&mut engine, &mut budget, "DROP TABLE retired_rows");
+    assert!(!String::from_utf8_lossy(&dropped).contains("ERROR"));
+    let replaced = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replacement_rows (id integer PRIMARY KEY, payload text); \
+         INSERT INTO replacement_rows \
+         SELECT value, repeat('n', 40) FROM generate_series(1, 20) AS g(value); \
+         SELECT count(*), sum(id), sum(length(payload)) FROM replacement_rows",
+    );
+    assert_eq!(data_rows(&replaced), ["20|210|800"]);
+    let crate::storage::ResolvedRelation::Table(replacement_slot) = engine
+        .storage
+        .resolve_relation(None, "replacement_rows", 0)
+        .unwrap()
+    else {
+        panic!("replacement table did not resolve")
+    };
+    assert_eq!(
+        replacement_slot, retired_slot,
+        "fixture must reuse the slot"
+    );
+    assert_eq!(engine.storage.spill_generation_count(replacement_slot), 0);
+    assert!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(replacement_slot)
+            > 0,
+        "the checkpointer still holds the retired published generation"
+    );
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*), sum(id), sum(length(payload)) FROM replacement_rows",
+        )),
+        ["20|210|800"]
+    );
+    drop(engine);
+
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*), sum(id), sum(length(payload)) FROM replacement_rows",
+        )),
+        ["20|210|800"],
+        "a replacement table must not inherit the retired table's SSTs"
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn temporary_rows_spill_locally_without_object_publication() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("temporary-local-spill-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("temporary-local-spill-{}-{sequence}", std::process::id());
+    config.memtable_bytes = 256 * 1024;
+    config.table_rows = 512;
+    config.temporary_spill_bytes = 64 * crate::store::BLOCK_SIZE;
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 0);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(namespace.borrow().object_count(), 0);
+
+    let created = run_as(
+        &mut engine,
+        &mut budget,
+        41,
+        "CREATE TEMP TABLE local_spill_rows (id integer PRIMARY KEY, payload text)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    for batch in 0..8 {
+        let first = batch * 120 + 1;
+        let last = first + 119;
+        let statement = format!(
+            "INSERT INTO local_spill_rows \
+             SELECT value, repeat('x', 200) FROM generate_series({first}, {last}) AS g(value)"
+        );
+        let inserted = run_as(&mut engine, &mut budget, 41, &statement);
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+        assert!(engine.maybe_checkpoint());
+    }
+
+    let crate::storage::ResolvedRelation::Table(table) = engine
+        .storage
+        .resolve_relation(None, "local_spill_rows", 0)
+        .unwrap()
+    else {
+        panic!("temporary table did not resolve")
+    };
+    assert!(
+        engine.storage.spill_generation_count(table) > 1,
+        "fixture must exercise both the initial local spill and a delta"
+    );
+    assert!(engine.temporary_spiller.as_ref().unwrap().block_count() > 0);
+    assert_eq!(
+        namespace.borrow().object_count(),
+        0,
+        "temporary row spill must not create durable objects"
+    );
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            41,
+            "SELECT count(*), sum(length(payload)) FROM local_spill_rows",
+        )),
+        ["960|192000"]
+    );
+    let mixed_checkpoint = run_as(
+        &mut engine,
+        &mut budget,
+        41,
+        "UPDATE local_spill_rows SET payload = 'changed' WHERE id = 1; \
+         CREATE TABLE durable_checkpoint_rows (id integer); \
+         INSERT INTO durable_checkpoint_rows VALUES (1); \
+         CHECKPOINT; \
+         SELECT payload FROM local_spill_rows WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&mixed_checkpoint),
+        ["changed"],
+        "{}",
+        String::from_utf8_lossy(&mixed_checkpoint)
+    );
+    assert!(namespace.borrow().object_count() > 0);
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            42,
+            "SELECT to_regclass('local_spill_rows') IS NULL",
+        )),
+        ["t"]
+    );
+
+    let other = run_as(
+        &mut engine,
+        &mut budget,
+        42,
+        "CREATE TEMP TABLE other_local_spill (id integer, payload text)",
+    );
+    assert!(!String::from_utf8_lossy(&other).contains("ERROR"));
+    for batch in 0..6 {
+        let first = 2000 + batch * 120;
+        let last = first + 119;
+        let statement = format!(
+            "INSERT INTO other_local_spill \
+             SELECT value, repeat('z', 200) FROM generate_series({first}, {last}) AS g(value)"
+        );
+        let inserted = run_as(&mut engine, &mut budget, 42, &statement);
+        assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+        assert!(engine.maybe_checkpoint());
+    }
+    let blocks_before_disconnect = engine.temporary_spiller.as_ref().unwrap().block_count();
+    engine.drop_connection(41);
+    let blocks_after_disconnect = engine.temporary_spiller.as_ref().unwrap().block_count();
+    assert!(blocks_after_disconnect > 0);
+    assert!(blocks_after_disconnect < blocks_before_disconnect);
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            42,
+            "SELECT count(*) FROM other_local_spill",
+        )),
+        ["720"]
+    );
+    engine.drop_connection(42);
+    assert_eq!(engine.temporary_spiller.as_ref().unwrap().block_count(), 0);
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn temporary_rows_spill_with_durable_object_storage_disabled() {
+    let mut config = test_config("temporary-local-spill-object-off");
+    config.object_store_on = false;
+    config.memtable_bytes = 128 * 1024;
+    config.table_rows = 256;
+    config.temporary_spill_bytes = 32 * crate::store::BLOCK_SIZE;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_as(
+        &mut engine,
+        &mut budget,
+        51,
+        "CREATE TEMP TABLE object_off_temp_rows (id integer, payload text)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    for batch in 0..6 {
+        let first = batch * 80 + 1;
+        let last = first + 79;
+        let statement = format!(
+            "INSERT INTO object_off_temp_rows \
+             SELECT value, repeat('q', 200) FROM generate_series({first}, {last}) AS g(value)"
+        );
+        let inserted = run_as(&mut engine, &mut budget, 51, &statement);
+        assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+        assert!(engine.maybe_checkpoint());
+    }
+    let crate::storage::ResolvedRelation::Table(table) = engine
+        .storage
+        .resolve_relation(None, "object_off_temp_rows", 0)
+        .unwrap()
+    else {
+        panic!("temporary table did not resolve")
+    };
+    assert!(engine.storage.spill_generation_count(table) > 0);
+    assert_eq!(
+        data_rows(&run_as(
+            &mut engine,
+            &mut budget,
+            51,
+            "SELECT count(*) FROM object_off_temp_rows",
+        )),
+        ["480"]
+    );
+    engine.drop_connection(51);
+    assert_eq!(engine.temporary_spiller.as_ref().unwrap().block_count(), 0);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn temporary_relation_ddl_never_enters_recovery_wal() {
+    let mut config = test_config("temporary_relation_wal_isolation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("temporary-relation-wal-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE TABLE wal_parent (id integer); \
+         CREATE TEMP TABLE wal_child (payload text) INHERITS (wal_parent); \
+         CREATE TEMP TABLE wal_partitioned (id integer) PARTITION BY RANGE (id); \
+         CREATE TEMP TABLE wal_leaf PARTITION OF wal_partitioned FOR VALUES FROM (0) TO (10); \
+         INSERT INTO wal_child VALUES (1, 'child'); \
+         INSERT INTO wal_partitioned VALUES (2); \
+         ALTER TABLE wal_partitioned ADD CONSTRAINT wal_partitioned_positive CHECK (id > 0); \
+         CREATE TEMP TABLE wal_temp \
+           (id integer GENERATED ALWAYS AS IDENTITY, payload text); \
+         ALTER TABLE wal_temp ADD COLUMN secondary integer GENERATED BY DEFAULT AS IDENTITY; \
+         ALTER TABLE wal_temp DROP COLUMN secondary; \
+         ALTER TABLE wal_temp ALTER COLUMN id SET STATISTICS 77; \
+         ALTER TABLE wal_temp ALTER COLUMN id SET INCREMENT BY 2; \
+         ALTER TABLE wal_temp ADD CONSTRAINT wal_temp_positive CHECK (id > 0); \
+         COMMENT ON CONSTRAINT wal_temp_positive ON wal_temp IS 'session constraint'; \
+         ALTER TABLE wal_temp RENAME CONSTRAINT wal_temp_positive TO wal_temp_positive_renamed; \
+         ALTER TABLE wal_temp DROP CONSTRAINT wal_temp_positive_renamed; \
+         CREATE UNIQUE INDEX wal_temp_identity_idx ON wal_temp (id); \
+         ALTER TABLE wal_temp REPLICA IDENTITY USING INDEX wal_temp_identity_idx",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE STATISTICS wal_temp_stats ON id, payload FROM wal_temp; \
+         ANALYZE wal_temp; \
+         CREATE INDEX wal_temp_payload_idx ON wal_temp (payload); \
+         ALTER INDEX wal_temp_payload_idx RENAME TO wal_temp_payload_renamed; \
+         CREATE FUNCTION wal_temp_trigger_function() RETURNS trigger LANGUAGE plpgsql \
+           AS 'BEGIN RETURN NEW; END'; \
+         CREATE TRIGGER wal_temp_trigger BEFORE INSERT ON wal_temp \
+           FOR EACH ROW EXECUTE FUNCTION wal_temp_trigger_function(); \
+         CREATE FUNCTION wal_temp_cascade_function() RETURNS trigger LANGUAGE plpgsql \
+           AS 'BEGIN RETURN NEW; END'; \
+         CREATE TRIGGER wal_temp_cascade BEFORE INSERT ON wal_temp \
+           FOR EACH ROW EXECUTE FUNCTION wal_temp_cascade_function(); \
+         DROP FUNCTION wal_temp_cascade_function() CASCADE; \
+         ALTER TABLE wal_temp DISABLE TRIGGER wal_temp_trigger; \
+         ALTER TABLE wal_temp ENABLE ROW LEVEL SECURITY; \
+         CREATE POLICY wal_temp_policy ON wal_temp USING (id > 0); \
+         CREATE RULE wal_temp_rule AS ON INSERT TO wal_temp DO ALSO NOTHING; \
+         COMMENT ON STATISTICS wal_temp_stats IS 'session metadata'; \
+         COMMENT ON TRIGGER wal_temp_trigger ON wal_temp IS 'session metadata'; \
+         COMMENT ON POLICY wal_temp_policy ON wal_temp IS 'session metadata'; \
+         COMMENT ON RULE wal_temp_rule ON wal_temp IS 'session metadata'; \
+         COMMENT ON TABLE wal_temp IS 'session only'; \
+         COMMENT ON COLUMN wal_temp.payload IS 'session only'; \
+         GRANT SELECT (payload) ON wal_temp TO PUBLIC; \
+         CREATE TEMP SEQUENCE wal_temp_seq START 7; \
+         ALTER SEQUENCE wal_temp_seq INCREMENT BY 2; \
+         ALTER SEQUENCE wal_temp_seq RENAME TO wal_temp_seq_renamed; \
+         SELECT nextval('wal_temp_seq_renamed'); \
+         DROP INDEX wal_temp_payload_renamed",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT count(*) FROM pg_class WHERE relpersistence = 't'; \
+         SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'wal_temp_stats'; \
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'wal_temp_trigger'; \
+         SELECT count(*) FROM pg_policy WHERE polname = 'wal_temp_policy'; \
+         SELECT count(*) FROM pg_rewrite WHERE rulename = 'wal_temp_rule'; \
+         SELECT count(*) FROM pg_description WHERE description = 'session metadata'; \
+         SELECT count(*) FROM pg_proc WHERE proname = 'wal_temp_trigger_function'; \
+         SELECT count(*) FROM pg_proc WHERE proname = 'wal_temp_cascade_function'; \
+         SELECT count(*) FROM pg_class WHERE relname = 'wal_parent'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0", "0", "0", "0", "0", "0", "1", "0", "1"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

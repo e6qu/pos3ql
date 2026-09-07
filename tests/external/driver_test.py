@@ -640,6 +640,51 @@ except psycopg.DatabaseError as error:
     assert error.sqlstate == "2202H", error.sqlstate
 print("TABLESAMPLE extended protocol ok")
 
+# Relation persistence crosses extended-query, COPY, catalog, transaction,
+# and connection boundaries.  A temporary relation shadows the permanent
+# relation only in its owning session, while an unlogged relation retains its
+# distinct catalog identity.
+cur.execute("DROP TABLE IF EXISTS drv_persistence")
+cur.execute("DROP TABLE IF EXISTS drv_unlogged")
+cur.execute("CREATE TABLE drv_persistence (id integer)")
+cur.execute("INSERT INTO drv_persistence VALUES (1)")
+cur.execute("CREATE UNLOGGED TABLE drv_unlogged (id integer)")
+cur.execute("INSERT INTO drv_unlogged VALUES (%s)", (7,))
+cur.execute("CREATE TEMP TABLE drv_persistence (id integer) ON COMMIT PRESERVE ROWS")
+with cur.copy("COPY drv_persistence (id) FROM STDIN") as copy:
+    copy.write_row((2,))
+    copy.write_row((3,))
+cur.execute("SELECT id FROM drv_persistence ORDER BY id")
+assert cur.fetchall() == [(2,), (3,)]
+cur.execute(
+    "SELECT (SELECT relpersistence FROM pg_class WHERE oid = 'drv_persistence'::regclass), "
+    "(SELECT relpersistence FROM pg_class WHERE oid = 'public.drv_persistence'::regclass), "
+    "(SELECT relpersistence FROM pg_class WHERE oid = 'drv_unlogged'::regclass)"
+)
+assert cur.fetchone() == ("t", "p", "u")
+
+observer = psycopg.connect(
+    host="127.0.0.1", port=5433, user="postgres", dbname="postgres",
+    sslmode="disable", autocommit=True,
+)
+observer_cur = observer.cursor()
+observer_cur.execute("SELECT id FROM drv_persistence")
+assert observer_cur.fetchone() == (1,)
+observer_cur.execute("SELECT pg_my_temp_schema(), to_regclass('pg_temp.drv_persistence') IS NULL")
+assert observer_cur.fetchone() == (0, True)
+
+cur.execute("BEGIN")
+cur.execute("CREATE TEMP TABLE drv_delete (id integer) ON COMMIT DELETE ROWS")
+cur.execute("CREATE TEMP TABLE drv_drop (id integer) ON COMMIT DROP")
+cur.execute("INSERT INTO drv_delete VALUES (%s)", (9,))
+cur.execute("INSERT INTO drv_drop VALUES (%s)", (10,))
+cur.execute("COMMIT")
+cur.execute("SELECT count(*) FROM drv_delete")
+assert cur.fetchone() == (0,)
+cur.execute("SELECT to_regclass('drv_drop') IS NULL")
+assert cur.fetchone() == (True,)
+print("relation persistence extended/COPY/session boundaries ok")
+
 # Subscription URI conninfo is catalog text at the SQL boundary, but its
 # escaped values must become one typed bounded transport identity on restart.
 cur.execute(
@@ -657,5 +702,8 @@ cur.execute("DROP SUBSCRIPTION drv_uri_subscription")
 print("subscription URI conninfo extended protocol ok")
 
 conn.close()
+observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")
+assert observer_cur.fetchone() == (0,)
+observer.close()
 
 print("ALL DRIVER TESTS PASSED")

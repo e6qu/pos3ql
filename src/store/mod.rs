@@ -61,6 +61,7 @@ macro_rules! delegate_async_block_reads {
 mod bloom;
 mod cache;
 mod disk;
+mod ephemeral;
 #[cfg(test)]
 mod memory;
 mod object;
@@ -70,6 +71,7 @@ mod value;
 
 pub(crate) mod lz4;
 
+pub(crate) use ephemeral::EphemeralBlockStore;
 #[cfg(test)]
 pub(crate) use memory::MemoryBlockStore;
 pub(crate) use object::OwnedObjectStore;

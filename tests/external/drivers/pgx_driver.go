@@ -183,6 +183,46 @@ func main() {
 		"SELECT count(*) FROM pgx_sample_source TABLESAMPLE SYSTEM ($1) REPEATABLE ($2)",
 		0.0, 42.0).Scan(&sampled))
 	fmt.Printf("system sample rows=%d\n", sampled)
+
+	exec("DROP TABLE IF EXISTS pgx_persistence")
+	exec("DROP TABLE IF EXISTS pgx_unlogged")
+	exec("CREATE TABLE pgx_persistence (id integer)")
+	exec("INSERT INTO pgx_persistence VALUES (1)")
+	exec("CREATE UNLOGGED TABLE pgx_unlogged (id integer)")
+	exec("INSERT INTO pgx_unlogged VALUES ($1)", 7)
+	exec("CREATE TEMP TABLE pgx_persistence (id integer) ON COMMIT PRESERVE ROWS")
+	copied, err := conn.CopyFrom(ctx, pgx.Identifier{"pgx_persistence"}, []string{"id"},
+		pgx.CopyFromRows([][]any{{2}, {3}}))
+	must("copy temporary rows", err)
+	fmt.Printf("temp copy rows=%d\n", copied)
+	var temporary, permanent, unlogged string
+	must("persistence catalog", conn.QueryRow(ctx,
+		"SELECT (SELECT relpersistence::text FROM pg_class WHERE oid='pgx_persistence'::regclass), "+
+			"(SELECT relpersistence::text FROM pg_class WHERE oid='public.pgx_persistence'::regclass), "+
+			"(SELECT relpersistence::text FROM pg_class WHERE oid='pgx_unlogged'::regclass)").
+		Scan(&temporary, &permanent, &unlogged))
+	fmt.Printf("persistence %s|%s|%s\n", temporary, permanent, unlogged)
+	other, err := pgx.Connect(ctx, url)
+	must("connect persistence observer", err)
+	var ownerValues, otherValues string
+	must("owner temporary rows", conn.QueryRow(ctx,
+		"SELECT string_agg(id::text, ',' ORDER BY id) FROM pgx_persistence").Scan(&ownerValues))
+	must("observer permanent rows", other.QueryRow(ctx,
+		"SELECT string_agg(id::text, ',' ORDER BY id) FROM pgx_persistence").Scan(&otherValues))
+	fmt.Printf("temp isolation %s|%s\n", ownerValues, otherValues)
+	other.Close(ctx)
+	exec("BEGIN")
+	exec("CREATE TEMP TABLE pgx_delete (id integer) ON COMMIT DELETE ROWS")
+	exec("CREATE TEMP TABLE pgx_drop (id integer) ON COMMIT DROP")
+	exec("INSERT INTO pgx_delete VALUES ($1)", 9)
+	exec("INSERT INTO pgx_drop VALUES ($1)", 10)
+	exec("COMMIT")
+	var deleted int
+	var dropped bool
+	must("temporary on commit", conn.QueryRow(ctx,
+		"SELECT (SELECT count(*) FROM pgx_delete), to_regclass('pgx_drop') IS NULL").
+		Scan(&deleted, &dropped))
+	fmt.Printf("on commit %d|%t\n", deleted, dropped)
 }
 
 func firstLine(err error) string {

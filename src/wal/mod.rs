@@ -92,6 +92,10 @@ const KIND_SET_DEFAULT_ACL: u8 = 34;
 const KIND_CREATE_PUBLICATION_V2: u8 = 128;
 const KIND_DROP_PUBLICATION: u8 = 36;
 const KIND_ALTER_PUBLICATION_V2: u8 = 129;
+/// Recovery-only state transition emitted after an unclean startup. It makes
+/// the in-memory reset of every unlogged relation durable across later clean
+/// restarts without exposing the reset through logical replication.
+const KIND_RESET_UNLOGGED_RELATIONS: u8 = 130;
 const KIND_SET_PUBLICATION_OWNER: u8 = 43;
 const KIND_RENAME_PUBLICATION: u8 = 44;
 const KIND_CREATE_ROUTINE: u8 = 45;
@@ -159,7 +163,7 @@ const KIND_DROP_RULE: u8 = 106;
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 3;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 4;
 const KIND_SET_PARAMETER_ACL: u8 = 123;
 const KIND_PREPARE_TRANSACTION: u8 = 107;
 const KIND_COMMIT_PREPARED: u8 = 108;
@@ -188,7 +192,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_ALTER_PUBLICATION_V2;
+const LAST_KIND: u8 = KIND_RESET_UNLOGGED_RELATIONS;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -1007,6 +1011,7 @@ pub(crate) enum WalOp<'a> {
         cycle: bool,
         owner: Option<crate::storage::SequenceOwner>,
         generator_for: Option<crate::storage::SequenceOwner>,
+        persistence: crate::storage::RelationPersistence,
     },
     DropSequence {
         schema: &'a str,
@@ -1150,6 +1155,10 @@ pub(crate) enum WalOp<'a> {
         last: i64,
         is_called: bool,
     },
+    /// Clears every unlogged table and resets every unlogged sequence after an
+    /// unclean startup. The operation is global because recovery has already
+    /// restored every database into one storage image.
+    ResetUnloggedRelations,
     /// A `COMMENT ON` set or removal. `class` is the [`CommentClass`]
     /// discriminant; `subid` is 0 for a relation/schema or the column number;
     /// `text == None` is a removal. Absolute, so replay is idempotent.
@@ -2090,6 +2099,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateSequence { .. } => KIND_CREATE_SEQUENCE,
         WalOp::DropSequence { .. } => KIND_DROP_SEQUENCE,
         WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
+        WalOp::ResetUnloggedRelations => KIND_RESET_UNLOGGED_RELATIONS,
         WalOp::Comment { .. } => KIND_COMMENT,
         WalOp::CreateDomain(_) => KIND_CREATE_DOMAIN,
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
@@ -2221,7 +2231,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::CreateTable(def) => {
-            let mut n = 1 + 1 + def.name.as_str().len() + 2 + 2 + 2;
+            let mut n = 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
             n += match def.access_method {
                 crate::storage::TableAccessMethod::Heap => 1,
                 crate::storage::TableAccessMethod::Catalog(_) => 5,
@@ -2802,7 +2812,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len()
                 + 1
                 + schema.len()
-                + 1
+                + 3
                 + 5 * 8
                 + 1
                 + 1
@@ -3166,6 +3176,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             new_name,
         } => 1 + name.len() + 1 + schema.len() + 1 + new_schema.len() + 1 + new_name.len(),
         WalOp::SequenceAdvance { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 8 + 1,
+        WalOp::ResetUnloggedRelations => 0,
         WalOp::Comment {
             schema, name, text, ..
         } => 1 + name.len() + 1 + schema.len() + 1 + 4 + 1 + text.map_or(0, |t| 2 + t.len()),
@@ -3809,6 +3820,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 match def.kind {
                     crate::storage::TableKind::Local => 0,
                     crate::storage::TableKind::Foreign => 1,
+                },
+                def.persistence.code(),
+                match def.on_commit {
+                    crate::storage::OnCommitAction::PreserveRows => 0,
+                    crate::storage::OnCommitAction::DeleteRows => 1,
+                    crate::storage::OnCommitAction::Drop => 2,
                 },
             ]);
             ok &= buffer.append(&def.tablespace.to_le_bytes());
@@ -4702,10 +4719,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             cycle,
             owner,
             generator_for,
+            persistence,
         } => {
             let mut ok = name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
-                && buffer.append(&[*data_type])
+                && buffer.append(&[u8::MAX, persistence.code(), *data_type])
                 && buffer.append(&increment.to_le_bytes())
                 && buffer.append(&min_value.to_le_bytes())
                 && buffer.append(&max_value.to_le_bytes())
@@ -5204,6 +5222,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&last.to_le_bytes())
                 && buffer.append(&[u8::from(*is_called)])
         }
+        WalOp::ResetUnloggedRelations => true,
         WalOp::Comment {
             class,
             schema,
@@ -6293,7 +6312,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             })
         }
         KIND_CREATE => {
-            if payload.get(at).copied()? != TABLE_DEF_PAYLOAD_VERSION {
+            let table_version = payload.get(at).copied()?;
+            if !matches!(table_version, 3 | TABLE_DEF_PAYLOAD_VERSION) {
                 return None;
             }
             at += 1;
@@ -6311,6 +6331,24 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
+            let (persistence, on_commit) = if table_version >= 4 {
+                let persistence =
+                    crate::storage::RelationPersistence::from_code(*payload.get(at)?)?;
+                at += 1;
+                let on_commit = match *payload.get(at)? {
+                    0 => crate::storage::OnCommitAction::PreserveRows,
+                    1 => crate::storage::OnCommitAction::DeleteRows,
+                    2 => crate::storage::OnCommitAction::Drop,
+                    _ => return None,
+                };
+                at += 1;
+                (persistence, on_commit)
+            } else {
+                (
+                    crate::storage::RelationPersistence::Permanent,
+                    crate::storage::OnCommitAction::PreserveRows,
+                )
+            };
             let tablespace = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let access_method = match *payload.get(at)? {
@@ -6336,6 +6374,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 n_columns: n_cols,
                 has_toast,
                 kind,
+                persistence,
+                on_commit,
                 tablespace,
                 access_method,
                 ..TableDef::empty()
@@ -7982,8 +8022,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_CREATE_SEQUENCE => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let data_type = *payload.get(at)?;
+            let marker = *payload.get(at)?;
             at += 1;
+            let (persistence, data_type) = if marker == u8::MAX {
+                let persistence =
+                    crate::storage::RelationPersistence::from_code(*payload.get(at)?)?;
+                at += 1;
+                let data_type = *payload.get(at)?;
+                at += 1;
+                (persistence, data_type)
+            } else {
+                (crate::storage::RelationPersistence::Permanent, marker)
+            };
             let take_i64 = |at: &mut usize| -> Option<i64> {
                 let v = i64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().unwrap());
                 *at += 8;
@@ -8030,6 +8080,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 cycle,
                 owner,
                 generator_for,
+                persistence,
             })
         }
         KIND_DROP_SEQUENCE => {
@@ -8050,6 +8101,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 last,
                 is_called,
             })
+        }
+        KIND_RESET_UNLOGGED_RELATIONS => {
+            (at == payload.len()).then_some(WalOp::ResetUnloggedRelations)
         }
         KIND_COMMENT => {
             let name = take_name(&mut at)?;
@@ -11945,6 +11999,7 @@ mod tests {
                     cycle: true,
                     owner: Some(sequence_link),
                     generator_for: Some(sequence_link),
+                    persistence: crate::storage::RelationPersistence::Permanent,
                 },
             )
             .unwrap();
@@ -12658,6 +12713,18 @@ mod tests {
         assert!(cascade);
         assert!(restart_identity);
         assert_eq!(command_id, 17);
+    }
+
+    #[test]
+    fn unlogged_recovery_reset_round_trips_without_payload() {
+        let mut budget = Budget::new(128);
+        let mut payload = FixedBuf::new(&mut budget, "unlogged reset WAL", 64).unwrap();
+        assert!(append_payload(&mut payload, &WalOp::ResetUnloggedRelations));
+        assert!(payload.is_empty());
+        assert!(matches!(
+            decode_op(KIND_RESET_UNLOGGED_RELATIONS, payload.readable()),
+            Some(WalOp::ResetUnloggedRelations)
+        ));
     }
 
     #[test]

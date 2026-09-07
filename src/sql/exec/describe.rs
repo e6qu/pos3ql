@@ -3106,7 +3106,9 @@ pub fn infer_type_res(
                 (crate::sql::types::ArrElem::Text.array_oid(), -1)
             }
             "pg_typeof" => (oid::REGTYPE, 4),
+            "to_regclass" => (oid::REGCLASS, 4),
             "pg_event_trigger_table_rewrite_oid" => (oid::OID, 4),
+            "pg_my_temp_schema" => (oid::OID, 4),
             "pg_event_trigger_table_rewrite_reason" => of(ColType::Int4),
             "pg_extension_config_dump" => (oid::VOID, 4),
             "version" | "getdatabaseencoding" | "pg_tablespace_location" => of(ColType::Text),
@@ -3121,6 +3123,7 @@ pub fn infer_type_res(
             | "has_database_privilege"
             | "has_parameter_privilege"
             | "pg_relation_is_publishable" => of(ColType::Bool),
+            "pg_is_other_temp_schema" => of(ColType::Bool),
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
                 of(ColType::Int4)
             }

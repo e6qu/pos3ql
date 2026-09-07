@@ -869,6 +869,7 @@ pub enum Stmt<'a> {
         if_not_exists: bool,
         kind: CreateTableAsKind,
         options: TableAsOptions<'a>,
+        persistence: RelationPersistence,
     },
     /// REFRESH MATERIALIZED VIEW name — re-run the stored query, replacing rows.
     RefreshMaterializedView {
@@ -885,6 +886,7 @@ pub enum Stmt<'a> {
         name: QualName<'a>,
         if_not_exists: bool,
         options: SeqOptions<'a>,
+        persistence: RelationPersistence,
     },
     /// ALTER SEQUENCE has exactly one typed action.  A rename cannot carry
     /// parameter options or a schema move into execution.
@@ -3349,9 +3351,12 @@ pub struct CreateTable<'a> {
     /// rejects these closed states until it can preserve their scan and
     /// dependency semantics through durable storage.
     pub membership: TableMembership<'a>,
-    /// Relation persistence requested by the client. Only permanent tables
-    /// can enter object-native durable storage.
+    /// Relation persistence requested by the client. Temporary tables are the
+    /// only variant excluded from object-native durable storage.
     pub persistence: RelationPersistence,
+    /// Transaction-end behavior. PostgreSQL only permits non-default actions
+    /// on temporary tables.
+    pub on_commit: OnCommitAction,
     /// The PostgreSQL table access method, resolved before storage mutation.
     pub access_method: TableAccessMethod<'a>,
     /// An explicit relation tablespace. `None` selects the database default.
@@ -3410,6 +3415,14 @@ pub struct TableAsOptions<'a> {
     pub access_method: TableAccessMethod<'a>,
     pub tablespace: Option<&'a str>,
     pub storage_options: RelationStorageOptions,
+    pub on_commit: OnCommitAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnCommitAction {
+    PreserveRows,
+    DeleteRows,
+    Drop,
 }
 
 impl<'a> TableAsOptions<'a> {
@@ -3417,6 +3430,7 @@ impl<'a> TableAsOptions<'a> {
         access_method: TableAccessMethod::Heap,
         tablespace: None,
         storage_options: RelationStorageOptions::DEFAULT,
+        on_commit: OnCommitAction::PreserveRows,
     };
 }
 
@@ -3831,6 +3845,7 @@ pub enum AlterSequenceAction<'a> {
     Options(SeqOptions<'a>),
     RenameTo(&'a str),
     SetSchema(&'a str),
+    SetPersistence(RelationPersistence),
 }
 
 impl<'a> SeqOptions<'a> {

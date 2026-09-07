@@ -2335,6 +2335,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
+    fn current_temporary_namespace_oid(&self) -> i32 {
+        super::catalog::current_temporary_namespace_oid(self.storage, self.txid)
+    }
+
+    fn is_other_temporary_namespace(&self, oid: i32) -> bool {
+        super::catalog::is_other_temporary_namespace(self.storage, self.txid, oid)
+    }
+
     fn index_def<'a>(
         &self,
         oid: i32,

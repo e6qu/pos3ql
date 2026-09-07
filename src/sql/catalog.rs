@@ -551,6 +551,30 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 3495,
+        name: "to_regclass",
+        result_oid: 2205,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2854,
+        name: "pg_my_temp_schema",
+        result_oid: 26,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2855,
+        name: "pg_is_other_temp_schema",
+        result_oid: 16,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 1215,
         name: "obj_description",
         result_oid: 25,
@@ -2489,6 +2513,7 @@ fn pg_default_acl<'a>(
 /// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
 /// schema's OID is derived from its registry slot, above the table range.
 const FIRST_SCHEMA_OID: i32 = 80_000;
+const FIRST_TEMP_NAMESPACE_OID: i32 = 2_000_000;
 pub(crate) const fn namespace_oid_for_slot(slot: usize) -> i32 {
     FIRST_SCHEMA_OID + slot as i32
 }
@@ -2498,6 +2523,11 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
         "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
         "pg_toast" => PG_TOAST_NS_OID,
+        _ if schema.starts_with("pg_temp_") => schema[8..]
+            .parse::<i32>()
+            .ok()
+            .and_then(|connection| connection.checked_add(FIRST_TEMP_NAMESPACE_OID))
+            .unwrap_or(0),
         _ => storage
             .find_schema(schema)
             .map(namespace_oid_for_slot)
@@ -2505,15 +2535,72 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
     }
 }
 
+pub(crate) fn current_temporary_namespace_oid(storage: &Storage, txid: u32) -> i32 {
+    let Ok(schema) = storage.temporary_schema() else {
+        return 0;
+    };
+    let exists = (0..storage.table_count()).any(|slot| {
+        storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).schema == schema
+            && storage.table_def(slot, txid).persistence
+                == crate::storage::RelationPersistence::Temporary
+    }) || (0..storage.sequence_count()).any(|slot| {
+        storage.sequence_slot_visible_to(slot, txid)
+            && storage.sequence_for(slot, txid).schema == schema
+            && storage.sequence_for(slot, txid).persistence
+                == crate::storage::RelationPersistence::Temporary
+    });
+    if exists {
+        namespace_oid(storage, schema.as_str())
+    } else {
+        0
+    }
+}
+
+pub(crate) fn is_other_temporary_namespace(storage: &Storage, txid: u32, oid: i32) -> bool {
+    let current = current_temporary_namespace_oid(storage, txid);
+    oid != current
+        && ((0..storage.table_count()).any(|slot| {
+            storage.table_slot_visible_to(slot, txid)
+                && storage.table_def(slot, txid).persistence
+                    == crate::storage::RelationPersistence::Temporary
+                && namespace_oid(storage, storage.table_def(slot, txid).schema.as_str()) == oid
+        }) || (0..storage.sequence_count()).any(|slot| {
+            storage.sequence_slot_visible_to(slot, txid)
+                && storage.sequence_for(slot, txid).persistence
+                    == crate::storage::RelationPersistence::Temporary
+                && namespace_oid(storage, storage.sequence_for(slot, txid).schema.as_str()) == oid
+        }))
+}
+
 pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Option<&str> {
     match oid {
         PUBLIC_NS_OID => Some("public"),
         PG_CATALOG_NS_OID => Some("pg_catalog"),
         PG_TOAST_NS_OID => Some("pg_toast"),
-        _ => storage
-            .visible_schemas(txid)
-            .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
-            .map(|(_, schema)| schema.name.as_str()),
+        _ => (0..storage.table_count())
+            .find_map(|slot| {
+                let table = storage.table_def(slot, txid);
+                (storage.table_slot_visible_to(slot, txid)
+                    && table.persistence == crate::storage::RelationPersistence::Temporary
+                    && namespace_oid(storage, table.schema.as_str()) == oid)
+                    .then_some(table.schema.as_str())
+            })
+            .or_else(|| {
+                (0..storage.sequence_count()).find_map(|slot| {
+                    let sequence = storage.sequence(slot);
+                    (storage.sequence_slot_visible_to(slot, txid)
+                        && sequence.persistence == crate::storage::RelationPersistence::Temporary
+                        && namespace_oid(storage, sequence.schema.as_str()) == oid)
+                        .then_some(sequence.schema.as_str())
+                })
+            })
+            .or_else(|| {
+                storage
+                    .visible_schemas(txid)
+                    .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
+                    .map(|(_, schema)| schema.name.as_str())
+            }),
     }
 }
 
@@ -2522,6 +2609,24 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
         "public" => Some(PUBLIC_NS_OID),
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
         "pg_toast" => Some(PG_TOAST_NS_OID),
+        "pg_temp" => (current_temporary_namespace_oid(storage, txid) != 0)
+            .then(|| current_temporary_namespace_oid(storage, txid)),
+        _ if name.starts_with("pg_temp_") => {
+            let oid = namespace_oid(storage, name);
+            (oid != 0
+                && ((0..storage.table_count()).any(|slot| {
+                    storage.table_slot_visible_to(slot, txid)
+                        && storage.table_def(slot, txid).persistence
+                            == crate::storage::RelationPersistence::Temporary
+                        && storage.table_def(slot, txid).schema.as_str() == name
+                }) || (0..storage.sequence_count()).any(|slot| {
+                    storage.sequence_slot_visible_to(slot, txid)
+                        && storage.sequence_for(slot, txid).persistence
+                            == crate::storage::RelationPersistence::Temporary
+                        && storage.sequence_for(slot, txid).schema.as_str() == name
+                })))
+            .then_some(oid)
+        }
         _ => storage
             .find_schema_visible(name, txid)
             .map(namespace_oid_for_slot),
@@ -3158,14 +3263,23 @@ fn index_oid_by_name(
     schema: Option<&str>,
     name: &str,
 ) -> Option<i32> {
+    let current_temporary_schema = storage.temporary_schema().ok();
     let mut found = None;
     visit_indexes(storage, txid, |index| {
+        let table = storage.table_def(index.table_slot, txid);
+        let is_current_temporary = table.persistence
+            == crate::storage::RelationPersistence::Temporary
+            && current_temporary_schema.is_some_and(|current| current == table.schema);
         if found.is_none()
             && index.name.as_str() == name
-            && schema.is_none_or(|schema| {
-                storage.table_def(index.table_slot, txid).schema.as_str() == schema
-            })
+            && schema.is_none_or(|schema| table.schema.as_str() == schema)
+            && (table.persistence != crate::storage::RelationPersistence::Temporary
+                || is_current_temporary)
         {
+            found = Some(index.oid);
+        } else if schema.is_none() && is_current_temporary && index.name.as_str() == name {
+            // A generated or explicit temporary index shares the relation
+            // namespace and shadows an ordinary-path index of the same name.
             found = Some(index.oid);
         }
     });
@@ -3255,18 +3369,46 @@ pub fn relname_text<'a>(
 /// ordinary tables, synthesized index relations, sequences, plain views, and
 /// named composite backing relations; `None` if no such relation.
 pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
-    let (schema, relation) = name
+    let (requested_schema, relation) = name
         .split_once('.')
         .map_or((None, name), |(schema, relation)| (Some(schema), relation));
-    if schema.is_none_or(|schema| schema == "pg_catalog")
+    if requested_schema.is_none_or(|schema| schema == "pg_catalog")
         && let Some(oid) = catalog_relation_oid(relation)
     {
         return Some(oid);
+    }
+    let current_temporary_schema = storage.temporary_schema().ok();
+    let classified_schema = storage
+        .classify_relation(requested_schema, relation, txid)
+        .map(|(schema, _)| schema);
+    let schema = match (classified_schema.as_ref(), requested_schema) {
+        (Some(schema), _) => Some(schema.as_str()),
+        (None, Some("pg_temp")) => Some(current_temporary_schema.as_ref()?.as_str()),
+        (None, Some(schema)) if schema.starts_with("pg_temp_") => {
+            if current_temporary_schema
+                .as_ref()
+                .is_none_or(|current| current.as_str() != schema)
+            {
+                return None;
+            }
+            Some(schema)
+        }
+        (None, schema) => schema,
+    };
+    if let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(schema, relation, txid)
+    {
+        return Some(table_oid(storage, slot));
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid)
             && storage.table_def(slot, txid).name.as_str() == relation
             && schema.is_none_or(|schema| storage.table_def(slot, txid).schema.as_str() == schema)
+            && (storage.table_def(slot, txid).persistence
+                != crate::storage::RelationPersistence::Temporary
+                || current_temporary_schema
+                    .as_ref()
+                    .is_some_and(|current| *current == storage.table_def(slot, txid).schema))
         {
             return Some(table_oid(storage, slot));
         }
@@ -3279,6 +3421,10 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
         if storage.sequence_slot_visible_to(slot, txid)
             && sequence.name.as_str() == relation
             && schema.is_none_or(|schema| sequence.schema.as_str() == schema)
+            && (sequence.persistence != crate::storage::RelationPersistence::Temporary
+                || current_temporary_schema
+                    .as_ref()
+                    .is_some_and(|current| *current == sequence.schema))
         {
             return Some(sequence_oid(slot));
         }
@@ -4682,8 +4828,12 @@ pub fn collation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool 
 }
 
 pub fn relation_oid_is_publishable(storage: &Storage, txid: u32, oid: i32) -> bool {
-    (0..storage.table_count())
-        .any(|slot| storage.table_slot_visible_to(slot, txid) && table_oid(storage, slot) == oid)
+    (0..storage.table_count()).any(|slot| {
+        storage.table_slot_visible_to(slot, txid)
+            && storage.table_def(slot, txid).persistence
+                == crate::storage::RelationPersistence::Permanent
+            && table_oid(storage, slot) == oid
+    })
 }
 
 /// Stored SELECT text for `pg_get_viewdef`, by relation OID.
@@ -8321,7 +8471,10 @@ fn pg_class<'a>(
                 } else {
                     0
                 }),
-                text("p", arena)?, // relpersistence: permanent
+                text(
+                    core::str::from_utf8(&[table_def.persistence.code()]).unwrap_or("p"),
+                    arena,
+                )?,
                 text(
                     match table_def.replica_identity {
                         crate::storage::ReplicaIdentityMode::Default => "d",
@@ -8390,7 +8543,11 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                text("p", arena)?,
+                text(
+                    core::str::from_utf8(&[storage.table_def(slot, txid).persistence.code()])
+                        .unwrap_or("p"),
+                    arena,
+                )?,
                 text("n", arena)?,
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(0),
@@ -8427,7 +8584,11 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                text("p", arena)?,
+                text(
+                    core::str::from_utf8(&[storage.table_def(slot, txid).persistence.code()])
+                        .unwrap_or("p"),
+                    arena,
+                )?,
                 text("n", arena)?,
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(0),
@@ -8543,7 +8704,14 @@ fn pg_class<'a>(
                 })),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                text("p", arena)?,
+                text(
+                    core::str::from_utf8(&[storage
+                        .table_def(info.table_slot, txid)
+                        .persistence
+                        .code()])
+                    .unwrap_or("p"),
+                    arena,
+                )?,
                 text("d", arena)?,
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(0),
@@ -8596,7 +8764,10 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                text("p", arena)?,
+                text(
+                    core::str::from_utf8(&[seq.persistence.code()]).unwrap_or("p"),
+                    arena,
+                )?,
                 text("n", arena)?, // relreplident: nothing (sequences)
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(0),
@@ -14231,8 +14402,11 @@ fn pg_namespace<'a>(
             ("nspacl", ColType::Array(super::types::ArrElem::AclItem)),
         ],
     );
-    let mut out: [&[Datum]; 3 + crate::storage::MAX_SCHEMAS] =
-        [&[]; 3 + crate::storage::MAX_SCHEMAS];
+    let capacity =
+        4 + crate::storage::MAX_SCHEMAS + storage.table_count() + storage.sequence_count();
+    let out = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     out[0] = row(
         &[
             Datum::Int4(PG_NAMESPACE_OID),
@@ -14280,6 +14454,59 @@ fn pg_namespace<'a>(
                     txid,
                     arena,
                 )?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    // PostgreSQL exposes every live session's temporary namespace in the
+    // catalogs while name resolution still restricts pg_temp to this session.
+    // Derive these virtual namespaces from their objects so no durable schema
+    // entry can outlive a connection.
+    let temporary = arena
+        .alloc_slice_with(storage.table_count() + storage.sequence_count(), |_| {
+            (crate::storage::SqlName::EMPTY, 0_u16)
+        })
+        .map_err(|_| arena_full())?;
+    let mut temporary_count = 0usize;
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        if table.persistence != crate::storage::RelationPersistence::Temporary
+            || temporary[..temporary_count]
+                .iter()
+                .any(|(schema, _)| *schema == table.schema)
+        {
+            continue;
+        }
+        temporary[temporary_count] = (table.schema, storage.table(slot).ownership.owner_to(txid));
+        temporary_count += 1;
+    }
+    for slot in 0..storage.sequence_count() {
+        if !storage.sequence_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let sequence = storage.sequence_for(slot, txid);
+        if sequence.persistence != crate::storage::RelationPersistence::Temporary
+            || temporary[..temporary_count]
+                .iter()
+                .any(|(schema, _)| *schema == sequence.schema)
+        {
+            continue;
+        }
+        temporary[temporary_count] = (sequence.schema, sequence.ownership.owner_to(txid));
+        temporary_count += 1;
+    }
+    for &(schema, owner) in &temporary[..temporary_count] {
+        out[n] = row(
+            &[
+                Datum::Int4(PG_NAMESPACE_OID),
+                Datum::Int4(namespace_oid(storage, schema.as_str())),
+                text(schema.as_str(), arena)?,
+                Datum::Int4(Storage::role_oid(usize::from(owner))),
+                Datum::Null,
             ],
             arena,
         )?;

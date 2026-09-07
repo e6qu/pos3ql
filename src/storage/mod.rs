@@ -21,9 +21,9 @@ use crate::pg::replication_client::{ConnectionInfo, ConnectionInfoError};
 use crate::sql::ast::{Collation, TablespaceCost};
 use crate::sql::eval::{SqlError, SqlState, hash_key, hash_key_collated, sqlstate};
 use crate::sql::types::{ArrElem, ColType, Datum};
-use crate::sql_err;
 use crate::store::BlockStore;
 use crate::util::StackStr;
+use crate::{sql_err, stack_format};
 
 pub(crate) use rowenc::MAX_COLUMNS;
 
@@ -1363,6 +1363,8 @@ pub struct TableDef {
     pub schema: SqlName,
     pub name: SqlName,
     pub kind: TableKind,
+    pub persistence: RelationPersistence,
+    pub on_commit: OnCommitAction,
     /// The durable PostgreSQL-visible table access method. The object-native
     /// row representation implements the ordinary heap relation contract.
     pub access_method: TableAccessMethod,
@@ -1467,6 +1469,59 @@ impl ReplicaIdentityMode {
 pub enum TableKind {
     Local,
     Foreign,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationPersistence {
+    Permanent,
+    Unlogged,
+    Temporary,
+}
+
+impl RelationPersistence {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Permanent => b'p',
+            Self::Unlogged => b'u',
+            Self::Temporary => b't',
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'p' => Some(Self::Permanent),
+            b'u' => Some(Self::Unlogged),
+            b't' => Some(Self::Temporary),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::sql::ast::RelationPersistence> for RelationPersistence {
+    fn from(value: crate::sql::ast::RelationPersistence) -> Self {
+        match value {
+            crate::sql::ast::RelationPersistence::Permanent => Self::Permanent,
+            crate::sql::ast::RelationPersistence::Unlogged => Self::Unlogged,
+            crate::sql::ast::RelationPersistence::Temporary => Self::Temporary,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnCommitAction {
+    PreserveRows,
+    DeleteRows,
+    Drop,
+}
+
+impl From<crate::sql::ast::OnCommitAction> for OnCommitAction {
+    fn from(value: crate::sql::ast::OnCommitAction) -> Self {
+        match value {
+            crate::sql::ast::OnCommitAction::PreserveRows => Self::PreserveRows,
+            crate::sql::ast::OnCommitAction::DeleteRows => Self::DeleteRows,
+            crate::sql::ast::OnCommitAction::Drop => Self::Drop,
+        }
+    }
 }
 
 /// The table access methods that have an executable object-native relation
@@ -1718,6 +1773,8 @@ impl TableDef {
             schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
             kind: TableKind::Local,
+            persistence: RelationPersistence::Permanent,
+            on_commit: OnCommitAction::PreserveRows,
             access_method: TableAccessMethod::Heap,
             storage_options: TableStorageOptions::DEFAULT,
             tablespace: 0,
@@ -8076,6 +8133,7 @@ pub struct SequenceDef {
     pub start_value: i64,
     pub cache: i64,
     pub cycle: bool,
+    pub persistence: RelationPersistence,
     /// The table column whose lifetime owns this sequence. Names, rather than
     /// slots, keep the dependency stable across checkpoint restore and
     /// catalog-slot reuse.
@@ -8117,6 +8175,7 @@ pub(crate) struct PendingSequenceDefinition {
     pub spec: SeqSpec,
     pub owner: Option<SequenceOwner>,
     pub generator_for: Option<SequenceOwner>,
+    pub persistence: RelationPersistence,
     pub last_value: i64,
     pub is_called: bool,
     pub log_count: i64,
@@ -8174,7 +8233,7 @@ fn rebind_sequence_column(
 /// from the CREATE/ALTER options, then handed to storage. Kept apart from the
 /// live value state ([`SequenceDef`]'s `Cell` fields).
 #[derive(Debug, Clone, Copy)]
-pub struct SeqSpec {
+pub(crate) struct SeqSpec {
     pub data_type: SeqType,
     pub increment: i64,
     pub min_value: i64,
@@ -8185,12 +8244,23 @@ pub struct SeqSpec {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct SequenceCreateSpec {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub spec: SeqSpec,
+    pub owner: Option<SequenceOwner>,
+    pub generator_for: Option<SequenceOwner>,
+    pub persistence: RelationPersistence,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceAlteration {
     pub schema: SqlName,
     pub name: SqlName,
     pub spec: SeqSpec,
     pub owner: Option<SequenceOwner>,
     pub generator_for: Option<SequenceOwner>,
+    pub persistence: RelationPersistence,
     pub restart: Option<i64>,
 }
 
@@ -8223,6 +8293,7 @@ impl SequenceDef {
                     cycle: pending.spec.cycle,
                     owner: pending.owner,
                     generator_for: pending.generator_for,
+                    persistence: pending.persistence,
                     cache_generation: self.cache_generation.wrapping_add(1),
                     pending_definition: None,
                     ..self.clone()
@@ -10501,6 +10572,10 @@ pub struct Storage {
     indexes: FixedVec<IndexDef>,
     databases: FixedVec<DatabaseDef>,
     current_database: DatabaseOid,
+    current_connection_id: Cell<i32>,
+    /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
+    /// must reject them before state can outlive the owning connection.
+    temporary_transactions: std::cell::RefCell<FixedVec<u32>>,
     tablespaces: FixedVec<TablespaceDef>,
     schemas: FixedVec<SchemaDef>,
     extensions: FixedVec<ExtensionDef>,
@@ -10712,8 +10787,10 @@ unsafe extern "C" {
 /// and startup-reserved; the stack is shared with the checkpointer through a
 /// `RefCell` (single-threaded engine, short borrows).
 pub(crate) struct SpillReader {
-    blocks:
+    blocks: Option<
         std::rc::Rc<std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>>,
+    >,
+    temporary_blocks: Option<std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>>>,
     /// Two scratch sets so one consume-in-place fetch may nest inside another
     /// (a validation scan holding one row while checking it against the
     /// rest). Deeper nesting is a loud error, not a deadlock.
@@ -10727,7 +10804,7 @@ pub(crate) struct SpillReader {
     next_walk_id: std::cell::Cell<u64>,
     /// Independent buffers for persistent value probes. A probe may invoke an
     /// authoritative spilled-row recheck, so it must not borrow row scratch.
-    value_scratch: [std::cell::RefCell<ValueIndexScratch>; 2],
+    value_scratch: Option<[std::cell::RefCell<ValueIndexScratch>; 2]>,
     /// Nested materializers lease independent external-run producers. Their
     /// buffers and merge fan-in are fixed at startup; run blocks travel
     /// through `blocks`, never a provider-specific path.
@@ -10858,10 +10935,16 @@ impl SpillReader {
     /// Startup-only: reserves the reader scratch from the budget.
     pub(crate) fn new(
         budget: &mut Budget,
-        blocks: std::rc::Rc<
-            std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+        blocks: Option<
+            std::rc::Rc<
+                std::cell::RefCell<crate::store::TieredStore<crate::store::OwnedObjectStore>>,
+            >,
+        >,
+        temporary_blocks: Option<
+            std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>>,
         >,
     ) -> Result<Self, BudgetError> {
+        let durable = blocks.is_some();
         budget.draw(
             2 * (5 * crate::store::MAX_PAYLOAD
                 + crate::store::MAX_ASSEMBLED
@@ -10874,30 +10957,36 @@ impl SpillReader {
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>()),
             "row-state walk contexts",
         )?;
-        budget.draw(
-            4 * crate::store::MAX_PAYLOAD,
-            "persistent value-index readers",
-        )?;
-        budget.draw_array(
-            EXTERNAL_RUN_CONTEXTS,
-            core::mem::size_of::<std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>>(),
-            "external query run producer slots",
-        )?;
-        let mut external_sorters = Vec::with_capacity(EXTERNAL_RUN_CONTEXTS);
-        for _ in 0..EXTERNAL_RUN_CONTEXTS {
-            external_sorters.push(std::cell::RefCell::new(Box::new(
-                crate::sql::external::ExternalSorter::new(budget)?,
-            )));
-        }
-        budget.draw(
-            EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes(),
-            "external query run readers",
-        )?;
-        let external_readers = (0..EXTERNAL_RUN_CONTEXTS)
-            .map(|_| std::cell::RefCell::new(crate::sql::external::ExternalRunReader::new()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-            .into();
+        let mut external_sorters = Vec::new();
+        let external_readers = if durable {
+            budget.draw(
+                4 * crate::store::MAX_PAYLOAD,
+                "persistent value-index readers",
+            )?;
+            budget.draw_array(
+                EXTERNAL_RUN_CONTEXTS,
+                core::mem::size_of::<std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>>(
+                ),
+                "external query run producer slots",
+            )?;
+            external_sorters.reserve_exact(EXTERNAL_RUN_CONTEXTS);
+            for _ in 0..EXTERNAL_RUN_CONTEXTS {
+                external_sorters.push(std::cell::RefCell::new(Box::new(
+                    crate::sql::external::ExternalSorter::new(budget)?,
+                )));
+            }
+            budget.draw(
+                EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes(),
+                "external query run readers",
+            )?;
+            (0..EXTERNAL_RUN_CONTEXTS)
+                .map(|_| std::cell::RefCell::new(crate::sql::external::ExternalRunReader::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+                .into()
+        } else {
+            Vec::new().into_boxed_slice().into()
+        };
         let fresh = || {
             std::cell::RefCell::new(SpillScratch {
                 index_buf: vec![0u8; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -10938,29 +11027,80 @@ impl SpillReader {
         }
         Ok(Self {
             blocks,
+            temporary_blocks,
             scratch: [fresh(), fresh()],
             scan_contexts: scan_contexts.into_boxed_slice(),
             next_walk_id: std::cell::Cell::new(1),
-            value_scratch: [value(), value()],
+            value_scratch: durable.then(|| [value(), value()]),
             external_sorters: external_sorters.into_boxed_slice(),
             external_readers,
         })
     }
 
     /// The budget the contexts and scratch draw, for memory-plan estimates.
-    pub(crate) fn budget_bytes() -> usize {
-        2 * (5 * crate::store::MAX_PAYLOAD
-            + crate::store::MAX_ASSEMBLED
-            + core::mem::size_of::<SpillScratch>())
+    pub(crate) fn budget_bytes(durable: bool) -> usize {
+        let row_reader = 2
+            * (5 * crate::store::MAX_PAYLOAD
+                + crate::store::MAX_ASSEMBLED
+                + core::mem::size_of::<SpillScratch>())
             + SCAN_CONTEXTS
                 * ((2 * MAX_SPILL_SSTS + 4) * crate::store::MAX_PAYLOAD
-                    + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
-            + 4 * crate::store::MAX_PAYLOAD
-            + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
-            + EXTERNAL_RUN_CONTEXTS
-                * core::mem::size_of::<std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>>(
-                )
-            + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes()
+                    + core::mem::size_of::<std::cell::RefCell<ScanContext>>());
+        if durable {
+            row_reader
+                + 4 * crate::store::MAX_PAYLOAD
+                + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalSorter::budget_bytes()
+                + EXTERNAL_RUN_CONTEXTS
+                    * core::mem::size_of::<
+                        std::cell::RefCell<Box<crate::sql::external::ExternalSorter>>,
+                    >()
+                + EXTERNAL_RUN_CONTEXTS * crate::sql::external::ExternalRunReader::budget_bytes()
+        } else {
+            row_reader
+        }
+    }
+
+    fn relation_blocks<'a>(&'a self, table: &Table) -> RelationBlockStore<'a> {
+        if table.def.persistence == RelationPersistence::Temporary {
+            RelationBlockStore::Temporary(
+                self.temporary_blocks
+                    .as_ref()
+                    .expect("spilled temporary table has a temporary block store")
+                    .borrow_mut(),
+            )
+        } else {
+            RelationBlockStore::Durable(
+                self.blocks
+                    .as_ref()
+                    .expect("durable spilled table has a durable block stack")
+                    .borrow_mut(),
+            )
+        }
+    }
+}
+
+enum RelationBlockStore<'a> {
+    Durable(std::cell::RefMut<'a, crate::store::TieredStore<crate::store::OwnedObjectStore>>),
+    Temporary(std::cell::RefMut<'a, crate::store::EphemeralBlockStore>),
+}
+
+impl core::ops::Deref for RelationBlockStore<'_> {
+    type Target = dyn crate::store::BlockStore;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Durable(store) => &**store,
+            Self::Temporary(store) => &**store,
+        }
+    }
+}
+
+impl core::ops::DerefMut for RelationBlockStore<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Durable(store) => &mut **store,
+            Self::Temporary(store) => &mut **store,
+        }
     }
 }
 
@@ -11261,6 +11401,233 @@ fn rename_table_sql_identity(
 }
 
 impl Storage {
+    pub(crate) fn set_current_connection_id(&self, connection_id: i32) {
+        self.current_connection_id.set(connection_id);
+    }
+
+    fn mark_temporary_transaction(&self, txid: u32) {
+        if txid == 0 {
+            return;
+        }
+        let mut transactions = self.temporary_transactions.borrow_mut();
+        if !transactions.contains(&txid) {
+            transactions
+                .push(txid)
+                .expect("temporary transaction registry is sized to transaction capacity");
+        }
+    }
+
+    pub(crate) fn transaction_used_temporary_relation(&self, txid: u32) -> bool {
+        self.temporary_transactions.borrow().contains(&txid)
+    }
+
+    pub(crate) fn clear_temporary_transaction(&self, txid: u32) {
+        let mut transactions = self.temporary_transactions.borrow_mut();
+        if let Some(index) = transactions.iter().position(|candidate| *candidate == txid) {
+            transactions.swap_remove(index);
+        }
+    }
+
+    pub(crate) fn temporary_schema(&self) -> Result<SqlName, SqlError> {
+        SqlName::parse(stack_format!(63, "pg_temp_{}", self.current_connection_id.get()).as_str())
+    }
+
+    fn is_current_temporary_schema(&self, schema: &str) -> bool {
+        self.temporary_schema()
+            .is_ok_and(|name| name.as_str() == schema)
+    }
+
+    pub(crate) fn relation_visible_to_current_session(&self, table: usize, txid: u32) -> bool {
+        self.table(table).visible_to(txid)
+            && (self.table_def(table, txid).persistence != RelationPersistence::Temporary
+                || self.is_current_temporary_schema(self.table_def(table, txid).schema.as_str()))
+    }
+
+    pub(crate) fn drop_connection_temporary_relations(&mut self, connection_id: i32) {
+        self.set_current_connection_id(connection_id);
+        let Ok(schema) = self.temporary_schema() else {
+            return;
+        };
+        for slot in 0..self.table_count() {
+            if self.tables[slot].database != self.current_database
+                || !self.tables[slot].live
+                || self.tables[slot].def.persistence != RelationPersistence::Temporary
+                || self.tables[slot].def.schema != schema
+            {
+                continue;
+            }
+            let name = self.tables[slot].def.name;
+            self.drop_indexes_for(schema.as_str(), name.as_str(), 0);
+            self.commit_indexes_for(schema.as_str(), name.as_str(), 0);
+            self.commit_drop(slot);
+        }
+        for slot in 0..self.sequences.len() {
+            if self.sequences[slot].database == self.current_database
+                && self.sequences[slot].ddl_state == CatalogDdlState::Present
+                && self.sequences[slot].persistence == RelationPersistence::Temporary
+                && self.sequences[slot].schema == schema
+            {
+                self.sequences[slot].ddl_state = self.sequences[slot].ddl_state.drop_by(0);
+                self.commit_sequence_drop(slot);
+            }
+        }
+    }
+
+    pub(crate) fn apply_temporary_on_commit(&mut self) -> Result<(), SqlError> {
+        let Ok(schema) = self.temporary_schema() else {
+            return Ok(());
+        };
+        for slot in 0..self.table_count() {
+            if self.tables[slot].database != self.current_database
+                || !self.tables[slot].live
+                || self.tables[slot].def.persistence != RelationPersistence::Temporary
+                || self.tables[slot].def.schema != schema
+            {
+                continue;
+            }
+            match self.tables[slot].def.on_commit {
+                OnCommitAction::PreserveRows => {}
+                OnCommitAction::DeleteRows => {
+                    self.tables[slot].rows.clear();
+                    self.tables[slot].statistics = TableStatistics::EMPTY;
+                    self.tables[slot].statistics_wal_dirty = false;
+                    self.set_spill_list(slot, &[]);
+                    self.refresh_enforcers(slot)?;
+                }
+                OnCommitAction::Drop => {
+                    let table = self.tables[slot].def.name;
+                    self.drop_indexes_for(schema.as_str(), table.as_str(), 0);
+                    self.commit_indexes_for(schema.as_str(), table.as_str(), 0);
+                    for sequence in 0..self.sequences.len() {
+                        if self.sequences[sequence].ddl_state == CatalogDdlState::Present
+                            && self.sequences[sequence].owner.is_some_and(|owner| {
+                                owner.table_schema == schema && owner.table == table
+                            })
+                        {
+                            self.sequences[sequence].ddl_state =
+                                self.sequences[sequence].ddl_state.drop_by(0);
+                            self.commit_sequence_drop(sequence);
+                        }
+                    }
+                    self.commit_drop(slot);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reset_unlogged_relations(&mut self) -> Result<(), SqlError> {
+        for slot in 0..self.table_count() {
+            if !self.tables[slot].live
+                || self.tables[slot].def.persistence != RelationPersistence::Unlogged
+            {
+                continue;
+            }
+            self.tables[slot].rows.clear();
+            self.tables[slot].serial_last = [0; MAX_COLUMNS];
+            self.tables[slot].serial_dirty = false;
+            self.tables[slot].statistics = TableStatistics::EMPTY;
+            self.tables[slot].statistics_wal_dirty = false;
+            self.set_spill_list(slot, &[]);
+            self.tables[slot].mark_dirty();
+            self.refresh_enforcers(slot)?;
+        }
+        for sequence in self.sequences.iter_mut() {
+            if sequence.ddl_state == CatalogDdlState::Present
+                && sequence.persistence == RelationPersistence::Unlogged
+            {
+                sequence.last_value.set(sequence.start_value);
+                sequence.is_called.set(false);
+                sequence.log_count.set(0);
+                sequence.dirty.set(false);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_unlogged_relations(&self) -> bool {
+        self.tables
+            .iter()
+            .any(|table| table.live && table.def.persistence == RelationPersistence::Unlogged)
+            || self.sequences.iter().any(|sequence| {
+                sequence.ddl_state == CatalogDdlState::Present
+                    && sequence.persistence == RelationPersistence::Unlogged
+            })
+    }
+
+    pub(crate) fn require_temporary_privilege(&self, txid: u32) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let object = AccessObject {
+            class: AccessClass::Database,
+            slot: self.current_database_slot(txid) as u16,
+        };
+        if self.has_object_privilege(object, role, PrivilegeSet::TEMPORARY, txid) {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for database {}",
+                self.current_database_name(txid).as_str()
+            ))
+        }
+    }
+
+    pub(crate) fn access_object_is_temporary(&self, object: AccessObject, txid: u32) -> bool {
+        match object.class {
+            AccessClass::Table => {
+                self.table_def(object.slot as usize, txid).persistence
+                    == RelationPersistence::Temporary
+            }
+            AccessClass::Index => self
+                .indexes
+                .get(object.slot as usize)
+                .and_then(|index| {
+                    self.tables.iter().enumerate().find_map(|(slot, table)| {
+                        (table.database == index.database
+                            && table.visible_to(txid)
+                            && self.table_def(slot, txid).schema == index.schema
+                            && self.table_def(slot, txid).name == index.table)
+                            .then_some(slot)
+                    })
+                })
+                .is_some_and(|table| {
+                    self.table_def(table, txid).persistence == RelationPersistence::Temporary
+                }),
+            AccessClass::Sequence => {
+                self.sequence_for(object.slot as usize, txid).persistence
+                    == RelationPersistence::Temporary
+            }
+            AccessClass::Statistics => self
+                .extended_statistics
+                .get(object.slot as usize)
+                .is_some_and(|statistics| {
+                    self.table_def(usize::from(statistics.table), txid)
+                        .persistence
+                        == RelationPersistence::Temporary
+                }),
+            AccessClass::Trigger => {
+                self.triggers
+                    .get(object.slot as usize)
+                    .is_some_and(|trigger| match trigger.target {
+                        TriggerTarget::Table(table) => {
+                            self.table_def(usize::from(table), txid).persistence
+                                == RelationPersistence::Temporary
+                        }
+                        TriggerTarget::View(_) => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn foreign_wrapper(
         &self,
         name: &str,
@@ -12107,6 +12474,8 @@ impl Storage {
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<(u32, u64)>()
             + (config.max_connections as usize + config.max_prepared_transactions)
+                * size_of::<u32>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
                 * table_slot_capacity(config)
                 * size_of::<TableLock>()
             + crate::sql::lock::LockManager::budget_bytes(
@@ -12553,6 +12922,7 @@ impl Storage {
                     start_value: 1,
                     cache: 1,
                     cycle: false,
+                    persistence: RelationPersistence::Permanent,
                     owner: None,
                     generator_for: None,
                     last_value: Cell::new(1),
@@ -12814,6 +13184,11 @@ impl Storage {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
+        let temporary_transactions = std::cell::RefCell::new(FixedVec::new(
+            budget,
+            "temporary_transactions",
+            transaction_capacity,
+        )?);
         let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
             "table_locks",
@@ -12873,6 +13248,8 @@ impl Storage {
             indexes,
             databases,
             current_database: DatabaseOid::POSTGRES,
+            current_connection_id: Cell::new(0),
+            temporary_transactions,
             tablespaces,
             schemas,
             extensions,
@@ -16035,18 +16412,19 @@ impl Storage {
     }
 
     pub(crate) fn checkpoint_sequences(&self) -> impl Iterator<Item = &SequenceDef> {
-        self.sequences
-            .iter()
-            .filter(|value| value.ddl_state == CatalogDdlState::Present)
+        self.sequences.iter().filter(|value| {
+            value.ddl_state == CatalogDdlState::Present
+                && value.persistence != RelationPersistence::Temporary
+        })
     }
 
     pub(crate) fn checkpoint_sequences_with_slots(
         &self,
     ) -> impl Iterator<Item = (usize, &SequenceDef)> {
-        self.sequences
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        self.sequences.iter().enumerate().filter(|(_, value)| {
+            value.ddl_state == CatalogDdlState::Present
+                && value.persistence != RelationPersistence::Temporary
+        })
     }
 
     pub(crate) fn checkpoint_casts(&self) -> impl Iterator<Item = (usize, &CastDef)> {
@@ -16090,7 +16468,14 @@ impl Storage {
 
     pub(crate) fn checkpoint_rules(&self) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
         self.rules.iter().copied().enumerate().filter(|(_, rule)| {
-            rule.ddl_state == CatalogDdlState::Present && !rule.definition.is_view_return()
+            rule.ddl_state == CatalogDdlState::Present
+                && !rule.definition.is_view_return()
+                && !matches!(
+                    rule.definition.target,
+                    RuleTarget::Table(table)
+                        if self.table_def(usize::from(table), 0).persistence
+                            == RelationPersistence::Temporary
+                )
         })
     }
 
@@ -16129,10 +16514,15 @@ impl Storage {
     }
 
     pub(crate) fn checkpoint_triggers(&self) -> impl Iterator<Item = (usize, &TriggerDef)> {
-        self.triggers
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        self.triggers.iter().enumerate().filter(|(_, value)| {
+            value.ddl_state == CatalogDdlState::Present
+                && !matches!(
+                    value.target,
+                    TriggerTarget::Table(table)
+                        if self.table_def(usize::from(table), 0).persistence
+                            == RelationPersistence::Temporary
+                )
+        })
     }
 
     pub(crate) fn checkpoint_extended_statistics(
@@ -16141,14 +16531,19 @@ impl Storage {
         self.extended_statistics
             .iter()
             .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+            .filter(|(_, value)| {
+                value.ddl_state == CatalogDdlState::Present
+                    && self.table_def(usize::from(value.table), 0).persistence
+                        != RelationPersistence::Temporary
+            })
     }
 
     pub(crate) fn checkpoint_policies(&self) -> impl Iterator<Item = (usize, &PolicyDef)> {
-        self.policies
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        self.policies.iter().enumerate().filter(|(_, value)| {
+            value.ddl_state == CatalogDdlState::Present
+                && self.table_def(usize::from(value.table), 0).persistence
+                    != RelationPersistence::Temporary
+        })
     }
 
     pub(crate) fn checkpoint_extensions(&self) -> impl Iterator<Item = (usize, &ExtensionDef)> {
@@ -16177,16 +16572,22 @@ impl Storage {
     }
 
     pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, &IndexDef)> {
-        self.indexes
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        self.indexes.iter().enumerate().filter(|(_, value)| {
+            value.ddl_state == CatalogDdlState::Present
+                && !self.tables.iter().any(|table| {
+                    table.database == value.database
+                        && table.live
+                        && table.def.schema == value.schema
+                        && table.def.name == value.table
+                        && table.def.persistence == RelationPersistence::Temporary
+                })
+        })
     }
 
     pub(crate) fn checkpoint_comments(&self) -> impl Iterator<Item = &CommentEntry> {
-        self.comments
-            .iter()
-            .filter(|value| value.used && value.live.is_some())
+        self.comments.iter().filter(|value| {
+            value.used && value.live.is_some() && !value.schema.as_str().starts_with("pg_temp_")
+        })
     }
 
     pub(crate) fn checkpoint_default_acls(
@@ -17625,6 +18026,9 @@ impl Storage {
         if txid == 0 {
             return Ok(());
         }
+        if self.is_current_temporary_schema(schema) {
+            return self.require_temporary_privilege(txid);
+        }
         let role = self.current_role_slot(txid).ok_or_else(|| {
             sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -17685,6 +18089,9 @@ impl Storage {
         txid: u32,
     ) -> Result<(), SqlError> {
         if txid == 0 || schema == "pg_catalog" {
+            return Ok(());
+        }
+        if self.is_current_temporary_schema(schema) {
             return Ok(());
         }
         let schema_slot = self.find_schema_visible(schema, txid).ok_or_else(|| {
@@ -20394,7 +20801,21 @@ impl Storage {
             return Some(ResolvedRelation::Catalog);
         }
         if let Some(schema) = qualifier {
+            if schema == "pg_temp" {
+                return self
+                    .temporary_schema()
+                    .ok()
+                    .and_then(|schema| self.relation_in(schema.as_str(), name, txid));
+            }
+            if schema.starts_with("pg_temp_") && !self.is_current_temporary_schema(schema) {
+                return None;
+            }
             return self.relation_in(schema, name, txid);
+        }
+        if let Ok(schema) = self.temporary_schema()
+            && let Some(found) = self.relation_in(schema.as_str(), name, txid)
+        {
+            return Some(found);
         }
         for entry in path.entries() {
             match entry {
@@ -20422,6 +20843,9 @@ impl Storage {
 
     fn relation_in(&self, schema: &str, name: &str, txid: u32) -> Option<ResolvedRelation> {
         if let Some(t) = self.find_visible(schema, name, txid) {
+            if self.table_def(t, txid).persistence == RelationPersistence::Temporary {
+                self.mark_temporary_transaction(txid);
+            }
             return Some(ResolvedRelation::Table(t));
         }
         self.views
@@ -20459,7 +20883,7 @@ impl Storage {
             i.database == self.current_database
                 && i.visible_to(txid)
                 && i.schema.as_str() == schema
-                && i.name.as_str() == name
+                && i.name_for(txid).as_str() == name
         }) {
             return Some(StoredRelKind::Index);
         }
@@ -20477,9 +20901,23 @@ impl Storage {
         txid: u32,
     ) -> Option<(SqlName, StoredRelKind)> {
         if let Some(schema) = qualifier {
+            if schema == "pg_temp" {
+                let temporary = self.temporary_schema().ok()?;
+                return self
+                    .relation_kind_in(temporary.as_str(), name, txid)
+                    .map(|kind| (temporary, kind));
+            }
+            if schema.starts_with("pg_temp_") && !self.is_current_temporary_schema(schema) {
+                return None;
+            }
             return self
                 .relation_kind_in(schema, name, txid)
                 .map(|k| (SqlName::parse(schema).unwrap_or(SqlName::EMPTY), k));
+        }
+        if let Ok(temporary) = self.temporary_schema()
+            && let Some(kind) = self.relation_kind_in(temporary.as_str(), name, txid)
+        {
+            return Some((temporary, kind));
         }
         for entry in self.path.entries() {
             if let PathEntry::Schema(slot) = entry {
@@ -20494,8 +20932,8 @@ impl Storage {
 
     /// The 1-based column number of `column` in the relation at `table_slot`, or
     /// `None` if the relation has no such column.
-    pub fn column_number(&self, table_slot: usize, column: &str) -> Option<u32> {
-        let def = &self.tables[table_slot].def;
+    pub fn column_number(&self, table_slot: usize, column: &str, txid: u32) -> Option<u32> {
+        let def = self.table_def(table_slot, txid);
         def.columns()
             .iter()
             .position(|c| c.name.as_str() == column)
@@ -20621,13 +21059,16 @@ impl Storage {
         }
     }
 
-    /// Attaches the spilled-row read path (engine setup, object storage on).
+    /// Attaches the spilled-row read path. The local temporary store is always
+    /// present; its durable block stack is optional.
     pub(crate) fn attach_spill(&mut self, reader: SpillReader) {
         self.spill = Some(reader);
     }
 
     pub fn spill_attached(&self) -> bool {
-        self.spill.is_some()
+        self.spill
+            .as_ref()
+            .is_some_and(|reader| reader.blocks.is_some())
     }
 
     /// Cumulative traffic through the provider-neutral block stack.
@@ -20638,7 +21079,8 @@ impl Storage {
     pub(crate) fn block_io_stats(&self) -> crate::store::BlockIoStats {
         self.spill
             .as_ref()
-            .map(|reader| reader.blocks.borrow().io_stats())
+            .and_then(|reader| reader.blocks.as_ref())
+            .map(|blocks| blocks.borrow().io_stats())
             .unwrap_or_default()
     }
 
@@ -20650,7 +21092,7 @@ impl Storage {
         std::cell::RefMut<'_, Box<crate::sql::external::ExternalSorter>>,
         crate::sql::eval::SqlError,
     > {
-        let Some(spill) = self.spill.as_ref() else {
+        let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                 "external query runs require durable object storage"
@@ -20676,7 +21118,7 @@ impl Storage {
         std::cell::RefMut<'_, crate::sql::external::ExternalRunReader>,
         crate::sql::eval::SqlError,
     > {
-        let Some(spill) = self.spill.as_ref() else {
+        let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                 "external query runs require durable object storage"
@@ -20699,14 +21141,15 @@ impl Storage {
     pub(crate) fn external_run_access(
         &self,
     ) -> Result<ExternalRunAccess, crate::sql::eval::SqlError> {
-        let Some(spill) = self.spill.as_ref() else {
+        let Some(spill) = self.spill.as_ref().filter(|spill| spill.blocks.is_some()) else {
             return Err(crate::sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
                 "external query runs require durable object storage"
             ));
         };
+        let blocks = spill.blocks.as_ref().expect("filtered above");
         Ok(ExternalRunAccess {
-            blocks: std::rc::Rc::as_ptr(&spill.blocks),
+            blocks: std::rc::Rc::as_ptr(blocks),
             readers: std::rc::Rc::as_ptr(&spill.external_readers),
         })
     }
@@ -20720,7 +21163,7 @@ impl Storage {
         operation: impl FnOnce(&mut dyn crate::store::BlockStore) -> R,
     ) -> Option<R> {
         let reader = self.spill.as_ref()?;
-        let mut blocks = reader.blocks.borrow_mut();
+        let mut blocks = reader.blocks.as_ref()?.borrow_mut();
         Some(operation(&mut *blocks))
     }
 
@@ -21012,7 +21455,7 @@ impl Storage {
                             pax_row_buf,
                             ..
                         } = &mut *context;
-                        let mut blocks = spill.blocks.borrow_mut();
+                        let mut blocks = spill.relation_blocks(table);
                         let mut at = 0usize;
                         pax_value_extents.fill(None);
                         for column in 0..layout.columns() {
@@ -21106,7 +21549,7 @@ impl Storage {
                         )
                     })?;
                     let (copied_key, copied_tombstone, copied) = {
-                        let mut blocks = spill.blocks.borrow_mut();
+                        let mut blocks = spill.relation_blocks(table);
                         crate::store::copy_block_entry_at(
                             &mut *blocks,
                             &context.member_blocks[member as usize][..cursor.loaded_len],
@@ -21291,7 +21734,7 @@ impl Storage {
         let handle = table.spill_ssts[member].expect("cursor members exist");
         loop {
             if let Some((ordinal, leaf)) = cursor.prefetched_leaf {
-                let mut blocks = spill.blocks.borrow_mut();
+                let mut blocks = spill.relation_blocks(table);
                 if let Some(reference) = crate::store::take_prefetched_index_first_data(
                     &mut *blocks,
                     &leaf,
@@ -21310,7 +21753,7 @@ impl Storage {
             }
             if cursor.loaded != Some(cursor.ordinal) {
                 let resume_raw_row = cursor.raw_row;
-                let mut blocks = spill.blocks.borrow_mut();
+                let mut blocks = spill.relation_blocks(table);
                 // Both index shapes resolve through one helper; the index
                 // buffer is scratch for the descent and the decompression
                 // bounce alike.
@@ -21473,9 +21916,11 @@ impl Storage {
         let mut best: Option<SpillVersion> = None;
         for member in 0..table.n_spill_ssts {
             let handle = table.spill_ssts[member].expect("counted");
-            let verdict = reader
-                .probe_at(&mut *spill.blocks.borrow_mut(), &handle, rowid, snapshot)
-                .map_err(spill_read_error)?;
+            let verdict = {
+                let mut blocks = spill.relation_blocks(table);
+                reader.probe_at(&mut *blocks, &handle, rowid, snapshot)
+            }
+            .map_err(spill_read_error)?;
             if let Some(probe) = verdict
                 && best.is_none_or(|current| {
                     probe.key.commit_lsn > current.commit_lsn
@@ -21977,7 +22422,7 @@ impl Storage {
                         "spilled-row fetches nested deeper than the reader supports"
                     ));
                 };
-                let mut blocks = spill.blocks.borrow_mut();
+                let mut blocks = spill.relation_blocks(&self.tables[table_slot]);
                 let SpillScratch {
                     index_buf,
                     data_buf,
@@ -22081,7 +22526,7 @@ impl Storage {
                 // through it).
                 let row_buf = &mut assembly_buf[..len as usize];
                 let got = {
-                    let mut blocks = spill.blocks.borrow_mut();
+                    let mut blocks = spill.relation_blocks(&self.tables[table_slot]);
                     let mut reader = crate::store::SstReader::over(
                         index_buf,
                         data_buf,
@@ -22125,22 +22570,43 @@ impl Storage {
     /// installed on the tables; rows with no SST (empty tables) are left.
     pub fn evict_committed(&mut self) {
         for i in 0..self.tables.len() {
-            if !self.tables[i].live || self.tables[i].n_spill_ssts == 0 {
-                continue;
+            if self.tables[i].def.persistence != RelationPersistence::Temporary {
+                self.evict_committed_table(i);
             }
-            let table = &mut self.tables[i];
-            // The newest SST is the delta the checkpoint just wrote, and it
-            // holds every committed heap row of this table.
-            let newest = (table.n_spill_ssts - 1) as u8;
-            for (_, state) in table.rows.iter_mut() {
-                if let Some(RowHome::Heap(loc)) = state.committed {
-                    state.committed = Some(RowHome::Spilled {
-                        len: loc.len,
-                        sst: newest,
-                        commit_lsn: state.committed_lsn,
-                    });
-                }
+        }
+    }
+
+    /// Marks committed heap rows of one freshly-spilled table as local SST
+    /// residents. Temporary spill uses this narrower form because a durable
+    /// table may have changed since its last manifest publication.
+    pub(crate) fn evict_committed_table(&mut self, slot: usize) {
+        if !self.tables[slot].live || self.tables[slot].n_spill_ssts == 0 {
+            return;
+        }
+        let table = &mut self.tables[slot];
+        // The newest SST is the delta just written, and it carries every
+        // committed heap image selected for eviction.
+        let newest = (table.n_spill_ssts - 1) as u8;
+        for (_, state) in table.rows.iter_mut() {
+            if let Some(RowHome::Heap(loc)) = state.committed {
+                state.committed = Some(RowHome::Spilled {
+                    len: loc.len,
+                    sst: newest,
+                    commit_lsn: state.committed_lsn,
+                });
             }
+        }
+    }
+
+    pub(crate) fn release_table_histories(&mut self, slot: usize) {
+        for (_, state) in self.tables[slot].rows.iter_mut() {
+            state.history.prune(None);
+        }
+    }
+
+    pub(crate) fn clear_table_dirty_through(&mut self, slot: usize, generation: u64) {
+        if self.tables[slot].generation == generation {
+            self.tables[slot].dirty = false;
         }
     }
 
@@ -22494,7 +22960,7 @@ impl Storage {
                 *n += 1;
             }
             for child in 0..storage.table_count() {
-                if !storage.table(child).visible_to(txid) {
+                if !storage.relation_visible_to_current_session(child, txid) {
                     continue;
                 }
                 let child_def = storage.table_def(child, txid);
@@ -22529,7 +22995,7 @@ impl Storage {
         ) -> Result<(), SqlError> {
             let mut found = false;
             for child in 0..storage.table_count() {
-                if !storage.table(child).visible_to(txid) {
+                if !storage.relation_visible_to_current_session(child, txid) {
                     continue;
                 }
                 let Some(PartitionAttachment { parent, state, .. }) =
@@ -22561,10 +23027,10 @@ impl Storage {
     }
 
     /// Whether a relation has a direct partition or ordinary-inheritance
-    /// descendant in the transaction-visible catalog.
+    /// descendant visible to the current session and transaction.
     pub fn relation_has_descendants(&self, root: usize, txid: u32) -> bool {
         (0..self.table_count()).any(|child| {
-            self.table(child).visible_to(txid)
+            self.relation_visible_to_current_session(child, txid)
                 && (self
                     .table_def(child, txid)
                     .partition
@@ -22634,7 +23100,9 @@ impl Storage {
                 .copied()
                 .any(|parent| visit(storage, usize::from(parent), ancestor, txid, depth + 1))
         }
-        table != ancestor && visit(self, table, ancestor, txid, 0)
+        table != ancestor
+            && self.relation_visible_to_current_session(table, txid)
+            && visit(self, table, ancestor, txid, 0)
     }
 
     /// Finds the physical owner of a row identity emitted while scanning a
@@ -22937,6 +23405,15 @@ impl Storage {
             .any(|t| t.live && t.n_spill_ssts > 0 && t.rows.len() * 100 >= t.rows.capacity() * 50)
     }
 
+    pub(crate) fn temporary_map_pressure(&self) -> bool {
+        self.tables.iter().any(|table| {
+            table.live
+                && table.def.persistence == RelationPersistence::Temporary
+                && table.dirty
+                && table.rows.len() * 100 >= table.rows.capacity() * 50
+        })
+    }
+
     /// Starts an object flush before the resident safety window can fill.
     /// Published versions are then read through the immutable SST forest and
     /// the resident side chain is released.
@@ -22953,7 +23430,11 @@ impl Storage {
     /// A successful manifest publish made every resident historical image
     /// reachable through the table's installed versioned SST list.
     pub fn release_durable_histories(&mut self) {
-        for table in self.tables.iter_mut().filter(|table| table.live) {
+        for table in self
+            .tables
+            .iter_mut()
+            .filter(|table| table.live && table.def.persistence != RelationPersistence::Temporary)
+        {
             for (_, state) in table.rows.iter_mut() {
                 state.history.prune(None);
             }
@@ -23249,6 +23730,8 @@ impl Storage {
                 };
                 let Some(mut scratch) = spill
                     .value_scratch
+                    .as_ref()
+                    .expect("durable value indexes have reader scratch")
                     .iter()
                     .find_map(|candidate| candidate.try_borrow_mut().ok())
                 else {
@@ -23260,7 +23743,11 @@ impl Storage {
                 let scratch = &mut *scratch;
                 crate::store::ValueIndexReader::over(&mut scratch.roster, &mut scratch.data)
                     .probe(
-                        &mut *spill.blocks.borrow_mut(),
+                        &mut *spill
+                            .blocks
+                            .as_ref()
+                            .expect("value-index generations are durable")
+                            .borrow_mut(),
                         &handle,
                         hash,
                         |rowid, _, _| visit(rowid),
@@ -23359,6 +23846,8 @@ impl Storage {
         };
         let Some(mut scratch) = spill
             .value_scratch
+            .as_ref()
+            .expect("durable value indexes have reader scratch")
             .iter()
             .find_map(|candidate| candidate.try_borrow_mut().ok())
         else {
@@ -23372,7 +23861,11 @@ impl Storage {
             let mut callback_error = Ok(());
             crate::store::ValueIndexReader::over(roster, data)
                 .walk(
-                    &mut *spill.blocks.borrow_mut(),
+                    &mut *spill
+                        .blocks
+                        .as_ref()
+                        .expect("value-index generations are durable")
+                        .borrow_mut(),
                     &handle,
                     |_, rowid, _, key| {
                         if callback_error.is_ok()
@@ -24305,6 +24798,9 @@ impl Storage {
                 creating: true,
             }),
         )?;
+        if def.persistence == RelationPersistence::Temporary {
+            self.mark_temporary_transaction(txid);
+        }
         // Build the enforcers now (fallible pool acquire surfaces at CREATE, not
         // at commit); this transaction's inserts maintain them at commit.
         self.refresh_enforcers(slot)?;
@@ -24340,6 +24836,7 @@ impl Storage {
         self.tables[index].mark_dirty();
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
+        self.commit_extended_statistics_for_table(index);
     }
 
     /// Transactional drop: the table stays visible to every other transaction
@@ -24381,17 +24878,8 @@ impl Storage {
         self.tables[index].statistics_wal_dirty = false;
         self.commit_triggers_for_table(index);
         self.commit_policies_for_table(index);
-        for slot in 0..self.rules.len() {
-            if self.rules[slot].database == self.current_database
-                && self.rules[slot].definition.target == RuleTarget::Table(index as u16)
-                && matches!(
-                    self.rules[slot].ddl_state,
-                    CatalogDdlState::PendingDrop { .. }
-                )
-            {
-                self.commit_rule_drop(slot);
-            }
-        }
+        self.commit_extended_statistics_for_table(index);
+        self.commit_rules_for_table(index);
     }
 
     /// Rolls back an uncommitted CREATE, freeing the slot.
@@ -26197,13 +26685,19 @@ impl Storage {
     }
 
     pub fn sequence_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.sequences.iter().position(|s| {
+        let slot = self.sequences.iter().position(|s| {
             let definition = s.definition_for(txid);
             s.database == self.current_database
                 && s.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
-        })
+        });
+        if slot.is_some_and(|slot| {
+            self.sequence_for(slot, txid).persistence == RelationPersistence::Temporary
+        }) {
+            self.mark_temporary_transaction(txid);
+        }
+        slot
     }
 
     pub fn generated_sequence_slot(
@@ -26236,7 +26730,21 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         if let Some(schema) = qualifier {
+            if schema == "pg_temp" {
+                return self
+                    .temporary_schema()
+                    .ok()
+                    .and_then(|schema| self.sequence_slot(schema.as_str(), name, txid));
+            }
+            if schema.starts_with("pg_temp_") && !self.is_current_temporary_schema(schema) {
+                return None;
+            }
             return self.sequence_slot(schema, name, txid);
+        }
+        if let Ok(schema) = self.temporary_schema()
+            && let Some(found) = self.sequence_slot(schema.as_str(), name, txid)
+        {
+            return Some(found);
         }
         for entry in self.path.entries() {
             if let PathEntry::Schema(slot) = entry {
@@ -26257,15 +26765,19 @@ impl Storage {
 
     /// Registers a sequence as an uncommitted CREATE owned by `txid`. The caller
     /// has already validated options and checked the name is free.
-    pub fn create_sequence(
+    pub(crate) fn create_sequence(
         &mut self,
-        schema: SqlName,
-        name: SqlName,
-        spec: SeqSpec,
-        owner: Option<SequenceOwner>,
-        generator_for: Option<SequenceOwner>,
+        create: SequenceCreateSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
+        let SequenceCreateSpec {
+            schema,
+            name,
+            spec,
+            owner,
+            generator_for,
+            persistence,
+        } = create;
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
             (s.database == self.current_database
@@ -26307,6 +26819,7 @@ impl Storage {
             start_value: spec.start_value,
             cache: spec.cache,
             cycle: spec.cycle,
+            persistence,
             owner,
             generator_for,
             last_value: Cell::new(spec.start_value),
@@ -26320,6 +26833,9 @@ impl Storage {
             pending_dirty: Cell::new(false),
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        if persistence == RelationPersistence::Temporary {
+            self.mark_temporary_transaction(txid);
+        }
         Ok(new)
     }
 
@@ -26389,6 +26905,7 @@ impl Storage {
             spec: alteration.spec,
             owner: alteration.owner,
             generator_for: alteration.generator_for,
+            persistence: alteration.persistence,
             last_value,
             is_called,
             log_count: 0,
@@ -31895,11 +32412,14 @@ impl Storage {
         &self,
     ) -> impl Iterator<Item = (usize, usize, TriggerEnabled)> + '_ {
         self.partition_trigger_states.iter().filter_map(|state| {
-            state.present.then_some((
-                usize::from(state.trigger),
-                usize::from(state.table),
-                state.enabled,
-            ))
+            (state.present
+                && self.table_def(usize::from(state.table), 0).persistence
+                    != RelationPersistence::Temporary)
+                .then_some((
+                    usize::from(state.trigger),
+                    usize::from(state.table),
+                    state.enabled,
+                ))
         })
     }
 
@@ -32580,6 +33100,16 @@ impl Storage {
             self.extended_statistics[slot].ddl_state.commit_drop();
     }
 
+    fn commit_extended_statistics_for_table(&mut self, table: usize) {
+        for slot in 0..self.extended_statistics.len() {
+            if self.extended_statistics[slot].ddl_state != CatalogDdlState::Absent
+                && usize::from(self.extended_statistics[slot].table) == table
+            {
+                self.commit_extended_statistics_drop(slot);
+            }
+        }
+    }
+
     pub(crate) fn rollback_extended_statistics_drop(&mut self, slot: usize, txid: u32) {
         self.extended_statistics[slot].ddl_state =
             self.extended_statistics[slot].ddl_state.rollback_drop(txid);
@@ -32777,11 +33307,50 @@ impl Storage {
     }
 
     pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.indexes.iter().position(|index| {
+        let slot = self.indexes.iter().position(|index| {
             index.database == self.current_database
                 && index.visible_to(txid)
                 && index.schema.as_str() == schema
                 && index.name_for(txid).as_str() == name
+        });
+        if slot.is_some_and(|slot| {
+            self.index_table_slot_to(slot, txid).is_some_and(|table| {
+                self.table_def(table, txid).persistence == RelationPersistence::Temporary
+            })
+        }) {
+            self.mark_temporary_transaction(txid);
+        }
+        slot
+    }
+
+    /// Resolves an index through PostgreSQL's relation search order. Temporary
+    /// indexes share their table's virtual, session-local namespace.
+    pub(crate) fn resolve_index_slot(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        if let Some(schema) = schema {
+            if schema == "pg_temp" {
+                let temporary = self.temporary_schema().ok()?;
+                return self.index_slot(temporary.as_str(), name, txid);
+            }
+            if schema.starts_with("pg_temp_") && !self.is_current_temporary_schema(schema) {
+                return None;
+            }
+            return self.index_slot(schema, name, txid);
+        }
+        if let Ok(temporary) = self.temporary_schema()
+            && let Some(slot) = self.index_slot(temporary.as_str(), name, txid)
+        {
+            return Some(slot);
+        }
+        self.path.entries().iter().find_map(|entry| match entry {
+            PathEntry::Schema(slot) => {
+                self.index_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
+            }
+            PathEntry::Catalog => None,
         })
     }
 
@@ -36197,6 +36766,34 @@ impl Storage {
         }
         self.rules[slot].pending = None;
         self.rules[slot].ddl_state = self.rules[slot].ddl_state.commit_drop();
+    }
+
+    /// Rules are internal relation dependents. Session teardown drops a
+    /// temporary table directly rather than first staging every dependent, so
+    /// remove both present and transactionally dropped rules here.
+    fn commit_rules_for_table(&mut self, table: usize) {
+        for slot in 0..self.rules.len() {
+            let rule = self.rules[slot];
+            if rule.database != self.current_database
+                || rule.ddl_state == CatalogDdlState::Absent
+                || rule.definition.target != RuleTarget::Table(table as u16)
+            {
+                continue;
+            }
+            let subid = rule.definition.target.comment_subid();
+            for comment in self.comments.iter_mut() {
+                if comment.used
+                    && comment.database == Some(self.current_database)
+                    && comment.class == CommentClass::Rule
+                    && comment.name == rule.definition.name
+                    && comment.subid == subid
+                {
+                    *comment = CommentEntry::empty();
+                }
+            }
+            self.rules[slot].pending = None;
+            self.rules[slot].ddl_state = CatalogDdlState::Absent;
+        }
     }
 
     pub(crate) fn rollback_rule_drop(&mut self, slot: usize, txid: u32) {

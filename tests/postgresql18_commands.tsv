@@ -41,12 +41,12 @@ ALTER ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover typed rol
 ALTER ROUTINE	partial	90_routine_lifecycle.sql, 141_routine_attribute_evolution.sql, and aggregate extension dependencies in 111_extension_lifecycle.sql
 ALTER RULE	complete	tests/external/differential/122_rewrite_rules.sql
 ALTER SCHEMA	complete	37_schemas.sql, raw-wire lifecycle probe, and object-only WAL/checkpoint recovery
-ALTER SEQUENCE	partial	54_sequence.sql and 85_sequences.sql (options, ownership, rename/schema, dependent defaults, recovery; unlogged remains an object-native durability boundary)
+ALTER SEQUENCE	partial	54_sequence.sql, 85_sequences.sql, and 145_relation_persistence.sql (options, ownership, rename/schema, dependent defaults, typed logged/unlogged persistence, recovery)
 ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
 ALTER SYSTEM	complete	118_database_configuration.sql
-ALTER TABLE	partial	45_alter_column.sql, 125_replica_identity.sql, 132_ordinary_inheritance_alter.sql, 135_table_column_metadata.sql, 137_alter_table_control_plane.sql, 138_rewrite_rule_enablement.sql, 139_not_null_constraint_inheritance.sql, and 140_catalog_schema_evolution.sql cover typed metadata, duplicate-safe columns, clustering, typed-table membership, tablespace moves, durable rewrite-rule firing modes, and NOT NULL inheritance controls
+ALTER TABLE	partial	45_alter_column.sql, 125_replica_identity.sql, 132_ordinary_inheritance_alter.sql, 135_table_column_metadata.sql, 137_alter_table_control_plane.sql, 138_rewrite_rule_enablement.sql, 139_not_null_constraint_inheritance.sql, 140_catalog_schema_evolution.sql, and 145_relation_persistence.sql cover typed metadata, duplicate-safe columns, clustering, typed-table membership, tablespace moves, durable rewrite-rule firing modes, NOT NULL inheritance controls, and logged/unlogged transitions
 ALTER TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 ALTER TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql
 ALTER TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text_search.sql
@@ -66,7 +66,7 @@ CLUSTER	complete	tests/external/differential/124_cluster.sql and object-cold rec
 COMMENT	partial	59_comment.sql; typed routine, policy, statistics, role, foreign-data-wrapper, foreign-server, foreign-table, publication, subscription, access-method, and procedural-language identities
 COMMIT	complete	05_transactions.sql
 COMMIT PREPARED	complete	120_two_phase_transactions.sql
-COPY	complete	40_copy.sql
+COPY	complete	40_copy.sql plus temporary-relation COPY through psycopg, pgx, and pgJDBC
 CREATE ACCESS METHOD	partial	134_access_methods.sql; bounded table methods using heap_tableam_handler, transactional catalog/WAL/checkpoint/object recovery, and event-trigger identity; arbitrary native and index handlers reject explicitly
 CREATE AGGREGATE	complete	110_user_defined_aggregates.sql
 CREATE CAST	complete	117_cast_operator_catalog.sql
@@ -92,12 +92,12 @@ CREATE PUBLICATION	complete	84_publication.sql, typed descendant selection, priv
 CREATE ROLE	partial	83_roles_acl.sql, 100_role_credentials.sql, and 140_catalog_schema_evolution.sql cover attributes, SCRAM/MD5 credentials, aliases, initial memberships, and recovery
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	complete	37_schemas.sql and typed dynamic-utility checkpoint/cold-recovery coverage
-CREATE SEQUENCE	partial	54_sequence.sql (permanent sequences; temporary and unlogged variants remain object-native durability boundaries)
+CREATE SEQUENCE	partial	54_sequence.sql and 145_relation_persistence.sql (permanent, temporary, and unlogged variants with typed catalog and recovery boundaries)
 CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
-CREATE TABLE	partial	14_surface.sql, 135_table_column_metadata.sql, 136_like_metadata.sql, and 140_catalog_schema_evolution.sql
-CREATE TABLE AS	complete	52_create_table_as.sql
+CREATE TABLE	partial	14_surface.sql, 135_table_column_metadata.sql, 136_like_metadata.sql, 140_catalog_schema_evolution.sql, and 145_relation_persistence.sql (permanent, temporary, unlogged, inheritance, partitions, identity, and ON COMMIT)
+CREATE TABLE AS	complete	52_create_table_as.sql and 145_relation_persistence.sql cover permanent, temporary, unlogged, and ON COMMIT forms
 CREATE TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 CREATE TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql
 CREATE TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text_search.sql
@@ -184,7 +184,7 @@ ROLLBACK TO SAVEPOINT	complete	05_transactions.sql
 SAVEPOINT	complete	05_transactions.sql
 SECURITY LABEL	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 SELECT	complete	14_surface.sql
-SELECT INTO	complete	69_select_into.sql
+SELECT INTO	complete	69_select_into.sql and 145_relation_persistence.sql cover permanent and temporary persistence
 SET	complete	75_guc_mutation.sql and 119_transaction_configuration.sql
 SET CONSTRAINTS	complete	101_trigger_timing.sql
 SET ROLE	complete	83_roles_acl.sql

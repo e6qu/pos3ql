@@ -20,6 +20,10 @@ Architecture: [README.md](README.md). Naming: [docs/terminology.md](docs/termino
 5. **Logical replication.** Keep pgoutput, slot, and subscription work only where it preserves object-native performance; physical/binary-WAL replication remains deliberately unsupported.
 6. **Physical-demand execution.** Complete: every base-source path carries an opaque selected-column proof or an explicit full-row reason through joins, correlation, CTEs, materialization, sorting/grouping/window spill, set operations, and DML/`MERGE` sources.
 
+## Current SQL work
+
+`UPDATE`, conflict updates, and `MERGE` now share typed multi-column assignment sources: row constructors, per-element `DEFAULT`, and scalar row subqueries retain arity, cardinality, simultaneous old-row reads, and record shape through portals and recovery.
+
 ## Delivery order
 
 One large PR is open at a time; it is merged and `main` is refreshed before the next begins.

@@ -1221,6 +1221,7 @@ fn ungrouped_column<'e, 'a>(
         | Expr::Param(_)
         | Expr::DefaultMarker
         | Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
         | Expr::Exists(_)
         | Expr::ArraySubquery(_) => None,
         Expr::Unary { operand, .. }
@@ -1270,7 +1271,9 @@ fn ungrouped_column<'e, 'a>(
                 .or_else(|| lower.and_then(|e| ungrouped_column(e, group_by, scope, storage, txid)))
                 .or_else(|| upper.and_then(|e| ungrouped_column(e, group_by, scope, storage, txid)))
         }
-        Expr::Field { base, .. } => ungrouped_column(base, group_by, scope, storage, txid),
+        Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
+            ungrouped_column(base, group_by, scope, storage, txid)
+        }
         Expr::AnyAll { operand, array, .. } => first(&[operand, array]),
     }
 }

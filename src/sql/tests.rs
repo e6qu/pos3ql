@@ -6811,6 +6811,17 @@ fn quantified_row_subqueries_keep_set_types_and_null_semantics() {
     let output = run_with(
         &mut engine,
         &mut budget,
+        "SELECT ROW(1,2) < ANY (SELECT a, b FROM quantified_rows)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
         "SELECT r.a, r.b FROM quantified_rows AS r \
           WHERE r.* = ANY (SELECT x FROM quantified_rows AS x WHERE x.a = 1) \
           ORDER BY 1, 2",
@@ -31276,6 +31287,103 @@ fn merge_assignment_states_and_inheritance_selection_are_typed() {
             "{invalid}"
         );
     }
+}
+
+#[test]
+fn dml_row_assignments_are_simultaneous_and_subquery_typed() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dml_row_assignment (id integer PRIMARY KEY, a integer DEFAULT 7, b integer DEFAULT 8); \
+         INSERT INTO dml_row_assignment VALUES (1, 10, 20), (2, 30, 40); \
+         UPDATE dml_row_assignment SET (a, b) = (b, a) WHERE id = 1; \
+         UPDATE dml_row_assignment SET (a, b) = ROW(DEFAULT, DEFAULT) WHERE id = 2; \
+         UPDATE dml_row_assignment SET (a, b) = (SELECT 50, 60) WHERE id = 1; \
+         INSERT INTO dml_row_assignment VALUES (1, 0, 0) \
+           ON CONFLICT (id) DO UPDATE SET (a, b) = (excluded.b, excluded.a); \
+         CREATE TABLE dml_row_assignment_source (id integer, a integer, b integer); \
+         INSERT INTO dml_row_assignment_source VALUES (2, 70, 80); \
+         MERGE INTO dml_row_assignment AS target USING dml_row_assignment_source AS source \
+           ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET (a, b) = (source.b, source.a)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, a, b FROM dml_row_assignment ORDER BY id",
+        )),
+        ["1|0|0", "2|80|70"]
+    );
+    for (statement, sqlstate) in [
+        ("UPDATE dml_row_assignment SET (a, b) = (1)", "0A000"),
+        ("UPDATE dml_row_assignment SET (a, b) = (1, 2, 3)", "42601"),
+        ("UPDATE dml_row_assignment SET a = 1, a = 2", "42601"),
+        ("UPDATE dml_row_assignment SET (a, a) = (1, 2)", "42601"),
+        (
+            "UPDATE dml_row_assignment SET (a, b) = (SELECT 1, 2 UNION ALL SELECT 3, 4)",
+            "21000",
+        ),
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains(&format!("C{sqlstate}\0")),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn dml_row_subquery_assignments_survive_object_only_recovery() {
+    let mut config = test_config("dml-row-assignment-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("dml-row-assignment-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dml_row_assignment_recovery (id integer PRIMARY KEY, a integer, b integer); \
+         INSERT INTO dml_row_assignment_recovery VALUES (1, 10, 20); \
+         UPDATE dml_row_assignment_recovery SET (a, b) = (SELECT b, a) WHERE id = 1; \
+         SELECT id, a, b FROM dml_row_assignment_recovery",
+    );
+    assert!(
+        !String::from_utf8_lossy(&changed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    assert_eq!(data_rows(&changed), ["1|20|10"]);
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT id, a, b FROM dml_row_assignment_recovery",
+        )),
+        ["1|20|10"]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

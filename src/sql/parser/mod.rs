@@ -6256,6 +6256,117 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    /// Parses a DML `SET` list into its scalar execution form. A row target is
+    /// expanded here so every executor shares the same assignment semantics.
+    fn assignment_list(&mut self) -> Result<&'a [(&'a str, &'a Expr<'a>)], ParseError> {
+        let null = self.arena_expr(Expr::Null)?;
+        let mut assignments = [("", null); MAX_LIST];
+        let mut assigned = 0usize;
+        loop {
+            let mut names = [""; MAX_LIST];
+            let mut name_count = 0usize;
+            if self.eat_op("(")? {
+                loop {
+                    if name_count == MAX_LIST {
+                        return Err(self.limit("assignment target", MAX_LIST));
+                    }
+                    names[name_count] = self.col_ident("column name")?;
+                    name_count += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+            } else {
+                names[0] = self.col_ident("column name")?;
+                name_count = 1;
+            }
+            self.expect_op("=")?;
+
+            let mut values = [null; MAX_LIST];
+            let value_count = if name_count == 1 {
+                values[0] = self.expression(0)?;
+                1
+            } else if self.eat_ident("row")? {
+                self.expect_op("(")?;
+                self.assignment_row_values(&mut values)?
+            } else if self.eat_op("(")? {
+                if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
+                    let select = self.query_select()?;
+                    self.expect_op(")")?;
+                    let select = self
+                        .arena
+                        .alloc(select)
+                        .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                    let arity = u8::try_from(name_count)
+                        .map_err(|_| self.err_here("assignment target is too wide"))?;
+                    let record = self.arena_expr(Expr::RowSubquery { select, arity })?;
+                    for (index, value) in values.iter_mut().enumerate().take(name_count) {
+                        *value = self.arena_expr(Expr::RecordFieldIndex {
+                            base: record,
+                            index: index as u8,
+                        })?;
+                    }
+                    name_count
+                } else {
+                    self.assignment_row_values(&mut values)?
+                }
+            } else {
+                return Err(self.err_here(
+                    "source for a multiple-column assignment must be a row expression or sub-SELECT",
+                ));
+            };
+            if value_count != name_count {
+                if value_count > name_count {
+                    return Err(self.err_here("number of columns does not match number of values"));
+                }
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "number of columns does not match number of values"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            }
+            for (name, value) in names[..name_count].iter().zip(&values[..value_count]) {
+                if assignments[..assigned]
+                    .iter()
+                    .any(|(previous, _)| *previous == *name)
+                {
+                    return Err(self.err_here("multiple assignments to the same column"));
+                }
+                if assigned == MAX_LIST {
+                    return Err(self.limit("SET list", MAX_LIST));
+                }
+                assignments[assigned] = (*name, *value);
+                assigned += 1;
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&assignments[..assigned])
+    }
+
+    /// Parses the comma-separated body after a multi-column assignment's
+    /// opening parenthesis and consumes its closing parenthesis.
+    fn assignment_row_values(
+        &mut self,
+        values: &mut [&'a Expr<'a>; MAX_LIST],
+    ) -> Result<usize, ParseError> {
+        let mut count = 0usize;
+        loop {
+            if count == MAX_LIST {
+                return Err(self.limit("assignment source", MAX_LIST));
+            }
+            values[count] = self.expression(0)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(count)
+    }
+
     /// `ON CONFLICT [(columns) | ON CONSTRAINT name] DO {NOTHING | UPDATE SET a
     /// = e, ... [WHERE cond]}`.
     fn on_conflict(&mut self) -> Result<Option<OnConflict<'a>>, ParseError> {
@@ -6308,28 +6419,13 @@ impl<'a> Parser<'a> {
         } else {
             self.expect_ident("update")?;
             self.expect_ident("set")?;
-            let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-            let mut assigns: [(&'a str, &'a Expr<'a>); MAX_LIST] = [("", null_expr); MAX_LIST];
-            let mut na = 0;
-            loop {
-                if na == MAX_LIST {
-                    return Err(self.limit("assignments", MAX_LIST));
-                }
-                let col = self.col_ident("column name")?;
-                self.expect_op("=")?;
-                let value = self.expression(0)?;
-                assigns[na] = (col, value);
-                na += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
+            let assigns = self.assignment_list()?;
             let where_clause = if self.eat_ident("where")? {
                 Some(self.expression(0)?)
             } else {
                 None
             };
-            (Some(self.arena_slice(&assigns[..na])?), where_clause)
+            (Some(assigns), where_clause)
         };
         Ok(Some(OnConflict {
             target: self.arena_slice(&target[..nt])?,
@@ -6349,22 +6445,7 @@ impl<'a> Parser<'a> {
                 None
             };
         self.expect_ident("set")?;
-        let dummy: (&'a str, &'a Expr<'a>) = ("", &Expr::Null);
-        let mut assignments = [dummy; MAX_LIST];
-        let mut n = 0;
-        loop {
-            if n == MAX_LIST {
-                return Err(self.limit("SET list", MAX_LIST));
-            }
-            let col = self.col_ident("column name")?;
-            self.expect_op("=")?;
-            let value = self.expression(0)?;
-            assignments[n] = (col, value);
-            n += 1;
-            if !self.eat_op(",")? {
-                break;
-            }
-        }
+        let assignments = self.assignment_list()?;
         let from = if self.eat_ident("from")? {
             let fc = self.from_clause()?;
             Some(
@@ -6381,7 +6462,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Update(Update {
             table,
             alias,
-            assignments: self.arena_slice(&assignments[..n])?,
+            assignments,
             from,
             where_clause,
             returning,
@@ -6501,24 +6582,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("update")? {
             self.expect_ident("set")?;
-            let dummy: (&'a str, &'a Expr<'a>) = ("", &Expr::Null);
-            let mut assignments = [dummy; MAX_LIST];
-            let mut n = 0;
-            loop {
-                if n == MAX_LIST {
-                    return Err(self.limit("SET list", MAX_LIST));
-                }
-                let col = self.col_ident("column name")?;
-                self.expect_op("=")?;
-                assignments[n] = (col, self.expression(0)?);
-                n += 1;
-                if !self.eat_op(",")? {
-                    break;
-                }
-            }
-            Ok(MergeTargetAction::Update(
-                self.arena_slice(&assignments[..n])?,
-            ))
+            Ok(MergeTargetAction::Update(self.assignment_list()?))
         } else {
             self.expect_ident("delete")?;
             Ok(MergeTargetAction::Delete)

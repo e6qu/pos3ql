@@ -5368,6 +5368,12 @@ pub enum Expr<'a> {
     DefaultMarker,
     /// Scalar subquery: must yield one column, at most one row.
     Subquery(&'a Select<'a>),
+    /// A parenthesized subquery used as the right-hand side of a multi-column
+    /// DML assignment. It must yield `arity` columns and at most one row.
+    RowSubquery {
+        select: &'a Select<'a>,
+        arity: u8,
+    },
     /// `expression [NOT] IN (SELECT ...)`.
     InSubquery {
         operand: &'a Expr<'a>,
@@ -5408,6 +5414,13 @@ pub enum Expr<'a> {
     Field {
         base: &'a Expr<'a>,
         field: &'a str,
+    },
+    /// An ordinal field of the record yielded by a multi-column DML subquery.
+    /// Keeping the ordinal avoids exposing select-list labels as assignment
+    /// semantics.
+    RecordFieldIndex {
+        base: &'a Expr<'a>,
+        index: u8,
     },
     /// `t.*` in an expression position: the table's typed composite row.
     WholeRow(&'a str),
@@ -5551,6 +5564,7 @@ impl Expr<'_> {
             | Expr::RoutineParam { .. }
             | Expr::Param(_)
             | Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
@@ -5614,7 +5628,7 @@ impl Expr<'_> {
                     && lower.is_none_or(|e| e.is_constant())
                     && upper.is_none_or(|e| e.is_constant())
             }
-            Expr::Field { base, .. } => base.is_constant(),
+            Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => base.is_constant(),
             Expr::AnyAll { operand, array, .. } => operand.is_constant() && array.is_constant(),
         }
     }
@@ -5643,7 +5657,8 @@ impl Expr<'_> {
             | Expr::Cast { operand, .. }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
-            | Expr::Field { base: operand, .. } => operand.contains_call(),
+            | Expr::Field { base: operand, .. }
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.contains_call(),
             Expr::Slice { base, lower, upper } => {
                 base.contains_call()
                     || lower.is_some_and(|e| e.contains_call())
@@ -5687,6 +5702,7 @@ impl Expr<'_> {
             // A subquery-bearing default is rejected elsewhere; treat it as
             // non-foldable to be safe.
             Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
@@ -5699,6 +5715,7 @@ impl Expr<'_> {
     pub fn contains_subquery(&self) -> bool {
         match self {
             Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
@@ -5721,7 +5738,8 @@ impl Expr<'_> {
             | Expr::Cast { operand, .. }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
-            | Expr::Field { base: operand, .. } => operand.contains_subquery(),
+            | Expr::Field { base: operand, .. }
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.contains_subquery(),
             Expr::Slice { base, lower, upper } => {
                 base.contains_subquery()
                     || lower.is_some_and(|e| e.contains_subquery())
@@ -5803,6 +5821,7 @@ impl Expr<'_> {
             | Expr::Param(_)
             | Expr::DefaultMarker
             | Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
@@ -5811,7 +5830,8 @@ impl Expr<'_> {
             | Expr::Cast { operand, .. }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
-            | Expr::Field { base: operand, .. } => operand.find_function(matches),
+            | Expr::Field { base: operand, .. }
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.find_function(matches),
             Expr::Slice { base, lower, upper } => base
                 .find_function(matches)
                 .or_else(|| lower.and_then(|e| e.find_function(matches)))
@@ -5881,6 +5901,7 @@ impl Expr<'_> {
             | Expr::Param(_)
             | Expr::DefaultMarker
             | Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
@@ -5889,7 +5910,8 @@ impl Expr<'_> {
             | Expr::Cast { operand, .. }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
-            | Expr::Field { base: operand, .. } => operand.for_each_column(f),
+            | Expr::Field { base: operand, .. }
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.for_each_column(f),
             Expr::Slice { base, lower, upper } => {
                 base.for_each_column(f);
                 if let Some(e) = lower {
@@ -5973,6 +5995,7 @@ impl Expr<'_> {
             | Expr::RoutineParam { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
@@ -5981,7 +6004,8 @@ impl Expr<'_> {
             | Expr::Cast { operand, .. }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
-            | Expr::Field { base: operand, .. } => operand.for_each_column_reference(f),
+            | Expr::Field { base: operand, .. }
+            | Expr::RecordFieldIndex { base: operand, .. } => operand.for_each_column_reference(f),
             Expr::Slice { base, lower, upper } => {
                 base.for_each_column_reference(f);
                 if let Some(expression) = lower {

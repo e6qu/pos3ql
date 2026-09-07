@@ -48057,6 +48057,7 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
             column(None, name)
         }
         Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
@@ -48077,6 +48078,7 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
         | Expr::Collate { operand, .. }
         | Expr::IsNull { operand, .. }
         | Expr::Field { base: operand, .. }
+        | Expr::RecordFieldIndex { base: operand, .. }
         | Expr::Subscript { base: operand, .. } => validate_copy_predicate(operand, def),
         Expr::Binary { left, right, .. }
         | Expr::Match {
@@ -51622,7 +51624,7 @@ impl<'d> MergeLookup<'d, '_> {
 }
 
 fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
-    expression: &Expr<'a>,
+    expression: &'a Expr<'a>,
     storage: &Storage,
     txid: u32,
     seq_session: &crate::sql::guc::SeqSession,
@@ -51631,11 +51633,15 @@ fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
     row: &R,
 ) -> Result<Datum<'a>, SqlError> {
     let value = {
+        let expressions = [Some(expression)];
+        let subs =
+            super::query::subquery_hooks_outer(&expressions, storage, txid, arena, params, row)?;
         let catalog = super::query::storage_catalog(storage, arena, txid);
         let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             sequences: Some(&sequences),
+            subs: Some(&subs),
             ..NO_HOOKS
         };
         eval_full(expression, arena, params, row, &hooks)?
@@ -55968,6 +55974,13 @@ pub(crate) fn update<'a>(
                 statement.table.name
             ));
         };
+        if targets[..i].contains(&column) {
+            return sql_fail(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "multiple assignments to the same column \"{}\"",
+                name
+            ));
+        }
         targets[i] = column;
         updated_columns |= 1u64 << column;
     }
@@ -56091,9 +56104,18 @@ pub(crate) fn update<'a>(
         subquery_expressions[subquery_expression_count] = Some(expression);
         subquery_expression_count += 1;
     }
-    for (_, expression) in statement.assignments {
-        subquery_expressions[subquery_expression_count] = Some(*expression);
-        subquery_expression_count += 1;
+    let mut assignment_correlated = [false; MAX_COLUMNS];
+    for (index, (_, expression)) in statement.assignments.iter().enumerate() {
+        assignment_correlated[index] = match super::query::expression_has_correlated_subquery(
+            expression, storage, txn.txid, arena,
+        ) {
+            Ok(correlated) => correlated,
+            Err(error) => return sql_fail(error),
+        };
+        if !assignment_correlated[index] {
+            subquery_expressions[subquery_expression_count] = Some(*expression);
+            subquery_expression_count += 1;
+        }
     }
     let subs = match super::query::subquery_hooks(
         &subquery_expressions[..subquery_expression_count],
@@ -56394,8 +56416,23 @@ pub(crate) fn update<'a>(
                                 );
                                 let catalog =
                                     super::query::storage_catalog(storage, arena, txn.txid);
+                                let local_subs;
+                                let active_subs = if assignment_correlated[a] {
+                                    let expressions = [Some(*expression)];
+                                    local_subs = super::query::subquery_hooks_outer(
+                                        &expressions,
+                                        storage,
+                                        txn.txid,
+                                        arena,
+                                        params,
+                                        combined,
+                                    )?;
+                                    &local_subs
+                                } else {
+                                    &subs
+                                };
                                 let hooks = super::eval::EvalHooks {
-                                    subs: Some(&subs),
+                                    subs: Some(active_subs),
                                     catalog: Some(&catalog),
                                     sequences: Some(&sequences),
                                     ..super::eval::NO_HOOKS
@@ -56456,8 +56493,26 @@ pub(crate) fn update<'a>(
                     }
                     let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
                     let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let local_subs;
+                    let active_subs = if assignment_correlated[a] {
+                        let expressions = [Some(*expression)];
+                        local_subs = match super::query::subquery_hooks_outer(
+                            &expressions,
+                            storage,
+                            txn.txid,
+                            arena,
+                            params,
+                            &context,
+                        ) {
+                            Ok(subs) => subs,
+                            Err(error) => return sql_fail(error),
+                        };
+                        &local_subs
+                    } else {
+                        &subs
+                    };
                     let hooks = super::eval::EvalHooks {
-                        subs: Some(&subs),
+                        subs: Some(active_subs),
                         catalog: Some(&catalog),
                         sequences: Some(&seq),
                         ..super::eval::NO_HOOKS

@@ -2966,7 +2966,8 @@ pub fn infer_type_res(
         // body is resolved against storage only at execution); an array-from-
         // subquery is likewise unknown here. Both carry their real type in the
         // pre-evaluated datum.
-        Expr::Subquery(_) | Expr::ArraySubquery(_) => (oid::UNKNOWN, -2),
+        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) => (oid::UNKNOWN, -2),
+        Expr::RecordFieldIndex { .. } => (oid::UNKNOWN, -2),
         // `x IN (subquery)` and EXISTS are predicates: their result is boolean.
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {
             of(ColType::Bool)

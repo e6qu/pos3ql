@@ -671,6 +671,7 @@ fn collect_subqueries<'a>(
     if matches!(
         expression,
         Expr::Subquery(_)
+            | Expr::RowSubquery { .. }
             | Expr::InSubquery { .. }
             | Expr::QuantifiedSubquery { .. }
             | Expr::Exists(_)
@@ -908,7 +909,7 @@ pub(crate) fn walk_children<'a>(
             }
             Ok(())
         }
-        Expr::Field { base, .. } => f(base),
+        Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => f(base),
         _ => Ok(()),
     }
 }
@@ -1236,6 +1237,30 @@ fn eval_subquery_nodes<'a>(
     let (mut n_scalars, mut n_lists) = (0, 0);
     for node in nodes.iter().flatten() {
         match node {
+            Expr::RowSubquery { select, arity } => {
+                let (values, _, witness) = run_row_subquery(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    depth,
+                    outer,
+                    *arity as usize,
+                )?;
+                if values.len() > 1 {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
+                        "more than one row returned by a subquery used as an expression"
+                    ));
+                }
+                scalars_tmp[n_scalars] = (
+                    *node as *const _,
+                    values.first().copied().unwrap_or(Datum::Null),
+                    witness,
+                );
+                n_scalars += 1;
+            }
             Expr::Subquery(select) => {
                 if storage.spill_attached() {
                     let (value, witness) = streaming_scalar_subquery(
@@ -1502,6 +1527,7 @@ fn subquery_node_correlated<'a>(
 ) -> Result<bool, SqlError> {
     let select = match node {
         Expr::Subquery(s)
+        | Expr::RowSubquery { select: s, .. }
         | Expr::InSubquery { select: s, .. }
         | Expr::QuantifiedSubquery { select: s, .. }
         | Expr::Exists(s)
@@ -1799,6 +1825,30 @@ pub(super) fn merge_correlated<'a, 'b>(
     }
     for node in correlated {
         match node {
+            Expr::RowSubquery { select, arity } => {
+                let (values, _, witness) = run_row_subquery(
+                    select,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    SUBQUERY_DEPTH,
+                    Some(outer),
+                    *arity as usize,
+                )?;
+                if values.len() > 1 {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::CARDINALITY_VIOLATION,
+                        "more than one row returned by a subquery used as an expression"
+                    ));
+                }
+                scalars[ns] = (
+                    *node as *const _,
+                    values.first().copied().unwrap_or(Datum::Null),
+                    witness,
+                );
+                ns += 1;
+            }
             Expr::Subquery(select) => {
                 if storage.spill_attached() {
                     let (value, witness) = streaming_scalar_subquery(
@@ -2207,6 +2257,80 @@ fn catalog_type_witness(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_scalar_record_subquery<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    outer: Option<&dyn ColumnLookup<'a>>,
+    row_arity: usize,
+) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    let witness = row_subquery_witness(select, storage, txid, arena, outer)?;
+    let Datum::Record(witness_fields) = witness else {
+        unreachable!("row subquery witness is a record")
+    };
+    if witness_fields.len() < row_arity {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "subquery has too few columns"
+        ));
+    }
+    if witness_fields.len() > row_arity {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "subquery has too many columns"
+        ));
+    }
+    let mut value = None;
+    select_into_rows(
+        storage,
+        txid,
+        select,
+        arena,
+        params,
+        outer,
+        None,
+        &mut |row| {
+            if row.len() != row_arity {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "subquery changed its projected column count"
+                ));
+            }
+            if value.is_some() {
+                return Err(sql_err!(
+                    sqlstate::CARDINALITY_VIOLATION,
+                    "more than one row returned by a subquery used as an expression"
+                ));
+            }
+            let mut fields = [RecordField {
+                name: "",
+                type_oid: 0,
+                value: Datum::Null,
+            }; MAX_PROJ];
+            for (column, field_value) in row.iter().copied().enumerate() {
+                fields[column] = RecordField {
+                    name: witness_fields[column].name,
+                    type_oid: witness_fields[column].type_oid,
+                    value: crate::sql::exec::detach_routine_datum(field_value, arena)?,
+                };
+            }
+            let fields = arena
+                .alloc_slice_copy(&fields[..row_arity])
+                .map_err(|_| arena_full())?;
+            value = Some(Datum::Record(fields));
+            Ok(())
+        },
+    )?;
+    let output = match value {
+        Some(value) => arena.alloc_slice_copy(&[value]).map_err(|_| arena_full())?,
+        None => &[][..],
+    };
+    Ok((output, false, witness))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_record_subquery<'a>(
     select: &'a Select<'a>,
     storage: &'a Storage,
@@ -2294,6 +2418,37 @@ fn run_record_subquery<'a>(
         },
     )?;
     Ok((&*output, false, witness))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_row_subquery<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    depth: u32,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    row_arity: usize,
+) -> Result<(&'a [Datum<'a>], bool, Datum<'a>), SqlError> {
+    if depth == 0 {
+        return Err(sql_err!(
+            sqlstate::STATEMENT_TOO_COMPLEX,
+            "subqueries nested too deeply"
+        ));
+    }
+    if let Some(tree) = select.set_body {
+        let (values, saw_null, witness) =
+            run_set_subquery(tree, select, storage, txid, arena, params, row_arity)?;
+        if values.len() > 1 {
+            return Err(sql_err!(
+                sqlstate::CARDINALITY_VIOLATION,
+                "more than one row returned by a subquery used as an expression"
+            ));
+        }
+        return Ok((values, saw_null, witness));
+    }
+    run_scalar_record_subquery(select, storage, txid, arena, params, outer, row_arity)
 }
 
 /// Executes a subquery to a value list: exactly one select item, full
@@ -3005,10 +3160,8 @@ fn subquery_hooks_with_outer<'a>(
     })
 }
 
-/// Copies a subquery result through the projected-row codec so no value keeps
-/// borrowing catalog storage after the read phase. DML can then consume the
-/// detached result and mutably update storage without weakening provenance.
+/// Detaches a subquery result before DML mutates storage. Records retain their
+/// typed fields instead of being flattened through the scalar row codec.
 fn detach_subquery_datum<'a>(value: Datum<'_>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-    Ok(crate::sql::exec::decode_projected_pub(encoded, 0))
+    crate::sql::exec::detach_routine_datum(value, arena)
 }

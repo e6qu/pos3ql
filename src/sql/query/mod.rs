@@ -382,11 +382,11 @@ pub(crate) use plan::join_order;
 use plan::{postpone_cost, reorder_qual, simplify_qual, where_passes};
 
 mod subquery;
-pub(crate) use subquery::expression_has_correlated_subquery;
 use subquery::{
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, merge_correlated,
     prepare_outer_subqueries, subquery_witness,
 };
+pub(crate) use subquery::{expression_has_correlated_subquery, subquery_hooks_outer};
 pub use subquery::{prepare_subqueries, subquery_hooks};
 pub(crate) use subquery::{type_witness, walk_children};
 
@@ -4378,6 +4378,7 @@ fn rewrite_grouped_expr<'a>(
         | Expr::DefaultMarker
         // Subqueries evaluate through their own hooks, not the group.
         | Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
         | Expr::Exists(_)
         | Expr::ArraySubquery(_) => Ok(e),
         Expr::RoutineParam {
@@ -4592,6 +4593,9 @@ fn rewrite_grouped_expr<'a>(
             upper: upper.map(&rewrite).transpose()?,
         }),
         Expr::Field { base, field } => alloc(Expr::Field { base: rewrite(base)?, field }),
+        Expr::RecordFieldIndex { base, index } => {
+            alloc(Expr::RecordFieldIndex { base: rewrite(base)?, index: *index })
+        }
         Expr::AnyAll { operand, operator, array, all } => alloc(Expr::AnyAll {
             operand: rewrite(operand)?,
             operator: *operator,

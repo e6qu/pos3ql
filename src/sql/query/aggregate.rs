@@ -335,6 +335,7 @@ enum AggKind {
     /// `array_agg(expr [ORDER BY ...])`: buffers every value (NULLs kept),
     /// optionally sorted / DISTINCT, then builds an array.
     ArrayAgg,
+    XmlAgg,
     /// `json_agg`/`jsonb_agg(expr [ORDER BY ...])`: buffers values, then
     /// serializes them to a JSON array. `star` distinguishes json vs jsonb.
     JsonAgg {
@@ -775,6 +776,7 @@ impl<'a> AggState<'a> {
             "bit_xor" => AggKind::BitXor,
             "string_agg" => AggKind::StringAgg,
             "array_agg" => AggKind::ArrayAgg,
+            "xmlagg" => AggKind::XmlAgg,
             "json_agg" => AggKind::JsonAgg {
                 jsonb: false,
                 absent: false,
@@ -887,7 +889,7 @@ impl<'a> AggState<'a> {
         if !order_by.is_empty()
             && matches!(
                 self.kind,
-                AggKind::StringAgg | AggKind::ArrayAgg | AggKind::JsonAgg { .. }
+                AggKind::StringAgg | AggKind::ArrayAgg | AggKind::XmlAgg | AggKind::JsonAgg { .. }
             )
         {
             if *distinct {
@@ -1113,7 +1115,10 @@ impl<'a> AggState<'a> {
             self.push_ordered(enc, arena)?;
             return Ok(());
         }
-        if matches!(self.kind, AggKind::ArrayAgg | AggKind::JsonAgg { .. }) {
+        if matches!(
+            self.kind,
+            AggKind::ArrayAgg | AggKind::XmlAgg | AggKind::JsonAgg { .. }
+        ) {
             if args.len() != 1 {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
@@ -1548,6 +1553,7 @@ impl<'a> AggState<'a> {
             | AggKind::PercentileDisc
             | AggKind::Mode
             | AggKind::ArrayAgg
+            | AggKind::XmlAgg
             | AggKind::JsonAgg { .. }
             | AggKind::JsonObjectAgg { .. }
             | AggKind::Corr
@@ -1930,6 +1936,24 @@ impl<'a> AggState<'a> {
         if self.kind == AggKind::ArrayAgg {
             return self.finish_array_agg(arena, catalog);
         }
+        if self.kind == AggKind::XmlAgg {
+            let values = self.collect_agg_values(arena, catalog)?;
+            if values.is_empty() {
+                return Ok(Datum::Null);
+            }
+            for value in values {
+                if !matches!(value, Datum::Null | Datum::Xml(_)) {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "xmlagg argument must be xml"
+                    ));
+                }
+            }
+            let text = arena
+                .alloc_str_display(XmlAggregateDisplay(values))
+                .map_err(|_| arena_full())?;
+            return Ok(Datum::Xml(text));
+        }
         if let AggKind::JsonAgg { jsonb, .. } = self.kind {
             return self.finish_json_agg(jsonb, arena, catalog);
         }
@@ -2069,9 +2093,10 @@ impl<'a> AggState<'a> {
             AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => Datum::Null,
             // Handled by `finish_array_agg` / `finish_json_agg` before this
             // match.
-            AggKind::ArrayAgg | AggKind::JsonAgg { .. } | AggKind::JsonObjectAgg { .. } => {
-                Datum::Null
-            }
+            AggKind::ArrayAgg
+            | AggKind::XmlAgg
+            | AggKind::JsonAgg { .. }
+            | AggKind::JsonObjectAgg { .. } => Datum::Null,
         })
     }
 
@@ -2362,5 +2387,18 @@ impl<'a> AggState<'a> {
             }
             Ok(unsafe { core::slice::from_raw_parts(self.vals, self.vals_len) })
         }
+    }
+}
+
+struct XmlAggregateDisplay<'a>(&'a [Datum<'a>]);
+
+impl core::fmt::Display for XmlAggregateDisplay<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for value in self.0 {
+            if let Datum::Xml(text) = value {
+                f.write_str(crate::sql::xml::without_declaration(text))?;
+            }
+        }
+        Ok(())
     }
 }

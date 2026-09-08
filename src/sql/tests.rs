@@ -60,6 +60,326 @@ fn foreign_data_catalogs_are_typed_transactional_and_visible() {
 }
 
 #[test]
+fn sql_xml_type_constructors_and_xpath_are_typed() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_typeof('<a/>'::xml), '<a/>'::xml::text; \
+         SELECT xmlparse(content 'a<b/>c'), xmlparse(document '<a/>'); \
+         SELECT '<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>'::xml, ('<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>'::xml)::text, '<?xml version=\"1.0\" standalone=\"yes\"?><b/>'::xml, '<?xml version=\"1.0\" encoding=\"UTF-8\"?><c/>'::xml; \
+         SELECT xmlelement(name foo, xmlattributes(1 AS id, 'x&y' AS label), 'a<b', '<z/>'::xml); \
+         SELECT xmlforest(1 AS a, NULL AS b, 'x&y' AS c); \
+         SELECT xmlconcat('<?xml version=\"1.0\"?><a/>'::xml, '<b/>'::xml); \
+         SELECT xmlpi(name php, 'echo <x>'), xmlroot('<a/>'::xml, version '1.1', standalone yes), xmlcomment('a < b'); \
+         SELECT xmlexists('/a/b' passing by ref ('<a><b/></a>'::xml)); \
+         SELECT xpath('/a/b/@id', '<a><b id=\"x\"/></a>'::xml)::text, xpath_exists('//b', '<a><b/></a>'::xml); \
+         SELECT xml_is_well_formed('<a/><b/>'), xml_is_well_formed_document('<a/><b/>'), xml_is_well_formed_content('<a/><b/>')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "xml|<a/>",
+            "a<b/>c|<a/>",
+            "<a/>|<?xml version=\"1.0\" encoding=\"UTF-8\"?><a/>|<?xml version=\"1.0\" standalone=\"yes\"?><b/>|<c/>",
+            "<foo id=\"1\" label=\"x&amp;y\">a&lt;b<z/></foo>",
+            "<a>1</a><c>x&amp;y</c>",
+            "<a/><b/>",
+            "<?php echo <x>?>|<?xml version=\"1.1\" standalone=\"yes\"?><a/>|<!--a < b-->",
+            "t",
+            "{x}|t",
+            "t|f|t",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn xmltable_and_xmlagg_cover_relational_execution() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM XMLTABLE('/rows/row' PASSING ('<rows><row id=\"1\"><name>A</name></row><row id=\"2\"><name>B</name></row></rows>'::xml) COLUMNS ord FOR ORDINALITY, id int PATH '@id', name text, raw xml PATH '.'); \
+         SELECT xmlagg(x ORDER BY n) FROM (VALUES (2,'<b/>'::xml),(1,'<a/>'::xml),(3,NULL::xml)) AS t(n,x)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1|1|A|<row id=\"1\"><name>A</name></row>",
+            "2|2|B|<row id=\"2\"><name>B</name></row>",
+            "<a/><b/>",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn sql_xml_namespaces_and_xpath_scalar_results_match_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT xpath('/q:rows/q:row/@id', '<p:rows xmlns:p=\"urn:x\"><p:row id=\"7\"/></p:rows>'::xml, ARRAY[ARRAY['q','urn:x']])::text; \
+         SELECT xpath_exists('/q:rows/q:missing', '<p:rows xmlns:p=\"urn:x\"><p:row/></p:rows>'::xml, ARRAY[ARRAY['q','urn:x']]); \
+         SELECT xpath('/q:a', '<a/>'::xml, ARRAY[ARRAY['q','urn:missing']])::text, xpath('/q:a', '<x:a xmlns:x=\"urn:y\"/>'::xml, ARRAY[ARRAY['q','urn:x'],ARRAY['q','urn:y']])::text; \
+         SELECT xpath_exists('false()', '<a/>'::xml), xmlexists('false()' PASSING BY REF ('<a/>'::xml)); \
+         SELECT xpath('string(/a/b)', '<a><b>x&amp;y</b></a>'::xml)::text, xpath('number(7)', '<a/>'::xml)::text; \
+         SELECT * FROM XMLTABLE(XMLNAMESPACES('urn:x' AS q), '/q:rows/q:row' PASSING ('<p:rows xmlns:p=\"urn:x\"><p:row id=\"7\"><p:name>A</p:name></p:row></p:rows>'::xml) COLUMNS id int PATH '@id', name text PATH 'q:name')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "{7}",
+            "f",
+            "{}|{\"<x:a xmlns:x=\\\"urn:y\\\"/>\"}",
+            "t|t",
+            "{x&amp;y}|{7}",
+            "7|A",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn sql_xml_validation_and_xmloption_reject_invalid_states() {
+    let (mut engine, mut budget) = test_engine();
+    let validation = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT
+           xml_is_well_formed_document('<?xml version=\"1.0\"?><a/>'),
+           xml_is_well_formed_document('<?xml version junk=\"1.0\"?><a/>'),
+           xml_is_well_formed_document('<!DOCTYPE a [<!ENTITY declared \"ok\">]><a>&declared;</a>'),
+           xml_is_well_formed_document('<!DOCTYPE a [<!ENTITY declared \"ok\">]><a>&missing;</a>'),
+           xml_is_well_formed_content('<a/><b/>'),
+           xml_is_well_formed_document('<a/><b/>'),
+           xml_is_well_formed_document('<a duplicate=\"1\" duplicate=\"2\"/>'),
+           xml_is_well_formed_document('<a><!--bad--comment--></a>')",
+    );
+    assert_eq!(
+        data_rows(&validation),
+        ["t|f|t|f|t|f|f|f"],
+        "{}",
+        String::from_utf8_lossy(&validation),
+    );
+
+    let mut guc = GucState::new();
+    let document_mode = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SET xmloption = document; SHOW xmloption; SELECT '<a/>'::xml; SELECT '<a/><b/>'::xml",
+        1 << 18,
+        &mut guc,
+    );
+    assert_eq!(data_rows(&document_mode), ["document", "<a/>"]);
+    assert!(
+        String::from_utf8_lossy(&document_mode).contains("2200M"),
+        "{}",
+        String::from_utf8_lossy(&document_mode),
+    );
+    let content_mode = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SET xmloption = content; SELECT '<a/><b/>'::xml",
+        1 << 18,
+        &mut guc,
+    );
+    assert_eq!(data_rows(&content_mode), ["<a/><b/>"]);
+
+    let arena = Arena::new(&mut budget, "xml binary input", 1 << 16).unwrap();
+    let binary = engine
+        .decode_binary_parameter(crate::sql::types::oid::XML, b"<binary/>", &arena, 0)
+        .unwrap();
+    assert_eq!(binary, Datum::Xml("<binary/>"));
+    assert!(
+        engine
+            .decode_binary_parameter(crate::sql::types::oid::XML, b"<broken>", &arena, 0)
+            .is_err()
+    );
+}
+
+#[test]
+fn sql_xml_catalogs_expose_postgresql_type_routine_and_aggregate_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, typname, typtype, typcategory, typelem, typarray
+           FROM pg_type WHERE oid IN (142, 143) ORDER BY oid;
+         SELECT oid, proname, prorettype, proargtypes, pronargdefaults,
+                proretset, provolatile, proisstrict, prokind
+           FROM pg_proc
+          WHERE oid IN (2895, 2900, 2901, 2931, 2932, 3049, 3050, 3051, 3052, 3053)
+          ORDER BY oid;
+         SELECT aggfnoid, aggkind, aggnumdirectargs, aggtransfn,
+                aggtranstype, agginitval
+           FROM pg_aggregate WHERE aggfnoid = 'xmlagg'::regproc",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "142|xml|b|U|0|143",
+            "143|_xml|b|A|142|0",
+            "2895|xmlcomment|142|25|0|f|i|t|f",
+            "2900|xmlconcat2|142|142 142|0|f|i|f|f",
+            "2901|xmlagg|142|142|0|f|i|f|a",
+            "2931|xpath|143|25 142 1009|0|f|i|t|f",
+            "2932|xpath|143|25 142|0|f|i|t|f",
+            "3049|xpath_exists|16|25 142 1009|0|f|i|t|f",
+            "3050|xpath_exists|16|25 142|0|f|i|t|f",
+            "3051|xml_is_well_formed|16|25|0|f|s|t|f",
+            "3052|xml_is_well_formed_document|16|25|0|f|i|t|f",
+            "3053|xml_is_well_formed_content|16|25|0|f|i|t|f",
+            "xmlagg|n|0|xmlconcat2|142|NULL",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn sql_xml_crosses_dml_stored_query_and_object_recovery_boundaries() {
+    let mut config = test_config("sql-xml-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.max_tables = 16;
+    config.object_store_namespace = format!("sql-xml-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE xml_documents (
+             id integer PRIMARY KEY,
+             document xml NOT NULL CHECK (xml_is_well_formed_document(document::text)),
+             fragments xml[],
+             serialized text GENERATED ALWAYS AS (document::text) STORED
+         );
+         INSERT INTO xml_documents(id, document, fragments) VALUES
+           (1, '<item name=\"alpha\"><value>10</value></item>',
+               ARRAY['<a/>'::xml, NULL, '<b>two</b>'::xml]);
+         CREATE VIEW xml_document_view AS
+           SELECT id, xpath_exists('/item/value', document) AS has_value,
+                  XMLSERIALIZE(DOCUMENT document AS text) AS rendered
+             FROM xml_documents;
+         CREATE MATERIALIZED VIEW xml_document_materialized AS
+           SELECT id, xpath('/item/@name', document)::text AS names
+             FROM xml_documents;
+         CREATE TABLE xml_targets(id integer PRIMARY KEY, name text, payload xml);
+         INSERT INTO xml_targets
+           SELECT id, name, payload FROM XMLTABLE(
+             '/rows/row' PASSING ('<rows><row id=\"1\"><name>first</name><payload><old/></payload></row><row id=\"2\"><name>second</name><payload><new/></payload></row></rows>'::xml)
+             COLUMNS id integer PATH '@id', name text PATH 'name', payload xml PATH 'payload/*');
+         UPDATE xml_targets AS target SET name = source.name
+           FROM XMLTABLE('/rows/row' PASSING ('<rows><row id=\"1\"><name>updated</name></row></rows>'::xml)
+             COLUMNS id integer PATH '@id', name text PATH 'name') AS source
+          WHERE target.id = source.id;
+         DELETE FROM xml_targets AS target USING
+           XMLTABLE('/rows/row' PASSING ('<rows><row id=\"2\"/></rows>'::xml)
+             COLUMNS id integer PATH '@id') AS source
+          WHERE target.id = source.id;
+         MERGE INTO xml_targets AS target USING
+           XMLTABLE('/rows/row' PASSING ('<rows><row id=\"1\"><name>merged</name></row><row id=\"3\"><name>third</name></row></rows>'::xml)
+             COLUMNS id integer PATH '@id', name text PATH 'name') AS source
+           ON target.id = source.id
+           WHEN MATCHED THEN UPDATE SET name = source.name
+           WHEN NOT MATCHED THEN INSERT (id, name, payload) VALUES (source.id, source.name, '<inserted/>'::xml);
+         CREATE TABLE xml_table_copy AS
+           SELECT * FROM XMLTABLE('/rows/row' PASSING ('<rows><row id=\"9\"><name>copied</name></row></rows>'::xml)
+             COLUMNS id integer PATH '@id', name text PATH 'name');
+         CREATE FUNCTION xml_first_name(input xml) RETURNS text LANGUAGE plpgsql AS
+           'DECLARE found text; BEGIN
+              SELECT name INTO found FROM XMLTABLE(''/item'' PASSING input COLUMNS name text PATH ''@name'');
+              RETURN found;
+            END';
+         PREPARE xml_prepared(xml) AS SELECT xpath_exists('/item/value', $1), xml_first_name($1);
+         EXECUTE xml_prepared('<item name=\"prepared\"><value/></item>'::xml);
+         BEGIN;
+         DECLARE xml_cursor CURSOR FOR
+           SELECT id, name FROM XMLTABLE('/rows/row' PASSING ('<rows><row id=\"4\"><name>cursor</name></row></rows>'::xml)
+             COLUMNS id integer PATH '@id', name text PATH 'name');
+         FETCH ALL FROM xml_cursor;
+         COMMIT",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&setup),
+        ["t|prepared", "4|cursor"],
+        "{}",
+        String::from_utf8_lossy(&setup),
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, name, payload::text FROM xml_targets ORDER BY id;
+             SELECT id, has_value, rendered FROM xml_document_view;
+             SELECT id, names FROM xml_document_materialized;
+             SELECT id, name FROM xml_table_copy;
+             SELECT pg_typeof(document), pg_typeof(fragments), serialized,
+                    fragments::text, xml_first_name(document)
+               FROM xml_documents"
+        )),
+        [
+            "1|merged|<old/>",
+            "3|third|<inserted/>",
+            "1|t|<item name=\"alpha\"><value>10</value></item>",
+            "1|{alpha}",
+            "9|copied",
+            "xml|xml[]|<item name=\"alpha\"><value>10</value></item>|{<a/>,NULL,<b>two</b>}|alpha",
+        ]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let checkpoint_rows = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT id, document::text, fragments::text, serialized, xml_first_name(document)
+           FROM xml_documents;
+         SELECT id, has_value, rendered FROM xml_document_view;
+         SELECT id, names FROM xml_document_materialized;
+         UPDATE xml_documents SET document = '<item name=\"wal\"><value>11</value></item>'::xml WHERE id = 1",
+    );
+    assert_eq!(
+        data_rows(&checkpoint_rows),
+        [
+            "1|<item name=\"alpha\"><value>10</value></item>|{<a/>,NULL,<b>two</b>}|<item name=\"alpha\"><value>10</value></item>|alpha",
+            "1|t|<item name=\"alpha\"><value>10</value></item>",
+            "1|{alpha}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&checkpoint_rows),
+    );
+    recovered.commit_wal().unwrap();
+    drop(recovered);
+
+    let mut wal_budget = Budget::new(1 << 29);
+    let mut wal_recovered = Engine::new(&config, &mut wal_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut wal_recovered,
+            &mut wal_budget,
+            "SELECT document::text, serialized, xml_first_name(document) FROM xml_documents"
+        )),
+        [
+            "<item name=\"wal\"><value>11</value></item>|<item name=\"wal\"><value>11</value></item>|wal"
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn plpgsql_scalar_functions_are_typed_transactional_and_durable() {
     let mut config = test_config("plpgsql_scalar_functions");
     config.object_store_on = true;
@@ -16933,10 +17253,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
         run("SET synchronize_seqscans = on").contains("0A000"),
         "unsupported scan mode"
     );
-    assert!(
-        run("SET xmloption = document").contains("0A000"),
-        "unsupported XML mode"
-    );
+    assert!(run("SET xmloption = document; SHOW xmloption").contains("document"));
     assert!(
         run("SET default_tablespace = fast").contains("22023"),
         "missing tablespace"

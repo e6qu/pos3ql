@@ -41,6 +41,7 @@ pub(crate) mod two_phase;
 pub mod txn;
 pub mod types;
 pub mod tzif;
+pub mod xml;
 
 use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
 use crate::config::Config;

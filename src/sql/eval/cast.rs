@@ -392,6 +392,20 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
         },
+        ColType::Xml => match v {
+            Datum::Xml(_) => v,
+            Datum::Text(text) => {
+                let mode =
+                    if crate::sql::guc::active_render().is_some_and(|render| render.xml_document) {
+                        crate::sql::xml::Mode::Document
+                    } else {
+                        crate::sql::xml::Mode::Content
+                    };
+                crate::sql::xml::validate(text, mode)?;
+                Datum::Xml(text)
+            }
+            _ => return Err(cast_unsupported(&v, "xml")),
+        },
         ColType::Jsonpath => match v {
             Datum::JsonPath(_) => v,
             Datum::Text(text) => Datum::JsonPath(crate::sql::jsonpath::canonicalize(text, arena)?),

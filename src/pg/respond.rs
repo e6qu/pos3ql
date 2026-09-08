@@ -139,6 +139,7 @@ fn write_wire_text(value: &Datum, out: &mut dyn FnMut(&[u8])) {
     }
     match value {
         Datum::Char(byte) => out(&[*byte]),
+        Datum::Xml(text) => crate::sql::xml::write_output(text, |part| out(part.as_bytes())),
         Datum::Array { element, raw } => write_wire_array(*element, raw, out),
         Datum::Record(fields) | Datum::Composite { fields, .. } => {
             out(b"(");
@@ -297,6 +298,7 @@ fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usiz
         Datum::PgDdlCommand => unreachable!("pg_ddl_command output is rejected before encoding"),
         Datum::Char(_) => 1,
         Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => wire_text_len(value),
+        Datum::Xml(_) => wire_text_len(value),
         Datum::Text(text)
         | Datum::Bpchar(text)
         | Datum::Regtype { name: text, .. }
@@ -357,6 +359,11 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Timetz(..) => 12,
         Datum::Interval(_) | Datum::Uuid(_) => 16,
         Datum::Text(text) | Datum::Bpchar(text) => text.len(),
+        Datum::Xml(text) => {
+            let mut length = 0usize;
+            crate::sql::xml::write_output(text, |part| length = length.saturating_add(part.len()));
+            length
+        }
         Datum::TsVector(text) => crate::sql::full_text::emit_vector_binary(text.as_str(), |_| {}),
         Datum::TsQuery(text) => crate::sql::full_text::emit_query_binary(text.as_str(), |_| {}),
         Datum::Bytea(bytes) => bytes.len(),
@@ -1035,6 +1042,13 @@ impl<'b> Responder<'b> {
                     m.i32(1);
                     m.u8(*byte);
                 }
+                Datum::Xml(_) => {
+                    m.field(|m| {
+                        write_wire_text(v, &mut |bytes| {
+                            m.bytes(bytes);
+                        })
+                    });
+                }
                 Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
                     m.field(|m| {
                         write_wire_text(v, &mut |bytes| {
@@ -1172,6 +1186,16 @@ impl<'b> Responder<'b> {
             }
             Datum::Char(byte) => arena.alloc_slice_copy(&[*byte]).map_err(|_| full())?,
             Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
+                let len = wire_text_len(v);
+                let bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| full())?;
+                let mut at = 0;
+                write_wire_text(v, &mut |part| {
+                    bytes[at..at + part.len()].copy_from_slice(part);
+                    at += part.len();
+                });
+                &*bytes
+            }
+            Datum::Xml(_) => {
                 let len = wire_text_len(v);
                 let bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| full())?;
                 let mut at = 0;
@@ -1327,6 +1351,13 @@ impl<'b> Responder<'b> {
                         m.i32(text.len() as i32);
                     }
                     m.bytes(text.as_bytes());
+                }
+                Datum::Xml(text) => {
+                    m.field(|m| {
+                        crate::sql::xml::write_output(text, |part| {
+                            m.bytes(part.as_bytes());
+                        });
+                    });
                 }
                 Datum::JsonPath(text) => {
                     m.i32(text.len() as i32 + 1);

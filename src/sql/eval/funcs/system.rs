@@ -1691,6 +1691,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Interval(_) => "interval",
                     Datum::Json { jsonb: false, .. } => "json",
                     Datum::Json { jsonb: true, .. } => "jsonb",
+                    Datum::Xml(_) => "xml",
                     Datum::JsonPath(_) => "jsonpath",
                     Datum::TsVector(_) => "tsvector",
                     Datum::TsQuery(_) => "tsquery",

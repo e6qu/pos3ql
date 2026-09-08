@@ -52,7 +52,7 @@ CREATE TABLE cb (
   na numeric[], namea name[], vca varchar[], bpa char[], da date[],
   tsa timestamp[], tza timestamptz[], tma time[], tta timetz[], iva interval[],
   ja json[], jba jsonb[], ua uuid[], bya bytea[], ineta inet[], cidra cidr[],
-  maca macaddr[], mac8a macaddr8[], bita bit[], vbita varbit[])"""
+  maca macaddr[], mac8a macaddr8[], bita bit[], vbita varbit[], x xml, xa xml[])"""
 
 INSERT = """INSERT INTO cb VALUES
   (32000, 123456, 9000000000, 1.5, 2.25, 123.456, true, 'héllo', 'abc', 'xy',
@@ -71,7 +71,9 @@ INSERT = """INSERT INTO cb VALUES
    ARRAY['00112233-4455-6677-8899-aabbccddeeff'::uuid], ARRAY['\\xcafe'::bytea],
    ARRAY['192.168.1.2/24'::inet], ARRAY['192.168.1.0/24'::cidr],
    ARRAY['08:00:2b:01:02:03'::macaddr], ARRAY['08:00:2b:01:02:03:04:05'::macaddr8],
-   ARRAY[B'1'::bit], ARRAY[B'101'::varbit]),
+   ARRAY[B'1'::bit], ARRAY[B'101'::varbit],
+   '<?xml version="1.0" encoding="UTF-8"?><root>héllo &amp; goodbye</root>'::xml,
+   ARRAY['<a/>'::xml, NULL, '<b>bé</b>'::xml]),
   (-1, -123, -9000000000, -0.5, -1.25, -0.001, false, '', 'z', '', '2000-01-01',
    '1999-12-31 23:59:59', '2000-06-01 12:00:00+00', '00:00:00', '23:59:59+14',
    '-5 days', 'null', '[1,2,3]', 'ffffffff-ffff-ffff-ffff-ffffffffffff', '\\x',
@@ -81,10 +83,11 @@ INSERT = """INSERT INTO cb VALUES
    ARRAY[]::numeric[], ARRAY[]::name[], ARRAY[]::varchar[], ARRAY[]::char[], ARRAY[]::date[],
    ARRAY[]::timestamp[], ARRAY[]::timestamptz[], ARRAY[]::time[], ARRAY[]::timetz[], ARRAY[]::interval[],
    ARRAY[]::json[], ARRAY[]::jsonb[], ARRAY[]::uuid[], ARRAY[]::bytea[], ARRAY[]::inet[], ARRAY[]::cidr[],
-   ARRAY[]::macaddr[], ARRAY[]::macaddr8[], ARRAY[]::bit[], ARRAY[]::varbit[]),
+   ARRAY[]::macaddr[], ARRAY[]::macaddr8[], ARRAY[]::bit[], ARRAY[]::varbit[],
+   '<empty/>'::xml, ARRAY[]::xml[]),
   (NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
-   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
+   NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)"""
 
 COMPOSITE_DDL = """DROP TABLE IF EXISTS cb_composite;
 CREATE DOMAIN cb_mood_value AS cb_mood;
@@ -140,7 +143,13 @@ REFERENCE_INSERT = """INSERT INTO cb_references VALUES (
 
 
 def connect(host, port):
-    return psycopg.connect(host=host, port=port, user="postgres", dbname="postgres", autocommit=True)
+    connection = psycopg.connect(
+        host=host, port=port, user="postgres", dbname="postgres", autocommit=True
+    )
+    # Timestamptz text is session-local presentation. Pin both engines so
+    # comparisons do not depend on the developer or CI host zone.
+    connection.execute("SET TimeZone = 'UTC'")
+    return connection
 
 
 def dump(conn, table="cb"):

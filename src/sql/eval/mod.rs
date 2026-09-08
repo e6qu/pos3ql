@@ -173,6 +173,8 @@ pub mod sqlstate {
     pub const DIVISION_BY_ZERO: &str = "22012";
     pub const NUMERIC_OUT_OF_RANGE: &str = "22003";
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
+    pub const INVALID_XML_DOCUMENT: &str = "2200M";
+    pub const INVALID_XML_CONTENT: &str = "2200N";
     pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
@@ -3724,6 +3726,11 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
+        && let Some(result) = funcs::xml::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
         && let Some(result) = funcs::array::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
@@ -6437,6 +6444,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Interval(_) => "interval",
         Datum::Json { jsonb: false, .. } => "json",
         Datum::Json { jsonb: true, .. } => "jsonb",
+        Datum::Xml(_) => "xml",
         Datum::JsonPath(_) => "jsonpath",
         Datum::TsVector(_) => "tsvector",
         Datum::TsQuery(_) => "tsquery",

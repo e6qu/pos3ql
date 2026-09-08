@@ -57,6 +57,8 @@ pub mod oid {
     pub const TIMETZ: i32 = 1266;
     pub const INTERVAL: i32 = 1186;
     pub const JSON: i32 = 114;
+    pub const XML: i32 = 142;
+    pub const XML_ARRAY: i32 = 143;
     pub const JSONB: i32 = 3802;
     pub const JSONPATH: i32 = 4072;
     pub const JSONPATH_ARRAY: i32 = 4073;
@@ -375,6 +377,8 @@ pub enum ColType {
     Interval,
     /// Textual JSON (stored verbatim).
     Json,
+    /// A well-formed XML document or content fragment, retained verbatim.
+    Xml,
     /// Binary/normalized JSON (canonicalized on input).
     Jsonb,
     /// A validated SQL/JSON path in PostgreSQL's canonical text form.
@@ -514,7 +518,7 @@ impl BtreeOperatorClass {
             Uuid => Self::Uuid,
             Bit { varying: true } => Self::Varbit,
             Void | Internal | PgDdlCommand | Int2Vector | OidVector | PgNodeTree | PgNdistinct
-            | PgDependencies | PgMcvList | PgStatisticArray | Json | Jsonpath => {
+            | PgDependencies | PgMcvList | PgStatisticArray | Json | Xml | Jsonpath => {
                 return None;
             }
         })
@@ -779,6 +783,7 @@ impl ColType {
             "timetz" | "time with time zone" => Self::Timetz,
             "interval" => Self::Interval,
             "json" => Self::Json,
+            "xml" => Self::Xml,
             "jsonb" => Self::Jsonb,
             "jsonpath" => Self::Jsonpath,
             "tsvector" => Self::TsVector,
@@ -840,6 +845,7 @@ impl ColType {
             Self::Timetz => oid::TIMETZ,
             Self::Interval => oid::INTERVAL,
             Self::Json => oid::JSON,
+            Self::Xml => oid::XML,
             Self::Jsonb => oid::JSONB,
             Self::Jsonpath => oid::JSONPATH,
             Self::TsVector => oid::TSVECTOR,
@@ -909,6 +915,7 @@ impl ColType {
             oid::TIMETZ => Some(Self::Timetz),
             oid::INTERVAL => Some(Self::Interval),
             oid::JSON => Some(Self::Json),
+            oid::XML => Some(Self::Xml),
             oid::JSONB => Some(Self::Jsonb),
             oid::JSONPATH => Some(Self::Jsonpath),
             oid::TSVECTOR => Some(Self::TsVector),
@@ -1032,6 +1039,7 @@ impl ColType {
             | Self::Bytea
             | Self::Numeric
             | Self::Json
+            | Self::Xml
             | Self::Jsonb
             | Self::Jsonpath
             | Self::TsVector
@@ -1119,6 +1127,7 @@ impl ColType {
             Self::Timetz => "timetz",
             Self::Interval => "interval",
             Self::Json => "json",
+            Self::Xml => "xml",
             Self::Jsonb => "jsonb",
             Self::Jsonpath => "jsonpath",
             Self::TsVector => "tsvector",
@@ -1196,6 +1205,7 @@ impl ColType {
             Self::Timetz => "time with time zone",
             Self::Interval => "interval",
             Self::Json => "json",
+            Self::Xml => "xml",
             Self::Jsonb => "jsonb",
             Self::Jsonpath => "jsonpath",
             Self::TsVector => "tsvector",
@@ -1269,6 +1279,7 @@ impl ColType {
             Self::Timetz => 41,
             Self::Interval => 17,
             Self::Json => 18,
+            Self::Xml => 229,
             Self::Jsonb => 19,
             Self::Jsonpath => 227,
             Self::TsVector => 77,
@@ -1351,6 +1362,7 @@ impl ColType {
             41 => Self::Timetz,
             17 => Self::Interval,
             18 => Self::Json,
+            229 => Self::Xml,
             19 => Self::Jsonb,
             227 => Self::Jsonpath,
             77 => Self::TsVector,
@@ -1415,6 +1427,7 @@ pub enum ArrElem {
     Uuid,
     Bytea,
     Json,
+    Xml,
     Jsonb,
     Jsonpath,
     TsVector,
@@ -1477,7 +1490,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 63] = [
+    pub const BUILTIN: [Self; 64] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1499,6 +1512,7 @@ impl ArrElem {
         Self::Timetz,
         Self::Interval,
         Self::Json,
+        Self::Xml,
         Self::Jsonb,
         Self::Jsonpath,
         Self::TsVector,
@@ -1593,6 +1607,7 @@ impl ArrElem {
             ArrElem::Uuid => "_uuid",
             ArrElem::Bytea => "_bytea",
             ArrElem::Json => "_json",
+            ArrElem::Xml => "_xml",
             ArrElem::Jsonb => "_jsonb",
             ArrElem::Jsonpath => "_jsonpath",
             ArrElem::TsVector => "_tsvector",
@@ -1674,6 +1689,7 @@ impl ArrElem {
             ArrElem::Uuid => "uuid[]",
             ArrElem::Bytea => "bytea[]",
             ArrElem::Json => "json[]",
+            ArrElem::Xml => "xml[]",
             ArrElem::Jsonb => "jsonb[]",
             ArrElem::Jsonpath => "jsonpath[]",
             ArrElem::TsVector => "tsvector[]",
@@ -1762,6 +1778,7 @@ impl ArrElem {
             Datum::Uuid(_) => ArrElem::Uuid,
             Datum::Bytea(_) => ArrElem::Bytea,
             Datum::Json { jsonb: false, .. } => ArrElem::Json,
+            Datum::Xml(_) => ArrElem::Xml,
             Datum::Json { jsonb: true, .. } => ArrElem::Jsonb,
             Datum::JsonPath(_) => ArrElem::Jsonpath,
             Datum::TsVector(_) => ArrElem::TsVector,
@@ -1850,6 +1867,7 @@ impl ArrElem {
             ColType::Uuid => ArrElem::Uuid,
             ColType::Bytea => ArrElem::Bytea,
             ColType::Json => ArrElem::Json,
+            ColType::Xml => ArrElem::Xml,
             ColType::Jsonb => ArrElem::Jsonb,
             ColType::Jsonpath => ArrElem::Jsonpath,
             ColType::TsVector => ArrElem::TsVector,
@@ -1886,6 +1904,7 @@ impl ArrElem {
             ArrElem::Uuid => ColType::Uuid,
             ArrElem::Bytea => ColType::Bytea,
             ArrElem::Json => ColType::Json,
+            ArrElem::Xml => ColType::Xml,
             ArrElem::Jsonb => ColType::Jsonb,
             ArrElem::Jsonpath => ColType::Jsonpath,
             ArrElem::TsVector => ColType::TsVector,
@@ -1955,6 +1974,7 @@ impl ArrElem {
             ArrElem::Uuid => 2951,
             ArrElem::Bytea => 1001,
             ArrElem::Json => 199,
+            ArrElem::Xml => oid::XML_ARRAY,
             ArrElem::Jsonb => 3807,
             ArrElem::Jsonpath => oid::JSONPATH_ARRAY,
             ArrElem::TsVector => oid::TSVECTOR_ARRAY,
@@ -2022,6 +2042,7 @@ impl ArrElem {
             ArrElem::Uuid => 13,
             ArrElem::Bytea => 14,
             ArrElem::Json => 15,
+            ArrElem::Xml => 148,
             ArrElem::Jsonb => 16,
             ArrElem::Jsonpath => 146,
             ArrElem::TsVector => 64,
@@ -2084,6 +2105,7 @@ impl ArrElem {
             13 => ArrElem::Uuid,
             14 => ArrElem::Bytea,
             15 => ArrElem::Json,
+            148 => ArrElem::Xml,
             16 => ArrElem::Jsonb,
             146 => ArrElem::Jsonpath,
             64 => ArrElem::TsVector,
@@ -2693,6 +2715,8 @@ pub enum Datum<'a> {
         text: &'a str,
         jsonb: bool,
     },
+    /// Validated XML document or content fragment.
+    Xml(&'a str),
     /// Canonical text of a validated `jsonpath` value.
     JsonPath(&'a str),
     /// Canonical `tsvector` text produced by the full-text parser. Keeping a
@@ -2821,6 +2845,7 @@ impl<'a> Datum<'a> {
             Datum::Interval(_) => oid::INTERVAL,
             Datum::Json { jsonb: false, .. } => oid::JSON,
             Datum::Json { jsonb: true, .. } => oid::JSONB,
+            Datum::Xml(_) => oid::XML,
             Datum::JsonPath(_) => oid::JSONPATH,
             Datum::TsVector(_) => oid::TSVECTOR,
             Datum::TsQuery(_) => oid::TSQUERY,
@@ -3009,6 +3034,7 @@ impl fmt::Display for Datum<'_> {
                 f.write_str(super::datetime::format_interval_styled(*interval, style).as_str())
             }
             Datum::Json { text, .. } => f.write_str(text),
+            Datum::Xml(text) => f.write_str(text),
             Datum::JsonPath(text) => f.write_str(text),
             Datum::TsVector(text) => f.write_str(text.as_str()),
             Datum::TsQuery(text) => f.write_str(text.as_str()),
@@ -3664,6 +3690,8 @@ mod code_roundtrip_tests {
         assert_eq!(ColType::Array(ArrElem::Bool).code(), 80);
         assert_eq!(ColType::Array(ArrElem::Jsonpath).code(), 226);
         assert_eq!(ColType::Jsonpath.code(), 227);
+        assert_eq!(ColType::Array(ArrElem::Xml).code(), 228);
+        assert_eq!(ColType::Xml.code(), 229);
         assert_eq!(ColType::Geometry(GeometryKind::Point).code(), 219);
         assert_eq!(
             ColType::Array(ArrElem::Geometry(GeometryKind::Point)).code(),

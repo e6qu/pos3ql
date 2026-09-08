@@ -698,6 +698,7 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[26])
         }
         Datum::Json { jsonb: false, .. } => hasher.write(&[27]),
+        Datum::Xml(_) => hasher.write(&[43]),
         Datum::JsonPath(_) => hasher.write(&[42]),
         // Network addresses hash by their comparison key (family, address,
         // mask), so equal values hash equal and distinct ones rarely collide.

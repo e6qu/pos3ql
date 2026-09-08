@@ -2328,6 +2328,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_jsonpath_query = tref.table.eq_ignore_ascii_case("jsonb_path_query")
         || tref.table.eq_ignore_ascii_case("jsonb_path_query_tz");
     let is_json_table = tref.table.eq_ignore_ascii_case("json_table");
+    let is_xml_table = tref.table.eq_ignore_ascii_case("xmltable");
     let is_populate_record = matches!(
         tref.table,
         "json_populate_record"
@@ -2359,6 +2360,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_elems
         || is_jsonpath_query
         || is_json_table
+        || is_xml_table
         || is_populate_record
         || is_json_to_record
         || is_each
@@ -2426,6 +2428,70 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         };
         let mut count = 0usize;
         json_table_append_columns(specifications, storage, txid, &mut default_cols, &mut count)?;
+        count
+    } else if is_xml_table {
+        let args = tref.func_args.unwrap_or(&[]);
+        if args.len() != 4 {
+            return Err(srf_signature_error(tref.table));
+        }
+        let Expr::Call {
+            name: "__xml_table_columns",
+            args: specifications,
+            ..
+        } = *args[2]
+        else {
+            return Err(srf_signature_error(tref.table));
+        };
+        let mut count = 0usize;
+        for specification in specifications {
+            let Expr::Call { name, args, .. } = specification else {
+                return Err(srf_signature_error(tref.table));
+            };
+            let Some(Expr::Str(column_name)) = args.first().copied() else {
+                return Err(srf_signature_error(tref.table));
+            };
+            if default_cols[..count]
+                .iter()
+                .any(|column| column.name.as_str() == *column_name)
+            {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_COLUMN,
+                    "column name \"{}\" specified more than once",
+                    column_name
+                ));
+            }
+            if count == default_cols.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "XMLTABLE output exceeds configured column capacity"
+                ));
+            }
+            let (ctype, user_type, type_mod) = if *name == "__xml_table_ordinality" {
+                (ColType::Int8, None, -1)
+            } else if *name == "__xml_table_column" {
+                let (Some(Expr::Str(type_name)), Some(Expr::Int(type_mod))) =
+                    (args.get(1).copied(), args.get(2).copied())
+                else {
+                    return Err(srf_signature_error(tref.table));
+                };
+                let resolved = crate::sql::exec::resolve_routine_type(storage, txid, type_name)?;
+                (resolved.ctype, resolved.user_type, *type_mod as i32)
+            } else {
+                return Err(srf_signature_error(tref.table));
+            };
+            default_cols[count] = table_function_column(
+                SqlName::parse(column_name)?,
+                ctype,
+                user_type,
+                type_mod,
+                if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            );
+            count += 1;
+        }
         count
     } else if is_logical_slot_record {
         let argument_count = tref.func_args.unwrap_or(&[]).len();
@@ -3088,6 +3154,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
         };
         return json_table_rows(args, arena, params, columns, &hooks);
+    }
+    if tref.table.eq_ignore_ascii_case("xmltable") {
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+        };
+        return xml_table_rows(args, arena, params, columns, &hooks);
     }
     if matches!(
         tref.table,
@@ -4689,6 +4763,196 @@ fn populate_record_rows<'a, C: ColumnLookup<'a>>(
         *row_slot = crate::sql::exec::encode_projected_pub(values, arena)?;
     }
     Ok(&*rows)
+}
+
+fn xml_table_rows<'a, C: ColumnLookup<'a>>(
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    if args.len() != 4 {
+        return Err(srf_signature_error("xmltable"));
+    }
+    let row_path = eval_full(args[0], arena, params, columns, hooks)?;
+    let document = eval_full(args[1], arena, params, columns, hooks)?;
+    if row_path.is_null() || document.is_null() {
+        return Ok(&[]);
+    }
+    let row_path = crate::sql::eval::cast_to_text(row_path, arena)?;
+    let document = match document {
+        Datum::Xml(text) => text,
+        other => {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "XMLTABLE document must be xml, got {:?}",
+                other
+            ));
+        }
+    };
+    let Expr::Call {
+        name: "__xml_namespaces",
+        args: namespace_specs,
+        ..
+    } = *args[3]
+    else {
+        return Err(srf_signature_error("xmltable"));
+    };
+    if !namespace_specs.len().is_multiple_of(2) {
+        return Err(srf_signature_error("xmltable"));
+    }
+    let mut namespaces = [("", ""); crate::sql::parser::MAX_LIST / 2];
+    let mut namespace_count = 0usize;
+    for pair in namespace_specs.as_chunks::<2>().0 {
+        let uri = eval_full(pair[0], arena, params, columns, hooks)?;
+        if uri.is_null() {
+            return Err(sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "null XML namespace URI"
+            ));
+        }
+        let uri = crate::sql::eval::cast_to_text(uri, arena)?;
+        let Expr::Str(prefix) = pair[1] else {
+            return Err(srf_signature_error("xmltable"));
+        };
+        if namespaces[..namespace_count]
+            .iter()
+            .any(|(existing, _)| existing == prefix)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "duplicate XML namespace prefix \"{}\"",
+                prefix
+            ));
+        }
+        namespaces[namespace_count] = (prefix, uri);
+        namespace_count += 1;
+    }
+    let row_path = crate::sql::xml::rewrite_namespaces(
+        row_path,
+        document,
+        &namespaces[..namespace_count],
+        arena,
+    )?;
+    let roots = crate::sql::xml::xpath(row_path, document, arena)?;
+    let Expr::Call {
+        name: "__xml_table_columns",
+        args: specifications,
+        ..
+    } = *args[2]
+    else {
+        return Err(srf_signature_error("xmltable"));
+    };
+    const EMPTY: &[u8] = &[];
+    let mut encoded = [EMPTY; crate::sql::parser::MAX_ROWS];
+    let mut count = 0usize;
+    for (ordinal, root) in roots.iter().enumerate() {
+        let Datum::Xml(context) = root else {
+            continue;
+        };
+        if count == encoded.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "XMLTABLE produced too many rows"
+            ));
+        }
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        for (column, specification) in specifications.iter().enumerate() {
+            let Expr::Call { name, args, .. } = specification else {
+                return Err(srf_signature_error("xmltable"));
+            };
+            if *name == "__xml_table_ordinality" {
+                values[column] = Datum::Int8((ordinal + 1) as i64);
+                continue;
+            }
+            if *name != "__xml_table_column" || args.len() != 6 {
+                return Err(srf_signature_error("xmltable"));
+            }
+            let (
+                Expr::Str(column_name),
+                Expr::Str(type_name),
+                Expr::Int(type_mod),
+                Expr::Bool(not_null),
+            ) = (args[0], args[1], args[2], args[5])
+            else {
+                return Err(srf_signature_error("xmltable"));
+            };
+            let path = eval_full(args[3], arena, params, columns, hooks)?;
+            let path = if path.is_null() {
+                column_name
+            } else {
+                crate::sql::eval::cast_to_text(path, arena)?
+            };
+            let path = crate::sql::xml::rewrite_namespaces(
+                path,
+                document,
+                &namespaces[..namespace_count],
+                arena,
+            )?;
+            let selected = crate::sql::xml::xpath_relative(path, context, arena)?;
+            let target_is_xml = ColType::from_sql_name(type_name) == Some(ColType::Xml);
+            let mut value = if selected.is_empty() {
+                if matches!(args[4], Expr::Null) {
+                    Datum::Null
+                } else {
+                    eval_full(args[4], arena, params, columns, hooks)?
+                }
+            } else if target_is_xml {
+                let text = arena
+                    .alloc_str_display(XmlTableConcat(selected))
+                    .map_err(|_| arena_full())?;
+                Datum::Xml(text)
+            } else {
+                if selected.len() != 1 {
+                    return Err(sql_err!(
+                        sqlstate::CARDINALITY_VIOLATION,
+                        "more than one value returned by XMLTABLE column path"
+                    ));
+                }
+                let Datum::Xml(fragment) = selected[0] else {
+                    unreachable!()
+                };
+                Datum::Text(crate::sql::xml::string_value(fragment, arena)?)
+            };
+            if !value.is_null() {
+                value = crate::sql::eval::funcs::json::sql_json_cast(
+                    value,
+                    type_name,
+                    *type_mod as i32,
+                    arena,
+                    hooks,
+                )?;
+            }
+            if *not_null && value.is_null() {
+                return Err(sql_err!(
+                    sqlstate::NOT_NULL_VIOLATION,
+                    "null value in column \"{}\" violates not-null constraint",
+                    column_name
+                ));
+            }
+            values[column] = value;
+        }
+        encoded[count] =
+            crate::sql::exec::encode_projected_pub(&values[..specifications.len()], arena)?;
+        count += 1;
+    }
+    arena
+        .alloc_slice_copy(&encoded[..count])
+        .map(|rows| &*rows)
+        .map_err(|_| arena_full())
+}
+
+struct XmlTableConcat<'a>(&'a [Datum<'a>]);
+impl core::fmt::Display for XmlTableConcat<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for value in self.0 {
+            if let Datum::Xml(text) = value {
+                output.write_str(text)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn json_table_rows<'a, C: ColumnLookup<'a>>(

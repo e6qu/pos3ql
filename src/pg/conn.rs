@@ -4646,6 +4646,9 @@ pub(crate) fn decode_binary_param<'a>(
                 jsonb: false,
             })
             .map_err(|_| "invalid UTF-8 in binary json parameter"),
+        oids::XML => core::str::from_utf8(bytes)
+            .map(Datum::Text)
+            .map_err(|_| "invalid UTF-8 in binary xml parameter"),
         oids::JSONB => {
             // jsonb send format: a 1-byte version (0x01) then the JSON text.
             let (&ver, rest) = bytes.split_first().ok_or(wrong)?;

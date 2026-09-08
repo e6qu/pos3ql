@@ -50,6 +50,11 @@ STATIC_COLUMNS = [
     ("json_value", "json", "'{\"a\":1}'"),
     ("jsonb_value", "jsonb", "'{\"b\": 2}'"),
     ("jsonpath_value", "jsonpath", "'strict $.items[*] ? (@.price >= 10)'"),
+    (
+        "xml_value",
+        "xml",
+        "'<?xml version=\"1.0\" encoding=\"UTF-8\"?><root id=\"7\">héllo &amp; goodbye</root>'",
+    ),
     ("tsvector_value", "tsvector", "'fat:2A rat:3B'"),
     ("tsquery_value", "tsquery", "'fat & (rat | !cat:*AB)'"),
     ("uuid_value", "uuid", "'00112233-4455-6677-8899-aabbccddeeff'"),
@@ -94,6 +99,7 @@ STATIC_COLUMNS = [
     ("json_array", "json[]", "ARRAY['{\"a\":1}', NULL, '[2]']::json[]"),
     ("jsonb_array", "jsonb[]", "ARRAY['{\"a\":1}', NULL, '[2]']::jsonb[]"),
     ("jsonpath_array", "jsonpath[]", "ARRAY['$.a'::jsonpath, NULL, 'strict $.b[*]'::jsonpath]"),
+    ("xml_array", "xml[]", "ARRAY['<a/>'::xml, NULL, '<b>bé</b>'::xml]"),
     ("tsvector_array", "tsvector[]", "ARRAY['fat:2A rat:3B'::tsvector, NULL, 'cat'::tsvector]"),
     ("tsquery_array", "tsquery[]", "ARRAY['fat & rat'::tsquery, NULL, '!cat:*AB'::tsquery]"),
     ("inet_array", "inet[]", "ARRAY['192.0.2.1/24', NULL, '2001:db8::1/64']::inet[]"),
@@ -152,7 +158,13 @@ STATIC_COLUMNS = [
 
 
 def connect(host, port):
-    return psycopg.connect(host=host, port=port, user="postgres", dbname="postgres", autocommit=True)
+    connection = psycopg.connect(
+        host=host, port=port, user="postgres", dbname="postgres", autocommit=True
+    )
+    # Timestamptz text is session-local presentation. Pin both sides so this
+    # binary-fidelity test does not depend on the developer or CI host zone.
+    connection.execute("SET TimeZone = 'UTC'")
+    return connection
 
 
 def copy_out(conn, query):

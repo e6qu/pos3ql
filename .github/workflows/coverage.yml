@@ -242,11 +242,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The instrumented complete corpus outgrew the five-minute worker
-          # ceiling. Split its existing deterministic shard contract; only one
-          # worker owns the auxiliary probes.
-          - { name: corpus-a, corpus_shard: "0-of-2", auxiliary: all }
+          # Keep the instrumented corpus and auxiliary probes in independent
+          # workers so cold setup plus measurement stays below five minutes.
+          - { name: corpus-a, corpus_shard: "0-of-2", auxiliary: none }
           - { name: corpus-b, corpus_shard: "1-of-2", auxiliary: none }
+          - { name: auxiliary, corpus_shard: "none", auxiliary: all }
     services:
       postgres:
         image: postgres:18

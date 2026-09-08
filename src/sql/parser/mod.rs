@@ -2429,6 +2429,7 @@ impl<'a> Parser<'a> {
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                bound_table: None,
                 view_access: None,
             };
             let select = Select {
@@ -2518,6 +2519,7 @@ impl<'a> Parser<'a> {
                     with_ordinality: false,
                     lateral: false,
                     authorization_role: None,
+                    bound_table: None,
                     view_access: None,
                 }; MAX_LIST];
                 let mut count = 0usize;
@@ -2577,6 +2579,7 @@ impl<'a> Parser<'a> {
                     with_ordinality,
                     lateral,
                     authorization_role: None,
+                    bound_table: None,
                     view_access: None,
                 });
             }
@@ -2621,6 +2624,7 @@ impl<'a> Parser<'a> {
                 with_ordinality: false,
                 lateral,
                 authorization_role: None,
+                bound_table: None,
                 view_access: None,
             });
         }
@@ -2768,6 +2772,7 @@ impl<'a> Parser<'a> {
             with_ordinality,
             lateral,
             authorization_role: None,
+            bound_table: None,
             view_access: None,
         })
     }
@@ -3256,6 +3261,7 @@ impl<'a> Parser<'a> {
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                bound_table: None,
                 view_access: None,
             },
             kind: JoinKind::Inner,
@@ -10426,6 +10432,27 @@ mod tests {
                         panic!("CREATE VIEW did not parse into a typed view statement")
                     };
                     assert_eq!(security_barrier, expected);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn temporary_view_spellings_retain_typed_persistence() {
+        with_parser(
+            "CREATE TEMP VIEW first AS SELECT 1; \
+             CREATE TEMPORARY VIEW second AS SELECT 2; \
+             CREATE OR REPLACE TEMP VIEW third AS SELECT 3",
+            |parser| {
+                for expected in ["first", "second", "third"] {
+                    let Some(Stmt::CreateView {
+                        name, persistence, ..
+                    }) = parser.next_stmt().unwrap()
+                    else {
+                        panic!("temporary view did not parse into CREATE VIEW")
+                    };
+                    assert_eq!(name.name, expected);
+                    assert_eq!(persistence, crate::sql::ast::RelationPersistence::Temporary);
                 }
             },
         );

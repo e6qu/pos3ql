@@ -316,6 +316,7 @@ pub enum CreateSchemaElement<'a> {
     Table(CreateTable<'a>),
     View {
         name: QualName<'a>,
+        persistence: RelationPersistence,
         columns: &'a [&'a str],
         or_replace: bool,
         security: ViewSecurity,
@@ -548,6 +549,7 @@ pub enum Stmt<'a> {
     /// stored and re-expanded as a derived table at query time.
     CreateView {
         name: QualName<'a>,
+        persistence: RelationPersistence,
         /// Output names are part of the view's durable relation identity, not
         /// aliases discarded after parsing the SELECT body.
         columns: &'a [&'a str],
@@ -3214,6 +3216,10 @@ pub struct TableRef<'a> {
     /// Set only by stored-view expansion; ordinary parsed references use the
     /// current effective role.
     pub authorization_role: Option<u16>,
+    /// Catalog slot pinned by stored-query dependency expansion. Parsed SQL
+    /// never sets this; it prevents a captured relation from being rebound or
+    /// rejected by the executing session's namespace visibility rules.
+    pub bound_table: Option<u16>,
     /// Source view retained across expansion so projected column privileges
     /// remain enforceable after its body becomes a derived table.
     pub view_access: Option<u16>,

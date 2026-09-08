@@ -4099,6 +4099,7 @@ impl ViewOptions {
 
 #[derive(Clone)]
 pub struct ViewDefinition {
+    pub persistence: RelationPersistence,
     pub columns: ViewColumns,
     pub query: StoredQueryDefinition,
     pub options: ViewOptions,
@@ -4330,6 +4331,7 @@ pub struct ViewDef {
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
+    pub persistence: RelationPersistence,
     pub(crate) return_rule: u16,
     pub options: ViewOptions,
     pub columns: ViewColumns,
@@ -7276,6 +7278,19 @@ impl From<usize> for TriggerTarget {
 }
 
 impl TriggerTarget {
+    pub(crate) const fn access_object(self) -> AccessObject {
+        match self {
+            Self::Table(slot) => AccessObject {
+                class: AccessClass::Table,
+                slot,
+            },
+            Self::View(slot) => AccessObject {
+                class: AccessClass::View,
+                slot,
+            },
+        }
+    }
+
     /// Internal comment identity. Relation slots are stable across renames and
     /// schema moves; the high bit separates table and view namespaces.
     pub(crate) const fn comment_subid(self) -> u32 {
@@ -11472,7 +11487,7 @@ impl Storage {
         SqlName::parse(stack_format!(63, "pg_temp_{}", self.current_connection_id.get()).as_str())
     }
 
-    fn is_current_temporary_schema(&self, schema: &str) -> bool {
+    pub(crate) fn is_current_temporary_schema(&self, schema: &str) -> bool {
         self.temporary_schema()
             .is_ok_and(|name| name.as_str() == schema)
     }
@@ -11488,6 +11503,16 @@ impl Storage {
         let Ok(schema) = self.temporary_schema() else {
             return;
         };
+        for slot in 0..self.views.len() {
+            if self.views[slot].database == self.current_database
+                && self.views[slot].ddl_state == CatalogDdlState::Present
+                && self.views[slot].persistence == RelationPersistence::Temporary
+                && self.views[slot].schema == schema
+            {
+                self.pending_drop_view(slot, 0);
+                self.commit_view_drop(slot);
+            }
+        }
         for slot in 0..self.table_count() {
             if self.tables[slot].database != self.current_database
                 || !self.tables[slot].live
@@ -11645,6 +11670,10 @@ impl Storage {
                 self.sequence_for(object.slot as usize, txid).persistence
                     == RelationPersistence::Temporary
             }
+            AccessClass::View => self
+                .views
+                .get(object.slot as usize)
+                .is_some_and(|view| view.persistence == RelationPersistence::Temporary),
             AccessClass::Statistics => self
                 .extended_statistics
                 .get(object.slot as usize)
@@ -11661,7 +11690,10 @@ impl Storage {
                             self.table_def(usize::from(table), txid).persistence
                                 == RelationPersistence::Temporary
                         }
-                        TriggerTarget::View(_) => false,
+                        TriggerTarget::View(view) => {
+                            self.views[usize::from(view)].persistence
+                                == RelationPersistence::Temporary
+                        }
                     })
             }
             _ => false,
@@ -12631,6 +12663,7 @@ impl Storage {
                     created_at: 0,
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
+                    persistence: RelationPersistence::Permanent,
                     return_rule: u16::MAX,
                     options: ViewOptions::DEFAULT,
                     columns: ViewColumns::EMPTY,
@@ -14261,6 +14294,7 @@ impl Storage {
                 let source_schema = self.schemas[source_slot];
                 if source_schema.database != source
                     || source_schema.ddl_state != CatalogDdlState::Present
+                    || source_schema.name.as_str().starts_with("pg_temp_")
                 {
                     continue;
                 }
@@ -14415,6 +14449,9 @@ impl Storage {
                 if self.tables[source_slot].database != source || !self.tables[source_slot].live {
                     continue;
                 }
+                if self.tables[source_slot].def.persistence == RelationPersistence::Temporary {
+                    continue;
+                }
                 if self.tables[source_slot].pending_ddl.is_some()
                     || self.tables[source_slot].pending_def_txid.is_some()
                 {
@@ -14489,6 +14526,7 @@ impl Storage {
                 let source_definition = &self.sequences[source_slot];
                 if source_definition.database != source
                     || source_definition.ddl_state != CatalogDdlState::Present
+                    || source_definition.persistence == RelationPersistence::Temporary
                 {
                     continue;
                 }
@@ -14512,6 +14550,7 @@ impl Storage {
                 let source_definition = &self.views[source_slot];
                 if source_definition.database != source
                     || source_definition.ddl_state != CatalogDdlState::Present
+                    || source_definition.persistence == RelationPersistence::Temporary
                 {
                     continue;
                 }
@@ -14531,7 +14570,10 @@ impl Storage {
             }
             for source_slot in 0..self.rules.len() {
                 let mut rule = self.rules[source_slot];
-                if rule.database != source || rule.ddl_state != CatalogDdlState::Present {
+                if rule.database != source
+                    || rule.ddl_state != CatalogDdlState::Present
+                    || self.access_object_is_temporary(rule.definition.target.access_object(), 0)
+                {
                     continue;
                 }
                 let target_object = self
@@ -14760,7 +14802,15 @@ impl Storage {
 
             for source_slot in 0..self.indexes.len() {
                 let mut definition = self.indexes[source_slot];
-                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                if definition.database != source
+                    || definition.ddl_state != CatalogDdlState::Present
+                    || self.access_object_is_temporary(
+                        AccessObject {
+                            class: AccessClass::Index,
+                            slot: source_slot as u16,
+                        },
+                        0,
+                    )
                 {
                     continue;
                 }
@@ -14818,7 +14868,10 @@ impl Storage {
 
             for source_slot in 0..self.policies.len() {
                 let mut definition = self.policies[source_slot];
-                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                if definition.database != source
+                    || definition.ddl_state != CatalogDdlState::Present
+                    || self.tables[usize::from(definition.table)].def.persistence
+                        == RelationPersistence::Temporary
                 {
                     continue;
                 }
@@ -14850,7 +14903,9 @@ impl Storage {
 
             for source_slot in 0..self.triggers.len() {
                 let mut definition = self.triggers[source_slot];
-                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                if definition.database != source
+                    || definition.ddl_state != CatalogDdlState::Present
+                    || self.access_object_is_temporary(definition.target.access_object(), 0)
                 {
                     continue;
                 }
@@ -14916,7 +14971,10 @@ impl Storage {
 
             for source_slot in 0..self.extended_statistics.len() {
                 let mut definition = self.extended_statistics[source_slot];
-                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                if definition.database != source
+                    || definition.ddl_state != CatalogDdlState::Present
+                    || self.tables[usize::from(definition.table)].def.persistence
+                        == RelationPersistence::Temporary
                 {
                     continue;
                 }
@@ -15062,6 +15120,7 @@ impl Storage {
                 let dependency = self.extension_dependencies[source_slot];
                 if !dependency.live
                     || self.extensions[usize::from(dependency.extension)].database != source
+                    || self.access_object_is_temporary(dependency.object, 0)
                 {
                     continue;
                 }
@@ -15103,7 +15162,9 @@ impl Storage {
             }
             for source_slot in 0..self.extension_configs.len() {
                 let config = self.extension_configs[source_slot];
-                if !config.live || self.extensions[usize::from(config.extension)].database != source
+                if !config.live
+                    || self.extensions[usize::from(config.extension)].database != source
+                    || self.access_object_is_temporary(config.relation.access_object(), 0)
                 {
                     continue;
                 }
@@ -15151,7 +15212,10 @@ impl Storage {
 
             for source_slot in 0..self.acl_entries.len() {
                 let entry = self.acl_entries[source_slot];
-                if !entry.live || self.access_object_database(entry.object) != Some(source) {
+                if !entry.live
+                    || self.access_object_database(entry.object) != Some(source)
+                    || self.access_object_is_temporary(entry.object, 0)
+                {
                     continue;
                 }
                 let object = self
@@ -15170,6 +15234,7 @@ impl Storage {
                 let entry = self.column_acl_entries[source_slot];
                 if !entry.live
                     || self.access_object_database(entry.target.relation()) != Some(source)
+                    || self.access_object_is_temporary(entry.target.relation(), 0)
                 {
                     continue;
                 }
@@ -15220,7 +15285,11 @@ impl Storage {
             }
             for source_slot in 0..self.comments.len() {
                 let mut entry = self.comments[source_slot];
-                if !entry.used || entry.database != Some(source) || entry.live.is_none() {
+                if !entry.used
+                    || entry.database != Some(source)
+                    || entry.live.is_none()
+                    || entry.schema.as_str().starts_with("pg_temp_")
+                {
                     continue;
                 }
                 let target_slot = self
@@ -16452,10 +16521,10 @@ impl Storage {
     }
 
     pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+        self.views.iter().enumerate().filter(|(_, value)| {
+            value.ddl_state == CatalogDdlState::Present
+                && value.persistence != RelationPersistence::Temporary
+        })
     }
 
     pub(crate) fn checkpoint_publications(&self) -> impl Iterator<Item = (usize, &PublicationDef)> {
@@ -16555,6 +16624,12 @@ impl Storage {
                         if self.table_def(usize::from(table), 0).persistence
                             == RelationPersistence::Temporary
                 )
+                && !matches!(
+                    rule.definition.target,
+                    RuleTarget::View(view)
+                        if self.views[usize::from(view)].persistence
+                            == RelationPersistence::Temporary
+                )
         })
     }
 
@@ -16601,6 +16676,12 @@ impl Storage {
                         if self.table_def(usize::from(table), 0).persistence
                             == RelationPersistence::Temporary
                 )
+                && !matches!(
+                    value.target,
+                    TriggerTarget::View(view)
+                        if self.views[usize::from(view)].persistence
+                            == RelationPersistence::Temporary
+                )
         })
     }
 
@@ -16638,7 +16719,7 @@ impl Storage {
         self.extension_dependencies
             .iter()
             .enumerate()
-            .filter(|(_, value)| value.live)
+            .filter(|(_, value)| value.live && !self.access_object_is_temporary(value.object, 0))
     }
 
     pub(crate) fn checkpoint_extension_configs(
@@ -16681,6 +16762,7 @@ impl Storage {
     pub(crate) fn checkpoint_acls(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
         self.acl_entries.iter().enumerate().filter(|(_, value)| {
             value.object.slot != u16::MAX
+                && !self.access_object_is_temporary(value.object, 0)
                 && (value.live
                     || (value.object.class == AccessClass::Schema
                         && value.grantee == PUBLIC_ROLE
@@ -16700,7 +16782,9 @@ impl Storage {
         self.column_acl_entries
             .iter()
             .enumerate()
-            .filter(|(_, value)| value.live)
+            .filter(|(_, value)| {
+                value.live && !self.access_object_is_temporary(value.target.relation, 0)
+            })
     }
 
     pub(crate) fn access_class_slots(&self, class: AccessClass) -> usize {
@@ -20927,15 +21011,18 @@ impl Storage {
             }
             return Some(ResolvedRelation::Table(t));
         }
-        self.views
-            .iter()
-            .position(|v| {
-                v.database == self.current_database
-                    && v.visible_to(txid)
-                    && v.schema_for(txid).as_str() == schema
-                    && v.name_for(txid).as_str() == name
-            })
-            .map(ResolvedRelation::View)
+        let view = self.views.iter().position(|v| {
+            v.database == self.current_database
+                && v.visible_to(txid)
+                && v.schema_for(txid).as_str() == schema
+                && v.name_for(txid).as_str() == name
+        });
+        if let Some(slot) = view
+            && self.views[slot].persistence == RelationPersistence::Temporary
+        {
+            self.mark_temporary_transaction(txid);
+        }
+        view.map(ResolvedRelation::View)
     }
 
     /// The kind of a relation named `name` in `schema` (visible to `txid`), or
@@ -29756,7 +29843,7 @@ impl Storage {
             ));
         };
         if let Some(old) = existing {
-            self.pending_drop_view(old, txid);
+            self.pending_replace_view(old, txid);
         }
         let ownership = self.initial_ownership(txid);
         self.clear_object_acl_entries(AccessObject {
@@ -29769,6 +29856,7 @@ impl Storage {
             created_at: self.catalog_seq,
             schema,
             name,
+            persistence: definition.persistence,
             return_rule: u16::MAX,
             options: definition.options,
             columns: definition.columns,
@@ -29779,6 +29867,9 @@ impl Storage {
             pending_columns: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        if definition.persistence == RelationPersistence::Temporary {
+            self.mark_temporary_transaction(txid);
+        }
         let mut source = StackStr::<RULE_SQL_MAX>::new();
         use core::fmt::Write as _;
         let _ = source.write_str(definition.query.sql.as_str());
@@ -29816,6 +29907,43 @@ impl Storage {
         debug_assert!(prior.is_none());
         self.views[new].return_rule = rule as u16;
         Ok((new, existing))
+    }
+
+    /// Restores a checkpointed view at its durable catalog slot. View OIDs and
+    /// relation-target comment identities are slot-derived, so compacting a
+    /// replacement-created hole during recovery would corrupt both.
+    pub(crate) fn restore_view_at(
+        &mut self,
+        slot: usize,
+        schema: SqlName,
+        name: SqlName,
+        definition: ViewDefinition,
+    ) -> Result<(), SqlError> {
+        if slot >= self.views.len() || self.views[slot].ddl_state != CatalogDdlState::Absent {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "checkpoint view slot is unavailable"
+            ));
+        }
+        let (created, replaced) = self.create_view(schema, name, definition, true, 0)?;
+        if replaced.is_some() {
+            self.rollback_view_create(created);
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "checkpoint contains a duplicate view"
+            ));
+        }
+        if created != slot {
+            self.views[slot] = self.views[created].clone();
+            self.views[created].ddl_state = CatalogDdlState::Absent;
+            let return_rule = usize::from(self.views[slot].return_rule);
+            self.rules[return_rule].definition.target = RuleTarget::View(slot as u16);
+            if let Some(pending) = &mut self.rules[return_rule].pending {
+                pending.definition.target = RuleTarget::View(slot as u16);
+            }
+        }
+        self.commit_view_create(slot);
+        Ok(())
     }
 
     /// Marks the view visible to `txid` pending-dropped; returns its slot (for
@@ -29861,27 +29989,95 @@ impl Storage {
         }
     }
 
+    /// A replacement retires only the old view and its SELECT rule. User
+    /// rules, triggers, extension membership, and stored-query references
+    /// belong to the logical view and are retargeted to the new catalog slot.
+    fn pending_replace_view(&mut self, slot: usize, txid: u32) {
+        self.views[slot].ddl_state = self.views[slot].ddl_state.drop_by(txid);
+        let return_rule = usize::from(self.views[slot].return_rule);
+        self.rules[return_rule].ddl_state = self.rules[return_rule].ddl_state.drop_by(txid);
+    }
+
+    /// Moves the internal identity of a replaced view between physical catalog
+    /// slots. The same operation in the opposite direction is the rollback.
+    pub(crate) fn retarget_view_dependents(&mut self, from: usize, to: usize) {
+        let schema = self.views[to].schema;
+        let name = self.views[to].name;
+        self.replace_stored_query_dependency_slot(DependencyClass::View, from, to, schema, name);
+
+        let old_rule_subid = RuleTarget::View(from as u16).comment_subid();
+        let new_rule_subid = RuleTarget::View(to as u16).comment_subid();
+        let excluded_return_rule = usize::from(self.views[from].return_rule);
+        let mut moved_rule = false;
+        for (slot, rule) in self.rules.iter_mut().enumerate() {
+            if slot == excluded_return_rule || rule.ddl_state == CatalogDdlState::Absent {
+                continue;
+            }
+            let mut changed = false;
+            if rule.definition.target == RuleTarget::View(from as u16) {
+                rule.definition.target = RuleTarget::View(to as u16);
+                changed = true;
+            }
+            if let Some(pending) = &mut rule.pending
+                && pending.definition.target == RuleTarget::View(from as u16)
+            {
+                pending.definition.target = RuleTarget::View(to as u16);
+                changed = true;
+            }
+            moved_rule |= changed;
+        }
+        if moved_rule {
+            for comment in self.comments.iter_mut().filter(|comment| {
+                comment.used
+                    && comment.database == Some(self.current_database)
+                    && comment.class == CommentClass::Rule
+                    && comment.subid == old_rule_subid
+            }) {
+                comment.subid = new_rule_subid;
+            }
+        }
+
+        let old_trigger_target = TriggerTarget::View(from as u16);
+        let new_trigger_target = TriggerTarget::View(to as u16);
+        let mut moved_trigger = false;
+        for trigger in self.triggers.iter_mut().filter(|trigger| {
+            trigger.database == self.current_database
+                && trigger.ddl_state != CatalogDdlState::Absent
+                && trigger.target == old_trigger_target
+        }) {
+            trigger.target = new_trigger_target;
+            moved_trigger = true;
+        }
+        if moved_trigger {
+            let old_subid = old_trigger_target.comment_subid();
+            let new_subid = new_trigger_target.comment_subid();
+            for comment in self.comments.iter_mut().filter(|comment| {
+                comment.used
+                    && comment.database == Some(self.current_database)
+                    && comment.class == CommentClass::Trigger
+                    && comment.subid == old_subid
+            }) {
+                comment.subid = new_subid;
+            }
+        }
+
+        let old_object = AccessObject {
+            class: AccessClass::View,
+            slot: from as u16,
+        };
+        let new_object = AccessObject {
+            class: AccessClass::View,
+            slot: to as u16,
+        };
+        for dependency in self.extension_dependencies.iter_mut() {
+            if dependency.object == old_object {
+                dependency.object = new_object;
+            }
+        }
+    }
+
     /// Promotes an uncommitted CREATE VIEW into the committed catalog.
     pub fn commit_view_create(&mut self, slot: usize) {
-        let database = self.views[slot].database;
-        let schema = self.views[slot].schema;
-        let name = self.views[slot].name;
-        if let Some(old_slot) = self.views.iter().enumerate().find_map(|(old_slot, view)| {
-            (old_slot != slot
-                && view.database == database
-                && view.ddl_state == CatalogDdlState::Present
-                && view.schema == schema
-                && view.name == name)
-                .then_some(old_slot)
-        }) {
-            self.replace_stored_query_dependency_slot(
-                DependencyClass::View,
-                old_slot,
-                slot,
-                schema,
-                name,
-            );
-        }
         self.views[slot].ddl_state = self.views[slot].ddl_state.commit_create();
         self.commit_rule_create(usize::from(self.views[slot].return_rule));
     }
@@ -30152,12 +30348,25 @@ impl Storage {
                 self.commit_rule_drop(rule_slot);
             }
         }
+        self.commit_triggers_for_view(slot);
+        self.clear_extension_dependencies_for_object(AccessObject {
+            class: AccessClass::View,
+            slot: slot as u16,
+        });
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::View,
+            slot: slot as u16,
+        });
         self.views[slot].ddl_state = self.views[slot].ddl_state.commit_drop();
     }
 
     /// Discards an uncommitted CREATE VIEW (rollback): the slot is freed.
     pub fn rollback_view_create(&mut self, slot: usize) {
         self.rollback_rule_create(usize::from(self.views[slot].return_rule), None);
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::View,
+            slot: slot as u16,
+        });
         self.views[slot].ddl_state = self.views[slot].ddl_state.rollback_create();
     }
 
@@ -32915,6 +33124,19 @@ impl Storage {
     /// retires them in the same catalog transition.
     pub(crate) fn commit_triggers_for_table(&mut self, table: usize) {
         let target = TriggerTarget::Table(table as u16);
+        self.drop_trigger_comments_for_target(target);
+        for slot in 0..self.triggers.len() {
+            let trigger = self.triggers[slot];
+            if trigger.ddl_state != CatalogDdlState::Absent && trigger.target == target {
+                self.triggers[slot].ddl_state = CatalogDdlState::Absent;
+                self.triggers[slot].pending_definition = None;
+                self.clear_trigger_dependents(slot, trigger);
+            }
+        }
+    }
+
+    pub(crate) fn commit_triggers_for_view(&mut self, view: usize) {
+        let target = TriggerTarget::View(view as u16);
         self.drop_trigger_comments_for_target(target);
         for slot in 0..self.triggers.len() {
             let trigger = self.triggers[slot];

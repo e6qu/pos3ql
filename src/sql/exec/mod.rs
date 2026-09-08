@@ -12060,20 +12060,26 @@ pub fn drop_schema(
                 }
             }
             SchemaObject::View(v) => {
-                let (schema, vname) = {
+                let (schema, vname, temporary) = {
                     let view = storage.view(*v);
-                    (view.schema, view.name)
+                    (
+                        view.schema,
+                        view.name,
+                        view.persistence == crate::storage::RelationPersistence::Temporary,
+                    )
                 };
-                let lsn = storage.bump_lsn();
-                if let Err(e) = wal.stage(
-                    txn.txid,
-                    lsn,
-                    &WalOp::DropView {
-                        schema: schema.as_str(),
-                        name: vname.as_str(),
-                    },
-                ) {
-                    return sql_fail(e);
+                if !temporary {
+                    let lsn = storage.bump_lsn();
+                    if let Err(e) = wal.stage(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropView {
+                            schema: schema.as_str(),
+                            name: vname.as_str(),
+                        },
+                    ) {
+                        return sql_fail(e);
+                    }
                 }
                 let dropped = match storage.drop_view(schema.as_str(), vname.as_str(), txn.txid) {
                     Ok(d) => d,
@@ -14147,6 +14153,7 @@ fn replica_identity_columns(
 /// transaction and response dependencies distinct from statement input.
 pub struct CreateViewCommand<'a> {
     pub name: &'a QualName<'a>,
+    pub persistence: super::ast::RelationPersistence,
     pub columns: &'a [&'a str],
     pub or_replace: bool,
     pub security: super::ast::ViewSecurity,
@@ -20012,6 +20019,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 let requalified = super::requalify_schema_element(element, name, context.arena)?;
                 if let Stmt::CreateView {
                     name: view_name,
+                    persistence,
                     columns,
                     or_replace,
                     security,
@@ -20056,6 +20064,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                                         txn,
                                         super::exec::CreateViewCommand {
                                             name: view_name,
+                                            persistence: *persistence,
                                             columns,
                                             or_replace: *or_replace,
                                             security: *security,
@@ -20308,6 +20317,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 }
                 Stmt::CreateView {
                     name,
+                    persistence,
                     columns,
                     or_replace,
                     security,
@@ -20320,6 +20330,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     super::exec::CreateViewCommand {
                         name,
+                        persistence: *persistence,
                         columns,
                         or_replace: *or_replace,
                         security: *security,
@@ -34143,6 +34154,7 @@ pub fn create_view(
 ) -> Outcome {
     let CreateViewCommand {
         name,
+        persistence: requested_persistence,
         columns,
         or_replace,
         security,
@@ -34208,9 +34220,58 @@ pub fn create_view(
             Err(error) => return sql_fail(error),
         }
     };
+    let dependencies = match super::query::stored_query_dependencies(
+        buffer.as_str(),
+        storage,
+        txn.txid,
+        path,
+        arena,
+    ) {
+        Ok(dependencies) => dependencies,
+        Err(error) => return sql_fail(error),
+    };
+    let inferred_temporary = stored_query_uses_temporary_relation(storage, &dependencies, txn.txid);
+    let persistence = match (requested_persistence, inferred_temporary) {
+        (super::ast::RelationPersistence::Unlogged, _) => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "views cannot be unlogged"
+            ));
+        }
+        (super::ast::RelationPersistence::Temporary, _)
+        | (super::ast::RelationPersistence::Permanent, true) => {
+            crate::storage::RelationPersistence::Temporary
+        }
+        (super::ast::RelationPersistence::Permanent, false) => {
+            crate::storage::RelationPersistence::Permanent
+        }
+    };
+    let schema = match if persistence == crate::storage::RelationPersistence::Temporary {
+        if name.schema.is_some_and(|schema| schema != "pg_temp") {
+            Err(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "cannot create temporary relation in non-temporary schema"
+            ))
+        } else {
+            storage
+                .require_temporary_privilege(txn.txid)
+                .and_then(|()| storage.temporary_schema())
+        }
+    } else {
+        storage.creation_schema(name.schema, name.name, txn.txid)
+    } {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    let sqlname = match SqlName::parse(name.name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
     if or_replace
-        && let Some(crate::storage::ResolvedRelation::View(slot)) =
-            storage.resolve_relation(name.schema, name.name, txn.txid)
+        && let Some(slot) = storage.views_visible_to(txn.txid).find_map(|(slot, view)| {
+            (view.schema_for(txn.txid) == schema && view.name_for(txn.txid) == sqlname)
+                .then_some(slot)
+        })
     {
         let prior = *storage.view(slot).columns_for(txn.txid);
         if prior.len() > columns.len() {
@@ -34269,37 +34330,18 @@ pub fn create_view(
             };
         }
     }
-    let dependencies = match super::query::stored_query_dependencies(
-        buffer.as_str(),
-        storage,
-        txn.txid,
-        path,
-        arena,
-    ) {
-        Ok(dependencies) => dependencies,
-        Err(error) => return sql_fail(error),
-    };
-    if stored_query_uses_temporary_relation(storage, &dependencies, txn.txid) {
-        return sql_fail(if name.schema.is_some_and(|schema| schema != "pg_temp") {
-            sql_err!(
-                sqlstate::INVALID_TABLE_DEFINITION,
-                "cannot create temporary relation in non-temporary schema"
-            )
-        } else {
-            sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "temporary views are not supported"
-            )
-        });
+    if inferred_temporary
+        && matches!(persistence, crate::storage::RelationPersistence::Temporary)
+        && matches!(
+            requested_persistence,
+            super::ast::RelationPersistence::Permanent
+        )
+    {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            stack_format!(128, "view \"{}\" will be a temporary view", name.name).as_str(),
+        )?;
     }
-    let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
-        Ok(n) => n,
-        Err(e) => return sql_fail(e),
-    };
-    let sqlname = match SqlName::parse(name.name) {
-        Ok(n) => n,
-        Err(e) => return sql_fail(e),
-    };
     let mut creation_path = crate::util::StackStr::<128>::new();
     let _ = core::fmt::Write::write_str(&mut creation_path, raw_path);
     if creation_path.is_truncated() {
@@ -34312,6 +34354,7 @@ pub fn create_view(
         schema,
         sqlname,
         crate::storage::ViewDefinition {
+            persistence,
             columns,
             query: crate::storage::StoredQueryDefinition {
                 sql: buffer,
@@ -34368,29 +34411,36 @@ pub fn create_view(
                     }
                 }
             }
-            let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::CreateView {
-                    schema: schema.as_str(),
-                    name: name.name,
-                    columns,
-                    sql,
-                    path: raw_path,
-                    security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
-                    security_barrier: match security_barrier {
-                        super::ast::ViewSecurityBarrier::Default => 0,
-                        super::ast::ViewSecurityBarrier::Enabled => 1,
-                        super::ast::ViewSecurityBarrier::Disabled => 2,
+            let staged = if persistence == crate::storage::RelationPersistence::Temporary {
+                Ok(())
+            } else {
+                let lsn = storage.bump_lsn();
+                wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::CreateView {
+                        schema: schema.as_str(),
+                        name: name.name,
+                        columns,
+                        sql,
+                        path: raw_path,
+                        security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
+                        security_barrier: match security_barrier {
+                            super::ast::ViewSecurityBarrier::Default => 0,
+                            super::ast::ViewSecurityBarrier::Enabled => 1,
+                            super::ast::ViewSecurityBarrier::Disabled => 2,
+                        },
+                        check_option: check_option.map_or(0, |option| match option {
+                            super::ast::ViewCheckOption::Local => 1,
+                            super::ast::ViewCheckOption::Cascaded => 2,
+                        }),
+                        dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                            &dependencies,
+                        ),
                     },
-                    check_option: check_option.map_or(0, |option| match option {
-                        super::ast::ViewCheckOption::Local => 1,
-                        super::ast::ViewCheckOption::Cascaded => 2,
-                    }),
-                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
-                },
-            ) {
+                )
+            };
+            if let Err(e) = staged {
                 // The journal rejected the record; undo the in-memory apply.
                 storage.rollback_view_create(new_slot);
                 if let Some(o) = old_slot {
@@ -34421,10 +34471,14 @@ pub fn create_view(
             {
                 return sql_fail(error);
             }
-            if let Some(o) = old_slot
-                && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(o as u32))
-            {
-                return sql_fail(e);
+            if let Some(old) = old_slot {
+                if let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
+                    old: old as u32,
+                    new: new_slot as u32,
+                }) {
+                    return sql_fail(e);
+                }
+                storage.retarget_view_dependents(old, new_slot);
             }
         }
         Err(e) => return sql_fail(e),
@@ -34452,6 +34506,10 @@ fn stored_query_uses_temporary_relation(
                 storage
                     .sequence_for(usize::from(dependency.slot), txid)
                     .persistence
+                    == crate::storage::RelationPersistence::Temporary
+            }
+            crate::storage::DependencyClass::View => {
+                storage.view(usize::from(dependency.slot)).persistence
                     == crate::storage::RelationPersistence::Temporary
             }
             _ => false,
@@ -34521,6 +34579,15 @@ pub fn alter_view(
             responder.command_complete("ALTER VIEW")?;
             return sql_ok();
         }
+        if storage.view(slot).persistence == crate::storage::RelationPersistence::Temporary
+            || new_schema == "pg_temp"
+            || new_schema.starts_with("pg_temp_")
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot move objects into or out of temporary schemas"
+            ));
+        }
         if storage.find_schema_visible(new_schema, txn.txid).is_none() {
             return sql_fail(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
@@ -34551,16 +34618,19 @@ pub fn alter_view(
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::SetViewSchema {
-                schema: schema.as_str(),
-                name: view_name.as_str(),
-                new_schema,
-            },
-        ) {
+        let staged = {
+            let lsn = storage.bump_lsn();
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetViewSchema {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                    new_schema,
+                },
+            )
+        };
+        if let Err(error) = staged {
             storage.rollback_view_schema(slot, prior);
             return sql_fail(error);
         }
@@ -34691,16 +34761,23 @@ pub fn alter_view(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::SetViewColumns {
-                    schema: schema.as_str(),
-                    name: view_name.as_str(),
-                    columns,
-                },
-            ) {
+            let staged = if storage.view(slot).persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                Ok(())
+            } else {
+                let lsn = storage.bump_lsn();
+                wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::SetViewColumns {
+                        schema: schema.as_str(),
+                        name: view_name.as_str(),
+                        columns,
+                    },
+                )
+            };
+            if let Err(error) = staged {
                 storage.rollback_view_columns(slot, prior);
                 return sql_fail(error);
             }
@@ -34735,16 +34812,23 @@ pub fn alter_view(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::SetViewColumns {
-                    schema: schema.as_str(),
-                    name: view_name.as_str(),
-                    columns,
-                },
-            ) {
+            let staged = if storage.view(slot).persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                Ok(())
+            } else {
+                let lsn = storage.bump_lsn();
+                wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::SetViewColumns {
+                        schema: schema.as_str(),
+                        name: view_name.as_str(),
+                        columns,
+                    },
+                )
+            };
+            if let Err(error) = staged {
                 storage.rollback_view_columns(slot, prior);
                 return sql_fail(error);
             }
@@ -34783,16 +34867,23 @@ pub fn alter_view(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::SetViewColumns {
-                    schema: schema.as_str(),
-                    name: view_name.as_str(),
-                    columns,
-                },
-            ) {
+            let staged = if storage.view(slot).persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                Ok(())
+            } else {
+                let lsn = storage.bump_lsn();
+                wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::SetViewColumns {
+                        schema: schema.as_str(),
+                        name: view_name.as_str(),
+                        columns,
+                    },
+                )
+            };
+            if let Err(error) = staged {
                 storage.rollback_view_columns(slot, prior);
                 return sql_fail(error);
             }
@@ -34801,6 +34892,20 @@ pub fn alter_view(
                 prior,
             }) {
                 storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = rewrite_view_column_dependents(
+                storage,
+                wal,
+                txn,
+                slot,
+                index,
+                CompositeFieldRename {
+                    from: SqlName::parse(from).expect("resolved view column name fits"),
+                    to: name,
+                },
+                arena,
+            ) {
                 return sql_fail(error);
             }
             responder.command_complete("ALTER VIEW")?;
@@ -34830,16 +34935,23 @@ pub fn alter_view(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::RenameView {
-                    schema: schema.as_str(),
-                    name: current_name.as_str(),
-                    new_name,
-                },
-            ) {
+            let staged = if storage.view(slot).persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                Ok(())
+            } else {
+                let lsn = storage.bump_lsn();
+                wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::RenameView {
+                        schema: schema.as_str(),
+                        name: current_name.as_str(),
+                        new_name,
+                    },
+                )
+            };
+            if let Err(error) = staged {
                 storage.rollback_view_rename(slot, prior);
                 return sql_fail(error);
             }
@@ -34867,20 +34979,26 @@ pub fn alter_view(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
-        txn.txid,
-        lsn,
-        &WalOp::SetViewOptions {
-            schema: schema.as_str(),
-            name: view_name.as_str(),
-            security_invoker: matches!(options.security, crate::storage::ViewSecurity::Invoker),
-            security_barrier: options.security_barrier.code(),
-            check_option: options
-                .check_option
-                .map_or(0, crate::storage::ViewCheckOption::code),
-        },
-    ) {
+    let staged = if storage.view(slot).persistence == crate::storage::RelationPersistence::Temporary
+    {
+        Ok(())
+    } else {
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetViewOptions {
+                schema: schema.as_str(),
+                name: view_name.as_str(),
+                security_invoker: matches!(options.security, crate::storage::ViewSecurity::Invoker),
+                security_barrier: options.security_barrier.code(),
+                check_option: options
+                    .check_option
+                    .map_or(0, crate::storage::ViewCheckOption::code),
+            },
+        )
+    };
+    if let Err(error) = staged {
         storage.rollback_view_options(slot, prior);
         return sql_fail(error);
     }
@@ -34893,6 +35011,143 @@ pub fn alter_view(
     }
     responder.command_complete("ALTER VIEW")?;
     sql_ok()
+}
+
+fn rewrite_view_column_dependents(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    source_view: usize,
+    source_column: usize,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let view_count = storage.view_count();
+    let created_through = (0..view_count)
+        .filter(|&slot| storage.view(slot).visible_to(txn.txid))
+        .map(|slot| storage.view(slot).created_at)
+        .max()
+        .unwrap_or(0);
+    for view_slot in 0..view_count {
+        if view_slot == source_view
+            || !storage.view(view_slot).visible_to(txn.txid)
+            || storage.view(view_slot).created_at > created_through
+        {
+            continue;
+        }
+        let dependencies = *storage.view_dependencies(view_slot);
+        let references_column = dependencies.entries().iter().any(|dependency| {
+            dependency.class == crate::storage::DependencyClass::View
+                && usize::from(dependency.slot) == source_view
+                && dependency.referenced_columns & (1u64 << source_column) != 0
+        });
+        if !references_column {
+            continue;
+        }
+
+        let view = storage.view(view_slot).clone();
+        let view_sql =
+            StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(storage.view_sql(view_slot));
+        let rewritten = rewrite_relation_column_identifiers(view_sql.as_str(), rename, arena)?;
+        if rewritten == view_sql {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "dependent view column binding has no matching stored identifier"
+            ));
+        }
+        let creation_path = StackStr::<128>::from_str(storage.view_creation_path(view_slot));
+        let user = super::eval::funcs::system::session_user_owned();
+        let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
+        let rebound = super::query::stored_query_dependencies(
+            rewritten.as_str(),
+            storage,
+            txn.txid,
+            path,
+            arena,
+        )?;
+        if rebound != dependencies {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "view column rename would change a dependent view binding"
+            ));
+        }
+
+        let dependent_columns = view.columns.with_aliases(true);
+        let (new_slot, old_slot) = storage.create_view(
+            view.schema,
+            view.name,
+            crate::storage::ViewDefinition {
+                persistence: view.persistence,
+                columns: dependent_columns,
+                query: crate::storage::StoredQueryDefinition {
+                    sql: rewritten,
+                    creation_path,
+                    dependencies,
+                },
+                options: crate::storage::ViewOptions {
+                    ..view.options_for(txn.txid)
+                },
+            },
+            true,
+            txn.txid,
+        )?;
+        let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
+            Ok(())
+        } else {
+            let lsn = storage.bump_lsn();
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateView {
+                    schema: view.schema.as_str(),
+                    name: view.name.as_str(),
+                    columns: dependent_columns,
+                    sql: rewritten.as_str(),
+                    path: creation_path.as_str(),
+                    security_invoker: matches!(
+                        view.security_for(txn.txid),
+                        crate::storage::ViewSecurity::Invoker
+                    ),
+                    security_barrier: view.security_barrier_for(txn.txid).code(),
+                    check_option: view
+                        .check_option_for(txn.txid)
+                        .map_or(0, |option| option.code()),
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
+                },
+            )
+        };
+        if let Err(error) = staged {
+            storage.rollback_view_create(new_slot);
+            if let Some(old_slot) = old_slot {
+                storage.rollback_view_drop(old_slot, txn.txid);
+            }
+            return Err(error);
+        }
+        txn.record_ddl(super::txn::DdlUndo::ViewCreated(new_slot as u32))?;
+        let old_slot = old_slot.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "dependent view replacement lost its prior definition"
+            )
+        })?;
+        let old_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: old_slot as u16,
+        };
+        let new_object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: new_slot as u16,
+        };
+        let owner = storage.object_owner(old_object, txn.txid);
+        storage.set_object_owner(new_object, owner, txn.txid);
+        preserve_object_acl(storage, txn, old_object, new_object)?;
+        txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
+            old: old_slot as u32,
+            new: new_slot as u32,
+        })?;
+        storage.retarget_view_dependents(old_slot, new_slot);
+    }
+    Ok(())
 }
 
 fn rule_target(
@@ -35594,12 +35849,7 @@ pub fn drop_rule(
             )
         }
     };
-    let temporary = matches!(
-        target,
-        crate::storage::RuleTarget::Table(table)
-            if storage.table_def(usize::from(table), txn.txid).persistence
-                == crate::storage::RelationPersistence::Temporary
-    );
+    let temporary = storage.access_object_is_temporary(target.access_object(), txn.txid);
     if !temporary {
         let lsn = storage.lsn() + 1;
         if let Err(error) = wal.stage(
@@ -35632,12 +35882,7 @@ fn stage_rule(
     slot: usize,
     definition: crate::storage::RuleDefinition,
 ) -> Result<(), SqlError> {
-    if matches!(
-        definition.target,
-        crate::storage::RuleTarget::Table(table)
-            if storage.table_def(usize::from(table), txn.txid).persistence
-                == crate::storage::RelationPersistence::Temporary
-    ) {
+    if storage.access_object_is_temporary(definition.target.access_object(), txn.txid) {
         return Ok(());
     }
     let (target, schema, relation) = match definition.target {
@@ -36592,6 +36837,7 @@ fn stage_comment(
     let temporary = match identity.class {
         crate::storage::CommentClass::Relation => [
             crate::storage::AccessClass::Table,
+            crate::storage::AccessClass::View,
             crate::storage::AccessClass::Index,
             crate::storage::AccessClass::Sequence,
         ]
@@ -36617,12 +36863,21 @@ fn stage_comment(
             )
             .is_some_and(|object| storage.access_object_is_temporary(object, txn.txid)),
         crate::storage::CommentClass::Trigger | crate::storage::CommentClass::Rule
-            if identity.subid != 0 && identity.subid & (1 << 31) == 0 =>
+            if identity.subid != 0 =>
         {
-            storage
-                .table_def((identity.subid - 1) as usize, txn.txid)
-                .persistence
-                == crate::storage::RelationPersistence::Temporary
+            let view = identity.subid & (1 << 31) != 0;
+            let slot = (identity.subid & !(1 << 31)).saturating_sub(1) as u16;
+            storage.access_object_is_temporary(
+                crate::storage::AccessObject {
+                    class: if view {
+                        crate::storage::AccessClass::View
+                    } else {
+                        crate::storage::AccessClass::Table
+                    },
+                    slot,
+                },
+                txn.txid,
+            )
         }
         crate::storage::CommentClass::Policy => storage
             .policies_with_slots_visible_to(txn.txid)
@@ -42454,12 +42709,12 @@ fn stage_rule_drop(
     txn: &TxnState,
     definition: crate::storage::RuleDefinition,
 ) -> Result<(), SqlError> {
+    if storage.access_object_is_temporary(definition.target.access_object(), txn.txid) {
+        return Ok(());
+    }
     let (target, schema, relation) = match definition.target {
         crate::storage::RuleTarget::Table(table) => {
             let table = storage.table_def(usize::from(table), txn.txid);
-            if table.persistence == crate::storage::RelationPersistence::Temporary {
-                return Ok(());
-            }
             (
                 crate::wal::TriggerTargetKind::Table,
                 table.schema,
@@ -42490,12 +42745,12 @@ fn stage_trigger_drop(
     txn: &TxnState,
     trigger: crate::storage::TriggerDef,
 ) -> Result<(), SqlError> {
+    if storage.access_object_is_temporary(trigger.target.access_object(), txn.txid) {
+        return Ok(());
+    }
     let (target, schema, relation) = match trigger.target {
         crate::storage::TriggerTarget::Table(table) => {
             let table = storage.table_def(usize::from(table), txn.txid);
-            if table.persistence == crate::storage::RelationPersistence::Temporary {
-                return Ok(());
-            }
             (
                 crate::wal::TriggerTargetKind::Table,
                 table.schema,
@@ -42526,20 +42781,26 @@ fn drop_view_slot(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
-    let (schema, name) = {
+    let (schema, name, temporary) = {
         let view = storage.view(slot);
-        (view.schema, view.name)
+        (
+            view.schema,
+            view.name,
+            view.persistence == crate::storage::RelationPersistence::Temporary,
+        )
     };
     drop_view_trigger_dependencies(storage, wal, txn, slot)?;
-    let lsn = storage.bump_lsn();
-    wal.stage(
-        txn.txid,
-        lsn,
-        &WalOp::DropView {
-            schema: schema.as_str(),
-            name: name.as_str(),
-        },
-    )?;
+    if !temporary {
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropView {
+                schema: schema.as_str(),
+                name: name.as_str(),
+            },
+        )?;
+    }
     if let Some(slot) = storage.drop_view(schema.as_str(), name.as_str(), txn.txid)? {
         txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))?;
     }
@@ -42561,17 +42822,19 @@ fn drop_view_trigger_dependencies(
             let view = storage.view(view_slot);
             (view.schema, view.name)
         };
-        let lsn = storage.bump_lsn();
-        wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::DropTrigger {
-                name: trigger.name_to(txn.txid).as_str(),
-                target: crate::wal::TriggerTargetKind::View,
-                table_schema: schema.as_str(),
-                table: name.as_str(),
-            },
-        )?;
+        if storage.view(view_slot).persistence != crate::storage::RelationPersistence::Temporary {
+            let lsn = storage.bump_lsn();
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::DropTrigger {
+                    name: trigger.name_to(txn.txid).as_str(),
+                    target: crate::wal::TriggerTargetKind::View,
+                    table_schema: schema.as_str(),
+                    table: name.as_str(),
+                },
+            )?;
+        }
         storage.drop_trigger(slot, txn.txid);
         txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
     }
@@ -43606,6 +43869,80 @@ fn rewrite_table_publication_column_references(
     Ok(())
 }
 
+fn rewrite_relation_column_identifiers<const N: usize>(
+    text: &str,
+    rename: CompositeFieldRename,
+    arena: &Arena,
+) -> Result<crate::util::StackStr<N>, SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    use core::fmt::Write;
+
+    let mut output = crate::util::StackStr::<N>::new();
+    let mut lexer = Lexer::new(text, arena);
+    let mut previous = None;
+    let mut before_previous = None;
+    let mut copied = 0usize;
+    loop {
+        let token = lexer.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored query at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })?;
+        if token == Tok::Eof {
+            break;
+        }
+        let mut lookahead = lexer.clone();
+        let next = lookahead.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored query at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })?;
+        let matches_name = match token {
+            Tok::Ident(name) | Tok::QuotedIdent(name) => {
+                name.eq_ignore_ascii_case(rename.from.as_str())
+            }
+            _ => false,
+        };
+        let is_function = next == Tok::Op("(");
+        let is_relation_qualifier = next == Tok::Op(".");
+        let is_type_or_collation = previous == Some(Tok::Op("::"))
+            || matches!(previous, Some(Tok::Ident("as") | Tok::Ident("collate")));
+        let is_composite_selector = previous == Some(Tok::Op("."))
+            && matches!(before_previous, Some(Tok::Op(")") | Tok::Op("]")));
+        if matches_name
+            && !is_function
+            && !is_relation_qualifier
+            && !is_type_or_collation
+            && !is_composite_selector
+        {
+            let start = lexer.token_start();
+            let end = raw_identifier_end(text, start).ok_or_else(|| {
+                sql_err!(sqlstate::SYNTAX_ERROR, "invalid stored query identifier")
+            })?;
+            let _ = output.write_str(&text[copied..start]);
+            write_identifier(&mut output, rename.to.as_str());
+            copied = end;
+        }
+        before_previous = previous;
+        previous = Some(token);
+    }
+    let _ = output.write_str(&text[copied..]);
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "rewritten stored query exceeds {} bytes",
+            N
+        ));
+    }
+    Ok(output)
+}
+
 fn rewrite_table_column_reference<const N: usize>(
     text: &str,
     current: &TableDef,
@@ -43847,28 +44184,30 @@ fn rewrite_composite_dependent_tables(
             mapping[position] = Some(column.name);
         }
         storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
-        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
-        for (position, target) in wal_mapping.iter_mut().enumerate().take(current.n_columns) {
-            *target = position as u16;
-        }
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::BeginTableRewrite {
-                previous_schema: current.schema.as_str(),
-                previous_name: current.name.as_str(),
-                preserve_rows: true,
-                column_mapping: wal_mapping,
-            },
-        ) {
-            storage.rollback_table_def(table_slot, txn.txid);
-            return Err(error);
-        }
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered)) {
-            storage.rollback_table_def(table_slot, txn.txid);
-            return Err(error);
+        if current.persistence != crate::storage::RelationPersistence::Temporary {
+            let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+            for (position, target) in wal_mapping.iter_mut().enumerate().take(current.n_columns) {
+                *target = position as u16;
+            }
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::BeginTableRewrite {
+                    previous_schema: current.schema.as_str(),
+                    previous_name: current.name.as_str(),
+                    preserve_rows: true,
+                    column_mapping: wal_mapping,
+                },
+            ) {
+                storage.rollback_table_def(table_slot, txn.txid);
+                return Err(error);
+            }
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered)) {
+                storage.rollback_table_def(table_slot, txn.txid);
+                return Err(error);
+            }
         }
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
             storage.rollback_table_def(table_slot, txn.txid);
@@ -43932,6 +44271,7 @@ fn rewrite_composite_dependent_views(
             view.schema,
             view.name,
             crate::storage::ViewDefinition {
+                persistence: view.persistence,
                 columns: view.columns,
                 query: crate::storage::StoredQueryDefinition {
                     sql: rewritten,
@@ -43945,27 +44285,32 @@ fn rewrite_composite_dependent_views(
             true,
             txn.txid,
         )?;
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::CreateView {
-                schema: view.schema.as_str(),
-                name: view.name.as_str(),
-                columns: view.columns,
-                sql: rewritten.as_str(),
-                path: creation_path.as_str(),
-                security_invoker: matches!(
-                    view.security_for(txn.txid),
-                    crate::storage::ViewSecurity::Invoker
-                ),
-                security_barrier: view.security_barrier_for(txn.txid).code(),
-                check_option: view
-                    .check_option_for(txn.txid)
-                    .map_or(0, |option| option.code()),
-                dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
-            },
-        ) {
+        let staged = if view.persistence == crate::storage::RelationPersistence::Temporary {
+            Ok(())
+        } else {
+            let lsn = storage.bump_lsn();
+            wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateView {
+                    schema: view.schema.as_str(),
+                    name: view.name.as_str(),
+                    columns: view.columns,
+                    sql: rewritten.as_str(),
+                    path: creation_path.as_str(),
+                    security_invoker: matches!(
+                        view.security_for(txn.txid),
+                        crate::storage::ViewSecurity::Invoker
+                    ),
+                    security_barrier: view.security_barrier_for(txn.txid).code(),
+                    check_option: view
+                        .check_option_for(txn.txid)
+                        .map_or(0, |option| option.code()),
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
+                },
+            )
+        };
+        if let Err(error) = staged {
             storage.rollback_view_create(new_slot);
             if let Some(old_slot) = old_slot {
                 storage.rollback_view_drop(old_slot, txn.txid);
@@ -43990,7 +44335,11 @@ fn rewrite_composite_dependent_views(
         let owner = storage.object_owner(old_object, txn.txid);
         storage.set_object_owner(new_object, owner, txn.txid);
         preserve_object_acl(storage, txn, old_object, new_object)?;
-        txn.record_ddl(super::txn::DdlUndo::ViewDropped(old_slot as u32))?;
+        txn.record_ddl(super::txn::DdlUndo::ViewReplaced {
+            old: old_slot as u32,
+            new: new_slot as u32,
+        })?;
+        storage.retarget_view_dependents(old_slot, new_slot);
     }
     Ok(())
 }
@@ -44604,9 +44953,13 @@ pub fn drop_view(
             ) {
                 return sql_fail(error);
             }
-            let (schema, view_name) = {
+            let (schema, view_name, temporary) = {
                 let v = storage.view(slot);
-                (v.schema, v.name)
+                (
+                    v.schema,
+                    v.name,
+                    v.persistence == crate::storage::RelationPersistence::Temporary,
+                )
             };
             let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
                 dependency.class == crate::storage::DependencyClass::View
@@ -44672,16 +45025,18 @@ pub fn drop_view(
             if cascade && let Err(error) = drop_view_trigger_dependencies(storage, wal, txn, slot) {
                 return sql_fail(error);
             }
-            let lsn = storage.bump_lsn();
-            if let Err(e) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::DropView {
-                    schema: schema.as_str(),
-                    name: view_name.as_str(),
-                },
-            ) {
-                return sql_fail(e);
+            if !temporary {
+                let lsn = storage.bump_lsn();
+                if let Err(e) = wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::DropView {
+                        schema: schema.as_str(),
+                        name: view_name.as_str(),
+                    },
+                ) {
+                    return sql_fail(e);
+                }
             }
             let dropped = match storage.drop_view(schema.as_str(), view_name.as_str(), txn.txid) {
                 Ok(d) => d,
@@ -52479,6 +52834,7 @@ pub fn describe_merge_returning<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        bound_table: None,
         view_access: None,
     };
     let joins = arena

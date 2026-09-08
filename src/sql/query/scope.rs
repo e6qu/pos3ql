@@ -984,9 +984,15 @@ impl<'d> QueryScope<'d> {
     ) -> Result<(), SqlError> {
         // `txid == 0` (schema-only / Describe) resolves against the committed
         // catalog; a real transaction sees its own uncommitted CREATE/DROP.
-        let Some(crate::storage::ResolvedRelation::Table(slot)) =
-            storage.resolve_relation(tref.schema, tref.table, txid)
-        else {
+        let slot = tref.bound_table.map(usize::from).or_else(|| {
+            storage
+                .resolve_relation(tref.schema, tref.table, txid)
+                .and_then(|relation| match relation {
+                    crate::storage::ResolvedRelation::Table(slot) => Some(slot),
+                    _ => None,
+                })
+        });
+        let Some(slot) = slot else {
             return Err(match tref.schema {
                 Some(s) => sql_err!(
                     sqlstate::UNDEFINED_TABLE,

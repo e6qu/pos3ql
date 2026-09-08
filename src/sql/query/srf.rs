@@ -1076,6 +1076,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                bound_table: None,
                 view_access: None,
             })
             .map_err(|_| arena_full())?;

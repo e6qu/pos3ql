@@ -9642,8 +9642,7 @@ fn pg_class<'a>(
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_class"));
         }
-        let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
-        let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
+        let n_columns = view.columns_for(txid).len();
         let mut option_values = [Datum::Null; 3];
         let mut option_count = 0;
         if matches!(
@@ -9708,7 +9707,10 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                text("p", arena)?,
+                text(
+                    core::str::from_utf8(&[view.persistence.code()]).unwrap_or("p"),
+                    arena,
+                )?,
                 text("n", arena)?,
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),

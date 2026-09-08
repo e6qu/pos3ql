@@ -1505,14 +1505,15 @@ fn emit_pending_truncates(
         let mut relation_count = 0usize;
         for &table_slot in &truncate.table_slots[..truncate.table_count] {
             let table_slot = table_slot as usize;
-            if !publication_selects(
+            let Some(column_mask) = publication_column_mask(
                 storage,
                 publication_names,
                 table_slot,
                 PublicationOperation::Truncate,
-            )? {
+            )?
+            else {
                 continue;
-            }
+            };
             let output_slot = publication_output_relation(
                 storage,
                 publication_names,
@@ -1529,7 +1530,7 @@ fn emit_pending_truncates(
                 output_slot,
                 definition,
                 relation_id,
-                u64::MAX,
+                column_mask,
                 responder,
                 end_lsn,
             )?;
@@ -16835,6 +16836,7 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
         "server_encoding" => Some("UTF8"),
         "standard_conforming_strings" => Some("on"),
         "integer_datetimes" => Some("on"),
+        "data_directory_mode" => Some("0700"),
         _ => None,
     }
 }
@@ -16848,6 +16850,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "check_function_bodies",
     "client_encoding",
     "client_min_messages",
+    "data_directory_mode",
     "DateStyle",
     "default_transaction_deferrable",
     "default_transaction_isolation",

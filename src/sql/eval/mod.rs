@@ -754,6 +754,9 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    fn replica_identity_index_oid(&self, _relation_oid: i32) -> Option<i32> {
+        None
+    }
     /// Resolves a transaction-visible collation name to its stable identity.
     fn resolve_collation(&self, _schema: Option<&str>, _name: &str) -> Option<Collation> {
         None
@@ -2950,7 +2953,16 @@ pub fn eval_full<'a>(
             all,
         } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
-            let array = eval_full(array, arena, params, row, hooks)?;
+            let mut array = eval_full(array, arena, params, row, hooks)?;
+            array = match array {
+                Datum::Int2Vector(_) => {
+                    cast_to(array, ColType::Array(super::types::ArrElem::Int2), arena)?
+                }
+                Datum::OidVector(_) => {
+                    cast_to(array, ColType::Array(super::types::ArrElem::Oid), arena)?
+                }
+                value => value,
+            };
             let (element, raw) = match array {
                 Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),

@@ -262,26 +262,41 @@ struct StandbyStatusUpdate {
 }
 
 /// Decodes the complete physical-replication status envelope shared by
-/// logical CopyBoth streams. Acknowledgements describe one ordered receiver
-/// frontier: bytes written are at least bytes flushed, which are at least
-/// bytes applied.
+/// logical CopyBoth streams. PostgreSQL treats its write, flush, and apply
+/// positions as independent receiver observations; only flush advances the
+/// durable slot frontier.
 fn standby_status_update(payload: &[u8]) -> Option<StandbyStatusUpdate> {
     if payload.len() != 34 || payload[0] != b'r' {
         return None;
     }
-    let write_lsn = u64::from_be_bytes(payload[1..9].try_into().ok()?);
+    let _write_lsn = u64::from_be_bytes(payload[1..9].try_into().ok()?);
     let flush_lsn = u64::from_be_bytes(payload[9..17].try_into().ok()?);
-    let apply_lsn = u64::from_be_bytes(payload[17..25].try_into().ok()?);
+    let _apply_lsn = u64::from_be_bytes(payload[17..25].try_into().ok()?);
     let _client_time = i64::from_be_bytes(payload[25..33].try_into().ok()?);
     let reply_requested = match payload[33] {
         0 => false,
         1 => true,
         _ => return None,
     };
-    (write_lsn >= flush_lsn && flush_lsn >= apply_lsn).then_some(StandbyStatusUpdate {
+    Some(StandbyStatusUpdate {
         flush_lsn,
         reply_requested,
     })
+}
+
+/// Validates PostgreSQL's hot-standby feedback envelope. pos3ql retention is
+/// slot-LSN based and never prunes catalog tuples by a transaction-id horizon,
+/// so valid xmin advice requires no state transition after this boundary.
+fn hot_standby_feedback(payload: &[u8]) -> bool {
+    if payload.len() != 25 || payload[0] != b'h' {
+        return false;
+    }
+    let _client_time = i64::from_be_bytes(payload[1..9].try_into().unwrap());
+    let _xmin = u32::from_be_bytes(payload[9..13].try_into().unwrap());
+    let _xmin_epoch = u32::from_be_bytes(payload[13..17].try_into().unwrap());
+    let _catalog_xmin = u32::from_be_bytes(payload[17..21].try_into().unwrap());
+    let _catalog_xmin_epoch = u32::from_be_bytes(payload[21..25].try_into().unwrap());
+    true
 }
 
 /// Server-wide authentication context, fixed at startup.
@@ -320,6 +335,10 @@ pub struct Conn {
     auth_reject: bool,
     replication: ReplicationMode,
     replication_stream: Option<ReplicationStream>,
+    /// PostgreSQL flushes backend CopyDone before ending both the COPY and the
+    /// START_REPLICATION command. libpq consumes the first CommandComplete in
+    /// PQendcopy, then exposes the second one to the walreceiver.
+    replication_completion_pending: bool,
     /// Parsed pgoutput publication names. Its startup-sized capacity matches
     /// the configured bound on publications in storage.
     replication_publications: FixedVec<SqlName>,
@@ -423,6 +442,7 @@ impl Conn {
             auth_reject: false,
             replication: ReplicationMode::None,
             replication_stream: None,
+            replication_completion_pending: false,
             replication_publications: FixedVec::new(
                 budget,
                 "replication_publications",
@@ -479,6 +499,7 @@ impl Conn {
         self.auth_reject = false;
         self.replication = ReplicationMode::None;
         self.replication_stream = None;
+        self.replication_completion_pending = false;
         self.replication_publications.clear();
         self.copy = None;
         self.copy_buf.clear();
@@ -513,7 +534,9 @@ impl Conn {
     }
 
     pub fn wants_write(&self) -> bool {
-        !self.send.is_empty() || self.tls.as_ref().is_some_and(|t| t.wants_write())
+        !self.send.is_empty()
+            || self.replication_completion_pending
+            || self.tls.as_ref().is_some_and(|t| t.wants_write())
     }
 
     pub(crate) fn wants_read(&self) -> bool {
@@ -687,6 +710,25 @@ impl Conn {
     pub fn on_writable(&mut self) -> After {
         let flushed = self.flush();
         self.activate_pending_tls();
+        if flushed.is_ok()
+            && self.send.is_empty()
+            && self.tls.as_ref().is_none_or(|tls| !tls.wants_write())
+            && self.replication_completion_pending
+        {
+            self.replication_completion_pending = false;
+            let mut responder = Responder::new(&mut self.send);
+            if responder
+                .command_complete("COPY 0")
+                .and_then(|()| responder.command_complete("START_REPLICATION"))
+                .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                .is_err()
+            {
+                return After::Close;
+            }
+            // Leave the completion queued for the next writable edge. This
+            // preserves PostgreSQL's flush boundary after backend CopyDone.
+            return After::Continue;
+        }
         // A TLS session mid-handshake may still owe the peer bytes after the
         // socket accepted what it could; keep the connection alive.
         match flushed {
@@ -731,6 +773,11 @@ impl Conn {
             match after {
                 Step::NeedMoreData => return After::Continue,
                 Step::Parked => return After::Continue,
+                Step::Continue
+                    if self.terminate_after_flush || self.replication_completion_pending =>
+                {
+                    return After::Continue;
+                }
                 Step::Continue => {}
                 Step::Close => return After::Close,
             }
@@ -1397,12 +1444,7 @@ impl Conn {
             return Step::NeedMoreData;
         }
 
-        if self.replication != ReplicationMode::None
-            && !(self.replication_stream.is_some()
-                && matches!(
-                    msg_type,
-                    wire::FMSG_COPY_DATA | wire::FMSG_TERMINATE | wire::FMSG_FLUSH
-                ))
+        if self.replication == ReplicationMode::Physical
             && !matches!(
                 msg_type,
                 wire::FMSG_QUERY | wire::FMSG_TERMINATE | wire::FMSG_FLUSH
@@ -1411,7 +1453,7 @@ impl Conn {
             let mut responder = Responder::new(&mut self.send);
             let _ = responder.error(
                 sqlstate::PROTOCOL_VIOLATION,
-                "replication connections accept only the simple query protocol",
+                "physical replication connections accept only the simple query protocol",
             );
             return Step::Close;
         }
@@ -1729,31 +1771,125 @@ impl Conn {
         match msg_type {
             wire::FMSG_COPY_DATA => {
                 let payload = &self.recv.readable()[5..total];
+                if payload.first() == Some(&b'h') {
+                    return if hot_standby_feedback(payload) {
+                        Step::Continue
+                    } else {
+                        self.fail_replication_stream(
+                            engine,
+                            sql_err!(
+                                sqlstate::PROTOCOL_VIOLATION,
+                                "malformed hot standby feedback"
+                            ),
+                        )
+                    };
+                }
                 let Some(status) = standby_status_update(payload) else {
-                    return Step::Close;
+                    return self.fail_replication_stream(
+                        engine,
+                        sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "malformed standby status update (type {:#04X}, length {})",
+                            payload.first().copied().unwrap_or(0),
+                            payload.len()
+                        ),
+                    );
                 };
+                let (cursor_lsn, last_sent_lsn) = self
+                    .replication_stream
+                    .as_ref()
+                    .map(|stream| (stream.cursor_lsn, stream.last_sent_lsn))
+                    .expect("active replication stream");
+                if status.flush_lsn > last_sent_lsn {
+                    return self.fail_replication_stream(
+                        engine,
+                        sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "standby acknowledged LSN {:#X} beyond sent LSN {:#X}",
+                            status.flush_lsn,
+                            last_sent_lsn
+                        ),
+                    );
+                }
+                if status.flush_lsn > cursor_lsn {
+                    let slot = self
+                        .replication_stream
+                        .as_ref()
+                        .expect("active replication stream")
+                        .slot;
+                    if let Err(error) =
+                        engine.advance_replication_slot(slot.as_str(), status.flush_lsn)
+                    {
+                        return self.fail_replication_stream(engine, error);
+                    }
+                    let stream = self
+                        .replication_stream
+                        .as_mut()
+                        .expect("active replication stream");
+                    stream.cursor_lsn = status.flush_lsn;
+                }
                 let stream = self
                     .replication_stream
                     .as_mut()
                     .expect("active replication stream");
-                if status.flush_lsn > stream.last_sent_lsn {
-                    return Step::Close;
-                }
-                if status.flush_lsn > stream.cursor_lsn {
-                    if engine
-                        .advance_replication_slot(stream.slot.as_str(), status.flush_lsn)
-                        .is_err()
-                    {
-                        return Step::Close;
-                    }
-                    stream.cursor_lsn = status.flush_lsn;
-                }
                 stream.reply_requested = status.reply_requested;
                 Step::Continue
             }
+            wire::FMSG_COPY_DONE => {
+                if total != 5 {
+                    return self.fail_replication_stream(
+                        engine,
+                        sql_err!(sqlstate::PROTOCOL_VIOLATION, "malformed CopyDone message"),
+                    );
+                }
+                self.stop_replication(engine);
+                let mut responder = Responder::new(&mut self.send);
+                if responder.copy_done().is_err() {
+                    Step::Close
+                } else {
+                    self.replication_completion_pending = true;
+                    Step::Continue
+                }
+            }
+            wire::FMSG_COPY_FAIL => {
+                let mut input = MsgIn::new(&self.recv.readable()[5..total]);
+                let Ok(message) = input.cstr() else {
+                    return self.fail_replication_stream(
+                        engine,
+                        sql_err!(sqlstate::PROTOCOL_VIOLATION, "malformed CopyFail message"),
+                    );
+                };
+                if !input.done() {
+                    return self.fail_replication_stream(
+                        engine,
+                        sql_err!(sqlstate::PROTOCOL_VIOLATION, "malformed CopyFail message"),
+                    );
+                }
+                let detail = crate::stack_format!(
+                    256,
+                    "logical replication terminated by client: {message}"
+                );
+                self.stop_replication(engine);
+                let mut responder = Responder::new(&mut self.send);
+                if responder
+                    .error(sqlstate::QUERY_CANCELED, detail.as_str())
+                    .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+                    .is_err()
+                {
+                    Step::Close
+                } else {
+                    Step::Continue
+                }
+            }
             wire::FMSG_FLUSH => Step::Continue,
             wire::FMSG_TERMINATE => Step::Close,
-            _ => Step::Close,
+            _ => self.fail_replication_stream(
+                engine,
+                sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "unexpected message type during logical replication"
+                ),
+            ),
         }
     }
 
@@ -1813,9 +1949,17 @@ impl Conn {
                 stream.reply_requested = false;
                 After::Continue
             }
-            Err(_) => {
+            Err(error) => {
                 self.send.truncate_to(mark);
-                After::Close
+                self.terminate_after_flush = true;
+                if Responder::new(&mut self.send)
+                    .error(error.sqlstate, error.message.as_str())
+                    .is_ok()
+                {
+                    After::Continue
+                } else {
+                    After::Close
+                }
             }
         }
     }
@@ -1825,6 +1969,19 @@ impl Conn {
             engine.deactivate_replication_slot(stream.slot.as_str());
         }
         self.replication_publications.clear();
+    }
+
+    fn fail_replication_stream(&mut self, engine: &mut Engine, error: SqlError) -> Step {
+        self.stop_replication(engine);
+        self.terminate_after_flush = true;
+        if Responder::new(&mut self.send)
+            .error(error.sqlstate, error.message.as_str())
+            .is_ok()
+        {
+            Step::Continue
+        } else {
+            Step::Close
+        }
     }
 
     /// The next time an idle CopyBoth stream must be serviced. This gives the
@@ -3521,7 +3678,10 @@ fn parse_logical_replication_command(
                 "DROP_REPLICATION_SLOT requires a slot name"
             )
         })?;
-        if take_replication_word(&mut input).is_some() {
+        let option = take_replication_word(&mut input);
+        if option.is_some_and(|option| !option.eq_ignore_ascii_case("wait"))
+            || take_replication_word(&mut input).is_some()
+        {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "invalid DROP_REPLICATION_SLOT input"
@@ -3593,7 +3753,17 @@ fn parse_logical_replication_command(
             "CREATE_REPLICATION_SLOT requires LOGICAL pgoutput"
         )
     })?;
-    if !kind.eq_ignore_ascii_case("logical") || !plugin.eq_ignore_ascii_case("pgoutput") {
+    let plugin_quoted = plugin.starts_with('"');
+    let plugin = plugin
+        .strip_prefix('"')
+        .and_then(|plugin| plugin.strip_suffix('"'))
+        .unwrap_or(plugin);
+    let plugin_matches = if plugin_quoted {
+        plugin == "pgoutput"
+    } else {
+        plugin.eq_ignore_ascii_case("pgoutput")
+    };
+    if !kind.eq_ignore_ascii_case("logical") || !plugin_matches {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "only LOGICAL pgoutput replication slots are supported"
@@ -3729,10 +3899,10 @@ fn parse_create_slot_options(
             } else if value.eq_ignore_ascii_case("'nothing'") {
                 export_snapshot = false;
             } else if value.eq_ignore_ascii_case("'use'") {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "CREATE_REPLICATION_SLOT SNAPSHOT 'use' is not supported"
-                ));
+                // The caller already established the transaction snapshot on
+                // this replication connection. The slot starts at the current
+                // frontier without exporting a second snapshot.
+                export_snapshot = false;
             } else {
                 return Err(sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
@@ -3888,17 +4058,29 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), Sq
             }
             break;
         }
-        let key_end = input
-            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
-            .unwrap_or(input.len());
-        if key_end == 0 {
-            return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "invalid pgoutput option name"
-            ));
+        let key;
+        let quoted_key;
+        if let Some(quoted) = input.strip_prefix('"') {
+            let end = quoted.find('"').ok_or_else(|| {
+                sql_err!(sqlstate::SYNTAX_ERROR, "unterminated pgoutput option name")
+            })?;
+            key = &quoted[..end];
+            quoted_key = true;
+            input = quoted[end + 1..].trim_start();
+        } else {
+            let key_end = input
+                .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .unwrap_or(input.len());
+            if key_end == 0 {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "invalid pgoutput option name"
+                ));
+            }
+            key = &input[..key_end];
+            quoted_key = false;
+            input = input[key_end..].trim_start();
         }
-        let key = &input[..key_end];
-        input = input[key_end..].trim_start();
         if let Some(rest) = input.strip_prefix('=') {
             input = rest.trim_start();
         }
@@ -3912,41 +4094,39 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), Sq
                 "pgoutput options require commas"
             ));
         }
-        if key.eq_ignore_ascii_case("proto_version") {
+        let key_is = |expected: &str| {
+            if quoted_key {
+                key == expected
+            } else {
+                key.eq_ignore_ascii_case(expected)
+            }
+        };
+        if key_is("proto_version") {
             if proto_version.replace(value).is_some() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "duplicate pgoutput proto_version"
                 ));
             }
-        } else if key.eq_ignore_ascii_case("publication_names") {
+        } else if key_is("publication_names") {
             if publication.replace(value).is_some() {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "duplicate pgoutput publication_names"
                 ));
             }
-        } else if key.eq_ignore_ascii_case("binary") {
+        } else if key_is("binary") {
             if saw_binary {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "duplicate pgoutput binary option"
                 ));
             }
-            binary = match value {
-                "true" => true,
-                "false" => false,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "pgoutput binary must be 'true' or 'false'"
-                    ));
-                }
-            };
+            binary = pgoutput_bool("binary", value)?;
             saw_binary = true;
-        } else if key.eq_ignore_ascii_case("messages") {
+        } else if key_is("messages") {
             require_pgoutput_disabled_option("messages", value)?;
-        } else if key.eq_ignore_ascii_case("two_phase") {
+        } else if key_is("two_phase") {
             if saw_two_phase {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -3955,7 +4135,7 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), Sq
             }
             two_phase = pgoutput_bool("two_phase", value)?;
             saw_two_phase = true;
-        } else if key.eq_ignore_ascii_case("streaming") {
+        } else if key_is("streaming") {
             if saw_streaming {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -3975,7 +4155,7 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), Sq
                 ));
             };
             saw_streaming = true;
-        } else if key.eq_ignore_ascii_case("origin") {
+        } else if key_is("origin") {
             if saw_origin {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
@@ -5578,6 +5758,21 @@ mod tests {
         ));
         assert!(matches!(
             parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT \"changes\" LOGICAL \"pgoutput\" (SNAPSHOT 'nothing')"
+            ),
+            Ok(LogicalReplicationCommand::CreateSlot {
+                export_snapshot: false,
+                ..
+            })
+        ));
+        assert!(
+            parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT changes LOGICAL \"PGOUTPUT\" (SNAPSHOT 'nothing')"
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            parse_logical_replication_command(
                 "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput (SNAPSHOT 'export')"
             ),
             Ok(LogicalReplicationCommand::CreateSlot {
@@ -5588,6 +5783,15 @@ mod tests {
         assert!(matches!(
             parse_logical_replication_command(
                 "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput (SNAPSHOT 'nothing')"
+            ),
+            Ok(LogicalReplicationCommand::CreateSlot {
+                export_snapshot: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_logical_replication_command(
+                "CREATE_REPLICATION_SLOT changes LOGICAL pgoutput (SNAPSHOT 'use')"
             ),
             Ok(LogicalReplicationCommand::CreateSlot {
                 export_snapshot: false,
@@ -5626,6 +5830,10 @@ mod tests {
             panic!("expected DROP_REPLICATION_SLOT")
         };
         assert_eq!(name.as_str(), "changes");
+        assert!(matches!(
+            parse_logical_replication_command("DROP_REPLICATION_SLOT changes WAIT"),
+            Ok(LogicalReplicationCommand::DropSlot { .. })
+        ));
     }
 
     #[test]
@@ -5646,6 +5854,18 @@ mod tests {
         assert_eq!(name.as_str(), "changes");
         assert_eq!(publication, "changes_pub");
         assert_eq!(requested_lsn, 0);
+        assert!(parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (\"proto_version\" '4', \"publication_names\" 'changes_pub')"
+        )
+        .is_ok());
+        assert!(parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (\"PROTO_VERSION\" '4', \"publication_names\" 'changes_pub')"
+        )
+        .is_err());
+        assert!(parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (PROTO_VERSION '4', PUBLICATION_NAMES 'changes_pub')"
+        )
+        .is_ok());
         assert!(!options.binary);
         assert_eq!(
             options.proto_version,
@@ -5653,6 +5873,14 @@ mod tests {
         );
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', binary 'true', proto_version '1')",
+        )
+        .unwrap();
+        let LogicalReplicationCommand::Start { options, .. } = command else {
+            panic!("expected START_REPLICATION")
+        };
+        assert!(options.binary);
+        let command = parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', binary 'TRUE', proto_version '1')",
         )
         .unwrap();
         let LogicalReplicationCommand::Start { options, .. } = command else {
@@ -5816,7 +6044,7 @@ mod tests {
     }
 
     #[test]
-    fn standby_status_requires_an_ordered_complete_frontier() {
+    fn standby_status_requires_postgresqls_complete_typed_envelope() {
         let mut status = [0_u8; 34];
         status[0] = b'r';
         status[1..9].copy_from_slice(&30_u64.to_be_bytes());
@@ -5833,10 +6061,31 @@ mod tests {
         );
 
         status[17..25].copy_from_slice(&21_u64.to_be_bytes());
-        assert_eq!(standby_status_update(&status), None);
+        assert_eq!(
+            standby_status_update(&status),
+            Some(StandbyStatusUpdate {
+                flush_lsn: 20,
+                reply_requested: true,
+            })
+        );
         status[17..25].copy_from_slice(&10_u64.to_be_bytes());
         status[33] = 2;
         assert_eq!(standby_status_update(&status), None);
         assert_eq!(standby_status_update(&status[..33]), None);
+    }
+
+    #[test]
+    fn hot_standby_feedback_requires_postgresqls_complete_typed_envelope() {
+        let mut feedback = [0_u8; 25];
+        feedback[0] = b'h';
+        feedback[1..9].copy_from_slice(&42_i64.to_be_bytes());
+        feedback[9..13].copy_from_slice(&10_u32.to_be_bytes());
+        feedback[13..17].copy_from_slice(&1_u32.to_be_bytes());
+        feedback[17..21].copy_from_slice(&20_u32.to_be_bytes());
+        feedback[21..25].copy_from_slice(&2_u32.to_be_bytes());
+        assert!(hot_standby_feedback(&feedback));
+        assert!(!hot_standby_feedback(&feedback[..24]));
+        feedback[0] = b'r';
+        assert!(!hot_standby_feedback(&feedback));
     }
 }

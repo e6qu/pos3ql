@@ -154,7 +154,7 @@ pub fn type_message(message: &mut MsgOut, type_oid: i32, schema: &str, name: &st
 pub fn insert(message: &mut MsgOut, relation_id: u32, values: &[Datum], binary: bool) {
     message.u8(b'I');
     message.i32(relation_id as i32);
-    tuple(message, values, binary);
+    new_tuple(message, values, binary);
 }
 
 /// pgoutput Update carries the exact old-tuple tag required by the relation's
@@ -173,8 +173,8 @@ pub fn update(
     message.u8(b'U');
     message.i32(relation_id as i32);
     message.u8(old_tag);
-    tuple(message, old_values, binary);
-    tuple(message, new_values, binary);
+    tuple_data(message, old_values, binary);
+    new_tuple(message, new_values, binary);
 }
 
 /// pgoutput Delete carries the exact old-tuple tag required by the relation's
@@ -192,7 +192,7 @@ pub fn delete(
     message.u8(b'D');
     message.i32(relation_id as i32);
     message.u8(old_tag);
-    tuple(message, old_values, binary);
+    tuple_data(message, old_values, binary);
 }
 
 /// pgoutput Truncate, available from protocol version 2. The option byte is
@@ -206,8 +206,12 @@ pub fn truncate(message: &mut MsgOut, relation_ids: &[u32], cascade: bool, resta
     }
 }
 
-fn tuple(message: &mut MsgOut, values: &[Datum], binary: bool) {
+fn new_tuple(message: &mut MsgOut, values: &[Datum], binary: bool) {
     message.u8(b'N');
+    tuple_data(message, values, binary);
+}
+
+fn tuple_data(message: &mut MsgOut, values: &[Datum], binary: bool) {
     message.i16(values.len() as i16);
     for value in values {
         if matches!(value, Datum::Null) {
@@ -280,8 +284,10 @@ mod tests {
         let bytes = buffer.readable();
         assert_eq!(bytes[5], b'U');
         assert_eq!(bytes[10], b'K');
-        assert_eq!(bytes[35], b'D');
-        assert_eq!(bytes[40], b'O');
+        assert_eq!(&bytes[11..13], &[0, 1]);
+        assert_eq!(bytes[34], b'D');
+        assert_eq!(bytes[39], b'O');
+        assert_eq!(&bytes[40..42], &[0, 1]);
     }
 
     #[test]

@@ -1703,6 +1703,15 @@ fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, C
             _ => None,
         };
     }
+    if name.eq_ignore_ascii_case("pg_get_publication_tables") {
+        return match index {
+            0 => Some(("pubid", ColType::Oid)),
+            1 => Some(("relid", ColType::Oid)),
+            2 => Some(("attrs", ColType::Int2Vector)),
+            3 => Some(("qual", ColType::PgNodeTree)),
+            _ => None,
+        };
+    }
     None
 }
 
@@ -3123,6 +3132,7 @@ pub fn infer_type_res(
             | "has_database_privilege"
             | "has_parameter_privilege"
             | "pg_relation_is_publishable" => of(ColType::Bool),
+            "pg_get_replica_identity_index" => of(ColType::Regclass),
             "pg_is_other_temp_schema" => of(ColType::Bool),
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
                 of(ColType::Int4)
@@ -3590,6 +3600,7 @@ pub fn infer_type_res(
             | "jsonb_each_text"
             | "pg_options_to_table"
             | "pg_get_sequence_data"
+            | "pg_get_publication_tables"
             | "_pg_expandarray" => (oid::RECORD, -1),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),

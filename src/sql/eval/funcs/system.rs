@@ -516,6 +516,7 @@ pub(crate) fn dispatch<'a>(
             | "has_tablespace_privilege"
             | "has_parameter_privilege"
             | "pg_relation_is_publishable"
+            | "pg_get_replica_identity_index"
             | "pg_my_temp_schema"
             | "pg_is_other_temp_schema"
             | "pg_get_indexdef"
@@ -566,6 +567,32 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "pg_get_replica_identity_index" => {
+                arity(1)?;
+                let relation_oid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Oid(oid) => i32::try_from(oid).ok(),
+                    Datum::Int4(oid) => Some(oid),
+                    Datum::RegObject { referenced_oid, .. } => Some(referenced_oid),
+                    Datum::Null => return Ok(Datum::Null),
+                    value => return Err(type_mismatch(name, &value)),
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let Some(index_oid) =
+                    relation_oid.and_then(|oid| catalog.replica_identity_index_oid(oid))
+                else {
+                    return Ok(Datum::Null);
+                };
+                let name = catalog
+                    .relname(index_oid, arena)?
+                    .unwrap_or("pg_get_replica_identity_index");
+                Ok(Datum::RegObject {
+                    type_oid: crate::sql::types::oid::REGCLASS,
+                    referenced_oid: index_oid,
+                    name,
+                })
+            }
             "version" => {
                 arity(0)?;
                 Ok(Datum::Text(concat!(

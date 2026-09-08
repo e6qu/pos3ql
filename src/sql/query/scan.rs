@@ -1360,7 +1360,8 @@ fn materialize_lateral_source<'a, C: ColumnLookup<'a>>(
     let external_function = tref.func_args.is_some()
         && super::srf::is_srf_name(tref.table)
         && !tref.table.eq_ignore_ascii_case("pg_options_to_table")
-        && !tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
+        && !tref.table.eq_ignore_ascii_case("pg_get_sequence_data")
+        && !tref.table.eq_ignore_ascii_case("pg_get_publication_tables");
     if !storage.spill_attached() || (tref.subquery.is_none() && !external_function) {
         return Ok(LateralRows::Local(materialize_lateral(
             storage, txid, tref, arena, params, outer,

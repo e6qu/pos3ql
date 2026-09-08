@@ -847,6 +847,22 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 6119,
+        name: "pg_get_publication_tables",
+        result_oid: 2249,
+        argument_types: "1009",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 6120,
+        name: "pg_get_replica_identity_index",
+        result_oid: 2205,
+        argument_types: "2205",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 6121,
         name: "pg_relation_is_publishable",
         result_oid: 16,
@@ -959,7 +975,7 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
 fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
         715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
-        | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 1402 | 1403 | 2078 | 3086 => "u",
+        | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 1402 | 1403 | 2078 | 3086 | 6119 | 6120 => "u",
         1641 | 3566 | 4568 => "r",
         _ => "s",
     }
@@ -992,11 +1008,17 @@ const DROPPED_OBJECT_OUTPUT_NAMES: &[&str] = &[
     "address_names",
     "address_args",
 ];
+const PUBLICATION_TABLE_OUTPUT_OIDS: &[i32] = &[26, 26, 22, 194];
+const PUBLICATION_TABLE_OUTPUT_NAMES: &[&str] = &["pubid", "relid", "attrs", "qual"];
 
 fn intrinsic_record_outputs(
     routine: IntrinsicRoutine,
 ) -> Option<(&'static [i32], &'static [&'static str])> {
     match routine.oid {
+        6119 => Some((
+            PUBLICATION_TABLE_OUTPUT_OIDS,
+            PUBLICATION_TABLE_OUTPUT_NAMES,
+        )),
         4568 => Some((DDL_COMMAND_OUTPUT_OIDS, DDL_COMMAND_OUTPUT_NAMES)),
         3566 => Some((DROPPED_OBJECT_OUTPUT_OIDS, DROPPED_OBJECT_OUTPUT_NAMES)),
         _ => None,
@@ -3189,6 +3211,37 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
             visit(info);
         }
     }
+}
+
+pub(crate) fn replica_identity_index_oid(
+    storage: &Storage,
+    txid: u32,
+    relation_oid: i32,
+) -> Option<i32> {
+    let table_slot = (0..storage.table_count()).find(|slot| {
+        storage.table_slot_visible_to(*slot, txid) && user_table_oid(*slot) == relation_oid
+    })?;
+    let mode = storage.table_def(table_slot, txid).replica_identity;
+    let mut selected = None;
+    visit_indexes(storage, txid, |index| {
+        if index.table_slot != table_slot || selected.is_some() {
+            return;
+        }
+        let matches = match mode {
+            crate::storage::ReplicaIdentityMode::Default => {
+                index.is_primary && !index.timing.is_deferrable()
+            }
+            crate::storage::ReplicaIdentityMode::Index => index
+                .explicit_definition
+                .is_some_and(|definition| definition.replica_identity),
+            crate::storage::ReplicaIdentityMode::Full
+            | crate::storage::ReplicaIdentityMode::Nothing => false,
+        };
+        if matches {
+            selected = Some(index.oid);
+        }
+    });
+    selected
 }
 
 fn empty_index() -> IdxInfo {
@@ -12601,11 +12654,18 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         let mut all_types = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
         let mut modes = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
         let mut names = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+        let record_input_count = usize::from(routine.oid == 6119);
+        if routine.oid == 6119 {
+            all_types[0] = Datum::Oid(1009);
+            modes[0] = Datum::Char(b'v');
+            names[0] = Datum::Text("pubname");
+        }
         if let Some((output_oids, output_names)) = record_outputs {
             for output in 0..output_oids.len() {
-                all_types[output] = Datum::Oid(output_oids[output] as u32);
-                modes[output] = Datum::Char(b'o');
-                names[output] = Datum::Text(output_names[output]);
+                let index = record_input_count + output;
+                all_types[index] = Datum::Oid(output_oids[output] as u32);
+                modes[index] = Datum::Char(b'o');
+                names[index] = Datum::Text(output_names[output]);
             }
         }
         rows[index] = row(
@@ -12641,8 +12701,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bool(intrinsic_routine_is_strict(*routine)),
                 Datum::Bool(false),
                 Datum::Null,
-                Datum::Float8(1.0),
-                Datum::Float8(0.0),
+                Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
+                Datum::Float8(if routine.oid == 6119 { 1000.0 } else { 0.0 }),
                 Datum::Null,
                 Datum::RegObject {
                     type_oid: super::types::oid::REGPROC,
@@ -12650,25 +12710,38 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     name: "-",
                 },
                 Datum::Int4(0),
-                Datum::Int4(0),
+                Datum::Int4(if routine.oid == 6119 {
+                    super::types::oid::TEXT
+                } else {
+                    0
+                }),
                 match record_outputs {
                     Some((output_oids, _)) => Datum::Array {
                         element: super::types::ArrElem::Oid,
-                        raw: super::array::build(&all_types[..output_oids.len()], arena)?,
+                        raw: super::array::build(
+                            &all_types[..record_input_count + output_oids.len()],
+                            arena,
+                        )?,
                     },
                     None => Datum::Null,
                 },
                 match record_outputs {
                     Some((output_oids, _)) => Datum::Array {
                         element: super::types::ArrElem::Char,
-                        raw: super::array::build(&modes[..output_oids.len()], arena)?,
+                        raw: super::array::build(
+                            &modes[..record_input_count + output_oids.len()],
+                            arena,
+                        )?,
                     },
                     None => Datum::Null,
                 },
                 match record_outputs {
                     Some((_, output_names)) => Datum::Array {
                         element: super::types::ArrElem::Text,
-                        raw: super::array::build(&names[..output_names.len()], arena)?,
+                        raw: super::array::build(
+                            &names[..record_input_count + output_names.len()],
+                            arena,
+                        )?,
                     },
                     None => Datum::Null,
                 },
@@ -15204,6 +15277,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             | "standard_conforming_strings" => "on",
             "client_encoding" | "server_encoding" => "UTF8",
             "client_min_messages" => "notice",
+            "data_directory_mode" => "0700",
             "DateStyle" => "ISO, MDY",
             "default_transaction_deferrable" | "default_transaction_read_only" => "off",
             "default_transaction_isolation" => "read committed",
@@ -15248,7 +15322,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "enum"
         } else if matches!(
             name,
-            "extra_float_digits" | "max_connections" | "max_prepared_transactions"
+            "data_directory_mode"
+                | "extra_float_digits"
+                | "max_connections"
+                | "max_prepared_transactions"
         ) {
             "integer"
         } else {
@@ -15256,7 +15333,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         };
         let context = if matches!(
             name,
-            "integer_datetimes"
+            "data_directory_mode"
+                | "integer_datetimes"
                 | "is_superuser"
                 | "server_encoding"
                 | "server_version"

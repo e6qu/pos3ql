@@ -18,6 +18,36 @@ use super::super::{
     load_array, sqlstate, text_arg, text_view, type_mismatch, unify_arr_elem,
 };
 
+fn vector_bounds<'a>(
+    name: &str,
+    length: usize,
+    args: &[&Expr<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    if name == "cardinality" {
+        return Ok(Datum::Int4(length as i32));
+    }
+    let dimension = match eval_full(args[1], arena, params, row, hooks)? {
+        Datum::Int2(value) => value as i64,
+        Datum::Int4(value) => value as i64,
+        Datum::Int8(value) => value,
+        Datum::Null => return Ok(Datum::Null),
+        value => return Err(type_mismatch("array dimension must be an integer", &value)),
+    };
+    if dimension != 1 {
+        return Ok(Datum::Null);
+    }
+    Ok(match name {
+        "array_length" => Datum::Int4(length as i32),
+        "array_upper" => Datum::Int4(length as i32 - 1),
+        "array_lower" => Datum::Int4(0),
+        _ => unreachable!(),
+    })
+}
+
 /// Handles the array scalar family. Returns `None` if `name` is not one of
 /// these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -97,6 +127,12 @@ pub(crate) fn dispatch<'a>(
                             "array_lower" => Datum::Int4(shape.lower_bound(index).unwrap()),
                             _ => unreachable!(),
                         })
+                    }
+                    Datum::Int2Vector(raw) => {
+                        vector_bounds(name, raw.len() / 2, args, arena, params, row, hooks)
+                    }
+                    Datum::OidVector(raw) => {
+                        vector_bounds(name, raw.len() / 4, args, arena, params, row, hooks)
                     }
                     Datum::Null => Ok(Datum::Null),
                     _ => Err(type_mismatch("array_length requires an array", &a)),
@@ -446,6 +482,24 @@ pub(crate) fn dispatch<'a>(
                 let arr = eval_full(args[0], arena, params, row, hooks)?;
                 let raw = match arr {
                     Datum::Array { raw, .. } => raw,
+                    Datum::Int2Vector(raw) => {
+                        if name == "array_ndims" {
+                            return Ok(Datum::Int4(1));
+                        }
+                        let bounds = crate::stack_format!(32, "[0:{}]", raw.len() as i64 / 2 - 1);
+                        return Ok(Datum::Text(
+                            arena.alloc_str(bounds.as_str()).map_err(|_| arena_full())?,
+                        ));
+                    }
+                    Datum::OidVector(raw) => {
+                        if name == "array_ndims" {
+                            return Ok(Datum::Int4(1));
+                        }
+                        let bounds = crate::stack_format!(32, "[0:{}]", raw.len() as i64 / 4 - 1);
+                        return Ok(Datum::Text(
+                            arena.alloc_str(bounds.as_str()).map_err(|_| arena_full())?,
+                        ));
+                    }
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Err(type_mismatch(name, &arr)),
                 };

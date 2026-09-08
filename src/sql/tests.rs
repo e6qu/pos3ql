@@ -12901,13 +12901,30 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
 fn logical_publication_of_partitioned_parent_emits_routed_leaf_changes() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(
+    run_with(
         &mut engine,
         &mut budget,
-        &mut transaction,
         "CREATE TABLE publication_parent (id int PRIMARY KEY) PARTITION BY RANGE (id); \
-         CREATE TABLE publication_leaf PARTITION OF publication_parent FOR VALUES FROM (0) TO (10); \
-         CREATE PUBLICATION partition_changes FOR TABLE publication_parent WHERE (id > 10)",
+         CREATE TABLE publication_leaf PARTITION OF publication_parent FOR VALUES FROM (0) TO (10)",
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION invalid_partition_filter
+           FOR TABLE publication_parent WHERE (id > 10)",
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("22023"));
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION invalid_partition_columns
+           FOR TABLE publication_parent (id)",
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("22023"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION partition_changes FOR TABLE publication_parent",
     );
     let floor = engine.storage.lsn();
     run_txn(
@@ -12935,7 +12952,7 @@ fn logical_publication_of_partitioned_parent_emits_routed_leaf_changes() {
         send.readable()
             .windows(b"publication_leaf".len())
             .any(|window| window == b"publication_leaf"),
-        "default publication identity and row filter are those of the physical partition"
+        "default publication identity is that of the physical partition"
     );
     assert!(send.readable().windows(1).any(|byte| byte == b"I"));
 }
@@ -13743,6 +13760,67 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack()
         error.sqlstate,
         crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED
     );
+}
+
+#[test]
+fn logical_replication_publishes_filtered_projected_truncate_in_binary_v4() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE subscriber_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text); \
+         INSERT INTO subscriber_target VALUES (1, 'snapshot', 'private'); \
+         CREATE PUBLICATION subscriber_pub FOR TABLE subscriber_target (id, body) WHERE (id > 0)",
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "TRUNCATE subscriber_target",
+    );
+
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "projected truncate scratch", 1 << 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "projected truncate send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("subscriber_pub").unwrap()],
+            true,
+            crate::pg::pgoutput::ProtocolVersion::V4,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("truncate transaction is retained");
+    assert!(emitted);
+
+    let mut at = 0usize;
+    let mut relation_columns = None;
+    let mut truncate_relations = None;
+    while at < send.len() {
+        let bytes = send.readable();
+        let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+        let payload = &bytes[at + 5..at + 1 + length];
+        match crate::pg::pginput::copy_data(payload).unwrap() {
+            crate::pg::pginput::CopyData::XLogData {
+                message: crate::pg::pginput::Message::Relation { relation, .. },
+                ..
+            } => relation_columns = Some(relation.columns().len()),
+            crate::pg::pginput::CopyData::XLogData {
+                message: crate::pg::pginput::Message::Truncate { truncate, .. },
+                ..
+            } => truncate_relations = Some(truncate.relation_ids().len()),
+            _ => {}
+        }
+        at += 1 + length;
+    }
+    assert_eq!(relation_columns, Some(2));
+    assert_eq!(truncate_relations, Some(1));
 }
 
 #[test]
@@ -45362,6 +45440,212 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
 }
 
 #[test]
+fn publication_table_function_supports_postgresql_subscriber_introspection() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE subscriber_introspection (
+           id int PRIMARY KEY,
+           payload text,
+           publisher_only text
+         );
+         CREATE PUBLICATION subscriber_introspection_pub
+           FOR TABLE subscriber_introspection (id, payload) WHERE (id > 0)",
+    );
+    let publication_names = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(pubname::text)::text
+           FROM pg_publication
+          WHERE pubname IN ('subscriber_introspection_pub')",
+    );
+    assert_eq!(
+        data_rows(&publication_names),
+        ["{subscriber_introspection_pub}"],
+        "{}",
+        String::from_utf8_lossy(&publication_names)
+    );
+    let result = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT DISTINCT n.nspname, c.relname, gpt.attrs::text,
+                         pg_get_expr(gpt.qual, gpt.relid)
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           JOIN (
+             SELECT (pg_get_publication_tables(
+                       VARIADIC array_agg(pubname::text))).*
+               FROM pg_publication
+              WHERE pubname IN ('subscriber_introspection_pub')
+           ) AS gpt ON gpt.relid = c.oid",
+    );
+    assert_eq!(
+        data_rows(&result),
+        ["public|subscriber_introspection|1 2|(id > 0)"],
+        "{}",
+        String::from_utf8_lossy(&result)
+    );
+    let direct = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT attrs::text, pg_get_expr(qual, relid)
+           FROM pg_get_publication_tables('subscriber_introspection_pub')",
+    );
+    assert_eq!(data_rows(&direct), ["1 2|(id > 0)"]);
+    let null_variadic = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_get_publication_tables(VARIADIC NULL::text[])",
+    );
+    assert_eq!(data_rows(&null_variadic), ["0"]);
+    for invalid in [
+        "SELECT * FROM pg_get_publication_tables(NULL)",
+        "SELECT * FROM pg_get_publication_tables(ARRAY['subscriber_introspection_pub'])",
+        "SELECT * FROM pg_get_publication_tables(
+           'subscriber_introspection_pub',
+           VARIADIC ARRAY['subscriber_introspection_pub'])",
+    ] {
+        let result = run_with(&mut engine, &mut budget, invalid);
+        assert!(
+            String::from_utf8_lossy(&result).contains("ERROR"),
+            "invalid publication SRF signature succeeded: {invalid}"
+        );
+    }
+    let vector_shape = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_length(attrs, 1), array_lower(attrs, 1),
+                array_upper(attrs, 1), cardinality(attrs),
+                array_ndims(attrs), array_dims(attrs), 1 = ANY(attrs)
+           FROM pg_get_publication_tables('subscriber_introspection_pub')",
+    );
+    assert_eq!(data_rows(&vector_shape), ["2|0|1|2|1|[0:1]|t"]);
+    let empty_vector_shape = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_ndims(''::int2vector), array_dims(''::int2vector),
+                array_length(''::int2vector, 1),
+                array_lower(''::int2vector, 1),
+                array_upper(''::int2vector, 1), cardinality(''::int2vector)",
+    );
+    assert_eq!(data_rows(&empty_vector_shape), ["1|[0:-1]|0|0|-1|0"]);
+    let replica_identity = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_get_replica_identity_index(c.oid) = i.indexrelid,
+                pg_typeof(pg_get_replica_identity_index(c.oid))::text,
+                pg_get_replica_identity_index(c.oid)::text
+           FROM pg_class c
+           JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
+          WHERE c.relname = 'subscriber_introspection'",
+    );
+    assert_eq!(
+        data_rows(&replica_identity),
+        ["t|regclass|subscriber_introspection_pkey"]
+    );
+    let catalog_contract = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, prorettype, proretset, provariadic, procost, proparallel
+           FROM pg_proc
+          WHERE proname IN ('pg_get_publication_tables',
+                            'pg_get_replica_identity_index')
+          ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&catalog_contract),
+        ["6119|2249|t|25|1|u", "6120|2205|f|0|10|u"]
+    );
+    let replication_tool_setting = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT setting, vartype, context
+           FROM pg_settings WHERE name = 'data_directory_mode'",
+    );
+    assert_eq!(
+        data_rows(&replication_tool_setting),
+        ["0700|integer|internal"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE subscriber_partition_root (id int PRIMARY KEY, payload text)
+           PARTITION BY RANGE (id);
+         CREATE TABLE subscriber_partition_leaf
+           PARTITION OF subscriber_partition_root FOR VALUES FROM (0) TO (10);
+         CREATE PUBLICATION subscriber_partition_leaves
+           FOR TABLE subscriber_partition_root;
+         CREATE PUBLICATION subscriber_explicit_leaf_root_mode
+           FOR TABLE subscriber_partition_leaf (id) WHERE (id > 1)
+           WITH (publish_via_partition_root = true);
+         CREATE PUBLICATION subscriber_partition_root_mode
+           FOR TABLE subscriber_partition_root (id) WHERE (id > 2)
+           WITH (publish_via_partition_root = true)",
+    );
+    let partition_contract = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT p.pubname, c.relname, g.attrs::text,
+                pg_get_expr(g.qual, g.relid)
+           FROM pg_publication p,
+                LATERAL pg_get_publication_tables(p.pubname) g,
+                pg_class c
+          WHERE (p.pubname LIKE 'subscriber_partition_%'
+                 OR p.pubname = 'subscriber_explicit_leaf_root_mode')
+            AND c.oid = g.relid
+          ORDER BY p.pubname, c.relname",
+    );
+    assert_eq!(
+        data_rows(&partition_contract),
+        [
+            "subscriber_explicit_leaf_root_mode|subscriber_partition_leaf|1|(id > 1)",
+            "subscriber_partition_leaves|subscriber_partition_leaf|1 2|NULL",
+            "subscriber_partition_root_mode|subscriber_partition_root|1|(id > 2)",
+        ]
+    );
+    let combined_partition_contract = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT p.pubname, c.relname
+           FROM pg_get_publication_tables(
+                  VARIADIC ARRAY['subscriber_partition_leaves',
+                                 'subscriber_partition_root_mode']) g
+           JOIN pg_publication p ON p.oid = g.pubid
+           JOIN pg_class c ON c.oid = g.relid
+          ORDER BY p.pubname, c.relname",
+    );
+    assert_eq!(
+        data_rows(&combined_partition_contract),
+        ["subscriber_partition_root_mode|subscriber_partition_root"],
+        "PostgreSQL globally favors an included root over its partitions"
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION subscriber_partition_root_mode
+           SET (publish_via_partition_root = false)",
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("22023"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pubviaroot FROM pg_publication
+              WHERE pubname = 'subscriber_partition_root_mode'"
+        )),
+        ["t"],
+        "a rejected partition-root change leaves the publication unchanged"
+    );
+    let missing = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM pg_get_publication_tables('absent_publication')",
+    );
+    assert!(String::from_utf8_lossy(&missing).contains("42704"));
+}
+
+#[test]
 fn publication_row_filters_follow_column_renames_through_replication_and_recovery() {
     let mut config = test_config("publication-filter-column-rename");
     config.object_store_on = true;
@@ -46778,7 +47062,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     begin[8] = 100;
     begin[20] = 3;
     receive(&mut apply, &mut engine, 100, &begin);
-    let delete = [b'D', 0, 0, 0, 1, b'K', b'N', 0, 1, b't', 0, 0, 0, 1, b'1'];
+    let delete = [b'D', 0, 0, 0, 1, b'K', 0, 1, b't', 0, 0, 0, 1, b'1'];
     receive(&mut apply, &mut engine, 100, &delete);
     commit[9] = 100;
     commit[17] = 101;
@@ -47315,7 +47599,6 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     let mut update = vec![b'U'];
     update.extend_from_slice(&7_u32.to_be_bytes());
     update.push(b'K');
-    update.push(b'N');
     update.extend_from_slice(&tuple(&[b"1"]));
     update.push(b'N');
     update.extend_from_slice(&tuple(&[b"11", b"moved"]));
@@ -47342,7 +47625,6 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     let mut delete = vec![b'D'];
     delete.extend_from_slice(&7_u32.to_be_bytes());
     delete.push(b'K');
-    delete.push(b'N');
     delete.extend_from_slice(&tuple(&[b"11"]));
     receive(&mut apply, &mut engine, 100, &delete);
     receive(&mut apply, &mut engine, 101, &commit(100, 101));

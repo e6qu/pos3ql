@@ -278,10 +278,14 @@ impl<'a> Input<'a> {
     }
 }
 
-fn tuple<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
+fn new_tuple<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
     if input.u8()? != b'N' {
         return Err(DecodeError::Invalid);
     }
+    tuple_data(input)
+}
+
+fn tuple_data<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
     let count = usize::from(input.u16()?);
     if count > MAX_COLUMNS {
         return Err(DecodeError::Limit);
@@ -385,7 +389,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
             Message::Insert {
                 xid,
                 relation_id,
-                new: tuple(&mut input)?,
+                new: new_tuple(&mut input)?,
             }
         }
         b'U' => {
@@ -400,7 +404,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                         } else {
                             ReplicaIdentity::Old
                         },
-                        tuple: tuple(&mut input)?,
+                        tuple: tuple_data(&mut input)?,
                     })
                 }
                 _ => UpdateIdentity::NewTupleKey,
@@ -409,7 +413,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                 xid,
                 relation_id,
                 identity,
-                new: tuple(&mut input)?,
+                new: new_tuple(&mut input)?,
             }
         }
         b'D' => {
@@ -426,7 +430,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                 relation_id,
                 old: OldTuple {
                     identity,
-                    tuple: tuple(&mut input)?,
+                    tuple: tuple_data(&mut input)?,
                 },
             }
         }
@@ -651,8 +655,8 @@ mod tests {
     #[test]
     fn old_tuple_kind_preserves_key_vs_full_row_mapping() {
         let plugin = [
-            b'U', 0, 0, 0, 7, b'K', b'N', 0, 1, b't', 0, 0, 0, 1, b'1', b'N', 0, 2, b't', 0, 0, 0,
-            1, b'1', b'u',
+            b'U', 0, 0, 0, 7, b'K', 0, 1, b't', 0, 0, 0, 1, b'1', b'N', 0, 2, b't', 0, 0, 0, 1,
+            b'1', b'u',
         ];
         let bytes = xlog(&plugin);
         let CopyData::XLogData {

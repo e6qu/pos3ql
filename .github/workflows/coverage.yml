@@ -127,22 +127,34 @@ jobs:
           docker run --rm --detach --name pos3ql-subscription-publisher \
             -e POSTGRES_HOST_AUTH_METHOD=trust -p 15496:5432 postgres:18 \
             -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
+          docker run --rm --detach --name pos3ql-subscription-subscriber \
+            -e POSTGRES_HOST_AUTH_METHOD=trust -p 15564:5432 postgres:18
           mkdir -p .ci-bin
           sed 's/^          //' > .ci-bin/psql <<'SH'
           #!/bin/sh
           exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 psql "$@"
           SH
+          sed 's/^          //' > .ci-bin/pg_recvlogical <<'SH'
+          #!/bin/sh
+          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" -v /tmp:/tmp postgres:18 pg_recvlogical "$@"
+          SH
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/postgres
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/initdb
           printf '%s\n' '#!/bin/sh' 'exit 0' > .ci-bin/pg_ctl
-          chmod +x .ci-bin/psql .ci-bin/postgres .ci-bin/initdb .ci-bin/pg_ctl
-          for _ in $(seq 1 50); do .ci-bin/psql -h 127.0.0.1 -p 15496 -U postgres -X -q -c 'SELECT 1' >/dev/null 2>&1 && exit 0; sleep 0.1; done
+          chmod +x .ci-bin/psql .ci-bin/pg_recvlogical .ci-bin/postgres .ci-bin/initdb .ci-bin/pg_ctl
+          for _ in $(seq 1 50); do
+            .ci-bin/psql -h 127.0.0.1 -p 15496 -U postgres -X -q -c 'SELECT 1' >/dev/null 2>&1 \
+              && .ci-bin/psql -h 127.0.0.1 -p 15564 -U postgres -X -q -c 'SELECT 1' >/dev/null 2>&1 \
+              && exit 0
+            sleep 0.1
+          done
           exit 1
       - name: Run logical-subscription recovery against PostgreSQL 18
         env:
           POS3QL_PGBIN: ${{ github.workspace }}/.ci-bin
           POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
           POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT: "15496"
+          POS3QL_EXTERNAL_SUBSCRIBER_PORT: "15564"
           COVERAGE_SHARD: runtest:subscription
         run: sh tools/coverage.sh
 

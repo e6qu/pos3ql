@@ -12594,6 +12594,17 @@ pub fn create_publication(
             Ok(members) => members,
             Err(error) => return sql_fail(error),
         };
+    if let Err(error) = validate_partitioned_publication_features(
+        storage,
+        txn.txid,
+        name,
+        &members[..table_count],
+        &table_column_masks[..table_count],
+        &table_filter_sql[..table_count],
+        publish_via_partition_root,
+    ) {
+        return sql_fail(error);
+    }
     let schema_members = match publication_schemas(storage, txn.txid, schemas) {
         Ok(schemas) => schemas,
         Err(error) => return sql_fail(error),
@@ -13813,7 +13824,18 @@ pub fn alter_publication(
         Ok(filters) => filters,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = validate_publication_replica_identity(storage, &definition) {
+    if let Err(error) = validate_partitioned_publication_features(
+        storage,
+        txn.txid,
+        name,
+        &definition.tables[..definition.table_count],
+        &definition.table_column_masks[..definition.table_count],
+        &definition_filter_sql[..definition.table_count],
+        definition.publish_via_partition_root,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = validate_publication_replica_identity(storage, &definition, txn.txid) {
         return sql_fail(error);
     }
     let (slot, prior) = match storage.alter_publication(name, definition, txn.txid) {
@@ -13873,6 +13895,43 @@ fn validate_publication_target_mix(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot specify a column list when publishing tables in a schema"
         ));
+    }
+    Ok(())
+}
+
+fn validate_partitioned_publication_features<const N: usize>(
+    storage: &Storage,
+    txid: u32,
+    publication: &str,
+    tables: &[u16],
+    column_masks: &[u64],
+    filters: &[StackStr<N>],
+    publish_via_partition_root: bool,
+) -> Result<(), SqlError> {
+    if publish_via_partition_root {
+        return Ok(());
+    }
+    for ((table, column_mask), filter) in tables.iter().zip(column_masks).zip(filters) {
+        let definition = storage.table_def(usize::from(*table), txid);
+        if !definition.partition.is_partitioned() {
+            continue;
+        }
+        if !filter.is_empty() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot use publication WHERE clause for relation \"{}\" when publish_via_partition_root is false",
+                definition.name.as_str()
+            ));
+        }
+        if *column_mask != 0 {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot use column list for relation \"{}.{}\" in publication \"{}\" when publish_via_partition_root is false",
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                publication
+            ));
+        }
     }
     Ok(())
 }
@@ -13999,6 +14058,7 @@ fn publication_members(
 fn validate_publication_replica_identity(
     storage: &Storage,
     definition: &crate::storage::PublicationDefinition,
+    txid: u32,
 ) -> Result<(), SqlError> {
     if !definition.publish_update && !definition.publish_delete {
         return Ok(());
@@ -14007,7 +14067,7 @@ fn validate_publication_replica_identity(
         .iter()
         .zip(&definition.table_column_masks[..definition.table_count])
     {
-        validate_publication_column_mask(storage, *table as usize, *mask, 0)?;
+        validate_publication_column_mask(storage, *table as usize, *mask, txid)?;
     }
     Ok(())
 }
@@ -43447,7 +43507,7 @@ fn rewrite_table_publication_column_references(
         }
         definition.table_filters =
             crate::storage::PublicationFilters::from_sql(&filters[..definition.table_count])?;
-        validate_publication_replica_identity(storage, &definition)?;
+        validate_publication_replica_identity(storage, &definition, txn.txid)?;
         let name = publication.name_for(txn.txid);
         let (altered_slot, prior) =
             storage.alter_publication(name.as_str(), definition, txn.txid)?;

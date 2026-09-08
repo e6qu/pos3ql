@@ -106,7 +106,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
     for item in statement.items {
-        if let SelectItem::Expr { expression, .. } = item {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             collect_grouped_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
         }
     }
@@ -190,6 +190,9 @@ pub(crate) fn rewrite_grouped_windows<'a>(
                 // column (`?g0`); pin the original name.
                 alias: Some(alias.unwrap_or(crate::sql::exec::derived_name(expression))),
             },
+            SelectItem::RecordStar(expression) => {
+                SelectItem::RecordStar(rewrite_grouped_expr(expression, &context, arena)?)
+            }
             other => *other,
         };
     }

@@ -42,6 +42,7 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("generate_subscripts")
         || name.eq_ignore_ascii_case("pg_options_to_table")
         || name.eq_ignore_ascii_case("pg_get_sequence_data")
+        || name.eq_ignore_ascii_case("pg_get_publication_tables")
         || name.eq_ignore_ascii_case("ts_parse")
         || name.eq_ignore_ascii_case("ts_token_type")
         || name.eq_ignore_ascii_case("ts_debug")
@@ -240,6 +241,391 @@ fn srf_signature_error(name: &str) -> SqlError {
         "function {}(...) does not exist",
         name
     )
+}
+
+fn evaluate_publication_arguments<'a, R: ColumnLookup<'a>>(
+    arguments: &'a [&'a Expr<'a>],
+    variadic: bool,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [Datum<'a>], SqlError> {
+    evaluate_publication_arguments_with(arguments, variadic, arena, |argument| {
+        eval_full(argument, arena, params, row, hooks)
+    })
+}
+
+fn evaluate_publication_arguments_with<'a, F>(
+    arguments: &'a [&'a Expr<'a>],
+    variadic: bool,
+    arena: &'a Arena,
+    mut evaluate: F,
+) -> Result<&'a [Datum<'a>], SqlError>
+where
+    F: FnMut(&'a Expr<'a>) -> Result<Datum<'a>, SqlError>,
+{
+    if arguments.is_empty() {
+        return Err(srf_signature_error("pg_get_publication_tables"));
+    }
+    if variadic {
+        if arguments.len() != 1 {
+            return Err(srf_signature_error("pg_get_publication_tables"));
+        }
+        return match evaluate(arguments[0])? {
+            Datum::Null => Ok(&[]),
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Text,
+                raw,
+            } => {
+                let values = arena
+                    .alloc_slice_with(crate::sql::array::len(raw), |_| Datum::Null)
+                    .map_err(|_| arena_full())?;
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = match crate::sql::array::get(
+                        raw,
+                        crate::sql::types::ArrElem::Text,
+                        index,
+                    ) {
+                        Some(Datum::Text(value)) => Datum::Text(value),
+                        Some(Datum::Null) => {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "null array element not allowed in this context"
+                            ));
+                        }
+                        Some(_) => unreachable!("text array has text elements"),
+                        None => unreachable!("array length fixes every publication index"),
+                    };
+                }
+                Ok(values)
+            }
+            _ => Err(srf_signature_error("pg_get_publication_tables")),
+        };
+    }
+    let values = arena
+        .alloc_slice_with(arguments.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (value, argument) in values.iter_mut().zip(arguments) {
+        *value = evaluate(argument)?;
+        match value {
+            Datum::Text(_) | Datum::Bpchar(_) => {}
+            Datum::Null => {
+                return Err(sql_err!(
+                    sqlstate::NULL_VALUE_NOT_ALLOWED,
+                    "null array element not allowed in this context"
+                ));
+            }
+            _ => return Err(srf_signature_error("pg_get_publication_tables")),
+        }
+    }
+    Ok(values)
+}
+
+#[derive(Clone, Copy)]
+struct PublishedRelation {
+    publication_slot: usize,
+    relation_slot: usize,
+}
+
+fn publication_member_for(
+    storage: &Storage,
+    txid: u32,
+    definition: crate::storage::PublicationDefinition,
+    table_slot: usize,
+) -> Option<usize> {
+    if let Some(index) = definition.tables[..definition.table_count]
+        .iter()
+        .position(|member| usize::from(*member) == table_slot)
+    {
+        return Some(index);
+    }
+    let mut partition = table_slot;
+    while let Some(attachment) = storage.table_def(partition, txid).partition.attachment {
+        partition = usize::from(attachment.parent);
+        if let Some(index) = definition.tables[..definition.table_count]
+            .iter()
+            .position(|member| usize::from(*member) == partition)
+        {
+            return Some(index);
+        }
+    }
+    definition.tables[..definition.table_count]
+        .iter()
+        .enumerate()
+        .find_map(|(index, member)| {
+            let member = usize::from(*member);
+            (definition.table_include_descendants[index]
+                && storage.relation_descends_from(table_slot, member, txid))
+            .then_some(index)
+        })
+}
+
+fn publication_schema_member_for(
+    storage: &Storage,
+    txid: u32,
+    definition: crate::storage::PublicationDefinition,
+    table_slot: usize,
+) -> bool {
+    let mut current = table_slot;
+    loop {
+        let schema_selected = storage
+            .find_schema(storage.table_def(current, txid).schema.as_str())
+            .is_some_and(|slot| {
+                definition.schemas[..definition.schema_count].contains(&(slot as u8))
+            });
+        if schema_selected {
+            return true;
+        }
+        let Some(attachment) = storage.table_def(current, txid).partition.attachment else {
+            return false;
+        };
+        current = usize::from(attachment.parent);
+    }
+}
+
+fn publication_partition_root_for(storage: &Storage, txid: u32, table_slot: usize) -> usize {
+    let mut current = table_slot;
+    while let Some(attachment) = storage.table_def(current, txid).partition.attachment {
+        current = usize::from(attachment.parent);
+    }
+    current
+}
+
+fn publication_output_relation_for(
+    storage: &Storage,
+    txid: u32,
+    definition: crate::storage::PublicationDefinition,
+    table_slot: usize,
+    explicit: Option<usize>,
+) -> usize {
+    if !definition.publish_via_partition_root {
+        return table_slot;
+    }
+    if definition.all_tables {
+        return publication_partition_root_for(storage, txid, table_slot);
+    }
+    if let Some(index) = explicit {
+        return usize::from(definition.tables[index]);
+    }
+    let mut current = table_slot;
+    let mut selected = table_slot;
+    loop {
+        let schema_selected = storage
+            .find_schema(storage.table_def(current, txid).schema.as_str())
+            .is_some_and(|slot| {
+                definition.schemas[..definition.schema_count].contains(&(slot as u8))
+            });
+        if schema_selected {
+            selected = current;
+        }
+        let Some(attachment) = storage.table_def(current, txid).partition.attachment else {
+            return selected;
+        };
+        current = usize::from(attachment.parent);
+    }
+}
+
+fn publication_int2vector<'a>(mask: u64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let count = mask.count_ones() as usize;
+    let raw = arena
+        .alloc_slice_with(count * 2, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    let mut output = 0usize;
+    for column in 0..MAX_COLUMNS {
+        if mask & (1u64 << column) == 0 {
+            continue;
+        }
+        let attribute_number = i16::try_from(column + 1).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "publication column number is too large"
+            )
+        })?;
+        raw[output * 2..output * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
+        output += 1;
+    }
+    Ok(Datum::Int2Vector(raw))
+}
+
+fn publication_table_rows<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    arguments: &[Datum<'a>],
+) -> Result<&'a [&'a [u8]], SqlError> {
+    const MAX_RESULTS: usize = crate::sql::parser::MAX_ROWS;
+    let mut names = [""; MAX_RESULTS];
+    let mut name_count = 0usize;
+    for argument in arguments {
+        match argument {
+            Datum::Text(name) | Datum::Bpchar(name) => {
+                if name_count == names.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "pg_get_publication_tables has too many publication names"
+                    ));
+                }
+                names[name_count] = name;
+                name_count += 1;
+            }
+            _ => return Err(srf_signature_error("pg_get_publication_tables")),
+        }
+    }
+
+    let empty = PublishedRelation {
+        publication_slot: usize::MAX,
+        relation_slot: usize::MAX,
+    };
+    let mut published = [empty; MAX_RESULTS];
+    let mut published_count = 0usize;
+    let mut any_via_root = false;
+    for name in &names[..name_count] {
+        let (publication_slot, publication) = storage
+            .publications_with_slots_visible_to(txid)
+            .find(|(_, publication)| publication.name_for(txid).as_str() == *name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "publication \"{}\" does not exist",
+                    name
+                )
+            })?;
+        let definition = publication.definition_for(txid);
+        any_via_root |= definition.publish_via_partition_root;
+        let publication_start = published_count;
+        for (table_slot, table) in storage.live_tables() {
+            if !table.visible_to(txid) {
+                continue;
+            }
+            let explicit = publication_member_for(storage, txid, definition, table_slot);
+            let schema = publication_schema_member_for(storage, txid, definition, table_slot);
+            if !definition.all_tables && !schema && explicit.is_none() {
+                continue;
+            }
+            if !definition.publish_via_partition_root
+                && storage
+                    .table_def(table_slot, txid)
+                    .partition
+                    .is_partitioned()
+            {
+                continue;
+            }
+            let relation_slot =
+                publication_output_relation_for(storage, txid, definition, table_slot, explicit);
+            if published[publication_start..published_count]
+                .iter()
+                .any(|entry| entry.relation_slot == relation_slot)
+            {
+                continue;
+            }
+            if published_count == published.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "pg_get_publication_tables exceeds {} rows",
+                    published.len()
+                ));
+            }
+            published[published_count] = PublishedRelation {
+                publication_slot,
+                relation_slot,
+            };
+            published_count += 1;
+        }
+    }
+
+    const EMPTY_ROW: &[u8] = &[];
+    let rows = arena
+        .alloc_slice_with(published_count, |_| EMPTY_ROW)
+        .map_err(|_| arena_full())?;
+    let mut row_count = 0usize;
+    for info in &published[..published_count] {
+        if any_via_root {
+            let mut ancestor = storage
+                .table_def(info.relation_slot, txid)
+                .partition
+                .attachment;
+            let mut shadowed = false;
+            while let Some(attachment) = ancestor {
+                let parent = usize::from(attachment.parent);
+                if published[..published_count]
+                    .iter()
+                    .any(|other| other.relation_slot == parent)
+                {
+                    shadowed = true;
+                    break;
+                }
+                ancestor = storage.table_def(parent, txid).partition.attachment;
+            }
+            if shadowed {
+                continue;
+            }
+        }
+        let (_, publication) = storage
+            .publications_with_slots_visible_to(txid)
+            .find(|(slot, _)| *slot == info.publication_slot)
+            .expect("published relation retains a visible publication");
+        let definition = publication.definition_for(txid);
+        let table = storage.table_def(info.relation_slot, txid);
+        let explicit = definition.tables[..definition.table_count]
+            .iter()
+            .position(|member| usize::from(*member) == info.relation_slot);
+        let schema = storage
+            .find_schema(table.schema.as_str())
+            .is_some_and(|slot| {
+                definition.schemas[..definition.schema_count].contains(&(slot as u8))
+            });
+        let implicit_mask = || {
+            table
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| {
+                    !column.default.is_generated()
+                        || definition.publish_generated_columns
+                            == crate::storage::PublishGeneratedColumns::Stored
+                })
+                .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
+        };
+        let (column_mask, filter) = if definition.all_tables || schema {
+            (implicit_mask(), None)
+        } else if let Some(index) = explicit {
+            let selected = definition.table_column_masks[index];
+            (
+                if selected == 0 {
+                    implicit_mask()
+                } else {
+                    selected
+                },
+                (!definition.table_filters.get(index).is_empty())
+                    .then(|| definition.table_filters.get(index)),
+            )
+        } else {
+            (implicit_mask(), None)
+        };
+        let qual = match filter {
+            Some(filter) => {
+                let rendered = crate::stack_format!(66, "({filter})");
+                Datum::Text(
+                    arena
+                        .alloc_str(rendered.as_str())
+                        .map_err(|_| arena_full())?,
+                )
+            }
+            None => Datum::Null,
+        };
+        rows[row_count] = crate::sql::exec::encode_projected_pub(
+            &[
+                Datum::Oid(crate::sql::catalog::publication_oid(info.publication_slot) as u32),
+                Datum::Oid(crate::sql::catalog::user_table_oid(info.relation_slot) as u32),
+                publication_int2vector(column_mask, arena)?,
+                qual,
+            ],
+            arena,
+        )?;
+        row_count += 1;
+    }
+    Ok(&rows[..row_count])
 }
 
 /// The set-returning function call (if any) driving a single expression's
@@ -497,7 +883,13 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         row: &R,
         hooks: &EvalHooks<'_, 'a>,
     ) -> Result<&'a [Datum<'a>], SqlError> {
-        let Expr::Call { name, args, .. } = expression else {
+        let Expr::Call {
+            name,
+            args,
+            variadic,
+            ..
+        } = expression
+        else {
             unreachable!("project-set materialization requires a call")
         };
         if is_event_trigger_introspection(name) {
@@ -520,6 +912,35 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                         crate::sql::exec::decode_projected_col_record(encoded, index, arena)?;
                 }
                 *value = Datum::Record(fields);
+            }
+            return Ok(values);
+        }
+        if name.eq_ignore_ascii_case("pg_get_publication_tables") {
+            let evaluated =
+                evaluate_publication_arguments(args, *variadic, arena, params, row, hooks)?;
+            let rows = publication_table_rows(storage, txid, arena, evaluated)?;
+            let values = arena
+                .alloc_slice_with(rows.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            let fields = [
+                ("pubid", ColType::Oid),
+                ("relid", ColType::Oid),
+                ("attrs", ColType::Int2Vector),
+                ("qual", ColType::PgNodeTree),
+            ];
+            for (value, encoded) in values.iter_mut().zip(rows) {
+                let decoded = arena
+                    .alloc_slice_with(fields.len(), |index| crate::sql::types::RecordField {
+                        name: fields[index].0,
+                        type_oid: fields[index].1.oid(),
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
+                for (index, field) in decoded.iter_mut().enumerate() {
+                    field.value =
+                        crate::sql::exec::decode_projected_col_record(encoded, index, arena)?;
+                }
+                *value = Datum::Record(decoded);
             }
             return Ok(values);
         }
@@ -1454,6 +1875,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_stt = tref.table.eq_ignore_ascii_case("string_to_table");
     let is_options = tref.table.eq_ignore_ascii_case("pg_options_to_table");
     let is_sequence_data = tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
+    let is_publication_tables = tref.table.eq_ignore_ascii_case("pg_get_publication_tables");
     let is_ts_parse = tref.table.eq_ignore_ascii_case("ts_parse");
     let is_ts_token_type = tref.table.eq_ignore_ascii_case("ts_token_type");
     let is_ts_debug = tref.table.eq_ignore_ascii_case("ts_debug");
@@ -1470,6 +1892,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_stt
         || is_options
         || is_sequence_data
+        || is_publication_tables
         || is_ts_parse
         || is_ts_token_type
         || is_ts_debug
@@ -1494,7 +1917,29 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
     let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
-    let n_default = if is_ts_stat {
+    let n_default = if is_publication_tables {
+        if tref.func_args.unwrap_or(&[]).is_empty() {
+            return Err(srf_signature_error(tref.table));
+        }
+        for (index, (name, ctype)) in [
+            ("pubid", ColType::Oid),
+            ("relid", ColType::Oid),
+            ("attrs", ColType::Int2Vector),
+            ("qual", ColType::PgNodeTree),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            default_cols[index] = table_function_column(
+                SqlName::parse(name)?,
+                ctype,
+                None,
+                -1,
+                crate::sql::ast::Collation::None,
+            );
+        }
+        4
+    } else if is_ts_stat {
         if !(1..=2).contains(&tref.func_args.unwrap_or(&[]).len()) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -2091,6 +2536,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
         None => crate::sql::eval::eval(argument, arena, params, columns),
     };
+    if tref.table.eq_ignore_ascii_case("pg_get_publication_tables") {
+        let evaluated =
+            evaluate_publication_arguments_with(args, tref.func_variadic, arena, eval_argument)?;
+        return publication_table_rows(storage, txid, arena, evaluated);
+    }
     if tref.table.eq_ignore_ascii_case("ts_stat") {
         if !(1..=2).contains(&args.len()) {
             return Err(sql_err!(

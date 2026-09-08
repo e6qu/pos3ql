@@ -570,10 +570,11 @@ pub(super) fn groups_for_mask<'a>(
         }
     }
 
-    let out_rows: &mut [&[u8]] = arena
-        .alloc_slice_with(n_groups, |_| empty)
+    let empty_group: &[&[u8]] = &[];
+    let per_group: &mut [&[&[u8]]] = arena
+        .alloc_slice_with(n_groups, |_| empty_group)
         .map_err(|_| arena_full())?;
-    let mut survivors = 0usize;
+    let mut output_count = 0usize;
     for g in 0..n_groups {
         let mut key_vals = [Datum::Null; MAX_PROJ];
         for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
@@ -635,22 +636,59 @@ pub(super) fn groups_for_mask<'a>(
                 }
             }
         }
-        let mut full = [Datum::Null; MAX_PROJ];
-        for (n, item) in statement.items.iter().enumerate() {
-            let SelectItem::Expr { expression, .. } = item else {
-                unreachable!()
+        let project_set = super::srf::prepare_project_set(
+            statement.items,
+            storage,
+            txid,
+            arena,
+            params,
+            &schema,
+            &group_hooks,
+        )?;
+        let group_rows = arena
+            .alloc_slice_with(project_set.count, |_| empty)
+            .map_err(|_| arena_full())?;
+        for (offset, output) in group_rows.iter_mut().enumerate() {
+            let project_hooks = EvalHooks {
+                srf_index: Some(offset + 1),
+                project_sets: Some(project_set.values),
+                ..group_hooks
             };
-            full[n] = eval_full(expression, arena, params, &schema, &group_hooks)?;
+            let mut full = [Datum::Null; MAX_PROJ];
+            for (n, item) in statement.items.iter().enumerate() {
+                let SelectItem::Expr { expression, .. } = item else {
+                    unreachable!()
+                };
+                full[n] = eval_full(expression, arena, params, &schema, &project_hooks)?;
+            }
+            for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
+                full[width + k] = eval_full(
+                    oe.expect("resolved"),
+                    arena,
+                    params,
+                    &schema,
+                    &project_hooks,
+                )?;
+            }
+            *output = crate::sql::exec::encode_projected_pub(&full[..width + n_order], arena)?;
         }
-        for (k, oe) in order_exprs.iter().take(n_order).enumerate() {
-            full[width + k] =
-                eval_full(oe.expect("resolved"), arena, params, &schema, &group_hooks)?;
-        }
-        out_rows[survivors] =
-            crate::sql::exec::encode_projected_pub(&full[..width + n_order], arena)?;
-        survivors += 1;
+        per_group[g] = group_rows;
+        output_count = output_count.checked_add(group_rows.len()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "grouped set-returning result is too large"
+            )
+        })?;
     }
-    Ok(&out_rows[..survivors])
+    let out_rows = arena
+        .alloc_slice_with(output_count, |_| empty)
+        .map_err(|_| arena_full())?;
+    let mut output = 0usize;
+    for rows in per_group {
+        out_rows[output..output + rows.len()].copy_from_slice(rows);
+        output += rows.len();
+    }
+    Ok(out_rows)
 }
 
 /// The row-producing half of grouped/aggregate execution: runs the scans,

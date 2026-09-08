@@ -1315,11 +1315,12 @@ def test_builtin_function_result_types_and_binary_json():
     parse = frontend_message(
         b"P",
         b"\x00SELECT jsonb_set('{\"a\": 1}'::jsonb, '{a}', '2'::jsonb), "
-        b"json_strip_nulls('{\"a\": null}'::json)\x00\x00\x00",
+        b"json_strip_nulls('{\"a\": null}'::json), "
+        b"'strict $.a[*]'::jsonpath\x00\x00\x00",
     )
     bind = frontend_message(
         b"B",
-        b"\x00\x00" + struct.pack("!hhh", 0, 0, 2) + struct.pack("!hh", 1, 1),
+        b"\x00\x00" + struct.pack("!hhh", 0, 0, 3) + struct.pack("!hhh", 1, 1, 1),
     )
     describe = frontend_message(b"D", b"P\x00")
     execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
@@ -1335,16 +1336,18 @@ def test_builtin_function_result_types_and_binary_json():
     check(
         "typed JSON functions preserve Describe OIDs and binary formats",
         description is not None
-        and row_description_type_oids(description) == [3802, 114]
-        and row_description_formats(description) == [1, 1],
+        and row_description_type_oids(description) == [3802, 114, 4072]
+        and row_description_formats(description) == [1, 1, 1],
         out,
     )
     expected = (
-        b"\x00\x02"
+        b"\x00\x03"
         + struct.pack("!i", len(b'\x01{\"a\": 2}'))
         + b'\x01{\"a\": 2}'
         + struct.pack("!i", len(b"{}"))
         + b"{}"
+        + struct.pack("!i", len(b'\x01strict $.\"a\"[*]'))
+        + b'\x01strict $.\"a\"[*]'
     )
     check("typed JSON functions preserve binary result bytes", row == expected, row)
 
@@ -3318,6 +3321,7 @@ def test_catalog_aware_binary_bind_parameters():
         ("invalid regtype", "SELECT $1::regtype", 2206, b"\x00", None, "22P03"),
         ("json", "SELECT $1::json", 114, b'{"b": 1, "a": 2}', '{"b": 1, "a": 2}', None),
         ("jsonb", "SELECT $1::jsonb", 3802, b'\x01{"b": 1, "a": 2}', '{"a": 2, "b": 1}', None),
+        ("jsonpath", "SELECT $1::jsonpath", 4072, b'\x01strict $.a[*]', 'strict $."a"[*]', None),
         ("enum", "SELECT $1::wire_binary_state", enum_oid, b"ready", "ready", None),
         ("domain", "SELECT $1::wire_binary_positive", domain_oid, struct.pack("!i", 7), "7", None),
         ("routine enum", "SELECT wire_binary_state_echo($1)", enum_oid, b"ready", "ready", None),
@@ -3469,6 +3473,8 @@ def test_catalog_aware_binary_bind_parameters():
         ("invalid enum", "SELECT $1::wire_binary_state", enum_oid, b"missing", None, "22P02"),
         ("invalid json", "SELECT $1::json", 114, b"{not json}", None, "22P02"),
         ("invalid jsonb", "SELECT $1::jsonb", 3802, b"\x01{not json}", None, "22P02"),
+        ("invalid jsonpath version", "SELECT $1::jsonpath", 4072, b"\x02$", None, "22P03"),
+        ("invalid jsonpath", "SELECT $1::jsonpath", 4072, b"\x01$.", None, "42601"),
         (
             "invalid domain",
             "SELECT $1::wire_binary_positive",

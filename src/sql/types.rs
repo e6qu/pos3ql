@@ -58,6 +58,8 @@ pub mod oid {
     pub const INTERVAL: i32 = 1186;
     pub const JSON: i32 = 114;
     pub const JSONB: i32 = 3802;
+    pub const JSONPATH: i32 = 4072;
+    pub const JSONPATH_ARRAY: i32 = 4073;
     pub const TSVECTOR: i32 = 3614;
     pub const TSQUERY: i32 = 3615;
     pub const TSVECTOR_ARRAY: i32 = 3643;
@@ -375,6 +377,8 @@ pub enum ColType {
     Json,
     /// Binary/normalized JSON (canonicalized on input).
     Jsonb,
+    /// A validated SQL/JSON path in PostgreSQL's canonical text form.
+    Jsonpath,
     /// PostgreSQL full-text document vector. The datum contains canonical,
     /// validated `tsvector` text; malformed search values never reach storage.
     TsVector,
@@ -510,7 +514,7 @@ impl BtreeOperatorClass {
             Uuid => Self::Uuid,
             Bit { varying: true } => Self::Varbit,
             Void | Internal | PgDdlCommand | Int2Vector | OidVector | PgNodeTree | PgNdistinct
-            | PgDependencies | PgMcvList | PgStatisticArray | Json => {
+            | PgDependencies | PgMcvList | PgStatisticArray | Json | Jsonpath => {
                 return None;
             }
         })
@@ -776,6 +780,7 @@ impl ColType {
             "interval" => Self::Interval,
             "json" => Self::Json,
             "jsonb" => Self::Jsonb,
+            "jsonpath" => Self::Jsonpath,
             "tsvector" => Self::TsVector,
             "tsquery" => Self::TsQuery,
             "uuid" => Self::Uuid,
@@ -836,6 +841,7 @@ impl ColType {
             Self::Interval => oid::INTERVAL,
             Self::Json => oid::JSON,
             Self::Jsonb => oid::JSONB,
+            Self::Jsonpath => oid::JSONPATH,
             Self::TsVector => oid::TSVECTOR,
             Self::TsQuery => oid::TSQUERY,
             Self::Array(e) => e.array_oid(),
@@ -904,6 +910,7 @@ impl ColType {
             oid::INTERVAL => Some(Self::Interval),
             oid::JSON => Some(Self::Json),
             oid::JSONB => Some(Self::Jsonb),
+            oid::JSONPATH => Some(Self::Jsonpath),
             oid::TSVECTOR => Some(Self::TsVector),
             oid::TSQUERY => Some(Self::TsQuery),
             oid::UUID => Some(Self::Uuid),
@@ -1026,6 +1033,7 @@ impl ColType {
             | Self::Numeric
             | Self::Json
             | Self::Jsonb
+            | Self::Jsonpath
             | Self::TsVector
             | Self::TsQuery => -1,
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
@@ -1112,6 +1120,7 @@ impl ColType {
             Self::Interval => "interval",
             Self::Json => "json",
             Self::Jsonb => "jsonb",
+            Self::Jsonpath => "jsonpath",
             Self::TsVector => "tsvector",
             Self::TsQuery => "tsquery",
             Self::Array(element) => element.array_name(),
@@ -1188,6 +1197,7 @@ impl ColType {
             Self::Interval => "interval",
             Self::Json => "json",
             Self::Jsonb => "jsonb",
+            Self::Jsonpath => "jsonpath",
             Self::TsVector => "tsvector",
             Self::TsQuery => "tsquery",
             Self::Array(_) => "array",
@@ -1260,6 +1270,7 @@ impl ColType {
             Self::Interval => 17,
             Self::Json => 18,
             Self::Jsonb => 19,
+            Self::Jsonpath => 227,
             Self::TsVector => 77,
             Self::TsQuery => 78,
             Self::Range(k) => RANGE_CODE_BASE + k.code(),
@@ -1341,6 +1352,7 @@ impl ColType {
             17 => Self::Interval,
             18 => Self::Json,
             19 => Self::Jsonb,
+            227 => Self::Jsonpath,
             77 => Self::TsVector,
             78 => Self::TsQuery,
             26 => Self::Bit { varying: false },
@@ -1404,6 +1416,7 @@ pub enum ArrElem {
     Bytea,
     Json,
     Jsonb,
+    Jsonpath,
     TsVector,
     TsQuery,
     Varchar,
@@ -1464,7 +1477,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 62] = [
+    pub const BUILTIN: [Self; 63] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1487,6 +1500,7 @@ impl ArrElem {
         Self::Interval,
         Self::Json,
         Self::Jsonb,
+        Self::Jsonpath,
         Self::TsVector,
         Self::TsQuery,
         Self::Uuid,
@@ -1580,6 +1594,7 @@ impl ArrElem {
             ArrElem::Bytea => "_bytea",
             ArrElem::Json => "_json",
             ArrElem::Jsonb => "_jsonb",
+            ArrElem::Jsonpath => "_jsonpath",
             ArrElem::TsVector => "_tsvector",
             ArrElem::TsQuery => "_tsquery",
             ArrElem::Varchar => "_varchar",
@@ -1660,6 +1675,7 @@ impl ArrElem {
             ArrElem::Bytea => "bytea[]",
             ArrElem::Json => "json[]",
             ArrElem::Jsonb => "jsonb[]",
+            ArrElem::Jsonpath => "jsonpath[]",
             ArrElem::TsVector => "tsvector[]",
             ArrElem::TsQuery => "tsquery[]",
             ArrElem::Varchar => "character varying[]",
@@ -1747,6 +1763,7 @@ impl ArrElem {
             Datum::Bytea(_) => ArrElem::Bytea,
             Datum::Json { jsonb: false, .. } => ArrElem::Json,
             Datum::Json { jsonb: true, .. } => ArrElem::Jsonb,
+            Datum::JsonPath(_) => ArrElem::Jsonpath,
             Datum::TsVector(_) => ArrElem::TsVector,
             Datum::TsQuery(_) => ArrElem::TsQuery,
             Datum::Inet(_) => ArrElem::Inet,
@@ -1834,6 +1851,7 @@ impl ArrElem {
             ColType::Bytea => ArrElem::Bytea,
             ColType::Json => ArrElem::Json,
             ColType::Jsonb => ArrElem::Jsonb,
+            ColType::Jsonpath => ArrElem::Jsonpath,
             ColType::TsVector => ArrElem::TsVector,
             ColType::TsQuery => ArrElem::TsQuery,
             ColType::Inet => ArrElem::Inet,
@@ -1869,6 +1887,7 @@ impl ArrElem {
             ArrElem::Bytea => ColType::Bytea,
             ArrElem::Json => ColType::Json,
             ArrElem::Jsonb => ColType::Jsonb,
+            ArrElem::Jsonpath => ColType::Jsonpath,
             ArrElem::TsVector => ColType::TsVector,
             ArrElem::TsQuery => ColType::TsQuery,
             ArrElem::Varchar => ColType::Varchar,
@@ -1937,6 +1956,7 @@ impl ArrElem {
             ArrElem::Bytea => 1001,
             ArrElem::Json => 199,
             ArrElem::Jsonb => 3807,
+            ArrElem::Jsonpath => oid::JSONPATH_ARRAY,
             ArrElem::TsVector => oid::TSVECTOR_ARRAY,
             ArrElem::TsQuery => oid::TSQUERY_ARRAY,
             ArrElem::Varchar => 1015,
@@ -2003,6 +2023,7 @@ impl ArrElem {
             ArrElem::Bytea => 14,
             ArrElem::Json => 15,
             ArrElem::Jsonb => 16,
+            ArrElem::Jsonpath => 146,
             ArrElem::TsVector => 64,
             ArrElem::TsQuery => 65,
             ArrElem::Varchar => 17,
@@ -2064,6 +2085,7 @@ impl ArrElem {
             14 => ArrElem::Bytea,
             15 => ArrElem::Json,
             16 => ArrElem::Jsonb,
+            146 => ArrElem::Jsonpath,
             64 => ArrElem::TsVector,
             65 => ArrElem::TsQuery,
             17 => ArrElem::Varchar,
@@ -2671,6 +2693,8 @@ pub enum Datum<'a> {
         text: &'a str,
         jsonb: bool,
     },
+    /// Canonical text of a validated `jsonpath` value.
+    JsonPath(&'a str),
     /// Canonical `tsvector` text produced by the full-text parser. Keeping a
     /// distinct datum prevents ordinary text from crossing search boundaries
     /// without validation.
@@ -2797,6 +2821,7 @@ impl<'a> Datum<'a> {
             Datum::Interval(_) => oid::INTERVAL,
             Datum::Json { jsonb: false, .. } => oid::JSON,
             Datum::Json { jsonb: true, .. } => oid::JSONB,
+            Datum::JsonPath(_) => oid::JSONPATH,
             Datum::TsVector(_) => oid::TSVECTOR,
             Datum::TsQuery(_) => oid::TSQUERY,
             Datum::Array { element, .. } => element.array_oid(),
@@ -2984,6 +3009,7 @@ impl fmt::Display for Datum<'_> {
                 f.write_str(super::datetime::format_interval_styled(*interval, style).as_str())
             }
             Datum::Json { text, .. } => f.write_str(text),
+            Datum::JsonPath(text) => f.write_str(text),
             Datum::TsVector(text) => f.write_str(text.as_str()),
             Datum::TsQuery(text) => f.write_str(text.as_str()),
             Datum::Range { text, .. } => f.write_str(text),
@@ -3636,6 +3662,8 @@ mod code_roundtrip_tests {
         }
         assert_eq!(ColType::from_code(ColType::Record.code()), None);
         assert_eq!(ColType::Array(ArrElem::Bool).code(), 80);
+        assert_eq!(ColType::Array(ArrElem::Jsonpath).code(), 226);
+        assert_eq!(ColType::Jsonpath.code(), 227);
         assert_eq!(ColType::Geometry(GeometryKind::Point).code(), 219);
         assert_eq!(
             ColType::Array(ArrElem::Geometry(GeometryKind::Point)).code(),

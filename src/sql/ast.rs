@@ -5551,7 +5551,7 @@ impl Expr<'_> {
         matches!(
             self,
             Expr::Call { name, .. }
-                if matches!(*name, "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "bit_and" | "bit_or" | "bit_xor" | "string_agg" | "array_agg" | "json_agg" | "jsonb_agg" | "json_object_agg" | "jsonb_object_agg" | "percentile_cont" | "percentile_disc" | "mode" | "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy")
+                if name.starts_with("__json_arrayagg_") || name.starts_with("__json_objectagg_") || matches!(*name, "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every" | "bit_and" | "bit_or" | "bit_xor" | "string_agg" | "array_agg" | "json_agg" | "json_agg_strict" | "jsonb_agg" | "jsonb_agg_strict" | "json_object_agg" | "json_object_agg_strict" | "json_object_agg_unique" | "json_object_agg_unique_strict" | "jsonb_object_agg" | "jsonb_object_agg_strict" | "jsonb_object_agg_unique" | "jsonb_object_agg_unique_strict" | "percentile_cont" | "percentile_disc" | "mode" | "var_pop" | "var_samp" | "variance" | "stddev_pop" | "stddev_samp" | "stddev" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept" | "regr_r2" | "regr_count" | "regr_avgx" | "regr_avgy" | "regr_sxx" | "regr_syy" | "regr_sxy")
         )
     }
 
@@ -6164,6 +6164,8 @@ pub enum BinaryOp {
     JsonExistsAny,
     /// `jsonb ?& array` — does it have all of the keys?
     JsonExistsAll,
+    /// `jsonb @? jsonpath` — does the path produce any item?
+    JsonPathExists,
     /// Integer bitwise operators.
     BitAnd,
     BitOr,
@@ -6217,6 +6219,7 @@ impl BinaryOp {
             b"?" => Self::JsonExists,
             b"?|" => Self::JsonExistsAny,
             b"?&" => Self::JsonExistsAll,
+            b"@?" => Self::JsonPathExists,
             b"&" => Self::BitAnd,
             b"|" => Self::BitOr,
             b"#" => Self::BitXor,
@@ -6259,6 +6262,7 @@ impl BinaryOp {
             Self::JsonExists => "?",
             Self::JsonExistsAny => "?|",
             Self::JsonExistsAll => "?&",
+            Self::JsonPathExists => "@?",
             Self::BitAnd => "&",
             Self::BitOr => "|",
             Self::BitXor => "#",
@@ -6290,7 +6294,9 @@ impl BinaryOp {
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
             Self::NetContainedEq | Self::NetContainsEq => 4,
             Self::Like | Self::ILike => 4,
-            Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll => 4,
+            Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll | Self::JsonPathExists => {
+                4
+            }
             Self::Concat => 5,
             Self::TextSearchPhrase => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,

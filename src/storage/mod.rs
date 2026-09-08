@@ -421,6 +421,10 @@ pub enum OwnedDatum {
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
+    JsonPath {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Array {
         element: crate::sql::types::ArrElem,
         len: u8,
@@ -591,6 +595,10 @@ impl OwnedDatum {
             Datum::Interval(value) => Self::Interval(*value),
             Datum::Uuid(value) => Self::Uuid(*value),
             Datum::Json { text, jsonb } => Self::json(*jsonb, text)?,
+            Datum::JsonPath(text) => {
+                let (len, bytes) = Self::bytes(text.as_bytes(), "jsonpath")?;
+                Self::JsonPath { len, bytes }
+            }
             Datum::TsVector(text) => {
                 let (len, bytes) = Self::bytes(text.as_bytes(), "text-search")?;
                 Self::TextSearch {
@@ -756,6 +764,9 @@ impl OwnedDatum {
                     .expect("stored from valid UTF-8"),
                 jsonb: *jsonb,
             },
+            Self::JsonPath { len, bytes } => Datum::JsonPath(
+                core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
+            ),
             Self::Array {
                 element,
                 len,

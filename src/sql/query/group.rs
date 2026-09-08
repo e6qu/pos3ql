@@ -716,7 +716,7 @@ pub(super) fn grouped_rows<'a>(
     // A star in a grouped select stands for its columns: expand it so each
     // expanded column is validated (and projected) like a written one —
     // PostgreSQL accepts `SELECT * FROM t GROUP BY a, b, c`.
-    let statement = expand_grouped_stars(statement, scope, arena)?;
+    let statement = expand_grouped_stars(statement, scope, storage, txid, arena)?;
     // Validate: non-aggregate select items must be GROUP BY expressions.
     for item in statement.items {
         let SelectItem::Expr { expression, .. } = item else {
@@ -1084,6 +1084,8 @@ fn same_scope_column(scope: &QueryScope, a: &Expr, b: &Expr) -> bool {
 fn expand_grouped_stars<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     use crate::sql::ast::SelectItem;
@@ -1137,28 +1139,33 @@ fn expand_grouped_stars<'a>(
             }
             SelectItem::RecordStar(base) => {
                 let mut error = None;
-                let expanded =
-                    crate::sql::exec::record_shape(base, &super::ScopeCols(scope), |name, _| {
-                        if error.is_some() {
-                            return;
-                        }
-                        let result = arena
-                            .alloc_str(name)
-                            .map_err(|_| arena_full())
-                            .and_then(|field| {
-                                arena
-                                    .alloc(Expr::Field { base, field })
-                                    .map(|expression| SelectItem::Expr {
-                                        expression: &*expression,
-                                        alias: None,
-                                    })
-                                    .map_err(|_| arena_full())
-                            })
-                            .and_then(|item| push(item, &mut n));
-                        if let Err(e) = result {
-                            error = Some(e);
-                        }
-                    });
+                let resolver = super::CatalogScopeCols {
+                    scope,
+                    outer_scope: None,
+                    storage,
+                    txid,
+                };
+                let expanded = crate::sql::exec::record_shape(base, &resolver, |name, _| {
+                    if error.is_some() {
+                        return;
+                    }
+                    let result = arena
+                        .alloc_str(name)
+                        .map_err(|_| arena_full())
+                        .and_then(|field| {
+                            arena
+                                .alloc(Expr::Field { base, field })
+                                .map(|expression| SelectItem::Expr {
+                                    expression: &*expression,
+                                    alias: None,
+                                })
+                                .map_err(|_| arena_full())
+                        })
+                        .and_then(|item| push(item, &mut n));
+                    if let Err(e) = result {
+                        error = Some(e);
+                    }
+                });
                 if let Some(error) = error {
                     return Err(error);
                 }

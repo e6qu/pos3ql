@@ -15812,18 +15812,75 @@ fn parse_trigger_assignment<'a>(
     let (target, expression) = (&statement[..offset], &statement[offset + 2..]);
     let target = target.trim();
     let expression = expression.trim();
-    let Some((record, column)) = target.split_once('.') else {
-        return Ok(None);
-    };
-    if !record.eq_ignore_ascii_case("new") {
+    if target.is_empty() || expression.is_empty() {
         return Ok(None);
     }
-    if column.is_empty() || expression.is_empty() {
-        return Ok(None);
-    }
-    let column = SqlName::parse(column)?;
     let expression = super::parser::parse_expr(expression, arena)?;
+    let (qualifier, column, expression) =
+        parse_plpgsql_assignment_target(target, expression, arena)?;
+    if !qualifier.is_some_and(|record| record.eq_ignore_ascii_case("new")) {
+        return Ok(None);
+    }
     Ok(Some(TriggerAssignment { column, expression }))
+}
+
+/// Resolves a PL/pgSQL assignment target and lowers any chained subscripts to
+/// the same JSONB setter used by UPDATE. Keeping one setter boundary gives
+/// trigger-row and local-variable assignment identical container creation,
+/// padding, and traversal errors.
+fn parse_plpgsql_assignment_target<'a>(
+    target: &'a str,
+    value: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<(Option<&'a str>, SqlName, &'a Expr<'a>), SqlError> {
+    let target = super::parser::parse_expr(target, arena)?;
+    let mut current = target;
+    let mut subscripts = [value; super::parser::MAX_LIST];
+    let mut count = 0usize;
+    while let Expr::Subscript { base, index } = current {
+        if count == subscripts.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL assignment has too many subscripts"
+            ));
+        }
+        subscripts[count] = index;
+        count += 1;
+        current = base;
+    }
+    let Expr::Column { qualifier, name } = current else {
+        return Err(unsupported_trigger_body());
+    };
+    let column = SqlName::parse(name)?;
+    if count == 0 {
+        return Ok((*qualifier, column, value));
+    }
+    let mut args = [value; super::parser::MAX_LIST];
+    args[0] = current;
+    args[1] = value;
+    for (output, subscript) in args[2..2 + count]
+        .iter_mut()
+        .zip(subscripts[..count].iter().rev())
+    {
+        *output = *subscript;
+    }
+    let args = arena
+        .alloc_slice_copy(&args[..2 + count])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let expression = arena
+        .alloc(Expr::Call {
+            name: "__jsonb_subscript_set",
+            args,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok((*qualifier, column, expression))
 }
 
 fn parse_trigger_local_assignment<'a>(
@@ -15835,13 +15892,15 @@ fn parse_trigger_local_assignment<'a>(
     };
     let name = statement[..offset].trim();
     let expression = statement[offset + 2..].trim();
-    if name.is_empty() || expression.is_empty() || name.contains('.') {
+    if name.is_empty() || expression.is_empty() {
         return Ok(None);
     }
-    Ok(Some(TriggerLocalAssignment {
-        name: SqlName::parse(name)?,
-        expression: super::parser::parse_expr(expression, arena)?,
-    }))
+    let expression = super::parser::parse_expr(expression, arena)?;
+    let (qualifier, name, expression) = parse_plpgsql_assignment_target(name, expression, arena)?;
+    if qualifier.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(TriggerLocalAssignment { name, expression }))
 }
 
 fn trigger_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {
@@ -50714,6 +50773,9 @@ fn decode_binary_field_with_context<'a>(
         // invalid JSON datum.
         ColType::Json => crate::sql::eval::cast_to(via(oids::JSON)?, ColType::Json, arena),
         ColType::Jsonb => crate::sql::eval::cast_to(via(oids::JSONB)?, ColType::Jsonb, arena),
+        ColType::Jsonpath => {
+            crate::sql::eval::cast_to(via(oids::JSONPATH)?, ColType::Jsonpath, arena)
+        }
         ColType::TsVector => crate::sql::full_text::decode_vector_binary(bytes, arena)
             .map(crate::sql::full_text::restore_vector)
             .map(Datum::TsVector)
@@ -65009,6 +65071,7 @@ pub(crate) fn coerce<'a>(
     }
     if let ColType::Composite(slot) = col.ctype {
         let typed = match v {
+            Datum::Null => return Ok(Datum::Null),
             value @ Datum::Composite { slot: actual, .. } if actual == slot => value,
             value @ Datum::CompositeText { slot: actual, .. } if actual == slot => {
                 return Ok(value);

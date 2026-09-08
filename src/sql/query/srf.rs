@@ -37,6 +37,10 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("json_array_elements")
         || name.eq_ignore_ascii_case("jsonb_array_elements_text")
         || name.eq_ignore_ascii_case("json_array_elements_text")
+        || name.eq_ignore_ascii_case("jsonb_path_query")
+        || name.eq_ignore_ascii_case("jsonb_path_query_tz")
+        || name.eq_ignore_ascii_case("json_populate_recordset")
+        || name.eq_ignore_ascii_case("jsonb_populate_recordset")
         || name.eq_ignore_ascii_case("regexp_split_to_table")
         || name.eq_ignore_ascii_case("string_to_table")
         || name.eq_ignore_ascii_case("generate_subscripts")
@@ -950,6 +954,93 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             }
             return Ok(values);
         }
+        if name.eq_ignore_ascii_case("jsonb_path_query")
+            || name.eq_ignore_ascii_case("jsonb_path_query_tz")
+        {
+            if !(2..=4).contains(&args.len()) {
+                return Err(srf_signature_error(name));
+            }
+            let target = eval_full(args[0], arena, params, row, hooks)?;
+            let path = eval_full(args[1], arena, params, row, hooks)?;
+            let variables = if args.len() >= 3 {
+                Some(eval_full(args[2], arena, params, row, hooks)?)
+            } else {
+                None
+            };
+            let silent = if args.len() == 4 {
+                Some(eval_full(args[3], arena, params, row, hooks)?)
+            } else {
+                None
+            };
+            let Some(path_values) = crate::sql::eval::funcs::json::path_query_values(
+                target,
+                path,
+                variables,
+                silent,
+                name.ends_with("_tz"),
+                arena,
+            )?
+            else {
+                return Ok(&[]);
+            };
+            let values = arena
+                .alloc_slice_with(path_values.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (value, path_value) in values.iter_mut().zip(path_values) {
+                *value = Datum::Json {
+                    text: crate::sql::eval::json_to_text_pub(path_value, arena)?,
+                    jsonb: true,
+                };
+            }
+            return Ok(values);
+        }
+        if name.eq_ignore_ascii_case("json_populate_recordset")
+            || name.eq_ignore_ascii_case("jsonb_populate_recordset")
+        {
+            let valid_arity = if name.eq_ignore_ascii_case("json_populate_recordset") {
+                matches!(args.len(), 2 | 3)
+            } else {
+                args.len() == 2
+            };
+            if !valid_arity {
+                return Err(srf_signature_error(name));
+            }
+            let base = eval_full(args[0], arena, params, row, hooks)?;
+            let source = eval_full(args[1], arena, params, row, hooks)?;
+            if let Some(option) = args.get(2) {
+                crate::sql::eval::cast_to(
+                    eval_full(option, arena, params, row, hooks)?,
+                    ColType::Bool,
+                    arena,
+                )?;
+            }
+            let source = match source {
+                Datum::Json { text, .. } | Datum::Text(text) => text,
+                Datum::Null => return Ok(&[]),
+                other => {
+                    return Err(crate::sql::eval::type_mismatch_pub(
+                        "populate_recordset requires JSON",
+                        &other,
+                    ));
+                }
+            };
+            let crate::sql::json::Json::Array(items) = crate::sql::json::parse(source, arena)?
+            else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "cannot call populate_recordset on a non-array"
+                ));
+            };
+            let values = arena
+                .alloc_slice_with(items.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (value, item) in values.iter_mut().zip(items) {
+                *value = crate::sql::eval::funcs::json::populate_record_from_json(
+                    args[0], base, *item, arena, row, hooks,
+                )?;
+            }
+            return Ok(values);
+        }
         if is_srf_name(name) {
             let count = srf_count(expression, arena, params, row, hooks)?;
             let values = arena
@@ -1237,6 +1328,68 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
             }
         }
         Ok(n)
+    } else if name.eq_ignore_ascii_case("jsonb_path_query")
+        || name.eq_ignore_ascii_case("jsonb_path_query_tz")
+    {
+        if !(2..=4).contains(&args.len()) {
+            return Err(srf_signature_error(name));
+        }
+        let target = eval_full(args[0], arena, params, row, hooks)?;
+        let path = eval_full(args[1], arena, params, row, hooks)?;
+        let variables = if args.len() >= 3 {
+            Some(eval_full(args[2], arena, params, row, hooks)?)
+        } else {
+            None
+        };
+        let silent = if args.len() == 4 {
+            Some(eval_full(args[3], arena, params, row, hooks)?)
+        } else {
+            None
+        };
+        Ok(crate::sql::eval::funcs::json::path_query_values(
+            target,
+            path,
+            variables,
+            silent,
+            name.ends_with("_tz"),
+            arena,
+        )?
+        .map_or(0, <[_]>::len))
+    } else if name.eq_ignore_ascii_case("json_populate_recordset")
+        || name.eq_ignore_ascii_case("jsonb_populate_recordset")
+    {
+        let valid_arity = if name.eq_ignore_ascii_case("json_populate_recordset") {
+            matches!(args.len(), 2 | 3)
+        } else {
+            args.len() == 2
+        };
+        if !valid_arity {
+            return Err(srf_signature_error(name));
+        }
+        if let Some(option) = args.get(2) {
+            crate::sql::eval::cast_to(
+                eval_full(option, arena, params, row, hooks)?,
+                ColType::Bool,
+                arena,
+            )?;
+        }
+        let source = match eval_full(args[1], arena, params, row, hooks)? {
+            Datum::Json { text, .. } | Datum::Text(text) => text,
+            Datum::Null => return Ok(0),
+            other => {
+                return Err(crate::sql::eval::type_mismatch_pub(
+                    "populate_recordset requires JSON",
+                    &other,
+                ));
+            }
+        };
+        match crate::sql::json::parse(source, arena)? {
+            crate::sql::json::Json::Array(items) => Ok(items.len()),
+            _ => Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot call populate_recordset on a non-array"
+            )),
+        }
     } else if name.eq_ignore_ascii_case("jsonb_object_keys")
         || name.eq_ignore_ascii_case("json_object_keys")
     {
@@ -1818,6 +1971,303 @@ fn table_function_column(
     }
 }
 
+fn json_table_append_columns(
+    specifications: &[&Expr<'_>],
+    storage: &Storage,
+    txid: u32,
+    output: &mut [ColumnMeta; MAX_COLUMNS],
+    count: &mut usize,
+) -> Result<(), SqlError> {
+    for specification in specifications {
+        let Expr::Call { name, args, .. } = specification else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid JSON_TABLE column specification"
+            ));
+        };
+        if *name == "__json_table_nested" {
+            let Some(Expr::Call {
+                name: "__json_table_columns",
+                args: children,
+                ..
+            }) = args.get(2).copied()
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid JSON_TABLE nested column specification"
+                ));
+            };
+            json_table_append_columns(children, storage, txid, output, count)?;
+            continue;
+        }
+        let Some(Expr::Str(column_name)) = args.first().copied() else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid JSON_TABLE column name"
+            ));
+        };
+        if output[..*count]
+            .iter()
+            .any(|column| column.name.as_str() == *column_name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column name \"{}\" specified more than once",
+                column_name
+            ));
+        }
+        if *count == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "JSON_TABLE output exceeds configured column capacity"
+            ));
+        }
+        let (ctype, user_type, type_mod) = if *name == "__json_table_ordinality" {
+            (ColType::Int8, None, -1)
+        } else if matches!(*name, "__json_table_value" | "__json_table_exists") {
+            let (Some(Expr::Str(type_name)), Some(Expr::Int(type_mod))) =
+                (args.get(1).copied(), args.get(2).copied())
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid JSON_TABLE column type"
+                ));
+            };
+            let resolved = crate::sql::exec::resolve_routine_type(storage, txid, type_name)?;
+            (
+                resolved.ctype,
+                resolved.user_type,
+                i32::try_from(*type_mod).map_err(|_| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "invalid JSON_TABLE type modifier")
+                })?,
+            )
+        } else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid JSON_TABLE column kind"
+            ));
+        };
+        output[*count] = table_function_column(
+            SqlName::parse(column_name)?,
+            ctype,
+            user_type,
+            type_mod,
+            if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        );
+        *count += 1;
+    }
+    Ok(())
+}
+
+fn json_table_validate_names(args: &[&Expr<'_>]) -> Result<(), SqlError> {
+    if !matches!(args.get(1).copied(), Some(Expr::Str(_))) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "only string constants are supported in JSON_TABLE path specification"
+        ));
+    }
+    let mut names = [SqlName::EMPTY; MAX_COLUMNS * 2];
+    let mut count = 0usize;
+    let mut add = |name: &str| -> Result<(), SqlError> {
+        let parsed = SqlName::parse(name)?;
+        if names[..count].contains(&parsed) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "duplicate JSON_TABLE column or path name: {}",
+                name
+            ));
+        }
+        if count == names.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "JSON_TABLE has too many column and path names"
+            ));
+        }
+        names[count] = parsed;
+        count += 1;
+        Ok(())
+    };
+
+    fn columns<'a>(
+        specifications: &[&'a Expr<'a>],
+        add: &mut impl FnMut(&'a str) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        for specification in specifications {
+            let Expr::Call { name, args, .. } = specification else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid JSON_TABLE column specification"
+                ));
+            };
+            if *name == "__json_table_nested" {
+                if let Some(Expr::Str(path_name)) = args.get(1).copied() {
+                    add(path_name)?;
+                }
+                let Some(Expr::Call {
+                    name: "__json_table_columns",
+                    args: children,
+                    ..
+                }) = args.get(2).copied()
+                else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "invalid JSON_TABLE nested column specification"
+                    ));
+                };
+                columns(children, add)?;
+            } else if let Some(Expr::Str(column_name)) = args.first().copied() {
+                add(column_name)?;
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid JSON_TABLE column name"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    if let Some(Expr::Str(root_name)) = args.get(2).copied() {
+        add(root_name)?;
+    }
+    let Some(Expr::Call {
+        name: "__json_table_columns",
+        args: specifications,
+        ..
+    }) = args.get(4).copied()
+    else {
+        return Err(srf_signature_error("json_table"));
+    };
+    columns(specifications, &mut add)
+}
+
+fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
+    args: &[&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    output: &mut [ColumnMeta; MAX_COLUMNS],
+) -> Result<usize, SqlError> {
+    if args.len() != 2 {
+        return Err(srf_signature_error("populate_record"));
+    }
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let type_oid = match crate::sql::eval::expression_type_identity(args[0], columns, &hooks)? {
+        crate::sql::eval::ExpressionTypeIdentity::Known(oid) => oid,
+        crate::sql::eval::ExpressionTypeIdentity::Unresolved => {
+            crate::sql::eval::eval_full(args[0], arena, params, columns, &hooks)?.type_oid()
+        }
+    };
+    let Some(composite_oid) =
+        crate::sql::eval::CatalogAccess::composite_base_type_oid(&catalog, type_oid)
+    else {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "first argument of populate_record must be a row type"
+        ));
+    };
+    let Some(ColType::Composite(slot)) = ColType::from_oid(composite_oid) else {
+        unreachable!("catalog composite base OID is a composite")
+    };
+    let definition = storage.composite_for(slot as usize, txid);
+    let mut count = 0usize;
+    for field in definition.active_fields() {
+        if count == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "populate_record output exceeds configured column capacity"
+            ));
+        }
+        output[count] = table_function_column(
+            field.name,
+            field.ctype,
+            field.user_type,
+            field.type_mod,
+            field.collation,
+        );
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn json_to_record_append_columns(
+    args: &[&Expr<'_>],
+    storage: &Storage,
+    txid: u32,
+    output: &mut [ColumnMeta; MAX_COLUMNS],
+) -> Result<usize, SqlError> {
+    if args.len() != 2 {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "a column definition list is required for functions returning record"
+        ));
+    }
+    let Expr::Call {
+        name: "__json_record_columns",
+        args: definitions,
+        ..
+    } = args[1]
+    else {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "a column definition list is required for functions returning record"
+        ));
+    };
+    for (index, definition) in definitions.iter().enumerate() {
+        if index == output.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "record definition exceeds configured column capacity"
+            ));
+        }
+        let Expr::Call {
+            name: "__json_record_column",
+            args: [Expr::Str(name), Expr::Str(type_name), Expr::Int(type_mod)],
+            ..
+        } = definition
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid JSON record column definition"
+            ));
+        };
+        if output[..index]
+            .iter()
+            .any(|column| column.name.as_str() == *name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column name \"{}\" specified more than once",
+                name
+            ));
+        }
+        let resolved = crate::sql::exec::resolve_routine_type(storage, txid, type_name)?;
+        output[index] = table_function_column(
+            SqlName::parse(name)?,
+            resolved.ctype,
+            resolved.user_type,
+            i32::try_from(*type_mod)
+                .map_err(|_| sql_err!(sqlstate::INTERNAL_ERROR, "invalid record type modifier"))?,
+            if resolved.ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        );
+    }
+    Ok(definitions.len())
+}
+
 fn table_function_array_element_type(
     storage: &Storage,
     txid: u32,
@@ -1875,6 +2325,20 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || tref.table.eq_ignore_ascii_case("json_array_elements")
         || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
         || tref.table.eq_ignore_ascii_case("json_array_elements_text");
+    let is_jsonpath_query = tref.table.eq_ignore_ascii_case("jsonb_path_query")
+        || tref.table.eq_ignore_ascii_case("jsonb_path_query_tz");
+    let is_json_table = tref.table.eq_ignore_ascii_case("json_table");
+    let is_populate_record = matches!(
+        tref.table,
+        "json_populate_record"
+            | "jsonb_populate_record"
+            | "json_populate_recordset"
+            | "jsonb_populate_recordset"
+    );
+    let is_json_to_record = matches!(
+        tref.table,
+        "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
+    );
     let is_each = is_json_each_name(tref.table);
     let is_rstt = tref.table.eq_ignore_ascii_case("regexp_split_to_table");
     let is_gsub = tref.table.eq_ignore_ascii_case("generate_subscripts");
@@ -1893,6 +2357,10 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_re
         || is_keys
         || is_elems
+        || is_jsonpath_query
+        || is_json_table
+        || is_populate_record
+        || is_json_to_record
         || is_each
         || is_rstt
         || is_gsub
@@ -1925,7 +2393,41 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
     let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
-    let n_default = if is_logical_slot_record {
+    let n_default = if is_json_to_record {
+        json_to_record_append_columns(
+            tref.func_args.unwrap_or(&[]),
+            storage,
+            txid,
+            &mut default_cols,
+        )?
+    } else if is_populate_record {
+        populate_record_append_columns(
+            tref.func_args.unwrap_or(&[]),
+            storage,
+            txid,
+            arena,
+            params,
+            columns,
+            &mut default_cols,
+        )?
+    } else if is_json_table {
+        let args = tref.func_args.unwrap_or(&[]);
+        if args.len() != 6 {
+            return Err(srf_signature_error(tref.table));
+        }
+        json_table_validate_names(args)?;
+        let Expr::Call {
+            name: "__json_table_columns",
+            args: specifications,
+            ..
+        } = args[4]
+        else {
+            return Err(srf_signature_error(tref.table));
+        };
+        let mut count = 0usize;
+        json_table_append_columns(specifications, storage, txid, &mut default_cols, &mut count)?;
+        count
+    } else if is_logical_slot_record {
         let argument_count = tref.func_args.unwrap_or(&[]).len();
         if crate::sql::logical_replication::result_type(tref.table, argument_count)
             != Some((crate::sql::types::oid::RECORD, -1))
@@ -2275,6 +2777,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             } else {
                 ColType::Text
             }
+        } else if is_jsonpath_query {
+            if !(2..=4).contains(&tref.func_args.unwrap_or(&[]).len()) {
+                return Err(srf_signature_error(tref.table));
+            }
+            ColType::Jsonb
         } else {
             let args = tref.func_args.unwrap_or(&[]);
             match args.first() {
@@ -2434,7 +2941,7 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &[Datum<'a>],
+    _params: &[Datum<'a>],
     columns: &C,
     eval_hooks: Option<&EvalHooks<'_, 'a>>,
 ) -> Result<Option<(usize, &'a RoutineDef)>, SqlError> {
@@ -2456,12 +2963,11 @@ fn table_func_routine<'a, C: ColumnLookup<'a>>(
                 crate::sql::eval::ExpressionTypeIdentity::Known(oid) => Some(oid),
                 crate::sql::eval::ExpressionTypeIdentity::Unresolved => None,
             };
-        argument_type_oids[slot] = match statically_known {
-            Some(oid) => oid,
-            None => {
-                crate::sql::eval::eval_full(argument, arena, params, columns, &hooks)?.type_oid()
-            }
-        };
+        // An unresolved literal or protocol parameter remains UNKNOWN while
+        // selecting the routine overload. Evaluating it here both converts a
+        // string literal to the implementation Text datum too early and can
+        // evaluate volatile table-function arguments twice.
+        argument_type_oids[slot] = statically_known.unwrap_or(crate::sql::types::oid::UNKNOWN);
     }
     let mut qualified = StackStr::<128>::new();
     let name = if let Some(schema) = tref.schema {
@@ -2575,6 +3081,41 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
         None => crate::sql::eval::eval(argument, arena, params, columns),
     };
+    if tref.table.eq_ignore_ascii_case("json_table") {
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+        };
+        return json_table_rows(args, arena, params, columns, &hooks);
+    }
+    if matches!(
+        tref.table,
+        "json_populate_record"
+            | "jsonb_populate_record"
+            | "json_populate_recordset"
+            | "jsonb_populate_recordset"
+    ) {
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+        };
+        return populate_record_rows(tref.table, args, arena, params, columns, &hooks);
+    }
+    if matches!(
+        tref.table,
+        "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
+    ) {
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+        };
+        return json_to_record_rows(
+            tref.table, args, storage, txid, arena, params, columns, &hooks,
+        );
+    }
     if is_logical_slot_record_function(tref.table) {
         let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
         let value = crate::sql::logical_replication::dispatch(
@@ -3314,6 +3855,48 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         }
         return Ok(&*rows);
     }
+    if tref.table.eq_ignore_ascii_case("jsonb_path_query")
+        || tref.table.eq_ignore_ascii_case("jsonb_path_query_tz")
+    {
+        if !(2..=4).contains(&args.len()) {
+            return Err(srf_signature_error(tref.table));
+        }
+        let target = eval_argument(args[0])?;
+        let path = eval_argument(args[1])?;
+        let variables = if args.len() >= 3 {
+            Some(eval_argument(args[2])?)
+        } else {
+            None
+        };
+        let silent = if args.len() == 4 {
+            Some(eval_argument(args[3])?)
+        } else {
+            None
+        };
+        let Some(values) = crate::sql::eval::funcs::json::path_query_values(
+            target,
+            path,
+            variables,
+            silent,
+            tref.table.ends_with("_tz"),
+            arena,
+        )?
+        else {
+            return Ok(&[]);
+        };
+        const EMPTY: &[u8] = &[];
+        let rows = arena
+            .alloc_slice_with(values.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (slot, value) in rows.iter_mut().zip(values) {
+            let datum = Datum::Json {
+                text: crate::sql::eval::json_to_text_pub(value, arena)?,
+                jsonb: true,
+            };
+            *slot = crate::sql::exec::encode_projected_pub(&[datum], arena)?;
+        }
+        return Ok(&*rows);
+    }
     // jsonb_array_elements / json_array_elements[_text]: one row per element.
     if tref.table.eq_ignore_ascii_case("jsonb_array_elements")
         || tref.table.eq_ignore_ascii_case("json_array_elements")
@@ -3355,9 +3938,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             for (slot, element) in rows.iter_mut().zip(items.iter()) {
                 let datum = if as_text {
                     match *element {
-                        crate::sql::json::Json::Str(s) => {
-                            Datum::Text(crate::sql::json::decode_string(s, arena)?)
-                        }
+                        crate::sql::json::Json::Str(s) => Datum::Text(s),
                         crate::sql::json::Json::Null => Datum::Null,
                         _ => Datum::Text(crate::sql::eval::json_to_text_pub(element, arena)?),
                     }
@@ -3379,9 +3960,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         for (slot, element) in rows.iter_mut().zip(items.iter()) {
             let datum = if as_text {
                 match crate::sql::json::parse(element, arena)? {
-                    crate::sql::json::Json::Str(s) => {
-                        Datum::Text(crate::sql::json::decode_string(s, arena)?)
-                    }
+                    crate::sql::json::Json::Str(s) => Datum::Text(s),
                     crate::sql::json::Json::Null => Datum::Null,
                     _ => Datum::Text(element),
                 }
@@ -3901,6 +4480,718 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         v += step;
     }
     Ok(&*rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_to_record_rows<'a, C: ColumnLookup<'a>>(
+    name: &str,
+    args: &[&'a Expr<'a>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    if args.len() != 2 {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "a column definition list is required for functions returning record"
+        ));
+    }
+    let recordset = name.ends_with("recordset");
+    let source = match eval_full(args[0], arena, params, columns, hooks)? {
+        Datum::Json { text, .. } | Datum::Text(text) => text,
+        Datum::Null if recordset => return Ok(&[]),
+        Datum::Null => {
+            let Expr::Call {
+                name: "__json_record_columns",
+                args: definitions,
+                ..
+            } = args[1]
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid JSON record definition"
+                ));
+            };
+            let values = arena
+                .alloc_slice_with(definitions.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
+            return arena
+                .alloc_slice_copy(&[encoded])
+                .map(|rows| &*rows)
+                .map_err(|_| arena_full());
+        }
+        other => {
+            return Err(crate::sql::eval::type_mismatch_pub(
+                "JSON record conversion requires JSON",
+                &other,
+            ));
+        }
+    };
+    let parsed = crate::sql::json::parse(source, arena)?;
+    let items = if recordset {
+        let crate::sql::json::Json::Array(items) = parsed else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot call json_to_recordset on a non-array"
+            ));
+        };
+        items
+    } else {
+        arena
+            .alloc_slice_copy(&[parsed])
+            .map_err(|_| arena_full())?
+    };
+    let Expr::Call {
+        name: "__json_record_columns",
+        args: definitions,
+        ..
+    } = args[1]
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON record definition"
+        ));
+    };
+    const EMPTY: &[u8] = &[];
+    let rows = arena
+        .alloc_slice_with(items.len(), |_| EMPTY)
+        .map_err(|_| arena_full())?;
+    for (row_slot, item) in rows.iter_mut().zip(items) {
+        let crate::sql::json::Json::Object(members) = item else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot call populate_record on a scalar"
+            ));
+        };
+        let values = arena
+            .alloc_slice_with(definitions.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (value, definition) in values.iter_mut().zip(*definitions) {
+            let Expr::Call {
+                name: "__json_record_column",
+                args:
+                    [
+                        Expr::Str(column_name),
+                        Expr::Str(type_name),
+                        Expr::Int(type_mod),
+                    ],
+                ..
+            } = definition
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid JSON record column definition"
+                ));
+            };
+            let Some((_, member)) = members.iter().find(|(name, _)| *name == *column_name) else {
+                continue;
+            };
+            let resolved = crate::sql::exec::resolve_routine_type(storage, txid, type_name)?;
+            let type_oid = storage
+                .routine_type_oid(resolved.ctype, resolved.user_type, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "record column type is absent from the catalog"
+                    )
+                })?;
+            *value = crate::sql::eval::funcs::json::json_value_to_type(
+                *member,
+                type_oid,
+                i32::try_from(*type_mod).map_err(|_| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "invalid record type modifier")
+                })?,
+                Datum::Null,
+                arena,
+                hooks,
+            )?;
+        }
+        *row_slot = crate::sql::exec::encode_projected_pub(values, arena)?;
+    }
+    Ok(&*rows)
+}
+
+fn populate_record_rows<'a, C: ColumnLookup<'a>>(
+    name: &str,
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let valid_arity = if name.eq_ignore_ascii_case("json_populate_record")
+        || name.eq_ignore_ascii_case("json_populate_recordset")
+    {
+        matches!(args.len(), 2 | 3)
+    } else {
+        args.len() == 2
+    };
+    if !valid_arity {
+        return Err(srf_signature_error(name));
+    }
+    let base = eval_full(args[0], arena, params, columns, hooks)?;
+    let source = eval_full(args[1], arena, params, columns, hooks)?;
+    if let Some(option) = args.get(2) {
+        crate::sql::eval::cast_to(
+            eval_full(option, arena, params, columns, hooks)?,
+            ColType::Bool,
+            arena,
+        )?;
+    }
+    let source = match source {
+        Datum::Json { text, .. } | Datum::Text(text) => text,
+        Datum::Null => return Ok(&[]),
+        other => {
+            return Err(crate::sql::eval::type_mismatch_pub(
+                "populate_record requires JSON",
+                &other,
+            ));
+        }
+    };
+    let parsed = crate::sql::json::parse(source, arena)?;
+    let recordset = name.ends_with("recordset");
+    let items = if recordset {
+        let crate::sql::json::Json::Array(items) = parsed else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot call populate_recordset on a non-array"
+            ));
+        };
+        items
+    } else {
+        arena
+            .alloc_slice_copy(&[parsed])
+            .map_err(|_| arena_full())?
+    };
+    const EMPTY: &[u8] = &[];
+    let rows = arena
+        .alloc_slice_with(items.len(), |_| EMPTY)
+        .map_err(|_| arena_full())?;
+    for (row_slot, item) in rows.iter_mut().zip(items) {
+        let record = crate::sql::eval::funcs::json::populate_record_from_json(
+            args[0], base, *item, arena, columns, hooks,
+        )?;
+        let fields = match record {
+            Datum::Composite { fields, .. } | Datum::Record(fields) => fields,
+            Datum::Null => continue,
+            _ => unreachable!("populate_record returns a composite"),
+        };
+        let values = arena
+            .alloc_slice_with(fields.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (value, field) in values.iter_mut().zip(fields) {
+            *value = field.value;
+        }
+        *row_slot = crate::sql::exec::encode_projected_pub(values, arena)?;
+    }
+    Ok(&*rows)
+}
+
+fn json_table_rows<'a, C: ColumnLookup<'a>>(
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    if args.len() != 6 {
+        return Err(srf_signature_error("json_table"));
+    }
+    let context = eval_full(args[0], arena, params, columns, hooks)?;
+    if context.is_null() {
+        return Ok(&[]);
+    }
+    // Context conversion errors are outside JSON_TABLE's ON ERROR boundary.
+    let context = match context {
+        Datum::Json { text, .. } => Datum::Json { text, jsonb: true },
+        Datum::Text(text) | Datum::Bpchar(text) => {
+            crate::sql::eval::cast_to(Datum::Text(text), ColType::Jsonb, arena)?
+        }
+        other => crate::sql::eval::cast_to(other, ColType::Jsonb, arena)?,
+    };
+    let path = eval_full(args[1], arena, params, columns, hooks)?;
+    let Expr::Call {
+        name: "__json_table_passing",
+        args: passing,
+        ..
+    } = args[3]
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON_TABLE passing specification"
+        ));
+    };
+    let variables = crate::sql::eval::funcs::json::sql_json_passing(
+        "json_table",
+        passing,
+        0,
+        arena,
+        params,
+        columns,
+        hooks,
+    )?
+    .map(|text| Datum::Json { text, jsonb: true });
+    let Expr::Str(on_error) = args[5] else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON_TABLE error behavior"
+        ));
+    };
+    let roots = match crate::sql::eval::funcs::json::path_query_values(
+        context, path, variables, None, false, arena,
+    ) {
+        Ok(Some(values)) => values,
+        Ok(None) => return Ok(&[]),
+        Err(_) if *on_error == "empty" => return Ok(&[]),
+        Err(error) => return Err(error),
+    };
+    let Expr::Call {
+        name: "__json_table_columns",
+        args: specifications,
+        ..
+    } = args[4]
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON_TABLE column specification"
+        ));
+    };
+    const EMPTY: &[u8] = &[];
+    let mut encoded = [EMPTY; crate::sql::parser::MAX_ROWS];
+    let mut encoded_count = 0usize;
+    let output_columns = json_table_specifications_width(specifications)?;
+    for (index, root) in roots.iter().enumerate() {
+        let values = [Datum::Null; MAX_COLUMNS];
+        json_table_emit_level(
+            *root,
+            index + 1,
+            specifications,
+            0,
+            output_columns,
+            values,
+            variables,
+            arena,
+            params,
+            columns,
+            hooks,
+            &mut encoded,
+            &mut encoded_count,
+        )?;
+    }
+    arena
+        .alloc_slice_copy(&encoded[..encoded_count])
+        .map(|rows| &*rows)
+        .map_err(|_| arena_full())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
+    current: crate::sql::json::Json<'a>,
+    ordinal: usize,
+    specifications: &[&'a Expr<'a>],
+    start_column: usize,
+    output_columns: usize,
+    mut values: [Datum<'a>; MAX_COLUMNS],
+    variables: Option<Datum<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    hooks: &EvalHooks<'_, 'a>,
+    encoded: &mut [&'a [u8]; crate::sql::parser::MAX_ROWS],
+    encoded_count: &mut usize,
+) -> Result<usize, SqlError> {
+    let mut column = start_column;
+    let mut nested = [None; crate::sql::parser::MAX_LIST];
+    let mut nested_count = 0usize;
+    for specification in specifications {
+        let Expr::Call { name, args, .. } = specification else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid JSON_TABLE column specification"
+            ));
+        };
+        match *name {
+            "__json_table_ordinality" => {
+                values[column] = Datum::Int8(i64::try_from(ordinal).map_err(|_| {
+                    sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "ordinality exceeds bigint")
+                })?);
+                column += 1;
+            }
+            "__json_table_value" | "__json_table_exists" => {
+                values[column] = json_table_column_value(
+                    current, name, args, variables, arena, params, columns, hooks,
+                )?;
+                column += 1;
+            }
+            "__json_table_nested" => {
+                let width = json_table_spec_width(specification)?;
+                nested[nested_count] = Some((*specification, column));
+                nested_count += 1;
+                column += width;
+            }
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid JSON_TABLE column kind"
+                ));
+            }
+        }
+    }
+    if nested_count == 0 {
+        if *encoded_count == encoded.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "JSON_TABLE produces more than {} rows",
+                encoded.len()
+            ));
+        }
+        encoded[*encoded_count] =
+            crate::sql::exec::encode_projected_pub(&values[..output_columns], arena)?;
+        *encoded_count += 1;
+        return Ok(column - start_column);
+    }
+
+    for (nested_specification, nested_start) in nested[..nested_count].iter().flatten() {
+        let Expr::Call { args, .. } = nested_specification else {
+            unreachable!("nested specification is a call")
+        };
+        let path = eval_full(args[0], arena, params, columns, hooks)?;
+        let current_text = crate::sql::eval::json_to_text_pub(&current, arena)?;
+        let children = crate::sql::eval::funcs::json::path_query_values(
+            Datum::Json {
+                text: current_text,
+                jsonb: true,
+            },
+            path,
+            variables,
+            None,
+            false,
+            arena,
+        )?
+        .unwrap_or(&[]);
+        let Expr::Call {
+            name: "__json_table_columns",
+            args: child_specifications,
+            ..
+        } = args[2]
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid JSON_TABLE nested columns"
+            ));
+        };
+        if children.is_empty() {
+            if *encoded_count == encoded.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "JSON_TABLE produces more than {} rows",
+                    encoded.len()
+                ));
+            }
+            encoded[*encoded_count] =
+                crate::sql::exec::encode_projected_pub(&values[..output_columns], arena)?;
+            *encoded_count += 1;
+        } else {
+            for (child_index, child) in children.iter().enumerate() {
+                json_table_emit_level(
+                    *child,
+                    child_index + 1,
+                    child_specifications,
+                    *nested_start,
+                    output_columns,
+                    values,
+                    variables,
+                    arena,
+                    params,
+                    columns,
+                    hooks,
+                    encoded,
+                    encoded_count,
+                )?;
+            }
+        }
+    }
+    Ok(column - start_column)
+}
+
+fn json_table_spec_width(specification: &Expr<'_>) -> Result<usize, SqlError> {
+    let Expr::Call { name, args, .. } = specification else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON_TABLE column"
+        ));
+    };
+    if *name != "__json_table_nested" {
+        return Ok(1);
+    }
+    let Some(Expr::Call {
+        name: "__json_table_columns",
+        args: children,
+        ..
+    }) = args.get(2).copied()
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON_TABLE nested columns"
+        ));
+    };
+    let mut width = 0usize;
+    for child in *children {
+        width = width
+            .checked_add(json_table_spec_width(child)?)
+            .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON_TABLE is too wide"))?;
+    }
+    Ok(width)
+}
+
+fn json_table_specifications_width(specifications: &[&Expr<'_>]) -> Result<usize, SqlError> {
+    let mut width = 0usize;
+    for specification in specifications {
+        width = width
+            .checked_add(json_table_spec_width(specification)?)
+            .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "JSON_TABLE is too wide"))?;
+    }
+    if width > MAX_COLUMNS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "JSON_TABLE output exceeds configured column capacity"
+        ));
+    }
+    Ok(width)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_table_column_value<'a, C: ColumnLookup<'a>>(
+    current: crate::sql::json::Json<'a>,
+    kind: &str,
+    args: &[&'a Expr<'a>],
+    variables: Option<Datum<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let (Some(Expr::Str(type_name)), Some(Expr::Int(type_mod))) =
+        (args.get(1).copied(), args.get(2).copied())
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON_TABLE column type"
+        ));
+    };
+    let type_mod = i32::try_from(*type_mod)
+        .map_err(|_| sql_err!(sqlstate::INTERNAL_ERROR, "invalid JSON_TABLE type modifier"))?;
+    let path = eval_full(args[3], arena, params, columns, hooks)?;
+    let current_text = crate::sql::eval::json_to_text_pub(&current, arena)?;
+    let queried = crate::sql::eval::funcs::json::path_query_values(
+        Datum::Json {
+            text: current_text,
+            jsonb: true,
+        },
+        path,
+        variables,
+        None,
+        false,
+        arena,
+    );
+    if kind == "__json_table_exists" {
+        let Expr::Str(behavior) = args[4] else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid JSON_TABLE EXISTS behavior"
+            ));
+        };
+        let value = match queried {
+            Ok(Some(values)) => Datum::Bool(!values.is_empty()),
+            Ok(None) => Datum::Null,
+            Err(error) => match *behavior {
+                "true" => Datum::Bool(true),
+                "false" => Datum::Bool(false),
+                "unknown" => Datum::Null,
+                _ => return Err(error),
+            },
+        };
+        return crate::sql::eval::funcs::json::sql_json_cast(
+            value, type_name, type_mod, arena, hooks,
+        );
+    }
+
+    let [
+        _,
+        _,
+        _,
+        _,
+        Expr::Str(format),
+        Expr::Str(wrapper),
+        Expr::Str(quotes),
+        empty_default,
+        error_default,
+        Expr::Str(empty_code),
+        Expr::Str(error_code),
+    ] = args
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid JSON_TABLE value specification"
+        ));
+    };
+    let convert = |values: &'a [crate::sql::json::Json<'a>]| -> Result<Datum<'a>, SqlError> {
+        if values.is_empty() {
+            return json_table_behavior(
+                empty_code,
+                empty_default,
+                sql_err!(sqlstate::DATA_EXCEPTION, "no SQL/JSON item"),
+                type_name,
+                type_mod,
+                arena,
+                params,
+                columns,
+                hooks,
+            );
+        }
+        let query_semantics = *format == "json"
+            || *wrapper != "without"
+            || ColType::from_sql_name(type_name).is_some_and(|ctype| {
+                matches!(ctype, ColType::Json | ColType::Jsonb | ColType::Array(_))
+            })
+            || hooks
+                .catalog
+                .is_some_and(|catalog| catalog.is_composite_type_name(type_name));
+        let raw = if query_semantics {
+            json_table_query_datum(values, wrapper, quotes, arena)?
+        } else {
+            if values.len() != 1 {
+                return Err(sql_err!(
+                    sqlstate::CARDINALITY_VIOLATION,
+                    "JSON path expression yielded multiple values"
+                ));
+            }
+            match values[0] {
+                crate::sql::json::Json::Null => Datum::Null,
+                crate::sql::json::Json::Str(value) => Datum::Text(value),
+                crate::sql::json::Json::Bool(value) => Datum::Bool(value),
+                crate::sql::json::Json::Number(value) => Datum::Text(value),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "JSON path expression yielded a non-scalar value"
+                    ));
+                }
+            }
+        };
+        crate::sql::eval::funcs::json::sql_json_cast(raw, type_name, type_mod, arena, hooks)
+    };
+    match queried {
+        Ok(Some(values)) => match convert(values) {
+            Ok(value) => Ok(value),
+            Err(error) => json_table_behavior(
+                error_code,
+                error_default,
+                error,
+                type_name,
+                type_mod,
+                arena,
+                params,
+                columns,
+                hooks,
+            ),
+        },
+        Ok(None) => Ok(Datum::Null),
+        Err(error) => json_table_behavior(
+            error_code,
+            error_default,
+            error,
+            type_name,
+            type_mod,
+            arena,
+            params,
+            columns,
+            hooks,
+        ),
+    }
+}
+
+fn json_table_query_datum<'a>(
+    values: &'a [crate::sql::json::Json<'a>],
+    wrapper: &str,
+    quotes: &str,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use core::fmt::Write as _;
+    let wrap = wrapper == "unconditional"
+        || (wrapper == "conditional"
+            && (values.len() != 1
+                || !matches!(
+                    values[0],
+                    crate::sql::json::Json::Array(_) | crate::sql::json::Json::Object(_)
+                )));
+    if !wrap && values.len() != 1 {
+        return Err(sql_err!(
+            sqlstate::CARDINALITY_VIOLATION,
+            "JSON path expression yielded multiple values"
+        ));
+    }
+    if !wrap
+        && quotes == "omit"
+        && let crate::sql::json::Json::Str(value) = values[0]
+    {
+        return Ok(Datum::Text(value));
+    }
+    let mut text = StackStr::<65536>::new();
+    if wrap {
+        text.write_char('[').map_err(|_| arena_full())?;
+        for (index, value) in values.iter().enumerate() {
+            if index > 0 {
+                text.write_str(", ").map_err(|_| arena_full())?;
+            }
+            value.write(&mut text).map_err(|_| arena_full())?;
+        }
+        text.write_char(']').map_err(|_| arena_full())?;
+    } else {
+        values[0].write(&mut text).map_err(|_| arena_full())?;
+    }
+    if text.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "JSON_TABLE column value is too large"
+        ));
+    }
+    Ok(Datum::Json {
+        text: arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
+        jsonb: true,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn json_table_behavior<'a, C: ColumnLookup<'a>>(
+    behavior: &str,
+    default: &'a Expr<'a>,
+    original: SqlError,
+    type_name: &str,
+    type_mod: i32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    columns: &C,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let value = match behavior {
+        "null" => return Ok(Datum::Null),
+        "array" => Datum::Json {
+            text: "[]",
+            jsonb: true,
+        },
+        "object" => Datum::Json {
+            text: "{}",
+            jsonb: true,
+        },
+        "default" => eval_full(default, arena, params, columns, hooks)?,
+        _ => return Err(original),
+    };
+    crate::sql::eval::funcs::json::sql_json_cast(value, type_name, type_mod, arena, hooks)
 }
 
 #[allow(clippy::too_many_arguments)]

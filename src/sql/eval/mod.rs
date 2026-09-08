@@ -195,6 +195,13 @@ pub mod sqlstate {
     pub const INVALID_ARGUMENT_FOR_LOG: &str = "2201E";
     pub const INVALID_ARGUMENT_FOR_POWER_FUNCTION: &str = "2201F";
     pub const INVALID_ARGUMENT_FOR_WIDTH_BUCKET: &str = "2201G";
+    pub const DUPLICATE_JSON_OBJECT_KEY_VALUE: &str = "22030";
+    pub const INVALID_ARGUMENT_FOR_SQL_JSON_DATETIME_FUNCTION: &str = "22031";
+    pub const INVALID_SQL_JSON_SUBSCRIPT: &str = "22033";
+    pub const NON_NUMERIC_SQL_JSON_ITEM: &str = "22036";
+    pub const SQL_JSON_ARRAY_NOT_FOUND: &str = "22039";
+    pub const SQL_JSON_MEMBER_NOT_FOUND: &str = "2203A";
+    pub const SQL_JSON_OBJECT_NOT_FOUND: &str = "2203C";
     pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET: &str = "2201X";
     pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
     pub const UNTRANSLATABLE_CHARACTER: &str = "22P05";
@@ -409,12 +416,14 @@ impl ExpressionTypeIdentity {
         }
     }
 
-    pub(crate) fn routine_argument_oid(self, value: &Datum<'_>) -> i32 {
+    pub(crate) const fn routine_argument_oid(self, _value: &Datum<'_>) -> i32 {
         match self {
             Self::Known(oid) => oid,
-            // An unconstrained literal or parameter acquires its call-site
-            // type from the value produced for overload resolution.
-            Self::Unresolved => value.type_oid(),
+            // Keep an unconstrained literal or parameter unknown until the
+            // routine declaration supplies its call-site type. Its evaluated
+            // datum representation (usually Text) must not pre-empt overload
+            // resolution.
+            Self::Unresolved => super::types::oid::UNKNOWN,
         }
     }
 }
@@ -512,6 +521,18 @@ pub(crate) fn expression_type_identity<'a>(
         && name.eq_ignore_ascii_case("row")
     {
         return Ok(ExpressionTypeIdentity::Known(super::types::oid::RECORD));
+    }
+    if let Expr::Call { name, args, .. } = expression
+        && matches!(
+            *name,
+            "json_populate_record"
+                | "jsonb_populate_record"
+                | "json_populate_recordset"
+                | "jsonb_populate_recordset"
+        )
+        && let Some(base) = args.first()
+    {
+        return expression_type_identity(base, row, hooks);
     }
     if let Expr::Call {
         name,
@@ -827,6 +848,19 @@ pub trait CatalogAccess {
             "named composite catalog access is unavailable"
         ))
     }
+    /// Normalizes one named-composite array member into its durable scalar
+    /// representation before the array codec sees it.
+    fn composite_array_element<'a>(
+        &self,
+        _value: Datum<'a>,
+        _slot: u16,
+        _arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "named composite catalog access is unavailable"
+        ))
+    }
     /// Produces the declared fields of a null named-composite value. `None`
     /// means the OID is not a visible named composite.
     fn null_composite_fields<'a>(
@@ -835,6 +869,23 @@ pub trait CatalogAccess {
         _arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
         Ok(None)
+    }
+    /// Resolves a named composite or a domain over one to the composite OID
+    /// that defines its physical fields.
+    fn composite_base_type_oid(&self, type_oid: i32) -> Option<i32> {
+        matches!(ColType::from_oid(type_oid), Some(ColType::Composite(_))).then_some(type_oid)
+    }
+    /// Declared modifier for one active field of a named composite. JSON row
+    /// conversion must apply character/numeric limits exactly as assignment
+    /// to that field would.
+    fn composite_field_type_mod(&self, _type_oid: i32, _field: usize) -> Option<i32> {
+        None
+    }
+    /// Whether a SQL type name resolves to a named composite. SQL/JSON query
+    /// conversion must preserve an object/array value for composites instead
+    /// of first reducing it to scalar text as domains and enums require.
+    fn is_composite_type_name(&self, _type_name: &str) -> bool {
+        false
     }
     /// Compares text with a resolved database collation. A query executor must
     /// supply this for the database default; an evaluator without a catalog
@@ -2623,15 +2674,18 @@ pub fn eval_full<'a>(
         Expr::Subscript { base, index } => {
             let b = eval_full(base, arena, params, row, hooks)?;
             let i = eval_full(index, arena, params, row, hooks)?;
-            let index = match i {
-                Datum::Int2(x) => x as i64,
-                Datum::Int4(x) => x as i64,
-                Datum::Int8(x) => x,
-                Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("array subscript must be integer", &i)),
+            if i.is_null() {
+                return Ok(Datum::Null);
+            }
+            let integer_index = |value: &Datum<'a>| match value {
+                Datum::Int2(x) => Ok(i64::from(*x)),
+                Datum::Int4(x) => Ok(i64::from(*x)),
+                Datum::Int8(x) => Ok(*x),
+                _ => Err(type_mismatch("array subscript must be integer", value)),
             };
             match b {
                 Datum::Array { element, raw } => {
+                    let index = integer_index(&i)?;
                     let shape = super::array::shape(raw).expect("array datum invariant");
                     if shape.dimension_count() == 0 {
                         return Ok(Datum::Null);
@@ -2657,6 +2711,7 @@ pub fn eval_full<'a>(
                     })
                 }
                 Datum::Int2Vector(raw) => {
+                    let index = integer_index(&i)?;
                     let Some(slot) = index
                         .checked_sub(1)
                         .and_then(|value| usize::try_from(value).ok())
@@ -2671,6 +2726,7 @@ pub fn eval_full<'a>(
                         .unwrap_or(Datum::Null))
                 }
                 Datum::OidVector(raw) => {
+                    let index = integer_index(&i)?;
                     let Some(slot) = index
                         .checked_sub(1)
                         .and_then(|value| usize::try_from(value).ok())
@@ -2691,6 +2747,7 @@ pub fn eval_full<'a>(
                             if row.col_type(*qualifier, name) == Some(ColType::Name)
                     ) =>
                 {
+                    let index = integer_index(&i)?;
                     // PostgreSQL's fixed-width `name` type exposes its
                     // underlying character array with zero-based subscripts.
                     // SQL text remains non-subscriptable.
@@ -2710,6 +2767,64 @@ pub fn eval_full<'a>(
                         None => Ok(Datum::Null),
                     }
                 }
+                Datum::Json { text, jsonb: true } => {
+                    let tree = super::json::parse(text, arena)?;
+                    let child = match tree {
+                        super::json::Json::Object(_) => {
+                            let key = match i {
+                                Datum::Text(key) | Datum::Bpchar(key) => key,
+                                Datum::Int2(value) => {
+                                    arena.alloc_str_display(value).map_err(|_| arena_full())?
+                                }
+                                Datum::Int4(value) => {
+                                    arena.alloc_str_display(value).map_err(|_| arena_full())?
+                                }
+                                Datum::Int8(value) => {
+                                    arena.alloc_str_display(value).map_err(|_| arena_full())?
+                                }
+                                other => {
+                                    return Err(type_mismatch(
+                                        "jsonb object subscript must be text",
+                                        &other,
+                                    ));
+                                }
+                            };
+                            tree.get_field(key)
+                        }
+                        super::json::Json::Array(_) => {
+                            let index = match i {
+                                Datum::Int2(value) => i64::from(value),
+                                Datum::Int4(value) => i64::from(value),
+                                Datum::Int8(value) => value,
+                                Datum::Text(value) | Datum::Bpchar(value) => {
+                                    let Ok(index) = value.parse::<i64>() else {
+                                        return Ok(Datum::Null);
+                                    };
+                                    index
+                                }
+                                other => {
+                                    return Err(type_mismatch(
+                                        "jsonb array subscript must be coercible to integer or text",
+                                        &other,
+                                    ));
+                                }
+                            };
+                            tree.get_index(index)
+                        }
+                        _ => None,
+                    };
+                    match child {
+                        Some(value) => Ok(Datum::Json {
+                            text: json_to_text(&value, arena)?,
+                            jsonb: true,
+                        }),
+                        None => Ok(Datum::Null),
+                    }
+                }
+                Datum::Json { jsonb: false, .. } => Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "cannot subscript type json because it does not support subscripting"
+                )),
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
             }
@@ -3547,7 +3662,7 @@ impl CallSyntax<'static, 'static> {
 
 fn call<'a>(
     name: &str,
-    args: &[&Expr<'a>],
+    args: &[&'a Expr<'a>],
     syntax: CallSyntax<'_, '_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -4086,6 +4201,47 @@ fn call<'a>(
             };
             Ok(Datum::Int4(subscript))
         }
+        "jsonb_path_query" | "jsonb_path_query_tz" => {
+            if !(2..=4).contains(&args.len()) || star {
+                return Err(arity_err(name, args.len()));
+            }
+            let target = eval_full(args[0], arena, params, row, hooks)?;
+            let path = eval_full(args[1], arena, params, row, hooks)?;
+            let variables = if args.len() >= 3 {
+                Some(eval_full(args[2], arena, params, row, hooks)?)
+            } else {
+                None
+            };
+            let silent = if args.len() == 4 {
+                Some(eval_full(args[3], arena, params, row, hooks)?)
+            } else {
+                None
+            };
+            let Some(values) = funcs::json::path_query_values(
+                target,
+                path,
+                variables,
+                silent,
+                name.ends_with("_tz"),
+                arena,
+            )?
+            else {
+                return Ok(Datum::Null);
+            };
+            let k = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
+            let Some(value) = values.get(k - 1) else {
+                return Ok(Datum::Null);
+            };
+            Ok(Datum::Json {
+                text: json_to_text(value, arena)?,
+                jsonb: true,
+            })
+        }
         "jsonb_object_keys" | "json_object_keys" => {
             arity(1)?;
             let jsonb = name.starts_with("jsonb");
@@ -4157,9 +4313,7 @@ fn call<'a>(
                 };
                 if as_text {
                     return Ok(match *element {
-                        super::json::Json::Str(s) => {
-                            Datum::Text(super::json::decode_string(s, arena)?)
-                        }
+                        super::json::Json::Str(s) => Datum::Text(s),
                         super::json::Json::Null => Datum::Null,
                         _ => Datum::Text(json_to_text(element, arena)?),
                     });
@@ -4179,7 +4333,7 @@ fn call<'a>(
                 // anything else its verbatim json (NULL for a json null).
                 let parsed = super::json::parse(element, arena)?;
                 return Ok(match parsed {
-                    super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                    super::json::Json::Str(s) => Datum::Text(s),
                     super::json::Json::Null => Datum::Null,
                     _ => Datum::Text(element),
                 });
@@ -4449,6 +4603,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             Some(ColType::Array(element)) => Some(element.to_coltype()),
             Some(ColType::Int2Vector) => Some(ColType::Int2),
             Some(ColType::OidVector) => Some(ColType::Oid),
+            Some(ColType::Jsonb) => Some(ColType::Jsonb),
             Some(ctype) if matches!(base, Expr::Subscript { .. }) => Some(ctype),
             _ => None,
         },
@@ -4694,7 +4849,7 @@ fn json_get<'a>(
         // ->> renders a JSON string as its unescaped text; other values as
         // their canonical JSON.
         if let super::json::Json::Str(s) = child {
-            return Ok(Datum::Text(super::json::decode_string(s, arena)?));
+            return Ok(Datum::Text(s));
         }
         let mut buffer = crate::util::StackStr::<8192>::new();
         let _ = core::fmt::Write::write_fmt(
@@ -4955,7 +5110,7 @@ pub fn json_each_pairs<'a>(
         for (slot, (key, value)) in out.iter_mut().zip(members.iter()) {
             let datum = if as_text {
                 match *value {
-                    super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                    super::json::Json::Str(s) => Datum::Text(s),
                     super::json::Json::Null => Datum::Null,
                     _ => Datum::Text(json_to_text(value, arena)?),
                 }
@@ -4977,7 +5132,7 @@ pub fn json_each_pairs<'a>(
     for (slot, (key, value)) in out.iter_mut().zip(members.iter()) {
         let datum = if as_text {
             match super::json::parse(value, arena)? {
-                super::json::Json::Str(s) => Datum::Text(super::json::decode_string(s, arena)?),
+                super::json::Json::Str(s) => Datum::Text(s),
                 super::json::Json::Null => Datum::Null,
                 _ => Datum::Text(value),
             }
@@ -5206,7 +5361,7 @@ fn json_path<'a>(
     }
     if as_text {
         if let super::json::Json::Str(str_value) = node {
-            return Ok(Datum::Text(super::json::decode_string(str_value, arena)?));
+            return Ok(Datum::Text(str_value));
         }
         if matches!(node, super::json::Json::Null) {
             return Ok(Datum::Null);
@@ -5281,6 +5436,46 @@ fn json_exists<'a>(
         }
         _ => unreachable!("json_exists only handles ?, ?|, ?&"),
     }
+}
+
+/// SQL/JSON path operators. `@?` tests whether the result sequence is nonempty;
+/// `@@` extracts a singleton predicate result. PostgreSQL's operator forms
+/// suppress structural, numeric, and datetime path errors.
+fn jsonpath_operator<'a>(
+    left: Datum<'a>,
+    right: Datum<'a>,
+    predicate: bool,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let target = match left {
+        Datum::Json { text, jsonb: true } => text,
+        Datum::Null => return Ok(Datum::Null),
+        other => return Err(type_mismatch("JSON path operator requires jsonb", &other)),
+    };
+    let path = match right {
+        Datum::JsonPath(text) => text,
+        Datum::Text(text) => super::jsonpath::canonicalize(text, arena)?,
+        Datum::Null => return Ok(Datum::Null),
+        other => {
+            return Err(type_mismatch(
+                "JSON path operator requires jsonpath",
+                &other,
+            ));
+        }
+    };
+    let outcome = super::jsonpath::query_outcome(target, path, None, true, false, arena)?;
+    if outcome.suppressed_error {
+        return Ok(Datum::Null);
+    }
+    let values = outcome.values;
+    if !predicate {
+        return Ok(Datum::Bool(!values.is_empty()));
+    }
+    Ok(match values {
+        [super::json::Json::Bool(value)] => Datum::Bool(*value),
+        [super::json::Json::Null] | [] => Datum::Null,
+        _ => Datum::Null,
+    })
 }
 
 /// Evaluates `left AND right` / `left OR right` with PostgreSQL's short-circuit
@@ -6242,6 +6437,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Interval(_) => "interval",
         Datum::Json { jsonb: false, .. } => "json",
         Datum::Json { jsonb: true, .. } => "jsonb",
+        Datum::JsonPath(_) => "jsonpath",
         Datum::TsVector(_) => "tsvector",
         Datum::TsQuery(_) => "tsquery",
         Datum::Uuid(_) => "uuid",

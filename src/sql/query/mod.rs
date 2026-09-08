@@ -1901,6 +1901,21 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
+    fn composite_array_element<'a>(
+        &self,
+        value: Datum<'a>,
+        slot: u16,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        super::exec::coerce_user_type_array_element(
+            value,
+            super::types::ArrElem::Composite(slot),
+            self.storage,
+            self.txid,
+            arena,
+        )
+    }
+
     fn null_composite_fields<'a>(
         &self,
         type_oid: i32,
@@ -1947,6 +1962,50 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             };
         }
         Ok(Some(fields))
+    }
+
+    fn composite_base_type_oid(&self, type_oid: i32) -> Option<i32> {
+        if matches!(ColType::from_oid(type_oid), Some(ColType::Composite(_))) {
+            return Some(type_oid);
+        }
+        let slot = usize::try_from(type_oid - super::types::oid::FIRST_DOMAIN).ok()?;
+        if !self.storage.domain_slot_visible_to(slot, self.txid) {
+            return None;
+        }
+        let ColType::Composite(composite_slot) = self.storage.domain_for(slot, self.txid).base
+        else {
+            return None;
+        };
+        Some(super::types::oid::composite_oid(composite_slot))
+    }
+
+    fn composite_field_type_mod(&self, type_oid: i32, field: usize) -> Option<i32> {
+        let slot = usize::try_from(type_oid - super::types::oid::FIRST_COMPOSITE).ok()?;
+        self.storage
+            .composites_with_slots_visible_to(self.txid)
+            .find_map(|(candidate, definition)| (candidate == slot).then_some(definition))?
+            .active_fields()
+            .nth(field)
+            .map(|field| field.type_mod)
+    }
+
+    fn is_composite_type_name(&self, type_name: &str) -> bool {
+        let type_name = type_name.strip_suffix("[]").unwrap_or(type_name);
+        if self
+            .storage
+            .resolve_composite_slot(type_name, self.txid)
+            .is_some()
+        {
+            return true;
+        }
+        self.storage
+            .resolve_domain_slot(type_name, self.txid)
+            .is_some_and(|slot| {
+                matches!(
+                    self.storage.domain_for(slot, self.txid).base,
+                    ColType::Composite(_)
+                )
+            })
     }
 
     fn compare_text(
@@ -7789,6 +7848,30 @@ fn describe_scope_record_star<'q>(
                 push(ColDesc::of_type(field, ctype), &mut n)?;
                 index += 1;
             }
+        }
+        Expr::Call { name, args, .. }
+            if matches!(
+                *name,
+                "json_populate_record"
+                    | "jsonb_populate_record"
+                    | "json_populate_recordset"
+                    | "jsonb_populate_recordset"
+            ) =>
+        {
+            return describe_scope_record_star(
+                args.first().copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "populate_record argument count"
+                    )
+                })?,
+                scope,
+                storage,
+                txid,
+                arena,
+                out,
+                n,
+            );
         }
         Expr::Call {
             name,

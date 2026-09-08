@@ -339,11 +339,14 @@ enum AggKind {
     /// serializes them to a JSON array. `star` distinguishes json vs jsonb.
     JsonAgg {
         jsonb: bool,
+        absent: bool,
     },
     /// `json_object_agg`/`jsonb_object_agg(key, value)`: buffers `[key, value]`
     /// tuples into a JSON object.
     JsonObjectAgg {
         jsonb: bool,
+        absent: bool,
+        unique: bool,
     },
     /// Ordered-set aggregates: the aggregated values come from `WITHIN GROUP
     /// (ORDER BY ...)` and are buffered (in `vals`), sorted, then reduced in
@@ -772,10 +775,83 @@ impl<'a> AggState<'a> {
             "bit_xor" => AggKind::BitXor,
             "string_agg" => AggKind::StringAgg,
             "array_agg" => AggKind::ArrayAgg,
-            "json_agg" => AggKind::JsonAgg { jsonb: false },
-            "jsonb_agg" => AggKind::JsonAgg { jsonb: true },
-            "json_object_agg" => AggKind::JsonObjectAgg { jsonb: false },
-            "jsonb_object_agg" => AggKind::JsonObjectAgg { jsonb: true },
+            "json_agg" => AggKind::JsonAgg {
+                jsonb: false,
+                absent: false,
+            },
+            "json_agg_strict" => AggKind::JsonAgg {
+                jsonb: false,
+                absent: true,
+            },
+            "jsonb_agg" => AggKind::JsonAgg {
+                jsonb: true,
+                absent: false,
+            },
+            "jsonb_agg_strict" => AggKind::JsonAgg {
+                jsonb: true,
+                absent: true,
+            },
+            "json_object_agg" => AggKind::JsonObjectAgg {
+                jsonb: false,
+                absent: false,
+                unique: false,
+            },
+            "json_object_agg_strict" => AggKind::JsonObjectAgg {
+                jsonb: false,
+                absent: true,
+                unique: false,
+            },
+            "json_object_agg_unique" => AggKind::JsonObjectAgg {
+                jsonb: false,
+                absent: false,
+                unique: true,
+            },
+            "json_object_agg_unique_strict" => AggKind::JsonObjectAgg {
+                jsonb: false,
+                absent: true,
+                unique: true,
+            },
+            "jsonb_object_agg" => AggKind::JsonObjectAgg {
+                jsonb: true,
+                absent: false,
+                unique: false,
+            },
+            "jsonb_object_agg_strict" => AggKind::JsonObjectAgg {
+                jsonb: true,
+                absent: true,
+                unique: false,
+            },
+            "jsonb_object_agg_unique" => AggKind::JsonObjectAgg {
+                jsonb: true,
+                absent: false,
+                unique: true,
+            },
+            "jsonb_object_agg_unique_strict" => AggKind::JsonObjectAgg {
+                jsonb: true,
+                absent: true,
+                unique: true,
+            },
+            "__json_arrayagg_absent_json" => AggKind::JsonAgg {
+                jsonb: false,
+                absent: true,
+            },
+            "__json_arrayagg_null_json" => AggKind::JsonAgg {
+                jsonb: false,
+                absent: false,
+            },
+            "__json_arrayagg_absent_jsonb" => AggKind::JsonAgg {
+                jsonb: true,
+                absent: true,
+            },
+            "__json_arrayagg_null_jsonb" => AggKind::JsonAgg {
+                jsonb: true,
+                absent: false,
+            },
+            synthetic if synthetic.starts_with("__json_objectagg_") => AggKind::JsonObjectAgg {
+                jsonb: synthetic.ends_with("_jsonb"),
+                absent: synthetic.contains("_absent_"),
+                unique: synthetic.contains("_unique_"),
+            },
             "percentile_cont" => AggKind::PercentileCont,
             "percentile_disc" => AggKind::PercentileDisc,
             "mode" => AggKind::Mode,
@@ -978,7 +1054,7 @@ impl<'a> AggState<'a> {
         if self.kind == AggKind::StringAgg {
             return self.update_string_agg(args, arena, params, row, hooks);
         }
-        if matches!(self.kind, AggKind::JsonObjectAgg { .. }) {
+        if let AggKind::JsonObjectAgg { absent, unique, .. } = self.kind {
             if args.len() != 2 {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
@@ -993,11 +1069,48 @@ impl<'a> AggState<'a> {
                 ));
             }
             let value = eval_full(args[1], arena, params, row, hooks)?;
+            self.count += 1;
+            if absent
+                && (value.is_null()
+                    || matches!(value, Datum::Json { text, jsonb: true } if text.trim() == "null"))
+            {
+                return Ok(());
+            }
+            if unique {
+                let candidate = crate::stack_format!(1024, "{}", key);
+                if candidate.is_truncated() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "JSON object key is too long"
+                    ));
+                }
+                let rows = if self.ord_len == 0 {
+                    &[]
+                } else {
+                    // `ord` is initialized on the first buffered row.
+                    unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) }
+                };
+                for encoded in rows {
+                    let prior = crate::sql::exec::decode_projected_pub(encoded, 0);
+                    let prior = crate::stack_format!(1024, "{}", prior);
+                    if prior.is_truncated() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "JSON object key is too long"
+                        ));
+                    }
+                    if prior.as_str() == candidate.as_str() {
+                        return Err(sql_err!(
+                            sqlstate::DUPLICATE_JSON_OBJECT_KEY_VALUE,
+                            "duplicate JSON object key value"
+                        ));
+                    }
+                }
+            }
             let tuple = [key, value];
             let enc = crate::sql::exec::encode_projected_pub(&tuple, arena)?;
             // Reuse the ordered buffer to hold the [key, value] pair.
             self.push_ordered(enc, arena)?;
-            self.count += 1;
             return Ok(());
         }
         if matches!(self.kind, AggKind::ArrayAgg | AggKind::JsonAgg { .. }) {
@@ -1009,6 +1122,9 @@ impl<'a> AggState<'a> {
             }
             // array_agg/json_agg keep NULL elements, unlike string_agg.
             let value = eval_full(args[0], arena, params, row, hooks)?;
+            if matches!(self.kind, AggKind::JsonAgg { absent: true, .. }) && value.is_null() {
+                return Ok(());
+            }
             if matches!(self.kind, AggKind::ArrayAgg) {
                 match crate::sql::eval::static_type_pub(args[0], row) {
                     Some(crate::sql::types::ColType::Array(_)) => self.array_input = true,
@@ -1814,10 +1930,10 @@ impl<'a> AggState<'a> {
         if self.kind == AggKind::ArrayAgg {
             return self.finish_array_agg(arena, catalog);
         }
-        if let AggKind::JsonAgg { jsonb } = self.kind {
+        if let AggKind::JsonAgg { jsonb, .. } = self.kind {
             return self.finish_json_agg(jsonb, arena, catalog);
         }
-        if let AggKind::JsonObjectAgg { jsonb } = self.kind {
+        if let AggKind::JsonObjectAgg { jsonb, .. } = self.kind {
             return self.finish_json_object_agg(jsonb, arena);
         }
         self.fold_distinct(arena, catalog)?;
@@ -2151,10 +2267,14 @@ impl<'a> AggState<'a> {
         jsonb: bool,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
-        if self.ord_len == 0 {
+        if self.count == 0 {
             return Ok(Datum::Null);
         }
-        let rows = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
+        let rows = if self.ord_len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) }
+        };
         let text = arena
             .alloc_str_display(JsonObjectAggregateDisplay { rows, jsonb })
             .map_err(|_| arena_full())?;

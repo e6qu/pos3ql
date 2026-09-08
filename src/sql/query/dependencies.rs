@@ -2316,6 +2316,19 @@ fn collect_expression<'a>(
     {
         collect_text_search_configuration(configuration_name, storage, txid, dependencies)?;
     }
+    // SQL/JSON typed table sources retain their output definitions in
+    // synthetic calls. Those names are every bit as durable as an ordinary
+    // cast and must therefore participate in DROP/rename/rebind dependency
+    // handling.
+    if let Expr::Call { name, args, .. } = expression
+        && matches!(
+            *name,
+            "__json_table_value" | "__json_table_exists" | "__json_record_column"
+        )
+        && let Some(Expr::Str(type_name)) = args.get(1).copied()
+    {
+        collect_type(type_name, storage, txid, path, dependencies)?;
+    }
     let mut child = |expression| {
         collect_expression(
             expression,

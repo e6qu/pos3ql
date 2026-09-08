@@ -634,6 +634,30 @@ fn describe_record_star<'q>(
             }
             Ok(())
         }
+        Expr::Call { name, args, .. }
+            if matches!(
+                *name,
+                "json_populate_record"
+                    | "jsonb_populate_record"
+                    | "json_populate_recordset"
+                    | "jsonb_populate_recordset"
+            ) =>
+        {
+            describe_record_star(
+                args.first().copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "populate_record argument count"
+                    )
+                })?,
+                def,
+                table_alias,
+                output_aliases,
+                storage,
+                txid,
+                push,
+            )
+        }
         Expr::Call { name, args, .. } if storage.is_some() => {
             let storage = storage.expect("matched");
             let resolver = CatalogCols {
@@ -900,7 +924,27 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             name: crate::sql::parser::OVERLAPS_PERIODS,
             ..
         } => Some("overlaps"),
-        Expr::Call { name, .. } if crate::sql::ast::catalog_operator_call(name).is_some() => None,
+        Expr::Call { name, .. }
+            if crate::sql::ast::catalog_operator_call(name).is_some()
+                || name.starts_with("__is_json_") =>
+        {
+            None
+        }
+        Expr::Call {
+            name: "__json" | "__json_unique",
+            ..
+        } => Some("json"),
+        Expr::Call { name, .. } if name.starts_with("__json_array_") => Some("json_array"),
+        Expr::Call { name, .. } if name.starts_with("__json_object_") => Some("json_object"),
+        Expr::Call { name, .. } if name.starts_with("__json_serialize_") => Some("json_serialize"),
+        Expr::Call { name, .. } if name.starts_with("__json_exists_") => Some("json_exists"),
+        Expr::Call {
+            name: "__json_value",
+            ..
+        } => Some("json_value"),
+        Expr::Call { name, .. } if name.starts_with("__json_query_") => Some("json_query"),
+        Expr::Call { name, .. } if name.starts_with("__json_arrayagg_") => Some("json_arrayagg"),
+        Expr::Call { name, .. } if name.starts_with("__json_objectagg_") => Some("json_objectagg"),
         Expr::Call { name, .. } => Some(name.rsplit('.').next().unwrap_or(name)),
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
@@ -1815,6 +1859,17 @@ fn record_shape_metadata_dyn(
             }
             Some(count)
         }
+        Expr::Call { name, args, .. }
+            if matches!(
+                *name,
+                "json_populate_record"
+                    | "jsonb_populate_record"
+                    | "json_populate_recordset"
+                    | "jsonb_populate_recordset"
+            ) =>
+        {
+            record_shape_metadata_dyn(args.first().copied()?, columns, visit)
+        }
         Expr::Call {
             name,
             args,
@@ -2005,6 +2060,26 @@ pub fn record_field_metadata(
                 index += 1;
             }
             found
+        }
+        Expr::Call { name, args, .. }
+            if matches!(
+                *name,
+                "json_populate_record"
+                    | "jsonb_populate_record"
+                    | "json_populate_recordset"
+                    | "jsonb_populate_recordset"
+            ) =>
+        {
+            return record_field_metadata(
+                args.first().copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "populate_record argument count"
+                    )
+                })?,
+                field,
+                columns,
+            );
         }
         Expr::Call {
             name,
@@ -2775,7 +2850,7 @@ pub fn infer_type_res(
                 ),
                 JsonGetText | JsonPathText => (oid::TEXT, -1),
                 JsonDeletePath => (oid::JSONB, -1),
-                JsonExists | JsonExistsAny | JsonExistsAll => of(ColType::Bool),
+                JsonExists | JsonExistsAny | JsonExistsAll | JsonPathExists => of(ColType::Bool),
                 // On bit strings the bitwise/shift operators return a bit
                 // string; on integers they keep the wider integer width.
                 BitAnd | BitOr | BitXor | Shl | Shr => {
@@ -3031,6 +3106,7 @@ pub fn infer_type_res(
                     Some(ColType::Int2Vector) => of(ColType::Int2),
                     Some(ColType::OidVector) => of(ColType::Oid),
                     Some(ColType::Name) => of(ColType::Bpchar),
+                    Some(ColType::Jsonb) => of(ColType::Jsonb),
                     Some(ctype) if matches!(base, Expr::Subscript { .. }) => of(ctype),
                     _ => (oid::UNKNOWN, -2),
                 }
@@ -3172,9 +3248,64 @@ pub fn infer_type_res(
             "array_dims" => of(ColType::Text),
             "current_schemas" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "array_to_json" => of(ColType::Json),
+            "json_populate_record"
+            | "jsonb_populate_record"
+            | "json_populate_recordset"
+            | "jsonb_populate_recordset" => args
+                .first()
+                .map(|argument| infer_type_res(argument, columns))
+                .transpose()?
+                .unwrap_or((oid::UNKNOWN, -2)),
+            "jsonb_populate_record_valid" => of(ColType::Bool),
+            "__json" | "__json_unique" | "json_scalar" | "__json_format" => of(ColType::Json),
+            name if name.starts_with("__json_array_") || name.starts_with("__json_object_") => {
+                if name.ends_with("_jsonb") {
+                    of(ColType::Jsonb)
+                } else if name.ends_with("_text") {
+                    of(ColType::Text)
+                } else if name.ends_with("_bytea") {
+                    of(ColType::Bytea)
+                } else {
+                    of(ColType::Json)
+                }
+            }
+            "__json_serialize_text" => of(ColType::Text),
+            "__json_serialize_bytea" => of(ColType::Bytea),
+            name if name.starts_with("__json_exists_") => of(ColType::Bool),
+            "__json_value" => of(ColType::Text),
+            "__jsonb_subscript_set" => of(ColType::Jsonb),
+            name if name.starts_with("__json_query_") => {
+                if name.ends_with("_jsonb") {
+                    of(ColType::Jsonb)
+                } else if name.ends_with("_json") {
+                    of(ColType::Json)
+                } else if name.ends_with("_bytea") {
+                    of(ColType::Bytea)
+                } else {
+                    of(ColType::Text)
+                }
+            }
+            name if name.starts_with("__json_arrayagg_")
+                || name.starts_with("__json_objectagg_") =>
+            {
+                if name.ends_with("_jsonb") {
+                    of(ColType::Jsonb)
+                } else {
+                    of(ColType::Json)
+                }
+            }
             "jsonb_set" | "jsonb_set_lax" | "jsonb_insert" | "jsonb_strip_nulls" => {
                 of(ColType::Jsonb)
             }
+            "jsonb_path_query_array"
+            | "jsonb_path_query_array_tz"
+            | "jsonb_path_query_first"
+            | "jsonb_path_query_first_tz" => of(ColType::Jsonb),
+            "jsonb_path_exists"
+            | "jsonb_path_exists_tz"
+            | "jsonb_path_match"
+            | "jsonb_path_match_tz" => of(ColType::Bool),
+            name if name.starts_with("__is_json_") => of(ColType::Bool),
             "json_strip_nulls" => of(ColType::Json),
             "jsonb_pretty" => of(ColType::Text),
             "pg_char_to_encoding" => of(ColType::Int4),
@@ -3596,7 +3727,9 @@ pub fn infer_type_res(
             | "json_object_keys"
             | "jsonb_array_elements_text"
             | "json_array_elements_text" => of(ColType::Text),
-            "jsonb_array_elements" => of(ColType::Jsonb),
+            "jsonb_array_elements" | "jsonb_path_query" | "jsonb_path_query_tz" => {
+                of(ColType::Jsonb)
+            }
             "json_array_elements" => of(ColType::Json),
             // The `each` family yields a `(key, value)` composite per member.
             "json_each"

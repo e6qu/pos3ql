@@ -801,6 +801,30 @@ INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,ma
   ('great', ROW(3,4)::outbound_dump.location, ARRAY['great'::outbound_dump.mood],
    ARRAY[ROW(9,10)::outbound_dump.location], ROW(30,40)::outbound_dump.location_domain,
    ARRAY[ROW(300,400)::outbound_dump.location_domain], 'two');
+CREATE TABLE outbound_dump.json_rows (
+  id integer PRIMARY KEY,
+  document jsonb NOT NULL,
+  item_path jsonpath NOT NULL,
+  fallback_paths jsonpath[] NOT NULL,
+  CONSTRAINT outbound_json_path_matches CHECK (jsonb_path_exists(document, item_path))
+);
+INSERT INTO outbound_dump.json_rows VALUES
+  (1,
+   '{"items":[{"id":1,"price":12.50,"active":true},{"id":2,"price":7,"active":false}]}'::jsonb,
+   '$.items[*] ? (@.active == true)'::jsonpath,
+   ARRAY['$.items[*].price'::jsonpath, 'strict $.missing'::jsonpath]);
+CREATE VIEW outbound_dump.json_projection AS
+  SELECT source.id, item.ordinality, item.item_id, item.price
+    FROM outbound_dump.json_rows AS source
+    CROSS JOIN LATERAL JSON_TABLE(
+      source.document,
+      '$.items[*] ? (@.active == true)'
+      COLUMNS (
+        ordinality FOR ORDINALITY,
+        item_id integer PATH '$.id',
+        price numeric(10,2) PATH '$.price'
+      )
+    ) AS item;
 ALTER TYPE outbound_dump.location ADD ATTRIBUTE z integer;
 ALTER TYPE outbound_dump.location RENAME ATTRIBUTE x TO east;
 CREATE TABLE outbound_dump.publication_rows (
@@ -1012,6 +1036,11 @@ else
         FROM outbound_dump.item_view ORDER BY id;
       SELECT id,note FROM outbound_dump.cte_view ORDER BY id;
       SELECT id,note FROM outbound_dump.cte_matview ORDER BY id;
+      SELECT id,item_path::text,fallback_paths::text,
+             jsonb_path_exists(document,item_path)
+        FROM outbound_dump.json_rows ORDER BY id;
+      SELECT id,ordinality,item_id,price
+        FROM outbound_dump.json_projection ORDER BY id,ordinality;
       INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,marked_locations,note)
         VALUES ('ok', ROW(5,6,NULL)::outbound_type_target.location,
                 ARRAY['ok'::outbound_type_target.mood],
@@ -1165,7 +1194,7 @@ else
       SELECT id,value FROM outbound_dump.transient_rows;
       SELECT last_value,is_called FROM outbound_dump.transient_sequence;
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion\n1|\'42\':2 \'cats\':1|\'cats\' & \'42\'|t\n2|\'7\':2 \'dogs\':1|\'dogs\'|t\n\'9\':2 \'birds\':1|{birds}\ndumped search configuration\n4\noutbound_search_expression_idx\noutbound_search_query_idx\noutbound_search_terms_idx\nsearch_documents_pkey'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n1|$."items"[*]?(@."active" == true)|{"$.\\"items\\"[*].\\"price\\"","strict $.\\"missing\\""}|t\n1|1|1|12.50\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion\n1|\'42\':2 \'cats\':1|\'cats\' & \'42\'|t\n2|\'7\':2 \'dogs\':1|\'dogs\'|t\n\'9\':2 \'birds\':1|{birds}\ndumped search configuration\n4\noutbound_search_expression_idx\noutbound_search_query_idx\noutbound_search_terms_idx\nsearch_documents_pkey'
   expected_outbound_observed+=$'\noutbound_dump_changes|outbound_reader|f|t|t|f|f|f|n\noutbound_dump|publication_rows|{id,visible}|(id > 0)'
   expected_outbound_observed+=$'\ntransient_rows|u\ntransient_rows_id_seq|u\ntransient_sequence|u\n1|dumped unlogged row\n71|t'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then

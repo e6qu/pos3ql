@@ -45,6 +45,59 @@ impl<'a> Parser<'a> {
             if min_prec <= 4 && self.peeked == Tok::Ident("is") {
                 self.advance()?;
                 let negated = self.eat_ident("not")?;
+                if self.eat_ident("json")? {
+                    let kind = if self.eat_ident("value")? {
+                        "value"
+                    } else if self.eat_ident("scalar")? {
+                        "scalar"
+                    } else if self.eat_ident("array")? {
+                        "array"
+                    } else if self.eat_ident("object")? {
+                        "object"
+                    } else {
+                        "value"
+                    };
+                    let unique = if self.eat_ident("with")? {
+                        self.expect_ident("unique")?;
+                        self.eat_ident("keys")?;
+                        true
+                    } else if self.eat_ident("without")? {
+                        self.expect_ident("unique")?;
+                        self.eat_ident("keys")?;
+                        false
+                    } else {
+                        false
+                    };
+                    let name = match (kind, unique) {
+                        ("scalar", false) => "__is_json_scalar",
+                        ("array", false) => "__is_json_array",
+                        ("object", false) => "__is_json_object",
+                        ("value", false) => "__is_json_value",
+                        ("scalar", true) => "__is_json_scalar_unique",
+                        ("array", true) => "__is_json_array_unique",
+                        ("object", true) => "__is_json_object_unique",
+                        ("value", true) => "__is_json_value_unique",
+                        _ => unreachable!(),
+                    };
+                    left = self.arena_expr(Expr::Call {
+                        name,
+                        args: self.arena_slice(&[left])?,
+                        argument_names: &[],
+                        variadic: false,
+                        star: false,
+                        distinct: false,
+                        order_by: &[],
+                        over: None,
+                        filter: None,
+                    })?;
+                    if negated {
+                        left = self.arena_expr(Expr::Unary {
+                            operator: UnaryOp::Not,
+                            operand: left,
+                        })?;
+                    }
+                    continue;
+                }
                 if self.eat_ident("null")? || self.eat_ident("unknown")? {
                     left = self.arena_expr(Expr::IsNull {
                         operand: left,
@@ -803,6 +856,27 @@ impl<'a> Parser<'a> {
                         .map_err(|_| self.err_here("statement too large for SQL arena"))?;
                     return self.arena_expr(Expr::ArraySubquery(boxed));
                 }
+                if name.eq_ignore_ascii_case("json") && self.peeked == Tok::Op("(") {
+                    return self.sql_json_constructor();
+                }
+                if name.eq_ignore_ascii_case("json_array") && self.peeked == Tok::Op("(") {
+                    return self.sql_json_array_constructor();
+                }
+                if name.eq_ignore_ascii_case("json_object") && self.peeked == Tok::Op("(") {
+                    return self.sql_json_object_constructor();
+                }
+                if name.eq_ignore_ascii_case("json_serialize") && self.peeked == Tok::Op("(") {
+                    return self.sql_json_serialize();
+                }
+                if name.eq_ignore_ascii_case("json_exists") && self.peeked == Tok::Op("(") {
+                    return self.sql_json_exists();
+                }
+                if name.eq_ignore_ascii_case("json_value") && self.peeked == Tok::Op("(") {
+                    return self.sql_json_value();
+                }
+                if name.eq_ignore_ascii_case("json_query") && self.peeked == Tok::Op("(") {
+                    return self.sql_json_query();
+                }
                 // Every construct this arm recognizes has now had its chance, so a
                 // still-unconsumed reserved word cannot begin an expression —
                 // `ARRAY` is itself reserved, which is why this cannot come
@@ -1018,6 +1092,500 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// SQL-standard `JSON(input [FORMAT JSON [ENCODING UTF8]] [WITH UNIQUE
+    /// KEYS])`. It is represented as an internal ordinary call so all existing
+    /// expression walkers retain the argument and its exactly-once evaluation.
+    fn sql_json_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let input = self.expression(0)?;
+        if self.eat_ident("format")? {
+            self.expect_ident("json")?;
+            if self.eat_ident("encoding")? {
+                self.expect_ident("utf8")?;
+            }
+        }
+        let unique = if self.eat_ident("with")? {
+            self.expect_ident("unique")?;
+            self.eat_ident("keys")?;
+            true
+        } else if self.eat_ident("without")? {
+            self.expect_ident("unique")?;
+            self.eat_ident("keys")?;
+            false
+        } else {
+            false
+        };
+        self.expect_op(")")?;
+        self.arena_expr(Expr::Call {
+            name: if unique { "__json_unique" } else { "__json" },
+            args: self.arena_slice(&[input])?,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+    }
+
+    fn sql_json_format_argument(
+        &mut self,
+        expression: &'a Expr<'a>,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        if !self.eat_ident("format")? {
+            return Ok(expression);
+        }
+        self.expect_ident("json")?;
+        if self.eat_ident("encoding")? {
+            self.expect_ident("utf8")?;
+        }
+        self.plain_call("__json_format", &[expression])
+    }
+
+    /// Parses a SQL/JSON `RETURNING` clause into the internal result family.
+    /// Character typmods are retained as an outer cast after construction.
+    fn sql_json_returning(&mut self) -> Result<(&'a str, &'a str, i32), ParseError> {
+        if !self.eat_ident("returning")? {
+            return Ok(("json", "json", -1));
+        }
+        let (type_name, type_mod) = self.type_name_mod()?;
+        let result = match crate::sql::types::ColType::from_sql_name(type_name) {
+            Some(crate::sql::types::ColType::Json) => "json",
+            Some(crate::sql::types::ColType::Jsonb) => "jsonb",
+            Some(crate::sql::types::ColType::Text)
+            | Some(crate::sql::types::ColType::Varchar)
+            | Some(crate::sql::types::ColType::Bpchar) => "text",
+            Some(crate::sql::types::ColType::Bytea) => "bytea",
+            _ => return Err(self.unexpected("unsupported SQL/JSON RETURNING type")),
+        };
+        if self.eat_ident("format")? {
+            self.expect_ident("json")?;
+        }
+        if self.eat_ident("encoding")? {
+            self.expect_ident("utf8")?;
+        }
+        Ok((result, type_name, type_mod))
+    }
+
+    fn sql_json_result_call(
+        &mut self,
+        family: &str,
+        option: bool,
+        result: &str,
+        type_name: &'a str,
+        args: &[&'a Expr<'a>],
+        type_mod: i32,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let name = match (family, option, result) {
+            ("array", true, "json") => "__json_array_absent_json",
+            ("array", true, "jsonb") => "__json_array_absent_jsonb",
+            ("array", true, "text") => "__json_array_absent_text",
+            ("array", true, "bytea") => "__json_array_absent_bytea",
+            ("array", false, "json") => "__json_array_null_json",
+            ("array", false, "jsonb") => "__json_array_null_jsonb",
+            ("array", false, "text") => "__json_array_null_text",
+            ("array", false, "bytea") => "__json_array_null_bytea",
+            ("object", true, "json") => "__json_object_unique_json",
+            ("object", true, "jsonb") => "__json_object_unique_jsonb",
+            ("object", true, "text") => "__json_object_unique_text",
+            ("object", true, "bytea") => "__json_object_unique_bytea",
+            ("object", false, "json") => "__json_object_json",
+            ("object", false, "jsonb") => "__json_object_jsonb",
+            ("object", false, "text") => "__json_object_text",
+            ("object", false, "bytea") => "__json_object_bytea",
+            _ => unreachable!(),
+        };
+        let call = self.plain_call(name, args)?;
+        if result != "text" || (type_name.eq_ignore_ascii_case("text") && type_mod < 0) {
+            return Ok(call);
+        }
+        self.arena_expr(Expr::Cast {
+            operand: call,
+            type_name,
+            type_mod,
+        })
+    }
+
+    fn sql_json_array_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let null = self.arena_expr(Expr::Null)?;
+        let mut values = [null; MAX_LIST];
+        let mut count = 0;
+        while self.peeked != Tok::Op(")")
+            && self.peeked != Tok::Ident("absent")
+            && self.peeked != Tok::Ident("returning")
+        {
+            if count == MAX_LIST {
+                return Err(self.limit("JSON array elements", MAX_LIST));
+            }
+            let value = self.expression(0)?;
+            values[count] = self.sql_json_format_argument(value)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let absent = if self.eat_ident("null")? {
+            self.expect_ident("on")?;
+            self.expect_ident("null")?;
+            false
+        } else if self.eat_ident("absent")? {
+            self.expect_ident("on")?;
+            self.expect_ident("null")?;
+            true
+        } else {
+            true
+        };
+        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        self.expect_op(")")?;
+        self.sql_json_result_call(
+            "array",
+            absent,
+            result,
+            type_name,
+            &values[..count],
+            type_mod,
+        )
+    }
+
+    fn sql_json_object_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let null = self.arena_expr(Expr::Null)?;
+        let mut values = [null; MAX_LIST];
+        let mut count = 0;
+        while self.peeked != Tok::Op(")")
+            && self.peeked != Tok::Ident("absent")
+            && self.peeked != Tok::Ident("returning")
+            && self.peeked != Tok::Ident("with")
+            && self.peeked != Tok::Ident("without")
+        {
+            if count + 2 > MAX_LIST {
+                return Err(self.limit("JSON object members", MAX_LIST / 2));
+            }
+            values[count] = self.expression(0)?;
+            count += 1;
+            if !self.eat_ident("value")? && !self.eat_op(":")? {
+                return Err(self.unexpected("expected VALUE or ':' in JSON_OBJECT"));
+            }
+            let value = self.expression(0)?;
+            values[count] = self.sql_json_format_argument(value)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        let absent = if self.eat_ident("null")? {
+            self.expect_ident("on")?;
+            self.expect_ident("null")?;
+            false
+        } else if self.eat_ident("absent")? {
+            self.expect_ident("on")?;
+            self.expect_ident("null")?;
+            true
+        } else {
+            false
+        };
+        let unique = if self.eat_ident("with")? {
+            self.expect_ident("unique")?;
+            self.eat_ident("keys")?;
+            true
+        } else if self.eat_ident("without")? {
+            self.expect_ident("unique")?;
+            self.eat_ident("keys")?;
+            false
+        } else {
+            false
+        };
+        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        self.expect_op(")")?;
+        // The object evaluator reads the final marker as ABSENT ON NULL while
+        // the call-name option remains the uniqueness requirement.
+        values[count] = self.arena_expr(Expr::Bool(absent))?;
+        count += 1;
+        self.sql_json_result_call(
+            "object",
+            unique,
+            result,
+            type_name,
+            &values[..count],
+            type_mod,
+        )
+    }
+
+    fn sql_json_serialize(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let input = self.expression(0)?;
+        if self.eat_ident("format")? {
+            self.expect_ident("json")?;
+            if self.eat_ident("encoding")? {
+                self.expect_ident("utf8")?;
+            }
+        }
+        let (result, type_name, type_mod) = if self.peeked == Tok::Ident("returning") {
+            self.sql_json_returning()?
+        } else {
+            ("text", "text", -1)
+        };
+        if !matches!(result, "text" | "bytea") {
+            return Err(self.unexpected("JSON_SERIALIZE requires a character or bytea result"));
+        }
+        self.expect_op(")")?;
+        let call = self.plain_call(
+            if result == "bytea" {
+                "__json_serialize_bytea"
+            } else {
+                "__json_serialize_text"
+            },
+            &[input],
+        )?;
+        if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
+            return self.arena_expr(Expr::Cast {
+                operand: call,
+                type_name,
+                type_mod,
+            });
+        }
+        Ok(call)
+    }
+
+    fn sql_json_exists(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let null = self.arena_expr(Expr::Null)?;
+        let mut args = [null; MAX_LIST];
+        args[0] = self.expression(0)?;
+        self.expect_op(",")?;
+        args[1] = self.expression(0)?;
+        let mut count = 2;
+        if self.eat_ident("passing")? {
+            loop {
+                if count + 2 > MAX_LIST {
+                    return Err(self.limit("JSON passing arguments", (MAX_LIST - 2) / 2));
+                }
+                args[count] = self.expression(0)?;
+                self.expect_ident("as")?;
+                let name = self.any_ident("JSON path variable name")?;
+                args[count + 1] = self.arena_expr(Expr::Str(name))?;
+                count += 2;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+        }
+        let behavior = if self.eat_ident("true")? {
+            "true"
+        } else if self.eat_ident("unknown")? {
+            "unknown"
+        } else if self.eat_ident("error")? {
+            "error"
+        } else {
+            self.eat_ident("false")?;
+            "false"
+        };
+        if self.eat_ident("on")? {
+            self.expect_ident("error")?;
+        } else if behavior != "false" {
+            return Err(self.unexpected("expected ON ERROR"));
+        }
+        self.expect_op(")")?;
+        self.plain_call(
+            match behavior {
+                "true" => "__json_exists_true",
+                "unknown" => "__json_exists_unknown",
+                "error" => "__json_exists_error",
+                _ => "__json_exists_false",
+            },
+            &args[..count],
+        )
+    }
+
+    fn sql_json_value(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let null = self.arena_expr(Expr::Null)?;
+        let mut args = [null; MAX_LIST];
+        args[0] = self.expression(0)?;
+        self.expect_op(",")?;
+        args[1] = self.expression(0)?;
+        let mut count = 2;
+        if self.eat_ident("passing")? {
+            loop {
+                if count + 2 + 6 > MAX_LIST {
+                    return Err(self.limit("JSON passing arguments", (MAX_LIST - 8) / 2));
+                }
+                args[count] = self.expression(0)?;
+                self.expect_ident("as")?;
+                let name = self.any_ident("JSON path variable name")?;
+                args[count + 1] = self.arena_expr(Expr::Str(name))?;
+                count += 2;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+        }
+        let (type_name, type_mod) = if self.eat_ident("returning")? {
+            self.type_name_mod()?
+        } else {
+            ("text", -1)
+        };
+        let mut empty_code = "null";
+        let mut error_code = "null";
+        let mut empty_default = null;
+        let mut error_default = null;
+        for _ in 0..2 {
+            let (code, default) = if self.eat_ident("default")? {
+                ("default", self.expression(0)?)
+            } else if self.eat_ident("error")? {
+                ("error", null)
+            } else if self.eat_ident("null")? {
+                ("null", null)
+            } else {
+                break;
+            };
+            self.expect_ident("on")?;
+            if self.eat_ident("empty")? {
+                empty_code = code;
+                empty_default = default;
+            } else {
+                self.expect_ident("error")?;
+                error_code = code;
+                error_default = default;
+            }
+        }
+        self.expect_op(")")?;
+        args[count] = empty_default;
+        args[count + 1] = error_default;
+        args[count + 2] = self.arena_expr(Expr::Str(empty_code))?;
+        args[count + 3] = self.arena_expr(Expr::Str(error_code))?;
+        args[count + 4] = self.arena_expr(Expr::Str(type_name))?;
+        args[count + 5] = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
+        let call = self.plain_call("__json_value", &args[..count + 6])?;
+        self.arena_expr(Expr::Cast {
+            operand: call,
+            type_name,
+            type_mod,
+        })
+    }
+
+    fn sql_json_query(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let null = self.arena_expr(Expr::Null)?;
+        let mut args = [null; MAX_LIST];
+        args[0] = self.expression(0)?;
+        self.expect_op(",")?;
+        args[1] = self.expression(0)?;
+        let mut count = 2;
+        if self.eat_ident("passing")? {
+            loop {
+                if count + 2 + 6 > MAX_LIST {
+                    return Err(self.limit("JSON passing arguments", (MAX_LIST - 8) / 2));
+                }
+                args[count] = self.expression(0)?;
+                self.expect_ident("as")?;
+                let name = self.any_ident("JSON path variable name")?;
+                args[count + 1] = self.arena_expr(Expr::Str(name))?;
+                count += 2;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+        }
+        let (result, type_name, type_mod) = if self.peeked == Tok::Ident("returning") {
+            self.sql_json_returning()?
+        } else {
+            ("jsonb", "jsonb", -1)
+        };
+        let wrapper = if self.eat_ident("without")? {
+            self.eat_ident("array")?;
+            self.expect_ident("wrapper")?;
+            "without"
+        } else if self.eat_ident("with")? {
+            let kind = if self.eat_ident("conditional")? {
+                "conditional"
+            } else {
+                self.eat_ident("unconditional")?;
+                "unconditional"
+            };
+            self.eat_ident("array")?;
+            self.expect_ident("wrapper")?;
+            kind
+        } else {
+            "without"
+        };
+        let quotes = if self.eat_ident("omit")? {
+            self.eat_ident("quotes")?;
+            if self.eat_ident("on")? {
+                self.expect_ident("scalar")?;
+                self.expect_ident("string")?;
+            }
+            "omit"
+        } else if self.eat_ident("keep")? {
+            self.eat_ident("quotes")?;
+            if self.eat_ident("on")? {
+                self.expect_ident("scalar")?;
+                self.expect_ident("string")?;
+            }
+            "keep"
+        } else {
+            "keep"
+        };
+        let mut empty_code = "null";
+        let mut error_code = "null";
+        let mut empty_default = null;
+        let mut error_default = null;
+        for _ in 0..2 {
+            let (code, default) = if self.eat_ident("default")? {
+                ("default", self.expression(0)?)
+            } else if self.eat_ident("empty")? {
+                if self.eat_ident("array")? {
+                    ("array", null)
+                } else {
+                    self.expect_ident("object")?;
+                    ("object", null)
+                }
+            } else if self.eat_ident("error")? {
+                ("error", null)
+            } else if self.eat_ident("null")? {
+                ("null", null)
+            } else {
+                break;
+            };
+            self.expect_ident("on")?;
+            if self.eat_ident("empty")? {
+                empty_code = code;
+                empty_default = default;
+            } else {
+                self.expect_ident("error")?;
+                error_code = code;
+                error_default = default;
+            }
+        }
+        self.expect_op(")")?;
+        args[count] = empty_default;
+        args[count + 1] = error_default;
+        args[count + 2] = self.arena_expr(Expr::Str(empty_code))?;
+        args[count + 3] = self.arena_expr(Expr::Str(error_code))?;
+        args[count + 4] = self.arena_expr(Expr::Str(wrapper))?;
+        args[count + 5] = self.arena_expr(Expr::Str(quotes))?;
+        let call = self.plain_call(
+            match result {
+                "json" => "__json_query_json",
+                "jsonb" => "__json_query_jsonb",
+                "text" => "__json_query_text",
+                "bytea" => "__json_query_bytea",
+                _ => unreachable!(),
+            },
+            &args[..count + 6],
+        )?;
+        if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
+            return self.arena_expr(Expr::Cast {
+                operand: call,
+                type_name,
+                type_mod,
+            });
+        }
+        Ok(call)
+    }
+
     /// Builds a simple function call `name(args)` (no star/distinct/over).
     pub(super) fn plain_call(
         &mut self,
@@ -1040,6 +1608,12 @@ impl<'a> Parser<'a> {
 
     pub(super) fn call(&mut self, name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
+        if name.eq_ignore_ascii_case("json_arrayagg") {
+            return self.sql_json_array_aggregate();
+        }
+        if name.eq_ignore_ascii_case("json_objectagg") {
+            return self.sql_json_object_aggregate();
+        }
         // SQL-standard `substring(str FROM start [FOR len])` and
         // `trim([both|leading|trailing] [chars] FROM str)` desugar to the plain
         // function forms.
@@ -1324,6 +1898,125 @@ impl<'a> Parser<'a> {
             over,
             filter,
         })
+    }
+
+    fn sql_json_array_aggregate(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let value = self.expression(0)?;
+        let value = self.sql_json_format_argument(value)?;
+        let order_by = if self.eat_ident("order")? {
+            self.expect_ident("by")?;
+            self.order_by_items()?
+        } else {
+            &[]
+        };
+        let absent = if self.eat_ident("null")? {
+            self.expect_ident("on")?;
+            self.expect_ident("null")?;
+            false
+        } else {
+            if self.eat_ident("absent")? {
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+            }
+            true
+        };
+        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        self.expect_op(")")?;
+        let filter = self.parse_filter()?;
+        let over = self.parse_over()?;
+        let aggregate = self.arena_expr(Expr::Call {
+            name: match (absent, result == "jsonb") {
+                (true, false) => "__json_arrayagg_absent_json",
+                (false, false) => "__json_arrayagg_null_json",
+                (true, true) => "__json_arrayagg_absent_jsonb",
+                (false, true) => "__json_arrayagg_null_jsonb",
+            },
+            args: self.arena_slice(&[value])?,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by,
+            over,
+            filter,
+        })?;
+        self.sql_json_aggregate_result(aggregate, result, type_name, type_mod)
+    }
+
+    fn sql_json_object_aggregate(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let key = self.expression(0)?;
+        if !self.eat_ident("value")? && !self.eat_op(":")? {
+            return Err(self.unexpected("expected VALUE or ':' in JSON_OBJECTAGG"));
+        }
+        let value = self.expression(0)?;
+        let value = self.sql_json_format_argument(value)?;
+        let absent = if self.eat_ident("absent")? {
+            self.expect_ident("on")?;
+            self.expect_ident("null")?;
+            true
+        } else {
+            if self.eat_ident("null")? {
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+            }
+            false
+        };
+        let unique = if self.eat_ident("with")? {
+            self.expect_ident("unique")?;
+            self.eat_ident("keys")?;
+            true
+        } else {
+            if self.eat_ident("without")? {
+                self.expect_ident("unique")?;
+                self.eat_ident("keys")?;
+            }
+            false
+        };
+        let (result, type_name, type_mod) = self.sql_json_returning()?;
+        self.expect_op(")")?;
+        let filter = self.parse_filter()?;
+        let over = self.parse_over()?;
+        let aggregate = self.arena_expr(Expr::Call {
+            name: match (absent, unique, result == "jsonb") {
+                (false, false, false) => "__json_objectagg_null_json",
+                (true, false, false) => "__json_objectagg_absent_json",
+                (false, true, false) => "__json_objectagg_null_unique_json",
+                (true, true, false) => "__json_objectagg_absent_unique_json",
+                (false, false, true) => "__json_objectagg_null_jsonb",
+                (true, false, true) => "__json_objectagg_absent_jsonb",
+                (false, true, true) => "__json_objectagg_null_unique_jsonb",
+                (true, true, true) => "__json_objectagg_absent_unique_jsonb",
+            },
+            args: self.arena_slice(&[key, value])?,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over,
+            filter,
+        })?;
+        self.sql_json_aggregate_result(aggregate, result, type_name, type_mod)
+    }
+
+    fn sql_json_aggregate_result(
+        &mut self,
+        aggregate: &'a Expr<'a>,
+        result: &str,
+        type_name: &'a str,
+        type_mod: i32,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        if result == "bytea" {
+            return self.plain_call("__json_serialize_bytea", &[aggregate]);
+        }
+        if result == "text" {
+            return self.arena_expr(Expr::Cast {
+                operand: aggregate,
+                type_name,
+                type_mod,
+            });
+        }
+        Ok(aggregate)
     }
 
     /// Consumes an operator or identifier token, returning its text (used
@@ -1961,6 +2654,7 @@ impl<'a> Parser<'a> {
             Tok::Op("?") => Some(BinaryOp::JsonExists),
             Tok::Op("?|") => Some(BinaryOp::JsonExistsAny),
             Tok::Op("?&") => Some(BinaryOp::JsonExistsAll),
+            Tok::Op("@?") => Some(BinaryOp::JsonPathExists),
             Tok::Op("&") => Some(BinaryOp::BitAnd),
             Tok::Op("|") => Some(BinaryOp::BitOr),
             Tok::Op("#") => Some(BinaryOp::BitXor),

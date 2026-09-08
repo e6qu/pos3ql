@@ -5532,7 +5532,8 @@ fn forward_operator_shells_are_typed_durable_and_fillable() {
          CREATE OPERATOR public.## (FUNCTION = public.shell_same, LEFTARG = integer, \
            RIGHTARG = integer, COMMUTATOR = OPERATOR(public.@@)); \
          SELECT oprresult = 0, oprcode = 0, oprcom <> 0 \
-           FROM pg_operator WHERE oprname = '@@'",
+           FROM pg_operator
+          WHERE oprname = '@@' AND oprnamespace = 'public'::regnamespace",
     );
     let text = String::from_utf8_lossy(&created);
     assert!(!text.contains("ERROR"), "{text}");
@@ -5555,7 +5556,8 @@ fn forward_operator_shells_are_typed_durable_and_fillable() {
            RIGHTARG = integer); \
          SELECT 1 ## 1, 1 @@ 2; \
          SELECT o1.oprcom = o2.oid FROM pg_operator o1, pg_operator o2 \
-           WHERE o1.oprname = '@@' AND o2.oprname = '##'",
+           WHERE o1.oprname = '@@' AND o1.oprnamespace = 'public'::regnamespace \
+             AND o2.oprname = '##' AND o2.oprnamespace = 'public'::regnamespace",
     );
     let text = String::from_utf8_lossy(&filled);
     assert!(!text.contains("ERROR"), "{text}");
@@ -18385,6 +18387,11 @@ fn json_and_jsonb_types() {
     assert!(run("SELECT '{\"b\": 1,  \"a\":2, \"b\":3}'::jsonb").contains("{\"a\": 2, \"b\": 3}"));
     assert!(run("SELECT '[1, 2,   3]'::jsonb").contains("[1, 2, 3]"));
     assert!(run("SELECT '1e2'::jsonb").contains("100"));
+    assert!(run("SELECT '\"\\u0061\"'::jsonb").contains("\"a\""));
+    assert!(
+        run("SELECT ('{\"\\u0061\":1}'::jsonb)->'a'").contains('1'),
+        "escaped object keys compare by decoded value"
+    );
     // -> keeps json/jsonb, ->> returns text; array index is 0-based.
     assert!(run("SELECT ('{\"a\":{\"x\":5},\"b\":[10,20]}'::jsonb)->'a'").contains("{\"x\": 5}"));
     assert!(run("SELECT ('{\"a\":5}'::jsonb)->>'a'").contains('5'));
@@ -18420,6 +18427,1024 @@ fn json_and_jsonb_types() {
     assert!(run("SELECT '{\"a\":1}'::jsonb <@ '{\"a\":1,\"b\":2}'::jsonb").contains('t'));
     // plain json has no containment operator.
     assert!(run("SELECT '{}'::json @> '{}'::json").contains("42883"));
+}
+
+#[test]
+fn jsonpath_type_is_validated_canonical_and_durable() {
+    // Type identity, text output and binary send format verified against
+    // PostgreSQL 18.4 (jsonpath OID 4072, array OID 4073).
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE paths (id integer, path jsonpath, paths jsonpath[]); \
+         INSERT INTO paths VALUES \
+           (1, 'lax $.a[0]'::jsonpath, ARRAY['strict $.a[*]'::jsonpath]), \
+           (2, '$ ? (@.price > 10)'::jsonpath, '{$.a,$.b}'::jsonpath[]); \
+         SELECT id, path, paths, pg_typeof(path), pg_typeof(paths) \
+           FROM paths ORDER BY id",
+    );
+    assert_eq!(
+        data_rows(&created),
+        [
+            "1|$.\"a\"[0]|{\"strict $.\\\"a\\\"[*]\"}|jsonpath|jsonpath[]",
+            "2|$?(@.\"price\" > 10)|{\"$.\\\"a\\\"\",\"$.\\\"b\\\"\"}|jsonpath|jsonpath[]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let invalid = run_with(&mut engine, &mut budget, "SELECT '$.'::jsonpath");
+    assert!(
+        String::from_utf8_lossy(&invalid).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, typname, typarray FROM pg_type \
+          WHERE oid IN (4072, 4073) ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        ["4072|jsonpath|4073", "4073|_jsonpath|0"]
+    );
+    let routine_catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, proname, prorettype, proargtypes, pronargdefaults, \
+                proretset, provolatile, proisstrict \
+           FROM pg_proc WHERE oid IN (1179, 3960, 4005, 4006, 6338) ORDER BY oid; \
+         SELECT oid, oprname, oprleft, oprright, oprresult, oprcode::oid \
+           FROM pg_operator WHERE oid IN (4012, 4013) ORDER BY oid; \
+         SELECT '@?'::regoper, '@?(jsonb,jsonpath)'::regoperator",
+    );
+    assert_eq!(
+        data_rows(&routine_catalog),
+        [
+            "1179|jsonb_path_query_tz|3802|3802 4072 3802 16|2|t|s|t",
+            "3960|json_populate_record|2283|2283 114 16|1|f|s|f",
+            "4005|jsonb_path_exists|16|3802 4072 3802 16|2|f|i|t",
+            "4006|jsonb_path_query|3802|3802 4072 3802 16|2|t|i|t",
+            "6338|jsonb_populate_record_valid|16|2283 3802|0|f|s|f",
+            "4012|@?|3802|4072|16|4010",
+            "4013|@@|3802|4072|16|4011",
+            "@?|@?(jsonb,jsonpath)",
+        ],
+        "{}",
+        String::from_utf8_lossy(&routine_catalog)
+    );
+
+    let arena = Arena::new(&mut budget, "jsonpath Bind", 1 << 16).unwrap();
+    let binary = engine
+        .decode_binary_parameter(
+            crate::sql::types::oid::JSONPATH,
+            b"\x01strict $.a[0]",
+            &arena,
+            0,
+        )
+        .unwrap();
+    assert_eq!(binary.to_string(), "strict $.\"a\"[0]");
+    assert_eq!(binary.type_oid(), crate::sql::types::oid::JSONPATH);
+    assert!(
+        engine
+            .decode_binary_parameter(crate::sql::types::oid::JSONPATH, b"\x02$", &arena, 0,)
+            .is_err()
+    );
+
+    let evaluated = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT \
+           jsonb_path_query_array('{\"a\":[1,2,3],\"b\":{\"x\":4}}'::jsonb, \
+                                  '$.a[*] ? (@ >= 2)'::jsonpath), \
+           jsonb_path_exists('{\"a\":1}'::jsonb, '$.a'::jsonpath), \
+           jsonb_path_match('{\"a\":1}'::jsonb, 'exists($.a)'::jsonpath), \
+           jsonb_path_query_first('{\"a\":[10,20]}'::jsonb, '$.a[last]'::jsonpath); \
+         SELECT \
+           jsonb_path_query_array('{\"a\":1,\"b\":2}'::jsonb, '$.*'::jsonpath), \
+           jsonb_path_query_array('{\"a\":[1,2]}'::jsonb, '$.**'::jsonpath), \
+           jsonb_path_query_array('{\"a\":7}'::jsonb, '$var + $.a'::jsonpath, \
+                                  '{\"var\":5}'::jsonb)",
+    );
+    assert_eq!(
+        data_rows(&evaluated),
+        [
+            "[2, 3]|t|t|20",
+            "[1, 2]|[{\"a\": [1, 2]}, [1, 2], 1, 2]|[12]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&evaluated)
+    );
+    let empty_last = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT jsonb_path_query_array('[]', '$[last]'); \
+         SELECT jsonb_path_query_array('[]', 'strict $[last]')",
+    );
+    assert_eq!(data_rows(&empty_last), ["[]"]);
+    assert!(String::from_utf8_lossy(&empty_last).contains("22033"));
+    let operators = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT '{\"a\":[1,2,3]}'::jsonb @? '$.a[*] ? (@ == 2)', \
+                '{\"a\":2}'::jsonb @@ '$.a == 2', \
+                '{\"a\":2}'::jsonb @? 'strict $.missing'",
+    );
+    assert_eq!(data_rows(&operators), ["t|t|NULL"]);
+    let temporal = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT \
+           jsonb_path_match('{}', '\"12:00:00+02\".time_tz() < \"10:00:00+00\".time_tz()'), \
+           jsonb_path_match('{}', '\"2024-01-01\".date() < \"2024-02-01\".date()'), \
+           jsonb_path_query_array('[\"12:00:00+02\",\"10:00:00+00\"]', '$[*].time_tz()'), \
+           jsonb_path_query_array('[\"bad\"]', '$[*].date()', '{}'::jsonb, true); \
+         SELECT jsonb_path_query_array('[{\"a\":1},{\"b\":2}]', '$[*].keyvalue()')",
+    );
+    assert_eq!(
+        data_rows(&temporal),
+        [
+            "t|t|[\"12:00:00+02:00\", \"10:00:00+00:00\"]|[]",
+            "[{\"id\": 12, \"key\": \"a\", \"value\": 1}, {\"id\": 36, \"key\": \"b\", \"value\": 2}]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&temporal)
+    );
+    let regex_flags = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT jsonb_path_match('{}', '"a\nb" like_regex "a.b"'),
+                  jsonb_path_match('{}', '"a\nb" like_regex "a.b" flag "s"'),
+                  jsonb_path_match('{}', '"x\ny" like_regex "^y$" flag "m"'),
+                  jsonb_path_match('{}', '"ab" like_regex " a  # comment\n b " flag "x"'),
+                  jsonb_path_match('{}', '"A.B" like_regex "a.b" flag "qi"')"#,
+    );
+    assert_eq!(data_rows(&regex_flags), ["f|t|t|t|t"]);
+    let methods = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT jsonb_path_query_array(
+                    '[-1.2,1.2,[1,2],{"a":1},true,null]', '$[*].type()'),
+                  jsonb_path_query_array('[-1.2,1.2]', '$[*].abs()'),
+                  jsonb_path_query_array('[-1.2,1.2]', '$[*].floor()'),
+                  jsonb_path_query_array('[-1.2,1.2]', '$[*].ceiling()');
+           SELECT jsonb_path_query_array('[[1,2],{"a":1},1]', '$[*].size()'),
+                  jsonb_path_query_array('[1,true,"x"]', '$[*].string()'),
+                  jsonb_path_query_array('["1.25","-2"]', '$[*].number()');
+           SELECT jsonb_path_exists_tz(
+                    '{}', '"2024-01-01 01:00:00+02".timestamp_tz() <
+                           "2024-01-01 00:00:00+00".timestamp_tz()'),
+                  jsonb_path_match_tz(
+                    '{}', '"12:00:00+02".time_tz() == "10:00:00+00".time_tz()'),
+                  jsonb_path_query_array_tz(
+                    '["2024-01-01 00:00:00+00"]', '$[*].timestamp_tz()')"#,
+    );
+    assert_eq!(
+        data_rows(&methods),
+        [
+            "[\"number\", \"number\", \"array\", \"object\", \"boolean\", \"null\"]|[1.2, 1.2]|[-2, 1]|[-1, 2]",
+            "[2, 1, 1]|[\"1\", \"true\", \"x\"]|[1.25, -2]",
+            "t|f|[\"2024-01-01T00:00:00+00:00\"]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&methods)
+    );
+    for (query, state) in [
+        (
+            "SELECT jsonb_path_query_array('{}', 'strict $.missing')",
+            "2203A",
+        ),
+        ("SELECT jsonb_path_query_array('1', 'strict $.*')", "2203C"),
+        ("SELECT jsonb_path_query_array('1', 'strict $[*]')", "22039"),
+        (
+            "SELECT jsonb_path_query_array('[1]', 'strict $[2]')",
+            "22033",
+        ),
+        (
+            "SELECT jsonb_path_query_array('[null]', '$[*].string()')",
+            "22036",
+        ),
+        (
+            "SELECT jsonb_path_query_array('[\"bad\"]', '$[*].date()')",
+            "22031",
+        ),
+    ] {
+        let error = run_with(&mut engine, &mut budget, query);
+        assert!(
+            String::from_utf8_lossy(&error).contains(state),
+            "{query}: {}",
+            String::from_utf8_lossy(&error)
+        );
+    }
+    let conversions = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT jsonb_path_query_array(
+                     '[0,1,-2,"true","false","yes","no","on","off","1","0","t","f"]',
+                     '$[*].boolean()');
+           SELECT jsonb_path_query('1234.5678', '$.decimal(6,2)'),
+                  jsonb_path_query('1234.5', '$.decimal(4,-1)'),
+                  jsonb_path_query('1.5', '$.bigint()'),
+                  jsonb_path_query('-1.5', '$.integer()');
+           SELECT jsonb_path_query('"12:34:56.789"', '$.time(2)'),
+                  jsonb_path_query('"12:34:56.789 +05:30"', '$.time_tz(2)'),
+                  jsonb_path_query('"2023-08-15 12:34:56.789"', '$.timestamp(2)'),
+                  jsonb_path_query('"2023-08-15 12:34:56.789 +05:30"', '$.timestamp_tz(2)');
+           SELECT jsonb_path_query_array('["12:30","18:40"]',
+                                         '$[*].datetime("HH24:MI")')"#,
+    );
+    assert_eq!(
+        data_rows(&conversions),
+        [
+            "[false, true, true, true, false, true, false, true, false, true, false, true, false]",
+            "1234.57|1230|2|-2",
+            "\"12:34:56.79\"|\"12:34:56.79+05:30\"|\"2023-08-15T12:34:56.79\"|\"2023-08-15T12:34:56.79+05:30\"",
+            "[\"12:30:00\", \"18:40:00\"]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&conversions)
+    );
+    let missing_variable = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT jsonb_path_exists('{}', '$missing', '{}'::jsonb, true)",
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_variable).contains("42704"),
+        "{}",
+        String::from_utf8_lossy(&missing_variable)
+    );
+    let set_results = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT jsonb_path_query('{\"a\":[1,2,3]}'::jsonb, '$.a[*] ? (@ > 1)'); \
+         SELECT value FROM jsonb_path_query('{\"a\":[1,2,3]}'::jsonb, '$.a[*]') AS q(value); \
+         SELECT id, value FROM (VALUES (1, '{\"a\":[10,20]}'::jsonb), \
+                                      (2, '{\"a\":[30]}'::jsonb)) AS source(id, document), \
+              LATERAL jsonb_path_query(document, '$.a[*]') AS q(value) ORDER BY id, value",
+    );
+    assert_eq!(
+        data_rows(&set_results),
+        ["2", "3", "1", "2", "3", "1|10", "1|20", "2|30"],
+        "{}",
+        String::from_utf8_lossy(&set_results)
+    );
+}
+
+#[test]
+fn sql_json_predicates_validate_shape_and_unique_keys() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT '1' IS JSON, '1' IS JSON SCALAR, '1' IS JSON ARRAY, \
+                '[]' IS JSON ARRAY, '{}' IS JSON OBJECT, \
+                '{\"a\":1,\"a\":2}' IS JSON WITH UNIQUE KEYS, \
+                '{\"a\":{\"b\":1,\"b\":2}}' IS JSON WITHOUT UNIQUE KEYS, \
+                'broken' IS NOT JSON, NULL::text IS JSON; \
+         SELECT '\\x7b2261223a317d'::bytea IS JSON OBJECT, \
+                '01' IS JSON, E'\"line\\nfeed\"' IS JSON",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t|t|f|t|t|f|t|t|NULL", "t|f|f"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn sql_json_and_json_scalar_constructors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON('{\"a\":1}' FORMAT JSON ENCODING UTF8), \
+                JSON('{\"a\":1}' WITHOUT UNIQUE KEYS), \
+                JSON_SCALAR(1), JSON_SCALAR('x'::text), \
+                JSON_SCALAR(ARRAY[1,2]), JSON_SCALAR(NULL); \
+         SELECT JSON('{\"a\":1,\"a\":2}' WITH UNIQUE KEYS)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["{\"a\":1}|{\"a\":1}|1|\"x\"|[1,2]|NULL"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(String::from_utf8_lossy(&output).contains("22030"));
+}
+
+#[test]
+fn sql_json_array_and_object_constructors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON_ARRAY(1, NULL, 'x' NULL ON NULL), \
+                JSON_ARRAY(1, NULL, 'x' ABSENT ON NULL), \
+                JSON_ARRAY('{\"a\":2}' FORMAT JSON RETURNING jsonb), \
+                pg_typeof(JSON_ARRAY(1 RETURNING text)), \
+                encode(JSON_ARRAY(1 RETURNING bytea), 'hex'), \
+                pg_typeof(JSON_ARRAY(1 RETURNING varchar(8))); \
+         SELECT JSON_OBJECT('a' VALUE 1, 'b': NULL NULL ON NULL), \
+                JSON_OBJECT('a':1, 'b':NULL ABSENT ON NULL), \
+                JSON_OBJECT('b':2, 'a':1 RETURNING jsonb), \
+                pg_typeof(JSON_OBJECT('a':1 RETURNING text)); \
+         SELECT JSON_OBJECT('a':1, 'a':2 WITH UNIQUE KEYS)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "[1, null, \"x\"]|[1, \"x\"]|[{\"a\": 2}]|text|5b315d|character varying",
+            "{\"a\" : 1, \"b\" : null}|{\"a\" : 1}|{\"a\": 1, \"b\": 2}|text",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(String::from_utf8_lossy(&output).contains("22030"));
+}
+
+#[test]
+fn sql_json_serialize_supports_character_and_binary_results() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON_SERIALIZE('{\"a\": 1}'::json), \
+                encode(JSON_SERIALIZE('{\"a\": 1}'::json RETURNING bytea), 'hex'), \
+                pg_typeof(JSON_SERIALIZE('[1]'::json RETURNING varchar(8))), \
+                JSON_SERIALIZE(NULL::json RETURNING text)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["{\"a\": 1}|7b2261223a20317d|character varying|NULL"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn sql_json_exists_supports_passing_and_error_behaviors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON_EXISTS('{\"a\":[1,2]}'::jsonb, 'strict $.a[0]'), \
+                JSON_EXISTS('{\"a\":1}', '$.b'), JSON_EXISTS(NULL, '$'), \
+                JSON_EXISTS('{\"a\":2}', '$.a ? (@ > $min)' PASSING 1 AS min), \
+                JSON_EXISTS('{\"a\":1}', 'strict $.b' TRUE ON ERROR), \
+                JSON_EXISTS('{\"a\":1}', 'strict $.b' FALSE ON ERROR), \
+                JSON_EXISTS('{\"a\":1}', 'strict $.b' UNKNOWN ON ERROR)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t|f|NULL|t|t|f|NULL"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let error = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON_EXISTS('{\"a\":1}', 'strict $.b' ERROR ON ERROR)",
+    );
+    assert!(String::from_utf8_lossy(&error).contains("2203A"));
+}
+
+#[test]
+fn sql_json_value_coerces_scalars_and_handles_empty_and_error() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON_VALUE('{\"a\":1}', '$.a'), \
+                pg_typeof(JSON_VALUE('{\"a\":1}', '$.a')), \
+                JSON_VALUE('{\"a\":null}', '$.a'), JSON_VALUE('{}', '$.a'), \
+                JSON_VALUE('{\"a\":\"12\"}', '$.a' RETURNING integer), \
+                JSON_VALUE('{\"a\":true}', '$.a' RETURNING boolean), \
+                JSON_VALUE('{}', '$.a' RETURNING integer DEFAULT 7 ON EMPTY), \
+                JSON_VALUE('{\"a\":[1,2]}', '$.a[*]' DEFAULT 'bad' ON ERROR), \
+                JSON_VALUE('{\"a\":4}', '$.a + $inc' PASSING 3 AS inc RETURNING bigint)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|text|NULL|NULL|12|t|7|bad|7"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn sql_json_query_supports_wrappers_quotes_and_behaviors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON_QUERY('{\"a\":[1,2]}', '$.a'), \
+                pg_typeof(JSON_QUERY('{\"a\":[1,2]}', '$.a')), \
+                JSON_QUERY('{}', '$.a'), \
+                JSON_QUERY('{\"a\":1}', '$.a' WITH ARRAY WRAPPER), \
+                JSON_QUERY('{\"a\":[1]}', '$.a' WITHOUT ARRAY WRAPPER); \
+         SELECT JSON_QUERY('{\"a\":\"x\"}', '$.a' RETURNING text OMIT QUOTES), \
+                JSON_QUERY('{\"a\":\"x\"}', '$.a' RETURNING text KEEP QUOTES), \
+                JSON_QUERY('{}', '$.a' EMPTY ARRAY ON EMPTY), \
+                JSON_QUERY('{}', '$.a' EMPTY OBJECT ON EMPTY), \
+                JSON_QUERY('{}', '$.a' DEFAULT '{\"z\":1}'::jsonb ON EMPTY); \
+         SELECT JSON_QUERY('{\"a\":[1,2]}', '$.a[*]' WITH CONDITIONAL ARRAY WRAPPER), \
+                JSON_QUERY('{\"a\":[1,2]}', '$.a[*]' WITH UNCONDITIONAL ARRAY WRAPPER), \
+                JSON_QUERY('{\"a\":[1]}', '$.a' WITH CONDITIONAL ARRAY WRAPPER), \
+                JSON_QUERY('{\"a\":4}', '$.a + $inc' PASSING 3 AS inc RETURNING json)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "[1, 2]|jsonb|NULL|[1]|[1]",
+            "x|\"x\"|[]|{}|{\"z\": 1}",
+            "[1, 2]|[1, 2]|[1]|7",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn strict_and_unique_json_aggregates_match_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT json_agg_strict(v ORDER BY id), jsonb_agg_strict(v ORDER BY id) \
+           FROM (VALUES (1, 1), (2, NULL), (3, 2)) AS source(id, v); \
+         SELECT json_object_agg_strict(k, v ORDER BY k), \
+                jsonb_object_agg_unique_strict(k, v ORDER BY k) \
+           FROM (VALUES ('b', 2), ('a', NULL), ('c', 3)) AS source(k, v); \
+         SELECT json_object_agg_unique(k, v) \
+           FROM (VALUES ('a', 1), ('a', 2)) AS source(k, v)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "[1, 2]|[1, 2]",
+            "{ \"b\" : 2, \"c\" : 3 }|{\"b\": 2, \"c\": 3}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(String::from_utf8_lossy(&output).contains("22030"));
+}
+
+#[test]
+fn sql_json_aggregates_support_options_ordering_and_returning() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT JSON_ARRAYAGG(v ORDER BY id), \
+                JSON_ARRAYAGG(v ORDER BY id NULL ON NULL), \
+                JSON_ARRAYAGG(v ORDER BY id ABSENT ON NULL RETURNING jsonb), \
+                pg_typeof(JSON_ARRAYAGG(v RETURNING text)) \
+           FROM (VALUES (1, 1), (2, NULL), (3, 2)) AS source(id, v); \
+         SELECT JSON_OBJECTAGG(k VALUE v ABSENT ON NULL WITH UNIQUE KEYS RETURNING jsonb) \
+           FROM (VALUES ('a', 1), ('b', NULL)) AS source(k, v); \
+         SELECT JSON_OBJECTAGG(k VALUE v ABSENT ON NULL RETURNING jsonb), \
+                jsonb_object_agg_strict(k, v) \
+           FROM (VALUES (1, 'null'::jsonb), (2, NULL::jsonb)) AS source(k, v)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["[1, 2]|[1, null, 2]|[1, 2]|text", "{\"a\": 1}", "{}|{}"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn json_table_projects_nested_rows_siblings_and_column_behaviors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM JSON_TABLE(
+             '{"favorites":[{"kind":"comedy","films":[{"title":"Bananas"},{"title":"Dinner"}]},{"kind":"drama","films":[{"title":"Yojimbo"}]}]}'::jsonb,
+             '$.favorites[*]'
+             COLUMNS (
+               id FOR ORDINALITY,
+               kind text,
+               titles text PATH '$.films[*].title' WITH ARRAY WRAPPER,
+               NESTED PATH '$.films[*]' COLUMNS (
+                 film_id FOR ORDINALITY,
+                 title text,
+                 missing integer DEFAULT 7 ON EMPTY))) AS jt;
+           SELECT * FROM JSON_TABLE(
+             '{"items":[{"n":2},{"n":"bad"}]}'::json,
+             '$.items[*]' COLUMNS (
+               n integer,
+               present text EXISTS PATH '$.n',
+               safe integer PATH '$.n' DEFAULT 9 ON ERROR)) AS jt"#,
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1|comedy|[\"Bananas\", \"Dinner\"]|1|Bananas|7",
+            "1|comedy|[\"Bananas\", \"Dinner\"]|2|Dinner|7",
+            "2|drama|[\"Yojimbo\"]|1|Yojimbo|7",
+            "2|true|2",
+            "NULL|true|9",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let siblings = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM JSON_TABLE(
+             '{"movies":[{"name":"One"},{"name":"Two"}],"books":[{"name":"Mystery"}]}'::jsonb,
+             '$' COLUMNS (
+               NESTED '$.movies[*]' COLUMNS (movie_id FOR ORDINALITY, movie text PATH '$.name'),
+               NESTED '$.books[*]' COLUMNS (book_id FOR ORDINALITY, book text PATH '$.name'))) jt"#,
+    );
+    assert_eq!(
+        data_rows(&siblings),
+        ["1|One|NULL|NULL", "2|Two|NULL|NULL", "NULL|NULL|1|Mystery"],
+        "{}",
+        String::from_utf8_lossy(&siblings)
+    );
+
+    let duplicate_name = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM JSON_TABLE('{}', '$' AS item
+              COLUMNS (item integer PATH '$')) AS jt"#,
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate_name).contains("42712"),
+        "{}",
+        String::from_utf8_lossy(&duplicate_name)
+    );
+
+    let nonconstant_path = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM JSON_TABLE('{}', '$'::jsonpath COLUMNS (value text)) AS jt",
+    );
+    assert!(
+        String::from_utf8_lossy(&nonconstant_path).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&nonconstant_path)
+    );
+    let nonconstant_nested_path = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (NESTED PATH concat('$', '') COLUMNS (value text))) AS jt",
+    );
+    assert!(
+        String::from_utf8_lossy(&nonconstant_nested_path).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&nonconstant_nested_path)
+    );
+
+    let typed_view = run_with(
+        &mut engine,
+        &mut budget,
+        r#"CREATE TYPE json_table_row AS (a integer);
+           CREATE VIEW json_table_view AS
+             SELECT * FROM JSON_TABLE('{"row":{"a":11}}', '$'
+               COLUMNS (row_value json_table_row FORMAT JSON PATH '$.row')) AS jt;
+           SELECT row_value FROM json_table_view;
+           DROP TYPE json_table_row"#,
+    );
+    assert_eq!(data_rows(&typed_view), ["(11)"]);
+    assert!(
+        String::from_utf8_lossy(&typed_view).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&typed_view)
+    );
+}
+
+#[test]
+fn json_table_integrates_with_data_modification_merge_and_plpgsql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        r#"CREATE TABLE json_table_dml_rows (id integer PRIMARY KEY, label text);
+           INSERT INTO json_table_dml_rows
+             SELECT id, label FROM JSON_TABLE(
+               '[{"id":1,"label":"one"},{"id":2,"label":"two"}]', '$[*]'
+               COLUMNS (id integer, label text)) AS source;
+           UPDATE json_table_dml_rows AS target SET label = source.label
+             FROM JSON_TABLE('[{"id":2,"label":"TWO"}]', '$[*]'
+               COLUMNS (id integer, label text)) AS source
+             WHERE target.id = source.id;
+           DELETE FROM json_table_dml_rows AS target
+             USING JSON_TABLE('[1]', '$[*]' COLUMNS (id integer PATH '$')) AS source
+             WHERE target.id = source.id;
+           MERGE INTO json_table_dml_rows AS target
+             USING JSON_TABLE(
+               '[{"id":2,"label":"second"},{"id":3,"label":"three"}]', '$[*]'
+               COLUMNS (id integer, label text)) AS source
+             ON target.id = source.id
+             WHEN MATCHED THEN UPDATE SET label = source.label
+             WHEN NOT MATCHED THEN INSERT (id, label) VALUES (source.id, source.label);
+           CREATE FUNCTION json_table_plpgsql(input jsonb)
+             RETURNS TABLE (id integer, label text) LANGUAGE plpgsql AS $$
+           BEGIN
+             RETURN QUERY SELECT source.id, source.label
+               FROM JSON_TABLE(input, '$[*]'
+                 COLUMNS (id integer, label text)) AS source;
+           END $$;
+           SELECT id, label FROM json_table_dml_rows ORDER BY id;
+           SELECT * FROM json_table_plpgsql(
+             '[{"id":4,"label":"four"},{"id":5,"label":"five"}]')"#,
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["2|second", "3|three", "4|four", "5|five"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn json_populate_record_converts_nested_composites_arrays_and_domains() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        r#"CREATE TYPE json_subrow AS (d integer, e text);
+           CREATE TYPE json_row AS (a integer, b text[], c json_subrow, matrix integer[][]);
+           CREATE TYPE json_short AS (a char(2));
+           CREATE DOMAIN json_positive AS integer CHECK (VALUE > 0);
+           CREATE DOMAIN json_positive_subrow AS json_subrow CHECK ((VALUE).d > 0);
+           CREATE TYPE json_mood AS ENUM ('ok', 'great');
+           CREATE TYPE json_rich_row AS (
+             children json_subrow[], positive json_positive,
+             mood json_mood, moods json_mood[])"#,
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM jsonb_populate_record(NULL::json_row,
+             '{"a":1,"b":["2","a b"],"c":{"d":4,"e":"a b c"},"matrix":[[1,2],[3,4]],"ignored":true}')"#,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|{2,\"a b\"}|(4,\"a b c\")|{{1,2},{3,4}}"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let base = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM json_populate_record(
+             ROW(9, ARRAY['base'], ROW(8,'old')::json_subrow, NULL::integer[])::json_row,
+             '{"a":2,"c":{"e":"new"}}')"#,
+    );
+    assert_eq!(
+        data_rows(&base),
+        ["2|{base}|(8,new)|NULL"],
+        "{}",
+        String::from_utf8_lossy(&base)
+    );
+    let expanded = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT (json_populate_record(NULL::json_row, '{"a":3}')).*"#,
+    );
+    assert_eq!(
+        data_rows(&expanded),
+        ["3|NULL|NULL|NULL"],
+        "{}",
+        String::from_utf8_lossy(&expanded)
+    );
+    let recordset = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM jsonb_populate_recordset(NULL::json_row,
+             '[{"a":10},{"a":20,"b":["x"]}]')"#,
+    );
+    assert_eq!(
+        data_rows(&recordset),
+        ["10|NULL|NULL|NULL", "20|{x}|NULL|NULL"],
+        "{}",
+        String::from_utf8_lossy(&recordset)
+    );
+    let valid = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT jsonb_populate_record_valid(NULL::json_short, '{"a":"aa"}'::jsonb),
+                  jsonb_populate_record_valid(NULL::json_short, '{"a":"aaa"}'::jsonb),
+                  jsonb_populate_record_valid(NULL::json_short, 'null'::jsonb),
+                  jsonb_populate_record_valid(NULL::json_short, NULL::jsonb)"#,
+    );
+    assert_eq!(
+        data_rows(&valid),
+        ["t|f|f|NULL"],
+        "{}",
+        String::from_utf8_lossy(&valid)
+    );
+    let user_types = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM jsonb_populate_record(NULL::json_rich_row,
+             '{"children":[{"d":1,"e":"x"}],"positive":3,"mood":"great","moods":["ok","great"]}');
+           SELECT * FROM jsonb_populate_record(NULL::json_rich_row, '{"positive":-1}')"#,
+    );
+    assert_eq!(
+        data_rows(&user_types),
+        ["{\"(1,x)\"}|3|great|{ok,great}"],
+        "{}",
+        String::from_utf8_lossy(&user_types)
+    );
+    let user_types = String::from_utf8_lossy(&user_types);
+    assert!(user_types.contains("23514"), "{user_types}");
+    let invalid_enum = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM jsonb_populate_record(NULL::json_rich_row, '{"mood":"bad"}')"#,
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid_enum).contains("22P02"),
+        "{}",
+        String::from_utf8_lossy(&invalid_enum)
+    );
+    let composite_domain = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT pg_typeof(jsonb_populate_record(
+               NULL::json_positive_subrow, '{"d":4,"e":"domain"}')),
+                  jsonb_populate_record(NULL::json_positive_subrow,
+                                        '{"d":4,"e":"domain"}');
+           SELECT * FROM jsonb_populate_recordset(
+             NULL::json_positive_subrow, '[{"d":5},{"d":6,"e":"six"}]')"#,
+    );
+    assert_eq!(
+        data_rows(&composite_domain),
+        ["json_positive_subrow|(4,domain)", "5|NULL", "6|six"],
+        "{}",
+        String::from_utf8_lossy(&composite_domain)
+    );
+    let invalid_composite_domain = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT jsonb_populate_record(NULL::json_positive_subrow, '{"d":-1}')"#,
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid_composite_domain).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&invalid_composite_domain)
+    );
+}
+
+#[test]
+fn sql_json_set_returning_arguments_are_evaluated_once() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        r#"CREATE SEQUENCE json_evaluation_sequence;
+           CREATE TYPE json_evaluation_row AS (id integer);
+           SELECT jsonb_path_query(
+             jsonb_build_array(nextval('json_evaluation_sequence'),
+                               nextval('json_evaluation_sequence')), '$[*]');
+           SELECT last_value FROM json_evaluation_sequence;
+           ALTER SEQUENCE json_evaluation_sequence RESTART WITH 1;
+           SELECT value FROM jsonb_path_query(
+             jsonb_build_array(nextval('json_evaluation_sequence'),
+                               nextval('json_evaluation_sequence')), '$[*]') AS rows(value);
+           SELECT last_value FROM json_evaluation_sequence;
+           ALTER SEQUENCE json_evaluation_sequence RESTART WITH 1;
+           SELECT * FROM jsonb_populate_recordset(
+             ROW(nextval('json_evaluation_sequence')::integer)::json_evaluation_row,
+             '[{},{}]');
+           SELECT last_value FROM json_evaluation_sequence"#,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1", "2", "2", "1", "2", "2", "1", "1", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn json_to_record_uses_typed_column_definition_lists() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT * FROM json_to_record('{"a":1,"b":[1,2],"extra":true}')
+             AS x(a integer, b integer[], missing text);
+           SELECT * FROM jsonb_to_recordset('[{"a":1,"b":"x"},{"a":2}]')
+             AS rows(a bigint, b varchar(3));
+           SELECT * FROM json_to_record('{"a":"toolong"}') AS (a varchar(3))"#,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|{1,2}|NULL", "1|x", "2|NULL"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(String::from_utf8_lossy(&output).contains("22001"));
+}
+
+#[test]
+fn jsonb_read_subscripts_support_objects_arrays_and_chains() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ('{\"a\":[10,20],\"1\":\"one\",\"n\":null}'::jsonb)['a'][1], \
+                ('[10,20]'::jsonb)[-1], \
+                ('{\"a\":1}'::jsonb)['missing'], \
+                ('{\"n\":null}'::jsonb)['n'], \
+                ('{\"1\":\"one\"}'::jsonb)[1], \
+                ('[10,20]'::jsonb)['not-an-index'], \
+                pg_typeof(('{\"a\":1}'::jsonb)['a'])",
+    );
+    assert_eq!(data_rows(&output), ["20|20|NULL|null|\"one\"|NULL|jsonb"]);
+    let rejected = run_with(&mut engine, &mut budget, "SELECT ('{}'::json)['a']");
+    assert!(String::from_utf8_lossy(&rejected).contains("42804"));
+}
+
+#[test]
+fn jsonb_write_subscripts_create_containers_and_pad_arrays() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE jsonb_subscript_rows (id integer PRIMARY KEY, document jsonb); \
+         INSERT INTO jsonb_subscript_rows VALUES (1, '{}'), (2, NULL), (3, '[1]'); \
+         UPDATE jsonb_subscript_rows SET document['a']['b'] = '2'::jsonb WHERE id = 1; \
+         UPDATE jsonb_subscript_rows SET document['items'][2] = '\"x\"'::jsonb WHERE id = 2; \
+         UPDATE jsonb_subscript_rows SET document[3] = '4'::jsonb WHERE id = 3; \
+         UPDATE jsonb_subscript_rows SET document[-1] = '9'::jsonb WHERE id = 3; \
+         SELECT id, document FROM jsonb_subscript_rows ORDER BY id",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1|{\"a\": {\"b\": 2}}",
+            "2|{\"items\": [null, null, \"x\"]}",
+            "3|[1, null, null, 9]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn plpgsql_jsonb_subscript_assignment_updates_rows_and_locals() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        r#"CREATE TABLE plpgsql_jsonb_rows (id integer PRIMARY KEY, document jsonb);
+           CREATE FUNCTION plpgsql_jsonb_row_trigger() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             NEW.document['triggered']['values'][1] := '7'::jsonb;
+             RETURN NEW;
+           END $$;
+           CREATE TRIGGER plpgsql_jsonb_row_trigger
+             BEFORE INSERT OR UPDATE ON plpgsql_jsonb_rows
+             FOR EACH ROW EXECUTE FUNCTION plpgsql_jsonb_row_trigger();
+           CREATE FUNCTION plpgsql_jsonb_local(input jsonb) RETURNS jsonb LANGUAGE plpgsql AS $$
+           BEGIN
+             input['local']['value'] := '9'::jsonb;
+             input['local']['items'][0] := 'true'::jsonb;
+             RETURN input;
+           END $$;
+           INSERT INTO plpgsql_jsonb_rows VALUES (1, NULL);
+           UPDATE plpgsql_jsonb_rows SET document['updated'] = 'true'::jsonb WHERE id = 1;
+           SELECT document, plpgsql_jsonb_local('{}')
+             FROM plpgsql_jsonb_rows WHERE id = 1"#,
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "{\"updated\": true, \"triggered\": {\"values\": [null, 7]}}|{\"local\": {\"items\": [true], \"value\": 9}}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn sql_json_survives_wal_savepoints_checkpoint_and_object_cold_recovery() {
+    let mut config = test_config("sql-json-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("sql-json-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        r#"CREATE TABLE durable_sql_json (
+             id integer PRIMARY KEY,
+             path jsonpath NOT NULL,
+             paths jsonpath[],
+             document jsonb CHECK (document['state'] = '"ready"'::jsonb),
+             item_count integer GENERATED ALWAYS AS
+               (jsonb_array_length(document['items'])) STORED
+           );
+           INSERT INTO durable_sql_json (id, path, paths, document) VALUES
+             (1, '$.items[*] ? (@ >= 2)',
+              ARRAY['$.state'::jsonpath, 'strict $.items[0]'::jsonpath],
+              '{"state":"ready","items":[1,2]}');
+           CREATE VIEW durable_sql_json_view AS
+             SELECT source.id, source.path, item.ordinality, item.value
+               FROM durable_sql_json AS source,
+                    LATERAL JSON_TABLE(source.document, '$.items[*]'
+                      COLUMNS (ordinality FOR ORDINALITY,
+                               value integer PATH '$')) AS item;
+           CREATE MATERIALIZED VIEW durable_sql_json_materialized AS
+             SELECT id, jsonb_path_query_array(document, path) AS matches
+               FROM durable_sql_json;
+           CHECKPOINT"#,
+        1 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        r#"UPDATE durable_sql_json SET document['state'] = '"broken"'::jsonb WHERE id = 1"#,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let mutation = run_with(
+        &mut engine,
+        &mut budget,
+        r#"BEGIN;
+           UPDATE durable_sql_json SET document['items'][3] = '4'::jsonb WHERE id = 1;
+           SAVEPOINT before_discarded_json_write;
+           UPDATE durable_sql_json SET document['discarded'] = 'true'::jsonb WHERE id = 1;
+           ROLLBACK TO SAVEPOINT before_discarded_json_write;
+           UPDATE durable_sql_json
+              SET document['items'][2] = '3'::jsonb,
+                  document['details']['active'] = 'true'::jsonb
+            WHERE id = 1;
+           COMMIT;
+           SELECT path, paths, document, item_count,
+                  jsonb_path_query_array(document, path)
+             FROM durable_sql_json"#,
+    );
+    assert_eq!(
+        data_rows(&mutation),
+        [
+            "$.\"items\"[*]?(@ >= 2)|{\"$.\\\"state\\\"\",\"strict $.\\\"items\\\"[0]\"}|{\"items\": [1, 2, 3, 4], \"state\": \"ready\", \"details\": {\"active\": true}}|4|[2, 3, 4]"
+        ],
+        "{}",
+        String::from_utf8_lossy(&mutation)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id, path, ordinality, value FROM durable_sql_json_view ORDER BY ordinality; \
+         SELECT id, matches FROM durable_sql_json_materialized; \
+         SELECT document['details']['active'], item_count, pg_typeof(path), pg_typeof(paths) \
+           FROM durable_sql_json",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "1|$.\"items\"[*]?(@ >= 2)|1|1",
+            "1|$.\"items\"[*]?(@ >= 2)|2|2",
+            "1|$.\"items\"[*]?(@ >= 2)|3|3",
+            "1|$.\"items\"[*]?(@ >= 2)|4|4",
+            "1|[2]",
+            "true|4|jsonpath|jsonpath[]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

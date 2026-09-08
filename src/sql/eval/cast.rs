@@ -392,6 +392,11 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
         },
+        ColType::Jsonpath => match v {
+            Datum::JsonPath(_) => v,
+            Datum::Text(text) => Datum::JsonPath(crate::sql::jsonpath::canonicalize(text, arena)?),
+            _ => return Err(cast_unsupported(&v, "jsonpath")),
+        },
         ColType::TsVector => match v {
             Datum::TsVector(_) => v,
             Datum::Text(text) => Datum::TsVector(crate::sql::full_text::restore_vector(

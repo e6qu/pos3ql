@@ -25,11 +25,28 @@ pub enum Json<'a> {
     Bool(bool),
     /// Canonical numeric text.
     Number(&'a str),
-    /// The raw (unescaped-in-source) string contents, without the quotes.
+    /// Decoded string contents.
     Str(&'a str),
+    /// SQL/JSON path datetime item. It serializes as its source JSON string,
+    /// but retains typed comparison semantics while a path is evaluated.
+    Temporal {
+        text: &'a str,
+        kind: JsonTemporalKind,
+        value: i64,
+        offset: i32,
+    },
     Array(&'a [Json<'a>]),
     /// Members, sorted by key with duplicates removed (last wins).
     Object(&'a [(&'a str, Json<'a>)]),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JsonTemporalKind {
+    Date,
+    Time,
+    TimeTz,
+    Timestamp,
+    TimestampTz,
 }
 
 struct P<'a> {
@@ -86,6 +103,24 @@ pub fn parse_source_order<'a>(input: &'a str, arena: &'a Arena) -> Result<Json<'
 /// stored verbatim).
 pub fn validate(input: &str, arena: &Arena) -> Result<(), SqlError> {
     parse(input, arena).map(|_| ())
+}
+
+/// Whether every object in a source-order JSON tree has distinct decoded
+/// keys. SQL/JSON `WITH UNIQUE KEYS` applies recursively, not only at the root.
+pub fn has_unique_keys(value: &Json<'_>) -> bool {
+    match value {
+        Json::Array(items) => items.iter().all(has_unique_keys),
+        Json::Object(members) => {
+            for (index, (key, value)) in members.iter().enumerate() {
+                if members[..index].iter().any(|(prior, _)| prior == key) || !has_unique_keys(value)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => true,
+    }
 }
 
 /// The shape of a JSON value at the top level, for the diagnostic messages the
@@ -296,7 +331,7 @@ impl<'a> P<'a> {
         match self.b.get(self.at) {
             Some(b'{') => self.object(depth),
             Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Json::Str(self.string()?)),
+            Some(b'"') => Ok(Json::Str(decode_string(self.string()?, self.arena)?)),
             Some(b't') => {
                 self.lit("true")?;
                 Ok(Json::Bool(true))
@@ -328,11 +363,50 @@ impl<'a> P<'a> {
         if self.b.get(self.at) == Some(&b'-') {
             self.at += 1;
         }
-        while self.at < self.b.len()
-            && (self.b[self.at].is_ascii_digit()
-                || matches!(self.b[self.at], b'.' | b'e' | b'E' | b'+' | b'-'))
+        if self.b.get(self.at) == Some(&b'0') {
+            self.at += 1;
+            if self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
+                return Err(bad());
+            }
+        } else {
+            let integer = self.at;
+            while self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+            if integer == self.at {
+                return Err(bad());
+            }
+        }
+        if self.b.get(self.at) == Some(&b'.') {
+            self.at += 1;
+            let fraction = self.at;
+            while self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+            if fraction == self.at {
+                return Err(bad());
+            }
+        }
+        if self
+            .b
+            .get(self.at)
+            .is_some_and(|byte| matches!(byte, b'e' | b'E'))
         {
             self.at += 1;
+            if self
+                .b
+                .get(self.at)
+                .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+            {
+                self.at += 1;
+            }
+            let exponent = self.at;
+            while self.b.get(self.at).is_some_and(u8::is_ascii_digit) {
+                self.at += 1;
+            }
+            if exponent == self.at {
+                return Err(bad());
+            }
         }
         let raw = core::str::from_utf8(&self.b[start..self.at]).map_err(|_| bad())?;
         // Canonicalize through NUMERIC (so 1e2 -> 100, 1.0 -> 1.0).
@@ -343,8 +417,8 @@ impl<'a> P<'a> {
         ))
     }
 
-    /// Parses a JSON string literal, returning the raw source contents between
-    /// the quotes (escapes are validated but kept as written).
+    /// Parses a JSON string literal, returning the source contents between the
+    /// quotes. The caller decodes escapes once at this parse boundary.
     fn string(&mut self) -> Result<&'a str, SqlError> {
         debug_assert_eq!(self.b[self.at], b'"');
         self.at += 1;
@@ -375,6 +449,7 @@ impl<'a> P<'a> {
                         _ => return Err(bad()),
                     }
                 }
+                Some(byte) if *byte < 0x20 => return Err(bad()),
                 Some(_) => self.at += 1,
             }
         }
@@ -437,7 +512,7 @@ impl<'a> P<'a> {
             if self.b.get(self.at) != Some(&b'"') {
                 return Err(bad());
             }
-            let key = self.string()?;
+            let key = decode_string(self.string()?, self.arena)?;
             self.ws();
             if self.b.get(self.at) != Some(&b':') {
                 return Err(bad());
@@ -505,7 +580,7 @@ impl<'a> Json<'a> {
             Json::Bool(true) => out.write_str("true"),
             Json::Bool(false) => out.write_str("false"),
             Json::Number(s) => out.write_str(s),
-            Json::Str(s) => write_json_string(s, out),
+            Json::Str(s) | Json::Temporal { text: s, .. } => write_json_raw_string(s, out),
             Json::Array(items) => {
                 out.write_str("[")?;
                 for (i, v) in items.iter().enumerate() {
@@ -522,7 +597,7 @@ impl<'a> Json<'a> {
                     if i > 0 {
                         out.write_str(", ")?;
                     }
-                    write_json_string(k, out)?;
+                    write_json_raw_string(k, out)?;
                     out.write_str(": ")?;
                     v.write(out)?;
                 }
@@ -536,7 +611,9 @@ impl<'a> Json<'a> {
     /// spaced object compactly.
     pub fn write_compact(&self, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
         match self {
-            Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_) => self.write(out),
+            Json::Null | Json::Bool(_) | Json::Number(_) | Json::Str(_) | Json::Temporal { .. } => {
+                self.write(out)
+            }
             Json::Array(items) => {
                 out.write_str("[")?;
                 for (i, v) in items.iter().enumerate() {
@@ -553,7 +630,7 @@ impl<'a> Json<'a> {
                     if i > 0 {
                         out.write_str(",")?;
                     }
-                    write_json_string(k, out)?;
+                    write_json_raw_string(k, out)?;
                     out.write_str(":")?;
                     v.write_compact(out)?;
                 }
@@ -682,6 +759,120 @@ fn array_index(index: &str, len: usize) -> Option<usize> {
     let i: i64 = index.parse().ok()?;
     let resolved = if i < 0 { len as i64 + i } else { i };
     (resolved >= 0 && (resolved as usize) < len).then_some(resolved as usize)
+}
+
+#[derive(Clone, Copy)]
+pub enum JsonSubscript<'a> {
+    Key(&'a str),
+    Index(i64),
+}
+
+fn empty_for<'a>(subscript: JsonSubscript<'a>) -> Json<'a> {
+    match subscript {
+        JsonSubscript::Key(_) => Json::Object(&[]),
+        JsonSubscript::Index(_) => Json::Array(&[]),
+    }
+}
+
+/// PostgreSQL jsonb assignment subscripting. Missing intermediate containers
+/// are inferred from the next subscript and arrays are JSON-null padded.
+pub fn set_subscript<'a>(
+    root: Json<'a>,
+    path: &[JsonSubscript<'a>],
+    value: Json<'a>,
+    arena: &'a Arena,
+) -> Result<Json<'a>, SqlError> {
+    let Some((head, rest)) = path.split_first() else {
+        return Ok(value);
+    };
+    match root {
+        Json::Object(members) => {
+            let key = match *head {
+                JsonSubscript::Key(key) => key,
+                JsonSubscript::Index(index) => arena
+                    .alloc_str_display(index)
+                    .map_err(|_| sql_err!(sqlstate::OUT_OF_MEMORY, "statement arena exhausted"))?,
+            };
+            let mut buffer: [(&str, Json); MAX_ELEMS] = [("", Json::Null); MAX_ELEMS];
+            buffer[..members.len()].copy_from_slice(members);
+            if let Some(index) = members.iter().position(|(name, _)| *name == key) {
+                let child = if rest.is_empty() {
+                    value
+                } else {
+                    let existing = members[index].1;
+                    let base = if matches!(existing, Json::Null) {
+                        empty_for(rest[0])
+                    } else {
+                        existing
+                    };
+                    set_subscript(base, rest, value, arena)?
+                };
+                buffer[index].1 = child;
+                build_object(&buffer[..members.len()], arena)
+            } else {
+                if members.len() == MAX_ELEMS {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "JSON object too large"
+                    ));
+                }
+                let child = if rest.is_empty() {
+                    value
+                } else {
+                    set_subscript(empty_for(rest[0]), rest, value, arena)?
+                };
+                buffer[members.len()] = (key, child);
+                build_object(&buffer[..members.len() + 1], arena)
+            }
+        }
+        Json::Array(items) => {
+            let JsonSubscript::Index(raw) = *head else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "jsonb array subscript is not an integer"
+                ));
+            };
+            let length = i64::try_from(items.len()).map_err(|_| bad())?;
+            let resolved = if raw < 0 { length + raw } else { raw };
+            if resolved < 0 {
+                return Err(sql_err!(
+                    sqlstate::ARRAY_SUBSCRIPT_ERROR,
+                    "jsonb array subscript is out of bounds"
+                ));
+            }
+            let index = usize::try_from(resolved).map_err(|_| bad())?;
+            if index >= MAX_ELEMS {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "JSON array too large"
+                ));
+            }
+            let new_len = items.len().max(index + 1);
+            let mut buffer = [Json::Null; MAX_ELEMS];
+            buffer[..items.len()].copy_from_slice(items);
+            let existing = buffer[index];
+            buffer[index] = if rest.is_empty() {
+                value
+            } else {
+                let base = if index >= items.len() || matches!(existing, Json::Null) {
+                    empty_for(rest[0])
+                } else {
+                    existing
+                };
+                set_subscript(base, rest, value, arena)?
+            };
+            Ok(Json::Array(
+                arena
+                    .alloc_slice_copy(&buffer[..new_len])
+                    .map_err(|_| bad())?,
+            ))
+        }
+        Json::Null => set_subscript(empty_for(*head), path, value, arena),
+        _ => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "cannot replace existing key"
+        )),
+    }
 }
 
 /// `jsonb_set(target, path, value, create_if_missing)`: replaces the value at
@@ -989,7 +1180,7 @@ pub fn pretty(root: &Json, indent: usize, out: &mut dyn core::fmt::Write) -> cor
             out.write_str("{\n")?;
             for (i, (k, v)) in members.iter().enumerate() {
                 pad(out, indent + 1)?;
-                write_json_string(k, out)?;
+                write_json_raw_string(k, out)?;
                 out.write_str(": ")?;
                 pretty(v, indent + 1, out)?;
                 if i + 1 < members.len() {
@@ -1069,38 +1260,6 @@ impl core::fmt::Display for JsonWrite<'_, '_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.write(f)
     }
-}
-
-/// Writes a JSON string literal with the canonical minimal escaping.
-fn write_json_string(s: &str, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
-    out.write_str("\"")?;
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => out.write_str("\\\"")?,
-            '\\' => {
-                // The source already contains an escape; copy it through so we
-                // do not double-escape a `\uXXXX` or `\n` written by the user.
-                let bytes = s.as_bytes();
-                if let Some(&nx) = bytes.get(i + 1) {
-                    out.write_char('\\')?;
-                    out.write_char(nx as char)?;
-                    // consume the escaped char from the iterator
-                    if nx == b'u' {
-                        for _ in 0..5 {
-                            chars.next();
-                        }
-                    } else {
-                        chars.next();
-                    }
-                } else {
-                    out.write_str("\\\\")?;
-                }
-            }
-            c => out.write_char(c)?,
-        }
-    }
-    out.write_str("\"")
 }
 
 /// Decodes a JSON string body (the bytes between the quotes, with escapes still
@@ -1207,25 +1366,7 @@ pub(crate) fn map_string_values<'a>(
     transform: &mut impl FnMut(&'a str, &'a Arena) -> Result<&'a str, SqlError>,
 ) -> Result<Json<'a>, SqlError> {
     Ok(match value {
-        Json::Str(source) => {
-            let decoded = decode_string(source, arena)?;
-            let transformed = transform(decoded, arena)?;
-            let mut escaped = crate::util::StackStr::<65536>::new();
-            write_json_raw_string(transformed, &mut escaped).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "JSON headline string exceeds the fixed output buffer"
-                )
-            })?;
-            if escaped.is_truncated() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "JSON headline string exceeds the fixed output buffer"
-                ));
-            }
-            let body = &escaped.as_str()[1..escaped.len() - 1];
-            Json::Str(arena.alloc_str(body).map_err(|_| bad())?)
-        }
+        Json::Str(source) => Json::Str(transform(source, arena)?),
         Json::Array(items) => {
             let mapped = arena
                 .alloc_slice_with(items.len(), |_| Json::Null)

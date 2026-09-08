@@ -361,6 +361,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::TsQuery(text) => crate::sql::full_text::emit_query_binary(text.as_str(), |_| {}),
         Datum::Bytea(bytes) => bytes.len(),
         Datum::Json { text, jsonb } => text.len().saturating_add(usize::from(*jsonb)),
+        Datum::JsonPath(text) => 1usize.saturating_add(text.len()),
         Datum::Range { text, .. } | Datum::Multirange { text, .. } => text.len(),
         Datum::Geometry { kind, text } => {
             crate::sql::geometry::binary_len(*kind, text).expect("geometry datum is canonical")
@@ -1325,6 +1326,11 @@ impl<'b> Responder<'b> {
                     } else {
                         m.i32(text.len() as i32);
                     }
+                    m.bytes(text.as_bytes());
+                }
+                Datum::JsonPath(text) => {
+                    m.i32(text.len() as i32 + 1);
+                    m.u8(1);
                     m.bytes(text.as_bytes());
                 }
                 Datum::Range { text, kind } => Self::encode_range_binary(m, text, *kind),

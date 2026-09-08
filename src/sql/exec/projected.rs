@@ -152,6 +152,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Regtype { name, .. } => 8 + name.len(),
         Datum::RegObject { name, .. } => 12 + name.len(),
         Datum::Json { text, .. } => 5 + text.len(),
+        Datum::JsonPath(text) => 4 + text.len(),
         Datum::Array { raw, .. } => 8 + raw.len(),
         Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
@@ -344,6 +345,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[2..6].copy_from_slice(&(text.len() as u32).to_le_bytes());
             out[6..6 + text.len()].copy_from_slice(text.as_bytes());
             6 + text.len()
+        }
+        Datum::JsonPath(text) => {
+            out[0] = 42;
+            out[1..5].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[5..5 + text.len()].copy_from_slice(text.as_bytes());
+            5 + text.len()
         }
         Datum::Array { element, raw } => {
             out[0] = 15;
@@ -652,6 +659,12 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
                 .expect("projected JSON was encoded from valid UTF-8");
             (Datum::Json { text: s, jsonb }, 5 + len)
+        }
+        42 => {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let text = core::str::from_utf8(&bytes[at + 4..at + 4 + len])
+                .expect("projected jsonpath was encoded from valid UTF-8");
+            (Datum::JsonPath(text), 4 + len)
         }
         15 => {
             let mut element = crate::sql::types::ArrElem::from_code(bytes[at])

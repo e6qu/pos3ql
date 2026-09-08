@@ -4661,6 +4661,15 @@ pub(crate) fn decode_binary_param<'a>(
                 })
                 .map_err(|_| "invalid UTF-8 in binary jsonb parameter")
         }
+        oids::JSONPATH => {
+            let (&version, text) = bytes.split_first().ok_or(wrong)?;
+            if version != 1 {
+                return Err("unsupported jsonpath binary version");
+            }
+            core::str::from_utf8(text)
+                .map(Datum::Text)
+                .map_err(|_| "invalid UTF-8 in binary jsonpath parameter")
+        }
         oids::NUMERIC => {
             let mut buffer = crate::util::StackStr::<96>::new();
             binary_numeric_to_str(bytes, &mut buffer)?;

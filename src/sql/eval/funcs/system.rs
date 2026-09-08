@@ -1507,6 +1507,21 @@ pub(crate) fn dispatch<'a>(
                     referenced_oid,
                     name,
                 };
+                if let crate::sql::ast::Expr::Call { name, .. } = args[0]
+                    && matches!(
+                        *name,
+                        "json_populate_record"
+                            | "jsonb_populate_record"
+                            | "json_populate_recordset"
+                            | "jsonb_populate_recordset"
+                    )
+                    && let Some(cat) = hooks.catalog
+                    && let super::super::ExpressionTypeIdentity::Known(referenced_oid) =
+                        super::super::expression_type_identity(args[0], row, hooks)?
+                    && let Some(type_name) = cat.type_name(referenced_oid, arena)?
+                {
+                    return Ok(regtype(referenced_oid, type_name));
+                }
                 if let crate::sql::ast::Expr::Call {
                     name,
                     args,
@@ -1676,6 +1691,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Interval(_) => "interval",
                     Datum::Json { jsonb: false, .. } => "json",
                     Datum::Json { jsonb: true, .. } => "jsonb",
+                    Datum::JsonPath(_) => "jsonpath",
                     Datum::TsVector(_) => "tsvector",
                     Datum::TsQuery(_) => "tsquery",
                     Datum::Array { element, .. } => element.typeof_name(),

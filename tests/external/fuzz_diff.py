@@ -11,7 +11,8 @@ the seed + statement for a one-line repro.
 The generator deliberately targets the seams where implementations drift:
 three-valued logic and NULL propagation, integer overflow and division by
 zero, operator precedence, mixed-type comparison and coercion, CASE, IN /
-BETWEEN / LIKE, aggregates with GROUP BY / HAVING, ORDER BY with NULL
+BETWEEN / LIKE, SQL/JSON construction and query functions, jsonpath methods
+and table expansion, aggregates with GROUP BY / HAVING, ORDER BY with NULL
 ordering, LIMIT/OFFSET, and datetime/text/boolean literals.
 
 Everything is deterministic from `--seed`; the PRNG is stdlib random seeded
@@ -53,6 +54,7 @@ def is_unsupported(result):
 # Fixed schema the fuzzer queries. Columns span the type/nullability space.
 SCHEMA = [
     "DROP TABLE IF EXISTS fz",
+    "DROP TABLE IF EXISTS fz_right",
     "CREATE TABLE fz ("
     " id int NOT NULL,"
     " a int,"
@@ -62,17 +64,19 @@ SCHEMA = [
     " flag bool,"
     " d date,"
     " ts timestamptz,"
-    " ai int[])",
+    " ai int[],"
+    " j jsonb,"
+    " path jsonpath)",
     "CREATE TABLE fz_right (id int NOT NULL, category text, weight int)",
 ]
 
 ROWS = [
-    "(1, 10, 3, 1.5, 'apple', true,  DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 00:00:00+00', ARRAY[1,2])",
-    "(2, -7, 0, -2.25,'banana',false, DATE '2021-06-15', TIMESTAMPTZ '2021-06-15 12:30:00+00', ARRAY[3,4])",
-    "(3, NULL, 5, NULL, NULL,  NULL,  NULL,               NULL, NULL)",
-    "(4, 2147483647, 1, 3.0, 'pear', true, DATE '1999-12-31', TIMESTAMPTZ '1999-12-31 23:59:59+00', ARRAY[5,6])",
-    "(5, 0, -4, 0.0, '',     false, DATE '2000-01-01', TIMESTAMPTZ '2000-01-01 00:00:00+00', ARRAY[7])",
-    "(6, 42, 42, 2.5, 'Apple',true,  DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 06:00:00+00', ARRAY[8,9])",
+    "(1, 10, 3, 1.5, 'apple', true, DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 00:00:00+00', ARRAY[1,2], '{\"a\":10,\"items\":[1,2],\"s\":\"Apple\"}', '$.items[*]')",
+    "(2, -7, 0, -2.25, 'banana', false, DATE '2021-06-15', TIMESTAMPTZ '2021-06-15 12:30:00+00', ARRAY[3,4], '{\"a\":-7,\"items\":[],\"s\":\"banana\"}', 'strict $.a')",
+    "(3, NULL, 5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+    "(4, 2147483647, 1, 3.0, 'pear', true, DATE '1999-12-31', TIMESTAMPTZ '1999-12-31 23:59:59+00', ARRAY[5,6], '{\"a\":4,\"items\":[null,4],\"nested\":{\"x\":1}}', '$.**')",
+    "(5, 0, -4, 0.0, '', false, DATE '2000-01-01', TIMESTAMPTZ '2000-01-01 00:00:00+00', ARRAY[7], 'null', '$')",
+    "(6, 42, 42, 2.5, 'Apple', true, DATE '2020-01-01', TIMESTAMPTZ '2020-01-01 06:00:00+00', ARRAY[8,9], '[1,2,3]', '$[*] ? (@ >= 2)')",
 ]
 
 RIGHT_ROWS = [
@@ -336,6 +340,35 @@ class Gen:
             "(SELECT id,weight FROM fz_right UNION ALL SELECT 9,9) ORDER BY id",
         ])
 
+    def json_statement(self):
+        """Generate PostgreSQL 18 SQL/JSON and jsonpath queries with total
+        ordering wherever a table expansion can emit multiple rows."""
+        return self.choice([
+            "SELECT id, path, jsonb_path_query_array(j, path) FROM fz ORDER BY id",
+            "SELECT id, jsonb_path_exists(j, '$.items[*] ? (@ >= 2)') FROM fz ORDER BY id",
+            "SELECT id, j @? '$.** ? (@.type() == \"number\")', "
+            "j @@ '$.a >= 0' FROM fz ORDER BY id",
+            "SELECT id, jsonb_path_query_first(j, '$.items[last]') FROM fz ORDER BY id",
+            "SELECT id, JSON_EXISTS(j, '$.items[*] ? (@ == $wanted)' "
+            "PASSING a AS wanted FALSE ON ERROR) FROM fz ORDER BY id",
+            "SELECT id, JSON_VALUE(j, '$.a' RETURNING integer "
+            "DEFAULT 7 ON EMPTY DEFAULT 9 ON ERROR) FROM fz ORDER BY id",
+            "SELECT id, JSON_QUERY(j, '$.items' RETURNING jsonb "
+            "EMPTY ARRAY ON EMPTY) FROM fz ORDER BY id",
+            "SELECT JSON_ARRAYAGG(j ORDER BY id ABSENT ON NULL RETURNING jsonb) FROM fz",
+            "SELECT JSON_OBJECTAGG(id VALUE j ABSENT ON NULL RETURNING jsonb) FROM fz",
+            "SELECT id, JSON_SERIALIZE(JSON(j) RETURNING text), "
+            "j IS JSON VALUE FROM fz ORDER BY id",
+            "SELECT id, j['items'][0], j['nested']['x'] FROM fz ORDER BY id",
+            "SELECT source.id, rows.value FROM fz AS source, "
+            "LATERAL jsonb_path_query(source.j, '$.items[*]') AS rows(value) "
+            "ORDER BY source.id, rows.value::text",
+            "SELECT source.id, item.ordinality, item.value FROM fz AS source, "
+            "LATERAL JSON_TABLE(source.j, '$.items[*]' COLUMNS ("
+            "ordinality FOR ORDINALITY, value integer PATH '$' NULL ON ERROR)) AS item "
+            "ORDER BY source.id, item.ordinality",
+        ])
+
     def order_by(self, tiebreak=True):
         # Always end with the unique `id` so ordering is total; LIMIT without
         # a total order is unspecified in SQL and its row set would differ by
@@ -354,19 +387,21 @@ class Gen:
     def statement(self):
         """A random SELECT: plain projection or an aggregate/GROUP BY."""
         r = self.rng.random()
-        if r < 0.08:
+        if r < 0.10:
+            return self.json_statement()
+        if r < 0.17:
             return self.array_statement()
-        if r < 0.14:
-            return self.join_statement()
-        if r < 0.19:
-            return self.correlated_subquery_statement()
         if r < 0.23:
-            return self.window_statement()
+            return self.join_statement()
         if r < 0.28:
+            return self.correlated_subquery_statement()
+        if r < 0.32:
+            return self.window_statement()
+        if r < 0.37:
             return self.array_scalar_statement()
-        if r < 0.34:
+        if r < 0.43:
             return self.row_srf_statement()
-        if r < 0.40:
+        if r < 0.49:
             return self.quantified_row_statement()
         if self.maybe(0.3):
             # Aggregate / GROUP BY form.
@@ -423,6 +458,9 @@ def main():
     ap.add_argument("--pg", type=int, required=True)
     ap.add_argument("--p3", type=int, required=True)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--database", default="postgres")
+    ap.add_argument("--pg-user", default="postgres")
+    ap.add_argument("--p3-user", default="postgres")
     ap.add_argument("--count", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-print", type=int, default=25)
@@ -434,9 +472,11 @@ def main():
     # client-side prepare would consume the server's bounded named-statement
     # pool instead of measuring SQL semantics; prepared protocol behavior has
     # dedicated wire and driver differentials.
-    pg = psycopg.connect(host=args.host, port=args.pg, user="postgres",
+    pg = psycopg.connect(host=args.host, port=args.pg, user=args.pg_user,
+                         dbname=args.database,
                          autocommit=True, sslmode="disable", prepare_threshold=None).cursor()
-    p3 = psycopg.connect(host=args.host, port=args.p3, user="postgres",
+    p3 = psycopg.connect(host=args.host, port=args.p3, user=args.p3_user,
+                         dbname=args.database,
                          autocommit=True, sslmode="disable", prepare_threshold=None).cursor()
 
     # Pin the session time zone so timestamptz rendering is deterministic and

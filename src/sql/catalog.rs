@@ -1046,14 +1046,188 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 2,
         volatility: "s",
     },
+    IntrinsicRoutine {
+        oid: 1177,
+        name: "jsonb_path_exists_tz",
+        result_oid: 16,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1179,
+        name: "jsonb_path_query_tz",
+        result_oid: 3802,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1180,
+        name: "jsonb_path_query_array_tz",
+        result_oid: 3802,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2023,
+        name: "jsonb_path_query_first_tz",
+        result_oid: 3802,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2030,
+        name: "jsonb_path_match_tz",
+        result_oid: 16,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3204,
+        name: "json_to_record",
+        result_oid: 2249,
+        argument_types: "114",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3205,
+        name: "json_to_recordset",
+        result_oid: 2249,
+        argument_types: "114",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3209,
+        name: "jsonb_populate_record",
+        result_oid: 2283,
+        argument_types: "2283 3802",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3475,
+        name: "jsonb_populate_recordset",
+        result_oid: 2283,
+        argument_types: "2283 3802",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3490,
+        name: "jsonb_to_record",
+        result_oid: 2249,
+        argument_types: "3802",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3491,
+        name: "jsonb_to_recordset",
+        result_oid: 2249,
+        argument_types: "3802",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3960,
+        name: "json_populate_record",
+        result_oid: 2283,
+        argument_types: "2283 114 16",
+        argument_count: 3,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3961,
+        name: "json_populate_recordset",
+        result_oid: 2283,
+        argument_types: "2283 114 16",
+        argument_count: 3,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 4005,
+        name: "jsonb_path_exists",
+        result_oid: 16,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 4006,
+        name: "jsonb_path_query",
+        result_oid: 3802,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 4007,
+        name: "jsonb_path_query_array",
+        result_oid: 3802,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 4008,
+        name: "jsonb_path_query_first",
+        result_oid: 3802,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 4009,
+        name: "jsonb_path_match",
+        result_oid: 16,
+        argument_types: "3802 4072 3802 16",
+        argument_count: 4,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 4010,
+        name: "jsonb_path_exists_opr",
+        result_oid: 16,
+        argument_types: "3802 4072",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 4011,
+        name: "jsonb_path_match_opr",
+        result_oid: 16,
+        argument_types: "3802 4072",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 6338,
+        name: "jsonb_populate_record_valid",
+        result_oid: 16,
+        argument_types: "2283 3802",
+        argument_count: 2,
+        volatility: "s",
+    },
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
-    !matches!(routine.oid, 1081 | 2078 | 3566 | 4568 | 6170 | 6232)
+    !matches!(
+        routine.oid,
+        1081 | 2078 | 3205 | 3209 | 3475 | 3491 | 3960 | 3961 | 6338 | 3566 | 4568 | 6170 | 6232
+    )
 }
 
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
-    matches!(routine.oid, 6119 | 4568 | 3566)
+    matches!(
+        routine.oid,
+        1179 | 3205 | 3475 | 3491 | 3961 | 4006 | 6119 | 4568 | 3566
+    )
 }
 
 fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
@@ -1193,6 +1367,18 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         name: "-",
         left: ColType::Int4,
         right: ColType::Int4,
+    },
+    CatalogOperator {
+        oid: 4012,
+        name: "@?",
+        left: ColType::Jsonb,
+        right: ColType::Jsonpath,
+    },
+    CatalogOperator {
+        oid: 4013,
+        name: "@@",
+        left: ColType::Jsonb,
+        right: ColType::Jsonpath,
     },
 ];
 
@@ -4261,9 +4447,10 @@ pub(crate) fn operator_oid_by_name(
             {
                 continue;
             }
-            // The modeled evaluator row is only one representative of each
-            // overloaded built-in name. A bare regoper must remain ambiguous.
-            if !signature || found.replace(operator.oid).is_some() {
+            // Most modeled evaluator rows are only one representative of an
+            // overloaded built-in name.  JSON path existence is PostgreSQL's
+            // sole built-in `@?`, so its bare regoper spelling is resolvable.
+            if (!signature && operator.name != "@?") || found.replace(operator.oid).is_some() {
                 return Err(ambiguous());
             }
         }
@@ -4333,6 +4520,12 @@ pub(crate) fn operator_name_by_oid<'a>(
         .find(|operator| operator.oid == oid)
     {
         if !signature {
+            if operator.name == "@?" {
+                return arena
+                    .alloc_str(operator.name)
+                    .map(Some)
+                    .map_err(|_| super::eval::arena_full());
+            }
             return arena
                 .alloc_str_display(format_args!("pg_catalog.{}", operator.name))
                 .map(Some)
@@ -12240,10 +12433,23 @@ fn pg_operator<'a>(
             ("oprjoin", ColType::Regproc),
         ],
     );
-    const OPCODES: [i32; 11] = [65, 66, 144, 147, 149, 150, 141, 154, 156, 177, 181];
-    const OPCODE_NAMES: [&str; 11] = [
-        "int4eq", "int4lt", "int4ne", "int4gt", "int4le", "int4ge", "int4mul", "int4div",
-        "int4mod", "int4pl", "int4mi",
+    const OPCODES: [i32; 13] = [
+        65, 66, 144, 147, 149, 150, 141, 154, 156, 177, 181, 4010, 4011,
+    ];
+    const OPCODE_NAMES: [&str; 13] = [
+        "int4eq",
+        "int4lt",
+        "int4ne",
+        "int4gt",
+        "int4le",
+        "int4ge",
+        "int4mul",
+        "int4div",
+        "int4mod",
+        "int4pl",
+        "int4mi",
+        "jsonb_path_exists_opr",
+        "jsonb_path_match_opr",
     ];
     let mut rows: [&[Datum]; 512] = [&[]; 512];
     for (index, operator) in CATALOG_OPERATORS.iter().enumerate() {
@@ -12259,7 +12465,7 @@ fn pg_operator<'a>(
                 Datum::Bool(index == 0),
                 Datum::Int4(operator.left.oid()),
                 Datum::Int4(operator.right.oid()),
-                Datum::Int4(if index < 6 {
+                Datum::Int4(if index < 6 || matches!(operator.oid, 4012 | 4013) {
                     ColType::Bool.oid()
                 } else {
                     ColType::Int4.oid()
@@ -13220,6 +13426,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(match routine.oid {
                     3577 | 3578 => 1,
                     3786 => 3,
+                    1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => 2,
+                    3960 | 3961 => 1,
                     _ => 0,
                 }),
                 Datum::Int4(if routine.oid == 6119 {
@@ -13260,6 +13468,10 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 match routine.oid {
                     3577 | 3578 => Datum::Text("false"),
                     3786 => Datum::Text("false false false"),
+                    1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
+                        Datum::Text("'{}'::jsonb false")
+                    }
+                    3960 | 3961 => Datum::Text("false"),
                     _ => Datum::Null,
                 },
                 Datum::Null,
@@ -14204,6 +14416,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Interval,
         ColType::Json,
         ColType::Jsonb,
+        ColType::Jsonpath,
         ColType::TsVector,
         ColType::TsQuery,
         ColType::Uuid,
@@ -14253,7 +14466,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::Uuid
         | ColType::Bytea
         | ColType::TsVector
-        | ColType::TsQuery => "U",
+        | ColType::TsQuery
+        | ColType::Jsonpath => "U",
         ColType::PgNodeTree
         | ColType::PgNdistinct
         | ColType::PgDependencies

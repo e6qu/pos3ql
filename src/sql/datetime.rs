@@ -1007,7 +1007,7 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
             (rest, 0, false)
         };
 
-    let mut it = time_part.splitn(3, ':');
+    let mut it = time_part.trim().splitn(3, ':');
     let h: i64 = it.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
     let m: i64 = it.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
     let (sec, micros) = match it.next() {
@@ -1082,9 +1082,11 @@ fn parse_time_parts(s: &str, type_name: &str) -> Result<(i64, Option<i32>), SqlE
         (stripped, Some(0))
     } else if let Some((head, name)) = t.rsplit_once(' ') {
         let name = name.trim();
+        if matches!(name.as_bytes().first(), Some(b'+' | b'-')) {
+            (head, Some(parse_zone_offset(name).ok_or_else(bad)?))
         // `UTC`/`GMT` are the zone names PostgreSQL accepts here that are not
         // in the region table; anything else goes through the usual lookup.
-        if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
+        } else if name.eq_ignore_ascii_case("utc") || name.eq_ignore_ascii_case("gmt") {
             (head, Some(0))
         } else {
             match super::timezone::lookup(name) {

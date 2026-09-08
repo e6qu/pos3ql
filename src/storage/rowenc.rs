@@ -49,6 +49,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Macaddr8(_) => 8,
             Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
             Datum::Json { text, .. }
+            | Datum::JsonPath(text)
             | Datum::Range { text, .. }
             | Datum::Multirange { text, .. }
             | Datum::Geometry { text, .. } => 4 + text.len(),
@@ -165,6 +166,7 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 take = 4 + s.len();
             }
             Datum::Json { text, .. }
+            | Datum::JsonPath(text)
             | Datum::Range { text, .. }
             | Datum::Multirange { text, .. }
             | Datum::Geometry { text, .. } => {
@@ -335,6 +337,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Bpchar
         | ColType::Json
         | ColType::Jsonb
+        | ColType::Jsonpath
         | ColType::TsVector
         | ColType::TsQuery
         | ColType::Range(_)
@@ -632,6 +635,14 @@ pub(crate) fn decode<'a>(
                     text: s,
                     jsonb: matches!(schema[i], ColType::Jsonb),
                 };
+            }
+            ColType::Jsonpath => {
+                let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                at += 4;
+                let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
+                at += len;
+                out[i] = Datum::JsonPath(core::str::from_utf8(raw).map_err(|_| corrupt())?);
             }
             ColType::TsVector | ColType::TsQuery => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;

@@ -473,7 +473,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(storage, tref, m, txid, arena, true);
         }
         if tref.is_function_source() {
-            return self.add_table_func(storage, tref, txid, arena, params, true, outer);
+            return self.add_table_func(storage, tref, txid, arena, params, sequences, true, outer);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -670,7 +670,7 @@ impl<'d> QueryScope<'d> {
             return self.add_materialized(storage, tref, m, txid, arena, false);
         }
         if tref.is_function_source() {
-            return self.add_table_func(storage, tref, txid, arena, &[], false, None);
+            return self.add_table_func(storage, tref, txid, arena, &[], None, false, None);
         }
         let Some(sub) = tref.subquery else {
             if matches!(
@@ -893,6 +893,7 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
+        sequences: Option<&dyn SequenceAccess>,
         materialize: bool,
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<(), SqlError>
@@ -934,11 +935,23 @@ impl<'d> QueryScope<'d> {
             self.n += 1;
             return Ok(());
         }
+        let hooks = crate::sql::eval::EvalHooks {
+            sequences,
+            ..crate::sql::eval::NO_HOOKS
+        };
         let rows: &'a [&'a [u8]] = if !materialize {
             &[]
         } else if outer.is_some() {
             table_func_rows_outer(
-                tref, storage, txid, arena, params, &columns, None, None, None,
+                tref,
+                storage,
+                txid,
+                arena,
+                params,
+                &columns,
+                Some(&hooks),
+                None,
+                None,
             )?
         } else {
             table_func_rows_outer(
@@ -948,7 +961,7 @@ impl<'d> QueryScope<'d> {
                 arena,
                 params,
                 &crate::sql::eval::NoColumns,
-                None,
+                Some(&hooks),
                 None,
                 None,
             )?

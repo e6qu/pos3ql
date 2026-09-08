@@ -16,8 +16,9 @@ use crate::sql::types::ColType;
 use super::{
     SqlError, arena_full, as_f64, as_i64, bad_text, cast_to_text, concat, datum_f64, datum_numeric,
     division_by_zero, interval_cmp_value, json_exists, json_get, json_path, jsonb_concat,
-    jsonb_delete, jsonb_delete_path, like_match, num_factor, out_of_range, overflow, parse_bool,
-    parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of, validate_bits,
+    jsonb_delete, jsonb_delete_path, jsonpath_operator, like_match, num_factor, out_of_range,
+    overflow, parse_bool, parse_uuid, sqlstate, to_numeric, type_mismatch, type_name_of,
+    validate_bits,
 };
 
 /// Text comparison is a distinct choke point because byte ordering is correct
@@ -697,6 +698,7 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[26])
         }
         Datum::Json { jsonb: false, .. } => hasher.write(&[27]),
+        Datum::JsonPath(_) => hasher.write(&[42]),
         // Network addresses hash by their comparison key (family, address,
         // mask), so equal values hash equal and distinct ones rarely collide.
         Datum::Inet(net) | Datum::Cidr(net) => {
@@ -1945,6 +1947,9 @@ pub(crate) fn binary<'a>(
             if l.is_null() || r.is_null() {
                 return Ok(Datum::Null);
             }
+            if matches!(l, Datum::Json { jsonb: true, .. }) {
+                return jsonpath_operator(l, r, true, arena);
+            }
             let (vector, query) = match (l, r) {
                 (Datum::TsVector(vector), Datum::TsQuery(query))
                 | (Datum::TsQuery(query), Datum::TsVector(vector)) => {
@@ -2019,6 +2024,7 @@ pub(crate) fn binary<'a>(
         JsonPath | JsonPathText => json_path(l, r, operator == JsonPathText, arena),
         JsonDeletePath => jsonb_delete_path(l, r, arena),
         JsonExists | JsonExistsAny | JsonExistsAll => json_exists(operator, l, r, arena),
+        JsonPathExists => jsonpath_operator(l, r, false, arena),
         Shl | Shr if is_network(&l) || is_network(&r) => network_op(operator, l, r),
         Shl | Shr => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r, arena),

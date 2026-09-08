@@ -9882,6 +9882,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Timetz(..)) => 12,
         Some(OwnedDatum::Interval(_)) | Some(OwnedDatum::Uuid(_)) => 16,
         Some(OwnedDatum::Text { len, .. }) => 1 + *len as usize,
+        Some(OwnedDatum::JsonPath { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Geometry { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::TextSearch { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Numeric { nbytes, .. }) => 6 + *nbytes as usize,
@@ -10081,6 +10082,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         }
         Some(OwnedDatum::Text { len, bytes }) => {
             out[0] = 6;
+            out[1] = *len;
+            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + *len as usize
+        }
+        Some(OwnedDatum::JsonPath { len, bytes }) => {
+            out[0] = 34;
             out[1] = *len;
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
@@ -10396,6 +10403,16 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             core::str::from_utf8(&bytes[..len]).ok()?;
             Some(OwnedDatum::Json {
                 jsonb,
+                len: len as u8,
+                bytes,
+            })
+        }
+        34 => {
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            core::str::from_utf8(&bytes[..len]).ok()?;
+            Some(OwnedDatum::JsonPath {
                 len: len as u8,
                 bytes,
             })

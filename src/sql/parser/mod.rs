@@ -2641,66 +2641,69 @@ impl<'a> Parser<'a> {
         // immediately after the (possibly schema-qualified) name.
         let mut func_argument_names: &'a [Option<&'a str>] = &[];
         let mut func_variadic = false;
-        let func_args = if self.peeked == Tok::Op("(") {
-            self.advance()?;
-            let mut args: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
-            let mut names = [None; MAX_LIST];
-            let mut n = 0;
-            let mut saw_named = false;
-            if self.peeked != Tok::Op(")") {
-                loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("function arguments", MAX_LIST));
-                    }
-                    let this_variadic = self.eat_ident("variadic")?;
-                    if this_variadic && saw_named {
-                        return Err(self.err_here("VARIADIC argument cannot use named notation"));
-                    }
-                    let first = self.expression(0)?;
-                    if self.eat_op("=>")? {
-                        names[n] = Some(match first {
-                            Expr::Column {
-                                qualifier: None,
-                                name,
-                            } => *name,
-                            _ => {
-                                return Err(
-                                    self.err_here("routine argument name must be an identifier")
-                                );
-                            }
-                        });
-                        args[n] = self.expression(0)?;
-                        saw_named = true;
-                    } else {
-                        if saw_named {
+        let mut func_args =
+            if table.eq_ignore_ascii_case("json_table") && self.peeked == Tok::Op("(") {
+                Some(self.json_table_arguments()?)
+            } else if self.peeked == Tok::Op("(") {
+                self.advance()?;
+                let mut args: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
+                let mut names = [None; MAX_LIST];
+                let mut n = 0;
+                let mut saw_named = false;
+                if self.peeked != Tok::Op(")") {
+                    loop {
+                        if n == MAX_LIST {
+                            return Err(self.limit("function arguments", MAX_LIST));
+                        }
+                        let this_variadic = self.eat_ident("variadic")?;
+                        if this_variadic && saw_named {
                             return Err(
-                                self.err_here("positional argument cannot follow named argument")
+                                self.err_here("VARIADIC argument cannot use named notation")
                             );
                         }
-                        args[n] = first;
-                    }
-                    if this_variadic {
-                        func_variadic = true;
-                        n += 1;
-                        if self.peeked != Tok::Op(")") {
-                            return Err(self.err_here("VARIADIC argument must be last"));
+                        let first = self.expression(0)?;
+                        if self.eat_op("=>")? {
+                            names[n] = Some(match first {
+                                Expr::Column {
+                                    qualifier: None,
+                                    name,
+                                } => *name,
+                                _ => {
+                                    return Err(self
+                                        .err_here("routine argument name must be an identifier"));
+                                }
+                            });
+                            args[n] = self.expression(0)?;
+                            saw_named = true;
+                        } else {
+                            if saw_named {
+                                return Err(self
+                                    .err_here("positional argument cannot follow named argument"));
+                            }
+                            args[n] = first;
                         }
-                        break;
-                    }
-                    n += 1;
-                    if !self.eat_op(",")? {
-                        break;
+                        if this_variadic {
+                            func_variadic = true;
+                            n += 1;
+                            if self.peeked != Tok::Op(")") {
+                                return Err(self.err_here("VARIADIC argument must be last"));
+                            }
+                            break;
+                        }
+                        n += 1;
+                        if !self.eat_op(",")? {
+                            break;
+                        }
                     }
                 }
-            }
-            self.expect_op(")")?;
-            if saw_named {
-                func_argument_names = self.arena_slice(&names[..n])?;
-            }
-            Some(self.arena_slice(&args[..n])?)
-        } else {
-            None
-        };
+                self.expect_op(")")?;
+                if saw_named {
+                    func_argument_names = self.arena_slice(&names[..n])?;
+                }
+                Some(self.arena_slice(&args[..n])?)
+            } else {
+                None
+            };
         if func_args.is_some() && inheritance == RelationInheritance::Only {
             return Err(self.err_here("ONLY requires a relation, not a function call"));
         }
@@ -2714,8 +2717,16 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
+        let json_to_record = matches!(
+            table,
+            "json_to_record" | "jsonb_to_record" | "json_to_recordset" | "jsonb_to_recordset"
+        ) && func_args.is_some();
         let alias = if self.eat_ident("as")? {
-            Some(self.col_ident("alias")?)
+            if json_to_record && self.peeked == Tok::Op("(") {
+                None
+            } else {
+                Some(self.col_ident("alias")?)
+            }
         } else if let Tok::Ident(word) = self.peeked {
             if is_column_name_keyword(word) {
                 None
@@ -2726,7 +2737,14 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let col_alias = self.column_alias_list()?;
+        let col_alias = if json_to_record && self.peeked == Tok::Op("(") {
+            func_args = Some(self.json_record_column_definitions(
+                func_args.expect("record function has arguments"),
+            )?);
+            None
+        } else {
+            self.column_alias_list()?
+        };
         let sample = if func_args.is_none() && self.eat_ident("tablesample")? {
             Some(self.table_sample()?)
         } else {
@@ -2750,6 +2768,292 @@ impl<'a> Parser<'a> {
             authorization_role: None,
             view_access: None,
         })
+    }
+
+    /// Parses `JSON_TABLE` into an ordinary bounded table-function source.
+    /// The synthetic expression nodes retain its recursive column grammar so
+    /// description and execution consume the same validated representation.
+    fn json_table_arguments(&mut self) -> Result<&'a [&'a Expr<'a>], ParseError> {
+        self.expect_op("(")?;
+        let context = self.expression(0)?;
+        self.expect_op(",")?;
+        let path = self.expression(0)?;
+        let path_name = if self.eat_ident("as")? {
+            let name = self.any_ident("JSON path name")?;
+            self.arena_expr(Expr::Str(name))?
+        } else {
+            self.arena_expr(Expr::Null)?
+        };
+        let passing = if self.eat_ident("passing")? {
+            let null = self.arena_expr(Expr::Null)?;
+            let mut pairs = [null; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count + 2 > pairs.len() {
+                    return Err(self.limit("JSON_TABLE passing arguments", pairs.len() / 2));
+                }
+                pairs[count] = self.expression(0)?;
+                self.expect_ident("as")?;
+                let name = self.any_ident("JSON path variable name")?;
+                pairs[count + 1] = self.arena_expr(Expr::Str(name))?;
+                count += 2;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.plain_call("__json_table_passing", &pairs[..count])?
+        } else {
+            self.plain_call("__json_table_passing", &[])?
+        };
+        self.expect_ident("columns")?;
+        let columns = self.json_table_columns(0)?;
+        let on_error = if self.eat_ident("error")? {
+            self.expect_ident("on")?;
+            self.expect_ident("error")?;
+            "error"
+        } else if self.eat_ident("empty")? {
+            self.eat_ident("array")?;
+            self.expect_ident("on")?;
+            self.expect_ident("error")?;
+            "empty"
+        } else {
+            "empty"
+        };
+        self.expect_op(")")?;
+        let behavior = self.arena_expr(Expr::Str(on_error))?;
+        self.arena_slice(&[context, path, path_name, passing, columns, behavior])
+    }
+
+    fn json_record_column_definitions(
+        &mut self,
+        function_args: &'a [&'a Expr<'a>],
+    ) -> Result<&'a [&'a Expr<'a>], ParseError> {
+        if function_args.len() != 1 {
+            return Err(self.err_here("JSON record conversion takes one JSON argument"));
+        }
+        self.expect_op("(")?;
+        let null = self.arena_expr(Expr::Null)?;
+        let mut definitions = [null; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == definitions.len() {
+                return Err(self.limit("record column definitions", definitions.len()));
+            }
+            let name = self.col_ident("record column name")?;
+            let (type_name, type_mod) = self.type_name_mod()?;
+            let name = self.arena_expr(Expr::Str(name))?;
+            let type_name = self.arena_expr(Expr::Str(type_name))?;
+            let type_mod = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
+            definitions[count] =
+                self.plain_call("__json_record_column", &[name, type_name, type_mod])?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        let definitions = self.plain_call("__json_record_columns", &definitions[..count])?;
+        self.arena_slice(&[function_args[0], definitions])
+    }
+
+    fn json_table_columns(&mut self, depth: u16) -> Result<&'a Expr<'a>, ParseError> {
+        if depth >= 64 {
+            return Err(self.err_here("JSON_TABLE columns are nested too deeply"));
+        }
+        self.expect_op("(")?;
+        let null = self.arena_expr(Expr::Null)?;
+        let mut columns = [null; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == columns.len() {
+                return Err(self.limit("JSON_TABLE columns", columns.len()));
+            }
+            columns[count] = self.json_table_column(depth)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        self.plain_call("__json_table_columns", &columns[..count])
+    }
+
+    fn json_table_column(&mut self, depth: u16) -> Result<&'a Expr<'a>, ParseError> {
+        if self.eat_ident("nested")? {
+            self.eat_ident("path")?;
+            let path = self.json_table_path()?;
+            let path_name = if self.eat_ident("as")? {
+                let name = self.any_ident("JSON path name")?;
+                self.arena_expr(Expr::Str(name))?
+            } else {
+                self.arena_expr(Expr::Null)?
+            };
+            self.expect_ident("columns")?;
+            let columns = self.json_table_columns(depth + 1)?;
+            return self.plain_call("__json_table_nested", &[path, path_name, columns]);
+        }
+
+        let name = self.col_ident("JSON_TABLE column name")?;
+        let name_expr = self.arena_expr(Expr::Str(name))?;
+        if self.eat_ident("for")? {
+            self.expect_ident("ordinality")?;
+            return self.plain_call("__json_table_ordinality", &[name_expr]);
+        }
+
+        let (type_name, type_mod) = self.type_name_mod()?;
+        let type_expr = self.arena_expr(Expr::Str(type_name))?;
+        let type_mod_expr = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
+        if self.eat_ident("exists")? {
+            let path = if self.eat_ident("path")? {
+                self.json_table_path()?
+            } else {
+                self.json_table_default_path(name)?
+            };
+            let behavior = if self.eat_ident("error")? {
+                "error"
+            } else if self.eat_ident("true")? {
+                "true"
+            } else if self.eat_ident("unknown")? {
+                "unknown"
+            } else {
+                let _ = self.eat_ident("false")?;
+                "false"
+            };
+            if behavior != "false" || self.peeked == Tok::Ident("on") {
+                self.expect_ident("on")?;
+                self.expect_ident("error")?;
+            }
+            let behavior = self.arena_expr(Expr::Str(behavior))?;
+            return self.plain_call(
+                "__json_table_exists",
+                &[name_expr, type_expr, type_mod_expr, path, behavior],
+            );
+        }
+
+        let format_json = if self.eat_ident("format")? {
+            self.expect_ident("json")?;
+            if self.eat_ident("encoding")? {
+                self.expect_ident("utf8")?;
+            }
+            true
+        } else {
+            false
+        };
+        let path = if self.eat_ident("path")? {
+            self.json_table_path()?
+        } else {
+            self.json_table_default_path(name)?
+        };
+        let wrapper = if self.eat_ident("without")? {
+            self.eat_ident("array")?;
+            self.expect_ident("wrapper")?;
+            "without"
+        } else if self.eat_ident("with")? {
+            let kind = if self.eat_ident("conditional")? {
+                "conditional"
+            } else {
+                self.eat_ident("unconditional")?;
+                "unconditional"
+            };
+            self.eat_ident("array")?;
+            self.expect_ident("wrapper")?;
+            kind
+        } else {
+            "without"
+        };
+        let quotes = if self.eat_ident("omit")? {
+            self.expect_ident("quotes")?;
+            if self.eat_ident("on")? {
+                self.expect_ident("scalar")?;
+                self.expect_ident("string")?;
+            }
+            "omit"
+        } else if self.eat_ident("keep")? {
+            self.expect_ident("quotes")?;
+            if self.eat_ident("on")? {
+                self.expect_ident("scalar")?;
+                self.expect_ident("string")?;
+            }
+            "keep"
+        } else {
+            "keep"
+        };
+        let mut empty_code = "null";
+        let mut error_code = "null";
+        let null = self.arena_expr(Expr::Null)?;
+        let mut empty_default = null;
+        let mut error_default = empty_default;
+        for _ in 0..2 {
+            let (code, default) = if self.eat_ident("default")? {
+                ("default", self.expression(0)?)
+            } else if self.eat_ident("empty")? {
+                if self.eat_ident("object")? {
+                    ("object", null)
+                } else {
+                    self.eat_ident("array")?;
+                    ("array", null)
+                }
+            } else if self.eat_ident("error")? {
+                ("error", null)
+            } else if self.eat_ident("null")? {
+                ("null", null)
+            } else {
+                break;
+            };
+            self.expect_ident("on")?;
+            if self.eat_ident("empty")? {
+                empty_code = code;
+                empty_default = default;
+            } else {
+                self.expect_ident("error")?;
+                error_code = code;
+                error_default = default;
+            }
+        }
+        let format = self.arena_expr(Expr::Str(if format_json { "json" } else { "value" }))?;
+        let wrapper = self.arena_expr(Expr::Str(wrapper))?;
+        let quotes = self.arena_expr(Expr::Str(quotes))?;
+        let empty_code = self.arena_expr(Expr::Str(empty_code))?;
+        let error_code = self.arena_expr(Expr::Str(error_code))?;
+        self.plain_call(
+            "__json_table_value",
+            &[
+                name_expr,
+                type_expr,
+                type_mod_expr,
+                path,
+                format,
+                wrapper,
+                quotes,
+                empty_default,
+                error_default,
+                empty_code,
+                error_code,
+            ],
+        )
+    }
+
+    fn json_table_default_path(&self, name: &str) -> Result<&'a Expr<'a>, ParseError> {
+        use core::fmt::Write as _;
+        let mut path = StackStr::<512>::new();
+        path.write_str("$.")
+            .map_err(|_| self.err_here("JSON path too long"))?;
+        super::json::write_json_raw_string(name, &mut path)
+            .map_err(|_| self.err_here("JSON path too long"))?;
+        if path.is_truncated() {
+            return Err(self.err_here("JSON path too long"));
+        }
+        let path = self.arena_str(path.as_str())?;
+        self.arena_expr(Expr::Str(path))
+    }
+
+    fn json_table_path(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let path = self.expression(0)?;
+        if !matches!(path, Expr::Str(_)) {
+            return Err(self
+                .err_here("only string constants are supported in JSON_TABLE path specification"));
+        }
+        Ok(path)
     }
 
     fn table_sample(&mut self) -> Result<TableSample<'a>, ParseError> {
@@ -6286,6 +6590,8 @@ impl<'a> Parser<'a> {
         loop {
             let mut names = [""; MAX_LIST];
             let mut name_count = 0usize;
+            let mut subscript_count = 0usize;
+            let mut subscripts = [null; MAX_LIST];
             if self.eat_op("(")? {
                 loop {
                     if name_count == MAX_LIST {
@@ -6301,12 +6607,51 @@ impl<'a> Parser<'a> {
             } else {
                 names[0] = self.col_ident("column name")?;
                 name_count = 1;
+                while self.eat_op("[")? {
+                    if subscript_count == MAX_LIST - 2 {
+                        return Err(self.limit("jsonb assignment subscripts", MAX_LIST - 2));
+                    }
+                    subscripts[subscript_count] = self.expression(0)?;
+                    subscript_count += 1;
+                    self.expect_op("]")?;
+                }
             }
             self.expect_op("=")?;
 
             let mut values = [null; MAX_LIST];
             let value_count = if name_count == 1 {
                 values[0] = self.expression(0)?;
+                if subscript_count != 0 {
+                    let base = assignments[..assigned]
+                        .iter()
+                        .find_map(|(previous, value)| {
+                            (*previous == names[0]
+                                && matches!(
+                                    **value,
+                                    Expr::Call {
+                                        name: "__jsonb_subscript_set",
+                                        ..
+                                    }
+                                ))
+                            .then_some(*value)
+                        })
+                        .map_or_else(
+                            || {
+                                self.arena_expr(Expr::Column {
+                                    qualifier: None,
+                                    name: names[0],
+                                })
+                            },
+                            Ok,
+                        )?;
+                    let mut call_args = [null; MAX_LIST];
+                    call_args[0] = base;
+                    call_args[1] = values[0];
+                    call_args[2..2 + subscript_count]
+                        .copy_from_slice(&subscripts[..subscript_count]);
+                    values[0] = self
+                        .plain_call("__jsonb_subscript_set", &call_args[..2 + subscript_count])?;
+                }
                 1
             } else if self.eat_ident("row")? {
                 self.expect_op("(")?;
@@ -6348,10 +6693,22 @@ impl<'a> Parser<'a> {
                 });
             }
             for (name, value) in names[..name_count].iter().zip(&values[..value_count]) {
-                if assignments[..assigned]
+                if let Some(previous) = assignments[..assigned]
                     .iter()
-                    .any(|(previous, _)| *previous == *name)
+                    .position(|(previous, _)| *previous == *name)
                 {
+                    if subscript_count != 0
+                        && matches!(
+                            *assignments[previous].1,
+                            Expr::Call {
+                                name: "__jsonb_subscript_set",
+                                ..
+                            }
+                        )
+                    {
+                        assignments[previous].1 = value;
+                        continue;
+                    }
                     return Err(self.err_here("multiple assignments to the same column"));
                 }
                 if assigned == MAX_LIST {

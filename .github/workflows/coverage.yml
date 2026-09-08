@@ -161,6 +161,7 @@ jobs:
           POS3QL_PSQL: ${{ github.workspace }}/.ci-bin/psql
           POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT: "15496"
           POS3QL_EXTERNAL_SUBSCRIBER_PORT: "15564"
+          POS3QL_EXTERNAL_SUBSCRIBER_CONTAINER: pos3ql-subscription-subscriber
           COVERAGE_SHARD: runtest:subscription
         run: sh tools/coverage.sh
 

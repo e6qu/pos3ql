@@ -44,7 +44,7 @@ impl RelationBinding {
         &self.remote_to_local[..self.column_count]
     }
 
-    pub fn old_remote_to_local(&self, identity: ReplicaIdentity) -> &[usize] {
+    pub fn identity_local_columns(&self, identity: ReplicaIdentity) -> &[usize] {
         match identity {
             ReplicaIdentity::Key => &self.key_remote_to_local[..self.key_count],
             ReplicaIdentity::Old => self.remote_to_local(),

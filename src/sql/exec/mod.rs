@@ -49748,14 +49748,32 @@ fn decode_replication_old_tuple<'a>(
     old: OldTuple<'a>,
     arena: &'a Arena,
 ) -> Result<[Datum<'a>; MAX_COLUMNS], SqlError> {
+    if old.tuple.columns().len() != binding.remote_to_local().len() {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription old tuple has {} columns, relation has {}",
+            old.tuple.columns().len(),
+            binding.remote_to_local().len()
+        ));
+    }
+    let identity_columns = binding.identity_local_columns(old.identity);
+    for (remote, field) in old.tuple.columns().iter().enumerate() {
+        let local = binding.remote_to_local()[remote];
+        if identity_columns.contains(&local) && matches!(field, TupleColumn::UnchangedToast) {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription old tuple omits a replica identity value"
+            ));
+        }
+    }
     decode_replication_tuple_for_columns(
         storage,
         txn,
         binding.table_slot(),
-        binding.old_remote_to_local(old.identity),
+        binding.remote_to_local(),
         old.tuple,
         arena,
-        false,
+        true,
     )
 }
 
@@ -49800,7 +49818,7 @@ pub fn locate_replication_row(
         txn,
         binding,
         &expected,
-        binding.old_remote_to_local(old.identity),
+        binding.identity_local_columns(old.identity),
         arena,
     )
 }
@@ -49904,7 +49922,31 @@ pub fn apply_replication_delete(
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply delete waits for its row"),
     }
     let definition = *storage.table_def(table_index, txn.txid);
-    let old_values = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
+    let state = storage.row_state(row_table, row.rowid())?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription replica identity disappeared before delete"
+        )
+    })?;
+    let home = storage
+        .visible_row_home(row_table, row.rowid(), state, txn.txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription replica identity is no longer visible before delete"
+            )
+        })?;
+    let bytes = storage.row_bytes(row_table, row.rowid(), home, arena)?;
+    let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "subscription delete row exceeds the apply arena"
+        )
+    })?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let mut old_values = [Datum::Null; MAX_COLUMNS];
+    rowenc::decode(bytes, &schema[..definition.n_columns], &mut old_values)?;
     if !fire_partition_row_triggers(
         storage,
         txn,

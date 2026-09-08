@@ -268,15 +268,15 @@ mod tests {
         update(
             &mut frame,
             7,
-            &[Datum::Int4(1)],
-            &[Datum::Int4(2)],
+            &[Datum::Int4(1), Datum::Text("old")],
+            &[Datum::Int4(2), Datum::Text("new")],
             true,
             ReplicaIdentity::Index,
         );
         delete(
             &mut frame,
             7,
-            &[Datum::Int4(2)],
+            &[Datum::Int4(2), Datum::Text("new")],
             true,
             ReplicaIdentity::Full,
         );
@@ -284,10 +284,10 @@ mod tests {
         let bytes = buffer.readable();
         assert_eq!(bytes[5], b'U');
         assert_eq!(bytes[10], b'K');
-        assert_eq!(&bytes[11..13], &[0, 1]);
-        assert_eq!(bytes[34], b'D');
-        assert_eq!(bytes[39], b'O');
-        assert_eq!(&bytes[40..42], &[0, 1]);
+        assert_eq!(&bytes[11..13], &[0, 2]);
+        let delete_at = bytes.iter().rposition(|byte| *byte == b'D').unwrap();
+        assert_eq!(bytes[delete_at + 5], b'O');
+        assert_eq!(&bytes[delete_at + 6..delete_at + 8], &[0, 2]);
     }
 
     #[test]

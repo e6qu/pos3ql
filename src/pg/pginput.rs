@@ -33,10 +33,10 @@ pub struct Tuple<'a> {
     count: usize,
 }
 
-/// Which publisher row image accompanies an UPDATE or DELETE.  `Key` carries
-/// exactly the relation columns marked as replica-identity keys; `Old` carries
-/// every relation column.  Keeping this distinction at the parse boundary
-/// prevents an apply caller from guessing how a short tuple is mapped.
+/// Which publisher row image accompanies an UPDATE or DELETE. Both tuple
+/// shapes follow the published Relation projection; `Key` restricts row
+/// identity to the columns flagged as keys while `Old` identifies by all of
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplicaIdentity {
     Key,
@@ -655,8 +655,8 @@ mod tests {
     #[test]
     fn old_tuple_kind_preserves_key_vs_full_row_mapping() {
         let plugin = [
-            b'U', 0, 0, 0, 7, b'K', 0, 1, b't', 0, 0, 0, 1, b'1', b'N', 0, 2, b't', 0, 0, 0, 1,
-            b'1', b'u',
+            b'U', 0, 0, 0, 7, b'K', 0, 2, b't', 0, 0, 0, 1, b'1', b't', 0, 0, 0, 3, b'o', b'l',
+            b'd', b'N', 0, 2, b't', 0, 0, 0, 1, b'1', b'u',
         ];
         let bytes = xlog(&plugin);
         let CopyData::XLogData {
@@ -674,7 +674,10 @@ mod tests {
         };
         assert_eq!(relation_id, 7);
         assert_eq!(old.identity, ReplicaIdentity::Key);
-        assert_eq!(old.tuple.columns(), [TupleColumn::Text(b"1")]);
+        assert_eq!(
+            old.tuple.columns(),
+            [TupleColumn::Text(b"1"), TupleColumn::Text(b"old")]
+        );
         assert_eq!(
             new.columns(),
             [TupleColumn::Text(b"1"), TupleColumn::UnchangedToast]

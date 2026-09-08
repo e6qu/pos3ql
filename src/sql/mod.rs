@@ -3719,7 +3719,9 @@ impl Engine {
                                             let (old_projected, old_count) =
                                                 project_replication_values(
                                                     &old_values[..column_count],
-                                                    replica_identity.key_mask,
+                                                    // Tuple width follows Relation; its key flags
+                                                    // select identity columns on the subscriber.
+                                                    column_mask,
                                                 );
                                             let (projected, projected_count) =
                                                 project_replication_values(
@@ -3887,7 +3889,9 @@ impl Engine {
                                         let (projected, projected_count) =
                                             project_replication_values(
                                                 &values[..column_count],
-                                                replica_identity.key_mask,
+                                                // K still carries the Relation projection; the
+                                                // relation flags identify its key fields.
+                                                column_mask,
                                             );
                                         pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
                                             pgoutput::delete(

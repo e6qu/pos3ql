@@ -47062,7 +47062,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     begin[8] = 100;
     begin[20] = 3;
     receive(&mut apply, &mut engine, 100, &begin);
-    let delete = [b'D', 0, 0, 0, 1, b'K', 0, 1, b't', 0, 0, 0, 1, b'1'];
+    let delete = [b'D', 0, 0, 0, 1, b'K', 0, 2, b't', 0, 0, 0, 1, b'1', b'u'];
     receive(&mut apply, &mut engine, 100, &delete);
     commit[9] = 100;
     commit[17] = 101;
@@ -47599,7 +47599,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     let mut update = vec![b'U'];
     update.extend_from_slice(&7_u32.to_be_bytes());
     update.push(b'K');
-    update.extend_from_slice(&tuple(&[b"1"]));
+    update.extend_from_slice(&tuple(&[b"1", b"first"]));
     update.push(b'N');
     update.extend_from_slice(&tuple(&[b"11", b"moved"]));
     receive(&mut apply, &mut engine, 80, &update);
@@ -47625,7 +47625,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     let mut delete = vec![b'D'];
     delete.extend_from_slice(&7_u32.to_be_bytes());
     delete.push(b'K');
-    delete.extend_from_slice(&tuple(&[b"11"]));
+    delete.extend_from_slice(&tuple(&[b"11", b"moved"]));
     receive(&mut apply, &mut engine, 100, &delete);
     receive(&mut apply, &mut engine, 101, &commit(100, 101));
     assert!(

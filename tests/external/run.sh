@@ -1109,6 +1109,13 @@ else
 fi
 if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
   PG_SUBSCRIBER_PSQL="$SUB_PGBIN/psql"
+  postgresql_subscriber_log() {
+    if [[ -n "${POS3QL_EXTERNAL_SUBSCRIBER_CONTAINER:-}" ]]; then
+      docker logs "$POS3QL_EXTERNAL_SUBSCRIBER_CONTAINER" 2>&1 | tail -80
+    else
+      tail -80 "$WORK/postgresql-subscriber.log"
+    fi
+  }
   for _ in {1..50}; do
     "$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -q \
       -c "SELECT 1" >/dev/null 2>&1 && break
@@ -1127,7 +1134,7 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
     >"$WORK/postgresql-subscriber-create.out" 2>&1; then
     bad "real PostgreSQL subscription creation"
     cat "$WORK/postgresql-subscriber-create.out"
-    tail -80 "$WORK/postgresql-subscriber.log"
+    postgresql_subscriber_log
     tail -80 "$WORK/subscription-pos3ql.log"
   else
     postgresql_subscription_rows() {
@@ -1159,14 +1166,14 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
       ok "PostgreSQL 18 subscriber imports a filtered projected pos3ql snapshot"
     else
       bad "PostgreSQL 18 subscriber initial copy (got $(postgresql_subscription_rows))"
-      tail -80 "$WORK/postgresql-subscriber.log"
+      postgresql_subscriber_log
       tail -80 "$WORK/subscription-pos3ql.log"
     fi
     if postgresql_subscription_ready; then
       ok "PostgreSQL 18 subscriber completes tablesync lifecycle"
     else
       bad "PostgreSQL 18 subscriber tablesync lifecycle"
-      tail -80 "$WORK/postgresql-subscriber.log"
+      postgresql_subscriber_log
       tail -80 "$WORK/subscription-pos3ql.log"
     fi
     if ! "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
@@ -1178,7 +1185,7 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
       ok "PostgreSQL 18 subscriber applies pos3ql inserts, updates, deletes, and row filters"
     else
       bad "PostgreSQL 18 subscriber steady stream (got $(postgresql_subscription_rows))"
-      tail -80 "$WORK/postgresql-subscriber.log"
+      postgresql_subscriber_log
       tail -80 "$WORK/subscription-pos3ql.log"
     fi
     PG_RECVLOGICAL="$SUB_PGBIN/pg_recvlogical"
@@ -1193,9 +1200,9 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
       cat "$WORK/pg-recvlogical-create.out"
     else
       "$PG_RECVLOGICAL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres \
-        -d postgres -S "$RECVLOGICAL_SLOT" --start --no-loop -f "$RECVLOGICAL_OUTPUT" \
+        -d postgres -S "$RECVLOGICAL_SLOT" --start --no-loop -f - \
         -o proto_version=4 -o publication_names=postgresql_subscriber_pub \
-        >"$WORK/pg-recvlogical.log" 2>&1 &
+        >"$RECVLOGICAL_OUTPUT" 2>"$WORK/pg-recvlogical.log" &
       RECVLOGICAL_PID=$!
       sleep 0.2
       "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
@@ -1235,7 +1242,7 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
       ok "PostgreSQL 18 subscriber applies a pos3ql truncate"
     else
       bad "PostgreSQL 18 subscriber truncate (got $(postgresql_subscription_rows))"
-      tail -80 "$WORK/postgresql-subscriber.log"
+      postgresql_subscriber_log
       tail -80 "$WORK/subscription-pos3ql.log"
     fi
     if "$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -q \

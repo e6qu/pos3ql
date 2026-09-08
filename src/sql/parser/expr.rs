@@ -12,6 +12,7 @@ use crate::sql::lexer::Tok;
 
 use super::{MAX_LIST, ParseError, Parser, is_base_prefixed, is_reserved_keyword};
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
+use crate::sql::types::ColType;
 
 impl<'a> Parser<'a> {
     /// The optional `ESCAPE c` trailing a LIKE or SIMILAR TO pattern.
@@ -877,6 +878,27 @@ impl<'a> Parser<'a> {
                 if name.eq_ignore_ascii_case("json_query") && self.peeked == Tok::Op("(") {
                     return self.sql_json_query();
                 }
+                if name.eq_ignore_ascii_case("xmlparse") && self.peeked == Tok::Op("(") {
+                    return self.sql_xml_parse();
+                }
+                if name.eq_ignore_ascii_case("xmlserialize") && self.peeked == Tok::Op("(") {
+                    return self.sql_xml_serialize();
+                }
+                if name.eq_ignore_ascii_case("xmlelement") && self.peeked == Tok::Op("(") {
+                    return self.sql_xml_element();
+                }
+                if name.eq_ignore_ascii_case("xmlforest") && self.peeked == Tok::Op("(") {
+                    return self.sql_xml_forest();
+                }
+                if name.eq_ignore_ascii_case("xmlpi") && self.peeked == Tok::Op("(") {
+                    return self.sql_xml_pi();
+                }
+                if name.eq_ignore_ascii_case("xmlroot") && self.peeked == Tok::Op("(") {
+                    return self.sql_xml_root();
+                }
+                if name.eq_ignore_ascii_case("xmlexists") && self.peeked == Tok::Op("(") {
+                    return self.sql_xml_exists();
+                }
                 // Every construct this arm recognizes has now had its chance, so a
                 // still-unconsumed reserved word cannot begin an expression —
                 // `ARRAY` is itself reserved, which is why this cannot come
@@ -1090,6 +1112,217 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.unexpected("expected an expression")),
         }
+    }
+
+    fn xml_call(
+        &mut self,
+        name: &'a str,
+        args: &[&'a Expr<'a>],
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let args = self.arena_slice(args)?;
+        self.arena_expr(Expr::Call {
+            name,
+            args,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+    }
+
+    fn sql_xml_parse(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let document = if self.eat_ident("document")? {
+            true
+        } else {
+            self.expect_ident("content")?;
+            false
+        };
+        let value = self.expression(0)?;
+        if self.eat_ident("preserve")? || self.eat_ident("strip")? {
+            self.expect_ident("whitespace")?;
+        }
+        self.expect_op(")")?;
+        self.xml_call(
+            if document {
+                "__xmlparse_document"
+            } else {
+                "__xmlparse_content"
+            },
+            &[value],
+        )
+    }
+
+    fn sql_xml_serialize(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let document = if self.eat_ident("document")? {
+            true
+        } else {
+            self.expect_ident("content")?;
+            false
+        };
+        let value = self.expression(0)?;
+        self.expect_ident("as")?;
+        let (target, type_mod) = self.type_name_mod()?;
+        if !matches!(
+            ColType::from_sql_name(target),
+            Some(ColType::Text | ColType::Varchar | ColType::Bpchar)
+        ) {
+            return Err(self.err_here("XMLSERIALIZE target must be a character type"));
+        }
+        self.expect_op(")")?;
+        let target = self.arena_expr(Expr::Str(target))?;
+        let type_mod = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
+        let mode = self.arena_expr(Expr::Bool(document))?;
+        self.xml_call("__xmlserialize", &[value, target, type_mod, mode])
+    }
+
+    fn sql_xml_element(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        self.expect_ident("name")?;
+        let element_name = self.any_ident("XML element name")?;
+        let mut args = [self.arena_expr(Expr::Null)?; MAX_LIST];
+        args[0] = self.arena_expr(Expr::Str(element_name))?;
+        args[1] = self.arena_expr(Expr::Int(0))?;
+        let mut n = 2;
+        let mut attributes = 0usize;
+        if self.eat_op(",")? && self.peeked == Tok::Ident("xmlattributes") {
+            self.advance()?;
+            self.expect_op("(")?;
+            loop {
+                if n + 2 > MAX_LIST {
+                    return Err(self.limit("XML element arguments", MAX_LIST));
+                }
+                let value = self.expression(0)?;
+                let alias = if self.eat_ident("as")? {
+                    self.any_ident("XML attribute name")?
+                } else if let Expr::Column { name, .. } = *value {
+                    name
+                } else {
+                    return Err(self.err_here("XML attribute value must have an alias"));
+                };
+                args[n] = self.arena_expr(Expr::Str(alias))?;
+                args[n + 1] = value;
+                n += 2;
+                attributes += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            if self.eat_op(",")? {
+                loop {
+                    if n == MAX_LIST {
+                        return Err(self.limit("XML element arguments", MAX_LIST));
+                    }
+                    args[n] = self.expression(0)?;
+                    n += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+            }
+        } else if n == 2 && self.peeked != Tok::Op(")") {
+            loop {
+                if n == MAX_LIST {
+                    return Err(self.limit("XML element arguments", MAX_LIST));
+                }
+                args[n] = self.expression(0)?;
+                n += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+        }
+        args[1] = self.arena_expr(Expr::Int(attributes as i64))?;
+        self.expect_op(")")?;
+        self.xml_call("__xmlelement", &args[..n])
+    }
+
+    fn sql_xml_forest(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let mut args = [self.arena_expr(Expr::Null)?; MAX_LIST];
+        let mut n = 0;
+        loop {
+            if n + 2 > MAX_LIST {
+                return Err(self.limit("XML forest arguments", MAX_LIST));
+            }
+            let value = self.expression(0)?;
+            let alias = if self.eat_ident("as")? {
+                self.any_ident("XML element name")?
+            } else if let Expr::Column { name, .. } = *value {
+                name
+            } else {
+                return Err(self.err_here("XML forest value must have an alias"));
+            };
+            args[n] = self.arena_expr(Expr::Str(alias))?;
+            args[n + 1] = value;
+            n += 2;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        self.xml_call("__xmlforest", &args[..n])
+    }
+
+    fn sql_xml_pi(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        self.expect_ident("name")?;
+        let target = self.any_ident("XML processing instruction name")?;
+        let target = self.arena_expr(Expr::Str(target))?;
+        let mut args = [target, self.arena_expr(Expr::Null)?];
+        let n = if self.eat_op(",")? {
+            args[1] = self.expression(0)?;
+            2
+        } else {
+            1
+        };
+        self.expect_op(")")?;
+        self.xml_call("__xmlpi", &args[..n])
+    }
+
+    fn sql_xml_root(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let value = self.expression(0)?;
+        self.expect_op(",")?;
+        self.expect_ident("version")?;
+        let version = if self.eat_ident("no")? {
+            self.expect_ident("value")?;
+            self.arena_expr(Expr::Null)?
+        } else {
+            self.expression(0)?
+        };
+        let standalone = if self.eat_op(",")? {
+            self.expect_ident("standalone")?;
+            let value = if self.eat_ident("yes")? {
+                1
+            } else if self.eat_ident("no")? {
+                if self.eat_ident("value")? { -1 } else { 0 }
+            } else {
+                return Err(self.err_here("expected YES, NO, or NO VALUE"));
+            };
+            self.arena_expr(Expr::Int(value))?
+        } else {
+            self.arena_expr(Expr::Int(-1))?
+        };
+        self.expect_op(")")?;
+        self.xml_call("__xmlroot", &[value, version, standalone])
+    }
+
+    fn sql_xml_exists(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        self.expect_op("(")?;
+        let path = self.expression(0)?;
+        self.expect_ident("passing")?;
+        if self.eat_ident("by")? && !self.eat_ident("ref")? {
+            self.expect_ident("value")?;
+        }
+        let document = self.expression(0)?;
+        self.expect_op(")")?;
+        self.xml_call("__xmlexists", &[path, document])
     }
 
     /// SQL-standard `JSON(input [FORMAT JSON [ENCODING UTF8]] [WITH UNIQUE

@@ -945,6 +945,32 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         Expr::Call { name, .. } if name.starts_with("__json_query_") => Some("json_query"),
         Expr::Call { name, .. } if name.starts_with("__json_arrayagg_") => Some("json_arrayagg"),
         Expr::Call { name, .. } if name.starts_with("__json_objectagg_") => Some("json_objectagg"),
+        Expr::Call {
+            name: "__xmlparse_content" | "__xmlparse_document",
+            ..
+        } => Some("xmlparse"),
+        Expr::Call {
+            name: "__xmlserialize",
+            ..
+        } => Some("xmlserialize"),
+        Expr::Call {
+            name: "__xmlelement",
+            ..
+        } => Some("xmlelement"),
+        Expr::Call {
+            name: "__xmlforest",
+            ..
+        } => Some("xmlforest"),
+        Expr::Call {
+            name: "__xmlpi", ..
+        } => Some("xmlpi"),
+        Expr::Call {
+            name: "__xmlroot", ..
+        } => Some("xmlroot"),
+        Expr::Call {
+            name: "__xmlexists",
+            ..
+        } => Some("xmlexists"),
         Expr::Call { name, .. } => Some(name.rsplit('.').next().unwrap_or(name)),
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
@@ -3552,6 +3578,27 @@ pub fn infer_type_res(
             | "jsonb_extract_path_text" => of(ColType::Text),
             "json_extract_path" => of(ColType::Json),
             "jsonb_extract_path" => of(ColType::Jsonb),
+            "__xmlparse_content"
+            | "__xmlparse_document"
+            | "__xmlelement"
+            | "__xmlforest"
+            | "xmlconcat"
+            | "xmlcomment"
+            | "__xmlpi"
+            | "__xmlroot" => of(ColType::Xml),
+            "__xmlserialize" => args
+                .get(1)
+                .and_then(|argument| match **argument {
+                    Expr::Str(name) => ColType::from_sql_name(name),
+                    _ => None,
+                })
+                .map_or(of(ColType::Text), of),
+            "xpath" => of(ColType::Array(crate::sql::types::ArrElem::Xml)),
+            "__xmlexists"
+            | "xpath_exists"
+            | "xml_is_well_formed"
+            | "xml_is_well_formed_document"
+            | "xml_is_well_formed_content" => of(ColType::Bool),
             "regexp_substr" => of(ColType::Text),
             "regexp_like" => of(ColType::Bool),
             "regexp_split_to_array" | "string_to_array" => {
@@ -3645,6 +3692,7 @@ pub fn infer_type_res(
             }
             "regr_count" => of(ColType::Int8),
             "string_agg" => of(ColType::Text),
+            "xmlagg" => of(ColType::Xml),
             "array_agg" => {
                 // Element type from the argument; the result is elem[].
                 let elem = args

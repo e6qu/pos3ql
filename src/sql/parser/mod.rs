@@ -2644,6 +2644,8 @@ impl<'a> Parser<'a> {
         let mut func_args =
             if table.eq_ignore_ascii_case("json_table") && self.peeked == Tok::Op("(") {
                 Some(self.json_table_arguments()?)
+            } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
+                Some(self.xml_table_arguments()?)
             } else if self.peeked == Tok::Op("(") {
                 self.advance()?;
                 let mut args: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
@@ -2822,6 +2824,105 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         let behavior = self.arena_expr(Expr::Str(on_error))?;
         self.arena_slice(&[context, path, path_name, passing, columns, behavior])
+    }
+
+    /// Parses XMLTABLE into a bounded table-function specification shared by
+    /// static description, stored queries and execution.
+    fn xml_table_arguments(&mut self) -> Result<&'a [&'a Expr<'a>], ParseError> {
+        self.expect_op("(")?;
+        let namespaces = if self.eat_ident("xmlnamespaces")? {
+            self.expect_op("(")?;
+            let null = self.arena_expr(Expr::Null)?;
+            let mut pairs = [null; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count + 2 > pairs.len() {
+                    return Err(self.limit("XML namespace declarations", pairs.len() / 2));
+                }
+                let default = self.eat_ident("default")?;
+                if default {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: StackStr::from_str("DEFAULT namespace is not supported"),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
+                }
+                pairs[count] = self.expression(0)?;
+                self.expect_ident("as")?;
+                let prefix = self.any_ident("XML namespace prefix")?;
+                pairs[count + 1] = self.arena_expr(Expr::Str(prefix))?;
+                count += 2;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            self.expect_op(",")?;
+            self.plain_call("__xml_namespaces", &pairs[..count])?
+        } else {
+            self.plain_call("__xml_namespaces", &[])?
+        };
+        let row_path = self.expression(0)?;
+        self.expect_ident("passing")?;
+        if self.eat_ident("by")? && !self.eat_ident("ref")? {
+            self.expect_ident("value")?;
+        }
+        let document = self.expression(0)?;
+        if self.eat_ident("by")? {
+            self.expect_ident("ref")?;
+        }
+        self.expect_ident("columns")?;
+        let columns = self.xml_table_columns()?;
+        self.expect_op(")")?;
+        self.arena_slice(&[row_path, document, columns, namespaces])
+    }
+
+    fn xml_table_columns(&mut self) -> Result<&'a Expr<'a>, ParseError> {
+        let null = self.arena_expr(Expr::Null)?;
+        let mut columns = [null; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == columns.len() {
+                return Err(self.limit("XMLTABLE columns", columns.len()));
+            }
+            let name = self.col_ident("XMLTABLE column name")?;
+            let name = self.arena_expr(Expr::Str(name))?;
+            if self.eat_ident("for")? {
+                self.expect_ident("ordinality")?;
+                columns[count] = self.plain_call("__xml_table_ordinality", &[name])?;
+            } else {
+                let (type_name, type_mod) = self.type_name_mod()?;
+                let type_name = self.arena_expr(Expr::Str(type_name))?;
+                let type_mod = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
+                let path = if self.eat_ident("path")? {
+                    self.expression(0)?
+                } else {
+                    name
+                };
+                let default = if self.eat_ident("default")? {
+                    self.column_default_expression()?
+                } else {
+                    null
+                };
+                let not_null = if self.eat_ident("not")? {
+                    self.expect_ident("null")?;
+                    true
+                } else {
+                    let _ = self.eat_ident("null")?;
+                    false
+                };
+                let not_null = self.arena_expr(Expr::Bool(not_null))?;
+                columns[count] = self.plain_call(
+                    "__xml_table_column",
+                    &[name, type_name, type_mod, path, default, not_null],
+                )?;
+            }
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.plain_call("__xml_table_columns", &columns[..count])
     }
 
     fn json_record_column_definitions(

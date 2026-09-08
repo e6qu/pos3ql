@@ -326,6 +326,7 @@ pub struct RenderContext {
     /// format (printable ASCII verbatim, `\\` for backslash, `\nnn` octal)
     /// instead of `\x` hex.
     pub bytea_escape: bool,
+    pub xml_document: bool,
 }
 
 impl Default for RenderContext {
@@ -336,6 +337,7 @@ impl Default for RenderContext {
             parsed_timezone: super::timezone::Timezone::utc(),
             min_message_level: MessageLevel::Notice,
             bytea_escape: false,
+            xml_document: false,
         }
     }
 }
@@ -499,6 +501,7 @@ struct GucValues {
     event_triggers: bool,
     /// bytea_output = escape (false = hex, the default).
     bytea_escape: bool,
+    xml_document: bool,
     /// Whether function bodies are checked at definition time. Function DDL is
     /// rejected before this matters, but the session value is still observable
     /// and is emitted by pg_dump.
@@ -577,6 +580,7 @@ impl GucValues {
             row_security: StackStr::new(),
             event_triggers: true,
             bytea_escape: false,
+            xml_document: false,
             check_function_bodies: true,
             default_transaction_isolation: TransactionIsolation::ReadCommitted,
             default_transaction_read_only: false,
@@ -717,6 +721,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     copy!(GUC_EVENT_TRIGGERS, event_triggers);
     copy!(GUC_BYTEA_OUTPUT, bytea_escape);
     copy!(GUC_CHECK_FUNCTION_BODIES, check_function_bodies);
+    copy!(GUC_XML_OPTION, xml_document);
     copy!(
         GUC_DEFAULT_TRANSACTION_ISOLATION,
         default_transaction_isolation
@@ -1843,13 +1848,14 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return Ok(());
     }
     if name.eq_ignore_ascii_case("xmloption") {
-        if is_default || v.eq_ignore_ascii_case("content") {
-            return Ok(());
-        }
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "xmloption can only be content (XML document validation is not supported)"
-        ));
+        values.xml_document = if is_default || v.eq_ignore_ascii_case("content") {
+            false
+        } else if v.eq_ignore_ascii_case("document") {
+            true
+        } else {
+            return Err(unsupported_value("xmloption", v));
+        };
+        return Ok(());
     }
     if name.eq_ignore_ascii_case("default_tablespace") {
         return store(
@@ -2138,7 +2144,11 @@ impl GucState {
                 "off"
             }))
         } else if name.eq_ignore_ascii_case("xmloption") {
-            Some(StackStr::from_str("content"))
+            Some(StackStr::from_str(if values.xml_document {
+                "document"
+            } else {
+                "content"
+            }))
         } else if name.eq_ignore_ascii_case("default_tablespace") {
             Some(StackStr::from_str(values.default_tablespace.as_str()))
         } else if name.eq_ignore_ascii_case("default_text_search_config") {
@@ -2204,6 +2214,7 @@ impl GucState {
             parsed_timezone: values.parsed_timezone,
             min_message_level: values.client_min_messages,
             bytea_escape: values.bytea_escape,
+            xml_document: values.xml_document,
         }
     }
 }

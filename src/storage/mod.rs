@@ -595,6 +595,10 @@ impl OwnedDatum {
             Datum::Interval(value) => Self::Interval(*value),
             Datum::Uuid(value) => Self::Uuid(*value),
             Datum::Json { text, jsonb } => Self::json(*jsonb, text)?,
+            Datum::Xml(text) => {
+                let (len, bytes) = Self::bytes(text.as_bytes(), "xml")?;
+                Self::Text { len, bytes }
+            }
             Datum::JsonPath(text) => {
                 let (len, bytes) = Self::bytes(text.as_bytes(), "jsonpath")?;
                 Self::JsonPath { len, bytes }

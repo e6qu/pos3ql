@@ -50773,6 +50773,10 @@ fn decode_binary_field_with_context<'a>(
         // invalid JSON datum.
         ColType::Json => crate::sql::eval::cast_to(via(oids::JSON)?, ColType::Json, arena),
         ColType::Jsonb => crate::sql::eval::cast_to(via(oids::JSONB)?, ColType::Jsonb, arena),
+        ColType::Xml => {
+            let text = core::str::from_utf8(bytes).map_err(|_| bad())?;
+            crate::sql::eval::cast_to(Datum::Text(text), ColType::Xml, arena)
+        }
         ColType::Jsonpath => {
             crate::sql::eval::cast_to(via(oids::JSONPATH)?, ColType::Jsonpath, arena)
         }

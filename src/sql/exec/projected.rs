@@ -146,7 +146,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Inet(_) | Datum::Cidr(_) => 18,
         Datum::Macaddr(_) => 6,
         Datum::Macaddr8(_) => 8,
-        Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
+        Datum::Text(s) | Datum::Bpchar(s) | Datum::Xml(s) => 4 + s.len(),
         Datum::TsVector(text) => 4 + text.len(),
         Datum::TsQuery(text) => 4 + text.len(),
         Datum::Regtype { name, .. } => 8 + name.len(),
@@ -348,6 +348,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         }
         Datum::JsonPath(text) => {
             out[0] = 42;
+            out[1..5].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[5..5 + text.len()].copy_from_slice(text.as_bytes());
+            5 + text.len()
+        }
+        Datum::Xml(text) => {
+            out[0] = 43;
             out[1..5].copy_from_slice(&(text.len() as u32).to_le_bytes());
             out[5..5 + text.len()].copy_from_slice(text.as_bytes());
             5 + text.len()
@@ -665,6 +671,13 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             let text = core::str::from_utf8(&bytes[at + 4..at + 4 + len])
                 .expect("projected jsonpath was encoded from valid UTF-8");
             (Datum::JsonPath(text), 4 + len)
+        }
+        43 => {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (
+                Datum::Xml(core::str::from_utf8(&bytes[at + 4..at + 4 + len]).unwrap()),
+                4 + len,
+            )
         }
         15 => {
             let mut element = crate::sql::types::ArrElem::from_code(bytes[at])

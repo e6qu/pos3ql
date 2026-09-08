@@ -2086,6 +2086,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
             text: "null",
             jsonb: true,
         },
+        ColType::Xml => Datum::Xml(""),
         ColType::Jsonpath => Datum::JsonPath("$"),
         ColType::TsVector => Datum::TsVector(crate::sql::full_text::restore_vector("")),
         ColType::TsQuery => Datum::TsQuery(crate::sql::full_text::restore_query("")),

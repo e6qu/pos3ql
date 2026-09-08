@@ -143,6 +143,86 @@ struct IntrinsicRoutine {
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
+        oid: 2895,
+        name: "xmlcomment",
+        result_oid: super::types::oid::XML,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 2900,
+        name: "xmlconcat2",
+        result_oid: super::types::oid::XML,
+        argument_types: "142 142",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 2901,
+        name: "xmlagg",
+        result_oid: super::types::oid::XML,
+        argument_types: "142",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 2931,
+        name: "xpath",
+        result_oid: super::types::oid::XML_ARRAY,
+        argument_types: "25 142 1009",
+        argument_count: 3,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 2932,
+        name: "xpath",
+        result_oid: super::types::oid::XML_ARRAY,
+        argument_types: "25 142",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3049,
+        name: "xpath_exists",
+        result_oid: super::types::oid::BOOL,
+        argument_types: "25 142 1009",
+        argument_count: 3,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3050,
+        name: "xpath_exists",
+        result_oid: super::types::oid::BOOL,
+        argument_types: "25 142",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3051,
+        name: "xml_is_well_formed",
+        result_oid: super::types::oid::BOOL,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3052,
+        name: "xml_is_well_formed_document",
+        result_oid: super::types::oid::BOOL,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3053,
+        name: "xml_is_well_formed_content",
+        result_oid: super::types::oid::BOOL,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
         oid: 3577,
         name: "pg_logical_emit_message",
         result_oid: super::types::oid::PG_LSN,
@@ -1219,7 +1299,20 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
     !matches!(
         routine.oid,
-        1081 | 2078 | 3205 | 3209 | 3475 | 3491 | 3960 | 3961 | 6338 | 3566 | 4568 | 6170 | 6232
+        1081 | 2078
+            | 2900
+            | 2901
+            | 3205
+            | 3209
+            | 3475
+            | 3491
+            | 3960
+            | 3961
+            | 6338
+            | 3566
+            | 4568
+            | 6170
+            | 6232
     )
 }
 
@@ -13391,7 +13484,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(routine.argument_count),
                 Datum::Int4(routine.result_oid),
                 Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
-                Datum::Bpchar("f"),
+                Datum::Bpchar(if routine.oid == 2901 { "a" } else { "f" }),
                 oidvector(&argument_oids[..argument_count], arena)?,
                 Datum::Bpchar(routine.volatility),
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
@@ -13734,6 +13827,10 @@ fn pg_aggregate<'a>(
     let regproc = |oid: i32| -> Result<Datum<'a>, SqlError> {
         let name = if oid == 0 {
             arena.alloc_str("-").map_err(|_| arena_full())?
+        } else if oid == 2900 {
+            "xmlconcat2"
+        } else if oid == 2901 {
+            "xmlagg"
         } else {
             let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {
                 sql_err!(
@@ -13790,15 +13887,16 @@ fn pg_aggregate<'a>(
             ("aggminitval", ColType::Text),
         ],
     );
-    let count = (0..storage.routine_count())
-        .filter(|slot| {
-            storage.routine_slot_visible_to(*slot, txid)
-                && matches!(
-                    storage.routine_for(*slot, txid).kind,
-                    crate::storage::RoutineKind::Aggregate(_)
-                )
-        })
-        .count();
+    let count = 1
+        + (0..storage.routine_count())
+            .filter(|slot| {
+                storage.routine_slot_visible_to(*slot, txid)
+                    && matches!(
+                        storage.routine_for(*slot, txid).kind,
+                        crate::storage::RoutineKind::Aggregate(_)
+                    )
+            })
+            .count();
     let rows = arena
         .alloc_slice_with(count.max(1), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -13807,7 +13905,34 @@ fn pg_aggregate<'a>(
         crate::storage::AggregateFinalModify::Shareable => "s",
         crate::storage::AggregateFinalModify::ReadWrite => "w",
     };
-    let mut index = 0usize;
+    rows[0] = row(
+        &[
+            regproc(2901)?,
+            Datum::Bpchar("n"),
+            Datum::Int2(0),
+            regproc(2900)?,
+            regproc(0)?,
+            regproc(0)?,
+            regproc(0)?,
+            regproc(0)?,
+            regproc(0)?,
+            regproc(0)?,
+            regproc(0)?,
+            Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Bpchar("r"),
+            Datum::Bpchar("r"),
+            Datum::Int4(0),
+            Datum::Int4(super::types::oid::XML),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Null,
+            Datum::Null,
+        ],
+        arena,
+    )?;
+    let mut index = 1usize;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {
@@ -14416,6 +14541,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Interval,
         ColType::Json,
         ColType::Jsonb,
+        ColType::Xml,
         ColType::Jsonpath,
         ColType::TsVector,
         ColType::TsQuery,
@@ -14467,6 +14593,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::Bytea
         | ColType::TsVector
         | ColType::TsQuery
+        | ColType::Xml
         | ColType::Jsonpath => "U",
         ColType::PgNodeTree
         | ColType::PgNdistinct

@@ -777,6 +777,36 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    /// Returns this session's top-level transaction identity. `assign` mirrors
+    /// PostgreSQL's distinction between assigning an identity and merely
+    /// observing one that was already assigned.
+    fn current_transaction_id(&self, _assign: bool) -> Result<Option<u64>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "transaction identity access is unavailable"
+        ))
+    }
+    fn current_transaction_snapshot<'a>(
+        &self,
+        _arena: &'a Arena,
+    ) -> Result<crate::sql::snapshot::Snapshot<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "transaction snapshot access is unavailable"
+        ))
+    }
+    fn transaction_status(&self, _transaction_id: u64) -> Result<Option<&'static str>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "transaction status access is unavailable"
+        ))
+    }
+    fn transaction_id_age(&self, _transaction_id: u32) -> Result<i32, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "transaction identity access is unavailable"
+        ))
+    }
     fn replica_identity_index_oid(&self, _relation_oid: i32) -> Option<i32> {
         None
     }
@@ -6419,6 +6449,9 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",
         Datum::Oid(_) => "oid",
+        Datum::Xid8(_) => "xid8",
+        Datum::Snapshot { legacy: false, .. } => "pg_snapshot",
+        Datum::Snapshot { legacy: true, .. } => "txid_snapshot",
         Datum::PgLsn(_) => "pg_lsn",
         Datum::Int8(_) => "bigint",
         Datum::Float4(_) => "real",

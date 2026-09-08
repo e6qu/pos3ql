@@ -35,6 +35,7 @@ pub mod regex;
 pub mod ryu;
 pub mod sequence;
 pub mod sha512;
+pub mod snapshot;
 pub mod timezone;
 pub mod to_char;
 pub(crate) mod two_phase;
@@ -2844,11 +2845,12 @@ impl Engine {
                 ));
             }
         }
-        let recovered_transaction_id = prepared_transactions
-            .entries()
-            .map(|(_, metadata)| metadata.transaction_id)
-            .max()
-            .unwrap_or(0);
+        let recovered_transaction_id = u32::try_from(storage.latest_transaction_identity())
+            .map_err(|_| {
+                EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
+                    "recovered transaction identity exceeds the internal counter",
+                ))
+            })?;
         // WAL carries catalog identities as names where runtime slots are not
         // durable. Rebind each recovered database only after every replayed
         // definition exists.
@@ -3663,8 +3665,9 @@ impl Engine {
                 let length =
                     u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
                 let total = crate::wal::HEADER_LEN + length;
-                if let Some(WalOp::Commit { transaction_id: id }) =
-                    crate::wal::decode_record(&transaction[at + 16..at + total])
+                if let Some(WalOp::Commit {
+                    transaction_id: id, ..
+                }) = crate::wal::decode_record(&transaction[at + 16..at + total])
                 {
                     transaction_id = id;
                 }
@@ -4362,6 +4365,7 @@ impl Engine {
         self.next_txid = self.next_txid.wrapping_add(1).max(1);
         txn.txid = self.next_txid;
         txn.mode = mode;
+        self.storage.begin_transaction_identity(txn.txid);
         datetime::begin_transaction();
         guc.begin_transaction();
         let (isolation, read_only, deferrable) = guc.transaction_defaults();
@@ -5262,7 +5266,13 @@ impl Engine {
                 self.wal
                     .prepare_stage(metadata, self.storage.lsn(), records)
             }
-            None => self.wal.commit_stage(txn.txid, self.storage.lsn()),
+            None => self.wal.commit_stage_with_transaction_identity(
+                txn.txid,
+                self.storage.lsn(),
+                self.storage
+                    .assigned_transaction_identity(txn.txid)
+                    .is_some(),
+            ),
         };
         let commit_lsn = match finish_result {
             Ok(lsn) => lsn,
@@ -5855,6 +5865,7 @@ impl Engine {
             guc.commit_transaction();
         }
         self.storage.clear_temporary_transaction(txn.txid);
+        self.storage.finish_transaction_identity(txn.txid, true);
         txn.clear();
         notify_result.and(index_result).and(temporary_result)
     }
@@ -6114,6 +6125,10 @@ impl Engine {
             self.prepared_transactions.release(slot);
             return Err(fail(self, txn, cursors, error));
         }
+        // PREPARE TRANSACTION assigns a full XID even when the transaction did
+        // no earlier work, so every successfully prepared transaction has the
+        // catalog identity required to resolve it later.
+        self.storage.assign_transaction_identity(txn.txid);
         if let Err(error) = self.storage.encode_transaction_locks(
             txn.txid,
             &mut self.prepared_transactions.slot_mut(slot).locks,
@@ -6211,7 +6226,7 @@ impl Engine {
             &mut self.prepared_transactions.slot_mut(slot).transaction,
         );
         let result = if commit && recovered {
-            self.rollback_transaction_state(txn);
+            self.rollback_transaction_state(txn, true);
             self.prepared_transactions
                 .slot(slot)
                 .visit_records(|_, raw| {
@@ -6230,7 +6245,7 @@ impl Engine {
             self.storage.release_row_locks(txn.txid);
             self.promote_transaction_state(txn, resolution_lsn, None)
         } else {
-            self.rollback_transaction_state(txn);
+            self.rollback_transaction_state(txn, false);
             Ok(())
         };
         self.prepared_transactions.release(slot);
@@ -6687,7 +6702,7 @@ impl Engine {
 
     /// Discards every uncommitted change and journal byte of the
     /// transaction.
-    fn rollback_transaction_state(&mut self, txn: &mut TxnState) {
+    fn rollback_transaction_state(&mut self, txn: &mut TxnState, committed: bool) {
         if txn.txid == 0 {
             txn.clear();
             return;
@@ -6718,6 +6733,8 @@ impl Engine {
         }
         self.wal.discard_stage(txn.txid);
         self.storage.clear_temporary_transaction(txn.txid);
+        self.storage
+            .finish_transaction_identity(txn.txid, committed);
         txn.clear();
     }
 
@@ -6729,7 +6746,7 @@ impl Engine {
             txn.clear();
             return;
         }
-        self.rollback_transaction_state(txn);
+        self.rollback_transaction_state(txn, false);
         guc.rollback_transaction();
     }
 
@@ -8514,6 +8531,9 @@ impl Engine {
         let result = if arguments.iter().any(Datum::is_null) {
             Ok(Datum::Null)
         } else {
+            if large_object::is_mutating(function_oid) {
+                self.storage.assign_transaction_identity(txn.txid);
+            }
             large_object::execute(function_oid, arguments, &mut self.storage, txn, arena)
         };
         let value = match result {
@@ -11056,7 +11076,11 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
             }
-            let value = match if logical_replication::is_intrinsic(oid) {
+            let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
+            if !logical_replication_intrinsic && large_object::is_mutating(oid) {
+                self.storage.assign_transaction_identity(txn.txid);
+            }
+            let value = match if logical_replication_intrinsic {
                 logical_replication::execute(
                     oid,
                     &arguments[..pending.argument_count],
@@ -13322,6 +13346,9 @@ impl Engine {
         );
         if let Err(error) = self.begin_command_snapshot(txn, takes_snapshot) {
             return Ok(Err(error));
+        }
+        if statement_writes(statement) {
+            self.storage.assign_transaction_identity(txn.txid);
         }
         let event_tag = event_trigger_tag(statement);
         if let Some(tag) = event_tag
@@ -17678,6 +17705,8 @@ fn replay_transaction_batches(
                     .slot_mut(slot)
                     .transaction
                     .restore_prepared_identity(transaction_id);
+                storage.begin_transaction_identity(transaction_id);
+                storage.assign_transaction_identity(transaction_id);
                 storage.select_database_for_recovery(database)?;
                 for (record_lsn, raw) in &batch[..batch.len() - 1] {
                     prepared.slot_mut(slot).push_record(*record_lsn, raw)?;
@@ -17883,7 +17912,18 @@ fn replay_transaction_batches(
                 prepared.slot_mut(slot).recovered = true;
                 storage.set_lsn(*lsn);
             }
-            WalOp::Commit { .. } => {
+            WalOp::Commit {
+                transaction_id,
+                assigned_transaction_identity,
+            } => {
+                if *lsn > apply_floor {
+                    storage.observe_transaction_identity(u64::from(transaction_id));
+                    if assigned_transaction_identity {
+                        storage.begin_transaction_identity(transaction_id);
+                        storage.assign_transaction_identity(transaction_id);
+                        storage.finish_transaction_identity(transaction_id, true);
+                    }
+                }
                 let mut resolution: Option<(bool, ast::PreparedTransactionId)> = None;
                 for (_, raw) in &batch[..batch.len() - 1] {
                     match crate::wal::decode_record(raw).ok_or_else(|| {
@@ -17919,6 +17959,7 @@ fn replay_transaction_batches(
                             gid.as_str()
                         )
                     })?;
+                    let prepared_transaction_id = prepared.slot(slot).metadata().transaction_id;
                     if commit && *lsn > apply_floor {
                         prepared.slot(slot).visit_records(|_, raw| {
                             let operation = crate::wal::decode_record(raw).ok_or_else(|| {
@@ -17930,6 +17971,7 @@ fn replay_transaction_batches(
                             apply_wal_op(storage, *lsn, operation)
                         })?;
                     }
+                    storage.finish_transaction_identity(prepared_transaction_id, commit);
                     prepared.release(slot);
                     storage.set_lsn(*lsn);
                 } else {

@@ -602,6 +602,11 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[35]);
             hasher.write(&v.to_le_bytes());
         }
+        Datum::Xid8(v) => {
+            hasher.write(&[44]);
+            hasher.write(&v.to_le_bytes());
+        }
+        Datum::Snapshot { .. } => hasher.write(&[45]),
         Datum::PgLsn(v) => {
             hasher.write(&[41]);
             hasher.write(&v.to_le_bytes());
@@ -735,6 +740,7 @@ pub(crate) fn compare_datums_as(
     use core::cmp::Ordering;
     let ord = match (l, r) {
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
+        (Datum::Xid8(a), Datum::Xid8(b)) => a.cmp(b),
         (Datum::PgLsn(a), Datum::PgLsn(b)) => a.cmp(b),
         (Datum::Char(a), Datum::Char(b)) => a.cmp(b),
         (Datum::Text(a), Datum::Text(b)) => a.cmp(b),

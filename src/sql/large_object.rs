@@ -266,6 +266,13 @@ pub(crate) fn execute<'a>(
     }
 }
 
+pub(crate) const fn is_mutating(function_oid: i32) -> bool {
+    matches!(
+        function_oid,
+        715 | 764 | 767 | 955 | 957 | 964 | 1004 | 3172 | 3457 | 3460
+    )
+}
+
 fn create<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,

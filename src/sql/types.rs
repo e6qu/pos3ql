@@ -39,6 +39,13 @@ pub mod oid {
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
     pub const XID: i32 = 28;
+    pub const XID_ARRAY: i32 = 1011;
+    pub const XID8: i32 = 5069;
+    pub const XID8_ARRAY: i32 = 271;
+    pub const TXID_SNAPSHOT: i32 = 2970;
+    pub const TXID_SNAPSHOT_ARRAY: i32 = 2949;
+    pub const PG_SNAPSHOT: i32 = 5038;
+    pub const PG_SNAPSHOT_ARRAY: i32 = 5039;
     pub const PG_LSN: i32 = 3220;
     pub const PG_LSN_ARRAY: i32 = 3221;
     pub const OID_ARRAY: i32 = 1028;
@@ -327,6 +334,12 @@ pub enum ColType {
     /// PostgreSQL transaction identity (`xid`, OID 28). Values retain unsigned
     /// four-byte storage while the declared type carries the distinct wire OID.
     Xid,
+    /// PostgreSQL's epoch-qualified, monotonically ordered transaction ID.
+    Xid8,
+    /// Current transaction snapshot (`pg_snapshot`, OID 5038).
+    PgSnapshot,
+    /// Deprecated bigint-facing snapshot type retained for compatibility.
+    TxidSnapshot,
     /// PostgreSQL WAL position (`pg_lsn`, OID 3220), retained as an unsigned
     /// 64-bit value so the high half cannot become a negative SQL integer.
     PgLsn,
@@ -476,6 +489,7 @@ pub enum BtreeOperatorClass {
     TsVector,
     /// Appended to preserve the persisted codes of earlier operator classes.
     PgLsn,
+    Xid8,
 }
 
 impl BtreeOperatorClass {
@@ -505,10 +519,11 @@ impl BtreeOperatorClass {
             Numeric => Self::Numeric,
             Oid | Xid | Regtype | Regproc | Regprocedure | Regoper | Regoperator | Regclass
             | Regnamespace | Regrole | Regconfig | Regdictionary => Self::Oid,
+            Xid8 => Self::Xid8,
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
             PgLsn => Self::PgLsn,
-            Char | Geometry(_) => return None,
+            Char | Geometry(_) | PgSnapshot | TxidSnapshot => return None,
             Time => Self::Time,
             Timestamp => Self::Timestamp,
             Timestamptz => Self::Timestamptz,
@@ -557,6 +572,7 @@ impl BtreeOperatorClass {
             "tsquery_ops" => Self::TsQuery,
             "tsvector_ops" => Self::TsVector,
             "pg_lsn_ops" => Self::PgLsn,
+            "xid8_ops" => Self::Xid8,
             "uuid_ops" => Self::Uuid,
             "varbit_ops" => Self::Varbit,
             _ => return None,
@@ -598,6 +614,7 @@ impl BtreeOperatorClass {
             31 => Self::TsQuery,
             32 => Self::TsVector,
             33 => Self::PgLsn,
+            34 => Self::Xid8,
             _ => return None,
         })
     }
@@ -639,6 +656,7 @@ impl BtreeOperatorClass {
             Self::TsQuery => "tsquery_ops",
             Self::TsVector => "tsvector_ops",
             Self::PgLsn => "pg_lsn_ops",
+            Self::Xid8 => "xid8_ops",
             Self::Uuid => "uuid_ops",
             Self::Varbit => "varbit_ops",
         }
@@ -677,6 +695,7 @@ impl BtreeOperatorClass {
             Self::TsQuery => 10074,
             Self::TsVector => 10071,
             Self::PgLsn => 10067,
+            Self::Xid8 => 10053,
             Self::Uuid => 10065,
             Self::Varbit => 10043,
         }
@@ -773,6 +792,9 @@ impl ColType {
             "name" => Self::Name,
             "oid" => Self::Oid,
             "xid" => Self::Xid,
+            "xid8" => Self::Xid8,
+            "pg_snapshot" => Self::PgSnapshot,
+            "txid_snapshot" => Self::TxidSnapshot,
             "pg_lsn" => Self::PgLsn,
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
@@ -819,6 +841,9 @@ impl ColType {
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
             Self::Xid => oid::XID,
+            Self::Xid8 => oid::XID8,
+            Self::PgSnapshot => oid::PG_SNAPSHOT,
+            Self::TxidSnapshot => oid::TXID_SNAPSHOT,
             Self::PgLsn => oid::PG_LSN,
             Self::Regtype => oid::REGTYPE,
             Self::Regproc => oid::REGPROC,
@@ -889,6 +914,9 @@ impl ColType {
             oid::INT4 => Some(Self::Int4),
             oid::OID => Some(Self::Oid),
             oid::XID => Some(Self::Xid),
+            oid::XID8 => Some(Self::Xid8),
+            oid::PG_SNAPSHOT => Some(Self::PgSnapshot),
+            oid::TXID_SNAPSHOT => Some(Self::TxidSnapshot),
             oid::PG_LSN => Some(Self::PgLsn),
             oid::REGPROC => Some(Self::Regproc),
             oid::REGPROCEDURE => Some(Self::Regprocedure),
@@ -1021,6 +1049,7 @@ impl ColType {
             | Self::Date
             | Self::Float4 => 4,
             Self::Int8
+            | Self::Xid8
             | Self::PgLsn
             | Self::Float8
             | Self::Timestamp
@@ -1043,7 +1072,9 @@ impl ColType {
             | Self::Jsonb
             | Self::Jsonpath
             | Self::TsVector
-            | Self::TsQuery => -1,
+            | Self::TsQuery
+            | Self::PgSnapshot
+            | Self::TxidSnapshot => -1,
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
             Self::Inet | Self::Cidr => -1,
             Self::Record => -1,
@@ -1068,6 +1099,8 @@ impl ColType {
             | Self::PgMcvList
             | Self::PgStatisticArray => Self::Text,
             Self::Oid | Self::Xid => Self::Int4,
+            Self::Xid8 => self,
+            Self::PgSnapshot | Self::TxidSnapshot => self,
             Self::Geometry(_) => self,
             Self::Regtype
             | Self::Regproc
@@ -1101,6 +1134,9 @@ impl ColType {
             Self::Int4 => "int4",
             Self::Oid => "oid",
             Self::Xid => "xid",
+            Self::Xid8 => "xid8",
+            Self::PgSnapshot => "pg_snapshot",
+            Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
@@ -1179,6 +1215,9 @@ impl ColType {
             Self::Int4 => "integer",
             Self::Oid => "oid",
             Self::Xid => "xid",
+            Self::Xid8 => "xid8",
+            Self::PgSnapshot => "pg_snapshot",
+            Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
@@ -1244,6 +1283,9 @@ impl ColType {
             Self::Int4 => 2,
             Self::Oid => 56,
             Self::Xid => 76,
+            Self::Xid8 => 235,
+            Self::PgSnapshot => 236,
+            Self::TxidSnapshot => 237,
             Self::PgLsn => 79,
             Self::Regtype => 58,
             Self::Regproc => 59,
@@ -1328,6 +1370,9 @@ impl ColType {
             2 => Self::Int4,
             56 => Self::Oid,
             76 => Self::Xid,
+            235 => Self::Xid8,
+            236 => Self::PgSnapshot,
+            237 => Self::TxidSnapshot,
             79 => Self::PgLsn,
             58 => Self::Regtype,
             59 => Self::Regproc,
@@ -1408,6 +1453,10 @@ pub enum ArrElem {
     Char,
     Int4,
     Oid,
+    Xid,
+    Xid8,
+    PgSnapshot,
+    TxidSnapshot,
     PgLsn,
     Int8,
     Float8,
@@ -1490,12 +1539,16 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 64] = [
+    pub const BUILTIN: [Self; 68] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
         Self::Int4,
         Self::Oid,
+        Self::Xid,
+        Self::Xid8,
+        Self::PgSnapshot,
+        Self::TxidSnapshot,
         Self::PgLsn,
         Self::Int8,
         Self::Float4,
@@ -1590,6 +1643,10 @@ impl ArrElem {
             ArrElem::Char => "_char",
             ArrElem::Int4 => "_int4",
             ArrElem::Oid => "_oid",
+            ArrElem::Xid => "_xid",
+            ArrElem::Xid8 => "_xid8",
+            ArrElem::PgSnapshot => "_pg_snapshot",
+            ArrElem::TxidSnapshot => "_txid_snapshot",
             ArrElem::PgLsn => "_pg_lsn",
             ArrElem::Int8 => "_int8",
             ArrElem::Float8 => "_float8",
@@ -1672,6 +1729,10 @@ impl ArrElem {
             ArrElem::Char => "\"char\"[]",
             ArrElem::Int4 => "integer[]",
             ArrElem::Oid => "oid[]",
+            ArrElem::Xid => "xid[]",
+            ArrElem::Xid8 => "xid8[]",
+            ArrElem::PgSnapshot => "pg_snapshot[]",
+            ArrElem::TxidSnapshot => "txid_snapshot[]",
             ArrElem::PgLsn => "pg_lsn[]",
             ArrElem::Int8 => "bigint[]",
             ArrElem::Float8 => "double precision[]",
@@ -1761,6 +1822,9 @@ impl ArrElem {
             Datum::Int2(_) => ArrElem::Int2,
             Datum::Int4(_) => ArrElem::Int4,
             Datum::Oid(_) => ArrElem::Oid,
+            Datum::Xid8(_) => ArrElem::Xid8,
+            Datum::Snapshot { legacy: false, .. } => ArrElem::PgSnapshot,
+            Datum::Snapshot { legacy: true, .. } => ArrElem::TxidSnapshot,
             Datum::PgLsn(_) => ArrElem::PgLsn,
             Datum::Int8(_) => ArrElem::Int8,
             Datum::Float4(_) => ArrElem::Float4,
@@ -1824,7 +1888,10 @@ impl ArrElem {
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
             ColType::Oid => return Some(ArrElem::Oid),
-            ColType::Xid => return None,
+            ColType::Xid => return Some(ArrElem::Xid),
+            ColType::Xid8 => return Some(ArrElem::Xid8),
+            ColType::PgSnapshot => return Some(ArrElem::PgSnapshot),
+            ColType::TxidSnapshot => return Some(ArrElem::TxidSnapshot),
             ColType::PgLsn => return Some(ArrElem::PgLsn),
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
@@ -1887,6 +1954,10 @@ impl ArrElem {
             ArrElem::Char => ColType::Char,
             ArrElem::Int4 => ColType::Int4,
             ArrElem::Oid => ColType::Oid,
+            ArrElem::Xid => ColType::Xid,
+            ArrElem::Xid8 => ColType::Xid8,
+            ArrElem::PgSnapshot => ColType::PgSnapshot,
+            ArrElem::TxidSnapshot => ColType::TxidSnapshot,
             ArrElem::PgLsn => ColType::PgLsn,
             ArrElem::Int8 => ColType::Int8,
             ArrElem::Float8 => ColType::Float8,
@@ -1957,6 +2028,10 @@ impl ArrElem {
             ArrElem::Char => 1002,
             ArrElem::Int4 => 1007,
             ArrElem::Oid => oid::OID_ARRAY,
+            ArrElem::Xid => oid::XID_ARRAY,
+            ArrElem::Xid8 => oid::XID8_ARRAY,
+            ArrElem::PgSnapshot => oid::PG_SNAPSHOT_ARRAY,
+            ArrElem::TxidSnapshot => oid::TXID_SNAPSHOT_ARRAY,
             ArrElem::PgLsn => oid::PG_LSN_ARRAY,
             ArrElem::Int8 => 1016,
             ArrElem::Float8 => 1022,
@@ -2026,6 +2101,10 @@ impl ArrElem {
             ArrElem::Char => 126,
             ArrElem::Int4 => 1,
             ArrElem::Oid => 63,
+            ArrElem::Xid => 151,
+            ArrElem::Xid8 => 152,
+            ArrElem::PgSnapshot => 153,
+            ArrElem::TxidSnapshot => 154,
             ArrElem::PgLsn => 123,
             ArrElem::Int8 => 2,
             ArrElem::Float8 => 3,
@@ -2089,6 +2168,10 @@ impl ArrElem {
             126 => ArrElem::Char,
             1 => ArrElem::Int4,
             63 => ArrElem::Oid,
+            151 => ArrElem::Xid,
+            152 => ArrElem::Xid8,
+            153 => ArrElem::PgSnapshot,
+            154 => ArrElem::TxidSnapshot,
             123 => ArrElem::PgLsn,
             2 => ArrElem::Int8,
             3 => ArrElem::Float8,
@@ -2661,6 +2744,14 @@ pub enum Datum<'a> {
     /// PostgreSQL's unsigned object identifier. This is distinct from int4:
     /// its upper half is valid and must not be rendered or ordered as negative.
     Oid(u32),
+    /// Epoch-qualified transaction identity (`xid8`).
+    Xid8(u64),
+    /// Canonical PostgreSQL transaction snapshot binary payload. `legacy`
+    /// retains the distinct deprecated `txid_snapshot` type identity.
+    Snapshot {
+        value: super::snapshot::Snapshot<'a>,
+        legacy: bool,
+    },
     PgLsn(u64),
     Int8(i64),
     /// `real`/`float4`. The width is the type: an f32 holds exactly what
@@ -2828,6 +2919,9 @@ impl<'a> Datum<'a> {
             Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
             Datum::Oid(_) => oid::OID,
+            Datum::Xid8(_) => oid::XID8,
+            Datum::Snapshot { legacy: false, .. } => oid::PG_SNAPSHOT,
+            Datum::Snapshot { legacy: true, .. } => oid::TXID_SNAPSHOT,
             Datum::PgLsn(_) => oid::PG_LSN,
             Datum::Int8(_) => oid::INT8,
             Datum::Float4(_) => oid::FLOAT4,
@@ -3001,6 +3095,8 @@ impl fmt::Display for Datum<'_> {
             Datum::Int2(v) => write!(f, "{v}"),
             Datum::Int4(v) => write!(f, "{v}"),
             Datum::Oid(v) => write!(f, "{v}"),
+            Datum::Xid8(v) => write!(f, "{v}"),
+            Datum::Snapshot { value, .. } => write!(f, "{value}"),
             Datum::PgLsn(v) => write!(f, "{:X}/{:X}", v >> 32, v & u64::from(u32::MAX)),
             Datum::Int8(v) => write!(f, "{v}"),
             Datum::Float4(v) => write_pg_float4(f, *v),

@@ -195,7 +195,14 @@ pub(crate) fn next_cached(
         session.record_nextval(slot, sequence.created_at, value);
         return Ok(value);
     }
-    let (value, reserved) = storage.reserve_sequence_values(slot, txid, sequence.cache)?;
+    let (value, reserved, prelogged) =
+        storage.reserve_sequence_values(slot, txid, sequence.cache)?;
+    // PostgreSQL assigns a full XID only when nextval must emit a sequence WAL
+    // record. Values covered by the sequence's prelogged range do not assign
+    // one, even though the durable absolute position still advances here.
+    if prelogged {
+        storage.assign_transaction_identity(txid);
+    }
     session.store_cache(slot, value, reserved, &sequence);
     session.record_nextval(slot, sequence.created_at, value);
     Ok(value)
@@ -247,6 +254,7 @@ impl SequenceAccess for SeqEval<'_> {
         let result = self
             .storage
             .set_sequence_value(slot, self.txid, value, is_called)?;
+        self.storage.assign_transaction_identity(self.txid);
         self.session.record_setval(slot, seq.created_at, value);
         Ok(result)
     }

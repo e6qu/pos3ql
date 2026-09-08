@@ -43,6 +43,27 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::PgDdlCommand => v,
             _ => return Err(cast_unsupported(&v, "pg_ddl_command")),
         },
+        ColType::Xid8 => match v {
+            Datum::Xid8(_) => v,
+            Datum::Text(text) => {
+                Datum::Xid8(text.parse::<u64>().map_err(|_| bad_text(text, "xid8"))?)
+            }
+            _ => return Err(cast_unsupported(&v, "xid8")),
+        },
+        ColType::PgSnapshot | ColType::TxidSnapshot => {
+            let legacy = target == ColType::TxidSnapshot;
+            match v {
+                Datum::Snapshot {
+                    value: _,
+                    legacy: source,
+                } if source == legacy => v,
+                Datum::Text(text) => Datum::Snapshot {
+                    value: crate::sql::snapshot::Snapshot::from_text(text, arena)?,
+                    legacy,
+                },
+                _ => return Err(cast_unsupported(&v, target.name())),
+            }
+        }
         // A cast *to* record has no source but a record itself; PostgreSQL
         // has no input conversion for anonymous records either.
         ColType::Record => match v {
@@ -188,6 +209,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         }
         ColType::Oid | ColType::Xid => match v {
             Datum::Oid(_) => v,
+            Datum::Xid8(value) if target == ColType::Xid => Datum::Oid(value as u32),
             Datum::Bit { bits, .. } => Datum::Oid(bits_to_uint(bits, 32, target.name())? as u32),
             Datum::Text(s) => Datum::Oid(parse_oid(s)?),
             Datum::RegObject { referenced_oid, .. } => Datum::Oid(referenced_oid as u32),

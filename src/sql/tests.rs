@@ -2826,6 +2826,471 @@ fn prepared_transactions_commit_rollback_catalog_and_lock_contracts() {
 }
 
 #[test]
+fn transaction_identity_types_functions_catalogs_and_storage_match_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let create = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE transaction_identity_values (
+             id xid8 PRIMARY KEY,
+             modern pg_snapshot NOT NULL,
+             legacy txid_snapshot NOT NULL,
+             ids xid8[] NOT NULL,
+             snapshots pg_snapshot[] NOT NULL
+         )",
+    );
+    assert!(
+        !message_types(&create).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&create)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         SELECT pg_current_xact_id_if_assigned() IS NULL,
+                txid_current_if_assigned() IS NULL;
+         SELECT pg_current_xact_id() IS NOT NULL;
+         INSERT INTO transaction_identity_values
+         SELECT pg_current_xact_id_if_assigned(), pg_current_snapshot(),
+                txid_current_snapshot(),
+                ARRAY[pg_current_xact_id_if_assigned(), '1'::xid8],
+                ARRAY[pg_current_snapshot()];
+         COMMIT",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t|t", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let stored = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_typeof(id), pg_typeof(modern), pg_typeof(legacy),
+                pg_typeof(ids), pg_typeof(snapshots),
+                pg_snapshot_xmin(modern) = id,
+                pg_snapshot_xmax(modern) > id,
+                pg_visible_in_snapshot(id, modern), age(id::xid) >= 0,
+                pg_xact_status(id), txid_status(id::text::bigint),
+                modern::text = modern::text::pg_snapshot::text,
+                legacy::text = legacy::text::txid_snapshot::text,
+                ids::text, snapshots::text
+           FROM transaction_identity_values",
+    );
+    assert_eq!(
+        data_rows(&stored),
+        [
+            "xid8|pg_snapshot|txid_snapshot|xid8[]|pg_snapshot[]|t|f|f|t|committed|committed|t|t|{3,1}|{3:3:}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&stored)
+    );
+
+    let set_values = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value, pg_typeof(value)
+           FROM pg_snapshot_xip('10:20:11,14'::pg_snapshot) AS value;
+         SELECT txid_snapshot_xip('10:20:11,14'::txid_snapshot)",
+    );
+    assert_eq!(
+        data_rows(&set_values),
+        ["11|xid8", "14|xid8", "11", "14"],
+        "{}",
+        String::from_utf8_lossy(&set_values)
+    );
+    let operators = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT '18446744073709551615'::xid8 > '9223372036854775807'::xid8,
+                ('4294967297'::xid8)::xid::text",
+    );
+    assert_eq!(
+        data_rows(&operators),
+        ["t|1"],
+        "{}",
+        String::from_utf8_lossy(&operators)
+    );
+
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, proname, prorettype, proretset, provolatile, proparallel,
+                proargtypes::text, prorows
+           FROM pg_proc
+          WHERE oid IN (1181,2943,3348,2944,2945,2946,2947,2948,3360,
+                        5059,5060,5061,5062,5063,5064,5065,5066)
+          ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&catalog).len(),
+        17,
+        "{}",
+        String::from_utf8_lossy(&catalog)
+    );
+    let index_catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, opcname, opcmethod, opcfamily, opcintype, opcdefault
+           FROM pg_opclass WHERE oid = 10053;
+         SELECT oid, opfname, opfmethod FROM pg_opfamily WHERE oid = 5067;
+         SELECT amopstrategy, amopopr FROM pg_amop
+          WHERE amopfamily = 5067 ORDER BY amopstrategy;
+         SELECT amprocnum, amproc::text FROM pg_amproc
+          WHERE amprocfamily = 5067 ORDER BY amprocnum;
+         SELECT oid, oprcanmerge, oprcanhash, oprcom, oprnegate,
+                oprrest::text, oprjoin::text
+           FROM pg_operator
+          WHERE oid IN (5068,5072,5073,5074,5075,5076) ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&index_catalog),
+        [
+            "10053|xid8_ops|403|5067|5069|t",
+            "5067|xid8_ops|403",
+            "1|5073",
+            "2|5075",
+            "3|5068",
+            "4|5076",
+            "5|5074",
+            "1|xid8cmp",
+            "4|btequalimage",
+            "5068|t|t|5068|5072|eqsel|eqjoinsel",
+            "5072|f|f|5072|5068|neqsel|neqjoinsel",
+            "5073|f|f|5074|5076|scalarltsel|scalarltjoinsel",
+            "5074|f|f|5073|5075|scalargtsel|scalargtjoinsel",
+            "5075|f|f|5076|5074|scalarlesel|scalarlejoinsel",
+            "5076|f|f|5075|5073|scalargesel|scalargejoinsel",
+        ],
+        "{}",
+        String::from_utf8_lossy(&index_catalog)
+    );
+
+    for invalid in [
+        "SELECT '10:9:'::pg_snapshot",
+        "SELECT '10:20:14,13'::pg_snapshot",
+        "SELECT '10:20:20'::txid_snapshot",
+    ] {
+        let response = run_with(&mut engine, &mut budget, invalid);
+        assert!(
+            String::from_utf8_lossy(&response).contains("22P02"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+}
+
+#[test]
+fn prepared_transaction_identity_is_in_progress_until_resolution() {
+    let mut config = test_config("prepared-transaction-status");
+    config.max_prepared_transactions = 1;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("prepared-transaction-status-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE identity_prepared_marker(id integer)",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    let empty = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         SELECT pg_current_xact_id_if_assigned() IS NULL;
+         PREPARE TRANSACTION 'identity-empty';
+         SELECT count(*), pg_xact_status(transaction::text::xid8)
+           FROM pg_prepared_xacts WHERE gid = 'identity-empty'
+          GROUP BY transaction",
+    );
+    assert_eq!(
+        data_rows(&empty),
+        ["t", "1|in progress"],
+        "{}",
+        String::from_utf8_lossy(&empty)
+    );
+    let empty_transaction_id = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT transaction::text FROM pg_prepared_xacts WHERE gid='identity-empty'",
+    ))
+    .pop()
+    .expect("empty prepared transaction identity");
+    let empty_rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK PREPARED 'identity-empty'",
+    );
+    assert!(!message_types(&empty_rollback).contains(&b'E'));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT pg_xact_status('{empty_transaction_id}'::xid8)"),
+        )),
+        ["aborted"]
+    );
+    let prepared = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         SELECT pg_current_xact_id_if_assigned() IS NULL;
+         INSERT INTO identity_prepared_marker VALUES (1);
+         SELECT pg_current_xact_id_if_assigned() IS NOT NULL;
+         PREPARE TRANSACTION 'identity-in-progress'",
+    );
+    assert_eq!(
+        data_rows(&prepared),
+        ["t", "t"],
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_current_xact_id() IS NOT NULL",
+        )),
+        ["t"]
+    );
+    let visible = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_xact_status(transaction::text::xid8),
+                pg_snapshot_xip(pg_current_snapshot()) = transaction::text::xid8
+           FROM pg_prepared_xacts
+          WHERE gid = 'identity-in-progress'",
+    );
+    assert_eq!(
+        data_rows(&visible),
+        ["in progress|t"],
+        "{}",
+        String::from_utf8_lossy(&visible)
+    );
+    let transaction_id = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT transaction::text FROM pg_prepared_xacts WHERE gid='identity-in-progress'",
+    ))
+    .pop()
+    .expect("prepared transaction identity");
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SELECT pg_xact_status('{transaction_id}'::xid8),
+                        pg_snapshot_xip(pg_current_snapshot()) = '{transaction_id}'::xid8"
+            ),
+        )),
+        ["in progress|t"]
+    );
+    let committed = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMIT PREPARED 'identity-in-progress'",
+    );
+    assert!(!message_types(&committed).contains(&b'E'));
+    let resolved = run_with(
+        &mut engine,
+        &mut budget,
+        &format!("SELECT pg_xact_status('{transaction_id}'::xid8)"),
+    );
+    assert_eq!(
+        data_rows(&resolved),
+        ["committed"],
+        "{}",
+        String::from_utf8_lossy(&resolved)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn transaction_identities_and_statuses_survive_object_cold_recovery() {
+    let mut config = test_config("transaction-identity-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace =
+        format!("transaction-identity-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_transaction_identity (
+             id xid8 PRIMARY KEY,
+             snap pg_snapshot NOT NULL,
+             identities xid8[] NOT NULL,
+             snapshots txid_snapshot[] NOT NULL
+         )",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO durable_transaction_identity
+         SELECT pg_current_xact_id(), pg_current_snapshot(),
+                ARRAY[pg_current_xact_id(), '99'::xid8],
+                ARRAY[txid_current_snapshot()]",
+    );
+    assert!(
+        !message_types(&inserted).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    let committed_id = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id::text FROM durable_transaction_identity",
+    ))
+    .pop()
+    .expect("committed transaction identity");
+    let aborted = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; SELECT pg_current_xact_id()::text; ROLLBACK",
+    );
+    let aborted_id = data_rows(&aborted)
+        .pop()
+        .expect("aborted transaction identity");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SELECT pg_xact_status('{committed_id}'::xid8), pg_xact_status('{aborted_id}'::xid8)"
+            ),
+        )),
+        ["committed|aborted"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        &format!(
+            "SELECT id::text, snap::text, identities::text, snapshots::text,
+                    pg_xact_status(id),
+                    pg_xact_status('{aborted_id}'::xid8),
+                    pg_current_xact_id() > id
+               FROM durable_transaction_identity"
+        ),
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), 1, "{}", String::from_utf8_lossy(&output));
+    let fields: Vec<_> = rows[0].split('|').collect();
+    assert_eq!(fields[0], committed_id);
+    assert!(fields[1].ends_with(':'));
+    assert!(fields[2].contains("99"));
+    assert!(fields[3].contains(':'));
+    assert_eq!(&fields[4..], ["committed", "aborted", "t"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn unassigned_wal_transactions_stay_full_xid_gaps_after_cold_recovery() {
+    let mut config = test_config("unassigned-transaction-identity-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!(
+        "unassigned-transaction-identity-recovery-{}",
+        std::process::id()
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE transaction_identity_gap_sequence",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    let first_advance = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         SELECT pg_current_xact_id_if_assigned() IS NULL;
+         SELECT nextval('transaction_identity_gap_sequence');
+         SELECT pg_current_xact_id_if_assigned() IS NOT NULL;
+         COMMIT",
+    );
+    assert_eq!(data_rows(&first_advance), ["t", "1", "t"]);
+    let prelogged_advance = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         SELECT pg_current_xact_id_if_assigned() IS NULL;
+         SELECT nextval('transaction_identity_gap_sequence');
+         SELECT pg_current_xact_id_if_assigned() IS NULL;
+         COMMIT",
+    );
+    assert_eq!(data_rows(&prelogged_advance), ["t", "2", "t"]);
+    let gap = engine.next_txid;
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT pg_xact_status('{gap}'::xid8) IS NULL"),
+        )),
+        ["t"]
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            &format!(
+                "SELECT pg_xact_status('{gap}'::xid8) IS NULL,
+                        nextval('transaction_identity_gap_sequence')"
+            ),
+        )),
+        ["t|3"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn prepare_transaction_is_strictly_configured_and_eligible() {
     assert!(ast::PreparedTransactionId::parse("").is_some());
     assert!(ast::PreparedTransactionId::parse(&"g".repeat(199)).is_some());
@@ -2955,7 +3420,8 @@ fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
     let prepared = run_with_guc(
         &mut engine,
         &mut budget,
-        "BEGIN; PREPARE TRANSACTION 'database-bound'",
+        "BEGIN; SELECT pg_current_xact_id() IS NOT NULL; \
+         PREPARE TRANSACTION 'database-bound'",
         1 << 18,
         &mut guc,
     );
@@ -5438,7 +5904,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
         "CREATE TABLE operator_class_index(value integer)",
         "CREATE INDEX operator_class_index_idx ON operator_class_index (value public.int_class)",
         "SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype",
-        "SELECT count(*) FROM pg_cast; SELECT count(*) FROM pg_operator WHERE oprname='==='; SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; SELECT count(*) FROM pg_amop WHERE amopstrategy=3; SELECT count(*) FROM pg_amproc WHERE amprocnum=1",
+        "SELECT count(*) FROM pg_cast; SELECT count(*) FROM pg_operator WHERE oprname='==='; SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amopstrategy=3; SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1",
         "SELECT 1 === 1, 1 OPERATOR(public.===) 2",
         "BEGIN; ALTER OPERATOR CLASS public.int_class USING btree RENAME TO abandoned; ROLLBACK",
         "ALTER OPERATOR CLASS public.int_class USING btree RENAME TO int_class_renamed",
@@ -5977,8 +6443,8 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
         SELECT count(*) FROM pg_operator WHERE oprname='==='; \
         SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; \
         SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; \
-        SELECT count(*) FROM pg_amop WHERE amopstrategy=3; \
-        SELECT count(*) FROM pg_amproc WHERE amprocnum=1; \
+        SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amopstrategy=3; \
+        SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1; \
         SELECT count(*) FROM pg_depend WHERE classid='pg_class'::regclass AND objid='catalog_index_values_mod10'::regclass AND refclassid='pg_opclass'::regclass; \
         SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast; \
         SELECT obj_description(oid, 'pg_cast') FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype; \
@@ -8543,7 +9009,7 @@ fn pg_lsn_is_a_cataloged_storable_indexable_binary_safe_type() {
     assert_eq!(
         data_rows(&output),
         [
-            "28|xid|4|U|0|0",
+            "28|xid|4|U|1011|0",
             "3220|pg_lsn|8|U|3221|0",
             "3221|_pg_lsn|-1|A|0|3220",
             "0/FF|{}|pg_lsn|pg_lsn[]",

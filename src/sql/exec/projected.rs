@@ -135,6 +135,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Float4(_) => 4,
         Datum::Int4(_) | Datum::Oid(_) | Datum::Date(_) => 4,
         Datum::Int8(_)
+        | Datum::Xid8(_)
         | Datum::PgLsn(_)
         | Datum::Float8(_)
         | Datum::Timestamp(_)
@@ -153,6 +154,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::RegObject { name, .. } => 12 + name.len(),
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::JsonPath(text) => 4 + text.len(),
+        Datum::Snapshot { value, .. } => 5 + value.raw().len(),
         Datum::Array { raw, .. } => 8 + raw.len(),
         Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
@@ -234,6 +236,18 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 35;
             out[1..5].copy_from_slice(&x.to_le_bytes());
             5
+        }
+        Datum::Xid8(x) => {
+            out[0] = 44;
+            out[1..9].copy_from_slice(&x.to_le_bytes());
+            9
+        }
+        Datum::Snapshot { value, legacy } => {
+            out[0] = 45;
+            out[1] = u8::from(*legacy);
+            out[2..6].copy_from_slice(&(value.raw().len() as u32).to_le_bytes());
+            out[6..6 + value.raw().len()].copy_from_slice(value.raw());
+            6 + value.raw().len()
         }
         Datum::PgLsn(x) => {
             out[0] = 41;
@@ -566,6 +580,22 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             Datum::Oid(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
             4,
         ),
+        44 => (
+            Datum::Xid8(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
+            8,
+        ),
+        45 => {
+            let legacy = bytes[at] != 0;
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            (
+                Datum::Snapshot {
+                    value: crate::sql::snapshot::Snapshot::restore(&bytes[at + 5..at + 5 + len])
+                        .expect("projected snapshot was validated before encoding"),
+                    legacy,
+                },
+                5 + len,
+            )
+        }
         41 => (
             Datum::PgLsn(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
             8,

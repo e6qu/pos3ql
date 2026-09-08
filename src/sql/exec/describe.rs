@@ -3246,6 +3246,20 @@ pub fn infer_type_res(
                 (crate::sql::types::ArrElem::Text.array_oid(), -1)
             }
             "pg_typeof" => (oid::REGTYPE, 4),
+            "pg_current_xact_id"
+            | "pg_current_xact_id_if_assigned"
+            | "pg_snapshot_xmin"
+            | "pg_snapshot_xmax" => of(ColType::Xid8),
+            "txid_current"
+            | "txid_current_if_assigned"
+            | "txid_snapshot_xmin"
+            | "txid_snapshot_xmax"
+            | "txid_snapshot_xip" => of(ColType::Int8),
+            "pg_current_snapshot" => of(ColType::PgSnapshot),
+            "txid_current_snapshot" => of(ColType::TxidSnapshot),
+            "pg_snapshot_xip" => of(ColType::Xid8),
+            "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => of(ColType::Bool),
+            "pg_xact_status" | "txid_status" => of(ColType::Text),
             "to_regclass" => (oid::REGCLASS, 4),
             "pg_event_trigger_table_rewrite_oid" => (oid::OID, 4),
             "pg_my_temp_schema" => (oid::OID, 4),
@@ -3849,6 +3863,9 @@ pub fn infer_type_res(
                 } else {
                     of(ColType::Timestamp)
                 }
+            }
+            "age" if args.len() == 1 && infer_type_res(args[0], columns)?.0 == oid::XID => {
+                of(ColType::Int4)
             }
             "age" | "justify_hours" | "justify_days" | "justify_interval" | "make_interval" => {
                 of(ColType::Interval)

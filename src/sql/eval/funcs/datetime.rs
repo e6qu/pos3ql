@@ -467,6 +467,25 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "age" => {
+                if args.len() == 1
+                    && crate::sql::eval::static_type_pub(args[0], row) == Some(ColType::Xid)
+                {
+                    let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
+                        Datum::Oid(value) => value,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => return Err(type_mismatch(name, &other)),
+                    };
+                    return hooks
+                        .catalog
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "transaction identity access is unavailable"
+                            )
+                        })?
+                        .transaction_id_age(transaction_id)
+                        .map(Datum::Int4);
+                }
                 // `age(a, b)` is the symbolic interval a - b; `age(a)` measures from
                 // the current date at midnight.
                 if args.len() != 1 && args.len() != 2 || star {

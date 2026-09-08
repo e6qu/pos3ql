@@ -349,6 +349,7 @@ fn binary_value_len(value: &Datum) -> usize {
         | Datum::Date(_)
         | Datum::Float4(_) => 4,
         Datum::Int8(_)
+        | Datum::Xid8(_)
         | Datum::PgLsn(_)
         | Datum::Timestamp(_)
         | Datum::Timestamptz(_)
@@ -369,6 +370,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Bytea(bytes) => bytes.len(),
         Datum::Json { text, jsonb } => text.len().saturating_add(usize::from(*jsonb)),
         Datum::JsonPath(text) => 1usize.saturating_add(text.len()),
+        Datum::Snapshot { value, .. } => value.raw().len(),
         Datum::Range { text, .. } | Datum::Multirange { text, .. } => text.len(),
         Datum::Geometry { kind, text } => {
             crate::sql::geometry::binary_len(*kind, text).expect("geometry datum is canonical")
@@ -1296,6 +1298,14 @@ impl<'b> Responder<'b> {
                     m.i32(4);
                     m.bytes(&x.to_be_bytes());
                 }
+                Datum::Xid8(x) => {
+                    m.i32(8);
+                    m.bytes(&x.to_be_bytes());
+                }
+                Datum::Snapshot { value, .. } => {
+                    m.i32(value.raw().len() as i32);
+                    m.bytes(value.raw());
+                }
                 Datum::PgLsn(x) => {
                     m.i32(8);
                     m.bytes(&x.to_be_bytes());
@@ -2051,6 +2061,30 @@ mod tests {
         Responder::encode_value_binary(&mut binary, &Datum::Char(0xff));
         binary.finish().unwrap();
         assert_eq!(buffer.readable(), &[b'd', 0, 0, 0, 9, 0, 0, 0, 1, 0xff]);
+    }
+
+    #[test]
+    fn binary_transaction_identity_results_use_postgresql_network_format() {
+        let mut arena_budget = Budget::new(4096);
+        let arena = Arena::new(&mut arena_budget, "transaction identity result", 1024).unwrap();
+        let snapshot = crate::sql::snapshot::Snapshot::from_text("10:20:11,14", &arena).unwrap();
+        let mut budget = Budget::new(4096);
+        let mut buffer = FixedBuf::new(&mut budget, "transaction identity result", 256).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(&mut message, &Datum::Xid8(u64::MAX));
+        Responder::encode_value_binary(
+            &mut message,
+            &Datum::Snapshot {
+                value: snapshot,
+                legacy: false,
+            },
+        );
+        message.finish().unwrap();
+        let bytes = buffer.readable();
+        assert_eq!(&bytes[5..9], &8i32.to_be_bytes());
+        assert_eq!(&bytes[9..17], &u64::MAX.to_be_bytes());
+        assert_eq!(&bytes[17..21], &36i32.to_be_bytes());
+        assert_eq!(&bytes[21..], snapshot.raw());
     }
 
     #[test]

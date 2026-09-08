@@ -2052,6 +2052,11 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         | ColType::PgMcvList
         | ColType::PgStatisticArray => Datum::Text(""),
         ColType::Oid | ColType::Xid => Datum::Oid(0),
+        ColType::Xid8 => Datum::Xid8(0),
+        ColType::PgSnapshot | ColType::TxidSnapshot => Datum::Snapshot {
+            value: crate::sql::snapshot::WITNESS,
+            legacy: ct == ColType::TxidSnapshot,
+        },
         ColType::PgLsn => Datum::PgLsn(0),
         ColType::Regtype => Datum::Regtype {
             referenced_oid: 0,

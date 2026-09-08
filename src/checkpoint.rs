@@ -1317,6 +1317,7 @@ impl Checkpointer {
         }
         let mut lsn = 0u64;
         let mut next_rowid = 1u64;
+        let mut latest_transaction_id = None;
         let mut saw_large_object_allocator = false;
         // manifest table index → live slot index
         let mut slot_of: Vec<Option<usize>> = Vec::new();
@@ -1357,6 +1358,36 @@ impl Checkpointer {
                 }
                 Some("next_rowid") => {
                     next_rowid = parse_field(words.next(), "next_rowid")?;
+                }
+                Some("latest_transaction_id") => {
+                    if latest_transaction_id.is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate transaction identity allocator",
+                        ));
+                    }
+                    latest_transaction_id =
+                        Some(parse_field(words.next(), "latest_transaction_id")?);
+                }
+                Some("transaction_status") => {
+                    let transaction_id = parse_field(words.next(), "transaction_status")?;
+                    let committed = match words.next() {
+                        Some("committed") => true,
+                        Some("aborted") => false,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid retained transaction status",
+                            ));
+                        }
+                    };
+                    if words.next().is_some()
+                        || storage
+                            .restore_transaction_status(transaction_id, committed)
+                            .is_err()
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid retained transaction status",
+                        ));
+                    }
                 }
                 Some("next_lo_oid") => {
                     if saw_large_object_allocator {
@@ -5779,6 +5810,9 @@ impl Checkpointer {
         if next_rowid > 0 {
             storage.observe_rowid(next_rowid - 1);
         }
+        if let Some(transaction_id) = latest_transaction_id {
+            storage.observe_transaction_identity(transaction_id);
+        }
         self.manifest_lsn = lsn;
         Ok(lsn)
     }
@@ -6056,6 +6090,27 @@ impl Checkpointer {
             &mut self.manifest_buf,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
+        write_manifest(
+            &mut self.manifest_buf,
+            format_args!(
+                "latest_transaction_id {}",
+                storage.latest_transaction_identity()
+            ),
+        )?;
+        let mut status_result = Ok(());
+        storage.visit_recent_transaction_statuses(|transaction_id, committed| {
+            if status_result.is_ok() {
+                status_result = write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "transaction_status {} {}",
+                        transaction_id,
+                        if committed { "committed" } else { "aborted" }
+                    ),
+                );
+            }
+        });
+        status_result?;
         match storage.next_large_object_oid() {
             Some(oid) => write_manifest(
                 &mut self.manifest_buf,
@@ -12186,7 +12241,10 @@ mod stored_dependency_tests {
         );
         assert!(matches!(
             crate::wal::decode_record(&frame[16..]),
-            Some(crate::wal::WalOp::Commit { transaction_id: 9 })
+            Some(crate::wal::WalOp::Commit {
+                transaction_id: 9,
+                assigned_transaction_identity: false,
+            })
         ));
     }
 

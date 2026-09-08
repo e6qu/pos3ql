@@ -347,6 +347,7 @@ fn binary_value_len(value: &Datum) -> usize {
         | Datum::Date(_)
         | Datum::Float4(_) => 4,
         Datum::Int8(_)
+        | Datum::PgLsn(_)
         | Datum::Timestamp(_)
         | Datum::Timestamptz(_)
         | Datum::Time(_)
@@ -1268,6 +1269,10 @@ impl<'b> Responder<'b> {
                 }
                 Datum::Oid(x) => {
                     m.i32(4);
+                    m.bytes(&x.to_be_bytes());
+                }
+                Datum::PgLsn(x) => {
+                    m.i32(8);
                     m.bytes(&x.to_be_bytes());
                 }
                 Datum::Regtype { referenced_oid, .. } => {

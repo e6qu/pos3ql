@@ -794,6 +794,29 @@ impl SubscriptionApply {
                 )?;
                 Ok(ApplyResult::None)
             }
+            Message::LogicalMessage {
+                xid, transactional, ..
+            } => {
+                if xid.is_some() {
+                    self.require_message_xid(xid)?;
+                }
+                if transactional
+                    && !matches!(
+                        self.remote,
+                        RemoteTransaction::Applying { .. }
+                            | RemoteTransaction::Skipping { .. }
+                            | RemoteTransaction::Streaming {
+                                segment_open: true,
+                                ..
+                            }
+                    )
+                {
+                    return Err(Self::protocol_error(
+                        "subscription transactional MESSAGE is outside BEGIN/COMMIT",
+                    ));
+                }
+                Ok(ApplyResult::None)
+            }
             Message::StreamStart { xid, first_segment } => {
                 match self.remote {
                     RemoteTransaction::Idle if first_segment => {

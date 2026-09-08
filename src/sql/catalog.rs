@@ -143,6 +143,86 @@ struct IntrinsicRoutine {
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
+        oid: 3577,
+        name: "pg_logical_emit_message",
+        result_oid: super::types::oid::PG_LSN,
+        argument_types: "16 25 25 16",
+        argument_count: 4,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3578,
+        name: "pg_logical_emit_message",
+        result_oid: super::types::oid::PG_LSN,
+        argument_types: "16 25 17 16",
+        argument_count: 4,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3786,
+        name: "pg_create_logical_replication_slot",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "19 19 16 16 16",
+        argument_count: 5,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3780,
+        name: "pg_drop_replication_slot",
+        result_oid: super::types::oid::VOID,
+        argument_types: "19",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 4222,
+        name: "pg_copy_logical_replication_slot",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "19 19 16 19",
+        argument_count: 4,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 4223,
+        name: "pg_copy_logical_replication_slot",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "19 19 16",
+        argument_count: 3,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 4224,
+        name: "pg_copy_logical_replication_slot",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "19 19",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3878,
+        name: "pg_replication_slot_advance",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "19 3220",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 6170,
+        name: "pg_stat_reset_replication_slot",
+        result_oid: super::types::oid::VOID,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 6232,
+        name: "pg_stat_reset_subscription_stats",
+        result_oid: super::types::oid::VOID,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
         oid: 540_000,
         name: "postgres_fdw_handler",
         result_oid: super::types::oid::FDW_HANDLER,
@@ -969,13 +1049,18 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
-    !matches!(routine.oid, 1081 | 2078 | 3566 | 4568)
+    !matches!(routine.oid, 1081 | 2078 | 3566 | 4568 | 6170 | 6232)
+}
+
+fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
+    matches!(routine.oid, 6119 | 4568 | 3566)
 }
 
 fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
         715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
-        | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 1402 | 1403 | 2078 | 3086 | 6119 | 6120 => "u",
+        | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
+        | 4223 | 4224 | 1402 | 1403 | 2078 | 3086 | 6119 | 6120 => "u",
         1641 | 3566 | 4568 => "r",
         _ => "s",
     }
@@ -1010,6 +1095,9 @@ const DROPPED_OBJECT_OUTPUT_NAMES: &[&str] = &[
 ];
 const PUBLICATION_TABLE_OUTPUT_OIDS: &[i32] = &[26, 26, 22, 194];
 const PUBLICATION_TABLE_OUTPUT_NAMES: &[&str] = &["pubid", "relid", "attrs", "qual"];
+const LOGICAL_SLOT_OUTPUT_OIDS: &[i32] = &[19, super::types::oid::PG_LSN];
+const LOGICAL_SLOT_OUTPUT_NAMES: &[&str] = &["slot_name", "lsn"];
+const LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES: &[&str] = &["slot_name", "end_lsn"];
 
 fn intrinsic_record_outputs(
     routine: IntrinsicRoutine,
@@ -1021,6 +1109,8 @@ fn intrinsic_record_outputs(
         )),
         4568 => Some((DDL_COMMAND_OUTPUT_OIDS, DDL_COMMAND_OUTPUT_NAMES)),
         3566 => Some((DROPPED_OBJECT_OUTPUT_OIDS, DROPPED_OBJECT_OUTPUT_NAMES)),
+        3786 | 4222 | 4223 | 4224 => Some((LOGICAL_SLOT_OUTPUT_OIDS, LOGICAL_SLOT_OUTPUT_NAMES)),
+        3878 => Some((LOGICAL_SLOT_OUTPUT_OIDS, LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES)),
         _ => None,
     }
 }
@@ -1131,8 +1221,12 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_extension", 3079),
     ("pg_default_acl", 826),
     ("pg_parameter_acl", 6243),
-    ("pg_replication_slots", 121),
+    ("pg_replication_slots", 12261),
+    ("pg_stat_replication", 12231),
+    ("pg_stat_replication_slots", 12266),
     ("pg_subscription", 6107),
+    ("pg_stat_subscription", 12248),
+    ("pg_stat_subscription_stats", 12347),
     ("pg_transform", 3576),
 ];
 
@@ -1231,8 +1325,12 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_publication_tables"
                 | "pg_publication_namespace"
                 | "pg_replication_slots"
+                | "pg_stat_replication"
+                | "pg_stat_replication_slots"
                 | "pg_subscription"
                 | "pg_subscription_rel"
+                | "pg_stat_subscription"
+                | "pg_stat_subscription_stats"
                 | "pg_foreign_table"
                 | "pg_foreign_server"
                 | "pg_user_mapping"
@@ -1311,8 +1409,12 @@ pub fn synthesize<'a>(
         (false, "pg_publication_rel") => pg_publication_rel(storage, txid, arena),
         (false, "pg_publication_tables") => pg_publication_tables(storage, txid, arena),
         (false, "pg_replication_slots") => pg_replication_slots(storage, arena),
+        (false, "pg_stat_replication") => pg_stat_replication(storage, arena),
+        (false, "pg_stat_replication_slots") => pg_stat_replication_slots(storage, arena),
         (false, "pg_subscription") => pg_subscription(storage, txid, arena),
         (false, "pg_subscription_rel") => pg_subscription_rel(storage, txid, arena),
+        (false, "pg_stat_subscription") => pg_stat_subscription(storage, txid, arena),
+        (false, "pg_stat_subscription_stats") => pg_stat_subscription_stats(storage, txid, arena),
         (false, "pg_inherits") => pg_inherits(storage, txid, arena),
         (false, "pg_rewrite") => pg_rewrite(storage, txid, arena),
         (false, "pg_trigger") => pg_trigger(storage, txid, arena),
@@ -7983,36 +8085,227 @@ fn pg_publication_tables<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+const PG_REPLICATION_SLOTS_COLUMNS: &[(&str, ColType)] = &[
+    ("slot_name", ColType::Name),
+    ("plugin", ColType::Name),
+    ("slot_type", ColType::Text),
+    ("datoid", ColType::Oid),
+    ("database", ColType::Name),
+    ("temporary", ColType::Bool),
+    ("active", ColType::Bool),
+    ("active_pid", ColType::Int4),
+    ("xmin", ColType::Xid),
+    ("catalog_xmin", ColType::Xid),
+    ("restart_lsn", ColType::PgLsn),
+    ("confirmed_flush_lsn", ColType::PgLsn),
+    ("wal_status", ColType::Text),
+    ("safe_wal_size", ColType::Int8),
+    ("two_phase", ColType::Bool),
+    ("two_phase_at", ColType::PgLsn),
+    ("inactive_since", ColType::Timestamptz),
+    ("conflicting", ColType::Bool),
+    ("invalidation_reason", ColType::Text),
+    ("failover", ColType::Bool),
+    ("synced", ColType::Bool),
+];
+
+const PG_STAT_REPLICATION_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("usesysid", ColType::Oid),
+    ("usename", ColType::Name),
+    ("application_name", ColType::Text),
+    ("client_addr", ColType::Inet),
+    ("client_hostname", ColType::Text),
+    ("client_port", ColType::Int4),
+    ("backend_start", ColType::Timestamptz),
+    ("backend_xmin", ColType::Xid),
+    ("state", ColType::Text),
+    ("sent_lsn", ColType::PgLsn),
+    ("write_lsn", ColType::PgLsn),
+    ("flush_lsn", ColType::PgLsn),
+    ("replay_lsn", ColType::PgLsn),
+    ("write_lag", ColType::Interval),
+    ("flush_lag", ColType::Interval),
+    ("replay_lag", ColType::Interval),
+    ("sync_priority", ColType::Int4),
+    ("sync_state", ColType::Text),
+    ("reply_time", ColType::Timestamptz),
+];
+
+const PG_STAT_REPLICATION_SLOTS_COLUMNS: &[(&str, ColType)] = &[
+    ("slot_name", ColType::Text),
+    ("spill_txns", ColType::Int8),
+    ("spill_count", ColType::Int8),
+    ("spill_bytes", ColType::Int8),
+    ("stream_txns", ColType::Int8),
+    ("stream_count", ColType::Int8),
+    ("stream_bytes", ColType::Int8),
+    ("total_txns", ColType::Int8),
+    ("total_bytes", ColType::Int8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+const PG_STAT_SUBSCRIPTION_COLUMNS: &[(&str, ColType)] = &[
+    ("subid", ColType::Oid),
+    ("subname", ColType::Name),
+    ("worker_type", ColType::Text),
+    ("pid", ColType::Int4),
+    ("leader_pid", ColType::Int4),
+    ("relid", ColType::Oid),
+    ("received_lsn", ColType::PgLsn),
+    ("last_msg_send_time", ColType::Timestamptz),
+    ("last_msg_receipt_time", ColType::Timestamptz),
+    ("latest_end_lsn", ColType::PgLsn),
+    ("latest_end_time", ColType::Timestamptz),
+];
+
+const PG_STAT_SUBSCRIPTION_STATS_COLUMNS: &[(&str, ColType)] = &[
+    ("subid", ColType::Oid),
+    ("subname", ColType::Name),
+    ("apply_error_count", ColType::Int8),
+    ("sync_error_count", ColType::Int8),
+    ("confl_insert_exists", ColType::Int8),
+    ("confl_update_origin_differs", ColType::Int8),
+    ("confl_update_exists", ColType::Int8),
+    ("confl_update_missing", ColType::Int8),
+    ("confl_delete_origin_differs", ColType::Int8),
+    ("confl_delete_missing", ColType::Int8),
+    ("confl_multiple_unique_conflicts", ColType::Int8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+type LogicalMonitoringRelation = (i32, i32, &'static str, &'static [(&'static str, ColType)]);
+
+const LOGICAL_MONITORING_RELATIONS: &[LogicalMonitoringRelation] = &[
+    (
+        12231,
+        12233,
+        "pg_stat_replication",
+        PG_STAT_REPLICATION_COLUMNS,
+    ),
+    (
+        12248,
+        12250,
+        "pg_stat_subscription",
+        PG_STAT_SUBSCRIPTION_COLUMNS,
+    ),
+    (
+        12261,
+        12263,
+        "pg_replication_slots",
+        PG_REPLICATION_SLOTS_COLUMNS,
+    ),
+    (
+        12266,
+        12268,
+        "pg_stat_replication_slots",
+        PG_STAT_REPLICATION_SLOTS_COLUMNS,
+    ),
+    (
+        12347,
+        12349,
+        "pg_stat_subscription_stats",
+        PG_STAT_SUBSCRIPTION_STATS_COLUMNS,
+    ),
+];
+
+const LOGICAL_MONITORING_ATTRIBUTE_COUNT: usize = 74;
+
+const fn logical_monitoring_type_oid(ctype: ColType) -> i32 {
+    match ctype {
+        ColType::Bool => 16,
+        ColType::Int8 => 20,
+        ColType::Int4 => 23,
+        ColType::Text => 25,
+        ColType::Oid => 26,
+        ColType::Xid => 28,
+        ColType::Name => 19,
+        ColType::Inet => 869,
+        ColType::Timestamptz => 1184,
+        ColType::Interval => 1186,
+        ColType::PgLsn => 3220,
+        _ => panic!("monitoring relation has an unsupported catalog type"),
+    }
+}
+
+const fn logical_monitoring_type_len(ctype: ColType) -> i32 {
+    match ctype {
+        ColType::Bool => 1,
+        ColType::Int4 | ColType::Oid | ColType::Xid => 4,
+        ColType::Int8 | ColType::Timestamptz | ColType::PgLsn => 8,
+        ColType::Interval => 16,
+        ColType::Name => 64,
+        ColType::Text | ColType::Inet => -1,
+        _ => panic!("monitoring relation has an unsupported catalog type"),
+    }
+}
+
+const fn logical_monitoring_type_alignment(ctype: ColType) -> &'static str {
+    match ctype {
+        ColType::Bool | ColType::Name => "c",
+        ColType::Int8 | ColType::Timestamptz | ColType::Interval | ColType::PgLsn => "d",
+        ColType::Int4 | ColType::Text | ColType::Oid | ColType::Xid | ColType::Inet => "i",
+        _ => panic!("monitoring relation has an unsupported catalog type"),
+    }
+}
+
+const fn logical_monitoring_attribute_rows()
+-> [[Datum<'static>; 23]; LOGICAL_MONITORING_ATTRIBUTE_COUNT] {
+    let mut rows = [[Datum::Null; 23]; LOGICAL_MONITORING_ATTRIBUTE_COUNT];
+    let mut row_index = 0;
+    let mut relation_index = 0;
+    while relation_index < LOGICAL_MONITORING_RELATIONS.len() {
+        let (relation_oid, _, _, columns) = LOGICAL_MONITORING_RELATIONS[relation_index];
+        let mut attribute = 0;
+        while attribute < columns.len() {
+            let (name, ctype) = columns[attribute];
+            let number = attribute as i32 + 1;
+            rows[row_index] = [
+                Datum::Int4(relation_oid),
+                Datum::Text(name),
+                Datum::Int4(logical_monitoring_type_oid(ctype)),
+                Datum::Int4(number),
+                Datum::Bool(false),
+                Datum::Int4(logical_monitoring_type_len(ctype)),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Int4(if ctype.is_collatable() { 100 } else { 0 }),
+                Datum::Text(""),
+                Datum::Text(""),
+                Datum::Text(if logical_monitoring_type_len(ctype) < 0 {
+                    "x"
+                } else {
+                    "p"
+                }),
+                Datum::Text(""),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Int4(number),
+                Datum::Text(logical_monitoring_type_alignment(ctype)),
+                Datum::Bool(true),
+                Datum::Null,
+                Datum::Null,
+                Datum::Bool(false),
+                Datum::Null,
+                Datum::Null,
+            ];
+            row_index += 1;
+            attribute += 1;
+        }
+        relation_index += 1;
+    }
+    assert!(row_index == LOGICAL_MONITORING_ATTRIBUTE_COUNT);
+    rows
+}
+
+static LOGICAL_MONITORING_ATTRIBUTE_ROWS: [[Datum<'static>; 23];
+    LOGICAL_MONITORING_ATTRIBUTE_COUNT] = logical_monitoring_attribute_rows();
+
 fn pg_replication_slots<'a>(
     storage: &Storage,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_replication_slots",
-        &[
-            ("slot_name", ColType::Name),
-            ("plugin", ColType::Name),
-            ("slot_type", ColType::Text),
-            ("datoid", ColType::Int4),
-            ("database", ColType::Name),
-            ("temporary", ColType::Bool),
-            ("active", ColType::Bool),
-            ("active_pid", ColType::Int4),
-            ("xmin", ColType::Text),
-            ("catalog_xmin", ColType::Text),
-            ("restart_lsn", ColType::Text),
-            ("confirmed_flush_lsn", ColType::Text),
-            ("wal_status", ColType::Text),
-            ("safe_wal_size", ColType::Int8),
-            ("two_phase", ColType::Bool),
-            ("two_phase_at", ColType::Text),
-            ("inactive_since", ColType::Timestamptz),
-            ("conflicting", ColType::Bool),
-            ("invalidation_reason", ColType::Text),
-            ("failover", ColType::Bool),
-            ("synced", ColType::Bool),
-        ],
-    );
+    let definition = def_of("pg_replication_slots", PG_REPLICATION_SLOTS_COLUMNS);
     let mut rows: [&[Datum]; 256] = [&[]; 256];
     let mut count = 0;
     let database_definition = storage.database_definition(
@@ -8029,27 +8322,25 @@ fn pg_replication_slots<'a>(
                 rows.len()
             ));
         }
-        let restart_lsn = stack_format!(32, "0/{:X}", slot.restart_lsn);
-        let confirmed_lsn = stack_format!(32, "0/{:X}", slot.confirmed_flush_lsn);
         rows[count] = row(
             &[
                 text(slot.name.as_str(), arena)?,
                 text("pgoutput", arena)?,
                 text("logical", arena)?,
-                Datum::Int4(storage.current_database_oid().get()),
+                Datum::Oid(storage.current_database_oid().get() as u32),
                 text(database_definition.name.as_str(), arena)?,
                 Datum::Bool(false),
                 Datum::Bool(slot.active),
+                slot.active_pid.map_or(Datum::Null, Datum::Int4),
                 Datum::Null,
                 Datum::Null,
-                Datum::Null,
-                text(restart_lsn.as_str(), arena)?,
-                text(confirmed_lsn.as_str(), arena)?,
+                Datum::PgLsn(slot.restart_lsn),
+                Datum::PgLsn(slot.confirmed_flush_lsn),
                 text("reserved", arena)?,
                 Datum::Null,
                 Datum::Bool(slot.behavior.two_phase),
                 if slot.behavior.two_phase {
-                    text(restart_lsn.as_str(), arena)?
+                    Datum::PgLsn(slot.restart_lsn)
                 } else {
                     Datum::Null
                 },
@@ -8058,6 +8349,92 @@ fn pg_replication_slots<'a>(
                 Datum::Null,
                 Datum::Bool(slot.behavior.failover),
                 Datum::Bool(false),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_replication<'a>(
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_stat_replication", PG_STAT_REPLICATION_COLUMNS);
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (_, slot) in storage
+        .replication_slots_with_slots()
+        .filter(|(_, slot)| slot.active)
+    {
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_stat_replication exceeds {} rows",
+                rows.len()
+            ));
+        }
+        rows[count] = row(
+            &[
+                slot.active_pid.map_or(Datum::Null, Datum::Int4),
+                Datum::Null,
+                Datum::Null,
+                text("logical replication", arena)?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                text("streaming", arena)?,
+                Datum::PgLsn(slot.sent_lsn),
+                Datum::PgLsn(slot.confirmed_flush_lsn),
+                Datum::PgLsn(slot.confirmed_flush_lsn),
+                Datum::PgLsn(slot.confirmed_flush_lsn),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Int4(0),
+                text("async", arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_replication_slots<'a>(
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_stat_replication_slots",
+        PG_STAT_REPLICATION_SLOTS_COLUMNS,
+    );
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (_, slot) in storage.replication_slots_with_slots() {
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_stat_replication_slots exceeds {} rows",
+                rows.len()
+            ));
+        }
+        rows[count] = row(
+            &[
+                text(slot.name.as_str(), arena)?,
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(slot.total_txns),
+                Datum::Int8(slot.total_bytes),
+                slot.stats_reset.map_or(Datum::Null, Datum::Timestamptz),
             ],
             arena,
         )?;
@@ -8219,6 +8596,94 @@ fn pg_subscription_rel<'a>(
         }
     }
     finish(definition, rows, arena)
+}
+
+fn pg_stat_subscription<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_stat_subscription", PG_STAT_SUBSCRIPTION_COLUMNS);
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (_, subscription) in storage
+        .subscriptions_with_slots_visible_to(txid)
+        .filter(|(_, subscription)| subscription.enabled_to(txid))
+    {
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_stat_subscription exceeds {} rows",
+                rows.len()
+            ));
+        }
+        let lsn = if subscription.confirmed_lsn == 0 {
+            Datum::Null
+        } else {
+            Datum::PgLsn(subscription.confirmed_lsn)
+        };
+        rows[count] = row(
+            &[
+                Datum::Oid(subscription_oid(subscription) as u32),
+                text(subscription.name_for(txid).as_str(), arena)?,
+                text("apply", arena)?,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                lsn,
+                Datum::Null,
+                Datum::Null,
+                lsn,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_subscription_stats<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_stat_subscription_stats",
+        PG_STAT_SUBSCRIPTION_STATS_COLUMNS,
+    );
+    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let mut count = 0;
+    for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
+        if count == rows.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pg_stat_subscription_stats exceeds {} rows",
+                rows.len()
+            ));
+        }
+        rows[count] = row(
+            &[
+                Datum::Oid(subscription_oid(subscription) as u32),
+                text(subscription.name_for(txid).as_str(), arena)?,
+                Datum::Int8(subscription.apply_error_count),
+                Datum::Int8(subscription.sync_error_count),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                subscription
+                    .stats_reset
+                    .map_or(Datum::Null, Datum::Timestamptz),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_inherits<'a>(
@@ -8419,6 +8884,45 @@ fn pg_class<'a>(
     let foreign_keys = collect_fkeys(storage, txid, arena)?;
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
+    for &(relation_oid, row_type_oid, name, columns) in LOGICAL_MONITORING_RELATIONS {
+        out[n] = row(
+            &[
+                Datum::Int4(relation_oid),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                text("v", arena)?,
+                Datum::Int4(columns.len() as i32),
+                Datum::Float8(-1.0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(10),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(row_type_oid),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
@@ -11085,6 +11589,10 @@ fn pg_attribute<'a>(
     );
     let mut out: [&[Datum]; 1024] = [&[]; 1024];
     let mut n = 0;
+    for attributes in &LOGICAL_MONITORING_ATTRIBUTE_ROWS {
+        out[n] = attributes;
+        n += 1;
+    }
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
             continue;
@@ -12676,7 +13184,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(routine.argument_count),
                 Datum::Int4(routine.result_oid),
-                Datum::Bool(record_outputs.is_some()),
+                Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
                 Datum::Bpchar("f"),
                 oidvector(&argument_oids[..argument_count], arena)?,
                 Datum::Bpchar(routine.volatility),
@@ -12709,7 +13217,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     referenced_oid: 0,
                     name: "-",
                 },
-                Datum::Int4(0),
+                Datum::Int4(match routine.oid {
+                    3577 | 3578 => 1,
+                    3786 => 3,
+                    _ => 0,
+                }),
                 Datum::Int4(if routine.oid == 6119 {
                     super::types::oid::TEXT
                 } else {
@@ -12745,7 +13257,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                     None => Datum::Null,
                 },
-                Datum::Null,
+                match routine.oid {
+                    3577 | 3578 => Datum::Text("false"),
+                    3786 => Datum::Text("false false false"),
+                    _ => Datum::Null,
+                },
                 Datum::Null,
             ],
             arena,
@@ -13661,6 +14177,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::PgMcvList,
         ColType::Int4,
         ColType::Oid,
+        ColType::Xid,
+        ColType::PgLsn,
         ColType::Regtype,
         ColType::Regproc,
         ColType::Regprocedure,
@@ -13723,13 +14241,19 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Bool => "B",
         ColType::Int2
         | ColType::Int4
+        | ColType::Oid
         | ColType::Int8
         | ColType::Float4
         | ColType::Float8
         | ColType::Numeric => "N",
         ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
         ColType::Interval => "T",
-        ColType::Uuid | ColType::Bytea | ColType::TsVector | ColType::TsQuery => "U",
+        ColType::Xid
+        | ColType::PgLsn
+        | ColType::Uuid
+        | ColType::Bytea
+        | ColType::TsVector
+        | ColType::TsQuery => "U",
         ColType::PgNodeTree
         | ColType::PgNdistinct
         | ColType::PgDependencies

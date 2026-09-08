@@ -162,6 +162,13 @@ pub enum Message<'a> {
         xid: Option<u32>,
         truncate: Truncate,
     },
+    LogicalMessage {
+        xid: Option<u32>,
+        transactional: bool,
+        message_lsn: u64,
+        prefix: &'a str,
+        content: &'a [u8],
+    },
     StreamStart {
         xid: u32,
         first_segment: bool,
@@ -458,6 +465,25 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                 },
             }
         }
+        b'M' => {
+            let xid = streamed_xid(&mut input, *state)?;
+            let transactional = match input.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::Invalid),
+            };
+            let message_lsn = input.u64()?;
+            let prefix = input.cstr()?;
+            let length: usize = input.i32()?.try_into().map_err(|_| DecodeError::Invalid)?;
+            let content = input.bytes(length)?;
+            Message::LogicalMessage {
+                xid,
+                transactional,
+                message_lsn,
+                prefix,
+                content,
+            }
+        }
         b'S' => {
             if state.streamed_segment {
                 return Err(DecodeError::Invalid);
@@ -648,6 +674,46 @@ mod tests {
         });
         assert_eq!(
             copy_data(&bytes[..25 + origin.len() - 1]),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn logical_message_is_binary_safe_and_rejects_bad_flags_or_lengths() {
+        let logical = [
+            b'M', 1, 0, 0, 0, 0, 0, 0, 0, 0x29, b'a', b'u', b'd', b'i', b't', 0, 0, 0, 0, 3, 0,
+            0xff, 1,
+        ];
+        let bytes = xlog(&logical);
+        guard::forbid_alloc(|| {
+            let decoded = copy_data(&bytes[..25 + logical.len()]);
+            assert!(
+                matches!(
+                    decoded,
+                    Ok(CopyData::XLogData {
+                        message: Message::LogicalMessage {
+                            xid: None,
+                            transactional: true,
+                            message_lsn: 41,
+                            prefix: "audit",
+                            content: &[0, 0xff, 1],
+                        },
+                        ..
+                    })
+                ),
+                "{decoded:?}"
+            );
+        });
+        let mut invalid = logical;
+        invalid[1] = 2;
+        let bytes = xlog(&invalid);
+        assert_eq!(
+            copy_data(&bytes[..25 + invalid.len()]),
+            Err(DecodeError::Invalid)
+        );
+        let bytes = xlog(&logical);
+        assert_eq!(
+            copy_data(&bytes[..25 + logical.len() - 1]),
             Err(DecodeError::Truncated)
         );
     }

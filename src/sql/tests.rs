@@ -7990,6 +7990,185 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery() {
     }
 }
 
+#[test]
+fn logical_replication_sql_slot_control_is_typed_atomic_and_complete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT * FROM pg_create_logical_replication_slot('sql_slot', 'pgoutput'); \
+         ROLLBACK; \
+         SELECT slot_name, plugin, slot_type, active, two_phase, failover, \
+                restart_lsn = confirmed_flush_lsn \
+           FROM pg_replication_slots WHERE slot_name = 'sql_slot'; \
+         SELECT * FROM pg_copy_logical_replication_slot('sql_slot', 'sql_copy', false, 'pgoutput'); \
+         SELECT * FROM pg_replication_slot_advance('sql_copy', 'FFFFFFFF/FFFFFFFF'::pg_lsn); \
+         SELECT copied.confirmed_flush_lsn >= source.confirmed_flush_lsn \
+           FROM pg_replication_slots source CROSS JOIN pg_replication_slots copied \
+          WHERE source.slot_name = 'sql_slot' AND copied.slot_name = 'sql_copy'; \
+         SELECT pg_drop_replication_slot('sql_copy'); \
+         SELECT pg_drop_replication_slot('sql_slot'); \
+         SELECT count(*) FROM pg_replication_slots \
+          WHERE slot_name IN ('sql_slot', 'sql_copy')",
+    );
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(!rendered.contains("ERROR"), "{rendered}");
+    let rows = data_rows(&output);
+    assert!(rows[0].starts_with("sql_slot|0/"), "{rows:?}");
+    assert_eq!(rows[1], "sql_slot|pgoutput|logical|f|f|f|t");
+    assert!(rows[2].starts_with("sql_copy|0/"), "{rows:?}");
+    assert!(rows[3].starts_with("sql_copy|0/"), "{rows:?}");
+    assert_eq!(rows[4], "t");
+    assert_eq!(rows.last().unwrap(), "0");
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_create_logical_replication_slot('bad_temp', 'pgoutput', true); \
+         SELECT pg_create_logical_replication_slot('bad_plugin', 'test_decoding')",
+    );
+    assert!(String::from_utf8_lossy(&rejected).contains("0A000"));
+    assert!(engine.storage.replication_slot("bad_temp").is_none());
+    assert!(engine.storage.replication_slot("bad_plugin").is_none());
+
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, pronargs, pronargdefaults, prorettype, proretset, provolatile, proparallel \
+           FROM pg_proc WHERE proname IN \
+           ('pg_create_logical_replication_slot', 'pg_drop_replication_slot', \
+            'pg_copy_logical_replication_slot', 'pg_replication_slot_advance') \
+          ORDER BY oid",
+    );
+    assert_eq!(data_rows(&catalog).len(), 6);
+    assert!(data_rows(&catalog).iter().all(|row| row.contains("|v|u")));
+}
+
+#[test]
+fn logical_replication_monitoring_views_have_postgresql_types_and_live_state() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM pg_create_logical_replication_slot('monitored', 'pgoutput'); \
+         SELECT slot_name, pg_typeof(datoid), pg_typeof(xmin), \
+                pg_typeof(restart_lsn), active_pid IS NULL \
+           FROM pg_replication_slots WHERE slot_name = 'monitored'; \
+         SELECT slot_name, spill_txns, stream_txns, total_txns, total_bytes, \
+                pg_typeof(total_bytes), stats_reset IS NULL \
+           FROM pg_stat_replication_slots WHERE slot_name = 'monitored'; \
+         SELECT pg_stat_reset_replication_slot('monitored'); \
+         SELECT total_txns, total_bytes, stats_reset IS NOT NULL \
+           FROM pg_stat_replication_slots WHERE slot_name = 'monitored'; \
+         CREATE SUBSCRIPTION monitored_sub CONNECTION \
+           'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' \
+           PUBLICATION changes WITH (connect = false, slot_name = NONE); \
+         SELECT subname, apply_error_count, sync_error_count, \
+                confl_insert_exists, stats_reset IS NULL \
+           FROM pg_stat_subscription_stats WHERE subname = 'monitored_sub'; \
+         SELECT pg_stat_reset_subscription_stats(oid) \
+           FROM pg_subscription WHERE subname = 'monitored_sub'; \
+         SELECT apply_error_count, sync_error_count, stats_reset IS NOT NULL \
+           FROM pg_stat_subscription_stats WHERE subname = 'monitored_sub'; \
+         SELECT count(*) FROM pg_stat_subscription WHERE subname = 'monitored_sub'; \
+         SELECT count(*) FROM pg_stat_replication; \
+         DROP SUBSCRIPTION monitored_sub; \
+         SELECT pg_drop_replication_slot('monitored')",
+    );
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(!rendered.contains("ERROR"), "{rendered}");
+    let rows = data_rows(&output);
+    assert!(rows[0].starts_with("monitored|0/"), "{rows:?}");
+    assert_eq!(
+        &rows[1..],
+        [
+            "monitored|oid|xid|pg_lsn|t",
+            "monitored|0|0|0|0|bigint|t",
+            "NULL",
+            "0|0|t",
+            "monitored_sub|0|0|0|t",
+            "NULL",
+            "0|0|t",
+            "0",
+            "0",
+            "NULL",
+        ],
+        "{rendered}"
+    );
+
+    assert!(
+        !String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE no_replication",
+        ))
+        .contains("ERROR")
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE no_replication; \
+         SELECT pg_create_logical_replication_slot('forbidden', 'pgoutput')",
+    );
+    assert!(String::from_utf8_lossy(&denied).contains("42501"));
+
+    let introspection = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_class \
+          WHERE oid IN (12231, 12248, 12261, 12266, 12347); \
+         SELECT count(*) FROM pg_attribute \
+          WHERE attrelid IN (12231, 12248, 12261, 12266, 12347) \
+            AND attnum > 0 AND NOT attisdropped; \
+         SELECT count(*) FROM pg_class relation \
+           JOIN pg_attribute attribute ON attribute.attrelid = relation.oid \
+          WHERE relation.oid IN (12231, 12248, 12261, 12266, 12347) \
+            AND attribute.attnum > 0 AND NOT attribute.attisdropped",
+    );
+    assert_eq!(data_rows(&introspection), ["5", "74", "74"]);
+}
+
+#[test]
+fn pg_lsn_is_a_cataloged_storable_indexable_binary_safe_type() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, typname, typlen, typcategory, typarray, typelem \
+           FROM pg_type WHERE oid IN (28, 3220, 3221) ORDER BY oid; \
+         CREATE TABLE lsn_values (position pg_lsn PRIMARY KEY, positions pg_lsn[]); \
+         INSERT INTO lsn_values VALUES \
+           ('1/10', ARRAY['1/20'::pg_lsn, 'FFFFFFFF/FFFFFFFF'::pg_lsn]), \
+           ('0/FF', ARRAY[]::pg_lsn[]); \
+         SELECT position, positions::text, pg_typeof(position), pg_typeof(positions) \
+           FROM lsn_values ORDER BY position; \
+         SELECT indclass::text FROM pg_index \
+          WHERE indexrelid = 'lsn_values_pkey'::regclass",
+    );
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(!rendered.contains("ERROR"), "{rendered}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "28|xid|4|U|0|0",
+            "3220|pg_lsn|8|U|3221|0",
+            "3221|_pg_lsn|-1|A|0|3220",
+            "0/FF|{}|pg_lsn|pg_lsn[]",
+            "1/10|{1/20,FFFFFFFF/FFFFFFFF}|pg_lsn|pg_lsn[]",
+            "10067",
+        ],
+        "{rendered}"
+    );
+
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO lsn_values(position) VALUES ('1/10')",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+}
+
 fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     let mut config = test_config("logical-slot-recovery");
     config.object_store_on = true;
@@ -12895,6 +13074,120 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
         .expect("unpublished transaction is retained for the stream cursor");
     assert!(!emitted);
     assert!(send.is_empty());
+}
+
+#[test]
+fn logical_messages_are_transactional_binary_safe_and_command_ordered() {
+    std::thread::Builder::new()
+        .name("logical-message-ordering".into())
+        .stack_size(8 << 20)
+        .spawn(logical_messages_are_transactional_binary_safe_and_command_ordered_body)
+        .expect("logical message test thread starts")
+        .join()
+        .expect("logical message test thread completes");
+}
+
+fn logical_messages_are_transactional_binary_safe_and_command_ordered_body() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE logical_message_rows(id integer PRIMARY KEY); \
+         CREATE PUBLICATION logical_message_publication FOR TABLE logical_message_rows",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let floor = engine.storage.lsn();
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; SELECT pg_logical_emit_message(true, 'rolled-back', 'gone'); ROLLBACK; \
+         BEGIN; SELECT pg_logical_emit_message(false, 'outside', decode('00ff01', 'hex')); ROLLBACK; \
+         BEGIN; \
+           SELECT pg_logical_emit_message(true, 'before', 'one'); \
+           INSERT INTO logical_message_rows VALUES (1); \
+           SELECT pg_logical_emit_message(true, 'after', 'two', true); \
+         COMMIT",
+    );
+    let output = String::from_utf8_lossy(&rolled_back);
+    assert!(!output.contains("ERROR"), "{output}");
+    assert_eq!(data_rows(&rolled_back).len(), 4);
+
+    let publication = crate::storage::SqlName::parse("logical_message_publication").unwrap();
+    let mut scan = floor;
+    let mut observed = Vec::new();
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "logical message scratch", 1 << 16).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "logical message send", 1 << 16).unwrap();
+    loop {
+        scratch.clear();
+        send.clear();
+        let Some((next, emitted)) = engine
+            .emit_replication_transaction_for_origin(
+                scan,
+                crate::sql::ReplicationEmission {
+                    publications: &[publication],
+                    binary: false,
+                    messages: true,
+                    origin: crate::storage::SubscriptionOrigin::Any,
+                    protocol: crate::pg::pgoutput::ProtocolVersion::V4,
+                },
+                &mut scratch,
+                &mut Responder::new(&mut send),
+            )
+            .unwrap()
+        else {
+            break;
+        };
+        scan = next;
+        if !emitted {
+            continue;
+        }
+        let mut at = 0usize;
+        while at < send.len() {
+            let bytes = send.readable();
+            let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let payload = &bytes[at + 5..at + 1 + length];
+            let crate::pg::pginput::CopyData::XLogData { message, .. } =
+                crate::pg::pginput::copy_data(payload).unwrap()
+            else {
+                panic!("unexpected keepalive")
+            };
+            match message {
+                crate::pg::pginput::Message::Begin { .. } => observed.push("B".to_string()),
+                crate::pg::pginput::Message::Commit { .. } => observed.push("C".to_string()),
+                crate::pg::pginput::Message::Insert { .. } => observed.push("I".to_string()),
+                crate::pg::pginput::Message::Relation { .. } => {}
+                crate::pg::pginput::Message::LogicalMessage {
+                    transactional,
+                    prefix,
+                    content,
+                    ..
+                } => observed.push(format!(
+                    "M:{}:{}:{}",
+                    transactional,
+                    prefix,
+                    content
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                )),
+                other => panic!("unexpected pgoutput message: {other:?}"),
+            }
+            at += 1 + length;
+        }
+    }
+    assert_eq!(
+        observed,
+        [
+            "M:false:outside:00ff01",
+            "B",
+            "M:true:before:6f6e65",
+            "I",
+            "M:true:after:74776f",
+            "C",
+        ]
+    );
 }
 
 #[test]
@@ -46976,6 +47269,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             crate::sql::ReplicationEmission {
                 publications: &[crate::storage::SqlName::parse("local_changes").unwrap()],
                 binary: false,
+                messages: false,
                 origin: crate::storage::SubscriptionOrigin::Any,
                 protocol: crate::pg::pgoutput::ProtocolVersion::V4,
             },
@@ -47012,6 +47306,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
             crate::sql::ReplicationEmission {
                 publications: &[crate::storage::SqlName::parse("local_changes").unwrap()],
                 binary: false,
+                messages: false,
                 origin: crate::storage::SubscriptionOrigin::None,
                 protocol: crate::pg::pgoutput::ProtocolVersion::V4,
             },

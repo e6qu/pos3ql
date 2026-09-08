@@ -206,6 +206,23 @@ pub fn truncate(message: &mut MsgOut, relation_ids: &[u32], cascade: bool, resta
     }
 }
 
+/// pgoutput logical-decoding message (`M`). This publisher does not negotiate
+/// streaming, so no transaction id precedes the flags byte.
+pub fn logical_message(
+    message: &mut MsgOut,
+    transactional: bool,
+    message_lsn: u64,
+    prefix: &str,
+    content: &[u8],
+) {
+    message.u8(b'M');
+    message.u8(u8::from(transactional));
+    message.i64(message_lsn as i64);
+    message.cstr(prefix);
+    message.i32(content.len() as i32);
+    message.bytes(content);
+}
+
 fn new_tuple(message: &mut MsgOut, values: &[Datum], binary: bool) {
     message.u8(b'N');
     tuple_data(message, values, binary);
@@ -258,6 +275,22 @@ mod tests {
         assert_eq!(bytes[5], b'O');
         assert_eq!(i64::from_be_bytes(bytes[6..14].try_into().unwrap()), 41);
         assert_eq!(&bytes[14..], b"pos3ql_subscription_2a\0");
+    }
+
+    #[test]
+    fn logical_message_matches_pgoutput_m_layout() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
+        let mut frame = MsgOut::begin(&mut buffer, b'd');
+        logical_message(&mut frame, true, 0x1234, "audit", &[0, 1, 0xff]);
+        frame.finish().unwrap();
+        let bytes = buffer.readable();
+        assert_eq!(bytes[5], b'M');
+        assert_eq!(bytes[6], 1);
+        assert_eq!(u64::from_be_bytes(bytes[7..15].try_into().unwrap()), 0x1234);
+        assert_eq!(&bytes[15..21], b"audit\0");
+        assert_eq!(i32::from_be_bytes(bytes[21..25].try_into().unwrap()), 3);
+        assert_eq!(&bytes[25..], &[0, 1, 0xff]);
     }
 
     #[test]

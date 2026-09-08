@@ -55,6 +55,12 @@ fn is_event_trigger_introspection(name: &str) -> bool {
         || name.eq_ignore_ascii_case("pg_event_trigger_dropped_objects")
 }
 
+fn is_logical_slot_record_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("pg_create_logical_replication_slot")
+        || name.eq_ignore_ascii_case("pg_copy_logical_replication_slot")
+        || name.eq_ignore_ascii_case("pg_replication_slot_advance")
+}
+
 fn require_no_arguments(name: &str, arguments: &[&Expr<'_>]) -> Result<(), SqlError> {
     if arguments.is_empty() {
         Ok(())
@@ -1881,6 +1887,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_ts_debug = tref.table.eq_ignore_ascii_case("ts_debug");
     let is_ts_stat = tref.table.eq_ignore_ascii_case("ts_stat");
     let is_event_introspection = is_event_trigger_introspection(tref.table);
+    let is_logical_slot_record = is_logical_slot_record_function(tref.table);
     let built_in = is_gs
         || is_unnest
         || is_re
@@ -1897,7 +1904,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_ts_token_type
         || is_ts_debug
         || is_ts_stat
-        || is_event_introspection;
+        || is_event_introspection
+        || is_logical_slot_record;
     let routine = if built_in {
         None
     } else {
@@ -1917,7 +1925,38 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
     let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
-    let n_default = if is_publication_tables {
+    let n_default = if is_logical_slot_record {
+        let argument_count = tref.func_args.unwrap_or(&[]).len();
+        if crate::sql::logical_replication::result_type(tref.table, argument_count)
+            != Some((crate::sql::types::oid::RECORD, -1))
+        {
+            return Err(srf_signature_error(tref.table));
+        }
+        default_cols[0] = table_function_column(
+            SqlName::parse("slot_name")?,
+            ColType::Name,
+            None,
+            -1,
+            crate::sql::ast::Collation::Default,
+        );
+        default_cols[1] = table_function_column(
+            SqlName::parse(
+                if tref
+                    .table
+                    .eq_ignore_ascii_case("pg_replication_slot_advance")
+                {
+                    "end_lsn"
+                } else {
+                    "lsn"
+                },
+            )?,
+            ColType::PgLsn,
+            None,
+            -1,
+            crate::sql::ast::Collation::None,
+        );
+        2
+    } else if is_publication_tables {
         if tref.func_args.unwrap_or(&[]).is_empty() {
             return Err(srf_signature_error(tref.table));
         }
@@ -2536,6 +2575,28 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
         None => crate::sql::eval::eval(argument, arena, params, columns),
     };
+    if is_logical_slot_record_function(tref.table) {
+        let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
+        let value = crate::sql::logical_replication::dispatch(
+            tref.table, args, false, arena, params, columns, &hooks,
+        )
+        .ok_or_else(|| srf_signature_error(tref.table))??;
+        let values = match value {
+            Datum::Record(fields) if fields.len() == 2 => [fields[0].value, fields[1].value],
+            Datum::Null => [Datum::Null, Datum::Null],
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "logical slot function returned an invalid record"
+                ));
+            }
+        };
+        let encoded = crate::sql::exec::encode_projected_pub(&values, arena)?;
+        let rows = arena
+            .alloc_slice_with(1, |_| encoded)
+            .map_err(|_| arena_full())?;
+        return Ok(&*rows);
+    }
     if tref.table.eq_ignore_ascii_case("pg_get_publication_tables") {
         let evaluated =
             evaluate_publication_arguments_with(args, tref.func_variadic, arena, eval_argument)?;

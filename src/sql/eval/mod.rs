@@ -3573,6 +3573,12 @@ fn call<'a>(
     };
     if argument_names.is_empty()
         && let Some(result) =
+            super::logical_replication::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) =
             super::large_object::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
@@ -6207,6 +6213,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",
         Datum::Oid(_) => "oid",
+        Datum::PgLsn(_) => "pg_lsn",
         Datum::Int8(_) => "bigint",
         Datum::Float4(_) => "real",
         Datum::Float8(_) => "double precision",

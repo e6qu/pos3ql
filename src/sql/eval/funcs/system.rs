@@ -1650,6 +1650,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int2(_) => "smallint",
                     Datum::Int4(_) => "integer",
                     Datum::Oid(_) => "oid",
+                    Datum::PgLsn(_) => "pg_lsn",
                     Datum::Int8(_) => "bigint",
                     Datum::Float4(_) => "real",
                     Datum::Float8(_) => "double precision",

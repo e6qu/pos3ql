@@ -1201,17 +1201,20 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
     else
       "$PG_RECVLOGICAL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres \
         -d postgres -S "$RECVLOGICAL_SLOT" --start --no-loop -f - \
-        -o proto_version=4 -o publication_names=postgresql_subscriber_pub \
+        -o proto_version=4 -o publication_names=postgresql_subscriber_pub -o messages=true \
         >"$RECVLOGICAL_OUTPUT" 2>"$WORK/pg-recvlogical.log" &
       RECVLOGICAL_PID=$!
       sleep 0.2
       "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
+        -c "SELECT pg_logical_emit_message(false, 'pg-recvlogical-message', 'tool-visible')" \
         -c "INSERT INTO postgresql_subscriber_target VALUES (3, 'pg-recvlogical-stream', 'private')" \
         >/dev/null 2>&1
       recvlogical_found=false
       for _ in {1..100}; do
         if [[ -f "$RECVLOGICAL_OUTPUT" ]] \
-          && grep -a -q "pg-recvlogical-stream" "$RECVLOGICAL_OUTPUT"; then
+          && grep -a -q "pg-recvlogical-stream" "$RECVLOGICAL_OUTPUT" \
+          && grep -a -q "pg-recvlogical-message" "$RECVLOGICAL_OUTPUT" \
+          && grep -a -q "tool-visible" "$RECVLOGICAL_OUTPUT"; then
           recvlogical_found=true
           break
         fi
@@ -1221,7 +1224,7 @@ if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
       wait "$RECVLOGICAL_PID" >/dev/null 2>&1 || true
       RECVLOGICAL_PID=""
       if [[ "$recvlogical_found" == true ]]; then
-        ok "PostgreSQL pg_recvlogical consumes pos3ql pgoutput"
+        ok "PostgreSQL pg_recvlogical consumes rows and logical messages from pos3ql pgoutput"
       else
         bad "pg_recvlogical pgoutput stream"
         cat "$WORK/pg-recvlogical.log"

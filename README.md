@@ -27,7 +27,7 @@ Permanent, unlogged, and session-temporary tables, indexes, identity sequences, 
 
 Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.
 
-All 183 PostgreSQL 18 top-level commands have a tested execution contract or an explicit architecture boundary; `tests/postgresql18_commands.tsv` is the ratchet. Logical replication interoperates with PostgreSQL 18 publishers, subscribers, and `pg_recvlogical` at the object-native boundary. Continuing differential, driver, and dump/restore testing remains the compatibility-discovery ratchet. Physical demand is proven through query execution and DML sources; PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md).
+All 183 PostgreSQL 18 top-level commands have a tested execution contract or an explicit architecture boundary; `tests/postgresql18_commands.tsv` is the ratchet. Logical replication interoperates with PostgreSQL 18 publishers, subscribers, and `pg_recvlogical` at the object-native boundary, including transactional and nontransactional logical messages, typed slot-management SQL, and replication monitoring views. Continuing differential, driver, and dump/restore testing remains the compatibility-discovery ratchet. Physical demand is proven through query execution and DML sources; PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md) and [the logical-replication boundary](docs/logical-replication.md).
 
 ## Quick start
 
@@ -43,6 +43,7 @@ psql -h 127.0.0.1 -p 5433 -U you
 - [BUGS.md](BUGS.md) — unresolved, genuinely blocked bugs only
 - [docs/terminology.md](docs/terminology.md) — naming and glossary
 - [docs/object-storage.md](docs/object-storage.md) — portable durability contract
+- [docs/logical-replication.md](docs/logical-replication.md) — PostgreSQL 18 protocol, SQL, monitoring, and architecture boundary
 - [AGENTS.md](AGENTS.md) — contribution rules
 
 ## References

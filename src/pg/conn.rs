@@ -1911,6 +1911,7 @@ impl Conn {
             crate::sql::ReplicationEmission {
                 publications: self.replication_publications.as_slice(),
                 binary: stream.options.binary,
+                messages: stream.options.messages,
                 origin: stream.options.origin,
                 protocol: stream.options.proto_version,
             },
@@ -1922,6 +1923,11 @@ impl Conn {
                 if emitted {
                     stream.last_sent_lsn = lsn;
                     stream.last_message_at = now;
+                    engine.record_replication_slot_transaction(
+                        stream.slot.as_str(),
+                        lsn,
+                        self.send.len().saturating_sub(mark),
+                    );
                 }
                 After::Continue
             }
@@ -3484,7 +3490,8 @@ impl Conn {
                         self.recv.consume(total);
                         return Step::Continue;
                     }
-                    let cursor_lsn = match engine.activate_replication_slot(name.as_str()) {
+                    let cursor_lsn = match engine.activate_replication_slot(name.as_str(), self.id)
+                    {
                         Ok(lsn) => lsn,
                         Err(error) => {
                             let mut responder = Responder::new(&mut self.send);
@@ -3659,6 +3666,7 @@ enum LogicalReplicationCommand<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PgoutputNegotiation {
     binary: bool,
+    messages: bool,
     streaming: crate::storage::SubscriptionStreaming,
     two_phase: bool,
     origin: crate::storage::SubscriptionOrigin,
@@ -4041,6 +4049,8 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), Sq
     let mut proto_version = None;
     let mut binary = false;
     let mut saw_binary = false;
+    let mut messages = false;
+    let mut saw_messages = false;
     let mut streaming = crate::storage::SubscriptionStreaming::Off;
     let mut saw_streaming = false;
     let mut two_phase = false;
@@ -4125,7 +4135,14 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), Sq
             binary = pgoutput_bool("binary", value)?;
             saw_binary = true;
         } else if key_is("messages") {
-            require_pgoutput_disabled_option("messages", value)?;
+            if saw_messages {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "duplicate pgoutput messages option"
+                ));
+            }
+            messages = pgoutput_bool("messages", value)?;
+            saw_messages = true;
         } else if key_is("two_phase") {
             if saw_two_phase {
                 return Err(sql_err!(
@@ -4233,6 +4250,7 @@ fn parse_pgoutput_options(input: &str) -> Result<(&str, PgoutputNegotiation), Sq
         publication,
         PgoutputNegotiation {
             binary,
+            messages,
             streaming,
             two_phase,
             origin,
@@ -4261,21 +4279,6 @@ fn pgoutput_bool(option: &str, value: &str) -> Result<bool, SqlError> {
             option
         ))
     }
-}
-
-fn require_pgoutput_disabled_option(option: &str, value: &str) -> Result<(), SqlError> {
-    if value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("off")
-        || value.eq_ignore_ascii_case("no")
-        || value == "0"
-    {
-        return Ok(());
-    }
-    Err(sql_err!(
-        sqlstate::FEATURE_NOT_SUPPORTED,
-        "pgoutput {} must be disabled",
-        option
-    ))
 }
 
 /// Takes a standard SQL single-quoted option value. The returned text retains
@@ -5867,6 +5870,7 @@ mod tests {
         )
         .is_ok());
         assert!(!options.binary);
+        assert!(!options.messages);
         assert_eq!(
             options.proto_version,
             crate::pg::pgoutput::ProtocolVersion::V1
@@ -5879,6 +5883,14 @@ mod tests {
             panic!("expected START_REPLICATION")
         };
         assert!(options.binary);
+        let command = parse_logical_replication_command(
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', messages 'true', proto_version '1')",
+        )
+        .unwrap();
+        let LogicalReplicationCommand::Start { options, .. } = command else {
+            panic!("expected START_REPLICATION")
+        };
+        assert!(options.messages);
         let command = parse_logical_replication_command(
             "START_REPLICATION SLOT changes LOGICAL 0/0 (publication_names 'changes_pub', binary 'TRUE', proto_version '1')",
         )
@@ -5964,6 +5976,8 @@ mod tests {
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '2', publication_names 'changes_pub', two_phase 'true')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '4', publication_names 'changes_pub', origin 'local')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', proto_version '1', publication_names 'changes_pub')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub', messages 'maybe')",
+            "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub', messages 'true', messages 'false')",
             "START_REPLICATION SLOT changes LOGICAL 0/not-lsn (proto_version '1', publication_names 'changes_pub')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1', publication_names 'changes_pub,')",
             "START_REPLICATION SLOT changes LOGICAL 0/0 (proto_version '1' publication_names 'changes_pub')",

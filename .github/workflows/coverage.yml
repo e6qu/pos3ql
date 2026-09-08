@@ -127,8 +127,14 @@ jobs:
           docker run --rm --detach --name pos3ql-subscription-publisher \
             -e POSTGRES_HOST_AUTH_METHOD=trust -p 15496:5432 postgres:18 \
             -c wal_level=logical -c max_replication_slots=4 -c max_wal_senders=4
+          # The subscriber's apply worker must reach the pos3ql publisher on
+          # the runner loopback address. Host networking gives the PostgreSQL
+          # backend that same loopback namespace; publishing a container port
+          # only makes inbound connections work and leaves 127.0.0.1 inside
+          # the container pointing back at PostgreSQL itself.
           docker run --rm --detach --name pos3ql-subscription-subscriber \
-            -e POSTGRES_HOST_AUTH_METHOD=trust -p 15564:5432 postgres:18
+            --network host -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18 \
+            -c port=15564
           mkdir -p .ci-bin
           sed 's/^          //' > .ci-bin/psql <<'SH'
           #!/bin/sh

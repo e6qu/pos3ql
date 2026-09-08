@@ -34,6 +34,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             // float4 keeps the historical 8-byte float8 layout (see the decode
             // side); the schema narrows it back to f32.
             Datum::Int8(_)
+            | Datum::PgLsn(_)
             | Datum::Float4(_)
             | Datum::Float8(_)
             | Datum::Timestamp(_)
@@ -141,6 +142,10 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 take = 4;
             }
             Datum::Int8(x) => {
+                rest[..8].copy_from_slice(&x.to_le_bytes());
+                take = 8;
+            }
+            Datum::PgLsn(x) => {
                 rest[..8].copy_from_slice(&x.to_le_bytes());
                 take = 8;
             }
@@ -309,6 +314,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         ColType::Char => Some(1),
         ColType::Int2 | ColType::Int4 | ColType::Oid | ColType::Xid | ColType::Date => Some(4),
         ColType::Int8
+        | ColType::PgLsn
         | ColType::Float4
         | ColType::Float8
         | ColType::Timestamp
@@ -465,6 +471,15 @@ pub(crate) fn decode<'a>(
                     _ => Datum::Int4(x),
                 };
                 at += 4;
+            }
+            ColType::PgLsn => {
+                let raw: [u8; 8] = bytes
+                    .get(at..at + 8)
+                    .ok_or_else(corrupt)?
+                    .try_into()
+                    .unwrap();
+                out[i] = Datum::PgLsn(u64::from_le_bytes(raw));
+                at += 8;
             }
             ColType::Regtype => {
                 let oid = i32::from_le_bytes(

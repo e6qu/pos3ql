@@ -2538,6 +2538,7 @@ fn is_read_only(name: &str) -> bool {
         "server_encoding",
         "is_superuser",
         "integer_datetimes",
+        "data_directory_mode",
         "in_hot_standby",
         "max_connections",
         "max_prepared_transactions",

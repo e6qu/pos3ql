@@ -754,6 +754,9 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    fn replica_identity_index_oid(&self, _relation_oid: i32) -> Option<i32> {
+        None
+    }
     /// Resolves a transaction-visible collation name to its stable identity.
     fn resolve_collation(&self, _schema: Option<&str>, _name: &str) -> Option<Collation> {
         None
@@ -2950,7 +2953,16 @@ pub fn eval_full<'a>(
             all,
         } => {
             let lhs = eval_full(operand, arena, params, row, hooks)?;
-            let array = eval_full(array, arena, params, row, hooks)?;
+            let mut array = eval_full(array, arena, params, row, hooks)?;
+            array = match array {
+                Datum::Int2Vector(_) => {
+                    cast_to(array, ColType::Array(super::types::ArrElem::Int2), arena)?
+                }
+                Datum::OidVector(_) => {
+                    cast_to(array, ColType::Array(super::types::ArrElem::Oid), arena)?
+                }
+                value => value,
+            };
             let (element, raw) = match array {
                 Datum::Array { element, raw } => (element, raw),
                 Datum::Null => return Ok(Datum::Null),
@@ -3559,6 +3571,12 @@ fn call<'a>(
             Ok(())
         }
     };
+    if argument_names.is_empty()
+        && let Some(result) =
+            super::logical_replication::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
     if argument_names.is_empty()
         && let Some(result) =
             super::large_object::dispatch(name, args, star, arena, params, row, hooks)
@@ -6195,6 +6213,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",
         Datum::Oid(_) => "oid",
+        Datum::PgLsn(_) => "pg_lsn",
         Datum::Int8(_) => "bigint",
         Datum::Float4(_) => "real",
         Datum::Float8(_) => "double precision",

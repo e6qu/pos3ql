@@ -44,7 +44,7 @@ impl RelationBinding {
         &self.remote_to_local[..self.column_count]
     }
 
-    pub fn old_remote_to_local(&self, identity: ReplicaIdentity) -> &[usize] {
+    pub fn identity_local_columns(&self, identity: ReplicaIdentity) -> &[usize] {
         match identity {
             ReplicaIdentity::Key => &self.key_remote_to_local[..self.key_count],
             ReplicaIdentity::Old => self.remote_to_local(),
@@ -792,6 +792,29 @@ impl SubscriptionApply {
                     truncate.cascade,
                     truncate.restart_identity,
                 )?;
+                Ok(ApplyResult::None)
+            }
+            Message::LogicalMessage {
+                xid, transactional, ..
+            } => {
+                if xid.is_some() {
+                    self.require_message_xid(xid)?;
+                }
+                if transactional
+                    && !matches!(
+                        self.remote,
+                        RemoteTransaction::Applying { .. }
+                            | RemoteTransaction::Skipping { .. }
+                            | RemoteTransaction::Streaming {
+                                segment_open: true,
+                                ..
+                            }
+                    )
+                {
+                    return Err(Self::protocol_error(
+                        "subscription transactional MESSAGE is outside BEGIN/COMMIT",
+                    ));
+                }
                 Ok(ApplyResult::None)
             }
             Message::StreamStart { xid, first_segment } => {

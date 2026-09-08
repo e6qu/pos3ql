@@ -12594,6 +12594,17 @@ pub fn create_publication(
             Ok(members) => members,
             Err(error) => return sql_fail(error),
         };
+    if let Err(error) = validate_partitioned_publication_features(
+        storage,
+        txn.txid,
+        name,
+        &members[..table_count],
+        &table_column_masks[..table_count],
+        &table_filter_sql[..table_count],
+        publish_via_partition_root,
+    ) {
+        return sql_fail(error);
+    }
     let schema_members = match publication_schemas(storage, txn.txid, schemas) {
         Ok(schemas) => schemas,
         Err(error) => return sql_fail(error),
@@ -13813,7 +13824,18 @@ pub fn alter_publication(
         Ok(filters) => filters,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = validate_publication_replica_identity(storage, &definition) {
+    if let Err(error) = validate_partitioned_publication_features(
+        storage,
+        txn.txid,
+        name,
+        &definition.tables[..definition.table_count],
+        &definition.table_column_masks[..definition.table_count],
+        &definition_filter_sql[..definition.table_count],
+        definition.publish_via_partition_root,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = validate_publication_replica_identity(storage, &definition, txn.txid) {
         return sql_fail(error);
     }
     let (slot, prior) = match storage.alter_publication(name, definition, txn.txid) {
@@ -13873,6 +13895,43 @@ fn validate_publication_target_mix(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot specify a column list when publishing tables in a schema"
         ));
+    }
+    Ok(())
+}
+
+fn validate_partitioned_publication_features<const N: usize>(
+    storage: &Storage,
+    txid: u32,
+    publication: &str,
+    tables: &[u16],
+    column_masks: &[u64],
+    filters: &[StackStr<N>],
+    publish_via_partition_root: bool,
+) -> Result<(), SqlError> {
+    if publish_via_partition_root {
+        return Ok(());
+    }
+    for ((table, column_mask), filter) in tables.iter().zip(column_masks).zip(filters) {
+        let definition = storage.table_def(usize::from(*table), txid);
+        if !definition.partition.is_partitioned() {
+            continue;
+        }
+        if !filter.is_empty() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot use publication WHERE clause for relation \"{}\" when publish_via_partition_root is false",
+                definition.name.as_str()
+            ));
+        }
+        if *column_mask != 0 {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "cannot use column list for relation \"{}.{}\" in publication \"{}\" when publish_via_partition_root is false",
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                publication
+            ));
+        }
     }
     Ok(())
 }
@@ -13999,6 +14058,7 @@ fn publication_members(
 fn validate_publication_replica_identity(
     storage: &Storage,
     definition: &crate::storage::PublicationDefinition,
+    txid: u32,
 ) -> Result<(), SqlError> {
     if !definition.publish_update && !definition.publish_delete {
         return Ok(());
@@ -14007,7 +14067,7 @@ fn validate_publication_replica_identity(
         .iter()
         .zip(&definition.table_column_masks[..definition.table_count])
     {
-        validate_publication_column_mask(storage, *table as usize, *mask, 0)?;
+        validate_publication_column_mask(storage, *table as usize, *mask, txid)?;
     }
     Ok(())
 }
@@ -43447,7 +43507,7 @@ fn rewrite_table_publication_column_references(
         }
         definition.table_filters =
             crate::storage::PublicationFilters::from_sql(&filters[..definition.table_count])?;
-        validate_publication_replica_identity(storage, &definition)?;
+        validate_publication_replica_identity(storage, &definition, txn.txid)?;
         let name = publication.name_for(txn.txid);
         let (altered_slot, prior) =
             storage.alter_publication(name.as_str(), definition, txn.txid)?;
@@ -49688,14 +49748,32 @@ fn decode_replication_old_tuple<'a>(
     old: OldTuple<'a>,
     arena: &'a Arena,
 ) -> Result<[Datum<'a>; MAX_COLUMNS], SqlError> {
+    if old.tuple.columns().len() != binding.remote_to_local().len() {
+        return Err(sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription old tuple has {} columns, relation has {}",
+            old.tuple.columns().len(),
+            binding.remote_to_local().len()
+        ));
+    }
+    let identity_columns = binding.identity_local_columns(old.identity);
+    for (remote, field) in old.tuple.columns().iter().enumerate() {
+        let local = binding.remote_to_local()[remote];
+        if identity_columns.contains(&local) && matches!(field, TupleColumn::UnchangedToast) {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription old tuple omits a replica identity value"
+            ));
+        }
+    }
     decode_replication_tuple_for_columns(
         storage,
         txn,
         binding.table_slot(),
-        binding.old_remote_to_local(old.identity),
+        binding.remote_to_local(),
         old.tuple,
         arena,
-        false,
+        true,
     )
 }
 
@@ -49740,7 +49818,7 @@ pub fn locate_replication_row(
         txn,
         binding,
         &expected,
-        binding.old_remote_to_local(old.identity),
+        binding.identity_local_columns(old.identity),
         arena,
     )
 }
@@ -49844,7 +49922,31 @@ pub fn apply_replication_delete(
         crate::sql::lock::LockDecision::Skipped => unreachable!("apply delete waits for its row"),
     }
     let definition = *storage.table_def(table_index, txn.txid);
-    let old_values = decode_replication_old_tuple(storage, txn, binding, old, arena)?;
+    let state = storage.row_state(row_table, row.rowid())?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROTOCOL_VIOLATION,
+            "subscription replica identity disappeared before delete"
+        )
+    })?;
+    let home = storage
+        .visible_row_home(row_table, row.rowid(), state, txn.txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "subscription replica identity is no longer visible before delete"
+            )
+        })?;
+    let bytes = storage.row_bytes(row_table, row.rowid(), home, arena)?;
+    let bytes = arena.alloc_slice_copy(bytes).map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "subscription delete row exceeds the apply arena"
+        )
+    })?;
+    let mut schema = [ColType::Bool; MAX_COLUMNS];
+    definition.schema(&mut schema);
+    let mut old_values = [Datum::Null; MAX_COLUMNS];
+    rowenc::decode(bytes, &schema[..definition.n_columns], &mut old_values)?;
     if !fire_partition_row_triggers(
         storage,
         txn,
@@ -50539,6 +50641,10 @@ fn decode_binary_field_with_context<'a>(
         ColType::Xid => {
             let value: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::Oid(u32::from_be_bytes(value)))
+        }
+        ColType::PgLsn => {
+            let value: [u8; 8] = bytes.try_into().map_err(|_| bad())?;
+            Ok(Datum::PgLsn(u64::from_be_bytes(value)))
         }
         ColType::Regtype => {
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;

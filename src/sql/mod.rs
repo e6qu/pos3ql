@@ -21,6 +21,7 @@ pub mod json;
 pub(crate) mod large_object;
 pub mod lexer;
 pub(crate) mod lock;
+pub(crate) mod logical_replication;
 pub mod md5;
 pub mod net;
 pub mod notify;
@@ -156,6 +157,7 @@ static EMPTY_DML_CTE: ast::MaterializedCte<'static> = ast::MaterializedCte {
 pub(crate) struct ReplicationEmission<'a> {
     pub publications: &'a [SqlName],
     pub binary: bool,
+    pub messages: bool,
     pub origin: crate::storage::SubscriptionOrigin,
     pub protocol: crate::pg::pgoutput::ProtocolVersion,
 }
@@ -1309,6 +1311,19 @@ struct PendingTruncate {
 }
 
 #[derive(Clone, Copy)]
+struct PendingLogicalMessage {
+    record_offset: usize,
+    command_id: u32,
+    emitted: bool,
+}
+
+const EMPTY_PENDING_LOGICAL_MESSAGE: PendingLogicalMessage = PendingLogicalMessage {
+    record_offset: 0,
+    command_id: 0,
+    emitted: false,
+};
+
+#[derive(Clone, Copy)]
 struct ReplicationType {
     oid: i32,
     schema: SqlName,
@@ -1505,14 +1520,15 @@ fn emit_pending_truncates(
         let mut relation_count = 0usize;
         for &table_slot in &truncate.table_slots[..truncate.table_count] {
             let table_slot = table_slot as usize;
-            if !publication_selects(
+            let Some(column_mask) = publication_column_mask(
                 storage,
                 publication_names,
                 table_slot,
                 PublicationOperation::Truncate,
-            )? {
+            )?
+            else {
                 continue;
-            }
+            };
             let output_slot = publication_output_relation(
                 storage,
                 publication_names,
@@ -1529,7 +1545,7 @@ fn emit_pending_truncates(
                 output_slot,
                 definition,
                 relation_id,
-                u64::MAX,
+                column_mask,
                 responder,
                 end_lsn,
             )?;
@@ -1562,6 +1578,71 @@ fn emit_pending_truncates(
                 })?;
         }
         truncate.emitted = true;
+    }
+    Ok(())
+}
+
+fn emit_pending_logical_messages(
+    transaction: &[u8],
+    enabled: bool,
+    end_lsn: u64,
+    command_id: u32,
+    messages: &mut [PendingLogicalMessage],
+    responder: &mut Responder,
+) -> Result<(), SqlError> {
+    if !enabled {
+        return Ok(());
+    }
+    for pending in messages {
+        if pending.emitted || pending.command_id > command_id {
+            continue;
+        }
+        let at = pending.record_offset;
+        let payload_len = u32::from_le_bytes(
+            transaction
+                .get(at + 4..at + 8)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt logical message WAL")
+                })?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let total = crate::wal::HEADER_LEN + payload_len;
+        let WalOp::LogicalMessage {
+            transactional,
+            message_lsn,
+            prefix,
+            content,
+            ..
+        } = crate::wal::decode_record(transaction.get(at + 16..at + total).ok_or_else(|| {
+            sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt logical message WAL")
+        })?)
+        .ok_or_else(|| sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt logical message WAL"))?
+        else {
+            return Err(sql_err!(
+                sqlstate::PROTOCOL_VIOLATION,
+                "logical message index refers to another WAL record"
+            ));
+        };
+        if content.len() > i32::MAX as usize {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "logical message exceeds pgoutput's signed length limit"
+            ));
+        }
+        responder
+            .copy_data(&|message| {
+                pgoutput::xlog_data(message, message_lsn, end_lsn, |plugin| {
+                    pgoutput::logical_message(plugin, transactional, message_lsn, prefix, content)
+                })
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "replication transaction exceeds connection send buffer"
+                )
+            })?;
+        pending.emitted = true;
     }
     Ok(())
 }
@@ -3079,6 +3160,178 @@ impl Engine {
         Ok(restart_lsn)
     }
 
+    /// Writes one user logical-decoding message. A transactional message joins
+    /// the caller's private WAL stage, so statement/savepoint/transaction
+    /// rollback removes it. A nontransactional message owns a complete batch
+    /// and remains visible even if the surrounding SQL transaction rolls back.
+    pub(crate) fn emit_logical_message(
+        &mut self,
+        txn: &mut TxnState,
+        transactional: bool,
+        prefix: &str,
+        content: &[u8],
+    ) -> Result<u64, SqlError> {
+        if prefix.as_bytes().contains(&0) {
+            return Err(sql_err!(
+                sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                "logical message prefix cannot contain a zero byte"
+            ));
+        }
+        if prefix.len() > u16::MAX as usize {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "logical message prefix exceeds 65535 bytes"
+            ));
+        }
+        if content.len() > i32::MAX as usize {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "logical message content exceeds PostgreSQL's signed length limit"
+            ));
+        }
+        let message_lsn =
+            self.storage.lsn().checked_add(1).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
+            })?;
+        let command_id = txn.command_id();
+        if transactional {
+            self.wal.stage(
+                txn.txid,
+                message_lsn,
+                &WalOp::LogicalMessage {
+                    transactional: true,
+                    message_lsn,
+                    command_id,
+                    prefix,
+                    content,
+                },
+            )?;
+            self.storage.set_lsn(message_lsn);
+            return Ok(message_lsn);
+        }
+
+        self.next_txid = self.next_txid.wrapping_add(1).max(1);
+        let transaction_id = self.next_txid;
+        if let Err(error) = self.wal.stage(
+            transaction_id,
+            message_lsn,
+            &WalOp::LogicalMessage {
+                transactional: false,
+                message_lsn,
+                command_id,
+                prefix,
+                content,
+            },
+        ) {
+            self.wal.discard_stage(transaction_id);
+            return Err(error);
+        }
+        let commit_lsn = match self.wal.commit_stage(transaction_id, self.storage.lsn()) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.wal.discard_stage(transaction_id);
+                return Err(error);
+            }
+        };
+        self.wal.commit();
+        self.storage.set_lsn(commit_lsn);
+        Ok(message_lsn)
+    }
+
+    pub(crate) fn copy_replication_slot(
+        &mut self,
+        source_name: crate::storage::ReplicationSlotName,
+        destination_name: crate::storage::ReplicationSlotName,
+    ) -> Result<u64, SqlError> {
+        let source = *self
+            .storage
+            .replication_slot(source_name.as_str())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "replication slot \"{}\" does not exist",
+                    source_name.as_str()
+                )
+            })?;
+        if source.active {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "replication slot \"{}\" is active",
+                source_name.as_str()
+            ));
+        }
+        if source.behavior.two_phase {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "copying a two-phase replication slot is not supported"
+            ));
+        }
+        if self
+            .storage
+            .replication_slot(destination_name.as_str())
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "replication slot \"{}\" already exists",
+                destination_name.as_str()
+            ));
+        }
+        if self.storage.replication_slots_with_slots().count()
+            == self.storage.replication_slot_capacity()
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many replication slots"
+            ));
+        }
+
+        self.next_txid = self.next_txid.wrapping_add(1).max(1);
+        let transaction_id = self.next_txid;
+        let lsn =
+            self.storage.lsn().checked_add(1).ok_or_else(|| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted")
+            })?;
+        let staged = self.wal.stage(
+            transaction_id,
+            lsn,
+            &WalOp::CreateReplicationSlot {
+                name: destination_name.as_str(),
+                restart_lsn: source.restart_lsn,
+                behavior: source.behavior,
+            },
+        );
+        if let Err(error) = staged.and_then(|()| {
+            self.wal.stage(
+                transaction_id,
+                lsn,
+                &WalOp::AdvanceReplicationSlot {
+                    name: destination_name.as_str(),
+                    confirmed_flush_lsn: source.confirmed_flush_lsn,
+                },
+            )
+        }) {
+            self.wal.discard_stage(transaction_id);
+            return Err(error);
+        }
+        let commit_lsn = match self.wal.commit_stage(transaction_id, self.storage.lsn()) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.wal.discard_stage(transaction_id);
+                return Err(error);
+            }
+        };
+        self.wal.commit();
+        self.storage.restore_replication_slot(
+            destination_name,
+            source.restart_lsn,
+            source.confirmed_flush_lsn,
+            source.behavior,
+        )?;
+        self.storage.set_lsn(commit_lsn);
+        Ok(source.confirmed_flush_lsn)
+    }
+
     pub(crate) fn drop_replication_slot(
         &mut self,
         name: crate::storage::ReplicationSlotName,
@@ -3181,8 +3434,78 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) fn activate_replication_slot(&mut self, name: &str) -> Result<u64, SqlError> {
-        self.storage.activate_replication_slot(name)
+    pub(crate) fn activate_replication_slot(
+        &mut self,
+        name: &str,
+        backend_pid: i32,
+    ) -> Result<u64, SqlError> {
+        self.storage.activate_replication_slot(name, backend_pid)
+    }
+
+    pub(crate) fn record_replication_slot_transaction(
+        &mut self,
+        name: &str,
+        sent_lsn: u64,
+        bytes: usize,
+    ) {
+        self.storage
+            .record_replication_slot_transaction(name, sent_lsn, bytes);
+    }
+
+    pub(crate) fn require_replication_privilege(&self, txid: u32) -> Result<(), SqlError> {
+        let allowed = self.storage.current_role_slot(txid).is_some_and(|role| {
+            let attributes = self.storage.role(role).attributes_to(txid);
+            attributes.superuser || attributes.replication
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "must be superuser or replication role to use replication slots"
+            ))
+        }
+    }
+
+    pub(crate) fn require_superuser(&self, txid: u32, function: &str) -> Result<(), SqlError> {
+        if self
+            .storage
+            .current_role_slot(txid)
+            .is_some_and(|role| self.storage.role(role).attributes_to(txid).superuser)
+        {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for function {}",
+                function
+            ))
+        }
+    }
+
+    pub(crate) fn reset_replication_slot_statistics(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<(), SqlError> {
+        self.storage
+            .reset_replication_slot_statistics(name, crate::sql::datetime::now_micros())
+    }
+
+    pub(crate) fn reset_subscription_statistics(&mut self, oid: Option<i32>, txid: u32) {
+        let slot = oid.and_then(|oid| {
+            self.storage
+                .subscriptions_with_slots_visible_to(txid)
+                .find_map(|(slot, subscription)| {
+                    (catalog::subscription_oid(subscription) == oid).then_some(slot)
+                })
+        });
+        if oid.is_none() || slot.is_some() {
+            self.storage.reset_subscription_statistics(
+                slot,
+                txid,
+                crate::sql::datetime::now_micros(),
+            );
+        }
     }
 
     pub(crate) fn deactivate_replication_slot(&mut self, name: &str) {
@@ -3229,10 +3552,18 @@ impl Engine {
         &mut self,
         name: &str,
         confirmed_flush_lsn: u64,
-    ) -> Result<(), SqlError> {
+    ) -> Result<u64, SqlError> {
+        let confirmed_flush_lsn = confirmed_flush_lsn.min(self.storage.lsn());
         let advance = self
             .storage
             .prepare_replication_slot_advance(name, confirmed_flush_lsn)?;
+        if self
+            .storage
+            .replication_slot(name)
+            .is_some_and(|slot| slot.confirmed_flush_lsn == confirmed_flush_lsn)
+        {
+            return Ok(confirmed_flush_lsn);
+        }
         self.next_txid = self.next_txid.wrapping_add(1).max(1);
         let transaction_id = self.next_txid;
         let lsn =
@@ -3257,7 +3588,7 @@ impl Engine {
         self.wal.commit();
         self.storage.apply_replication_slot_advance(advance);
         self.storage.set_lsn(commit_lsn);
-        Ok(())
+        Ok(confirmed_flush_lsn)
     }
 
     /// Emits the next complete committed transaction selected by one logical
@@ -3278,6 +3609,7 @@ impl Engine {
             ReplicationEmission {
                 publications: publication_names,
                 binary,
+                messages: false,
                 origin: crate::storage::SubscriptionOrigin::Any,
                 protocol: proto_version,
             },
@@ -3296,6 +3628,7 @@ impl Engine {
         let ReplicationEmission {
             publications: publication_names,
             binary,
+            messages,
             origin,
             protocol: proto_version,
         } = emission;
@@ -3318,6 +3651,12 @@ impl Engine {
                 emitted: false,
             }; crate::sql::txn::MAX_TXN_DDL];
             let mut truncate_count = 0usize;
+            let mut logical_messages =
+                [EMPTY_PENDING_LOGICAL_MESSAGE; crate::sql::query::MAX_ROUTINE_INVOCATIONS];
+            let mut logical_message_count = 0usize;
+            let mut has_transactional_message = false;
+            let mut has_nontransactional_message = false;
+            let mut has_row_change = false;
             while at < transaction.len() {
                 let length =
                     u32::from_le_bytes(transaction[at + 4..at + 8].try_into().unwrap()) as usize;
@@ -3422,7 +3761,45 @@ impl Engine {
                     };
                     truncate_count += 1;
                 }
+                if let Some(WalOp::LogicalMessage {
+                    transactional,
+                    command_id,
+                    ..
+                }) = crate::wal::decode_record(&transaction[at + 16..at + total])
+                {
+                    if logical_message_count == logical_messages.len() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "replication transaction contains too many logical messages"
+                        ));
+                    }
+                    logical_messages[logical_message_count] = PendingLogicalMessage {
+                        record_offset: at,
+                        command_id,
+                        emitted: false,
+                    };
+                    logical_message_count += 1;
+                    has_transactional_message |= transactional;
+                    has_nontransactional_message |= !transactional;
+                }
+                if matches!(
+                    crate::wal::decode_record(&transaction[at + 16..at + total]),
+                    Some(WalOp::Upsert { .. } | WalOp::Delete { .. })
+                ) {
+                    has_row_change = true;
+                }
                 at += total;
+            }
+            if has_nontransactional_message
+                && (has_transactional_message
+                    || truncate_count != 0
+                    || has_row_change
+                    || has_replication_origin)
+            {
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "nontransactional logical message shares a transactional WAL batch"
+                ));
             }
             if origin == crate::storage::SubscriptionOrigin::None && has_replication_origin {
                 return Ok(());
@@ -3431,7 +3808,7 @@ impl Engine {
             // selected by the publication union survives statement-level
             // TRUNCATE suppression. Catalog and slot WAL stay durable but do
             // not manufacture an empty subscriber transaction.
-            let mut publication_change = false;
+            let mut publication_change = messages && logical_message_count != 0;
             for truncate in &truncates[..truncate_count] {
                 for table_slot in &truncate.table_slots[..truncate.table_count] {
                     if publication_selects(
@@ -3585,13 +3962,15 @@ impl Engine {
                     "replication transaction exceeds connection send buffer"
                 )
             };
-            responder
-                .copy_data(&|message| {
-                    pgoutput::xlog_data(message, floor, end_lsn, |plugin| {
-                        pgoutput::begin(plugin, end_lsn, transaction_id)
+            if !has_nontransactional_message {
+                responder
+                    .copy_data(&|message| {
+                        pgoutput::xlog_data(message, floor, end_lsn, |plugin| {
+                            pgoutput::begin(plugin, end_lsn, transaction_id)
+                        })
                     })
-                })
-                .map_err(|_| overflow())?;
+                    .map_err(|_| overflow())?;
+            }
             if let Some((created_at, origin_lsn)) = subscription_origin {
                 // PostgreSQL replication-origin names identify the local
                 // stream that applied this transaction. `created_at` remains
@@ -3630,6 +4009,14 @@ impl Engine {
                             at += total;
                             continue;
                         }
+                        emit_pending_logical_messages(
+                            transaction,
+                            messages,
+                            end_lsn,
+                            command_id,
+                            &mut logical_messages[..logical_message_count],
+                            responder,
+                        )?;
                         emit_pending_truncates(
                             storage,
                             publication_names,
@@ -3718,7 +4105,9 @@ impl Engine {
                                             let (old_projected, old_count) =
                                                 project_replication_values(
                                                     &old_values[..column_count],
-                                                    replica_identity.key_mask,
+                                                    // Tuple width follows Relation; its key flags
+                                                    // select identity columns on the subscriber.
+                                                    column_mask,
                                                 );
                                             let (projected, projected_count) =
                                                 project_replication_values(
@@ -3811,6 +4200,14 @@ impl Engine {
                             at += total;
                             continue;
                         }
+                        emit_pending_logical_messages(
+                            transaction,
+                            messages,
+                            end_lsn,
+                            command_id,
+                            &mut logical_messages[..logical_message_count],
+                            responder,
+                        )?;
                         let Some(table_slot) = storage.find_table(schema, table) else {
                             return Err(sql_err!(
                                 sqlstate::UNDEFINED_TABLE,
@@ -3886,7 +4283,9 @@ impl Engine {
                                         let (projected, projected_count) =
                                             project_replication_values(
                                                 &values[..column_count],
-                                                replica_identity.key_mask,
+                                                // K still carries the Relation projection; the
+                                                // relation flags identify its key fields.
+                                                column_mask,
                                             );
                                         pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
                                             pgoutput::delete(
@@ -3902,7 +4301,7 @@ impl Engine {
                             }
                         }
                     }
-                    WalOp::Truncate { .. } => {}
+                    WalOp::Truncate { .. } | WalOp::LogicalMessage { .. } => {}
                     _ => {}
                 }
                 at += total;
@@ -3916,13 +4315,23 @@ impl Engine {
                 &mut truncates[..truncate_count],
                 responder,
             )?;
-            responder
-                .copy_data(&|message| {
-                    pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
-                        pgoutput::commit(plugin, end_lsn)
+            emit_pending_logical_messages(
+                transaction,
+                messages,
+                end_lsn,
+                u32::MAX,
+                &mut logical_messages[..logical_message_count],
+                responder,
+            )?;
+            if !has_nontransactional_message {
+                responder
+                    .copy_data(&|message| {
+                        pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
+                            pgoutput::commit(plugin, end_lsn)
+                        })
                     })
-                })
-                .map_err(|_| overflow())?;
+                    .map_err(|_| overflow())?;
+            }
             Ok(())
         };
         if let Some(checkpointer) = self.ckpt.as_mut() {
@@ -10639,13 +11048,23 @@ impl Engine {
                     Err(error) => return Ok(Err(error)),
                 };
             }
-            let value = match large_object::execute(
-                oid,
-                &arguments[..pending.argument_count],
-                &mut self.storage,
-                txn,
-                arena,
-            ) {
+            let value = match if logical_replication::is_intrinsic(oid) {
+                logical_replication::execute(
+                    oid,
+                    &arguments[..pending.argument_count],
+                    self,
+                    txn,
+                    arena,
+                )
+            } else {
+                large_object::execute(
+                    oid,
+                    &arguments[..pending.argument_count],
+                    &mut self.storage,
+                    txn,
+                    arena,
+                )
+            } {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
@@ -16835,6 +17254,7 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
         "server_encoding" => Some("UTF8"),
         "standard_conforming_strings" => Some("on"),
         "integer_datetimes" => Some("on"),
+        "data_directory_mode" => Some("0700"),
         _ => None,
     }
 }
@@ -16848,6 +17268,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "check_function_bodies",
     "client_encoding",
     "client_min_messages",
+    "data_directory_mode",
     "DateStyle",
     "default_transaction_deferrable",
     "default_transaction_isolation",
@@ -17576,7 +17997,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         | WalOp::PreparedLocks { .. }
         | WalOp::CommitPrepared { .. }
         | WalOp::RollbackPrepared { .. } => {}
-        WalOp::Truncate { .. } => {}
+        WalOp::Truncate { .. } | WalOp::LogicalMessage { .. } => {}
         WalOp::SetCast(definition) => {
             storage.create_cast_from_image(definition)?;
         }

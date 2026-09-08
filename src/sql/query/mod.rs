@@ -1566,6 +1566,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn replica_identity_index_oid(&self, relation_oid: i32) -> Option<i32> {
+        super::catalog::replica_identity_index_oid(self.storage, self.txid, relation_oid)
+    }
+
     fn resolve_collation(&self, schema: Option<&str>, name: &str) -> Option<super::ast::Collation> {
         self.storage.resolve_collation(schema, name, self.txid)
     }
@@ -4621,7 +4625,7 @@ pub fn check_select_constants<'a>(
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     for item in statement.items {
-        if let SelectItem::Expr { expression, .. } = item {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             super::eval::check_constant_errors(expression, arena)?;
         }
     }
@@ -4723,7 +4727,7 @@ pub fn validate_locking(statement: &Select) -> Result<(), SqlError> {
             ));
         }
         for item in statement.items {
-            if let SelectItem::Expr { expression, .. } = item {
+            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
                 if expr_has_window(expression) {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5089,7 +5093,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     let mut win_nodes: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
     let mut n_win = 0;
     for item in statement.items {
-        if let SelectItem::Expr { expression, .. } = item
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
             && let Err(e) = collect_windows(expression, &mut win_nodes, &mut n_win, storage, txid)
         {
             return sql_fail(e);
@@ -5124,7 +5128,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
     for item in statement.items {
-        if let SelectItem::Expr { expression, .. } = item
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
             && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)
         {
             return sql_fail(e);
@@ -5437,7 +5441,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     let mut win_probe: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
     let mut n_win = 0;
     for item in statement.items {
-        if let SelectItem::Expr { expression, .. } = item
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
             && let Err(e) = collect_windows(expression, &mut win_probe, &mut n_win, storage, txid)
         {
             return sql_fail(e);
@@ -5474,7 +5478,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
     let mut sub_exprs: [Option<&Expr>; 1 + MAX_PROJ] = [None; 1 + MAX_PROJ];
     sub_exprs[0] = statement.where_clause;
     for (i, item) in statement.items.iter().enumerate() {
-        if let SelectItem::Expr { expression, .. } = item {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             sub_exprs[1 + i] = Some(expression);
         }
     }
@@ -5536,7 +5540,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
     for item in statement.items {
-        if let SelectItem::Expr { expression, .. } = item
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
             && let Err(e) = collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)
         {
             return sql_fail(e);
@@ -6049,7 +6053,7 @@ fn select_into_rows_mode<'a>(
         [(core::ptr::null(), &Expr::Null); MAX_AGGS];
     let mut n_aggs = 0;
     for item in statement.items {
-        if let SelectItem::Expr { expression, .. } = item {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
         }
     }
@@ -6177,7 +6181,7 @@ fn select_into_rows_mode<'a>(
         sub_exprs[0] = statement.where_clause;
         sub_exprs[1] = statement.having;
         for (i, item) in statement.items.iter().enumerate() {
-            if let SelectItem::Expr { expression, .. } = item {
+            if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
                 sub_exprs[2 + i] = Some(expression);
             }
         }

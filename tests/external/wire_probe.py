@@ -12,6 +12,7 @@ import os
 import socket
 import struct
 import sys
+import time
 
 HOST = os.environ.get("POS3QL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("POS3QL_PORT", "5433"))
@@ -1648,6 +1649,173 @@ def test_pgoutput_startup_options_and_default_text_tuples():
     )
 
     stream.close()
+
+    message_stream = connect()
+    message_stream.sendall(
+        startup_payload(0, parameters=(("replication", "database"),))
+    )
+    drain_startup(message_stream)
+    simple_query(
+        message_stream,
+        "CREATE_REPLICATION_SLOT wire_replication_messages LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+    )
+    message_stream.sendall(
+        frontend_message(
+            b"Q",
+            b"START_REPLICATION SLOT wire_replication_messages LOGICAL 0/0 "
+            b"(proto_version '4', publication_names 'wire_replication_pub', messages 'true')\x00",
+        )
+    )
+    kind, payload = read_message(message_stream)
+    check(
+        "pgoutput messages=true enters CopyBoth",
+        kind == b"W",
+        (kind, payload),
+    )
+    emitted = simple_query(
+        setup,
+        "BEGIN; "
+        "SELECT pg_logical_emit_message(true, 'wire-before', 'before'); "
+        "INSERT INTO wire_replication VALUES (99); "
+        "SELECT pg_logical_emit_message(true, 'wire-after', '\\x610062'::bytea); "
+        "COMMIT",
+    )
+    check(
+        "pg_logical_emit_message SQL calls commit with their transaction",
+        not any(kind == b"E" for kind, _ in emitted),
+        emitted,
+    )
+    message_tags = []
+    logical_messages = []
+    end_lsn = 0
+    for _ in range(128):
+        kind, payload = read_message(message_stream)
+        if kind != b"d" or len(payload) <= 25 or payload[:1] != b"w":
+            continue
+        plugin = payload[25:]
+        message_tags.append(plugin[:1])
+        if plugin[:1] == b"M":
+            flags = plugin[1]
+            message_lsn = struct.unpack("!Q", plugin[2:10])[0]
+            prefix_end = plugin.index(b"\x00", 10)
+            content_length = struct.unpack(
+                "!I", plugin[prefix_end + 1 : prefix_end + 5]
+            )[0]
+            content = plugin[prefix_end + 5 :]
+            logical_messages.append(
+                (flags, message_lsn, plugin[10:prefix_end], content_length, content)
+            )
+        if plugin[:1] == b"C":
+            end_lsn = struct.unpack("!Q", payload[9:17])[0]
+            message_stream.sendall(standby_status(end_lsn))
+            break
+    before_index = next(
+        (index for index, message in enumerate(logical_messages) if message[2] == b"wire-before"),
+        None,
+    )
+    after_index = next(
+        (index for index, message in enumerate(logical_messages) if message[2] == b"wire-after"),
+        None,
+    )
+    first_insert = next(
+        (index for index, tag in enumerate(message_tags) if tag == b"I"), None
+    )
+    message_positions = [
+        index for index, tag in enumerate(message_tags) if tag == b"M"
+    ]
+    check(
+        "pgoutput logical messages preserve command order and binary content",
+        before_index == 0
+        and after_index == 1
+        and first_insert is not None
+        and len(message_positions) == 2
+        and message_positions[0] < first_insert < message_positions[1]
+        and logical_messages[0][0] == 1
+        and logical_messages[0][3:] == (6, b"before")
+        and logical_messages[1][0] == 1
+        and logical_messages[1][3:] == (3, b"a\x00b")
+        and all(message[1] > 0 for message in logical_messages),
+        (message_tags, logical_messages),
+    )
+
+    emitted = simple_query(
+        setup,
+        "BEGIN; "
+        "SELECT pg_logical_emit_message(false, 'wire-survives', 'rollback'); "
+        "SELECT pg_logical_emit_message(true, 'wire-rolled-back', 'hidden'); "
+        "ROLLBACK",
+    )
+    check(
+        "nontransactional logical emit commits independently of the rolled-back transaction",
+        not any(kind == b"E" for kind, _ in emitted),
+        emitted,
+    )
+    message_stream.sendall(standby_status(end_lsn, reply_requested=True))
+    nontransactional = None
+    for _ in range(128):
+        kind, payload = read_message(message_stream)
+        if kind != b"d" or len(payload) <= 25 or payload[:1] != b"w":
+            continue
+        plugin = payload[25:]
+        if plugin[:1] != b"M":
+            continue
+        prefix_end = plugin.index(b"\x00", 10)
+        content_length = struct.unpack(
+            "!I", plugin[prefix_end + 1 : prefix_end + 5]
+        )[0]
+        nontransactional = (
+            plugin[1],
+            plugin[10:prefix_end],
+            content_length,
+            plugin[prefix_end + 5 :],
+        )
+        break
+    check(
+        "nontransactional logical message survives outer rollback without a transaction envelope",
+        nontransactional == (0, b"wire-survives", 8, b"rollback"),
+        nontransactional,
+    )
+    monitoring = simple_query(
+        setup,
+        "SELECT slots.active, slots.active_pid IS NOT NULL, replication.state, "
+        "replication.sent_lsn >= slots.confirmed_flush_lsn, statistics.total_txns >= 2, "
+        "statistics.total_bytes > 0 "
+        "FROM pg_replication_slots slots "
+        "JOIN pg_stat_replication replication ON replication.pid = slots.active_pid "
+        "JOIN pg_stat_replication_slots statistics "
+        "ON statistics.slot_name = slots.slot_name::text "
+        "WHERE slots.slot_name = 'wire_replication_messages'",
+    )
+    check(
+        "logical replication monitoring reports the live sender and emitted transaction counters",
+        [
+            text_row_fields(payload)
+            for kind, payload in monitoring
+            if kind == b"D"
+        ]
+        == [["t", "t", "streaming", "t", "t", "t"]],
+        monitoring,
+    )
+    message_stream.close()
+    inactive = []
+    inactive_rows = []
+    for _ in range(50):
+        inactive = simple_query(
+            setup,
+            "SELECT active, active_pid IS NULL FROM pg_replication_slots "
+            "WHERE slot_name = 'wire_replication_messages'",
+        )
+        inactive_rows = [
+            text_row_fields(payload) for kind, payload in inactive if kind == b"D"
+        ]
+        if inactive_rows == [["f", "t"]]:
+            break
+        time.sleep(0.02)
+    check(
+        "closing a logical stream clears its monitoring identity",
+        inactive_rows == [["f", "t"]],
+        inactive,
+    )
 
     # Versions 3 and 4 add optional in-progress / two-phase capabilities, but
     # retain the ordinary committed-transaction message flow negotiated here.

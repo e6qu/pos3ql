@@ -50,6 +50,15 @@ else
 SUB_PG_PORT=$(select_port "${POS3QL_SUBSCRIPTION_PG_PORT:-}" 15496 15516)
 fi
 SUB_POS3QL_PORT=$(select_port "${POS3QL_SUBSCRIPTION_POS3QL_PORT:-}" 15542 15562)
+if [[ -n "${POS3QL_EXTERNAL_SUBSCRIBER_PORT:-}" ]]; then
+  SUBSCRIBER_PG_PORT=$POS3QL_EXTERNAL_SUBSCRIBER_PORT
+  if ! nc -z 127.0.0.1 "$SUBSCRIBER_PG_PORT" >/dev/null 2>&1; then
+    printf 'FAIL: external subscriber port %s is not listening\n' "$SUBSCRIBER_PG_PORT" >&2
+    exit 1
+  fi
+else
+  SUBSCRIBER_PG_PORT=$(select_port "${POS3QL_SUBSCRIBER_PG_PORT:-}" 15564 15584)
+fi
 STLS_PORT=$(select_port "${POS3QL_TLS_PORT:-}" 15520 15540)
 
 PASS=0
@@ -135,6 +144,12 @@ cleanup() {
   fi
   if [[ -n "${SUB_POS3QL_PID:-}" ]]; then
     stop_pos3ql "$SUB_POS3QL_PID"
+  fi
+  if [[ -n "${PG_SUBSCRIBER_DATA:-}" && -x "${SUB_PGBIN:-}/pg_ctl" ]]; then
+    "$SUB_PGBIN/pg_ctl" -D "$PG_SUBSCRIBER_DATA" stop -m immediate >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${RECVLOGICAL_PID:-}" ]]; then
+    kill "$RECVLOGICAL_PID" >/dev/null 2>&1 || true
   fi
   if [[ -n "${GATEWAY_PID:-}" ]]; then
     kill "$GATEWAY_PID" 2>/dev/null
@@ -1070,6 +1085,189 @@ else
   "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "DROP SUBSCRIPTION pos3ql_subscription_mismatch" >/dev/null 2>&1
   fi
+fi
+
+step "logical publication consumed by a real PostgreSQL 18 subscriber"
+PG_SUBSCRIBER_DATA="$WORK/postgresql-subscriber-data"
+PG_SUBSCRIBER_STARTED=false
+PG_SUBSCRIBER_AVAILABLE=false
+if [[ -n "${POS3QL_EXTERNAL_SUBSCRIBER_PORT:-}" ]]; then
+  PG_SUBSCRIBER_DATA=""
+  PG_SUBSCRIBER_AVAILABLE=true
+elif ! "$SUB_PGBIN/initdb" -D "$PG_SUBSCRIBER_DATA" -U postgres -A trust \
+  --encoding=UTF8 --lc-collate=C --lc-ctype=C > "$WORK/postgresql-subscriber-initdb.log" 2>&1; then
+  bad "PostgreSQL subscriber initialization"
+  tail -20 "$WORK/postgresql-subscriber-initdb.log"
+elif ! "$SUB_PGBIN/pg_ctl" -D "$PG_SUBSCRIBER_DATA" \
+  -o "-p $SUBSCRIBER_PG_PORT -c listen_addresses=127.0.0.1 -c unix_socket_directories=$WORK" \
+  -l "$WORK/postgresql-subscriber.log" start >/dev/null; then
+  bad "PostgreSQL subscriber start"
+  tail -20 "$WORK/postgresql-subscriber.log"
+else
+  PG_SUBSCRIBER_STARTED=true
+  PG_SUBSCRIBER_AVAILABLE=true
+fi
+if [[ "$PG_SUBSCRIBER_AVAILABLE" == true ]]; then
+  PG_SUBSCRIBER_PSQL="$SUB_PGBIN/psql"
+  postgresql_subscriber_log() {
+    if [[ -n "${POS3QL_EXTERNAL_SUBSCRIBER_CONTAINER:-}" ]]; then
+      docker logs "$POS3QL_EXTERNAL_SUBSCRIBER_CONTAINER" 2>&1 | tail -80
+    else
+      tail -80 "$WORK/postgresql-subscriber.log"
+    fi
+  }
+  for _ in {1..50}; do
+    "$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -q \
+      -c "SELECT 1" >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  if ! "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
+    -c "CREATE TABLE postgresql_subscriber_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text)" \
+    -c "INSERT INTO postgresql_subscriber_target VALUES (-1, 'filtered', 'private'), (1, 'snapshot', 'private')" \
+    -c "CREATE PUBLICATION postgresql_subscriber_pub FOR TABLE postgresql_subscriber_target (id, body) WHERE (id > 0)" \
+    >"$WORK/postgresql-subscriber-publisher.out" 2>&1; then
+    bad "PostgreSQL subscriber publisher setup"
+    cat "$WORK/postgresql-subscriber-publisher.out"
+  elif ! "$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -q \
+    -c "CREATE TABLE postgresql_subscriber_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text DEFAULT 'subscriber-default')" \
+    -c "CREATE SUBSCRIPTION postgresql_subscriber CONNECTION 'host=127.0.0.1 port=$SUB_POS3QL_PORT user=postgres dbname=postgres application_name=postgresql_subscriber sslmode=disable' PUBLICATION postgresql_subscriber_pub WITH (binary = true, streaming = parallel)" \
+    >"$WORK/postgresql-subscriber-create.out" 2>&1; then
+    bad "real PostgreSQL subscription creation"
+    cat "$WORK/postgresql-subscriber-create.out"
+    postgresql_subscriber_log
+    tail -80 "$WORK/subscription-pos3ql.log"
+  else
+    postgresql_subscription_rows() {
+      "$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -t -A -F'|' \
+        -c "SELECT id, body, publisher_only FROM postgresql_subscriber_target ORDER BY id" 2>&1
+    }
+    postgresql_subscription_wait() {
+      local expected=$1 actual=""
+      for _ in {1..100}; do
+        actual=$(postgresql_subscription_rows)
+        [[ "$actual" == "$expected" ]] && return 0
+        sleep 0.1
+      done
+      printf '%s\n' "$actual"
+      return 1
+    }
+    postgresql_subscription_ready() {
+      local state=""
+      for _ in {1..100}; do
+        state=$("$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -t -A \
+          -c "SELECT srsubstate FROM pg_subscription_rel" 2>&1)
+        [[ "$state" == "r" ]] && return 0
+        sleep 0.1
+      done
+      printf '%s\n' "$state"
+      return 1
+    }
+    if postgresql_subscription_wait "1|snapshot|subscriber-default"; then
+      ok "PostgreSQL 18 subscriber imports a filtered projected pos3ql snapshot"
+    else
+      bad "PostgreSQL 18 subscriber initial copy (got $(postgresql_subscription_rows))"
+      postgresql_subscriber_log
+      tail -80 "$WORK/subscription-pos3ql.log"
+    fi
+    if postgresql_subscription_ready; then
+      ok "PostgreSQL 18 subscriber completes tablesync lifecycle"
+    else
+      bad "PostgreSQL 18 subscriber tablesync lifecycle"
+      postgresql_subscriber_log
+      tail -80 "$WORK/subscription-pos3ql.log"
+    fi
+    if ! "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
+      -c "INSERT INTO postgresql_subscriber_target VALUES (-2, 'filtered-stream', 'private'), (2, 'stream', 'private')" \
+      -c "UPDATE postgresql_subscriber_target SET body = 'updated' WHERE id = 1" \
+      -c "DELETE FROM postgresql_subscriber_target WHERE id = 2" >/dev/null 2>&1; then
+      bad "pos3ql transaction for PostgreSQL subscriber"
+    elif postgresql_subscription_wait "1|updated|subscriber-default"; then
+      ok "PostgreSQL 18 subscriber applies pos3ql inserts, updates, deletes, and row filters"
+    else
+      bad "PostgreSQL 18 subscriber steady stream (got $(postgresql_subscription_rows))"
+      postgresql_subscriber_log
+      tail -80 "$WORK/subscription-pos3ql.log"
+    fi
+    PG_RECVLOGICAL="$SUB_PGBIN/pg_recvlogical"
+    RECVLOGICAL_SLOT=postgresql_tool_slot
+    RECVLOGICAL_OUTPUT="$WORK/pg-recvlogical.out"
+    if [[ ! -x "$PG_RECVLOGICAL" ]]; then
+      bad "PostgreSQL pg_recvlogical binary is unavailable"
+    elif ! "$PG_RECVLOGICAL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres \
+      -d postgres -S "$RECVLOGICAL_SLOT" -P pgoutput --create-slot \
+      >"$WORK/pg-recvlogical-create.out" 2>&1; then
+      bad "pg_recvlogical creates a pos3ql logical slot"
+      cat "$WORK/pg-recvlogical-create.out"
+    else
+      "$PG_RECVLOGICAL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres \
+        -d postgres -S "$RECVLOGICAL_SLOT" --start --no-loop -f - \
+        -o proto_version=4 -o publication_names=postgresql_subscriber_pub -o messages=true \
+        >"$RECVLOGICAL_OUTPUT" 2>"$WORK/pg-recvlogical.log" &
+      RECVLOGICAL_PID=$!
+      sleep 0.2
+      "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
+        -c "SELECT pg_logical_emit_message(false, 'pg-recvlogical-message', 'tool-visible')" \
+        -c "INSERT INTO postgresql_subscriber_target VALUES (3, 'pg-recvlogical-stream', 'private')" \
+        >/dev/null 2>&1
+      recvlogical_found=false
+      for _ in {1..100}; do
+        if [[ -f "$RECVLOGICAL_OUTPUT" ]] \
+          && grep -a -q "pg-recvlogical-stream" "$RECVLOGICAL_OUTPUT" \
+          && grep -a -q "pg-recvlogical-message" "$RECVLOGICAL_OUTPUT" \
+          && grep -a -q "tool-visible" "$RECVLOGICAL_OUTPUT"; then
+          recvlogical_found=true
+          break
+        fi
+        sleep 0.1
+      done
+      kill "$RECVLOGICAL_PID" >/dev/null 2>&1 || true
+      wait "$RECVLOGICAL_PID" >/dev/null 2>&1 || true
+      RECVLOGICAL_PID=""
+      if [[ "$recvlogical_found" == true ]]; then
+        ok "PostgreSQL pg_recvlogical consumes rows and logical messages from pos3ql pgoutput"
+      else
+        bad "pg_recvlogical pgoutput stream"
+        cat "$WORK/pg-recvlogical.log"
+      fi
+      if "$PG_RECVLOGICAL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres \
+        -d postgres -S "$RECVLOGICAL_SLOT" --drop-slot \
+        >"$WORK/pg-recvlogical-drop.out" 2>&1; then
+        ok "PostgreSQL pg_recvlogical drops its pos3ql slot"
+      else
+        bad "pg_recvlogical drops its pos3ql slot"
+        cat "$WORK/pg-recvlogical-drop.out"
+      fi
+    fi
+    if ! "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
+      -c "TRUNCATE postgresql_subscriber_target" >/dev/null 2>&1; then
+      bad "pos3ql truncate for PostgreSQL subscriber"
+    elif postgresql_subscription_wait ""; then
+      ok "PostgreSQL 18 subscriber applies a pos3ql truncate"
+    else
+      bad "PostgreSQL 18 subscriber truncate (got $(postgresql_subscription_rows))"
+      postgresql_subscriber_log
+      tail -80 "$WORK/subscription-pos3ql.log"
+    fi
+    if "$PG_SUBSCRIBER_PSQL" -h 127.0.0.1 -p "$SUBSCRIBER_PG_PORT" -U postgres -X -q \
+      -c "DROP SUBSCRIPTION postgresql_subscriber" >/dev/null 2>&1; then
+      postgresql_slot_count=1
+      for _ in {1..100}; do
+        postgresql_slot_count=$("$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -t -A \
+          -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'postgresql_subscriber'")
+        [[ "$postgresql_slot_count" == "0" ]] && break
+        sleep 0.1
+      done
+      [[ "$postgresql_slot_count" == "0" ]] \
+        && ok "PostgreSQL subscriber drop removes its pos3ql publisher slot" \
+        || bad "PostgreSQL subscriber slot cleanup (got $postgresql_slot_count)"
+    else
+      bad "PostgreSQL subscriber drop"
+    fi
+  fi
+fi
+if [[ "$PG_SUBSCRIBER_STARTED" == true ]]; then
+  "$SUB_PGBIN/pg_ctl" -D "$PG_SUBSCRIBER_DATA" stop -m immediate >/dev/null
+  PG_SUBSCRIBER_DATA=""
 fi
 stop_pos3ql "$SUB_POS3QL_PID"
 SUB_POS3QL_PID=""

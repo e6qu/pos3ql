@@ -96,6 +96,9 @@ const KIND_ALTER_PUBLICATION_V2: u8 = 129;
 /// the in-memory reset of every unlogged relation durable across later clean
 /// restarts without exposing the reset through logical replication.
 const KIND_RESET_UNLOGGED_RELATIONS: u8 = 130;
+/// User-defined logical decoding message. It is durable engine WAL but has no
+/// storage replay effect; pgoutput consumes it in command order.
+const KIND_LOGICAL_MESSAGE: u8 = 131;
 const KIND_SET_PUBLICATION_OWNER: u8 = 43;
 const KIND_RENAME_PUBLICATION: u8 = 44;
 const KIND_CREATE_ROUTINE: u8 = 45;
@@ -192,7 +195,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_RESET_UNLOGGED_RELATIONS;
+const LAST_KIND: u8 = KIND_LOGICAL_MESSAGE;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -553,6 +556,16 @@ pub(crate) enum WalOp<'a> {
         cascade: bool,
         restart_identity: bool,
         command_id: u32,
+    },
+    /// A payload emitted through `pg_logical_emit_message`. Transactional
+    /// records share their caller's commit boundary; nontransactional records
+    /// live in their own committed WAL batch.
+    LogicalMessage {
+        transactional: bool,
+        message_lsn: u64,
+        command_id: u32,
+        prefix: &'a str,
+        content: &'a [u8],
     },
     CreateView {
         schema: &'a str,
@@ -2030,6 +2043,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Upsert { .. } => KIND_UPSERT,
         WalOp::Delete { .. } => KIND_DELETE,
         WalOp::Truncate { .. } => KIND_TRUNCATE,
+        WalOp::LogicalMessage { .. } => KIND_LOGICAL_MESSAGE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::SetViewOptions { .. } => KIND_SET_VIEW_OPTIONS,
@@ -2339,6 +2353,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + table.len() + 8 + 1 + schema.len() + 1 + old_row.map_or(0, |old| 4 + old.len()) + 4
         }
         WalOp::Truncate { tables, .. } => 1 + tables.len() + 1 + 4,
+        WalOp::LogicalMessage {
+            prefix, content, ..
+        } => 1 + 8 + 4 + 2 + prefix.len() + 4 + content.len(),
         WalOp::CreateView {
             schema,
             name,
@@ -4014,6 +4031,23 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(tables)
                 && buffer.append(&[u8::from(*cascade) | (u8::from(*restart_identity) << 1)])
                 && buffer.append(&command_id.to_le_bytes())
+        }
+        WalOp::LogicalMessage {
+            transactional,
+            message_lsn,
+            command_id,
+            prefix,
+            content,
+        } => {
+            prefix.len() <= u16::MAX as usize
+                && content.len() <= u32::MAX as usize
+                && buffer.append(&[u8::from(*transactional)])
+                && buffer.append(&message_lsn.to_le_bytes())
+                && buffer.append(&command_id.to_le_bytes())
+                && buffer.append(&(prefix.len() as u16).to_le_bytes())
+                && buffer.append(prefix.as_bytes())
+                && buffer.append(&(content.len() as u32).to_le_bytes())
+                && buffer.append(content)
         }
         WalOp::CreateView {
             schema,
@@ -6788,6 +6822,34 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 cascade: flags & 1 != 0,
                 restart_identity: flags & 2 != 0,
                 command_id,
+            })
+        }
+        KIND_LOGICAL_MESSAGE => {
+            let transactional = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            let message_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let command_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let prefix_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            let prefix = core::str::from_utf8(payload.get(at..at + prefix_len)?).ok()?;
+            at += prefix_len;
+            let content_len =
+                u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+            at += 4;
+            let content = payload.get(at..at + content_len)?;
+            at += content_len;
+            (at == payload.len()).then_some(WalOp::LogicalMessage {
+                transactional,
+                message_lsn,
+                command_id,
+                prefix,
+                content,
             })
         }
         KIND_CREATE_VIEW => {
@@ -9810,7 +9872,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Bool(_)) => 1,
         Some(OwnedDatum::Char(_)) => 1,
         Some(OwnedDatum::Int4(_)) | Some(OwnedDatum::Oid(_)) => 4,
-        Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::Float8(_)) => 8,
+        Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::PgLsn(_)) | Some(OwnedDatum::Float8(_)) => 8,
         Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
         Some(OwnedDatum::RegObject { len, .. }) => 9 + *len as usize,
         Some(OwnedDatum::Date(_)) => 4,
@@ -9942,6 +10004,11 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         }
         Some(OwnedDatum::Int8(v)) => {
             out[0] = 4;
+            out[1..9].copy_from_slice(&v.to_le_bytes());
+            9
+        }
+        Some(OwnedDatum::PgLsn(v)) => {
+            out[0] = 33;
             out[1..9].copy_from_slice(&v.to_le_bytes());
             9
         }
@@ -10185,6 +10252,11 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = payload.get(*at..*at + 8)?;
             *at += 8;
             Some(OwnedDatum::Int8(i64::from_le_bytes(b.try_into().unwrap())))
+        }
+        33 => {
+            let b = payload.get(*at..*at + 8)?;
+            *at += 8;
+            Some(OwnedDatum::PgLsn(u64::from_le_bytes(b.try_into().unwrap())))
         }
         5 => {
             let b = payload.get(*at..*at + 8)?;
@@ -10890,6 +10962,43 @@ mod tests {
             let mut at = 0;
             assert_eq!(decode_default(&encoded[..len], &mut at), Some(default));
             assert_eq!(at, len);
+        }
+    }
+
+    #[test]
+    fn logical_message_payload_round_trips_binary_content_strictly() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "logical-message", 256).unwrap();
+        let operation = WalOp::LogicalMessage {
+            transactional: true,
+            message_lsn: 0x1234_5678_9abc_def0,
+            command_id: 17,
+            prefix: "binary-prefix",
+            content: b"a\0b\xff",
+        };
+        assert!(append_payload(&mut payload, &operation));
+        assert_eq!(payload.len(), encoded_payload_len(&operation));
+        let encoded = payload.readable();
+        let Some(WalOp::LogicalMessage {
+            transactional,
+            message_lsn,
+            command_id,
+            prefix,
+            content,
+        }) = decode_op(KIND_LOGICAL_MESSAGE, encoded)
+        else {
+            panic!("logical message did not decode")
+        };
+        assert!(transactional);
+        assert_eq!(message_lsn, 0x1234_5678_9abc_def0);
+        assert_eq!(command_id, 17);
+        assert_eq!(prefix, "binary-prefix");
+        assert_eq!(content, b"a\0b\xff");
+        for truncated in 0..encoded.len() {
+            assert!(
+                decode_op(KIND_LOGICAL_MESSAGE, &encoded[..truncated]).is_none(),
+                "accepted truncated logical message at {truncated}"
+            );
         }
     }
 

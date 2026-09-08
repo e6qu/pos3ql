@@ -39,6 +39,8 @@ pub mod oid {
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
     pub const XID: i32 = 28;
+    pub const PG_LSN: i32 = 3220;
+    pub const PG_LSN_ARRAY: i32 = 3221;
     pub const OID_ARRAY: i32 = 1028;
     pub const TEXT: i32 = 25;
     pub const ACLITEM: i32 = 1033;
@@ -321,6 +323,9 @@ pub enum ColType {
     /// PostgreSQL transaction identity (`xid`, OID 28). Values retain unsigned
     /// four-byte storage while the declared type carries the distinct wire OID.
     Xid,
+    /// PostgreSQL WAL position (`pg_lsn`, OID 3220), retained as an unsigned
+    /// 64-bit value so the high half cannot become a negative SQL integer.
+    PgLsn,
     /// `regtype`: a catalog type reference with OID storage and catalog-name
     /// text output, not ordinary text.
     Regtype,
@@ -461,6 +466,8 @@ pub enum BtreeOperatorClass {
     Varbit,
     TsQuery,
     TsVector,
+    /// Appended to preserve the persisted codes of earlier operator classes.
+    PgLsn,
 }
 
 impl BtreeOperatorClass {
@@ -492,6 +499,7 @@ impl BtreeOperatorClass {
             | Regnamespace | Regrole | Regconfig | Regdictionary => Self::Oid,
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
+            PgLsn => Self::PgLsn,
             Char | Geometry(_) => return None,
             Time => Self::Time,
             Timestamp => Self::Timestamp,
@@ -540,6 +548,7 @@ impl BtreeOperatorClass {
             "timetz_ops" => Self::Timetz,
             "tsquery_ops" => Self::TsQuery,
             "tsvector_ops" => Self::TsVector,
+            "pg_lsn_ops" => Self::PgLsn,
             "uuid_ops" => Self::Uuid,
             "varbit_ops" => Self::Varbit,
             _ => return None,
@@ -580,6 +589,7 @@ impl BtreeOperatorClass {
             30 => Self::Varbit,
             31 => Self::TsQuery,
             32 => Self::TsVector,
+            33 => Self::PgLsn,
             _ => return None,
         })
     }
@@ -620,6 +630,7 @@ impl BtreeOperatorClass {
             Self::Timetz => "timetz_ops",
             Self::TsQuery => "tsquery_ops",
             Self::TsVector => "tsvector_ops",
+            Self::PgLsn => "pg_lsn_ops",
             Self::Uuid => "uuid_ops",
             Self::Varbit => "varbit_ops",
         }
@@ -657,6 +668,7 @@ impl BtreeOperatorClass {
             Self::Timetz => 10041,
             Self::TsQuery => 10074,
             Self::TsVector => 10071,
+            Self::PgLsn => 10067,
             Self::Uuid => 10065,
             Self::Varbit => 10043,
         }
@@ -753,6 +765,7 @@ impl ColType {
             "name" => Self::Name,
             "oid" => Self::Oid,
             "xid" => Self::Xid,
+            "pg_lsn" => Self::PgLsn,
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
             "date" => Self::Date,
@@ -796,6 +809,7 @@ impl ColType {
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
             Self::Xid => oid::XID,
+            Self::PgLsn => oid::PG_LSN,
             Self::Regtype => oid::REGTYPE,
             Self::Regproc => oid::REGPROC,
             Self::Regprocedure => oid::REGPROCEDURE,
@@ -863,6 +877,7 @@ impl ColType {
             oid::INT4 => Some(Self::Int4),
             oid::OID => Some(Self::Oid),
             oid::XID => Some(Self::Xid),
+            oid::PG_LSN => Some(Self::PgLsn),
             oid::REGPROC => Some(Self::Regproc),
             oid::REGPROCEDURE => Some(Self::Regprocedure),
             oid::REGOPER => Some(Self::Regoper),
@@ -991,7 +1006,12 @@ impl ColType {
             | Self::Regdictionary
             | Self::Date
             | Self::Float4 => 4,
-            Self::Int8 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
+            Self::Int8
+            | Self::PgLsn
+            | Self::Float8
+            | Self::Timestamp
+            | Self::Timestamptz
+            | Self::Time => 8,
             Self::Timetz => 12,
             Self::Interval => 16,
             Self::Uuid => 16,
@@ -1065,6 +1085,7 @@ impl ColType {
             Self::Int4 => "int4",
             Self::Oid => "oid",
             Self::Xid => "xid",
+            Self::PgLsn => "pg_lsn",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -1140,6 +1161,7 @@ impl ColType {
             Self::Int4 => "integer",
             Self::Oid => "oid",
             Self::Xid => "xid",
+            Self::PgLsn => "pg_lsn",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -1202,6 +1224,7 @@ impl ColType {
             Self::Int4 => 2,
             Self::Oid => 56,
             Self::Xid => 76,
+            Self::PgLsn => 79,
             Self::Regtype => 58,
             Self::Regproc => 59,
             Self::Regprocedure => 60,
@@ -1283,6 +1306,7 @@ impl ColType {
             2 => Self::Int4,
             56 => Self::Oid,
             76 => Self::Xid,
+            79 => Self::PgLsn,
             58 => Self::Regtype,
             59 => Self::Regproc,
             60 => Self::Regprocedure,
@@ -1360,6 +1384,7 @@ pub enum ArrElem {
     Char,
     Int4,
     Oid,
+    PgLsn,
     Int8,
     Float8,
     Text,
@@ -1439,12 +1464,13 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 61] = [
+    pub const BUILTIN: [Self; 62] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
         Self::Int4,
         Self::Oid,
+        Self::PgLsn,
         Self::Int8,
         Self::Float4,
         Self::Float8,
@@ -1536,6 +1562,7 @@ impl ArrElem {
             ArrElem::Char => "_char",
             ArrElem::Int4 => "_int4",
             ArrElem::Oid => "_oid",
+            ArrElem::PgLsn => "_pg_lsn",
             ArrElem::Int8 => "_int8",
             ArrElem::Float8 => "_float8",
             ArrElem::Text => "_text",
@@ -1615,6 +1642,7 @@ impl ArrElem {
             ArrElem::Char => "\"char\"[]",
             ArrElem::Int4 => "integer[]",
             ArrElem::Oid => "oid[]",
+            ArrElem::PgLsn => "pg_lsn[]",
             ArrElem::Int8 => "bigint[]",
             ArrElem::Float8 => "double precision[]",
             ArrElem::Text => "text[]",
@@ -1701,6 +1729,7 @@ impl ArrElem {
             Datum::Int2(_) => ArrElem::Int2,
             Datum::Int4(_) => ArrElem::Int4,
             Datum::Oid(_) => ArrElem::Oid,
+            Datum::PgLsn(_) => ArrElem::PgLsn,
             Datum::Int8(_) => ArrElem::Int8,
             Datum::Float4(_) => ArrElem::Float4,
             Datum::Float8(_) => ArrElem::Float8,
@@ -1761,6 +1790,8 @@ impl ArrElem {
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
             ColType::Oid => return Some(ArrElem::Oid),
+            ColType::Xid => return None,
+            ColType::PgLsn => return Some(ArrElem::PgLsn),
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
             ColType::Bit { varying: false } => return Some(ArrElem::Bit),
@@ -1820,6 +1851,7 @@ impl ArrElem {
             ArrElem::Char => ColType::Char,
             ArrElem::Int4 => ColType::Int4,
             ArrElem::Oid => ColType::Oid,
+            ArrElem::PgLsn => ColType::PgLsn,
             ArrElem::Int8 => ColType::Int8,
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
@@ -1887,6 +1919,7 @@ impl ArrElem {
             ArrElem::Char => 1002,
             ArrElem::Int4 => 1007,
             ArrElem::Oid => oid::OID_ARRAY,
+            ArrElem::PgLsn => oid::PG_LSN_ARRAY,
             ArrElem::Int8 => 1016,
             ArrElem::Float8 => 1022,
             ArrElem::Text => 1009,
@@ -1953,6 +1986,7 @@ impl ArrElem {
             ArrElem::Char => 126,
             ArrElem::Int4 => 1,
             ArrElem::Oid => 63,
+            ArrElem::PgLsn => 123,
             ArrElem::Int8 => 2,
             ArrElem::Float8 => 3,
             ArrElem::Text => 4,
@@ -2013,6 +2047,7 @@ impl ArrElem {
             126 => ArrElem::Char,
             1 => ArrElem::Int4,
             63 => ArrElem::Oid,
+            123 => ArrElem::PgLsn,
             2 => ArrElem::Int8,
             3 => ArrElem::Float8,
             4 => ArrElem::Text,
@@ -2582,6 +2617,7 @@ pub enum Datum<'a> {
     /// PostgreSQL's unsigned object identifier. This is distinct from int4:
     /// its upper half is valid and must not be rendered or ordered as negative.
     Oid(u32),
+    PgLsn(u64),
     Int8(i64),
     /// `real`/`float4`. The width is the type: an f32 holds exactly what
     /// PostgreSQL's real does, so casts round through it and arithmetic between
@@ -2744,6 +2780,7 @@ impl<'a> Datum<'a> {
             Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
             Datum::Oid(_) => oid::OID,
+            Datum::PgLsn(_) => oid::PG_LSN,
             Datum::Int8(_) => oid::INT8,
             Datum::Float4(_) => oid::FLOAT4,
             Datum::Float8(_) => oid::FLOAT8,
@@ -2914,6 +2951,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Int2(v) => write!(f, "{v}"),
             Datum::Int4(v) => write!(f, "{v}"),
             Datum::Oid(v) => write!(f, "{v}"),
+            Datum::PgLsn(v) => write!(f, "{:X}/{:X}", v >> 32, v & u64::from(u32::MAX)),
             Datum::Int8(v) => write!(f, "{v}"),
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
@@ -3365,6 +3403,9 @@ mod tests {
     fn type_names_map() {
         assert_eq!(ColType::from_sql_name("integer"), Some(ColType::Int4));
         assert_eq!(ColType::from_sql_name("oid"), Some(ColType::Oid));
+        assert_eq!(ColType::from_sql_name("pg_lsn"), Some(ColType::PgLsn));
+        assert_eq!(ColType::PgLsn.oid(), oid::PG_LSN);
+        assert_eq!(ColType::PgLsn.typlen(), 8);
         assert_eq!(ColType::from_sql_name("float8"), Some(ColType::Float8));
         assert_eq!(ColType::from_sql_name("record"), Some(ColType::Record));
         assert_eq!(ColType::from_sql_name("geometry"), None);
@@ -3406,6 +3447,7 @@ mod tests {
             (ColType::Timetz, BtreeOperatorClass::Timetz),
             (ColType::TsQuery, BtreeOperatorClass::TsQuery),
             (ColType::TsVector, BtreeOperatorClass::TsVector),
+            (ColType::PgLsn, BtreeOperatorClass::PgLsn),
             (ColType::Uuid, BtreeOperatorClass::Uuid),
             (ColType::Bit { varying: true }, BtreeOperatorClass::Varbit),
         ];

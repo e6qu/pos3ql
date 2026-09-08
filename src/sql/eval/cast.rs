@@ -202,6 +202,11 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
             _ => return Err(cast_unsupported(&v, target.name())),
         },
+        ColType::PgLsn => match v {
+            Datum::PgLsn(_) => v,
+            Datum::Text(s) => Datum::PgLsn(parse_pg_lsn(s)?),
+            _ => return Err(cast_unsupported(&v, "pg_lsn")),
+        },
         ColType::Int8 => {
             if let Datum::Bit { bits, .. } = v {
                 Datum::Int8(bits_to_uint(bits, 64, "bigint")? as i64)
@@ -540,6 +545,24 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
     };
     Ok(out)
+}
+
+fn parse_pg_lsn(value: &str) -> Result<u64, SqlError> {
+    let (high, low) = value
+        .split_once('/')
+        .ok_or_else(|| bad_text(value, "pg_lsn"))?;
+    if high.is_empty()
+        || low.is_empty()
+        || high.len() > 8
+        || low.len() > 8
+        || !high.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !low.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(bad_text(value, "pg_lsn"));
+    }
+    let high = u32::from_str_radix(high, 16).map_err(|_| bad_text(value, "pg_lsn"))?;
+    let low = u32::from_str_radix(low, 16).map_err(|_| bad_text(value, "pg_lsn"))?;
+    Ok((u64::from(high) << 32) | u64::from(low))
 }
 
 fn invalid_vector(name: &'static str) -> SqlError {

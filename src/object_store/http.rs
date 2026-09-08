@@ -262,7 +262,7 @@ impl HttpClient {
             return Err(HttpError::Io {
                 context: "send body",
                 kind: e.kind(),
-                detail: stack_format!(160, "{e}"),
+                detail: StackStr::new(),
             });
         }
         // Switch to non-blocking for the response read.
@@ -271,7 +271,7 @@ impl HttpClient {
             return Err(HttpError::Io {
                 context: "set_nonblocking",
                 kind: e.kind(),
-                detail: stack_format!(160, "{e}"),
+                detail: StackStr::new(),
             });
         }
         self.head.clear();
@@ -360,7 +360,7 @@ impl HttpClient {
                         return Err(HttpError::Io {
                             context: "read head",
                             kind: e.kind(),
-                            detail: stack_format!(160, "{e}"),
+                            detail: StackStr::new(),
                         });
                     }
                 }
@@ -430,7 +430,7 @@ impl HttpClient {
                     return Err(HttpError::Io {
                         context: "read body",
                         kind: e.kind(),
-                        detail: stack_format!(160, "{e}"),
+                        detail: StackStr::new(),
                     });
                 }
             }
@@ -539,7 +539,7 @@ impl HttpClient {
             return Err(HttpError::Io {
                 context: "send body",
                 kind: e.kind(),
-                detail: stack_format!(160, "{e}"),
+                detail: StackStr::new(),
             });
         }
 
@@ -622,7 +622,7 @@ impl HttpClient {
             move |e: std::io::Error| HttpError::Io {
                 context,
                 kind: e.kind(),
-                detail: stack_format!(160, "{e}"),
+                detail: StackStr::new(),
             }
         };
         if self.stream.is_none() {
@@ -646,7 +646,7 @@ impl HttpClient {
             return Err(HttpError::Io {
                 context: "send head",
                 kind: e.kind(),
-                detail: stack_format!(160, "{e}"),
+                detail: StackStr::new(),
             });
         }
         Ok(())
@@ -671,7 +671,7 @@ fn read_response(
         let n = stream.read(space).map_err(|e| HttpError::Io {
             context: "read head",
             kind: e.kind(),
-            detail: stack_format!(160, "{e}"),
+            detail: StackStr::new(),
         })?;
         if n == 0 {
             return Err(HttpError::Io {
@@ -708,7 +708,7 @@ fn read_response(
                 let n = stream.read(&mut space[..want]).map_err(|e| HttpError::Io {
                     context: "read body",
                     kind: e.kind(),
-                    detail: stack_format!(160, "{e}"),
+                    detail: StackStr::new(),
                 })?;
                 if n == 0 {
                     return Err(HttpError::Io {
@@ -762,7 +762,7 @@ fn read_chunked_body(
             self.stream.read(out).map_err(|e| HttpError::Io {
                 context: "read chunk",
                 kind: e.kind(),
-                detail: stack_format!(160, "{e}"),
+                detail: StackStr::new(),
             })
         }
     }

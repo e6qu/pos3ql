@@ -375,6 +375,7 @@ pub enum OwnedDatum {
     Char(u8),
     Int4(i32),
     Oid(u32),
+    PgLsn(u64),
     Int8(i64),
     Regtype {
         referenced_oid: i32,
@@ -575,6 +576,7 @@ impl OwnedDatum {
             Datum::Char(byte) => Self::Char(*byte),
             Datum::Int4(v) => Self::Int4(*v),
             Datum::Oid(v) => Self::Oid(*v),
+            Datum::PgLsn(v) => Self::PgLsn(*v),
             Datum::Int2(v) => Self::Int4(*v as i32),
             Datum::Int8(v) => Self::Int8(*v),
             // Widened like int2→int4; the column re-coerces the default back to
@@ -686,6 +688,7 @@ impl OwnedDatum {
             Self::Char(byte) => Datum::Char(*byte),
             Self::Int4(v) => Datum::Int4(*v),
             Self::Oid(v) => Datum::Oid(*v),
+            Self::PgLsn(v) => Datum::PgLsn(*v),
             Self::Int8(v) => Datum::Int8(*v),
             Self::Regtype {
                 referenced_oid,
@@ -4520,6 +4523,15 @@ pub(crate) struct ReplicationSlotDef {
     pub confirmed_flush_lsn: u64,
     pub behavior: ReplicationSlotBehavior,
     pub active: bool,
+    /// Transient publisher backend identity. PostgreSQL does not persist slot
+    /// activity across restart, whereas the slot cursor above is durable.
+    pub active_pid: Option<i32>,
+    pub sent_lsn: u64,
+    /// Startup-bounded statistics for transactions actually emitted to a
+    /// logical consumer. They intentionally reset on server restart.
+    pub total_txns: i64,
+    pub total_bytes: i64,
+    pub stats_reset: Option<i64>,
     pub live: bool,
 }
 
@@ -4576,6 +4588,11 @@ pub(crate) struct SubscriptionDef {
     pending_bootstrap: Option<PendingSubscriptionBootstrap>,
     pub(crate) cleanup: SubscriptionCleanup,
     pub(crate) failure: Option<SubscriptionFailure>,
+    /// Transient PostgreSQL-compatible worker counters. Durable apply
+    /// position remains `confirmed_lsn`; statistics restart with the server.
+    pub(crate) apply_error_count: i64,
+    pub(crate) sync_error_count: i64,
+    pub(crate) stats_reset: Option<i64>,
     /// The latest publisher transaction durably applied locally.  This is
     /// advanced only after the same local commit has reached the WAL/object
     /// store durability boundary.
@@ -12845,6 +12862,11 @@ impl Storage {
                     confirmed_flush_lsn: 0,
                     behavior: ReplicationSlotBehavior::DEFAULT,
                     active: false,
+                    active_pid: None,
+                    sent_lsn: 0,
+                    total_txns: 0,
+                    total_bytes: 0,
+                    stats_reset: None,
                     live: false,
                 })
                 .expect("sized to max_replication_slots");
@@ -12873,6 +12895,9 @@ impl Storage {
                     pending_bootstrap: None,
                     cleanup: SubscriptionCleanup::None,
                     failure: None,
+                    apply_error_count: 0,
+                    sync_error_count: 0,
+                    stats_reset: None,
                     confirmed_lsn: 0,
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
@@ -25253,6 +25278,11 @@ impl Storage {
             confirmed_flush_lsn: restart_lsn,
             behavior,
             active: false,
+            active_pid: None,
+            sent_lsn: restart_lsn,
+            total_txns: 0,
+            total_bytes: 0,
+            stats_reset: None,
             live: true,
         };
         Ok(index)
@@ -25356,6 +25386,11 @@ impl Storage {
             confirmed_flush_lsn: 0,
             behavior: ReplicationSlotBehavior::DEFAULT,
             active: false,
+            active_pid: None,
+            sent_lsn: 0,
+            total_txns: 0,
+            total_bytes: 0,
+            stats_reset: None,
             live: false,
         };
         Ok(())
@@ -25401,7 +25436,11 @@ impl Storage {
         slot.restart_lsn = advance.confirmed_flush_lsn;
     }
 
-    pub(crate) fn activate_replication_slot(&mut self, name: &str) -> Result<u64, SqlError> {
+    pub(crate) fn activate_replication_slot(
+        &mut self,
+        name: &str,
+        backend_pid: i32,
+    ) -> Result<u64, SqlError> {
         let slot = self
             .replication_slots
             .iter_mut()
@@ -25421,7 +25460,55 @@ impl Storage {
             ));
         }
         slot.active = true;
+        slot.active_pid = Some(backend_pid);
+        slot.sent_lsn = slot.confirmed_flush_lsn;
         Ok(slot.confirmed_flush_lsn)
+    }
+
+    pub(crate) fn record_replication_slot_transaction(
+        &mut self,
+        name: &str,
+        sent_lsn: u64,
+        bytes: usize,
+    ) {
+        let Some(slot) = self
+            .replication_slots
+            .iter_mut()
+            .find(|slot| slot.live && slot.name.as_str() == name)
+        else {
+            return;
+        };
+        slot.sent_lsn = slot.sent_lsn.max(sent_lsn);
+        slot.total_txns = slot.total_txns.saturating_add(1);
+        slot.total_bytes = slot
+            .total_bytes
+            .saturating_add(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    pub(crate) fn reset_replication_slot_statistics(
+        &mut self,
+        name: Option<&str>,
+        reset_at: i64,
+    ) -> Result<(), SqlError> {
+        if let Some(name) = name
+            && self.replication_slot(name).is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "replication slot \"{}\" does not exist",
+                name
+            ));
+        }
+        for slot in self.replication_slots.iter_mut().filter(|slot| {
+            slot.database == self.current_database
+                && slot.live
+                && name.is_none_or(|name| slot.name.as_str() == name)
+        }) {
+            slot.total_txns = 0;
+            slot.total_bytes = 0;
+            slot.stats_reset = Some(reset_at);
+        }
+        Ok(())
     }
 
     pub(crate) fn deactivate_replication_slot(&mut self, name: &str) {
@@ -25431,6 +25518,7 @@ impl Storage {
             .find(|slot| slot.live && slot.name.as_str() == name)
         {
             slot.active = false;
+            slot.active_pid = None;
         }
     }
 
@@ -25444,6 +25532,24 @@ impl Storage {
             .filter(move |(_, subscription)| {
                 subscription.database == self.current_database && subscription.visible_to(txid)
             })
+    }
+
+    pub(crate) fn reset_subscription_statistics(
+        &mut self,
+        slot: Option<usize>,
+        txid: u32,
+        reset_at: i64,
+    ) {
+        for (index, subscription) in self.subscriptions.iter_mut().enumerate() {
+            if subscription.database == self.current_database
+                && subscription.visible_to(txid)
+                && slot.is_none_or(|slot| slot == index)
+            {
+                subscription.apply_error_count = 0;
+                subscription.sync_error_count = 0;
+                subscription.stats_reset = Some(reset_at);
+            }
+        }
     }
 
     pub(crate) fn subscription_for_event_trigger(&self, slot: usize) -> &SubscriptionDef {
@@ -25559,6 +25665,9 @@ impl Storage {
             pending_bootstrap: None,
             cleanup: SubscriptionCleanup::None,
             failure: None,
+            apply_error_count: 0,
+            sync_error_count: 0,
+            stats_reset: None,
             confirmed_lsn: 0,
             ownership: Ownership {
                 owner: owner as u16,
@@ -25989,6 +26098,11 @@ impl Storage {
             ));
         }
         subscription.failure = Some(failure);
+        if matches!(subscription.bootstrap, SubscriptionBootstrap::Ready) {
+            subscription.apply_error_count = subscription.apply_error_count.saturating_add(1);
+        } else {
+            subscription.sync_error_count = subscription.sync_error_count.saturating_add(1);
+        }
         if subscription.behavior.disable_on_error {
             subscription.enabled = false;
         }
@@ -38778,6 +38892,7 @@ mod tests {
         assert_eq!(slot.restart_lsn, 42);
         assert_eq!(slot.confirmed_flush_lsn, 42);
         assert!(!slot.active);
+        assert_eq!(slot.active_pid, None);
         assert_eq!(
             storage
                 .create_replication_slot(
@@ -38797,6 +38912,21 @@ mod tests {
         assert_eq!(slot.restart_lsn, 47);
         assert_eq!(slot.confirmed_flush_lsn, 47);
         assert_eq!(storage.oldest_replication_restart_lsn(), Some(47));
+        assert_eq!(
+            storage.activate_replication_slot("changes", 321).unwrap(),
+            47
+        );
+        storage.record_replication_slot_transaction("changes", 49, 500);
+        let slot = storage.replication_slot("changes").unwrap();
+        assert!(slot.active);
+        assert_eq!(slot.active_pid, Some(321));
+        assert_eq!(slot.sent_lsn, 49);
+        assert_eq!((slot.total_txns, slot.total_bytes), (1, 500));
+        storage.deactivate_replication_slot("changes");
+        assert_eq!(
+            storage.replication_slot("changes").unwrap().active_pid,
+            None
+        );
         storage.drop_replication_slot("changes").unwrap();
         assert!(storage.replication_slot("changes").is_none());
     }

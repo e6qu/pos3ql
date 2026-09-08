@@ -33,10 +33,10 @@ pub struct Tuple<'a> {
     count: usize,
 }
 
-/// Which publisher row image accompanies an UPDATE or DELETE.  `Key` carries
-/// exactly the relation columns marked as replica-identity keys; `Old` carries
-/// every relation column.  Keeping this distinction at the parse boundary
-/// prevents an apply caller from guessing how a short tuple is mapped.
+/// Which publisher row image accompanies an UPDATE or DELETE. Both tuple
+/// shapes follow the published Relation projection; `Key` restricts row
+/// identity to the columns flagged as keys while `Old` identifies by all of
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplicaIdentity {
     Key,
@@ -162,6 +162,13 @@ pub enum Message<'a> {
         xid: Option<u32>,
         truncate: Truncate,
     },
+    LogicalMessage {
+        xid: Option<u32>,
+        transactional: bool,
+        message_lsn: u64,
+        prefix: &'a str,
+        content: &'a [u8],
+    },
     StreamStart {
         xid: u32,
         first_segment: bool,
@@ -278,10 +285,14 @@ impl<'a> Input<'a> {
     }
 }
 
-fn tuple<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
+fn new_tuple<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
     if input.u8()? != b'N' {
         return Err(DecodeError::Invalid);
     }
+    tuple_data(input)
+}
+
+fn tuple_data<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
     let count = usize::from(input.u16()?);
     if count > MAX_COLUMNS {
         return Err(DecodeError::Limit);
@@ -385,7 +396,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
             Message::Insert {
                 xid,
                 relation_id,
-                new: tuple(&mut input)?,
+                new: new_tuple(&mut input)?,
             }
         }
         b'U' => {
@@ -400,7 +411,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                         } else {
                             ReplicaIdentity::Old
                         },
-                        tuple: tuple(&mut input)?,
+                        tuple: tuple_data(&mut input)?,
                     })
                 }
                 _ => UpdateIdentity::NewTupleKey,
@@ -409,7 +420,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                 xid,
                 relation_id,
                 identity,
-                new: tuple(&mut input)?,
+                new: new_tuple(&mut input)?,
             }
         }
         b'D' => {
@@ -426,7 +437,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                 relation_id,
                 old: OldTuple {
                     identity,
-                    tuple: tuple(&mut input)?,
+                    tuple: tuple_data(&mut input)?,
                 },
             }
         }
@@ -452,6 +463,25 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                     cascade: flags & 1 != 0,
                     restart_identity: flags & 2 != 0,
                 },
+            }
+        }
+        b'M' => {
+            let xid = streamed_xid(&mut input, *state)?;
+            let transactional = match input.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(DecodeError::Invalid),
+            };
+            let message_lsn = input.u64()?;
+            let prefix = input.cstr()?;
+            let length: usize = input.i32()?.try_into().map_err(|_| DecodeError::Invalid)?;
+            let content = input.bytes(length)?;
+            Message::LogicalMessage {
+                xid,
+                transactional,
+                message_lsn,
+                prefix,
+                content,
             }
         }
         b'S' => {
@@ -649,10 +679,50 @@ mod tests {
     }
 
     #[test]
+    fn logical_message_is_binary_safe_and_rejects_bad_flags_or_lengths() {
+        let logical = [
+            b'M', 1, 0, 0, 0, 0, 0, 0, 0, 0x29, b'a', b'u', b'd', b'i', b't', 0, 0, 0, 0, 3, 0,
+            0xff, 1,
+        ];
+        let bytes = xlog(&logical);
+        guard::forbid_alloc(|| {
+            let decoded = copy_data(&bytes[..25 + logical.len()]);
+            assert!(
+                matches!(
+                    decoded,
+                    Ok(CopyData::XLogData {
+                        message: Message::LogicalMessage {
+                            xid: None,
+                            transactional: true,
+                            message_lsn: 41,
+                            prefix: "audit",
+                            content: &[0, 0xff, 1],
+                        },
+                        ..
+                    })
+                ),
+                "{decoded:?}"
+            );
+        });
+        let mut invalid = logical;
+        invalid[1] = 2;
+        let bytes = xlog(&invalid);
+        assert_eq!(
+            copy_data(&bytes[..25 + invalid.len()]),
+            Err(DecodeError::Invalid)
+        );
+        let bytes = xlog(&logical);
+        assert_eq!(
+            copy_data(&bytes[..25 + logical.len() - 1]),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
     fn old_tuple_kind_preserves_key_vs_full_row_mapping() {
         let plugin = [
-            b'U', 0, 0, 0, 7, b'K', b'N', 0, 1, b't', 0, 0, 0, 1, b'1', b'N', 0, 2, b't', 0, 0, 0,
-            1, b'1', b'u',
+            b'U', 0, 0, 0, 7, b'K', 0, 2, b't', 0, 0, 0, 1, b'1', b't', 0, 0, 0, 3, b'o', b'l',
+            b'd', b'N', 0, 2, b't', 0, 0, 0, 1, b'1', b'u',
         ];
         let bytes = xlog(&plugin);
         let CopyData::XLogData {
@@ -670,7 +740,10 @@ mod tests {
         };
         assert_eq!(relation_id, 7);
         assert_eq!(old.identity, ReplicaIdentity::Key);
-        assert_eq!(old.tuple.columns(), [TupleColumn::Text(b"1")]);
+        assert_eq!(
+            old.tuple.columns(),
+            [TupleColumn::Text(b"1"), TupleColumn::Text(b"old")]
+        );
         assert_eq!(
             new.columns(),
             [TupleColumn::Text(b"1"), TupleColumn::UnchangedToast]

@@ -5491,7 +5491,14 @@ fn is_volatile_function(name: &str) -> bool {
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
         || matches!(
             name,
-            "lo_create"
+            "pg_logical_emit_message"
+                | "pg_create_logical_replication_slot"
+                | "pg_drop_replication_slot"
+                | "pg_copy_logical_replication_slot"
+                | "pg_replication_slot_advance"
+                | "pg_stat_reset_replication_slot"
+                | "pg_stat_reset_subscription_stats"
+                | "lo_create"
                 | "lo_import"
                 | "lo_export"
                 | "lo_open"

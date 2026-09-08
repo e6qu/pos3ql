@@ -154,7 +154,7 @@ pub fn type_message(message: &mut MsgOut, type_oid: i32, schema: &str, name: &st
 pub fn insert(message: &mut MsgOut, relation_id: u32, values: &[Datum], binary: bool) {
     message.u8(b'I');
     message.i32(relation_id as i32);
-    tuple(message, values, binary);
+    new_tuple(message, values, binary);
 }
 
 /// pgoutput Update carries the exact old-tuple tag required by the relation's
@@ -173,8 +173,8 @@ pub fn update(
     message.u8(b'U');
     message.i32(relation_id as i32);
     message.u8(old_tag);
-    tuple(message, old_values, binary);
-    tuple(message, new_values, binary);
+    tuple_data(message, old_values, binary);
+    new_tuple(message, new_values, binary);
 }
 
 /// pgoutput Delete carries the exact old-tuple tag required by the relation's
@@ -192,7 +192,7 @@ pub fn delete(
     message.u8(b'D');
     message.i32(relation_id as i32);
     message.u8(old_tag);
-    tuple(message, old_values, binary);
+    tuple_data(message, old_values, binary);
 }
 
 /// pgoutput Truncate, available from protocol version 2. The option byte is
@@ -206,8 +206,29 @@ pub fn truncate(message: &mut MsgOut, relation_ids: &[u32], cascade: bool, resta
     }
 }
 
-fn tuple(message: &mut MsgOut, values: &[Datum], binary: bool) {
+/// pgoutput logical-decoding message (`M`). This publisher does not negotiate
+/// streaming, so no transaction id precedes the flags byte.
+pub fn logical_message(
+    message: &mut MsgOut,
+    transactional: bool,
+    message_lsn: u64,
+    prefix: &str,
+    content: &[u8],
+) {
+    message.u8(b'M');
+    message.u8(u8::from(transactional));
+    message.i64(message_lsn as i64);
+    message.cstr(prefix);
+    message.i32(content.len() as i32);
+    message.bytes(content);
+}
+
+fn new_tuple(message: &mut MsgOut, values: &[Datum], binary: bool) {
     message.u8(b'N');
+    tuple_data(message, values, binary);
+}
+
+fn tuple_data(message: &mut MsgOut, values: &[Datum], binary: bool) {
     message.i16(values.len() as i16);
     for value in values {
         if matches!(value, Datum::Null) {
@@ -257,6 +278,22 @@ mod tests {
     }
 
     #[test]
+    fn logical_message_matches_pgoutput_m_layout() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
+        let mut frame = MsgOut::begin(&mut buffer, b'd');
+        logical_message(&mut frame, true, 0x1234, "audit", &[0, 1, 0xff]);
+        frame.finish().unwrap();
+        let bytes = buffer.readable();
+        assert_eq!(bytes[5], b'M');
+        assert_eq!(bytes[6], 1);
+        assert_eq!(u64::from_be_bytes(bytes[7..15].try_into().unwrap()), 0x1234);
+        assert_eq!(&bytes[15..21], b"audit\0");
+        assert_eq!(i32::from_be_bytes(bytes[21..25].try_into().unwrap()), 3);
+        assert_eq!(&bytes[25..], &[0, 1, 0xff]);
+    }
+
+    #[test]
     fn update_and_delete_carry_the_declared_replica_identity_tuple_kind() {
         let mut budget = Budget::new(1024);
         let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
@@ -264,15 +301,15 @@ mod tests {
         update(
             &mut frame,
             7,
-            &[Datum::Int4(1)],
-            &[Datum::Int4(2)],
+            &[Datum::Int4(1), Datum::Text("old")],
+            &[Datum::Int4(2), Datum::Text("new")],
             true,
             ReplicaIdentity::Index,
         );
         delete(
             &mut frame,
             7,
-            &[Datum::Int4(2)],
+            &[Datum::Int4(2), Datum::Text("new")],
             true,
             ReplicaIdentity::Full,
         );
@@ -280,8 +317,10 @@ mod tests {
         let bytes = buffer.readable();
         assert_eq!(bytes[5], b'U');
         assert_eq!(bytes[10], b'K');
-        assert_eq!(bytes[35], b'D');
-        assert_eq!(bytes[40], b'O');
+        assert_eq!(&bytes[11..13], &[0, 2]);
+        let delete_at = bytes.iter().rposition(|byte| *byte == b'D').unwrap();
+        assert_eq!(bytes[delete_at + 5], b'O');
+        assert_eq!(&bytes[delete_at + 6..delete_at + 8], &[0, 2]);
     }
 
     #[test]

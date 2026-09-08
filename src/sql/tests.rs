@@ -38871,6 +38871,193 @@ fn geometric_constructors_and_inspectors_match_postgresql_forms() {
 }
 
 #[test]
+fn geometric_conversion_functions_cover_postgresql_overloads() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT box(circle '<(0,0),2>')::text, box(point '(1,0)')::text, \
+                    box(polygon '((0,0),(1,1),(2,0))')::text, \
+                    bound_box(box '(1,1),(0,0)', box '(4,4),(3,3)')::text, \
+                    circle(box '(1,1),(0,0)')::text, \
+                    circle(polygon '((0,0),(1,3),(2,0))')::text, \
+                    lseg(box '(1,0),(-1,0)')::text, \
+                    path(polygon '((0,0),(1,1),(2,0))')::text, \
+                    point(lseg '[(-1,0),(1,0)]')::text, \
+                    point(polygon '((0,0),(1,1),(2,0))')::text, \
+                    polygon(box '(1,1),(0,0)')::text, \
+                    polygon(4, circle '<(3,0),1>')::text, \
+                    diagonal(box '(1,2),(0,0)')::text, \
+                    height(box '(1,2),(0,0)'), width(box '(1,2),(0,0)'), \
+                    slope(point '(0,0)', point '(2,1)')",
+        )),
+        [
+            "(1.414213562373095,1.414213562373095),(-1.414213562373095,-1.414213562373095)|(1,0),(1,0)|(2,1),(0,0)|(4,4),(0,0)|<(0.5,0.5),0.7071067811865476>|<(1,1),1.6094757082487299>|[(1,0),(-1,0)]|((0,0),(1,1),(2,0))|(0,0)|(1,0.3333333333333333)|((0,0),(0,1),(1,1),(1,0))|((2,0),(3,1),(4,1.2246467991473532e-16),(3,-1))|[(1,2),(0,0)]|2|1|0.5"
+        ]
+    );
+}
+
+#[test]
+fn geometric_operators_cover_transforms_relations_and_distance() {
+    let (mut engine, mut budget) = test_engine();
+    let rows = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (box '(1,1),(0,0)' + point '(2,0)')::text, \
+                (path '[(0,0),(1,1)]' + path '[(2,2),(3,3)]')::text, \
+                (@-@ path '[(0,0),(1,0),(1,1)]'), \
+                (@@ lseg '[(0,0),(2,2)]')::text, \
+                (# polygon '((0,0),(1,1))'), \
+                length(lseg '[(0,0),(3,4)]'), \
+                length(path '((-1,0),(1,0))'), \
+                (lseg '[(0,0),(1,1)]' # lseg '[(1,0),(0,1)]')::text, \
+                (box '(2,2),(-1,-1)' # box '(1,1),(-2,-2)')::text, \
+                (point '(0,0)' ## lseg '[(2,0),(0,2)]')::text, \
+                circle '<(0,0),1>' <-> circle '<(5,0),1>', \
+                circle '<(0,0),2>' @> point '(1,1)', \
+                point '(1,1)' <@ circle '<(0,0),2>', \
+                box '(1,1),(0,0)' && box '(2,2),(0,0)', \
+                circle '<(0,0),1>' << circle '<(5,0),1>', \
+                box '(3,3),(0,0)' <<| box '(5,5),(3,4)', \
+                lseg '[(-1,0),(1,0)]' ?# box '(2,2),(-2,-2)', \
+                ?- lseg '[(-1,0),(1,0)]', \
+                point '(0,1)' ?| point '(0,0)', \
+                lseg '[(0,0),(0,1)]' ?-| lseg '[(0,0),(1,0)]', \
+                lseg '[(-1,0),(1,0)]' ?|| lseg '[(-1,2),(1,2)]', \
+                polygon '((0,0),(1,1))' ~= polygon '((1,1),(0,0))', \
+                path '[(0,0),(100,0)]' = path '[(9,9),(8,8)]', \
+                path '[(0,0),(100,0)]' < path '[(0,0),(1,0),(2,0)]', \
+                line '{1,2,3}' = line '{2,4,6}', \
+                point '(1,1)' ~= point '(1.0000005,1)', \
+                point '(1,1)' <@ path '((0,0),(4,0),(0,4))', \
+                point '(1,1)' <@ path '[(0,0),(4,0),(0,4)]', \
+                point '(9,9)' <-> path '[(0,0)]', \
+                radius(circle '<(1,1),2>' * point '(0,2)'), \
+                ishorizontal(point '(1,0)', point '(0,0)'), \
+                isvertical(line '{1,0,0}'), \
+                isparallel(lseg '[(0,0),(1,1)]', lseg '[(2,0),(3,1)]'), \
+                isperp(line '{0,1,0}', line '{1,0,0}')",
+    ));
+    assert_eq!(
+        rows,
+        [
+            "(3,1),(2,0)|[(0,0),(1,1),(2,2),(3,3)]|2|(1,1)|2|5|4|(0.5,0.5)|(1,1),(-1,-1)|(1,1)|3|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|t|f|0|4|t|t|t|t"
+        ]
+    );
+    let unknown_literals = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (box '(1,1),(0,0)' + '(2,3)')::text, \
+                    (path '[(0,0),(1,1)]' + '[(2,2),(3,3)]')::text, \
+                    circle '<(0,0),1>' && '<(1,0),1>', \
+                    (line '{1,0,0}' ## '[(3,2),(3,4)]')::text, \
+                    point '(1,1)' ~= '(1.0000005,1)'",
+    );
+    assert_eq!(
+        data_rows(&unknown_literals),
+        ["(3,4),(2,3)|[(0,0),(1,1),(2,2),(3,3)]|t|NULL|t"],
+        "{}",
+        String::from_utf8_lossy(&unknown_literals)
+    );
+    for unsupported in [
+        "SELECT point '(0,0)' = point '(0,0)'",
+        "SELECT path '[(0,0)]' <> path '[(0,0)]'",
+        "SELECT polygon '((0,0),(1,0),(0,1))' = polygon '((0,0),(1,0),(0,1))'",
+        "SELECT box '(1,1),(0,0)' ?# lseg '[(0,0),(1,1)]'",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, unsupported))
+                .contains("42883")
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT point '(1,1)' <@ '((0,0),(4,0),(0,4))'",
+        ))
+        .contains("42725")
+    );
+}
+
+#[test]
+fn geometric_subscripts_read_and_update_typed_components() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE geometric_subscripts (id integer PRIMARY KEY, p point, b box, s lseg, l line); \
+         INSERT INTO geometric_subscripts VALUES \
+           (1, point '(1,2)', box '(4,5),(0,1)', lseg '[(2,3),(6,7)]', line '{1,2,3}'); \
+         SELECT p[0], p[1], b[0]::text, b[1]::text, s[0]::text, s[1]::text, \
+                l[0], l[1], l[2] \
+           FROM geometric_subscripts; \
+         UPDATE geometric_subscripts \
+            SET p[1] = 9, b[0] = point '(8,10)', s[1] = point '(11,12)', l[2] = 7 \
+          WHERE id = 1 \
+          RETURNING p::text, b::text, s::text, l::text;",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(
+        &rows[rows.len() - 2..],
+        [
+            "1|2|(4,5)|(0,1)|(2,3)|(6,7)|1|2|3",
+            "(1,9)|(8,10),(0,1)|[(2,3),(11,12)]|{1,2,7}"
+        ]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "UPDATE geometric_subscripts SET p[2] = 1 WHERE id = 1",
+        ))
+        .contains("2202E")
+    );
+}
+
+#[test]
+fn prepared_geometric_operator_results_retain_wire_types() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE prepared_geometric_rows (id integer, p point); \
+         INSERT INTO prepared_geometric_rows VALUES (1, point '(1,9)')",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "PREPARE prepared_geometric_distance(point) AS \
+           SELECT id, p <-> $1 AS distance FROM prepared_geometric_rows; \
+         EXECUTE prepared_geometric_distance(point '(1,9)')",
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [crate::sql::types::oid::INT4, crate::sql::types::oid::FLOAT8]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT @-@ path '[(0,0),(1,0)]', @@ box '(2,2),(0,0)', \
+                    # path '[(0,0),(1,0)]', ?- line '{0,1,0}', \
+                    (point '(1,2)')[0], (box '(2,2),(0,0)')[0], \
+                    length(path '[(0,0),(1,0)]')",
+        )),
+        [
+            crate::sql::types::oid::FLOAT8,
+            crate::sql::types::oid::POINT,
+            crate::sql::types::oid::INT4,
+            crate::sql::types::oid::BOOL,
+            crate::sql::types::oid::FLOAT8,
+            crate::sql::types::oid::POINT,
+            crate::sql::types::oid::FLOAT8,
+        ]
+    );
+}
+
+#[test]
 fn geometric_literals_preserve_postgresql_grammar_boundaries() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(
@@ -38911,9 +39098,24 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
         let output = run_with(
             &mut engine,
             &mut budget,
-            "CREATE TABLE durable_geometric_values (point_value point, line_value line, path_values path[], default_point point DEFAULT '(8,9)'); \
-             INSERT INTO durable_geometric_values (point_value, line_value, path_values) VALUES ('(1,2)', '((1,2),(3,4))', \
-               ARRAY['[(1,2),(3,4)]'::path, '((5,6),(7,8))'::path])",
+            "CREATE TABLE durable_geometric_values (\
+               point_value point, line_value line, path_values path[], \
+               circle_value circle DEFAULT '<(0,0),10>', \
+               constructed_circle circle DEFAULT circle(point '(1,2)', -3), \
+               default_point point DEFAULT '(8,9)', \
+               origin_distance double precision GENERATED ALWAYS AS \
+                 (point_value <-> point '(0,0)') STORED, \
+               CHECK (circle_value @> point_value)); \
+             INSERT INTO durable_geometric_values (point_value, line_value, path_values) VALUES \
+               ('(1,2)', '((1,2),(3,4))', \
+                ARRAY['[(1,2),(3,4)]'::path, '((5,6),(7,8))'::path]); \
+             UPDATE durable_geometric_values SET line_value[0] = 0, line_value[1] = 0; \
+             CREATE VIEW durable_geometric_view AS \
+               SELECT (point_value + point '(2,3)')::text AS translated, \
+                      point_value <-> point '(1,2)' AS distance, \
+                      circle_value @> point_value AS contains_point, \
+                      line_value[2] AS line_constant \
+                 FROM durable_geometric_values",
         );
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -38929,9 +39131,16 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT point_value::text, line_value::text, path_values::text, default_point::text FROM durable_geometric_values",
+            "SELECT point_value::text, line_value::text, path_values::text, default_point::text, \
+                    constructed_circle::text, origin_distance \
+               FROM durable_geometric_values; \
+             SELECT translated, distance, contains_point, line_constant \
+               FROM durable_geometric_view",
         )),
-        ["(1,2)|{1,-1,1}|{\"[(1,2),(3,4)]\",\"((5,6),(7,8))\"}|(8,9)"]
+        [
+            "(1,2)|{0,0,1}|{\"[(1,2),(3,4)]\",\"((5,6),(7,8))\"}|(8,9)|<(1,2),-3>|2.23606797749979",
+            "(3,5)|0|t|1"
+        ]
     );
     drop(engine);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);

@@ -1921,6 +1921,60 @@ pub(crate) fn binary<'a>(
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
     use BinaryOp::*;
+    let (mut l, mut r) = (l, r);
+    if let Some(name) = operator.operator_name() {
+        if l_unknown
+            && matches!(l, Datum::Text(_))
+            && let Datum::Geometry { kind, .. } = r
+            && super::funcs::geometry::unknown_operand_is_ambiguous(name, kind, true)
+        {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "operator is not unique: unknown {} {}",
+                name,
+                kind.name()
+            ));
+        }
+        if r_unknown
+            && matches!(r, Datum::Text(_))
+            && let Datum::Geometry { kind, .. } = l
+            && super::funcs::geometry::unknown_operand_is_ambiguous(name, kind, false)
+        {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_FUNCTION,
+                "operator is not unique: {} {} unknown",
+                kind.name(),
+                name
+            ));
+        }
+    }
+    if l_unknown
+        && matches!(l, Datum::Text(_))
+        && let Datum::Geometry { kind, .. } = r
+        && let Some(target) = operator
+            .operator_name()
+            .and_then(|name| super::funcs::geometry::unknown_operand_kind(name, kind, true))
+    {
+        l = cast_to(l, ColType::Geometry(target), arena)?;
+    }
+    if r_unknown
+        && matches!(r, Datum::Text(_))
+        && let Datum::Geometry { kind, .. } = l
+        && let Some(target) = operator
+            .operator_name()
+            .and_then(|name| super::funcs::geometry::unknown_operand_kind(name, kind, false))
+    {
+        r = cast_to(r, ColType::Geometry(target), arena)?;
+    }
+    if (matches!(l, Datum::Geometry { .. }) || matches!(r, Datum::Geometry { .. }))
+        && let Some(name) = operator.operator_name()
+    {
+        let argument_oids = [l.type_oid(), r.type_oid()];
+        if let Some(result) = super::funcs::geometry::operator(name, &[l, r], &argument_oids, arena)
+        {
+            return result;
+        }
+    }
     match operator {
         And | Or => logic(operator, l, r),
         Concat => match (l, r) {

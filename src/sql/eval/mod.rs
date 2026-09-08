@@ -2827,6 +2827,10 @@ pub fn eval_full<'a>(
                     sqlstate::DATATYPE_MISMATCH,
                     "cannot subscript type json because it does not support subscripting"
                 )),
+                Datum::Geometry { kind, text } => {
+                    let index = integer_index(&i)?;
+                    funcs::geometry::subscript(kind, text, index, arena)
+                }
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("cannot subscript a non-array", &b)),
             }

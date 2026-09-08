@@ -748,6 +748,30 @@ pub(crate) fn dispatch<'a>(
                     return Err(arity_err("jsonb subscripting assignment", args.len()));
                 }
                 let base = eval_full(args[0], arena, params, row, hooks)?;
+                if let Datum::Geometry { kind, text } = base {
+                    if args.len() != 3 {
+                        return Err(arity_err("geometric subscripting assignment", args.len()));
+                    }
+                    let index = match eval_full(args[2], arena, params, row, hooks)? {
+                        Datum::Int2(index) => i64::from(index),
+                        Datum::Int4(index) => i64::from(index),
+                        Datum::Int8(index) => index,
+                        Datum::Null => {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "geometric subscript in assignment must not be null"
+                            ));
+                        }
+                        other => {
+                            return Err(type_mismatch(
+                                "geometric subscript must be integer",
+                                &other,
+                            ));
+                        }
+                    };
+                    let value = eval_full(args[1], arena, params, row, hooks)?;
+                    return super::geometry::set_subscript(kind, text, index, value, arena);
+                }
                 let mut path = [json::JsonSubscript::Key(""); 64];
                 if args.len() - 2 > path.len() {
                     return Err(sql_err!(

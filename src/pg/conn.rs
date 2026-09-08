@@ -5483,8 +5483,8 @@ mod tests {
 
     #[test]
     fn binary_geometric_parameters_use_the_shared_typed_decoder() {
-        let mut budget = Budget::new(1024);
-        let arena = Arena::new(&mut budget, "binary point test", 64).expect("test arena");
+        let mut budget = Budget::new(2048);
+        let arena = Arena::new(&mut budget, "binary point test", 256).expect("test arena");
         let mut point = [0u8; 16];
         point[..8].copy_from_slice(&1.5_f64.to_be_bytes());
         point[8..].copy_from_slice(&(-2.25_f64).to_be_bytes());
@@ -5497,6 +5497,17 @@ mod tests {
             }
         );
         assert!(decode_binary_param(crate::sql::types::oid::POINT, &point[..15], &arena).is_err());
+
+        point[..8].copy_from_slice(&f64::NAN.to_be_bytes());
+        point[8..].copy_from_slice(&f64::INFINITY.to_be_bytes());
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::POINT, &point, &arena)
+                .expect("non-finite point parameter decodes"),
+            Datum::Geometry {
+                kind: crate::sql::types::GeometryKind::Point,
+                text: "(NaN,Infinity)",
+            }
+        );
 
         let mut lseg = [0u8; 32];
         for (index, value) in [1.0_f64, 2.0, 3.0, 4.0].into_iter().enumerate() {
@@ -5524,6 +5535,19 @@ mod tests {
                 text: "[(1,2),(3,4)]",
             }
         );
+
+        let mut circle = [0u8; 24];
+        circle[16..].copy_from_slice(&f64::NAN.to_be_bytes());
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::CIRCLE, &circle, &arena)
+                .expect("NaN circle radius decodes"),
+            Datum::Geometry {
+                kind: crate::sql::types::GeometryKind::Circle,
+                text: "<(0,0),NaN>",
+            }
+        );
+        circle[16..].copy_from_slice(&(-1.0_f64).to_be_bytes());
+        assert!(decode_binary_param(crate::sql::types::oid::CIRCLE, &circle, &arena).is_err());
     }
 
     #[test]

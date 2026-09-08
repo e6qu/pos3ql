@@ -31,6 +31,11 @@ session-visible `xmloption` input mode. The same wire, COPY, stored-query,
 PL/pgSQL, WAL, checkpoint, and object-cold recovery boundaries apply.
 [SQL/XML compatibility and limits](docs/sql-xml.md).
 
+PostgreSQL planar geometry includes all seven native value types, documented
+construction and conversion functions, transforms, distance and intersection
+operators, spatial relationships, component reads and updates, prepared-query
+typing, binary wire values, and object-cold recovery.
+
 Permanent, unlogged, and session-temporary tables, views, indexes, identity sequences, standalone sequences, CTAS, and `SELECT INTO` have distinct PostgreSQL lifetimes. A view becomes temporary when requested or when any captured relation is temporary, including through another view. Temporary relations use isolated per-connection namespaces and `ON COMMIT` actions and never enter WAL, checkpoints, object storage, template clones, or logical publications. Committed temporary rows spill to a bounded, startup-sized local store (`temporary_spill_bytes`, or `0` to keep them resident-only) that is recreated empty on restart. Unlogged definitions are durable, retain rows after a clean shutdown, and reset table and sequence state after an unclean restart.
 
 Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.

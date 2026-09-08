@@ -9,6 +9,27 @@ use crate::sql_err;
 use crate::util::StackStr;
 
 const MAX_POINTS: usize = 128;
+const EPSILON: f64 = 1e-6;
+
+fn fp_zero(value: f64) -> bool {
+    value.abs() <= EPSILON
+}
+
+fn pg_gt(left: f64, right: f64) -> bool {
+    match (left.is_nan(), right.is_nan()) {
+        (true, false) => true,
+        (false, true) | (true, true) => false,
+        (false, false) => left > right,
+    }
+}
+
+fn pg_max(left: f64, right: f64) -> f64 {
+    if pg_gt(left, right) { left } else { right }
+}
+
+fn pg_min(left: f64, right: f64) -> f64 {
+    if pg_gt(left, right) { right } else { left }
+}
 
 fn bad(kind: GeometryKind, text: &str) -> SqlError {
     sql_err!(
@@ -56,6 +77,26 @@ impl<'a> Reader<'a> {
         let start = self.at;
         if matches!(bytes.get(self.at), Some(b'+' | b'-')) {
             self.at += 1;
+        }
+        let unsigned = self.at;
+        for (word, magnitude) in [
+            ("infinity", f64::INFINITY),
+            ("inf", f64::INFINITY),
+            ("nan", f64::NAN),
+        ] {
+            let end = unsigned + word.len();
+            if self
+                .text
+                .get(unsigned..end)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(word))
+            {
+                self.at = end;
+                return Some(if bytes.get(start) == Some(&b'-') {
+                    -magnitude
+                } else {
+                    magnitude
+                });
+            }
         }
         let digit_start = self.at;
         while matches!(bytes.get(self.at), Some(b'0'..=b'9')) {
@@ -211,10 +252,7 @@ fn read_values(
                 if !reader.take(b',') {
                     return Err(bad(kind, text));
                 }
-                let radius = reader
-                    .number()
-                    .filter(|radius| *radius >= 0.0)
-                    .ok_or_else(|| bad(kind, text))?;
+                let radius = reader.number().ok_or_else(|| bad(kind, text))?;
                 if !reader.take(b'>') {
                     return Err(bad(kind, text));
                 }
@@ -225,10 +263,7 @@ fn read_values(
                 if !reader.take(b',') {
                     return Err(bad(kind, text));
                 }
-                let radius = reader
-                    .number()
-                    .filter(|radius| *radius >= 0.0)
-                    .ok_or_else(|| bad(kind, text))?;
+                let radius = reader.number().ok_or_else(|| bad(kind, text))?;
                 values[count] = radius;
                 count += 1;
             }
@@ -248,12 +283,7 @@ fn read_values(
                 return Err(bad(kind, text));
             }
             let closing = if opening == b'[' { b']' } else { b')' };
-            one_or_more_points(
-                &mut reader,
-                closing,
-                if kind == GeometryKind::Polygon { 3 } else { 1 },
-                &mut add,
-            )?;
+            one_or_more_points(&mut reader, closing, 1, &mut add)?;
             opening == b'('
         }
         GeometryKind::Line => {
@@ -269,9 +299,6 @@ fn read_values(
                 if !reader.take(b'}') {
                     return Err(bad(kind, text));
                 }
-                if values[0] == 0.0 && values[1] == 0.0 {
-                    return Err(bad(kind, text));
-                }
             } else {
                 if !reader.take(b'(') {
                     return Err(bad(kind, text));
@@ -281,10 +308,13 @@ fn read_values(
                     return Err(bad(kind, text));
                 }
                 let second = reader.point().ok_or_else(|| bad(kind, text))?;
-                if !reader.take(b')') || first == second {
+                if !reader.take(b')')
+                    || ((first.0 - second.0).abs() <= EPSILON
+                        && (first.1 - second.1).abs() <= EPSILON)
+                {
                     return Err(bad(kind, text));
                 }
-                let (a, b, c) = if first.0 == second.0 {
+                let (a, b, c) = if (first.0 - second.0).abs() <= EPSILON {
                     (-1.0, 0.0, first.0)
                 } else {
                     let a = (second.1 - first.1) / (second.0 - first.0);
@@ -329,6 +359,9 @@ fn points(out: &mut StackStr<2048>, values: &[f64]) {
 pub fn parse<'a>(kind: GeometryKind, text: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
     let mut values = [0.0; MAX_POINTS * 2];
     let (count, closed) = read_values(kind, text.trim(), &mut values)?;
+    if kind == GeometryKind::Line && fp_zero(values[0]) && fp_zero(values[1]) {
+        return Err(bad(kind, text));
+    }
     let text = text.trim();
     let mut out = StackStr::<2048>::new();
     match kind {
@@ -350,15 +383,17 @@ pub fn parse<'a>(kind: GeometryKind, text: &str, arena: &'a Arena) -> Result<&'a
             let _ = out.write_str("]");
         }
         GeometryKind::Box if count == 4 => {
-            let high_x = values[0].max(values[2]);
-            let high_y = values[1].max(values[3]);
-            let low_x = values[0].min(values[2]);
-            let low_y = values[1].min(values[3]);
+            let high_x = pg_max(values[0], values[2]);
+            let high_y = pg_max(values[1], values[3]);
+            let low_x = pg_min(values[0], values[2]);
+            let low_y = pg_min(values[1], values[3]);
             point(&mut out, high_x, high_y);
             let _ = out.write_str(",");
             point(&mut out, low_x, low_y);
         }
-        GeometryKind::Circle if count == 3 && values[2] >= 0.0 => {
+        GeometryKind::Circle
+            if count == 3 && values[2].partial_cmp(&0.0) != Some(core::cmp::Ordering::Less) =>
+        {
             let _ = out.write_str("<");
             point(&mut out, values[0], values[1]);
             let _ = write!(out, ",{}>", PgFloat8(values[2]));
@@ -368,7 +403,7 @@ pub fn parse<'a>(kind: GeometryKind, text: &str, arena: &'a Arena) -> Result<&'a
             points(&mut out, &values[..count]);
             let _ = out.write_str(if closed { ")" } else { "]" });
         }
-        GeometryKind::Polygon if count >= 6 && count % 2 == 0 => {
+        GeometryKind::Polygon if count >= 2 && count % 2 == 0 => {
             let _ = out.write_str("(");
             points(&mut out, &values[..count]);
             let _ = out.write_str(")");
@@ -449,7 +484,7 @@ pub fn decode_binary<'a>(
         GeometryKind::Polygon => {
             let header = bytes.get(..4).ok_or_else(bad_binary)?;
             let points = i32::from_be_bytes(header.try_into().unwrap());
-            if !(3..=MAX_POINTS as i32).contains(&points) || bytes.len() != 4 + points as usize * 16
+            if !(1..=MAX_POINTS as i32).contains(&points) || bytes.len() != 4 + points as usize * 16
             {
                 return Err(bad_binary());
             }
@@ -470,10 +505,6 @@ pub fn decode_binary<'a>(
     };
     let mut out = StackStr::<2048>::new();
     let read = |at: usize| f64::from_be_bytes(payload[at..at + 8].try_into().unwrap());
-    let finite = |value: f64| value.is_finite();
-    if (0..payload.len()).step_by(8).any(|at| !finite(read(at))) {
-        return Err(bad_binary());
-    }
     match kind {
         GeometryKind::Point => point(&mut out, read(0), read(8)),
         GeometryKind::Line => {

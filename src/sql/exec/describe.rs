@@ -371,6 +371,17 @@ impl ColTypeResolver for CatalogCols<'_> {
             if !(1..=2).contains(&arguments.len()) {
                 return None;
             }
+            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+                && let Some(ctype) =
+                    crate::sql::eval::funcs::geometry::operator_result(operator, arguments)
+            {
+                return Some(StaticTypeMeta {
+                    type_oid: ctype.oid(),
+                    ctype,
+                    type_mod: -1,
+                    collation: crate::sql::ast::Collation::None,
+                });
+            }
             if arguments.len() == 2
                 && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
             {
@@ -2774,6 +2785,11 @@ pub fn infer_type_res(
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
+            if let Some(result) = operator.operator_name().and_then(|name| {
+                crate::sql::eval::funcs::geometry::operator_result(name, &[lo, ro])
+            }) {
+                return Ok((result.oid(), result.typlen()));
+            }
             if let Some(result) = operator
                 .operator_name()
                 .and_then(|name| columns.operator_result(name, lo, ro))
@@ -3133,6 +3149,14 @@ pub fn infer_type_res(
                     Some(ColType::OidVector) => of(ColType::Oid),
                     Some(ColType::Name) => of(ColType::Bpchar),
                     Some(ColType::Jsonb) => of(ColType::Jsonb),
+                    Some(ColType::Geometry(
+                        crate::sql::types::GeometryKind::Point
+                        | crate::sql::types::GeometryKind::Line,
+                    )) => of(ColType::Float8),
+                    Some(ColType::Geometry(
+                        crate::sql::types::GeometryKind::Box
+                        | crate::sql::types::GeometryKind::Lseg,
+                    )) => of(ColType::Geometry(crate::sql::types::GeometryKind::Point)),
                     Some(ctype) if matches!(base, Expr::Subscript { .. }) => of(ctype),
                     _ => (oid::UNKNOWN, -2),
                 }
@@ -3245,7 +3269,7 @@ pub fn infer_type_res(
                 of(ColType::Int4)
             }
             "point" | "center" => of(ColType::Geometry(crate::sql::types::GeometryKind::Point)),
-            "lseg" => of(ColType::Geometry(crate::sql::types::GeometryKind::Lseg)),
+            "lseg" | "diagonal" => of(ColType::Geometry(crate::sql::types::GeometryKind::Lseg)),
             "path" | "pclose" | "popen" => {
                 of(ColType::Geometry(crate::sql::types::GeometryKind::Path))
             }
@@ -3253,7 +3277,10 @@ pub fn infer_type_res(
             "polygon" => of(ColType::Geometry(crate::sql::types::GeometryKind::Polygon)),
             "line" => of(ColType::Geometry(crate::sql::types::GeometryKind::Line)),
             "circle" => of(ColType::Geometry(crate::sql::types::GeometryKind::Circle)),
-            "x" | "y" | "radius" | "diameter" | "area" => of(ColType::Float8),
+            "x" | "y" | "radius" | "diameter" | "area" | "height" | "width" | "slope" => {
+                of(ColType::Float8)
+            }
+            "bound_box" => of(ColType::Geometry(crate::sql::types::GeometryKind::Box)),
             "length" => match args
                 .first()
                 .map(|arg| infer_type_res(arg, columns))
@@ -3263,7 +3290,9 @@ pub fn infer_type_res(
                 _ => of(ColType::Int4),
             },
             "npoints" => of(ColType::Int4),
-            "isclosed" | "isopen" => of(ColType::Bool),
+            "isclosed" | "isopen" | "ishorizontal" | "isvertical" | "isparallel" | "isperp" => {
+                of(ColType::Bool)
+            }
             // Network address functions.
             "family" | "masklen" => of(ColType::Int4),
             "host" | "abbrev" => of(ColType::Text),
@@ -3299,7 +3328,11 @@ pub fn infer_type_res(
             "__json_serialize_bytea" => of(ColType::Bytea),
             name if name.starts_with("__json_exists_") => of(ColType::Bool),
             "__json_value" => of(ColType::Text),
-            "__jsonb_subscript_set" => of(ColType::Jsonb),
+            "__jsonb_subscript_set" => args
+                .first()
+                .map(|base| infer_type_res(base, columns))
+                .transpose()?
+                .unwrap_or_else(|| of(ColType::Jsonb)),
             name if name.starts_with("__json_query_") => {
                 if name.ends_with("_jsonb") {
                     of(ColType::Jsonb)

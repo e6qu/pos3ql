@@ -1139,6 +1139,15 @@ pub(crate) fn execute_index_comparison<'a>(
 }
 
 pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<ColType> {
+    if let Some(result) = super::eval::funcs::geometry::operator_result(name, arguments) {
+        return Some(result);
+    }
+    if arguments
+        .iter()
+        .any(|oid| matches!(ColType::from_oid(*oid), Some(ColType::Geometry(_))))
+    {
+        return None;
+    }
     if arguments.len() != 2 {
         return None;
     }
@@ -1272,6 +1281,55 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 sqlstate::INTERNAL_ERROR,
                 "operator expression has an invalid argument contract"
             ));
+        }
+        let mut builtin_arguments = [Datum::Null; 2];
+        let mut builtin_oids = [crate::sql::types::oid::UNKNOWN; 2];
+        builtin_arguments[..arguments.len()].copy_from_slice(arguments);
+        builtin_oids[..argument_type_oids.len()].copy_from_slice(argument_type_oids);
+        if arguments.len() == 2 {
+            let left = ColType::from_oid(builtin_oids[0]);
+            let right = ColType::from_oid(builtin_oids[1]);
+            match (left, right) {
+                (None, Some(ColType::Geometry(known)))
+                    if builtin_oids[0] == crate::sql::types::oid::UNKNOWN =>
+                {
+                    if let Some(kind) =
+                        super::eval::funcs::geometry::unknown_operand_kind(name, known, true)
+                    {
+                        builtin_arguments[0] = super::eval::cast_to(
+                            builtin_arguments[0],
+                            ColType::Geometry(kind),
+                            arena,
+                        )?;
+                        builtin_oids[0] = ColType::Geometry(kind).oid();
+                    }
+                }
+                (Some(ColType::Geometry(known)), None)
+                    if builtin_oids[1] == crate::sql::types::oid::UNKNOWN =>
+                {
+                    if let Some(kind) =
+                        super::eval::funcs::geometry::unknown_operand_kind(name, known, false)
+                    {
+                        builtin_arguments[1] = super::eval::cast_to(
+                            builtin_arguments[1],
+                            ColType::Geometry(kind),
+                            arena,
+                        )?;
+                        builtin_oids[1] = ColType::Geometry(kind).oid();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            && let Some(result) = super::eval::funcs::geometry::operator(
+                name,
+                &builtin_arguments[..arguments.len()],
+                &builtin_oids[..argument_type_oids.len()],
+                arena,
+            )
+        {
+            return result.map(Some);
         }
         let (left_oid, right_oid) = if argument_type_oids.len() == 1 {
             (None, Some(argument_type_oids[0]))
@@ -2292,6 +2350,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
             if !(1..=2).contains(&argument_type_oids.len()) {
                 return None;
+            }
+            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+                && let Some(ctype) =
+                    super::eval::funcs::geometry::operator_result(operator, argument_type_oids)
+            {
+                return Some(ctype.oid());
             }
             if argument_type_oids.len() == 2
                 && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
@@ -8157,6 +8221,17 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
             if !(1..=2).contains(&arguments.len()) {
                 return None;
+            }
+            if schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+                && let Some(ctype) =
+                    super::eval::funcs::geometry::operator_result(operator, arguments)
+            {
+                return Some(super::exec::StaticTypeMeta {
+                    type_oid: ctype.oid(),
+                    ctype,
+                    type_mod: -1,
+                    collation: super::ast::Collation::None,
+                });
             }
             if arguments.len() == 2
                 && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))

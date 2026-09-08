@@ -520,6 +520,7 @@ fn rule_relation_ref<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        bound_table: None,
         view_access: None,
     }
 }
@@ -903,6 +904,7 @@ pub(crate) fn rule_transition_source<'a>(
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                bound_table: None,
                 view_access: None,
             };
             for (column, name) in columns.iter().copied().enumerate() {
@@ -969,6 +971,7 @@ pub(crate) fn rule_transition_source<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        bound_table: None,
         view_access: None,
     };
     Ok(RuleTransitionSource {
@@ -4595,6 +4598,7 @@ fn subst_tableref<'a>(
             with_ordinality: false,
             lateral: false,
             authorization_role: None,
+            bound_table: None,
             view_access: None,
         });
     }
@@ -4626,6 +4630,7 @@ fn subst_tableref<'a>(
             with_ordinality: false,
             lateral: false,
             authorization_role: None,
+            bound_table: None,
             view_access: None,
         });
     }
@@ -4680,26 +4685,37 @@ fn subst_tableref<'a>(
                     )
                 })?,
         };
-        context.storage.require_schema_usage_as(
-            view.schema_for(context.txid).as_str(),
-            requester,
-            context.txid,
-        )?;
+        let view_schema = view.schema_for(context.txid);
+        let catalog_describes_other_temporary_view = view.persistence
+            == crate::storage::RelationPersistence::Temporary
+            && !context
+                .storage
+                .is_current_temporary_schema(view_schema.as_str());
+        if !catalog_describes_other_temporary_view {
+            context.storage.require_schema_usage_as(
+                view_schema.as_str(),
+                requester,
+                context.txid,
+            )?;
+        }
         let view_object = crate::storage::AccessObject {
             class: crate::storage::AccessClass::View,
             slot: slot as u16,
         };
-        if !context.storage.has_object_privilege(
-            view_object,
-            requester,
-            crate::storage::PrivilegeSet::SELECT,
-            context.txid,
-        ) && !context.storage.has_any_column_privilege(
-            view_object,
-            requester,
-            crate::storage::PrivilegeSet::SELECT,
-            context.txid,
-        ) {
+        if !catalog_describes_other_temporary_view
+            && !context.storage.has_object_privilege(
+                view_object,
+                requester,
+                crate::storage::PrivilegeSet::SELECT,
+                context.txid,
+            )
+            && !context.storage.has_any_column_privilege(
+                view_object,
+                requester,
+                crate::storage::PrivilegeSet::SELECT,
+                context.txid,
+            )
+        {
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied for view {}",
@@ -4775,6 +4791,7 @@ fn subst_tableref<'a>(
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                bound_table: None,
                 view_access: Some(slot as u16),
             });
         }
@@ -4807,6 +4824,7 @@ fn subst_tableref<'a>(
             with_ordinality: false,
             lateral: false,
             authorization_role: None,
+            bound_table: None,
             view_access: Some(slot as u16),
         });
     }
@@ -4826,6 +4844,10 @@ fn subst_tableref<'a>(
             schema: Some(schema),
             table,
             alias: Some(t.alias.unwrap_or(t.table)),
+            bound_table: captured.and_then(|relation| match relation {
+                crate::storage::ResolvedRelation::Table(slot) => u16::try_from(slot).ok(),
+                _ => None,
+            }),
             authorization_role: context.authorization_role,
             ..*t
         });

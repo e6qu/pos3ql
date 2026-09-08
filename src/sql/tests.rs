@@ -7528,6 +7528,67 @@ fn instead_of_view_triggers_drive_insert_update_delete_and_returning() {
 }
 
 #[test]
+fn replacing_view_preserves_triggers_rules_comments_and_rollback_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replace_view_base (id integer PRIMARY KEY, value integer); \
+         CREATE VIEW replace_view_target AS SELECT id, value FROM replace_view_base; \
+         CREATE FUNCTION replace_view_write() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO replace_view_base VALUES (NEW.id, NEW.value); RETURN NEW; END'; \
+         CREATE TRIGGER replace_view_write INSTEAD OF INSERT ON replace_view_target \
+           FOR EACH ROW EXECUTE FUNCTION replace_view_write(); \
+         CREATE RULE replace_view_delete AS ON DELETE TO replace_view_target DO ALSO NOTHING; \
+         COMMENT ON TRIGGER replace_view_write ON replace_view_target IS 'stable trigger'; \
+         COMMENT ON RULE replace_view_delete ON replace_view_target IS 'stable rule'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         CREATE OR REPLACE VIEW replace_view_target AS \
+           SELECT id, value FROM replace_view_base WHERE id >= 0; \
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'replace_view_write'; \
+         SELECT count(*) FROM pg_rewrite WHERE rulename = 'replace_view_delete'; \
+         INSERT INTO replace_view_target VALUES (1, 10) RETURNING id, value; \
+         ROLLBACK; \
+         SELECT count(*) FROM replace_view_base",
+    );
+    assert_eq!(
+        data_rows(&rolled_back),
+        ["1", "1", "1|10", "0"],
+        "{}",
+        String::from_utf8_lossy(&rolled_back)
+    );
+
+    let committed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OR REPLACE VIEW replace_view_target AS \
+           SELECT id, value FROM replace_view_base WHERE id >= 0; \
+         INSERT INTO replace_view_target VALUES (2, 20) RETURNING id, value; \
+         SELECT obj_description(oid, 'pg_trigger') FROM pg_trigger \
+           WHERE tgname = 'replace_view_write'; \
+         SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
+           WHERE rulename = 'replace_view_delete'; \
+         SELECT id, value FROM replace_view_base",
+    );
+    assert_eq!(
+        data_rows(&committed),
+        ["2|20", "stable trigger", "stable rule", "2|20"],
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+}
+
+#[test]
 fn instead_of_view_trigger_survives_checkpoint_recovery() {
     let mut config = test_config("instead-of-view-recovery");
     config.object_store_on = true;
@@ -7553,6 +7614,10 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
             END'; \
          CREATE TRIGGER recovered_view_trigger INSTEAD OF INSERT OR UPDATE OR DELETE ON recovered_view \
            FOR EACH ROW EXECUTE FUNCTION recovered_view_trigger(); \
+         CREATE RULE recovered_view_rule AS ON DELETE TO recovered_view DO ALSO NOTHING; \
+         COMMENT ON TRIGGER recovered_view_trigger ON recovered_view IS 'recovered trigger'; \
+         COMMENT ON RULE recovered_view_rule ON recovered_view IS 'recovered rule'; \
+         CREATE OR REPLACE VIEW recovered_view AS SELECT id, value FROM recovered_view_base; \
          ALTER TABLE recovered_view DISABLE TRIGGER recovered_view_trigger;",
     );
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
@@ -7571,6 +7636,11 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
         &mut restarted,
         &mut restarted_budget,
         "ALTER TABLE recovered_view ENABLE TRIGGER recovered_view_trigger; \
+             SELECT obj_description(oid, 'pg_trigger') FROM pg_trigger \
+               WHERE tgname = 'recovered_view_trigger'; \
+             SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
+               WHERE rulename = 'recovered_view_rule'; \
+             DROP RULE recovered_view_rule ON recovered_view; \
              INSERT INTO recovered_view VALUES (7, 70); \
              UPDATE recovered_view AS target SET value = source.value \
                FROM recovered_view_source AS source WHERE target.id = source.id \
@@ -7581,7 +7651,7 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     );
     assert_eq!(
         data_rows(&recovered),
-        ["7|77", "7", "0"],
+        ["recovered trigger", "recovered rule", "7|77", "7", "0"],
         "{}",
         String::from_utf8_lossy(&recovered)
     );
@@ -9141,6 +9211,9 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
          INSERT INTO view_output_source VALUES (9);
          CREATE VIEW view_output_gateway (published_value) AS
            SELECT value FROM view_output_source;
+         CREATE VIEW view_output_dependent AS
+           SELECT published_value FROM view_output_gateway;
+         COMMENT ON VIEW view_output_dependent IS 'dependent output remains stable';
          SELECT published_value FROM view_output_gateway;
          INSERT INTO view_output_gateway (published_value) VALUES (10);
          UPDATE view_output_gateway SET published_value = published_value + 1
@@ -9150,6 +9223,7 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
           WHERE attrelid = 'view_output_gateway'::regclass AND attnum = 1;
          ALTER VIEW view_output_gateway RENAME COLUMN published_value TO current_value;
          SELECT current_value FROM view_output_gateway;
+         SELECT published_value FROM view_output_dependent;
          BEGIN;
          ALTER VIEW view_output_gateway RENAME COLUMN current_value TO temporary_value;
          SELECT temporary_value FROM view_output_gateway;
@@ -9163,6 +9237,8 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
             "9",
             "11",
             "published_value",
+            "9",
+            "11",
             "9",
             "11",
             "9",
@@ -9183,12 +9259,21 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
         &mut recovered,
         &mut recovered_budget,
         "SELECT current_value FROM view_output_gateway;
+             SELECT published_value FROM view_output_dependent;
+             SELECT obj_description('view_output_dependent'::regclass);
              SELECT attname FROM pg_attribute
               WHERE attrelid = 'view_output_gateway'::regclass AND attnum = 1;",
     );
     assert_eq!(
         data_rows(&recovered_rows),
-        ["9", "11", "current_value"],
+        [
+            "9",
+            "11",
+            "9",
+            "11",
+            "dependent output remains stable",
+            "current_value"
+        ],
         "{}",
         String::from_utf8_lossy(&recovered_rows)
     );
@@ -44361,6 +44446,238 @@ fn relation_persistence_is_typed_session_scoped_and_transactional() {
 }
 
 #[test]
+fn temporary_views_are_inferred_shadowed_mutable_and_session_scoped() {
+    let mut config = test_config("temporary-view-session");
+    config.max_prepared_transactions = 1;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    let created = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE ROLE temporary_view_reader; \
+         CREATE TABLE temporary_view_base (id integer); \
+         INSERT INTO temporary_view_base VALUES (1); \
+         CREATE VIEW temporary_view_shadow AS SELECT 1 AS id; \
+         CREATE TEMP VIEW temporary_view_shadow AS SELECT 2 AS id; \
+         CREATE TEMP TABLE temporary_view_rows (id integer); \
+         INSERT INTO temporary_view_rows VALUES (3); \
+         CREATE VIEW temporary_view_auto AS SELECT id FROM temporary_view_rows; \
+         CREATE VIEW temporary_view_chain AS SELECT id FROM temporary_view_auto; \
+         CREATE TEMPORARY VIEW temporary_view_explicit WITH (check_option = cascaded) AS \
+           SELECT id FROM temporary_view_base WHERE id > 0; \
+         CREATE TEMP SEQUENCE temporary_view_sequence START 40; \
+         CREATE VIEW temporary_view_sequence_value AS \
+           SELECT nextval('temporary_view_sequence') AS value; \
+         SELECT relname, relpersistence FROM pg_class \
+          WHERE relname LIKE 'temporary_view_%' AND relkind = 'v' \
+          ORDER BY relname, relpersistence; \
+         SELECT id FROM temporary_view_shadow; \
+         SELECT id FROM public.temporary_view_shadow; \
+         SELECT id FROM temporary_view_chain; \
+         SELECT value FROM temporary_view_sequence_value",
+    );
+    let created_text = String::from_utf8_lossy(&created);
+    assert!(!created_text.contains("ERROR"), "{created_text}");
+    assert!(
+        created_text.contains("view \"temporary_view_auto\" will be a temporary view")
+            && created_text.contains("view \"temporary_view_chain\" will be a temporary view")
+            && created_text
+                .contains("view \"temporary_view_sequence_value\" will be a temporary view"),
+        "{created_text}"
+    );
+    assert_eq!(
+        data_rows(&created),
+        [
+            "temporary_view_auto|t",
+            "temporary_view_chain|t",
+            "temporary_view_explicit|t",
+            "temporary_view_sequence_value|t",
+            "temporary_view_shadow|p",
+            "temporary_view_shadow|t",
+            "2",
+            "1",
+            "3",
+            "40",
+        ]
+    );
+
+    let dependent_rename = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "ALTER VIEW temporary_view_auto RENAME COLUMN id TO value; \
+         SELECT id FROM temporary_view_chain",
+    );
+    assert!(
+        !String::from_utf8_lossy(&dependent_rename).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dependent_rename)
+    );
+    assert_eq!(data_rows(&dependent_rename), ["3"]);
+
+    let replaced = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "CREATE OR REPLACE VIEW temporary_view_shadow AS SELECT 4 AS id; \
+         CREATE OR REPLACE TEMP VIEW temporary_view_shadow AS SELECT 5 AS id; \
+         SELECT id FROM temporary_view_shadow; \
+         SELECT id FROM public.temporary_view_shadow; \
+         INSERT INTO temporary_view_explicit VALUES (2); \
+         SELECT id FROM temporary_view_base ORDER BY id; \
+         ALTER VIEW temporary_view_explicit RENAME COLUMN id TO value; \
+         ALTER VIEW temporary_view_explicit SET (security_invoker = true); \
+         ALTER VIEW temporary_view_explicit RENAME TO temporary_view_renamed; \
+         COMMENT ON VIEW temporary_view_renamed IS 'session only'; \
+         GRANT SELECT (value) ON temporary_view_renamed TO temporary_view_reader; \
+         SELECT value FROM temporary_view_renamed; \
+         SELECT relpersistence, reloptions FROM pg_class \
+          WHERE oid = 'temporary_view_renamed'::regclass",
+    );
+    let replaced_text = String::from_utf8_lossy(&replaced);
+    assert!(!replaced_text.contains("ERROR"), "{replaced_text}");
+    assert_eq!(
+        data_rows(&replaced),
+        [
+            "5",
+            "4",
+            "1",
+            "2",
+            "1",
+            "2",
+            "t|{security_invoker=true,check_option=cascaded}",
+        ]
+    );
+
+    let rejected_row = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "INSERT INTO temporary_view_renamed VALUES (-1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_row).contains("44000"),
+        "{}",
+        String::from_utf8_lossy(&rejected_row)
+    );
+    for statement in [
+        "CREATE TEMP VIEW public.temporary_view_bad AS SELECT 1",
+        "CREATE VIEW public.temporary_view_bad AS SELECT * FROM temporary_view_rows",
+        "ALTER VIEW temporary_view_renamed SET SCHEMA public",
+    ] {
+        let output = run_as(&mut engine, &mut budget, 11, statement);
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("cannot create temporary relation in non-temporary schema")
+                || output.contains("cannot move objects into or out of temporary schemas"),
+            "{statement}: {output}"
+        );
+    }
+
+    let other_session = run_as(
+        &mut engine,
+        &mut budget,
+        12,
+        "SELECT id FROM temporary_view_shadow; \
+         SELECT to_regclass('pg_temp_11.temporary_view_renamed') IS NULL; \
+         SELECT count(*) FROM pg_class \
+          WHERE relkind = 'v' AND relpersistence = 't' \
+            AND relname LIKE 'temporary_view_%'; \
+         SELECT count(*) FROM pg_attribute attribute \
+           JOIN pg_class relation ON relation.oid = attribute.attrelid \
+          WHERE relation.relkind = 'v' AND relation.relpersistence = 't' \
+            AND relation.relname LIKE 'temporary_view_%' \
+            AND attribute.attnum > 0",
+    );
+    assert!(
+        !String::from_utf8_lossy(&other_session).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&other_session)
+    );
+    assert_eq!(data_rows(&other_session), ["4", "t", "5", "5"]);
+
+    let prepared = run_as(
+        &mut engine,
+        &mut budget,
+        11,
+        "BEGIN; SELECT count(*) FROM temporary_view_renamed; \
+         PREPARE TRANSACTION 'temporary_view_used'",
+    );
+    assert!(
+        String::from_utf8_lossy(&prepared)
+            .contains("cannot PREPARE a transaction that has operated on temporary objects"),
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+
+    engine.drop_connection(11);
+    let cleaned = run_as(
+        &mut engine,
+        &mut budget,
+        12,
+        "CREATE VIEW temporary_view_renamed AS SELECT 9 AS value; \
+         SELECT count(*) FROM pg_class WHERE relpersistence = 't'; \
+         SELECT obj_description('temporary_view_renamed'::regclass, 'pg_class') IS NULL; \
+         SELECT has_column_privilege( \
+           'temporary_view_reader', 'temporary_view_renamed', 'value', 'SELECT')",
+    );
+    assert_eq!(data_rows(&cleaned), ["0", "t", "f"]);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn temporary_view_catalog_dependents_do_not_reach_wal_or_checkpoint() {
+    let config = test_config("temporary-view-durability");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_as(
+        &mut engine,
+        &mut budget,
+        31,
+        "CREATE ROLE temporary_view_checkpoint_reader; \
+         CREATE TABLE temporary_view_checkpoint_base (id integer PRIMARY KEY); \
+         CREATE FUNCTION temporary_view_checkpoint_write() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO temporary_view_checkpoint_base VALUES (NEW.id); RETURN NEW; END'; \
+         CREATE TEMP VIEW temporary_view_checkpoint AS \
+           SELECT id FROM temporary_view_checkpoint_base; \
+         CREATE TRIGGER temporary_view_checkpoint_write INSTEAD OF INSERT \
+           ON temporary_view_checkpoint FOR EACH ROW \
+           EXECUTE FUNCTION temporary_view_checkpoint_write(); \
+         COMMENT ON VIEW temporary_view_checkpoint IS 'must not persist'; \
+         COMMENT ON TRIGGER temporary_view_checkpoint_write \
+           ON temporary_view_checkpoint IS 'must not persist'; \
+         GRANT SELECT, INSERT ON temporary_view_checkpoint \
+           TO temporary_view_checkpoint_reader; \
+         INSERT INTO temporary_view_checkpoint VALUES (7); \
+         SELECT id FROM temporary_view_checkpoint",
+    );
+    let created_text = String::from_utf8_lossy(&created);
+    assert!(!created_text.contains("ERROR"), "{created_text}");
+    assert_eq!(data_rows(&created), ["7"]);
+    engine.commit_wal().unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 28);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT id FROM temporary_view_checkpoint_base; \
+         SELECT to_regclass('temporary_view_checkpoint') IS NULL; \
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'temporary_view_checkpoint_write'; \
+         SELECT count(*) FROM pg_rewrite WHERE ev_class::regclass::text = \
+           'temporary_view_checkpoint'",
+    );
+    assert_eq!(data_rows(&recovered_rows), ["7", "t", "0", "0"]);
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn unlogged_relations_preserve_clean_shutdown_and_reset_after_crash() {
     let config = test_config("unlogged_clean_and_crash");
     let mut budget = Budget::new(1 << 28);
@@ -46371,6 +46688,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
            SELECT to_tsvector('template_app.documents', 'Cats') AS terms;
          CREATE SEQUENCE template_app.item_sequence;
          SELECT setval('template_app.item_sequence', 7, true);
+         CREATE TEMP TABLE template_private_rows(id integer);
+         INSERT INTO template_private_rows VALUES (99);
+         CREATE TEMP VIEW template_private_view AS SELECT id FROM template_private_rows;
+         CREATE TEMP SEQUENCE template_private_sequence;
+         COMMENT ON VIEW template_private_view IS 'session local';
          CREATE PUBLICATION template_changes FOR TABLE template_app.items;
          COMMENT ON TABLE template_app.items IS 'copied template table';
          GRANT USAGE ON SCHEMA template_app TO template_reader;
@@ -46428,6 +46750,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          SELECT nextval('template_app.item_sequence');
          SELECT (SELECT count(*) FROM pg_class WHERE relname IN ('items', 'ready_items', 'search_terms', 'item_sequence')),
                 (SELECT count(*) FROM pg_type WHERE typname IN ('state', 'positive'));
+         SELECT count(*) FROM pg_class
+          WHERE relname IN ('template_private_rows', 'template_private_view',
+                            'template_private_sequence');
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
          SELECT obj_description('template_app.items'::regclass, 'pg_class');
          SELECT has_table_privilege('template_reader', 'template_app.items', 'SELECT');
@@ -46449,6 +46774,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "1",
             "8",
             "4|2",
+            "0",
             "1",
             "copied template table",
             "t",

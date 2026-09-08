@@ -3182,7 +3182,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw11") => {
+                Some("vw11" | "vw12") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_view(storage, line)?;
                 }
@@ -7312,7 +7312,8 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "vw11 {} {} {} {} {} {} {} {} {}",
+                    "vw12 {} {} {} {} {} {} {} {} {} {}",
+                    view_slot,
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
@@ -11319,7 +11320,12 @@ fn load_subscription_relation(
 #[inline(never)]
 fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {
     let mut words = line.split(' ');
-    let _tag = words.next();
+    let tag = words.next();
+    let slot = if tag == Some("vw12") {
+        Some(parse_field::<usize>(words.next(), "view slot missing")?)
+    } else {
+        None
+    };
     let read_hex = |word: Option<&str>, what: &'static str| {
         word.ok_or(CheckpointSetupError::Corrupt(what))
             .and_then(decode_hex_name)
@@ -11438,35 +11444,42 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
     let _ = write!(buffer, "{sql}");
     let mut path_buffer = StackStr::<128>::new();
     let _ = write!(path_buffer, "{path}");
-    let (new_slot, old_slot) = storage
-        .create_view(
-            sql_name(&schema)?,
-            sql_name(&name)?,
-            crate::storage::ViewDefinition {
-                columns,
-                query: crate::storage::StoredQueryDefinition {
-                    sql: buffer,
-                    creation_path: path_buffer,
-                    dependencies,
-                },
-                options: crate::storage::ViewOptions {
-                    security,
-                    security_barrier,
-                    check_option,
-                },
-            },
-            true,
-            0,
-        )
-        .map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!(
-                "manifest view rejected: {}",
-                error.message.as_str()
-            ))
-        })?;
-    storage.commit_view_create(new_slot);
-    if let Some(old_slot) = old_slot {
-        storage.commit_view_drop(old_slot);
+    let definition = crate::storage::ViewDefinition {
+        persistence: crate::storage::RelationPersistence::Permanent,
+        columns,
+        query: crate::storage::StoredQueryDefinition {
+            sql: buffer,
+            creation_path: path_buffer,
+            dependencies,
+        },
+        options: crate::storage::ViewOptions {
+            security,
+            security_barrier,
+            check_option,
+        },
+    };
+    if let Some(slot) = slot {
+        storage
+            .restore_view_at(slot, sql_name(&schema)?, sql_name(&name)?, definition)
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest view rejected: {}",
+                    error.message.as_str()
+                ))
+            })?;
+    } else {
+        let (new_slot, old_slot) = storage
+            .create_view(sql_name(&schema)?, sql_name(&name)?, definition, true, 0)
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "manifest view rejected: {}",
+                    error.message.as_str()
+                ))
+            })?;
+        storage.commit_view_create(new_slot);
+        if let Some(old_slot) = old_slot {
+            storage.commit_view_drop(old_slot);
+        }
     }
     Ok(())
 }

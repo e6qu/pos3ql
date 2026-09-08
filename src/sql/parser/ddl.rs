@@ -1365,11 +1365,24 @@ impl<'a> Parser<'a> {
             false
         };
         if or_replace {
+            let persistence = if self.eat_ident("temporary")? || self.eat_ident("temp")? {
+                RelationPersistence::Temporary
+            } else {
+                RelationPersistence::Permanent
+            };
             if self.eat_ident("rule")? {
+                if persistence != RelationPersistence::Permanent {
+                    return Err(self.err_here(
+                        "TEMPORARY is only supported for views after CREATE OR REPLACE",
+                    ));
+                }
                 return self.create_rule(true);
             }
             if self.eat_ident("view")? {
-                return self.create_view(true);
+                return self.create_view(true, persistence);
+            }
+            if persistence != RelationPersistence::Permanent {
+                return Err(self.err_here("expected VIEW after CREATE OR REPLACE TEMPORARY"));
             }
             if self.eat_ident("function")? {
                 return self.create_routine(true, true);
@@ -1415,7 +1428,7 @@ impl<'a> Parser<'a> {
             return self.create_language(false, trusted);
         }
         if self.eat_ident("view")? {
-            return self.create_view(false);
+            return self.create_view(false, RelationPersistence::Permanent);
         }
         if self.eat_ident("rule")? {
             return self.create_rule(false);
@@ -1557,6 +1570,9 @@ impl<'a> Parser<'a> {
         };
         if self.eat_ident("sequence")? {
             return self.create_sequence(persistence);
+        }
+        if persistence == RelationPersistence::Temporary && self.eat_ident("view")? {
+            return self.create_view(false, persistence);
         }
         if persistence == RelationPersistence::Unlogged && self.eat_ident("materialized")? {
             self.expect_ident("view")?;
@@ -5161,6 +5177,7 @@ impl<'a> Parser<'a> {
                     Stmt::CreateTable(table) => CreateSchemaElement::Table(table),
                     Stmt::CreateView {
                         name,
+                        persistence,
                         columns,
                         or_replace,
                         security,
@@ -5169,6 +5186,7 @@ impl<'a> Parser<'a> {
                         sql,
                     } => CreateSchemaElement::View {
                         name,
+                        persistence,
                         columns,
                         or_replace,
                         security,
@@ -5598,7 +5616,11 @@ impl<'a> Parser<'a> {
     }
 
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
-    fn create_view(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
+    fn create_view(
+        &mut self,
+        or_replace: bool,
+        persistence: RelationPersistence,
+    ) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("view name")?;
         let columns = if self.peeked == Tok::Op("(") {
             let mut names = [""; crate::storage::MAX_COLUMNS];
@@ -5651,6 +5673,7 @@ impl<'a> Parser<'a> {
         let sql = self.text[start..end].trim();
         Ok(Stmt::CreateView {
             name,
+            persistence,
             columns,
             or_replace,
             security,

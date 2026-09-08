@@ -248,6 +248,12 @@ pub(crate) enum DdlUndo {
     /// DROP VIEW at this slot (or the superseded view of an OR REPLACE) —
     /// undo by reviving it.
     ViewDropped(u32),
+    /// CREATE OR REPLACE VIEW moved the old view's internal dependents to the
+    /// replacement slot. Commit retires `old`; rollback moves them back.
+    ViewReplaced {
+        old: u32,
+        new: u32,
+    },
     ViewSchemaChanged {
         slot: u32,
         prior: Option<crate::storage::PendingObjectSchema>,

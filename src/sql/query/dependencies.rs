@@ -898,6 +898,7 @@ fn dml_dependency_scope<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        bound_table: None,
         view_access: None,
     };
     let joins = match extra {
@@ -1953,7 +1954,7 @@ fn record_relation_column_references<'a>(
     from: &'a crate::sql::ast::FromClause<'a>,
     select: &'a Select<'a>,
     dependencies: &mut StoredQueryDependencies,
-    arena: &'a Arena,
+    _arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let mut sources = [RelationSource {
         class: DependencyClass::Table,
@@ -1993,26 +1994,15 @@ fn record_relation_column_references<'a>(
                 }
             }
             ResolvedRelation::View(slot) => {
-                let user = crate::sql::eval::funcs::system::session_user_owned();
-                let view_path =
-                    storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
-                let mut described = [crate::sql::types::ColDesc::new("", 0, 0); MAX_COLUMNS];
                 source.class = DependencyClass::View;
                 source.slot = slot;
-                source.n_columns = super::describe_stored_query(
-                    storage.view_sql(slot),
-                    storage,
-                    txid,
-                    view_path,
-                    storage.view_dependencies(slot),
-                    arena,
-                    &mut described,
-                )?;
-                for (column, described) in described.iter().enumerate().take(source.n_columns) {
+                let columns = storage.view(slot).columns_for(txid);
+                source.n_columns = columns.len();
+                for (column, name) in columns.names().iter().enumerate() {
                     source.columns[column] = table
                         .col_alias
                         .and_then(|aliases| aliases.get(column).copied())
-                        .unwrap_or(described.name);
+                        .unwrap_or(name.as_str());
                 }
             }
             _ => continue,
@@ -2652,15 +2642,30 @@ fn collect_sequence(
         .rsplit_once('.')
         .map_or((None, sequence_name), |(schema, name)| (Some(schema), name));
     let slot = if let Some(schema) = schema {
-        storage.sequence_slot(schema, name, txid)
+        if schema == "pg_temp" {
+            storage
+                .temporary_schema()
+                .ok()
+                .and_then(|schema| storage.sequence_slot(schema.as_str(), name, txid))
+        } else if schema.starts_with("pg_temp_") && !storage.is_current_temporary_schema(schema) {
+            None
+        } else {
+            storage.sequence_slot(schema, name, txid)
+        }
     } else {
-        path.entries().iter().find_map(|entry| match entry {
-            PathEntry::Schema(schema_slot) => {
-                let schema = storage.schema_def(*schema_slot as usize).name;
-                storage.sequence_slot(schema.as_str(), name, txid)
-            }
-            PathEntry::Catalog => None,
-        })
+        storage
+            .temporary_schema()
+            .ok()
+            .and_then(|schema| storage.sequence_slot(schema.as_str(), name, txid))
+            .or_else(|| {
+                path.entries().iter().find_map(|entry| match entry {
+                    PathEntry::Schema(schema_slot) => {
+                        let schema = storage.schema_def(*schema_slot as usize).name;
+                        storage.sequence_slot(schema.as_str(), name, txid)
+                    }
+                    PathEntry::Catalog => None,
+                })
+            })
     };
     if let Some(slot) = slot {
         let sequence = storage.sequence_for(slot, txid);

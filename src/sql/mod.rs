@@ -5384,6 +5384,7 @@ impl Engine {
                     );
                 }
                 DdlUndo::ViewDropped(slot) => self.storage.commit_view_drop(*slot as usize),
+                DdlUndo::ViewReplaced { old, .. } => self.storage.commit_view_drop(*old as usize),
                 DdlUndo::ViewSchemaChanged { slot, .. } => {
                     self.storage.commit_view_schema(*slot as usize, txn.txid)
                 }
@@ -6397,6 +6398,11 @@ impl Engine {
             }
             DdlUndo::ViewDropped(slot) => {
                 self.storage.rollback_view_drop(slot as usize, txid);
+            }
+            DdlUndo::ViewReplaced { old, new } => {
+                self.storage
+                    .retarget_view_dependents(new as usize, old as usize);
+                self.storage.rollback_view_drop(old as usize, txid);
             }
             DdlUndo::ViewSchemaChanged { slot, prior } => {
                 self.storage.rollback_view_schema(slot as usize, prior)
@@ -13504,6 +13510,7 @@ impl Engine {
             }
             Stmt::CreateView {
                 name,
+                persistence,
                 columns,
                 or_replace,
                 security,
@@ -13516,6 +13523,7 @@ impl Engine {
                 txn,
                 exec::CreateViewCommand {
                     name,
+                    persistence: *persistence,
                     columns,
                     or_replace: *or_replace,
                     security: *security,
@@ -14828,6 +14836,7 @@ impl Engine {
                         };
                         let result = if let Stmt::CreateView {
                             name,
+                            persistence,
                             columns,
                             or_replace,
                             security,
@@ -14854,6 +14863,7 @@ impl Engine {
                                 txn,
                                 exec::CreateViewCommand {
                                     name,
+                                    persistence: *persistence,
                                     columns,
                                     or_replace: *or_replace,
                                     security: *security,
@@ -17356,6 +17366,7 @@ pub(crate) fn requalify_schema_element<'a>(
         }),
         ast::CreateSchemaElement::View {
             name,
+            persistence,
             columns,
             or_replace,
             security,
@@ -17364,6 +17375,7 @@ pub(crate) fn requalify_schema_element<'a>(
             sql,
         } => Stmt::CreateView {
             name: requalify(*name)?,
+            persistence: *persistence,
             columns,
             or_replace: *or_replace,
             security: *security,
@@ -18643,6 +18655,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
                 crate::storage::ViewDefinition {
+                    persistence: crate::storage::RelationPersistence::Permanent,
                     columns,
                     query: crate::storage::StoredQueryDefinition {
                         sql: buffer,
@@ -18682,6 +18695,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 true,
                 0,
             )?;
+            if let Some(old) = old_slot {
+                storage.retarget_view_dependents(old, new_slot);
+            }
             storage.commit_view_create(new_slot);
             if let Some(old) = old_slot {
                 storage.commit_view_drop(old);

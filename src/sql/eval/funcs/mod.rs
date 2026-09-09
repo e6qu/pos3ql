@@ -24,4 +24,5 @@ pub(super) mod range;
 pub(super) mod regex;
 pub(super) mod string;
 pub mod system;
+pub(super) mod uuid;
 pub(super) mod xml;

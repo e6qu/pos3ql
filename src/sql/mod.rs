@@ -74,6 +74,36 @@ use types::{ColDesc, ColType, Datum};
 
 type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError> + 'a;
 
+fn intrinsic_uuid_parameter_oids(
+    written_name: &str,
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    argument_count: usize,
+) -> Option<[i32; crate::storage::MAX_ROUTINE_ARGUMENTS]> {
+    let name = match written_name.split_once('.') {
+        Some(("pg_catalog", name)) => name,
+        Some(_) => return None,
+        None => written_name,
+    };
+    if variadic || argument_count != 1 {
+        return None;
+    }
+    let positional = argument_names.is_empty() || argument_names.iter().all(Option::is_none);
+    let expected = if name.eq_ignore_ascii_case("uuidv7")
+        && (positional
+            || matches!(argument_names, [Some(argument)] if argument.eq_ignore_ascii_case("shift")))
+    {
+        types::oid::INTERVAL
+    } else if matches!(name, "uuid_extract_timestamp" | "uuid_extract_version") && positional {
+        types::oid::UUID
+    } else {
+        return None;
+    };
+    let mut oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    oids[0] = expected;
+    Some(oids)
+}
+
 /// Complete durable input for binding one startup-reserved subscription worker.
 /// Values are copied out of the catalog so the reactor never holds a catalog
 /// borrow while it drives a network socket or applies a remote transaction.
@@ -8812,13 +8842,18 @@ impl Engine {
                                 }
                             }
                         }
-                    } else if let Some(expected) = self.storage.function_call_parameter_oids(
-                        name,
-                        argument_names,
-                        *variadic,
-                        &actual[..args.len()],
-                        txid,
-                    ) {
+                    } else if let Some(expected) =
+                        intrinsic_uuid_parameter_oids(name, argument_names, *variadic, args.len())
+                            .or_else(|| {
+                                self.storage.function_call_parameter_oids(
+                                    name,
+                                    argument_names,
+                                    *variadic,
+                                    &actual[..args.len()],
+                                    txid,
+                                )
+                            })
+                    {
                         for (argument, expected_oid) in args.iter().copied().zip(expected) {
                             if expected_oid != types::oid::UNKNOWN {
                                 assign(argument, expected_oid, oids);

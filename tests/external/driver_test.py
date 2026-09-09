@@ -1,6 +1,9 @@
 # Driver-level test: psycopg 3 (a real PostgreSQL driver) against pos3ql.
 # psycopg uses the extended query protocol (Parse/Bind/Describe/Execute)
 # for parameterized queries.
+import datetime
+import uuid
+
 import psycopg
 
 conn = psycopg.connect(
@@ -75,6 +78,24 @@ cur.execute("SELECT id, name FROM drv ORDER BY id LIMIT 1")
 names = [d.name for d in cur.description]
 assert names == ["id", "name"], names
 print("describe ok:", names)
+
+# PostgreSQL 18 UUID generation and inspection retain their exact result OIDs
+# through binary extended-protocol results and infer UUID/interval Bind types.
+bcur = conn.cursor(binary=True)
+v7_fixture = uuid.UUID("018cc251-f400-7abc-8000-000000000000")
+bcur.execute(
+    "SELECT uuidv4(), uuidv7(), uuid_extract_version(%s), "
+    "uuid_extract_timestamp(%s), uuidv7(shift => %s)",
+    (v7_fixture, v7_fixture, datetime.timedelta(days=-1)),
+)
+assert [column.type_code for column in bcur.description] == [2950, 2950, 21, 1184, 2950]
+generated_v4, generated_v7, version, timestamp, shifted_v7 = bcur.fetchone()
+assert generated_v4.version == 4 and generated_v7.version == 7
+assert version == 7
+assert timestamp == datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+assert shifted_v7.version == 7
+bcur.close()
+print("PostgreSQL 18 UUID binary extended protocol ok")
 
 # User-defined cast/operator resolution crosses Parse, binary Bind, Describe,
 # and Result as one typed contract.

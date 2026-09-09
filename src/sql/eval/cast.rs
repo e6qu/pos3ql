@@ -830,24 +830,40 @@ pub(crate) fn parse_uuid(s: &str) -> Result<[u8; 16], SqlError> {
             s
         )
     };
-    let mut out = [0u8; 16];
-    let mut nibbles = 0usize;
-    for c in s.trim().chars() {
-        if c == '-' {
-            continue;
+    let source = s.as_bytes();
+    let mut at = 0usize;
+    let braces = source.first() == Some(&b'{');
+    if braces {
+        at += 1;
+    }
+    let hex = |byte: u8| -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
         }
-        let d = c.to_digit(16).ok_or_else(bad)? as u8;
-        if nibbles >= 32 {
+    };
+    let mut out = [0_u8; 16];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let high = source.get(at).copied().and_then(hex).ok_or_else(bad)?;
+        let low = source.get(at + 1).copied().and_then(hex).ok_or_else(bad)?;
+        *byte = high << 4 | low;
+        at += 2;
+        // PostgreSQL permits a dash only after a complete four-hex-digit
+        // group. Each such dash is optional, which includes both canonical
+        // 8-4-4-4-12 input and fully grouped 4-4-... input.
+        if index % 2 == 1 && index < 15 && source.get(at) == Some(&b'-') {
+            at += 1;
+        }
+    }
+    if braces {
+        if source.get(at) != Some(&b'}') {
             return Err(bad());
         }
-        if nibbles.is_multiple_of(2) {
-            out[nibbles / 2] = d << 4;
-        } else {
-            out[nibbles / 2] |= d;
-        }
-        nibbles += 1;
+        at += 1;
     }
-    if nibbles != 32 {
+    if at != source.len() {
         return Err(bad());
     }
     Ok(out)

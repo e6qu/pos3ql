@@ -36285,6 +36285,135 @@ fn datetime_uuid_bytea_types() {
 }
 
 #[test]
+fn postgresql18_uuid_functions_catalogs_and_input_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET TIME ZONE 'UTC'; \
+         SELECT '{a0eebc999c0b4ef8bb6d6bb9bd380a11}'::uuid, \
+                'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11'::uuid; \
+         SELECT uuid_extract_version(gen_random_uuid()), \
+                uuid_extract_version(uuidv4()), \
+                uuid_extract_version(uuidv7()), \
+                uuidv7() < uuidv7(), \
+                uuid_extract_timestamp(uuidv7(shift => interval '-1 day')) \
+                    < clock_timestamp(); \
+         SELECT uuid_extract_timestamp('018cc251-f400-7abc-8000-000000000000'), \
+                uuid_extract_timestamp('04c296c2-0c98-11f0-8000-000000000000'), \
+                uuid_extract_timestamp('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') IS NULL, \
+                uuid_extract_version('a0eebc99-9c0b-0ef8-bb6d-6bb9bd380a11'), \
+                uuid_extract_version('a0eebc99-9c0b-4ef8-3b6d-6bb9bd380a11') IS NULL",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            "4|4|7|t|t",
+            "2024-01-01 00:00:00+00|2025-03-29 12:19:10.290912+00|t|0|t",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [crate::sql::types::oid::UUID, crate::sql::types::oid::UUID]
+    );
+    let typed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT uuid_extract_timestamp('018cc251-f400-7abc-8000-000000000000'), \
+                uuid_extract_version('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+    );
+    assert_eq!(
+        row_description_type_oids(&typed),
+        [
+            crate::sql::types::oid::TIMESTAMPTZ,
+            crate::sql::types::oid::INT2,
+        ]
+    );
+
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, proname, prorettype, proargtypes, proargnames, \
+                provolatile, proparallel, proisstrict, proleakproof, prosrc \
+           FROM pg_proc \
+          WHERE oid IN (3432, 6428, 6429, 6430, 6342, 6343) ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        [
+            "3432|gen_random_uuid|2950||NULL|v|s|t|f|gen_random_uuid",
+            "6342|uuid_extract_timestamp|1184|2950|NULL|i|s|t|t|uuid_extract_timestamp",
+            "6343|uuid_extract_version|21|2950|NULL|i|s|t|t|uuid_extract_version",
+            "6428|uuidv4|2950||NULL|v|s|t|f|gen_random_uuid",
+            "6429|uuidv7|2950||NULL|v|s|t|f|uuidv7",
+            "6430|uuidv7|2950|1186|{shift}|v|s|t|f|uuidv7_interval",
+        ]
+    );
+
+    for invalid in [
+        "SELECT ' a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 '::uuid",
+        "SELECT 'a-0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
+        "SELECT uuid_extract_version('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::text)",
+        "SELECT uuidv7(bogus => interval '1 day')",
+    ] {
+        let error = run_with(&mut engine, &mut budget, invalid);
+        let rendered = String::from_utf8_lossy(&error);
+        assert!(
+            rendered.contains("22P02") || rendered.contains("42883"),
+            "{invalid}: {rendered}"
+        );
+    }
+
+    let arena = Arena::new(&mut budget, "UUID parameter inference", 1 << 15).unwrap();
+    let transaction = TxnState::new(&mut budget, 64).unwrap();
+    let inferred = engine.infer_param_types(
+        "SELECT uuid_extract_version($1), uuidv7(shift => $2)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(
+        inferred[..2],
+        [
+            crate::sql::types::oid::UUID,
+            crate::sql::types::oid::INTERVAL
+        ]
+    );
+}
+
+#[test]
+fn generated_uuid_defaults_survive_wal_and_checkpoint_recovery() {
+    let config = test_config("uuid-functions-recovery");
+    {
+        let mut budget = Budget::new(1 << 26);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE generated_uuid_values (\
+                 id uuid PRIMARY KEY DEFAULT uuidv7(), \
+                 random_id uuid NOT NULL DEFAULT gen_random_uuid(), \
+                 CHECK (uuid_extract_version(id) = 7), \
+                 CHECK (uuid_extract_version(random_id) = 4)); \
+             INSERT INTO generated_uuid_values DEFAULT VALUES; \
+             CHECKPOINT",
+        );
+    }
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO generated_uuid_values DEFAULT VALUES; \
+         SELECT count(*), min(uuid_extract_version(id)), \
+                max(uuid_extract_version(random_id)), count(DISTINCT id) \
+           FROM generated_uuid_values",
+    );
+    assert_eq!(data_rows(&output), ["2|7|4|2"]);
+}
+
+#[test]
 fn comment_roundtrip_and_removal() {
     let (mut e, mut b) = test_engine();
     run_with(
@@ -55331,6 +55460,32 @@ fn timezone_offset_affects_timestamptz() {
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SET timezone='Mars/Olympus'"))
             .contains("22023")
+    );
+}
+
+#[test]
+fn timestamptz_civil_operations_share_postgresql_dst_resolution() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET timezone='America/New_York'; \
+         SELECT extract(year FROM timestamp with time zone '2024-01-15 12:34:56-05'), \
+                extract(hour FROM timestamp with time zone '2024-01-15 12:34:56-05'), \
+                extract(timezone FROM timestamp with time zone '2024-01-15 12:34:56-05'), \
+                date_part('epoch', timestamp with time zone '2024-01-15 12:34:56-05'); \
+         SELECT timestamp '2024-03-10 02:30' AT TIME ZONE 'America/New_York', \
+                timestamp '2024-11-03 01:30' AT TIME ZONE 'America/New_York', \
+                date_trunc('year', timestamp with time zone '2024-07-15 12:34-04'), \
+                make_timestamptz(2024, 7, 15, 12, 0, 0), \
+                '2024-01-15'::timestamptz",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "2024|12|-18000|1705340096",
+            "2024-03-10 03:30:00-04|2024-11-03 01:30:00-05|2024-01-01 00:00:00-05|2024-07-15 12:00:00-04|2024-01-15 00:00:00-05",
+        ]
     );
 }
 

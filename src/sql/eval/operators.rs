@@ -1261,11 +1261,26 @@ pub(crate) fn arithmetic<'a>(
     // ± interval -> interval. Months add calendar months (day clamped).
     match (operator, l, r) {
         (BinaryOp::Add | BinaryOp::Sub, Datum::Interval(a), Datum::Interval(b)) => {
-            let s: i32 = if operator == BinaryOp::Sub { -1 } else { 1 };
+            let combine_i32 = if operator == BinaryOp::Sub {
+                i32::checked_sub
+            } else {
+                i32::checked_add
+            };
+            let combine_i64 = if operator == BinaryOp::Sub {
+                i64::checked_sub
+            } else {
+                i64::checked_add
+            };
             return Ok(Datum::Interval(Interval {
-                months: a.months + s * b.months,
-                days: a.days + s * b.days,
-                micros: a.micros + s as i64 * b.micros,
+                months: combine_i32(a.months, b.months).ok_or_else(|| {
+                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                })?,
+                days: combine_i32(a.days, b.days).ok_or_else(|| {
+                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                })?,
+                micros: combine_i64(a.micros, b.micros).ok_or_else(|| {
+                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                })?,
             }));
         }
         // `interval * number` / `number * interval` / `interval / number`.
@@ -1302,19 +1317,31 @@ pub(crate) fn arithmetic<'a>(
         ) => {
             let base = match dt {
                 Datum::Timestamp(t) | Datum::Timestamptz(t) => t,
-                Datum::Date(d) => d as i64 * 86_400_000_000,
+                Datum::Date(d) => i64::from(d).checked_mul(86_400_000_000).ok_or_else(|| {
+                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                })?,
                 _ => unreachable!(),
             };
             let signed = if operator == BinaryOp::Sub {
                 Interval {
-                    months: -interval.months,
-                    days: -interval.days,
-                    micros: -interval.micros,
+                    months: interval.months.checked_neg().ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
+                    days: interval.days.checked_neg().ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
+                    micros: interval.micros.checked_neg().ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
                 }
             } else {
                 interval
             };
-            let out = datetime::add_interval(base, signed);
+            let out = match dt {
+                Datum::Timestamptz(_) => datetime::checked_add_timestamptz(base, signed),
+                _ => datetime::checked_add_interval(base, signed),
+            }
+            .ok_or_else(|| sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range"))?;
             // date ± interval yields timestamp in PostgreSQL; timestamptz stays timezone.
             return Ok(match dt {
                 Datum::Timestamptz(_) => Datum::Timestamptz(out),
@@ -1326,31 +1353,52 @@ pub(crate) fn arithmetic<'a>(
         (BinaryOp::Add | BinaryOp::Sub, Datum::Time(t), Datum::Interval(interval))
         | (BinaryOp::Add, Datum::Interval(interval), Datum::Time(t)) => {
             let delta = if operator == BinaryOp::Sub {
-                -interval.micros
+                interval.micros.checked_neg().ok_or_else(|| {
+                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                })?
             } else {
                 interval.micros
             };
-            return Ok(Datum::Time((t + delta).rem_euclid(86_400_000_000)));
+            return Ok(Datum::Time(
+                t.checked_add(delta)
+                    .map(|value| value.rem_euclid(86_400_000_000))
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
+            ));
         }
         (BinaryOp::Add | BinaryOp::Sub, Datum::Timetz(t, zone), Datum::Interval(interval))
         | (BinaryOp::Add, Datum::Interval(interval), Datum::Timetz(t, zone)) => {
             let delta = if operator == BinaryOp::Sub {
-                -interval.micros
+                interval.micros.checked_neg().ok_or_else(|| {
+                    sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                })?
             } else {
                 interval.micros
             };
-            return Ok(Datum::Timetz((t + delta).rem_euclid(86_400_000_000), zone));
+            return Ok(Datum::Timetz(
+                t.checked_add(delta)
+                    .map(|value| value.rem_euclid(86_400_000_000))
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
+                zone,
+            ));
         }
         _ => {}
     }
     match (operator, l, r) {
         (BinaryOp::Sub, Datum::Date(a), Datum::Date(b)) => {
-            return Ok(Datum::Int4(a - b));
+            return Ok(Datum::Int4(a.checked_sub(b).ok_or_else(|| {
+                sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
+            })?));
         }
         // timestamp - timestamp -> interval (days + time, no month folding).
         (BinaryOp::Sub, Datum::Timestamp(a), Datum::Timestamp(b))
         | (BinaryOp::Sub, Datum::Timestamptz(a), Datum::Timestamptz(b)) => {
-            let diff = a - b;
+            let diff = a.checked_sub(b).ok_or_else(|| {
+                sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+            })?;
             return Ok(Datum::Interval(Interval {
                 months: 0,
                 days: (diff / 86_400_000_000) as i32,

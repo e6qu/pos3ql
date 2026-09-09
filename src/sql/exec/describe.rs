@@ -3326,6 +3326,16 @@ pub fn infer_type_res(
             "pg_snapshot_xip" => of(ColType::Xid8),
             "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => of(ColType::Bool),
             "pg_xact_status" | "txid_status" => of(ColType::Text),
+            "gen_random_uuid"
+            | "uuidv4"
+            | "uuidv7"
+            | "pg_catalog.gen_random_uuid"
+            | "pg_catalog.uuidv4"
+            | "pg_catalog.uuidv7" => of(ColType::Uuid),
+            "uuid_extract_timestamp" | "pg_catalog.uuid_extract_timestamp" => {
+                of(ColType::Timestamptz)
+            }
+            "uuid_extract_version" | "pg_catalog.uuid_extract_version" => of(ColType::Int2),
             "to_regclass" => (oid::REGCLASS, 4),
             "pg_event_trigger_table_rewrite_oid" => (oid::OID, 4),
             "pg_my_temp_schema" => (oid::OID, 4),

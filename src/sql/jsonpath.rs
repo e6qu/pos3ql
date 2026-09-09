@@ -2279,21 +2279,26 @@ fn compare_temporal_cross(
                 "cannot compare timestamp values without time zone usage"
             ));
         }
-        let normalize = |kind, value: i64| {
+        let normalize = |kind, value: i64| -> Result<i64, SqlError> {
             let local = if kind == JsonTemporalKind::Date {
-                value * DAY_MICROSECONDS
+                value.checked_mul(DAY_MICROSECONDS).ok_or_else(|| {
+                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                })?
             } else {
                 value
             };
             if needs_timezone && kind != JsonTemporalKind::TimestampTz {
-                let offset = crate::sql::timezone::session().resolve(local).0;
-                local - i64::from(offset) * 1_000_000
+                crate::sql::timezone::session()
+                    .resolve_local(local)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                    })
             } else {
-                local
+                Ok(local)
             }
         };
         return Ok(Some(
-            normalize(left_kind, left).cmp(&normalize(right_kind, right)),
+            normalize(left_kind, left)?.cmp(&normalize(right_kind, right)?),
         ));
     }
     let time_family = |kind| matches!(kind, JsonTemporalKind::Time | JsonTemporalKind::TimeTz);

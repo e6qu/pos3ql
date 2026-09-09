@@ -907,6 +907,26 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "v",
     },
+    intrinsic!(3432, "gen_random_uuid", super::types::oid::UUID, "", 0, "v"),
+    intrinsic!(6428, "uuidv4", super::types::oid::UUID, "", 0, "v"),
+    intrinsic!(6429, "uuidv7", super::types::oid::UUID, "", 0, "v"),
+    intrinsic!(6430, "uuidv7", super::types::oid::UUID, "1186", 1, "v"),
+    intrinsic!(
+        6342,
+        "uuid_extract_timestamp",
+        super::types::oid::TIMESTAMPTZ,
+        "2950",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        6343,
+        "uuid_extract_version",
+        super::types::oid::INT2,
+        "2950",
+        1,
+        "i"
+    ),
     IntrinsicRoutine {
         oid: 2077,
         name: "current_setting",
@@ -14857,10 +14877,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 },
                 Datum::Int4(12),
                 text(
-                    if routine.oid == 89 {
-                        "pgsql_version"
-                    } else {
-                        routine.name
+                    match routine.oid {
+                        89 => "pgsql_version",
+                        6428 => "gen_random_uuid",
+                        6430 => "uuidv7_interval",
+                        _ => routine.name,
                     },
                     arena,
                 )?,
@@ -14868,7 +14889,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bool(intrinsic_routine_is_strict(*routine)),
                 Datum::Bool(matches!(
                     routine.oid,
-                    69 | 1265 | 1292 | 2790 | 2791 | 2792 | 2793 | 2794
+                    69 | 1265 | 1292 | 2790 | 2791 | 2792 | 2793 | 2794 | 6342 | 6343
                 )),
                 Datum::Null,
                 Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
@@ -14915,15 +14936,19 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                     None => Datum::Null,
                 },
-                match record_outputs {
-                    Some((_, output_names)) => Datum::Array {
+                match (routine.oid, record_outputs) {
+                    (6430, _) => Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(&[Datum::Text("shift")], arena)?,
+                    },
+                    (_, Some((_, output_names))) => Datum::Array {
                         element: super::types::ArrElem::Text,
                         raw: super::array::build(
                             &names[..record_input_count + output_names.len()],
                             arena,
                         )?,
                     },
-                    None => Datum::Null,
+                    (_, None) => Datum::Null,
                 },
                 match routine.oid {
                     3577 | 3578 => Datum::Text("false"),

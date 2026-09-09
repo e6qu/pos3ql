@@ -358,9 +358,21 @@ pub(crate) fn dispatch<'a>(
                 match name {
                     "make_date" => Ok(Datum::Date(datetime::make_date(ints[0], ints[1], ints[2])?)),
                     "make_time" => Ok(Datum::Time(datetime::make_time(ints[0], ints[1], sec)?)),
-                    "make_timestamptz" => Ok(Datum::Timestamptz(datetime::make_timestamp(
-                        ints[0], ints[1], ints[2], ints[3], ints[4], sec,
-                    )?)),
+                    "make_timestamptz" => {
+                        let local = datetime::make_timestamp(
+                            ints[0], ints[1], ints[2], ints[3], ints[4], sec,
+                        )?;
+                        Ok(Datum::Timestamptz(
+                            crate::sql::timezone::session()
+                                .resolve_local(local)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATETIME_FIELD_OVERFLOW,
+                                        "timestamp out of range"
+                                    )
+                                })?,
+                        ))
+                    }
                     _ => Ok(Datum::Timestamp(datetime::make_timestamp(
                         ints[0], ints[1], ints[2], ints[3], ints[4], sec,
                     )?)),
@@ -455,14 +467,11 @@ pub(crate) fn dispatch<'a>(
                             utc + i64::from(offset_seconds) * 1_000_000,
                         ))
                     }
-                    Datum::Timestamp(wall_clock) => {
-                        // Resolve the offset at the wall-clock instant (exact away
-                        // from the sub-hour DST transition windows).
-                        let (offset_seconds, _) = zone.resolve(wall_clock);
-                        Ok(Datum::Timestamptz(
-                            wall_clock - i64::from(offset_seconds) * 1_000_000,
-                        ))
-                    }
+                    Datum::Timestamp(wall_clock) => Ok(Datum::Timestamptz(
+                        zone.resolve_local(wall_clock).ok_or_else(|| {
+                            sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                        })?,
+                    )),
                     other => Err(type_mismatch(name, &other)),
                 }
             }
@@ -567,6 +576,7 @@ pub(crate) fn dispatch<'a>(
                 // A time of day has no date, so its date fields read zero and
                 // only the time ones — plus, for timetz, `timezone` — apply.
                 let mut zone_secs: Option<i32> = None;
+                let mut instant_micros: Option<i64> = None;
                 let (days, in_day) = match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Date(d) => (d as i64, 0i64),
@@ -575,8 +585,25 @@ pub(crate) fn dispatch<'a>(
                         zone_secs = Some(zone);
                         (0, t)
                     }
-                    Datum::Timestamp(t) | Datum::Timestamptz(t) => {
+                    Datum::Timestamp(t) => {
                         (t.div_euclid(86_400_000_000), t.rem_euclid(86_400_000_000))
+                    }
+                    Datum::Timestamptz(t) => {
+                        let offset = session_offset(t);
+                        zone_secs = Some(offset);
+                        instant_micros = Some(t);
+                        let local =
+                            t.checked_add(i64::from(offset) * 1_000_000)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATETIME_FIELD_OVERFLOW,
+                                        "timestamp out of range"
+                                    )
+                                })?;
+                        (
+                            local.div_euclid(86_400_000_000),
+                            local.rem_euclid(86_400_000_000),
+                        )
                     }
                     // Interval fields come straight from the (months, days, micros)
                     // components (PostgreSQL's interval2tm), not a calendar date.
@@ -671,7 +698,23 @@ pub(crate) fn dispatch<'a>(
                 let micros_val: i64 = if eq("second") || eq("seconds") {
                     s * 1_000_000 + frac
                 } else if eq("epoch") {
-                    (days * 86_400_000_000 + in_day) + PG_EPOCH_SECS * 1_000_000
+                    let value = match instant_micros {
+                        Some(instant) => instant,
+                        None => days
+                            .checked_mul(86_400_000_000)
+                            .and_then(|date| date.checked_add(in_day))
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                                    "timestamp out of range"
+                                )
+                            })?,
+                    };
+                    value
+                        .checked_add(PG_EPOCH_SECS * 1_000_000)
+                        .ok_or_else(|| {
+                            sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                        })?
                 } else {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -703,10 +746,26 @@ pub(crate) fn dispatch<'a>(
                 let (is_tz, t) = match eval_full(args[1], arena, params, row, hooks)? {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Timestamp(t) => (false, t),
-                    Datum::Timestamptz(t) => (true, t),
+                    Datum::Timestamptz(t) => {
+                        let offset = i64::from(session_offset(t)) * 1_000_000;
+                        (
+                            true,
+                            t.checked_add(offset).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                                    "timestamp out of range"
+                                )
+                            })?,
+                        )
+                    }
                     // A date promotes to timestamptz here, as PostgreSQL
                     // resolves date_trunc(text, date) through that cast.
-                    Datum::Date(d) => (true, d as i64 * 86_400_000_000),
+                    Datum::Date(d) => (
+                        true,
+                        i64::from(d).checked_mul(86_400_000_000).ok_or_else(|| {
+                            sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                        })?,
+                    ),
                     other => return Err(type_mismatch(name, &other)),
                 };
                 use datetime::{PG_EPOCH_DAYS, civil_from_days, day_of_week, days_from_civil};
@@ -744,9 +803,26 @@ pub(crate) fn dispatch<'a>(
                         field
                     ));
                 };
-                let micros = new_days * 86_400_000_000 + sod * 1_000_000;
+                let micros = new_days
+                    .checked_mul(86_400_000_000)
+                    .and_then(|date| {
+                        sod.checked_mul(1_000_000)
+                            .and_then(|time| date.checked_add(time))
+                    })
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                    })?;
                 Ok(if is_tz {
-                    Datum::Timestamptz(micros)
+                    Datum::Timestamptz(
+                        crate::sql::timezone::session()
+                            .resolve_local(micros)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                                    "timestamp out of range"
+                                )
+                            })?,
+                    )
                 } else {
                     Datum::Timestamp(micros)
                 })

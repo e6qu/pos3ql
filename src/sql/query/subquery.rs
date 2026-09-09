@@ -2059,6 +2059,11 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         },
         ColType::PgLsn => Datum::PgLsn(0),
         ColType::Money => Datum::Money(0),
+        ColType::Tid => Datum::Tid(crate::sql::types::Tid {
+            block: 0,
+            offset: 0,
+        }),
+        ColType::Cid => Datum::Cid(0),
         ColType::Regtype => Datum::Regtype {
             referenced_oid: 0,
             name: "-",

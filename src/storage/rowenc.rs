@@ -30,7 +30,8 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Null => 0,
             Datum::Bool(_) => 1,
             Datum::Char(_) => 1,
-            Datum::Int2(_) | Datum::Int4(_) | Datum::Oid(_) | Datum::Date(_) => 4,
+            Datum::Int2(_) | Datum::Int4(_) | Datum::Oid(_) | Datum::Cid(_) | Datum::Date(_) => 4,
+            Datum::Tid(_) => 6,
             // float4 keeps the historical 8-byte float8 layout (see the decode
             // side); the schema narrows it back to f32.
             Datum::Int8(_)
@@ -141,6 +142,15 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             Datum::Oid(x) => {
                 rest[..4].copy_from_slice(&x.to_le_bytes());
                 take = 4;
+            }
+            Datum::Cid(x) => {
+                rest[..4].copy_from_slice(&x.to_le_bytes());
+                take = 4;
+            }
+            Datum::Tid(x) => {
+                rest[..4].copy_from_slice(&x.block.to_le_bytes());
+                rest[4..6].copy_from_slice(&x.offset.to_le_bytes());
+                take = 6;
             }
             Datum::Int2(x) => {
                 rest[..4].copy_from_slice(&(*x as i32).to_le_bytes());
@@ -332,7 +342,13 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
     let fixed = match column {
         ColType::Bool => Some(1),
         ColType::Char => Some(1),
-        ColType::Int2 | ColType::Int4 | ColType::Oid | ColType::Xid | ColType::Date => Some(4),
+        ColType::Int2
+        | ColType::Int4
+        | ColType::Oid
+        | ColType::Xid
+        | ColType::Cid
+        | ColType::Date => Some(4),
+        ColType::Tid => Some(6),
         ColType::Int8
         | ColType::Xid8
         | ColType::PgLsn
@@ -524,6 +540,33 @@ pub(crate) fn decode<'a>(
                     .unwrap();
                 out[i] = Datum::Money(i64::from_le_bytes(raw));
                 at += 8;
+            }
+            ColType::Tid => {
+                let block = u32::from_le_bytes(
+                    bytes
+                        .get(at..at + 4)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                );
+                let offset = u16::from_le_bytes(
+                    bytes
+                        .get(at + 4..at + 6)
+                        .ok_or_else(corrupt)?
+                        .try_into()
+                        .unwrap(),
+                );
+                out[i] = Datum::Tid(crate::sql::types::Tid { block, offset });
+                at += 6;
+            }
+            ColType::Cid => {
+                let raw: [u8; 4] = bytes
+                    .get(at..at + 4)
+                    .ok_or_else(corrupt)?
+                    .try_into()
+                    .unwrap();
+                out[i] = Datum::Cid(u32::from_le_bytes(raw));
+                at += 4;
             }
             snapshot_type @ (ColType::PgSnapshot | ColType::TxidSnapshot) => {
                 let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;

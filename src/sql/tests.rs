@@ -2987,6 +2987,74 @@ fn transaction_identity_types_functions_catalogs_and_storage_match_postgresql() 
 }
 
 #[test]
+fn tuple_and_command_identity_types_are_typed_storable_and_indexable() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE low_level_identities (
+             id integer PRIMARY KEY,
+             tuple_id tid UNIQUE,
+             command_id cid NOT NULL,
+             tuple_ids tid[] NOT NULL,
+             command_ids cid[] NOT NULL,
+             default_tuple tid DEFAULT '(9,7)'::tid,
+             default_command cid DEFAULT '42'::cid
+         );
+         INSERT INTO low_level_identities VALUES
+           (1, '(0,1)', '0', ARRAY['(0,1)'::tid, NULL, '(4,2)'::tid],
+            ARRAY['0'::cid, NULL, '4294967295'::cid], DEFAULT, DEFAULT),
+           (2, '(4294967295,65535)', '4294967295', ARRAY[]::tid[],
+            ARRAY[]::cid[], DEFAULT, DEFAULT);
+         SELECT id, tuple_id, command_id, tuple_ids::text, command_ids::text,
+                default_tuple, default_command, pg_typeof(tuple_id),
+                pg_typeof(command_id), pg_typeof(tuple_ids), pg_typeof(command_ids)
+           FROM low_level_identities ORDER BY tuple_id;
+         SELECT min(tuple_id), max(tuple_id),
+                '(0,1)'::tid < '(4,2)'::tid,
+                '(4,2)'::tid = tidin('(4,2)'),
+                bttidcmp('(4,2)'::tid, '(4,3)'::tid),
+                tidlarger('(1,2)'::tid, '(1,3)'::tid),
+                tidsmaller('(1,2)'::tid, '(1,3)'::tid),
+                cideq('42'::cid, cidin('42'))
+           FROM low_level_identities;
+         SELECT id FROM low_level_identities WHERE tuple_id >= '(0,1)'::tid ORDER BY tuple_id",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1|(0,1)|0|{\"(0,1)\",NULL,\"(4,2)\"}|{0,NULL,4294967295}|(9,7)|42|tid|cid|tid[]|cid[]",
+            "2|(4294967295,65535)|4294967295|{}|{}|(9,7)|42|tid|cid|tid[]|cid[]",
+            "(0,1)|(4294967295,65535)|t|t|-1|(1,3)|(1,2)|t",
+            "1",
+            "2",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    for unsupported in [
+        "SELECT '1'::cid <> '2'::cid",
+        "SELECT '1'::cid < '2'::cid",
+        "SELECT min(command_id) FROM low_level_identities",
+        "SELECT command_id FROM low_level_identities ORDER BY command_id",
+        "SELECT ARRAY['1'::cid] < ARRAY['2'::cid]",
+    ] {
+        let response = run_with(&mut engine, &mut budget, unsupported);
+        assert!(
+            String::from_utf8_lossy(&response).contains("42883"),
+            "{unsupported}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+}
+
+#[test]
 fn prepared_transaction_identity_is_in_progress_until_resolution() {
     let mut config = test_config("prepared-transaction-status");
     config.max_prepared_transactions = 1;
@@ -9211,6 +9279,93 @@ fn money_survives_checkpoint_wal_and_object_cold_recovery() {
             "2|-$12.34|{}",
             "$1,222.23|-$12.34|$1,234.57",
             "money WAL tail",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn tuple_and_command_identities_survive_checkpoint_wal_and_object_cold_recovery() {
+    let mut config = test_config("tuple-command-identity-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!(
+        "tuple-command-identity-cold-recovery-{}",
+        std::process::id()
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_low_level_identities (
+             id integer PRIMARY KEY,
+             tuple_id tid NOT NULL UNIQUE DEFAULT '(8,9)'::tid,
+             command_id cid NOT NULL DEFAULT '10'::cid,
+             tuple_ids tid[] NOT NULL,
+             command_ids cid[] NOT NULL
+         );
+         INSERT INTO durable_low_level_identities VALUES
+             (1, '(1,2)', '3', ARRAY['(1,2)'::tid, '(4,5)'::tid],
+              ARRAY['3'::cid, '6'::cid]);
+         CREATE VIEW durable_low_level_identity_extrema AS
+             SELECT min(tuple_id) AS smallest, max(tuple_id) AS largest
+             FROM durable_low_level_identities",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let tail = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE durable_low_level_identities
+            SET tuple_id = '(2,3)', command_id = '4',
+                tuple_ids = ARRAY['(2,3)'::tid, '(5,6)'::tid],
+                command_ids = ARRAY['4'::cid, '7'::cid]
+          WHERE id = 1;
+         INSERT INTO durable_low_level_identities
+              (id, tuple_ids, command_ids)
+         VALUES (2, ARRAY[]::tid[], ARRAY[]::cid[]);
+         COMMENT ON TABLE durable_low_level_identities IS 'identity WAL tail'",
+    );
+    assert!(
+        !message_types(&tail).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&tail)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id, tuple_id, command_id, tuple_ids::text, command_ids::text
+           FROM durable_low_level_identities ORDER BY tuple_id;
+         SELECT smallest, largest FROM durable_low_level_identity_extrema;
+         SELECT obj_description('durable_low_level_identities'::regclass, 'pg_class')",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "1|(2,3)|4|{\"(2,3)\",\"(5,6)\"}|{4,7}",
+            "2|(8,9)|10|{}|{}",
+            "(2,3)|(8,9)",
+            "identity WAL tail",
         ],
         "{}",
         String::from_utf8_lossy(&recovered)

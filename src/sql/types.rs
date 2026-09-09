@@ -40,10 +40,14 @@ pub mod oid {
     pub const PG_STATISTIC_ROW: i32 = 10029;
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
+    pub const TID: i32 = 27;
+    pub const TID_ARRAY: i32 = 1010;
     pub const XID: i32 = 28;
     pub const XID_ARRAY: i32 = 1011;
     pub const XID8: i32 = 5069;
     pub const XID8_ARRAY: i32 = 271;
+    pub const CID: i32 = 29;
+    pub const CID_ARRAY: i32 = 1012;
     pub const TXID_SNAPSHOT: i32 = 2970;
     pub const TXID_SNAPSHOT_ARRAY: i32 = 2949;
     pub const PG_SNAPSHOT: i32 = 5038;
@@ -171,6 +175,21 @@ pub mod oid {
     }
     pub fn composite_array_oid(slot: u16) -> i32 {
         FIRST_COMPOSITE_ARRAY + slot as i32
+    }
+}
+
+/// PostgreSQL's six-byte tuple identifier: an unsigned block number followed
+/// by an unsigned item offset. Keeping the widths in the value makes malformed
+/// text, wire, and durable states unrepresentable after their parse boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Tid {
+    pub block: u32,
+    pub offset: u16,
+}
+
+impl fmt::Display for Tid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({},{})", self.block, self.offset)
     }
 }
 
@@ -347,6 +366,10 @@ pub enum ColType {
     PgLsn,
     /// PostgreSQL `money`, stored as an exact signed count of cents.
     Money,
+    /// PostgreSQL tuple physical-location value (`tid`, OID 27).
+    Tid,
+    /// PostgreSQL command identity (`cid`, OID 29).
+    Cid,
     /// `regtype`: a catalog type reference with OID storage and catalog-name
     /// text output, not ordinary text.
     Regtype,
@@ -495,6 +518,7 @@ pub enum BtreeOperatorClass {
     PgLsn,
     Xid8,
     Money,
+    Tid,
 }
 
 impl BtreeOperatorClass {
@@ -529,6 +553,8 @@ impl BtreeOperatorClass {
             Text | Varchar => Self::Text,
             PgLsn => Self::PgLsn,
             Money => Self::Money,
+            Tid => Self::Tid,
+            Cid => return None,
             Char | Geometry(_) | PgSnapshot | TxidSnapshot => return None,
             Time => Self::Time,
             Timestamp => Self::Timestamp,
@@ -580,6 +606,7 @@ impl BtreeOperatorClass {
             "pg_lsn_ops" => Self::PgLsn,
             "xid8_ops" => Self::Xid8,
             "money_ops" => Self::Money,
+            "tid_ops" => Self::Tid,
             "uuid_ops" => Self::Uuid,
             "varbit_ops" => Self::Varbit,
             _ => return None,
@@ -623,6 +650,7 @@ impl BtreeOperatorClass {
             33 => Self::PgLsn,
             34 => Self::Xid8,
             35 => Self::Money,
+            36 => Self::Tid,
             _ => return None,
         })
     }
@@ -666,6 +694,7 @@ impl BtreeOperatorClass {
             Self::PgLsn => "pg_lsn_ops",
             Self::Xid8 => "xid8_ops",
             Self::Money => "money_ops",
+            Self::Tid => "tid_ops",
             Self::Uuid => "uuid_ops",
             Self::Varbit => "varbit_ops",
         }
@@ -706,6 +735,7 @@ impl BtreeOperatorClass {
             Self::PgLsn => 10067,
             Self::Xid8 => 10053,
             Self::Money => 10047,
+            Self::Tid => 10050,
             Self::Uuid => 10065,
             Self::Varbit => 10043,
         }
@@ -807,6 +837,8 @@ impl ColType {
             "txid_snapshot" => Self::TxidSnapshot,
             "pg_lsn" => Self::PgLsn,
             "money" => Self::Money,
+            "tid" => Self::Tid,
+            "cid" => Self::Cid,
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
             "date" => Self::Date,
@@ -857,6 +889,8 @@ impl ColType {
             Self::TxidSnapshot => oid::TXID_SNAPSHOT,
             Self::PgLsn => oid::PG_LSN,
             Self::Money => oid::MONEY,
+            Self::Tid => oid::TID,
+            Self::Cid => oid::CID,
             Self::Regtype => oid::REGTYPE,
             Self::Regproc => oid::REGPROC,
             Self::Regprocedure => oid::REGPROCEDURE,
@@ -931,6 +965,8 @@ impl ColType {
             oid::TXID_SNAPSHOT => Some(Self::TxidSnapshot),
             oid::PG_LSN => Some(Self::PgLsn),
             oid::MONEY => Some(Self::Money),
+            oid::TID => Some(Self::Tid),
+            oid::CID => Some(Self::Cid),
             oid::REGPROC => Some(Self::Regproc),
             oid::REGPROCEDURE => Some(Self::Regprocedure),
             oid::REGOPER => Some(Self::Regoper),
@@ -1039,6 +1075,7 @@ impl ColType {
             Self::PgDdlCommand => 8,
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
+            Self::Tid => 6,
             Self::Int2Vector
             | Self::OidVector
             | Self::PgNodeTree
@@ -1049,6 +1086,7 @@ impl ColType {
             Self::Int4
             | Self::Oid
             | Self::Xid
+            | Self::Cid
             | Self::Regtype
             | Self::Regproc
             | Self::Regprocedure
@@ -1115,6 +1153,7 @@ impl ColType {
             Self::Oid | Self::Xid => Self::Int4,
             Self::Xid8 => self,
             Self::Money => self,
+            Self::Tid | Self::Cid => self,
             Self::PgSnapshot | Self::TxidSnapshot => self,
             Self::Geometry(_) => self,
             Self::Regtype
@@ -1154,6 +1193,8 @@ impl ColType {
             Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
             Self::Money => "money",
+            Self::Tid => "tid",
+            Self::Cid => "cid",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -1236,6 +1277,8 @@ impl ColType {
             Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
             Self::Money => "money",
+            Self::Tid => "tid",
+            Self::Cid => "cid",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -1305,6 +1348,8 @@ impl ColType {
             Self::TxidSnapshot => 237,
             Self::PgLsn => 79,
             Self::Money => 238,
+            Self::Tid => 242,
+            Self::Cid => 243,
             Self::Regtype => 58,
             Self::Regproc => 59,
             Self::Regprocedure => 60,
@@ -1384,6 +1429,7 @@ impl ColType {
             1 => Self::Bool,
             57 => Self::Void,
             73 => Self::Internal,
+            75 => Self::PgDdlCommand,
             74 => Self::Char,
             2 => Self::Int4,
             56 => Self::Oid,
@@ -1393,6 +1439,8 @@ impl ColType {
             237 => Self::TxidSnapshot,
             79 => Self::PgLsn,
             238 => Self::Money,
+            242 => Self::Tid,
+            243 => Self::Cid,
             58 => Self::Regtype,
             59 => Self::Regproc,
             60 => Self::Regprocedure,
@@ -1415,6 +1463,7 @@ impl ColType {
             12 => Self::Int2,
             55 => Self::Int2Vector,
             68 => Self::OidVector,
+            67 => Self::PgNodeTree,
             69 => Self::PgNdistinct,
             70 => Self::PgDependencies,
             71 => Self::PgMcvList,
@@ -1473,6 +1522,8 @@ pub enum ArrElem {
     Int4,
     Oid,
     Xid,
+    Tid,
+    Cid,
     Xid8,
     PgSnapshot,
     TxidSnapshot,
@@ -1559,13 +1610,15 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 69] = [
+    pub const BUILTIN: [Self; 71] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
         Self::Int4,
         Self::Oid,
         Self::Xid,
+        Self::Tid,
+        Self::Cid,
         Self::Xid8,
         Self::PgSnapshot,
         Self::TxidSnapshot,
@@ -1665,6 +1718,8 @@ impl ArrElem {
             ArrElem::Int4 => "_int4",
             ArrElem::Oid => "_oid",
             ArrElem::Xid => "_xid",
+            ArrElem::Tid => "_tid",
+            ArrElem::Cid => "_cid",
             ArrElem::Xid8 => "_xid8",
             ArrElem::PgSnapshot => "_pg_snapshot",
             ArrElem::TxidSnapshot => "_txid_snapshot",
@@ -1752,6 +1807,8 @@ impl ArrElem {
             ArrElem::Int4 => "integer[]",
             ArrElem::Oid => "oid[]",
             ArrElem::Xid => "xid[]",
+            ArrElem::Tid => "tid[]",
+            ArrElem::Cid => "cid[]",
             ArrElem::Xid8 => "xid8[]",
             ArrElem::PgSnapshot => "pg_snapshot[]",
             ArrElem::TxidSnapshot => "txid_snapshot[]",
@@ -1845,6 +1902,8 @@ impl ArrElem {
             Datum::Int2(_) => ArrElem::Int2,
             Datum::Int4(_) => ArrElem::Int4,
             Datum::Oid(_) => ArrElem::Oid,
+            Datum::Tid(_) => ArrElem::Tid,
+            Datum::Cid(_) => ArrElem::Cid,
             Datum::Xid8(_) => ArrElem::Xid8,
             Datum::Snapshot { legacy: false, .. } => ArrElem::PgSnapshot,
             Datum::Snapshot { legacy: true, .. } => ArrElem::TxidSnapshot,
@@ -1913,6 +1972,8 @@ impl ArrElem {
             ColType::Name => return Some(ArrElem::Name),
             ColType::Oid => return Some(ArrElem::Oid),
             ColType::Xid => return Some(ArrElem::Xid),
+            ColType::Tid => return Some(ArrElem::Tid),
+            ColType::Cid => return Some(ArrElem::Cid),
             ColType::Xid8 => return Some(ArrElem::Xid8),
             ColType::PgSnapshot => return Some(ArrElem::PgSnapshot),
             ColType::TxidSnapshot => return Some(ArrElem::TxidSnapshot),
@@ -1981,6 +2042,8 @@ impl ArrElem {
             ArrElem::Int4 => ColType::Int4,
             ArrElem::Oid => ColType::Oid,
             ArrElem::Xid => ColType::Xid,
+            ArrElem::Tid => ColType::Tid,
+            ArrElem::Cid => ColType::Cid,
             ArrElem::Xid8 => ColType::Xid8,
             ArrElem::PgSnapshot => ColType::PgSnapshot,
             ArrElem::TxidSnapshot => ColType::TxidSnapshot,
@@ -2056,6 +2119,8 @@ impl ArrElem {
             ArrElem::Int4 => 1007,
             ArrElem::Oid => oid::OID_ARRAY,
             ArrElem::Xid => oid::XID_ARRAY,
+            ArrElem::Tid => oid::TID_ARRAY,
+            ArrElem::Cid => oid::CID_ARRAY,
             ArrElem::Xid8 => oid::XID8_ARRAY,
             ArrElem::PgSnapshot => oid::PG_SNAPSHOT_ARRAY,
             ArrElem::TxidSnapshot => oid::TXID_SNAPSHOT_ARRAY,
@@ -2130,6 +2195,8 @@ impl ArrElem {
             ArrElem::Int4 => 1,
             ArrElem::Oid => 63,
             ArrElem::Xid => 151,
+            ArrElem::Tid => 160,
+            ArrElem::Cid => 161,
             ArrElem::Xid8 => 152,
             ArrElem::PgSnapshot => 153,
             ArrElem::TxidSnapshot => 154,
@@ -2198,6 +2265,8 @@ impl ArrElem {
             1 => ArrElem::Int4,
             63 => ArrElem::Oid,
             151 => ArrElem::Xid,
+            160 => ArrElem::Tid,
+            161 => ArrElem::Cid,
             152 => ArrElem::Xid8,
             153 => ArrElem::PgSnapshot,
             154 => ArrElem::TxidSnapshot,
@@ -2774,6 +2843,10 @@ pub enum Datum<'a> {
     /// PostgreSQL's unsigned object identifier. This is distinct from int4:
     /// its upper half is valid and must not be rendered or ordered as negative.
     Oid(u32),
+    /// PostgreSQL tuple physical location (`tid`).
+    Tid(Tid),
+    /// PostgreSQL command identifier (`cid`).
+    Cid(u32),
     /// Epoch-qualified transaction identity (`xid8`).
     Xid8(u64),
     /// Canonical PostgreSQL transaction snapshot binary payload. `legacy`
@@ -2951,6 +3024,8 @@ impl<'a> Datum<'a> {
             Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
             Datum::Oid(_) => oid::OID,
+            Datum::Tid(_) => oid::TID,
+            Datum::Cid(_) => oid::CID,
             Datum::Xid8(_) => oid::XID8,
             Datum::Snapshot { legacy: false, .. } => oid::PG_SNAPSHOT,
             Datum::Snapshot { legacy: true, .. } => oid::TXID_SNAPSHOT,
@@ -3128,6 +3203,8 @@ impl fmt::Display for Datum<'_> {
             Datum::Int2(v) => write!(f, "{v}"),
             Datum::Int4(v) => write!(f, "{v}"),
             Datum::Oid(v) => write!(f, "{v}"),
+            Datum::Tid(v) => write!(f, "{v}"),
+            Datum::Cid(v) => write!(f, "{v}"),
             Datum::Xid8(v) => write!(f, "{v}"),
             Datum::Snapshot { value, .. } => write!(f, "{value}"),
             Datum::PgLsn(v) => write!(f, "{:X}/{:X}", v >> 32, v & u64::from(u32::MAX)),
@@ -3548,6 +3625,15 @@ mod tests {
         assert_eq!(Datum::Bool(false).to_string(), "f");
         assert_eq!(Datum::Int8(-42).to_string(), "-42");
         assert_eq!(Datum::Oid(u32::MAX).to_string(), "4294967295");
+        assert_eq!(
+            Datum::Tid(Tid {
+                block: 7,
+                offset: 9
+            })
+            .to_string(),
+            "(7,9)"
+        );
+        assert_eq!(Datum::Cid(u32::MAX).to_string(), "4294967295");
         assert_eq!(Datum::Float8(2.5).to_string(), "2.5");
         assert_eq!(Datum::Float8(f64::INFINITY).to_string(), "Infinity");
         assert_eq!(Datum::Text("hi").to_string(), "hi");
@@ -3588,6 +3674,11 @@ mod tests {
         assert_eq!(ColType::from_sql_name("pg_lsn"), Some(ColType::PgLsn));
         assert_eq!(ColType::PgLsn.oid(), oid::PG_LSN);
         assert_eq!(ColType::PgLsn.typlen(), 8);
+        assert_eq!(ColType::from_sql_name("tid"), Some(ColType::Tid));
+        assert_eq!(ColType::Tid.oid(), oid::TID);
+        assert_eq!(ColType::Tid.typlen(), 6);
+        assert_eq!(ColType::from_sql_name("cid"), Some(ColType::Cid));
+        assert_eq!(ColType::Cid.oid(), oid::CID);
         assert_eq!(ColType::from_sql_name("float8"), Some(ColType::Float8));
         assert_eq!(ColType::from_sql_name("record"), Some(ColType::Record));
         assert_eq!(ColType::from_sql_name("geometry"), None);
@@ -3630,6 +3721,7 @@ mod tests {
             (ColType::TsQuery, BtreeOperatorClass::TsQuery),
             (ColType::TsVector, BtreeOperatorClass::TsVector),
             (ColType::PgLsn, BtreeOperatorClass::PgLsn),
+            (ColType::Tid, BtreeOperatorClass::Tid),
             (ColType::Uuid, BtreeOperatorClass::Uuid),
             (ColType::Bit { varying: true }, BtreeOperatorClass::Varbit),
         ];
@@ -3675,6 +3767,8 @@ mod tests {
             ColType::TxidSnapshot,
             ColType::PgLsn,
             ColType::Money,
+            ColType::Tid,
+            ColType::Cid,
             ColType::Regtype,
             ColType::Regproc,
             ColType::Regprocedure,
@@ -3754,12 +3848,27 @@ mod code_roundtrip_tests {
         let mut types = vec![
             ColType::Void,
             ColType::Internal,
+            ColType::PgDdlCommand,
+            ColType::Char,
             ColType::Bool,
             ColType::Int2,
             ColType::Int2Vector,
             ColType::OidVector,
+            ColType::PgNodeTree,
+            ColType::PgNdistinct,
+            ColType::PgDependencies,
+            ColType::PgMcvList,
+            ColType::PgStatisticArray,
             ColType::Int4,
             ColType::Oid,
+            ColType::Xid,
+            ColType::Xid8,
+            ColType::PgSnapshot,
+            ColType::TxidSnapshot,
+            ColType::PgLsn,
+            ColType::Money,
+            ColType::Tid,
+            ColType::Cid,
             ColType::Regtype,
             ColType::Regproc,
             ColType::Regprocedure,
@@ -3768,6 +3877,8 @@ mod code_roundtrip_tests {
             ColType::Regclass,
             ColType::Regnamespace,
             ColType::Regrole,
+            ColType::Regconfig,
+            ColType::Regdictionary,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
@@ -3782,7 +3893,11 @@ mod code_roundtrip_tests {
             ColType::Timetz,
             ColType::Interval,
             ColType::Json,
+            ColType::Xml,
             ColType::Jsonb,
+            ColType::Jsonpath,
+            ColType::TsVector,
+            ColType::TsQuery,
             ColType::Uuid,
             ColType::Bytea,
             ColType::Numeric,
@@ -3826,7 +3941,13 @@ mod code_roundtrip_tests {
         // else would decode old data as itself instead of failing.
         for t in &types {
             let c = t.code();
-            let held_them_before = matches!(t, ColType::Range(_) | ColType::Bit { .. });
+            let held_them_before = matches!(
+                t,
+                ColType::Range(_)
+                    | ColType::Bit { .. }
+                    | ColType::Regconfig
+                    | ColType::Regdictionary
+            );
             assert!(
                 held_them_before || !(20..=40).contains(&c),
                 "{t:?} takes retired code {c}, which old data may still carry"

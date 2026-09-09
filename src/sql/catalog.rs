@@ -1608,6 +1608,44 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     ),
     intrinsic!(3823, "numeric", super::types::oid::NUMERIC, "790", 1, "s"),
     intrinsic!(3824, "money", super::types::oid::MONEY, "1700", 1, "s"),
+    intrinsic!(48, "tidin", super::types::oid::TID, "2275", 1, "i"),
+    intrinsic!(49, "tidout", 2275, "27", 1, "i"),
+    intrinsic!(52, "cidin", super::types::oid::CID, "2275", 1, "i"),
+    intrinsic!(53, "cidout", 2275, "29", 1, "i"),
+    intrinsic!(69, "cideq", super::types::oid::BOOL, "29 29", 2, "i"),
+    intrinsic!(1265, "tidne", super::types::oid::BOOL, "27 27", 2, "i"),
+    intrinsic!(1292, "tideq", super::types::oid::BOOL, "27 27", 2, "i"),
+    intrinsic!(2233, "hashtid", super::types::oid::INT4, "27", 1, "i"),
+    intrinsic!(
+        2234,
+        "hashtidextended",
+        super::types::oid::INT8,
+        "27 20",
+        2,
+        "i"
+    ),
+    intrinsic!(2438, "tidrecv", super::types::oid::TID, "2281", 1, "i"),
+    intrinsic!(2439, "tidsend", super::types::oid::BYTEA, "27", 1, "i"),
+    intrinsic!(2442, "cidrecv", super::types::oid::CID, "2281", 1, "i"),
+    intrinsic!(2443, "cidsend", super::types::oid::BYTEA, "29", 1, "i"),
+    intrinsic!(2790, "tidgt", super::types::oid::BOOL, "27 27", 2, "i"),
+    intrinsic!(2791, "tidlt", super::types::oid::BOOL, "27 27", 2, "i"),
+    intrinsic!(2792, "tidge", super::types::oid::BOOL, "27 27", 2, "i"),
+    intrinsic!(2793, "tidle", super::types::oid::BOOL, "27 27", 2, "i"),
+    intrinsic!(2794, "bttidcmp", super::types::oid::INT4, "27 27", 2, "i"),
+    intrinsic!(2795, "tidlarger", super::types::oid::TID, "27 27", 2, "i"),
+    intrinsic!(2796, "tidsmaller", super::types::oid::TID, "27 27", 2, "i"),
+    intrinsic!(2797, "max", super::types::oid::TID, "27", 1, "i"),
+    intrinsic!(2798, "min", super::types::oid::TID, "27", 1, "i"),
+    intrinsic!(6423, "hashcid", super::types::oid::INT4, "29", 1, "i"),
+    intrinsic!(
+        6424,
+        "hashcidextended",
+        super::types::oid::INT8,
+        "29 20",
+        2,
+        "i"
+    ),
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -1646,6 +1684,8 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 2112
             | 2125
             | 2141
+            | 2797
+            | 2798
     )
 }
 
@@ -1799,6 +1839,111 @@ macro_rules! catalog_comparison_operator {
 }
 
 const CATALOG_OPERATORS: &[CatalogOperator] = &[
+    catalog_comparison_operator!(
+        385,
+        "=",
+        ColType::Cid,
+        69,
+        "cideq",
+        385,
+        0,
+        false,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        387,
+        "=",
+        ColType::Tid,
+        1292,
+        "tideq",
+        387,
+        402,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        402,
+        "<>",
+        ColType::Tid,
+        1265,
+        "tidne",
+        402,
+        387,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        2799,
+        "<",
+        ColType::Tid,
+        2791,
+        "tidlt",
+        2800,
+        2802,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        2800,
+        ">",
+        ColType::Tid,
+        2790,
+        "tidgt",
+        2799,
+        2801,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        2801,
+        "<=",
+        ColType::Tid,
+        2793,
+        "tidle",
+        2802,
+        2800,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        2802,
+        ">=",
+        ColType::Tid,
+        2792,
+        "tidge",
+        2801,
+        2799,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
     catalog_comparison_operator!(
         900,
         "=",
@@ -2321,6 +2466,12 @@ const XID8_BTREE_OPERATOR_CLASS_OID: i32 = 10053;
 const XID8_CMP_OID: i32 = 5096;
 const MONEY_BTREE_OPERATOR_FAMILY_OID: i32 = 2099;
 const MONEY_BTREE_OPERATOR_CLASS_OID: i32 = 10047;
+const TID_BTREE_OPERATOR_FAMILY_OID: i32 = 2789;
+const TID_BTREE_OPERATOR_CLASS_OID: i32 = 10050;
+const CID_HASH_OPERATOR_FAMILY_OID: i32 = 2226;
+const CID_HASH_OPERATOR_CLASS_OID: i32 = 10054;
+const TID_HASH_OPERATOR_FAMILY_OID: i32 = 2227;
+const TID_HASH_OPERATOR_CLASS_OID: i32 = 10055;
 const MONEY_CMP_OID: i32 = 377;
 const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
@@ -13541,7 +13692,27 @@ fn pg_opfamily<'a>(
         ],
         arena,
     )?;
-    let mut count = 2usize;
+    for (index, (oid, method, name)) in [
+        (TID_BTREE_OPERATOR_FAMILY_OID, 403, "tid_ops"),
+        (CID_HASH_OPERATOR_FAMILY_OID, 405, "cid_ops"),
+        (TID_HASH_OPERATOR_FAMILY_OID, 405, "tid_ops"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 2] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 5usize;
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -13613,7 +13784,49 @@ fn pg_opclass<'a>(
         ],
         arena,
     )?;
-    let mut count = 2usize;
+    for (index, (oid, method, name, family, input)) in [
+        (
+            TID_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "tid_ops",
+            TID_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::TID,
+        ),
+        (
+            CID_HASH_OPERATOR_CLASS_OID,
+            405,
+            "cid_ops",
+            CID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::CID,
+        ),
+        (
+            TID_HASH_OPERATOR_CLASS_OID,
+            405,
+            "tid_ops",
+            TID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::TID,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 2] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Bool(true),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 5usize;
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -13683,6 +13896,13 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         (10228, 4, 905),
         (10229, 5, 903),
     ];
+    const TID_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
+        (10055, 1, 2799),
+        (10056, 2, 2801),
+        (10057, 3, 387),
+        (10058, 4, 2802),
+        (10059, 5, 2800),
+    ];
     let mut count = 0usize;
     for (oid, strategy, operator) in XID8_BTREE_OPERATORS {
         rows[count] = row(
@@ -13714,6 +13934,55 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar("s"),
                 Datum::Int4(operator),
                 Datum::Int4(403),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, strategy, operator) in TID_BTREE_OPERATORS {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(TID_BTREE_OPERATOR_FAMILY_OID),
+                Datum::Int4(super::types::oid::TID),
+                Datum::Int4(super::types::oid::TID),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(403),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, family, input, operator) in [
+        (
+            10290,
+            CID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::CID,
+            385,
+        ),
+        (
+            10291,
+            TID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::TID,
+            387,
+        ),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(1),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(405),
                 Datum::Int4(0),
             ],
             arena,
@@ -13820,7 +14089,73 @@ fn pg_amproc<'a>(
         ],
         arena,
     )?;
-    let mut count = 4usize;
+    for (index, (oid, family, input, number, procedure, name)) in [
+        (
+            10110,
+            TID_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::TID,
+            1,
+            2794,
+            "bttidcmp",
+        ),
+        (
+            10111,
+            TID_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::TID,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10182,
+            CID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::CID,
+            1,
+            6423,
+            "hashcid",
+        ),
+        (
+            10183,
+            CID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::CID,
+            2,
+            6424,
+            "hashcidextended",
+        ),
+        (
+            10184,
+            TID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::TID,
+            1,
+            2233,
+            "hashtid",
+        ),
+        (
+            10185,
+            TID_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::TID,
+            2,
+            2234,
+            "hashtidextended",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 4] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 10usize;
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .functions
@@ -14503,11 +14838,13 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(routine.argument_count),
                 Datum::Int4(routine.result_oid),
                 Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
-                Datum::Bpchar(if matches!(routine.oid, 2901 | 2112 | 2125 | 2141) {
-                    "a"
-                } else {
-                    "f"
-                }),
+                Datum::Bpchar(
+                    if matches!(routine.oid, 2901 | 2112 | 2125 | 2141 | 2797 | 2798) {
+                        "a"
+                    } else {
+                        "f"
+                    },
+                ),
                 oidvector(&argument_oids[..argument_count], arena)?,
                 Datum::Bpchar(routine.volatility),
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
@@ -14529,7 +14866,10 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )?,
                 Datum::Null,
                 Datum::Bool(intrinsic_routine_is_strict(*routine)),
-                Datum::Bool(false),
+                Datum::Bool(matches!(
+                    routine.oid,
+                    69 | 1265 | 1292 | 2790 | 2791 | 2792 | 2793 | 2794
+                )),
                 Datum::Null,
                 Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
                 Datum::Float8(match routine.oid {
@@ -14916,7 +15256,7 @@ fn pg_aggregate<'a>(
             ("aggminitval", ColType::Text),
         ],
     );
-    let count = 4
+    let count = 6
         + (0..storage.routine_count())
             .filter(|slot| {
                 storage.routine_slot_visible_to(*slot, txid)
@@ -15010,7 +15350,40 @@ fn pg_aggregate<'a>(
             arena,
         )?;
     }
-    let mut index = 4usize;
+    for (index, (aggregate_oid, transition_oid, sort_operator_oid)) in
+        [(2797, 2795, 2800), (2798, 2796, 2799)]
+            .into_iter()
+            .enumerate()
+    {
+        rows[index + 4] = row(
+            &[
+                regproc(aggregate_oid)?,
+                Datum::Bpchar("n"),
+                Datum::Int2(0),
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bpchar("r"),
+                Datum::Bpchar("r"),
+                Datum::Int4(sort_operator_oid),
+                Datum::Int4(super::types::oid::TID),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    let mut index = 6usize;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {
@@ -15598,6 +15971,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::TxidSnapshot,
         ColType::PgLsn,
         ColType::Money,
+        ColType::Tid,
+        ColType::Cid,
         ColType::Regtype,
         ColType::Regproc,
         ColType::Regprocedure,
@@ -15672,6 +16047,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Interval => "T",
         ColType::Xid
         | ColType::Xid8
+        | ColType::Tid
+        | ColType::Cid
         | ColType::PgSnapshot
         | ColType::TxidSnapshot
         | ColType::PgLsn
@@ -15717,8 +16094,24 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1), // typtypmod
                 Datum::Bool(false),
                 Datum::Null, // typdefault
-                text(if *t == ColType::Money { "cash_in" } else { "" }, arena)?,
-                text(if *t == ColType::Money { "cash_out" } else { "" }, arena)?,
+                text(
+                    match t {
+                        ColType::Money => "cash_in",
+                        ColType::Tid => "tidin",
+                        ColType::Cid => "cidin",
+                        _ => "",
+                    },
+                    arena,
+                )?,
+                text(
+                    match t {
+                        ColType::Money => "cash_out",
+                        ColType::Tid => "tidout",
+                        ColType::Cid => "cidout",
+                        _ => "",
+                    },
+                    arena,
+                )?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),
@@ -15935,22 +16328,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text(
-                    if element == super::types::ArrElem::Money {
-                        "array_in"
-                    } else {
-                        ""
-                    },
-                    arena,
-                )?,
-                text(
-                    if element == super::types::ArrElem::Money {
-                        "array_out"
-                    } else {
-                        ""
-                    },
-                    arena,
-                )?,
+                text("array_in", arena)?,
+                text("array_out", arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),

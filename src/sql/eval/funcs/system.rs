@@ -1810,6 +1810,8 @@ pub(crate) fn dispatch<'a>(
                     Datum::Snapshot { legacy: true, .. } => "txid_snapshot",
                     Datum::PgLsn(_) => "pg_lsn",
                     Datum::Money(_) => "money",
+                    Datum::Tid(_) => "tid",
+                    Datum::Cid(_) => "cid",
                     Datum::Int8(_) => "bigint",
                     Datum::Float4(_) => "real",
                     Datum::Float8(_) => "double precision",

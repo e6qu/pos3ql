@@ -375,6 +375,8 @@ pub enum OwnedDatum {
     Char(u8),
     Int4(i32),
     Oid(u32),
+    Tid(crate::sql::types::Tid),
+    Cid(u32),
     Xid8(u64),
     Snapshot {
         legacy: bool,
@@ -587,6 +589,8 @@ impl OwnedDatum {
             Datum::Char(byte) => Self::Char(*byte),
             Datum::Int4(v) => Self::Int4(*v),
             Datum::Oid(v) => Self::Oid(*v),
+            Datum::Tid(v) => Self::Tid(*v),
+            Datum::Cid(v) => Self::Cid(*v),
             Datum::Xid8(v) => Self::Xid8(*v),
             Datum::Snapshot { value, legacy } => {
                 let (len, bytes) = Self::bytes(value.raw(), "transaction snapshot")?;
@@ -717,6 +721,8 @@ impl OwnedDatum {
             Self::Char(byte) => Datum::Char(*byte),
             Self::Int4(v) => Datum::Int4(*v),
             Self::Oid(v) => Datum::Oid(*v),
+            Self::Tid(v) => Datum::Tid(*v),
+            Self::Cid(v) => Datum::Cid(*v),
             Self::Xid8(v) => Datum::Xid8(*v),
             Self::Snapshot { legacy, len, bytes } => Datum::Snapshot {
                 value: crate::sql::snapshot::Snapshot::restore(&bytes[..*len as usize])

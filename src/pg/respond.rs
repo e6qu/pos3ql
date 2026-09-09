@@ -344,10 +344,12 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Int2(_) => 2,
         Datum::Int4(_)
         | Datum::Oid(_)
+        | Datum::Cid(_)
         | Datum::Regtype { .. }
         | Datum::RegObject { .. }
         | Datum::Date(_)
         | Datum::Float4(_) => 4,
+        Datum::Tid(_) | Datum::Macaddr(_) => 6,
         Datum::Int8(_)
         | Datum::Xid8(_)
         | Datum::PgLsn(_)
@@ -357,7 +359,6 @@ fn binary_value_len(value: &Datum) -> usize {
         | Datum::Time(_)
         | Datum::Float8(_)
         | Datum::Macaddr8(_) => 8,
-        Datum::Macaddr(_) => 6,
         Datum::Timetz(..) => 12,
         Datum::Interval(_) | Datum::Uuid(_) => 16,
         Datum::Text(text) | Datum::Bpchar(text) => text.len(),
@@ -1299,6 +1300,15 @@ impl<'b> Responder<'b> {
                     m.i32(4);
                     m.bytes(&x.to_be_bytes());
                 }
+                Datum::Tid(x) => {
+                    m.i32(6);
+                    m.bytes(&x.block.to_be_bytes());
+                    m.bytes(&x.offset.to_be_bytes());
+                }
+                Datum::Cid(x) => {
+                    m.i32(4);
+                    m.bytes(&x.to_be_bytes());
+                }
                 Datum::Xid8(x) => {
                     m.i32(8);
                     m.bytes(&x.to_be_bytes());
@@ -2090,6 +2100,26 @@ mod tests {
         assert_eq!(&bytes[9..17], &u64::MAX.to_be_bytes());
         assert_eq!(&bytes[17..21], &36i32.to_be_bytes());
         assert_eq!(&bytes[21..], snapshot.raw());
+    }
+
+    #[test]
+    fn binary_tuple_and_command_identity_results_use_postgresql_network_format() {
+        let mut budget = Budget::new(128);
+        let mut buffer = FixedBuf::new(&mut budget, "low-level identity result", 64).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(
+            &mut message,
+            &Datum::Tid(crate::sql::types::Tid {
+                block: 0x0102_0304,
+                offset: 0x0506,
+            }),
+        );
+        Responder::encode_value_binary(&mut message, &Datum::Cid(0x0708_090a));
+        message.finish().unwrap();
+        assert_eq!(&buffer.readable()[5..9], &6i32.to_be_bytes());
+        assert_eq!(&buffer.readable()[9..15], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&buffer.readable()[15..19], &4i32.to_be_bytes());
+        assert_eq!(&buffer.readable()[19..23], &[7, 8, 9, 10]);
     }
 
     #[test]

@@ -133,7 +133,8 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Char(_) => 1,
         Datum::Int2(_) => 2,
         Datum::Float4(_) => 4,
-        Datum::Int4(_) | Datum::Oid(_) | Datum::Date(_) => 4,
+        Datum::Int4(_) | Datum::Oid(_) | Datum::Cid(_) | Datum::Date(_) => 4,
+        Datum::Tid(_) => 6,
         Datum::Int8(_)
         | Datum::Xid8(_)
         | Datum::PgLsn(_)
@@ -259,6 +260,17 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 46;
             out[1..9].copy_from_slice(&x.to_le_bytes());
             9
+        }
+        Datum::Tid(x) => {
+            out[0] = 47;
+            out[1..5].copy_from_slice(&x.block.to_le_bytes());
+            out[5..7].copy_from_slice(&x.offset.to_le_bytes());
+            7
+        }
+        Datum::Cid(x) => {
+            out[0] = 48;
+            out[1..5].copy_from_slice(&x.to_le_bytes());
+            5
         }
         Datum::Int2(x) => {
             out[0] = 22;
@@ -609,6 +621,17 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         46 => (
             Datum::Money(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
             8,
+        ),
+        47 => (
+            Datum::Tid(crate::sql::types::Tid {
+                block: u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()),
+                offset: u16::from_le_bytes(bytes[at + 4..at + 6].try_into().unwrap()),
+            }),
+            6,
+        ),
+        48 => (
+            Datum::Cid(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
+            4,
         ),
         3 => (
             Datum::Int8(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
@@ -1092,6 +1115,23 @@ mod tests {
         let encoded = encode_projected_pub(&values, &arena).unwrap();
         assert_eq!(projected_row_width(encoded), values.len());
         assert!(decode_projected_pub(encoded, values.len() - 1).is_null());
+    }
+
+    #[test]
+    fn low_level_identities_round_trip_through_schema_less_spill_rows() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "identity projected row", 128).unwrap();
+        let values = [
+            Datum::Tid(crate::sql::types::Tid {
+                block: u32::MAX,
+                offset: u16::MAX,
+            }),
+            Datum::Cid(u32::MAX),
+        ];
+        let encoded = encode_projected_pub(&values, &arena).unwrap();
+        assert_eq!(projected_row_width(encoded), 2);
+        assert_eq!(decode_projected_pub(encoded, 0), values[0]);
+        assert_eq!(decode_projected_pub(encoded, 1), values[1]);
     }
 
     #[test]

@@ -615,6 +615,15 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[46]);
             hasher.write(&v.to_le_bytes());
         }
+        Datum::Tid(v) => {
+            hasher.write(&[47]);
+            hasher.write(&v.block.to_le_bytes());
+            hasher.write(&v.offset.to_le_bytes());
+        }
+        Datum::Cid(v) => {
+            hasher.write(&[48]);
+            hasher.write(&v.to_le_bytes());
+        }
         Datum::Int8(v) => {
             hasher.write(&[2]);
             hasher.write(&v.to_le_bytes());
@@ -747,6 +756,8 @@ pub(crate) fn compare_datums_as(
         (Datum::Xid8(a), Datum::Xid8(b)) => a.cmp(b),
         (Datum::PgLsn(a), Datum::PgLsn(b)) => a.cmp(b),
         (Datum::Money(a), Datum::Money(b)) => a.cmp(b),
+        (Datum::Tid(a), Datum::Tid(b)) => a.cmp(b),
+        (Datum::Cid(a), Datum::Cid(b)) => a.cmp(b),
         (Datum::Char(a), Datum::Char(b)) => a.cmp(b),
         (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
         (Datum::TsVector(a), Datum::TsVector(b)) => {
@@ -1020,6 +1031,8 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
         Datum::Oid(_) => Datum::Oid(super::cast::parse_oid(s)?),
         Datum::Int8(_) => Datum::Int8(s.trim().parse().map_err(|_| bad_text(s, "bigint"))?),
         Datum::Money(_) => Datum::Money(crate::sql::money::parse(s)?),
+        Datum::Tid(_) => Datum::Tid(crate::sql::identity::parse_tid(s)?),
+        Datum::Cid(_) => Datum::Cid(crate::sql::identity::parse_cid(s)?),
         Datum::Float8(_) => Datum::Float8(
             s.trim()
                 .parse()
@@ -1139,6 +1152,32 @@ pub(crate) fn compare<'a>(
         BinaryOp::Gt => ">",
         _ => ">=",
     };
+    if matches!((&l, &r), (Datum::Cid(_), Datum::Cid(_))) && operator != BinaryOp::Eq {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: cid {} cid",
+            symbol
+        ));
+    }
+    if matches!(
+        (&l, &r),
+        (
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Cid,
+                ..
+            },
+            Datum::Array {
+                element: crate::sql::types::ArrElem::Cid,
+                ..
+            }
+        )
+    ) && !matches!(operator, BinaryOp::Eq | BinaryOp::NotEq)
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify a comparison function for type cid"
+        ));
+    }
     let ord = compare_datums_as(symbol, &l, &r)?;
     let out = match operator {
         BinaryOp::Eq => ord.is_eq(),

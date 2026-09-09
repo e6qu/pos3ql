@@ -2841,7 +2841,11 @@ pub fn infer_type_res(
                     if lo != oid::UNKNOWN
                         && ro != oid::UNKNOWN
                         && let (Some(a), Some(b)) = (coltype_of_oid(lo), coltype_of_oid(ro))
-                        && !comparable(a, b)
+                        && (!comparable(a, b)
+                            || (a == ColType::Cid && b == ColType::Cid && *operator != Eq)
+                            || (matches!(a, ColType::Array(crate::sql::types::ArrElem::Cid))
+                                && matches!(b, ColType::Array(crate::sql::types::ArrElem::Cid))
+                                && !matches!(*operator, Eq | NotEq)))
                     {
                         let sym = match operator {
                             Eq => "=",
@@ -3568,6 +3572,7 @@ pub fn infer_type_res(
                 if let Some((o, _)) = t {
                     let unordered = o == oid::BOOL
                         || o == oid::UUID
+                        || o == oid::CID
                         || matches!(
                             coltype_of_oid(o),
                             Some(
@@ -3596,6 +3601,15 @@ pub fn infer_type_res(
             "cash_div_cash" => of(ColType::Float8),
             "cash_out" | "cash_words" => of(ColType::Text),
             "cash_send" => of(ColType::Bytea),
+            "tidin" | "tidrecv" | "tidlarger" | "tidsmaller" => of(ColType::Tid),
+            "tidout" | "cidout" => of(ColType::Text),
+            "tidsend" | "cidsend" => of(ColType::Bytea),
+            "tideq" | "tidne" | "tidlt" | "tidle" | "tidgt" | "tidge" | "cideq" => {
+                of(ColType::Bool)
+            }
+            "bttidcmp" | "hashtid" | "hashcid" => of(ColType::Int4),
+            "hashtidextended" | "hashcidextended" => of(ColType::Int8),
+            "cidin" | "cidrecv" => of(ColType::Cid),
             // Functions returning the common type of their arguments (numeric
             // tower: float8 > numeric > int8 > int4), so a NULL of a wider type
             // still widens the result — matching PostgreSQL and the runtime

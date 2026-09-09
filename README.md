@@ -47,6 +47,14 @@ functions, aggregates, btree indexes and catalogs. Values retain that identity
 through COPY, stored rows, WAL, checkpoints, and object-cold recovery;
 unsupported monetary locales fail explicitly.
 
+PostgreSQL 18 binary and bit strings include the complete modeled `bytea`,
+fixed `bit`, and `varbit` scalar function/operator families, checksums,
+integer conversions, raw-byte and bitwise aggregates, and direct support
+routines. Exact procedure, operator, aggregate, cast, btree, and hash catalogs
+agree with PostgreSQL; binary wire/COPY and driver values, generated and check
+expressions, indexes, WAL, checkpoints, and object-cold recovery retain the
+same bounded byte representation.
+
 PostgreSQL `tid` and `cid` values and arrays retain their exact unsigned tuple
 and command identity through SQL, btree/hash support, text and binary wire/COPY,
 rows, spills, WAL, checkpoints, and object-cold recovery. Their PostgreSQL 18

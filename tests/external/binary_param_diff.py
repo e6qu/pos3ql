@@ -30,6 +30,9 @@ def connect(host, port):
 # Each case: a full query with a %b (binary) placeholder cast to text (so both
 # engines are compared on the same canonical representation), and the param.
 CASES = [
+    ("SELECT reverse(%b::bytea)", [b"\x00\xffA"]),
+    ("SELECT substring(%b::bytea FROM 2 FOR 2)", [b"\x00\x11\x22\x33"]),
+    ("SELECT crc32(%b::bytea)", [b"123456789"]),
     ("SELECT (%b::int4[])::text", [[1, 2, 3]]),
     ("SELECT (%b::int4[])::text", [[1, None, 3]]),
     ("SELECT (%b::int4[])::text", [[]]),
@@ -51,6 +54,11 @@ CASES = [
 # binary just as reliably as comparing raw frames, while also exercising all
 # subtype codecs clients actually use.
 RESULT_CASES = [
+    "SELECT overlay('\\x001122'::bytea PLACING '\\xaabb'::bytea FROM 2)",
+    "SELECT set_bit(B'1001'::varbit, 1, 1)",
+    "SELECT string_agg(value, delimiter ORDER BY ordinal) FROM "
+    "(VALUES (2, '\\x62'::bytea, '\\x2d'::bytea), "
+    "(1, '\\x6100'::bytea, '\\x2f'::bytea)) AS v(ordinal,value,delimiter)",
     "SELECT '[1,5)'::int4range",
     "SELECT '[100,200]'::int8range",
     "SELECT '[1.25,300.00)'::numrange",

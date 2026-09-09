@@ -1666,6 +1666,327 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         2,
         "i"
     ),
+    // Binary-string support, scalar functions, PostgreSQL 18 integer casts,
+    // checksums, and aggregates.
+    intrinsic!(31, "byteaout", 2275, "17", 1, "i"),
+    intrinsic!(1244, "byteain", super::types::oid::BYTEA, "2275", 1, "i"),
+    intrinsic!(1948, "byteaeq", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(1949, "bytealt", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(1950, "byteale", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(1951, "byteagt", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(1952, "byteage", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(1953, "byteane", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(1954, "byteacmp", super::types::oid::INT4, "17 17", 2, "i"),
+    intrinsic!(2005, "bytealike", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(2006, "byteanlike", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(2007, "like", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(2008, "notlike", super::types::oid::BOOL, "17 17", 2, "i"),
+    intrinsic!(720, "octet_length", super::types::oid::INT4, "17", 1, "i"),
+    intrinsic!(721, "get_byte", super::types::oid::INT4, "17 23", 2, "i"),
+    intrinsic!(
+        722,
+        "set_byte",
+        super::types::oid::BYTEA,
+        "17 23 23",
+        3,
+        "i"
+    ),
+    intrinsic!(723, "get_bit", super::types::oid::INT4, "17 20", 2, "i"),
+    intrinsic!(724, "set_bit", super::types::oid::BYTEA, "17 20 23", 3, "i"),
+    intrinsic!(
+        749,
+        "overlay",
+        super::types::oid::BYTEA,
+        "17 17 23 23",
+        4,
+        "i"
+    ),
+    intrinsic!(752, "overlay", super::types::oid::BYTEA, "17 17 23", 3, "i"),
+    intrinsic!(
+        2009,
+        "like_escape",
+        super::types::oid::BYTEA,
+        "17 17",
+        2,
+        "i"
+    ),
+    intrinsic!(2010, "length", super::types::oid::INT4, "17", 1, "i"),
+    intrinsic!(2011, "byteacat", super::types::oid::BYTEA, "17 17", 2, "i"),
+    intrinsic!(
+        2012,
+        "substring",
+        super::types::oid::BYTEA,
+        "17 23 23",
+        3,
+        "i"
+    ),
+    intrinsic!(2013, "substring", super::types::oid::BYTEA, "17 23", 2, "i"),
+    intrinsic!(2014, "position", super::types::oid::INT4, "17 17", 2, "i"),
+    intrinsic!(2015, "btrim", super::types::oid::BYTEA, "17 17", 2, "i"),
+    intrinsic!(2085, "substr", super::types::oid::BYTEA, "17 23 23", 3, "i"),
+    intrinsic!(2086, "substr", super::types::oid::BYTEA, "17 23", 2, "i"),
+    intrinsic!(1810, "bit_length", super::types::oid::INT4, "17", 1, "i"),
+    intrinsic!(1946, "encode", super::types::oid::TEXT, "17 25", 2, "i"),
+    intrinsic!(1947, "decode", super::types::oid::BYTEA, "25 25", 2, "i"),
+    intrinsic!(2321, "md5", super::types::oid::TEXT, "17", 1, "i"),
+    intrinsic!(2412, "bytearecv", super::types::oid::BYTEA, "2281", 1, "i"),
+    intrinsic!(2413, "byteasend", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(3331, "bytea_sortsupport", 2278, "2281", 1, "i"),
+    intrinsic!(3543, "bytea_string_agg_transfn", 2281, "2281 17 17", 3, "i"),
+    intrinsic!(3419, "sha224", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(3420, "sha256", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(3421, "sha384", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(3422, "sha512", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(
+        3544,
+        "bytea_string_agg_finalfn",
+        super::types::oid::BYTEA,
+        "2281",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        3545,
+        "string_agg",
+        super::types::oid::BYTEA,
+        "17 17",
+        2,
+        "i"
+    ),
+    intrinsic!(6195, "ltrim", super::types::oid::BYTEA, "17 17", 2, "i"),
+    intrinsic!(6196, "rtrim", super::types::oid::BYTEA, "17 17", 2, "i"),
+    intrinsic!(6299, "string_agg_combine", 2281, "2281 2281", 2, "i"),
+    intrinsic!(
+        6300,
+        "string_agg_serialize",
+        super::types::oid::BYTEA,
+        "2281",
+        1,
+        "i"
+    ),
+    intrinsic!(6301, "string_agg_deserialize", 2281, "17 2281", 2, "i"),
+    intrinsic!(6364, "crc32", super::types::oid::INT8, "17", 1, "i"),
+    intrinsic!(6365, "crc32c", super::types::oid::INT8, "17", 1, "i"),
+    intrinsic!(6367, "bytea", super::types::oid::BYTEA, "21", 1, "i"),
+    intrinsic!(6368, "bytea", super::types::oid::BYTEA, "23", 1, "i"),
+    intrinsic!(6369, "bytea", super::types::oid::BYTEA, "20", 1, "i"),
+    intrinsic!(6370, "int2", super::types::oid::INT2, "17", 1, "i"),
+    intrinsic!(6371, "int4", super::types::oid::INT4, "17", 1, "i"),
+    intrinsic!(6372, "int8", super::types::oid::INT8, "17", 1, "i"),
+    intrinsic!(6382, "reverse", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(
+        6393,
+        "bytea_larger",
+        super::types::oid::BYTEA,
+        "17 17",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        6394,
+        "bytea_smaller",
+        super::types::oid::BYTEA,
+        "17 17",
+        2,
+        "i"
+    ),
+    intrinsic!(6395, "max", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(6396, "min", super::types::oid::BYTEA, "17", 1, "i"),
+    intrinsic!(6413, "hashbytea", super::types::oid::INT4, "17", 1, "i"),
+    intrinsic!(
+        6414,
+        "hashbyteaextended",
+        super::types::oid::INT8,
+        "17 20",
+        2,
+        "i"
+    ),
+    // Fixed and varying bit-string support. PostgreSQL's scalar manipulation
+    // functions and bitwise aggregates resolve through the fixed `bit` type.
+    intrinsic!(1564, "bit_in", super::types::oid::BIT, "2275 26 23", 3, "i"),
+    intrinsic!(1565, "bit_out", 2275, "1560", 1, "i"),
+    intrinsic!(
+        1579,
+        "varbit_in",
+        super::types::oid::VARBIT,
+        "2275 26 23",
+        3,
+        "i"
+    ),
+    intrinsic!(1580, "varbit_out", 2275, "1562", 1, "i"),
+    intrinsic!(1581, "biteq", super::types::oid::BOOL, "1560 1560", 2, "i"),
+    intrinsic!(1582, "bitne", super::types::oid::BOOL, "1560 1560", 2, "i"),
+    intrinsic!(1592, "bitge", super::types::oid::BOOL, "1560 1560", 2, "i"),
+    intrinsic!(1593, "bitgt", super::types::oid::BOOL, "1560 1560", 2, "i"),
+    intrinsic!(1594, "bitle", super::types::oid::BOOL, "1560 1560", 2, "i"),
+    intrinsic!(1595, "bitlt", super::types::oid::BOOL, "1560 1560", 2, "i"),
+    intrinsic!(1596, "bitcmp", super::types::oid::INT4, "1560 1560", 2, "i"),
+    intrinsic!(
+        1666,
+        "varbiteq",
+        super::types::oid::BOOL,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1667,
+        "varbitne",
+        super::types::oid::BOOL,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1668,
+        "varbitge",
+        super::types::oid::BOOL,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1669,
+        "varbitgt",
+        super::types::oid::BOOL,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1670,
+        "varbitle",
+        super::types::oid::BOOL,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1671,
+        "varbitlt",
+        super::types::oid::BOOL,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1672,
+        "varbitcmp",
+        super::types::oid::INT4,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(1673, "bitand", super::types::oid::BIT, "1560 1560", 2, "i"),
+    intrinsic!(1674, "bitor", super::types::oid::BIT, "1560 1560", 2, "i"),
+    intrinsic!(1675, "bitxor", super::types::oid::BIT, "1560 1560", 2, "i"),
+    intrinsic!(1676, "bitnot", super::types::oid::BIT, "1560", 1, "i"),
+    intrinsic!(
+        1677,
+        "bitshiftleft",
+        super::types::oid::BIT,
+        "1560 23",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1678,
+        "bitshiftright",
+        super::types::oid::BIT,
+        "1560 23",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1679,
+        "bitcat",
+        super::types::oid::VARBIT,
+        "1562 1562",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        1680,
+        "substring",
+        super::types::oid::BIT,
+        "1560 23 23",
+        3,
+        "i"
+    ),
+    intrinsic!(1681, "length", super::types::oid::INT4, "1560", 1, "i"),
+    intrinsic!(
+        1682,
+        "octet_length",
+        super::types::oid::INT4,
+        "1560",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        1698,
+        "position",
+        super::types::oid::INT4,
+        "1560 1560",
+        2,
+        "i"
+    ),
+    intrinsic!(1699, "substring", super::types::oid::BIT, "1560 23", 2, "i"),
+    intrinsic!(1812, "bit_length", super::types::oid::INT4, "1560", 1, "i"),
+    intrinsic!(2242, "bit_and", super::types::oid::BIT, "1560", 1, "i"),
+    intrinsic!(2243, "bit_or", super::types::oid::BIT, "1560", 1, "i"),
+    intrinsic!(
+        2456,
+        "bit_recv",
+        super::types::oid::BIT,
+        "2281 26 23",
+        3,
+        "i"
+    ),
+    intrinsic!(2457, "bit_send", super::types::oid::BYTEA, "1560", 1, "i"),
+    intrinsic!(
+        2458,
+        "varbit_recv",
+        super::types::oid::VARBIT,
+        "2281 26 23",
+        3,
+        "i"
+    ),
+    intrinsic!(
+        2459,
+        "varbit_send",
+        super::types::oid::BYTEA,
+        "1562",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        3030,
+        "overlay",
+        super::types::oid::BIT,
+        "1560 1560 23 23",
+        4,
+        "i"
+    ),
+    intrinsic!(
+        3031,
+        "overlay",
+        super::types::oid::BIT,
+        "1560 1560 23",
+        3,
+        "i"
+    ),
+    intrinsic!(3032, "get_bit", super::types::oid::INT4, "1560 23", 2, "i"),
+    intrinsic!(
+        3033,
+        "set_bit",
+        super::types::oid::BIT,
+        "1560 23 23",
+        3,
+        "i"
+    ),
+    intrinsic!(6162, "bit_count", super::types::oid::INT8, "1560", 1, "i"),
+    intrinsic!(6163, "bit_count", super::types::oid::INT8, "17", 1, "i"),
+    intrinsic!(6167, "bit_xor", super::types::oid::BIT, "1560", 1, "i"),
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -1706,6 +2027,15 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 2141
             | 2797
             | 2798
+            | 2242
+            | 2243
+            | 3543
+            | 3544
+            | 3545
+            | 6299
+            | 6395
+            | 6396
+            | 6167
     )
 }
 
@@ -1859,6 +2189,372 @@ macro_rules! catalog_comparison_operator {
 }
 
 const CATALOG_OPERATORS: &[CatalogOperator] = &[
+    catalog_comparison_operator!(
+        1955,
+        "=",
+        ColType::Bytea,
+        1948,
+        "byteaeq",
+        1955,
+        1956,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1956,
+        "<>",
+        ColType::Bytea,
+        1953,
+        "byteane",
+        1956,
+        1955,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1957,
+        "<",
+        ColType::Bytea,
+        1949,
+        "bytealt",
+        1959,
+        1960,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1958,
+        "<=",
+        ColType::Bytea,
+        1950,
+        "byteale",
+        1960,
+        1959,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        1959,
+        ">",
+        ColType::Bytea,
+        1951,
+        "byteagt",
+        1957,
+        1958,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1960,
+        ">=",
+        ColType::Bytea,
+        1952,
+        "byteage",
+        1958,
+        1957,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_operator!(
+        2018,
+        "||",
+        ColType::Bytea,
+        ColType::Bytea,
+        ColType::Bytea,
+        2011,
+        "byteacat"
+    ),
+    CatalogOperator {
+        oid: 2016,
+        name: "~~",
+        left: ColType::Bytea,
+        right: ColType::Bytea,
+        result: ColType::Bool,
+        procedure_oid: 2005,
+        procedure_name: "bytealike",
+        commutator: 0,
+        negator: 2017,
+        merges: false,
+        hashes: false,
+        restriction: Some((1819, "likesel")),
+        join: Some((1825, "likejoinsel")),
+    },
+    CatalogOperator {
+        oid: 2017,
+        name: "!~~",
+        left: ColType::Bytea,
+        right: ColType::Bytea,
+        result: ColType::Bool,
+        procedure_oid: 2006,
+        procedure_name: "byteanlike",
+        commutator: 0,
+        negator: 2016,
+        merges: false,
+        hashes: false,
+        restriction: Some((1822, "nlikesel")),
+        join: Some((1828, "nlikejoinsel")),
+    },
+    catalog_comparison_operator!(
+        1784,
+        "=",
+        ColType::Bit { varying: false },
+        1581,
+        "biteq",
+        1784,
+        1785,
+        true,
+        false,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1785,
+        "<>",
+        ColType::Bit { varying: false },
+        1582,
+        "bitne",
+        1785,
+        1784,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1786,
+        "<",
+        ColType::Bit { varying: false },
+        1595,
+        "bitlt",
+        1787,
+        1789,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1787,
+        ">",
+        ColType::Bit { varying: false },
+        1593,
+        "bitgt",
+        1786,
+        1788,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1788,
+        "<=",
+        ColType::Bit { varying: false },
+        1594,
+        "bitle",
+        1789,
+        1787,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        1789,
+        ">=",
+        ColType::Bit { varying: false },
+        1592,
+        "bitge",
+        1788,
+        1786,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_operator_with_commutator!(
+        1791,
+        "&",
+        ColType::Bit { varying: false },
+        ColType::Bit { varying: false },
+        ColType::Bit { varying: false },
+        1673,
+        "bitand",
+        1791
+    ),
+    catalog_operator_with_commutator!(
+        1792,
+        "|",
+        ColType::Bit { varying: false },
+        ColType::Bit { varying: false },
+        ColType::Bit { varying: false },
+        1674,
+        "bitor",
+        1792
+    ),
+    catalog_operator_with_commutator!(
+        1793,
+        "#",
+        ColType::Bit { varying: false },
+        ColType::Bit { varying: false },
+        ColType::Bit { varying: false },
+        1675,
+        "bitxor",
+        1793
+    ),
+    catalog_operator!(
+        1795,
+        "<<",
+        ColType::Bit { varying: false },
+        ColType::Int4,
+        ColType::Bit { varying: false },
+        1677,
+        "bitshiftleft"
+    ),
+    catalog_operator!(
+        1796,
+        ">>",
+        ColType::Bit { varying: false },
+        ColType::Int4,
+        ColType::Bit { varying: false },
+        1678,
+        "bitshiftright"
+    ),
+    catalog_operator!(
+        1797,
+        "||",
+        ColType::Bit { varying: true },
+        ColType::Bit { varying: true },
+        ColType::Bit { varying: true },
+        1679,
+        "bitcat"
+    ),
+    catalog_comparison_operator!(
+        1804,
+        "=",
+        ColType::Bit { varying: true },
+        1666,
+        "varbiteq",
+        1804,
+        1805,
+        true,
+        false,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1805,
+        "<>",
+        ColType::Bit { varying: true },
+        1667,
+        "varbitne",
+        1805,
+        1804,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1806,
+        "<",
+        ColType::Bit { varying: true },
+        1671,
+        "varbitlt",
+        1807,
+        1809,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1807,
+        ">",
+        ColType::Bit { varying: true },
+        1669,
+        "varbitgt",
+        1806,
+        1808,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1808,
+        "<=",
+        ColType::Bit { varying: true },
+        1670,
+        "varbitle",
+        1809,
+        1807,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        1809,
+        ">=",
+        ColType::Bit { varying: true },
+        1668,
+        "varbitge",
+        1808,
+        1806,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
     catalog_comparison_operator!(
         385,
         "=",
@@ -2492,6 +3188,14 @@ const CID_HASH_OPERATOR_FAMILY_OID: i32 = 2226;
 const CID_HASH_OPERATOR_CLASS_OID: i32 = 10054;
 const TID_HASH_OPERATOR_FAMILY_OID: i32 = 2227;
 const TID_HASH_OPERATOR_CLASS_OID: i32 = 10055;
+const BIT_BTREE_OPERATOR_FAMILY_OID: i32 = 423;
+const BIT_BTREE_OPERATOR_CLASS_OID: i32 = 10002;
+const BYTEA_BTREE_OPERATOR_FAMILY_OID: i32 = 428;
+const BYTEA_BTREE_OPERATOR_CLASS_OID: i32 = 10006;
+const VARBIT_BTREE_OPERATOR_FAMILY_OID: i32 = 2002;
+const VARBIT_BTREE_OPERATOR_CLASS_OID: i32 = 10043;
+const BYTEA_HASH_OPERATOR_FAMILY_OID: i32 = 2223;
+const BYTEA_HASH_OPERATOR_CLASS_OID: i32 = 10049;
 const MONEY_CMP_OID: i32 = 377;
 const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
@@ -13494,27 +14198,73 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::MONEY,
             super::types::oid::NUMERIC,
             3823,
+            "a",
         ),
         (
             10_002,
             super::types::oid::NUMERIC,
             super::types::oid::MONEY,
             3824,
+            "a",
         ),
         (
             10_003,
             super::types::oid::INT4,
             super::types::oid::MONEY,
             3811,
+            "a",
         ),
         (
             10_004,
             super::types::oid::INT8,
             super::types::oid::MONEY,
             3812,
+            "a",
+        ),
+        (
+            10143,
+            super::types::oid::INT2,
+            super::types::oid::BYTEA,
+            6367,
+            "e",
+        ),
+        (
+            10144,
+            super::types::oid::INT4,
+            super::types::oid::BYTEA,
+            6368,
+            "e",
+        ),
+        (
+            10145,
+            super::types::oid::INT8,
+            super::types::oid::BYTEA,
+            6369,
+            "e",
+        ),
+        (
+            10146,
+            super::types::oid::BYTEA,
+            super::types::oid::INT2,
+            6370,
+            "e",
+        ),
+        (
+            10147,
+            super::types::oid::BYTEA,
+            super::types::oid::INT4,
+            6371,
+            "e",
+        ),
+        (
+            10148,
+            super::types::oid::BYTEA,
+            super::types::oid::INT8,
+            6372,
+            "e",
         ),
     ];
-    for (index, (oid, source, target, function)) in builtin.into_iter().enumerate() {
+    for (index, (oid, source, target, function, context)) in builtin.into_iter().enumerate() {
         rows[index] = row(
             &[
                 Datum::Int4(2605),
@@ -13522,7 +14272,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(source),
                 Datum::Int4(target),
                 Datum::Int4(function),
-                Datum::Bpchar("a"),
+                Datum::Bpchar(context),
                 Datum::Bpchar("f"),
             ],
             arena,
@@ -13732,7 +14482,28 @@ fn pg_opfamily<'a>(
             arena,
         )?;
     }
-    let mut count = 5usize;
+    for (index, (oid, method, name)) in [
+        (BIT_BTREE_OPERATOR_FAMILY_OID, 403, "bit_ops"),
+        (BYTEA_BTREE_OPERATOR_FAMILY_OID, 403, "bytea_ops"),
+        (VARBIT_BTREE_OPERATOR_FAMILY_OID, 403, "varbit_ops"),
+        (BYTEA_HASH_OPERATOR_FAMILY_OID, 405, "bytea_ops"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 5] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 9usize;
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -13846,7 +14617,56 @@ fn pg_opclass<'a>(
             arena,
         )?;
     }
-    let mut count = 5usize;
+    for (index, (oid, method, name, family, input)) in [
+        (
+            BIT_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "bit_ops",
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+        ),
+        (
+            BYTEA_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "bytea_ops",
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+        ),
+        (
+            VARBIT_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "varbit_ops",
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+        ),
+        (
+            BYTEA_HASH_OPERATOR_CLASS_OID,
+            405,
+            "bytea_ops",
+            BYTEA_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 5] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Bool(true),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 9usize;
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -14003,6 +14823,153 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar("s"),
                 Datum::Int4(operator),
                 Datum::Int4(405),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, family, input, strategy, operator, method) in [
+        (
+            10205,
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+            1,
+            1786,
+            403,
+        ),
+        (
+            10206,
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+            2,
+            1788,
+            403,
+        ),
+        (
+            10207,
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+            3,
+            1784,
+            403,
+        ),
+        (
+            10208,
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+            4,
+            1789,
+            403,
+        ),
+        (
+            10209,
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+            5,
+            1787,
+            403,
+        ),
+        (
+            10115,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            1,
+            1957,
+            403,
+        ),
+        (
+            10116,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            2,
+            1958,
+            403,
+        ),
+        (
+            10117,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            3,
+            1955,
+            403,
+        ),
+        (
+            10118,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            4,
+            1960,
+            403,
+        ),
+        (
+            10119,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            5,
+            1959,
+            403,
+        ),
+        (
+            10210,
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+            1,
+            1806,
+            403,
+        ),
+        (
+            10211,
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+            2,
+            1808,
+            403,
+        ),
+        (
+            10212,
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+            3,
+            1804,
+            403,
+        ),
+        (
+            10213,
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+            4,
+            1809,
+            403,
+        ),
+        (
+            10214,
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+            5,
+            1807,
+            403,
+        ),
+        (
+            10287,
+            BYTEA_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            1,
+            1955,
+            405,
+        ),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(method),
                 Datum::Int4(0),
             ],
             arena,
@@ -14175,7 +15142,97 @@ fn pg_amproc<'a>(
             arena,
         )?;
     }
-    let mut count = 10usize;
+    for (index, (oid, family, input, number, procedure, name)) in [
+        (
+            10001,
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+            1,
+            1596,
+            "bitcmp",
+        ),
+        (
+            10002,
+            BIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BIT,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10009,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            1,
+            1954,
+            "byteacmp",
+        ),
+        (
+            10010,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            2,
+            3331,
+            "bytea_sortsupport",
+        ),
+        (
+            10011,
+            BYTEA_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10100,
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+            1,
+            1672,
+            "varbitcmp",
+        ),
+        (
+            10101,
+            VARBIT_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::VARBIT,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10176,
+            BYTEA_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            1,
+            6413,
+            "hashbytea",
+        ),
+        (
+            10177,
+            BYTEA_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::BYTEA,
+            2,
+            6414,
+            "hashbyteaextended",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 10] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 19usize;
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .functions
@@ -15281,7 +16338,7 @@ fn pg_aggregate<'a>(
             ("aggminitval", ColType::Text),
         ],
     );
-    let count = 6
+    let count = 12
         + (0..storage.routine_count())
             .filter(|slot| {
                 storage.routine_slot_visible_to(*slot, txid)
@@ -15408,7 +16465,99 @@ fn pg_aggregate<'a>(
             arena,
         )?;
     }
-    let mut index = 6usize;
+    for (index, (aggregate_oid, transition_oid)) in [(2242, 1673), (2243, 1674), (6167, 1675)]
+        .into_iter()
+        .enumerate()
+    {
+        rows[index + 6] = row(
+            &[
+                regproc(aggregate_oid)?,
+                Datum::Bpchar("n"),
+                Datum::Int2(0),
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bpchar("r"),
+                Datum::Bpchar("r"),
+                Datum::Int4(0),
+                Datum::Int4(super::types::oid::BIT),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    for (index, (aggregate_oid, transition_oid, sort_operator_oid)) in
+        [(6395, 6393, 1959), (6396, 6394, 1957)]
+            .into_iter()
+            .enumerate()
+    {
+        rows[index + 9] = row(
+            &[
+                regproc(aggregate_oid)?,
+                Datum::Bpchar("n"),
+                Datum::Int2(0),
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bpchar("r"),
+                Datum::Bpchar("r"),
+                Datum::Int4(sort_operator_oid),
+                Datum::Int4(super::types::oid::BYTEA),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    rows[11] = row(
+        &[
+            regproc(3545)?,
+            Datum::Bpchar("n"),
+            Datum::Int2(0),
+            regproc(3543)?,
+            regproc(3544)?,
+            regproc(6299)?,
+            regproc(6300)?,
+            regproc(6301)?,
+            regproc(0)?,
+            regproc(0)?,
+            regproc(0)?,
+            Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Bpchar("r"),
+            Datum::Bpchar("r"),
+            Datum::Int4(0),
+            Datum::Int4(super::types::oid::INTERNAL),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Null,
+            Datum::Null,
+        ],
+        arena,
+    )?;
+    let mut index = 12usize;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {

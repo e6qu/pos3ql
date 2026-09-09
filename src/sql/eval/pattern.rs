@@ -75,7 +75,12 @@ pub(crate) fn similar_to_posix(
 /// SQL LIKE: `%` matches any run (including empty), `_` exactly one
 /// character, `\` escapes the next pattern character. Iterative
 /// two-pointer match with backtracking to the last `%`; allocation-free.
-pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Option<char>) -> bool {
+pub fn like_match(
+    text: &str,
+    pattern: &str,
+    case_insensitive: bool,
+    escape: Option<char>,
+) -> Result<bool, SqlError> {
     fn next_char(s: &str, at: usize) -> Option<(char, usize)> {
         s[at..].chars().next().map(|c| (c, at + c.len_utf8()))
     }
@@ -109,7 +114,12 @@ pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Opt
                 c if Some(c) == escape => {
                     let (want, after) = match next_char(pattern, p_next) {
                         Some((c, n)) => (c, n),
-                        None => (c, p_next), // a trailing escape stands for itself
+                        None => {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_ESCAPE_SEQUENCE,
+                                "LIKE pattern must not end with escape character"
+                            ));
+                        }
                     };
                     if let Some((tc, t_next)) = next_char(text, t)
                         && eq(tc, want)
@@ -130,7 +140,7 @@ pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Opt
                 }
             }
         } else if t >= text.len() {
-            return true;
+            return Ok(true);
         }
         // Mismatch (or pattern exhausted with text left): backtrack.
         match star {
@@ -140,10 +150,68 @@ pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Opt
                     t = nt;
                     p = star_p;
                 }
-                None => return false,
+                None => return Ok(false),
             },
-            None => return false,
+            None => return Ok(false),
         }
+    }
+}
+
+/// Binary `LIKE`: `%`, `_`, and the optional escape byte have the same grammar
+/// as text LIKE, but every match unit is one byte rather than one character.
+pub(crate) fn like_match_bytes(
+    text: &[u8],
+    pattern: &[u8],
+    escape: Option<u8>,
+) -> Result<bool, SqlError> {
+    let mut text_at = 0usize;
+    let mut pattern_at = 0usize;
+    let mut wildcard = None;
+    loop {
+        if let Some(&byte) = pattern.get(pattern_at) {
+            match byte {
+                b'%' => {
+                    pattern_at += 1;
+                    wildcard = Some((pattern_at, text_at));
+                    continue;
+                }
+                b'_' if text_at < text.len() => {
+                    pattern_at += 1;
+                    text_at += 1;
+                    continue;
+                }
+                byte if Some(byte) == escape => {
+                    let Some(&wanted) = pattern.get(pattern_at + 1) else {
+                        return Err(sql_err!(
+                            sqlstate::INVALID_ESCAPE_SEQUENCE,
+                            "LIKE pattern must not end with escape character"
+                        ));
+                    };
+                    if text.get(text_at) == Some(&wanted) {
+                        text_at += 1;
+                        pattern_at += 2;
+                        continue;
+                    }
+                }
+                byte if text.get(text_at) == Some(&byte) => {
+                    text_at += 1;
+                    pattern_at += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        } else if text_at == text.len() {
+            return Ok(true);
+        }
+        let Some((next_pattern, wildcard_text)) = wildcard else {
+            return Ok(false);
+        };
+        if wildcard_text == text.len() {
+            return Ok(false);
+        }
+        text_at = wildcard_text + 1;
+        wildcard = Some((next_pattern, text_at));
+        pattern_at = next_pattern;
     }
 }
 

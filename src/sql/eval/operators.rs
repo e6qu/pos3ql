@@ -2136,6 +2136,18 @@ pub(crate) fn binary<'a>(
                     .map(crate::sql::full_text::restore_query)
                     .map(Datum::TsQuery)
             }
+            (Datum::Bytea(left), Datum::Bytea(right)) => {
+                let out = arena
+                    .alloc_slice_with(left.len() + right.len(), |index| {
+                        if index < left.len() {
+                            left[index]
+                        } else {
+                            right[index - left.len()]
+                        }
+                    })
+                    .map_err(|_| arena_full())?;
+                Ok(Datum::Bytea(out))
+            }
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_concat(l, r, arena),
             // jsonb || jsonb: object merge (right wins), array concat, else
             // wrap-and-concat. (Plain json has no `||` operator in PostgreSQL,
@@ -2296,6 +2308,19 @@ pub(crate) fn binary<'a>(
             if l.is_null() || r.is_null() {
                 return Ok(Datum::Null);
             }
+            if let (Datum::Bytea(text), Datum::Bytea(pattern)) = (l, r) {
+                if operator == ILike {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "operator does not exist: bytea ~~* bytea"
+                    ));
+                }
+                return Ok(Datum::Bool(super::pattern::like_match_bytes(
+                    text,
+                    pattern,
+                    Some(b'\\'),
+                )?));
+            }
             let text = cast_to_text(l, arena)?;
             let pattern = cast_to_text(r, arena)?;
             Ok(Datum::Bool(like_match(
@@ -2303,7 +2328,7 @@ pub(crate) fn binary<'a>(
                 pattern,
                 operator == ILike,
                 Some('\\'),
-            )))
+            )?))
         }
         Pow => {
             // PostgreSQL `^` stays numeric when an operand is numeric (and none

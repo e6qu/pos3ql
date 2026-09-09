@@ -2919,6 +2919,8 @@ pub fn infer_type_res(
                         (oid::JSONB, -1)
                     } else if is_bit(lo) || is_bit(ro) {
                         (oid::VARBIT, -1)
+                    } else if lo == oid::BYTEA && ro == oid::BYTEA {
+                        (oid::BYTEA, -1)
                     } else {
                         (oid::TEXT, -1)
                     }
@@ -3750,7 +3752,23 @@ pub fn infer_type_res(
             "regexp_split_to_array" | "string_to_array" => {
                 of(ColType::Array(crate::sql::types::ArrElem::Text))
             }
-            "format" | "overlay" | "regexp_replace" => of(ColType::Text),
+            "format" | "regexp_replace" => of(ColType::Text),
+            "overlay" | "substr" | "substring" | "reverse" | "btrim" | "ltrim" | "rtrim" => {
+                match args
+                    .first()
+                    .map(|argument| infer_type_res(argument, columns))
+                    .transpose()?
+                    .map(|resolved| resolved.0)
+                {
+                    Some(oid::BYTEA) => of(ColType::Bytea),
+                    Some(oid::BIT | oid::VARBIT)
+                        if matches!(*name, "overlay" | "substr" | "substring") =>
+                    {
+                        of(ColType::Bit { varying: false })
+                    }
+                    _ => of(ColType::Text),
+                }
+            }
             "floor" | "ceil" | "ceiling" | "sign" => {
                 let a = args
                     .first()
@@ -3837,7 +3855,18 @@ pub fn infer_type_res(
                 of(ColType::Float8)
             }
             "regr_count" => of(ColType::Int8),
-            "string_agg" => of(ColType::Text),
+            "string_agg" => {
+                if args
+                    .first()
+                    .map(|argument| infer_type_res(argument, columns))
+                    .transpose()?
+                    .is_some_and(|resolved| resolved.0 == oid::BYTEA)
+                {
+                    of(ColType::Bytea)
+                } else {
+                    of(ColType::Text)
+                }
+            }
             "xmlagg" => of(ColType::Xml),
             "array_agg" => {
                 // Element type from the argument; the result is elem[].
@@ -3941,12 +3970,33 @@ pub fn infer_type_res(
             "make_timestamptz" => of(ColType::Timestamptz),
             "isfinite" => of(ColType::Bool),
             // Encoding / hashing / bytea manipulation.
-            "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "set_bit"
-            | "convert_to" | "convert" => of(ColType::Bytea),
-            "encode" | "convert_from" | "quote_ident" | "quote_literal" | "quote_nullable" => {
-                of(ColType::Text)
+            "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "convert_to"
+            | "convert" | "byteain" | "byteasend" | "byteacat" | "bytea_larger"
+            | "bytea_smaller" | "bit_send" | "varbit_send" | "bytea" => of(ColType::Bytea),
+            "set_bit" => match args
+                .first()
+                .map(|argument| infer_type_res(argument, columns))
+                .transpose()?
+                .map(|resolved| resolved.0)
+            {
+                Some(oid::BIT | oid::VARBIT) => of(ColType::Bit { varying: false }),
+                _ => of(ColType::Bytea),
+            },
+            "encode" | "convert_from" | "byteaout" | "bit_out" | "varbit_out" | "quote_ident"
+            | "quote_literal" | "quote_nullable" => of(ColType::Text),
+            "get_byte" | "get_bit" | "byteacmp" | "bitcmp" | "varbitcmp" | "hashbytea" | "int4" => {
+                of(ColType::Int4)
             }
-            "get_byte" | "get_bit" => of(ColType::Int4),
+            "int2" => of(ColType::Int2),
+            "int8" | "crc32" | "crc32c" | "hashbyteaextended" => of(ColType::Int8),
+            "byteaeq" | "byteane" | "bytealt" | "byteale" | "byteagt" | "byteage" | "bytealike"
+            | "byteanlike" | "biteq" | "bitne" | "bitlt" | "bitle" | "bitgt" | "bitge"
+            | "varbiteq" | "varbitne" | "varbitlt" | "varbitle" | "varbitgt" | "varbitge" => {
+                of(ColType::Bool)
+            }
+            "bit_in" | "bitand" | "bitor" | "bitxor" | "bitnot" | "bitshiftleft"
+            | "bitshiftright" => of(ColType::Bit { varying: false }),
+            "varbit_in" | "bitcat" => of(ColType::Bit { varying: true }),
             crate::sql::parser::OVERLAPS_PERIODS => of(ColType::Bool),
             "bit_count" => of(ColType::Int8),
             "parse_ident" => of(ColType::Array(crate::sql::types::ArrElem::Text)),

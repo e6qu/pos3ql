@@ -122,8 +122,7 @@ fn final_mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32) {
     (b, c)
 }
 
-fn hash_bytes(bytes: &[u8], seed: u64) -> (u32, u32) {
-    debug_assert!(bytes.len() < 12);
+fn hash_bytes(mut bytes: &[u8], seed: u64) -> (u32, u32) {
     let initial = 0x9e37_79b9u32
         .wrapping_add(bytes.len() as u32)
         .wrapping_add(3_923_095);
@@ -132,6 +131,13 @@ fn hash_bytes(bytes: &[u8], seed: u64) -> (u32, u32) {
         a = a.wrapping_add((seed >> 32) as u32);
         b = b.wrapping_add(seed as u32);
         (a, b, c) = mix(a, b, c);
+    }
+    while bytes.len() >= 12 {
+        a = a.wrapping_add(u32::from_ne_bytes(bytes[..4].try_into().unwrap()));
+        b = b.wrapping_add(u32::from_ne_bytes(bytes[4..8].try_into().unwrap()));
+        c = c.wrapping_add(u32::from_ne_bytes(bytes[8..12].try_into().unwrap()));
+        (a, b, c) = mix(a, b, c);
+        bytes = &bytes[12..];
     }
     for (index, byte) in bytes.iter().copied().enumerate() {
         #[cfg(target_endian = "little")]
@@ -183,6 +189,15 @@ pub fn hash_cid(value: u32) -> i32 {
 
 pub fn hash_cid_extended(value: u32, seed: i64) -> i64 {
     let (high, low) = hash_u32(value, seed as u64);
+    ((u64::from(high) << 32) | u64::from(low)) as i64
+}
+
+pub fn hash_bytea(value: &[u8]) -> i32 {
+    hash_bytes(value, 0).1 as i32
+}
+
+pub fn hash_bytea_extended(value: &[u8], seed: i64) -> i64 {
+    let (high, low) = hash_bytes(value, seed as u64);
     ((u64::from(high) << 32) | u64::from(low)) as i64
 }
 
@@ -248,5 +263,14 @@ mod tests {
         assert_eq!(hash_cid(42), 1_509_752_520);
         assert_eq!(hash_cid_extended(42, 0), 8_010_225_493_015_854_792);
         assert_eq!(hash_cid_extended(42, 123), -8_586_172_854_235_281_246);
+        assert_eq!(hash_bytea(&[]), -1_477_818_771);
+        assert_eq!(hash_bytea(&[0]), -1_062_527_899);
+        assert_eq!(
+            hash_bytea(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            1_048_759_404
+        );
+        let longer = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        assert_eq!(hash_bytea(&longer), 1_547_648_725);
+        assert_eq!(hash_bytea_extended(&longer, 123), 2_489_280_409_088_615_387);
     }
 }

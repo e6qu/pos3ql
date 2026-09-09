@@ -47,6 +47,14 @@ functions, aggregates, btree indexes and catalogs. Values retain that identity
 through COPY, stored rows, WAL, checkpoints, and object-cold recovery;
 unsupported monetary locales fail explicitly.
 
+PostgreSQL `tid` and `cid` values and arrays retain their exact unsigned tuple
+and command identity through SQL, btree/hash support, text and binary wire/COPY,
+rows, spills, WAL, checkpoints, and object-cold recovery. Their PostgreSQL 18
+catalog OIDs, operators, support routines, aggregates, and operator families
+are visible to clients. A local heap `ctid` system column is not synthesized:
+object-native row identities are not PostgreSQL heap-version addresses, so a
+reference fails explicitly instead of returning a stable but incorrect value.
+
 Permanent, unlogged, and session-temporary tables, views, indexes, identity sequences, standalone sequences, CTAS, and `SELECT INTO` have distinct PostgreSQL lifetimes. A view becomes temporary when requested or when any captured relation is temporary, including through another view. Temporary relations use isolated per-connection namespaces and `ON COMMIT` actions and never enter WAL, checkpoints, object storage, template clones, or logical publications. Committed temporary rows spill to a bounded, startup-sized local store (`temporary_spill_bytes`, or `0` to keep them resident-only) that is recreated empty on restart. Unlogged definitions are durable, retain rows after a clean shutdown, and reset table and sequence state after an unclean restart.
 
 Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.

@@ -4569,6 +4569,17 @@ pub(crate) fn decode_binary_param<'a>(
             let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Oid(u32::from_be_bytes(b)))
         }
+        oids::TID => {
+            let b: [u8; 6] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Tid(crate::sql::types::Tid {
+                block: u32::from_be_bytes(b[..4].try_into().unwrap()),
+                offset: u16::from_be_bytes(b[4..].try_into().unwrap()),
+            }))
+        }
+        oids::CID => {
+            let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Cid(u32::from_be_bytes(b)))
+        }
         oids::XID8 => {
             let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Xid8(u64::from_be_bytes(b)))
@@ -5531,6 +5542,27 @@ mod tests {
         assert!(
             decode_binary_param(crate::sql::types::oid::PG_SNAPSHOT, &snapshot, &arena).is_err()
         );
+    }
+
+    #[test]
+    fn binary_tuple_and_command_identity_parameters_are_exact_and_bounded() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "binary low-level identity test", 64).unwrap();
+        let tid = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::TID, &tid, &arena).unwrap(),
+            Datum::Tid(crate::sql::types::Tid {
+                block: u32::MAX,
+                offset: u16::MAX,
+            })
+        );
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::CID, &u32::MAX.to_be_bytes(), &arena,)
+                .unwrap(),
+            Datum::Cid(u32::MAX)
+        );
+        assert!(decode_binary_param(crate::sql::types::oid::TID, &tid[..5], &arena).is_err());
+        assert!(decode_binary_param(crate::sql::types::oid::CID, &[0; 5], &arena).is_err());
     }
 
     #[test]

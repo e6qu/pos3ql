@@ -14,6 +14,7 @@ pub(super) mod conditional;
 pub(super) mod datetime;
 pub(super) mod full_text;
 pub(crate) mod geometry;
+pub(super) mod identity;
 pub(crate) mod json;
 pub(super) mod math;
 pub(super) mod misc;

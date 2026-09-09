@@ -35,6 +35,7 @@
 - **MVCC**: visibility by transaction and commit LSN.
 - **PAX**: column-oriented row groups inside an SST, allowing selective column reads.
 - **physical-demand proof**: the columns a query path may read from a physical row.
+- **tuple identity value**: a PostgreSQL `tid` block/offset value carried at SQL and wire boundaries; it does not imply that an object-native row has a PostgreSQL heap address.
 - **SST**: immutable sorted table of versioned rows, index, filter, and roster blocks.
 - **VOPR**: deterministic simulation that injects faults from a reproducible seed.
 - **WAL**: checksummed local journal encoding used for recovery and logical replication; it is not PostgreSQL physical XLOG.

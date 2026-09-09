@@ -50,6 +50,16 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
             _ => return Err(cast_unsupported(&v, "xid8")),
         },
+        ColType::Tid => match v {
+            Datum::Tid(_) => v,
+            Datum::Text(text) => Datum::Tid(crate::sql::identity::parse_tid(text)?),
+            _ => return Err(cast_unsupported(&v, "tid")),
+        },
+        ColType::Cid => match v {
+            Datum::Cid(_) => v,
+            Datum::Text(text) => Datum::Cid(crate::sql::identity::parse_cid(text)?),
+            _ => return Err(cast_unsupported(&v, "cid")),
+        },
         ColType::PgSnapshot | ColType::TxidSnapshot => {
             let legacy = target == ColType::TxidSnapshot;
             match v {

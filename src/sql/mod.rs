@@ -17,6 +17,7 @@ pub(crate) mod foreign;
 pub mod full_text;
 pub mod geometry;
 pub mod guc;
+pub mod identity;
 pub mod json;
 pub mod jsonpath;
 pub(crate) mod large_object;

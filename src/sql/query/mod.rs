@@ -3736,7 +3736,7 @@ fn correlated_row_hooks<'scratch, 'a>(
 /// canonicalized `jsonb` instead. The `=` operator already declines here; these
 /// three sort and deduplicate by the projected encoding and so never consult
 /// it, which is why each has to be checked where its keys are known rather than
-/// where they are compared.
+/// where they are compared. `cid` and `cid[]` have equality but no ordering.
 fn check_key_types<'a>(
     statement: &'a Select<'a>,
     scope: &QueryScope<'a>,
@@ -3751,6 +3751,14 @@ fn check_key_types<'a>(
     };
     let is_json =
         |e: &Expr<'a>| matches!(infer_scope_type(e, scope), Ok((super::types::oid::JSON, _)));
+    let unordered_cid = |e: &Expr<'a>| {
+        matches!(
+            infer_scope_type(e, scope)
+                .ok()
+                .and_then(|(oid, _)| ColType::from_oid(oid)),
+            Some(ColType::Cid | ColType::Array(super::types::ArrElem::Cid))
+        )
+    };
     for key in statement.group_by.iter().chain(statement.distinct_on) {
         if is_json(key) {
             return undefined(false);
@@ -3760,6 +3768,23 @@ fn check_key_types<'a>(
         let target = resolve_order_target(order.expression, statement.items, scope, arena)?;
         if is_json(target) {
             return undefined(true);
+        }
+        if unordered_cid(target) {
+            let type_name = if matches!(
+                infer_scope_type(target, scope)
+                    .ok()
+                    .and_then(|(oid, _)| ColType::from_oid(oid)),
+                Some(ColType::Array(_))
+            ) {
+                "cid[]"
+            } else {
+                "cid"
+            };
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "could not identify an ordering operator for type {}",
+                type_name
+            ));
         }
     }
     if statement.distinct {

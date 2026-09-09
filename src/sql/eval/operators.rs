@@ -933,10 +933,10 @@ pub(crate) fn compare_datums_as(
         }
         (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
         (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
-        // Network addresses order by PostgreSQL's network_cmp: family, then
-        // address bytes, then mask length. `inet` and `cidr` compare across.
+        // Network addresses compare common network bits before mask width and
+        // remaining host bits. `inet` and `cidr` compare across.
         (Datum::Inet(a) | Datum::Cidr(a), Datum::Inet(b) | Datum::Cidr(b)) => {
-            a.cmp_key().cmp(&b.cmp_key())
+            crate::sql::net::network_cmp(a, b).cmp(&0)
         }
         (Datum::Macaddr(a), Datum::Macaddr(b)) => a.cmp(b),
         (Datum::Macaddr8(a), Datum::Macaddr8(b)) => a.cmp(b),
@@ -1778,6 +1778,14 @@ pub(crate) fn unary<'a>(
         (UnaryOp::BitNot, Datum::Int8(x)) => Ok(Datum::Int8(!x)),
         // ~inet inverts every address bit, preserving family and mask.
         (UnaryOp::BitNot, Datum::Inet(n) | Datum::Cidr(n)) => Ok(Datum::Inet(network_not(&n))),
+        (UnaryOp::BitNot, Datum::Macaddr(mut bytes)) => {
+            bytes.iter_mut().for_each(|byte| *byte = !*byte);
+            Ok(Datum::Macaddr(bytes))
+        }
+        (UnaryOp::BitNot, Datum::Macaddr8(mut bytes)) => {
+            bytes.iter_mut().for_each(|byte| *byte = !*byte);
+            Ok(Datum::Macaddr8(bytes))
+        }
         (UnaryOp::Neg, other) => Err(type_mismatch("-", &other)),
         (UnaryOp::Not, other) => match super::boolean_argument(other, "NOT")? {
             Datum::Bool(b) => Ok(Datum::Bool(!b)),
@@ -1893,7 +1901,7 @@ fn net_contains(sup: &NetAddr, sub: &NetAddr) -> bool {
 }
 
 /// The network containment/overlap predicates (`<<`, `>>`, `<<=`, `>>=`, `&&`).
-fn network_relop(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> bool {
+pub(crate) fn network_relop(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> bool {
     use BinaryOp::*;
     match operator {
         Shl => net_contains(r, l) && r.bits() < l.bits(),
@@ -1907,7 +1915,11 @@ fn network_relop(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> bool {
 
 /// `inet & inet` / `inet | inet`: bytewise over the address, result mask the
 /// larger of the two. Different families are an error.
-fn network_bitwise(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> Result<NetAddr, SqlError> {
+pub(crate) fn network_bitwise(
+    operator: BinaryOp,
+    l: &NetAddr,
+    r: &NetAddr,
+) -> Result<NetAddr, SqlError> {
     if l.family() != r.family() {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
@@ -1931,7 +1943,7 @@ fn network_bitwise(operator: BinaryOp, l: &NetAddr, r: &NetAddr) -> Result<NetAd
 }
 
 /// `~inet`: invert every address bit (over the family's byte width).
-fn network_not(n: &NetAddr) -> NetAddr {
+pub(crate) fn network_not(n: &NetAddr) -> NetAddr {
     let mut addr = *n.addr();
     for byte in addr[..n.addr_len()].iter_mut() {
         *byte = !*byte;
@@ -1941,7 +1953,7 @@ fn network_not(n: &NetAddr) -> NetAddr {
 
 /// Adds a signed delta to an address (big-endian over the family width),
 /// preserving the mask. `None` on overflow past the family's range.
-fn addr_offset(n: &NetAddr, delta: i64) -> Option<NetAddr> {
+pub(crate) fn addr_offset(n: &NetAddr, delta: i64) -> Option<NetAddr> {
     let len = n.addr_len();
     let mut addr = *n.addr();
     let magnitude = delta.unsigned_abs();
@@ -1976,7 +1988,7 @@ fn addr_offset(n: &NetAddr, delta: i64) -> Option<NetAddr> {
 
 /// `inet - inet`: the signed distance between two addresses as int8. Both must
 /// be the same family; a v6 distance beyond int8 overflows loudly.
-fn network_distance(l: &NetAddr, r: &NetAddr) -> Result<i64, SqlError> {
+pub(crate) fn network_distance(l: &NetAddr, r: &NetAddr) -> Result<i64, SqlError> {
     if l.family() != r.family() {
         return Err(sql_err!(
             sqlstate::UNDEFINED_FUNCTION,
@@ -2025,7 +2037,13 @@ fn network_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datu
                 // inet ± integer.
                 (Some(a), None) => {
                     let delta = as_i64(&r).ok_or_else(|| net_operand_error(operator, &l, &r))?;
-                    let signed = if operator == Sub { -delta } else { delta };
+                    let signed = if operator == Sub {
+                        delta.checked_neg().ok_or_else(|| {
+                            sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "result is out of range")
+                        })?
+                    } else {
+                        delta
+                    };
                     addr_offset(&a, signed).map(Datum::Inet).ok_or_else(|| {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "result is out of range")
                     })
@@ -2058,6 +2076,36 @@ fn net_operand_error(operator: BinaryOp, l: &Datum, r: &Datum) -> SqlError {
 /// Whether a datum is an `inet` or `cidr`.
 fn is_network(d: &Datum) -> bool {
     matches!(d, Datum::Inet(_) | Datum::Cidr(_))
+}
+
+fn is_mac(d: &Datum) -> bool {
+    matches!(d, Datum::Macaddr(_) | Datum::Macaddr8(_))
+}
+
+fn mac_bitwise<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datum<'a>, SqlError> {
+    if l.is_null() || r.is_null() {
+        return Ok(Datum::Null);
+    }
+    let apply = |left: u8, right: u8| match operator {
+        BinaryOp::BitAnd => left & right,
+        BinaryOp::BitOr => left | right,
+        _ => unreachable!("non-bitwise operator routed to mac_bitwise"),
+    };
+    match (l, r) {
+        (Datum::Macaddr(mut left), Datum::Macaddr(right)) => {
+            for (left, right) in left.iter_mut().zip(right) {
+                *left = apply(*left, right);
+            }
+            Ok(Datum::Macaddr(left))
+        }
+        (Datum::Macaddr8(mut left), Datum::Macaddr8(right)) => {
+            for (left, right) in left.iter_mut().zip(right) {
+                *left = apply(*left, right);
+            }
+            Ok(Datum::Macaddr8(left))
+        }
+        (left, right) => Err(net_operand_error(operator, &left, &right)),
+    }
 }
 
 pub(crate) fn binary<'a>(
@@ -2248,6 +2296,7 @@ pub(crate) fn binary<'a>(
         },
         NetContainedEq | NetContainsEq => network_op(operator, l, r),
         BitAnd | BitOr if is_network(&l) || is_network(&r) => network_op(operator, l, r),
+        BitAnd | BitOr if is_mac(&l) || is_mac(&r) => mac_bitwise(operator, l, r),
         BitAnd | BitOr | BitXor => match (l, r) {
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_bitwise(operator, l, r, arena),
             _ => bitwise(operator, l, r),

@@ -1987,6 +1987,445 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6162, "bit_count", super::types::oid::INT8, "1560", 1, "i"),
     intrinsic!(6163, "bit_count", super::types::oid::INT8, "17", 1, "i"),
     intrinsic!(6167, "bit_xor", super::types::oid::BIT, "1560", 1, "i"),
+    // PostgreSQL 18 network-address scalar, support, and aggregate routines.
+    intrinsic!(328, "hashmacaddr8", super::types::oid::INT4, "774", 1, "i"),
+    intrinsic!(399, "hashmacaddr", super::types::oid::INT4, "829", 1, "i"),
+    intrinsic!(422, "hashinet", super::types::oid::INT4, "869", 1, "i"),
+    intrinsic!(
+        436,
+        "macaddr_in",
+        super::types::oid::MACADDR,
+        "2275",
+        1,
+        "i"
+    ),
+    intrinsic!(437, "macaddr_out", 2275, "829", 1, "i"),
+    intrinsic!(598, "abbrev", super::types::oid::TEXT, "869", 1, "i"),
+    intrinsic!(599, "abbrev", super::types::oid::TEXT, "650", 1, "i"),
+    intrinsic!(
+        605,
+        "set_masklen",
+        super::types::oid::INET,
+        "869 23",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        635,
+        "set_masklen",
+        super::types::oid::CIDR,
+        "650 23",
+        2,
+        "i"
+    ),
+    intrinsic!(683, "network", super::types::oid::CIDR, "869", 1, "i"),
+    intrinsic!(696, "netmask", super::types::oid::INET, "869", 1, "i"),
+    intrinsic!(697, "masklen", super::types::oid::INT4, "869", 1, "i"),
+    intrinsic!(698, "broadcast", super::types::oid::INET, "869", 1, "i"),
+    intrinsic!(699, "host", super::types::oid::TEXT, "869", 1, "i"),
+    intrinsic!(711, "family", super::types::oid::INT4, "869", 1, "i"),
+    intrinsic!(730, "text", super::types::oid::TEXT, "869", 1, "i"),
+    intrinsic!(753, "trunc", super::types::oid::MACADDR, "829", 1, "i"),
+    intrinsic!(
+        778,
+        "hashmacaddrextended",
+        super::types::oid::INT8,
+        "829 20",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        779,
+        "hashinetextended",
+        super::types::oid::INT8,
+        "869 20",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        781,
+        "hashmacaddr8extended",
+        super::types::oid::INT8,
+        "774 20",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        830,
+        "macaddr_eq",
+        super::types::oid::BOOL,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        831,
+        "macaddr_lt",
+        super::types::oid::BOOL,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        832,
+        "macaddr_le",
+        super::types::oid::BOOL,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        833,
+        "macaddr_gt",
+        super::types::oid::BOOL,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        834,
+        "macaddr_ge",
+        super::types::oid::BOOL,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        835,
+        "macaddr_ne",
+        super::types::oid::BOOL,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        836,
+        "macaddr_cmp",
+        super::types::oid::INT4,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(910, "inet_in", super::types::oid::INET, "2275", 1, "i"),
+    intrinsic!(911, "inet_out", 2275, "869", 1, "i"),
+    intrinsic!(
+        920,
+        "network_eq",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        921,
+        "network_lt",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        922,
+        "network_le",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        923,
+        "network_gt",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        924,
+        "network_ge",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        925,
+        "network_ne",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        926,
+        "network_cmp",
+        super::types::oid::INT4,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        927,
+        "network_sub",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        928,
+        "network_subeq",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        929,
+        "network_sup",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        930,
+        "network_supeq",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(1267, "cidr_in", super::types::oid::CIDR, "2275", 1, "i"),
+    intrinsic!(1362, "hostmask", super::types::oid::INET, "869", 1, "i"),
+    intrinsic!(1427, "cidr_out", 2275, "650", 1, "i"),
+    intrinsic!(1715, "cidr", super::types::oid::CIDR, "869", 1, "i"),
+    intrinsic!(
+        2494,
+        "macaddr_recv",
+        super::types::oid::MACADDR,
+        "2281",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        2495,
+        "macaddr_send",
+        super::types::oid::BYTEA,
+        "829",
+        1,
+        "i"
+    ),
+    intrinsic!(2496, "inet_recv", super::types::oid::INET, "2281", 1, "i"),
+    intrinsic!(2497, "inet_send", super::types::oid::BYTEA, "869", 1, "i"),
+    intrinsic!(2498, "cidr_recv", super::types::oid::CIDR, "2281", 1, "i"),
+    intrinsic!(2499, "cidr_send", super::types::oid::BYTEA, "650", 1, "i"),
+    intrinsic!(2627, "inetnot", super::types::oid::INET, "869", 1, "i"),
+    intrinsic!(2628, "inetand", super::types::oid::INET, "869 869", 2, "i"),
+    intrinsic!(2629, "inetor", super::types::oid::INET, "869 869", 2, "i"),
+    intrinsic!(2630, "inetpl", super::types::oid::INET, "869 20", 2, "i"),
+    intrinsic!(
+        2631,
+        "int8pl_inet",
+        super::types::oid::INET,
+        "20 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        2632,
+        "inetmi_int8",
+        super::types::oid::INET,
+        "869 20",
+        2,
+        "i"
+    ),
+    intrinsic!(2633, "inetmi", super::types::oid::INT8, "869 869", 2, "i"),
+    intrinsic!(
+        3144,
+        "macaddr_not",
+        super::types::oid::MACADDR,
+        "829",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        3145,
+        "macaddr_and",
+        super::types::oid::MACADDR,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3146,
+        "macaddr_or",
+        super::types::oid::MACADDR,
+        "829 829",
+        2,
+        "i"
+    ),
+    intrinsic!(3359, "macaddr_sortsupport", 2278, "2281", 1, "i"),
+    intrinsic!(
+        3446,
+        "macaddr8_recv",
+        super::types::oid::MACADDR8,
+        "2281",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        3447,
+        "macaddr8_send",
+        super::types::oid::BYTEA,
+        "774",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        3551,
+        "network_overlap",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3562,
+        "network_larger",
+        super::types::oid::INET,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3563,
+        "network_smaller",
+        super::types::oid::INET,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(3564, "max", super::types::oid::INET, "869", 1, "i"),
+    intrinsic!(3565, "min", super::types::oid::INET, "869", 1, "i"),
+    intrinsic!(
+        4063,
+        "inet_merge",
+        super::types::oid::CIDR,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4071,
+        "inet_same_family",
+        super::types::oid::BOOL,
+        "869 869",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4110,
+        "macaddr8_in",
+        super::types::oid::MACADDR8,
+        "2275",
+        1,
+        "i"
+    ),
+    intrinsic!(4111, "macaddr8_out", 2275, "774", 1, "i"),
+    intrinsic!(4112, "trunc", super::types::oid::MACADDR8, "774", 1, "i"),
+    intrinsic!(
+        4113,
+        "macaddr8_eq",
+        super::types::oid::BOOL,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4114,
+        "macaddr8_lt",
+        super::types::oid::BOOL,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4115,
+        "macaddr8_le",
+        super::types::oid::BOOL,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4116,
+        "macaddr8_gt",
+        super::types::oid::BOOL,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4117,
+        "macaddr8_ge",
+        super::types::oid::BOOL,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4118,
+        "macaddr8_ne",
+        super::types::oid::BOOL,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4119,
+        "macaddr8_cmp",
+        super::types::oid::INT4,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4120,
+        "macaddr8_not",
+        super::types::oid::MACADDR8,
+        "774",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        4121,
+        "macaddr8_and",
+        super::types::oid::MACADDR8,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4122,
+        "macaddr8_or",
+        super::types::oid::MACADDR8,
+        "774 774",
+        2,
+        "i"
+    ),
+    intrinsic!(4123, "macaddr8", super::types::oid::MACADDR8, "829", 1, "i"),
+    intrinsic!(4124, "macaddr", super::types::oid::MACADDR, "774", 1, "i"),
+    intrinsic!(
+        4125,
+        "macaddr8_set7bit",
+        super::types::oid::MACADDR8,
+        "774",
+        1,
+        "i"
+    ),
+    intrinsic!(5033, "network_sortsupport", 2278, "2281", 1, "i"),
+    intrinsic!(5051, "btequalimage", super::types::oid::BOOL, "26", 1, "i"),
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -2036,6 +2475,8 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 6395
             | 6396
             | 6167
+            | 3564
+            | 3565
     )
 }
 
@@ -2113,8 +2554,8 @@ fn intrinsic_record_outputs(
 struct CatalogOperator {
     oid: i32,
     name: &'static str,
-    left: ColType,
-    right: ColType,
+    left: Option<ColType>,
+    right: Option<ColType>,
     result: ColType,
     procedure_oid: i32,
     procedure_name: &'static str,
@@ -2131,8 +2572,8 @@ macro_rules! catalog_operator {
         CatalogOperator {
             oid: $oid,
             name: $name,
-            left: $left,
-            right: $right,
+            left: Some($left),
+            right: Some($right),
             result: $result,
             procedure_oid: $procedure_oid,
             procedure_name: $procedure_name,
@@ -2151,8 +2592,8 @@ macro_rules! catalog_operator_with_commutator {
         CatalogOperator {
             oid: $oid,
             name: $name,
-            left: $left,
-            right: $right,
+            left: Some($left),
+            right: Some($right),
             result: $result,
             procedure_oid: $procedure_oid,
             procedure_name: $procedure_name,
@@ -2173,8 +2614,8 @@ macro_rules! catalog_comparison_operator {
         CatalogOperator {
             oid: $oid,
             name: $name,
-            left: $type,
-            right: $type,
+            left: Some($type),
+            right: Some($type),
             result: ColType::Bool,
             procedure_oid: $procedure_oid,
             procedure_name: $procedure_name,
@@ -2184,6 +2625,26 @@ macro_rules! catalog_comparison_operator {
             hashes: $hashes,
             restriction: Some(($restriction_oid, $restriction_name)),
             join: Some(($join_oid, $join_name)),
+        }
+    };
+}
+
+macro_rules! catalog_prefix_operator {
+    ($oid:literal, $name:literal, $right:expr, $result:expr, $procedure_oid:literal, $procedure_name:literal) => {
+        CatalogOperator {
+            oid: $oid,
+            name: $name,
+            left: None,
+            right: Some($right),
+            result: $result,
+            procedure_oid: $procedure_oid,
+            procedure_name: $procedure_name,
+            commutator: 0,
+            negator: 0,
+            merges: false,
+            hashes: false,
+            restriction: None,
+            join: None,
         }
     };
 }
@@ -2291,8 +2752,8 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
     CatalogOperator {
         oid: 2016,
         name: "~~",
-        left: ColType::Bytea,
-        right: ColType::Bytea,
+        left: Some(ColType::Bytea),
+        right: Some(ColType::Bytea),
         result: ColType::Bool,
         procedure_oid: 2005,
         procedure_name: "bytealike",
@@ -2306,8 +2767,8 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
     CatalogOperator {
         oid: 2017,
         name: "!~~",
-        left: ColType::Bytea,
-        right: ColType::Bytea,
+        left: Some(ColType::Bytea),
+        right: Some(ColType::Bytea),
         result: ColType::Bool,
         procedure_oid: 2006,
         procedure_name: "byteanlike",
@@ -3166,6 +3627,460 @@ const CATALOG_OPERATORS: &[CatalogOperator] = &[
         4011,
         "jsonb_path_match_opr"
     ),
+    CatalogOperator {
+        oid: 931,
+        name: "<<",
+        left: Some(ColType::Inet),
+        right: Some(ColType::Inet),
+        result: ColType::Bool,
+        procedure_oid: 927,
+        procedure_name: "network_sub",
+        commutator: 933,
+        negator: 0,
+        merges: false,
+        hashes: false,
+        restriction: Some((3560, "networksel")),
+        join: Some((3561, "networkjoinsel")),
+    },
+    CatalogOperator {
+        oid: 932,
+        name: "<<=",
+        left: Some(ColType::Inet),
+        right: Some(ColType::Inet),
+        result: ColType::Bool,
+        procedure_oid: 928,
+        procedure_name: "network_subeq",
+        commutator: 934,
+        negator: 0,
+        merges: false,
+        hashes: false,
+        restriction: Some((3560, "networksel")),
+        join: Some((3561, "networkjoinsel")),
+    },
+    CatalogOperator {
+        oid: 933,
+        name: ">>",
+        left: Some(ColType::Inet),
+        right: Some(ColType::Inet),
+        result: ColType::Bool,
+        procedure_oid: 929,
+        procedure_name: "network_sup",
+        commutator: 931,
+        negator: 0,
+        merges: false,
+        hashes: false,
+        restriction: Some((3560, "networksel")),
+        join: Some((3561, "networkjoinsel")),
+    },
+    CatalogOperator {
+        oid: 934,
+        name: ">>=",
+        left: Some(ColType::Inet),
+        right: Some(ColType::Inet),
+        result: ColType::Bool,
+        procedure_oid: 930,
+        procedure_name: "network_supeq",
+        commutator: 932,
+        negator: 0,
+        merges: false,
+        hashes: false,
+        restriction: Some((3560, "networksel")),
+        join: Some((3561, "networkjoinsel")),
+    },
+    catalog_comparison_operator!(
+        1201,
+        "=",
+        ColType::Inet,
+        920,
+        "network_eq",
+        1201,
+        1202,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1202,
+        "<>",
+        ColType::Inet,
+        925,
+        "network_ne",
+        1202,
+        1201,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1203,
+        "<",
+        ColType::Inet,
+        921,
+        "network_lt",
+        1205,
+        1206,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1204,
+        "<=",
+        ColType::Inet,
+        922,
+        "network_le",
+        1206,
+        1205,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        1205,
+        ">",
+        ColType::Inet,
+        923,
+        "network_gt",
+        1203,
+        1204,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1206,
+        ">=",
+        ColType::Inet,
+        924,
+        "network_ge",
+        1204,
+        1203,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_comparison_operator!(
+        1220,
+        "=",
+        ColType::Macaddr,
+        830,
+        "macaddr_eq",
+        1220,
+        1221,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1221,
+        "<>",
+        ColType::Macaddr,
+        835,
+        "macaddr_ne",
+        1221,
+        1220,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1222,
+        "<",
+        ColType::Macaddr,
+        831,
+        "macaddr_lt",
+        1224,
+        1225,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1223,
+        "<=",
+        ColType::Macaddr,
+        832,
+        "macaddr_le",
+        1225,
+        1224,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        1224,
+        ">",
+        ColType::Macaddr,
+        833,
+        "macaddr_gt",
+        1222,
+        1223,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        1225,
+        ">=",
+        ColType::Macaddr,
+        834,
+        "macaddr_ge",
+        1223,
+        1222,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_prefix_operator!(2634, "~", ColType::Inet, ColType::Inet, 2627, "inetnot"),
+    catalog_operator!(
+        2635,
+        "&",
+        ColType::Inet,
+        ColType::Inet,
+        ColType::Inet,
+        2628,
+        "inetand"
+    ),
+    catalog_operator!(
+        2636,
+        "|",
+        ColType::Inet,
+        ColType::Inet,
+        ColType::Inet,
+        2629,
+        "inetor"
+    ),
+    catalog_operator_with_commutator!(
+        2637,
+        "+",
+        ColType::Inet,
+        ColType::Int8,
+        ColType::Inet,
+        2630,
+        "inetpl",
+        2638
+    ),
+    catalog_operator_with_commutator!(
+        2638,
+        "+",
+        ColType::Int8,
+        ColType::Inet,
+        ColType::Inet,
+        2631,
+        "int8pl_inet",
+        2637
+    ),
+    catalog_operator!(
+        2639,
+        "-",
+        ColType::Inet,
+        ColType::Int8,
+        ColType::Inet,
+        2632,
+        "inetmi_int8"
+    ),
+    catalog_operator!(
+        2640,
+        "-",
+        ColType::Inet,
+        ColType::Inet,
+        ColType::Int8,
+        2633,
+        "inetmi"
+    ),
+    catalog_prefix_operator!(
+        3147,
+        "~",
+        ColType::Macaddr,
+        ColType::Macaddr,
+        3144,
+        "macaddr_not"
+    ),
+    catalog_operator!(
+        3148,
+        "&",
+        ColType::Macaddr,
+        ColType::Macaddr,
+        ColType::Macaddr,
+        3145,
+        "macaddr_and"
+    ),
+    catalog_operator!(
+        3149,
+        "|",
+        ColType::Macaddr,
+        ColType::Macaddr,
+        ColType::Macaddr,
+        3146,
+        "macaddr_or"
+    ),
+    catalog_comparison_operator!(
+        3362,
+        "=",
+        ColType::Macaddr8,
+        4113,
+        "macaddr8_eq",
+        3362,
+        3363,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3363,
+        "<>",
+        ColType::Macaddr8,
+        4118,
+        "macaddr8_ne",
+        3363,
+        3362,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3364,
+        "<",
+        ColType::Macaddr8,
+        4114,
+        "macaddr8_lt",
+        3366,
+        3367,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3365,
+        "<=",
+        ColType::Macaddr8,
+        4115,
+        "macaddr8_le",
+        3367,
+        3366,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        3366,
+        ">",
+        ColType::Macaddr8,
+        4116,
+        "macaddr8_gt",
+        3364,
+        3365,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3367,
+        ">=",
+        ColType::Macaddr8,
+        4117,
+        "macaddr8_ge",
+        3365,
+        3364,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_prefix_operator!(
+        3368,
+        "~",
+        ColType::Macaddr8,
+        ColType::Macaddr8,
+        4120,
+        "macaddr8_not"
+    ),
+    catalog_operator!(
+        3369,
+        "&",
+        ColType::Macaddr8,
+        ColType::Macaddr8,
+        ColType::Macaddr8,
+        4121,
+        "macaddr8_and"
+    ),
+    catalog_operator!(
+        3370,
+        "|",
+        ColType::Macaddr8,
+        ColType::Macaddr8,
+        ColType::Macaddr8,
+        4122,
+        "macaddr8_or"
+    ),
+    CatalogOperator {
+        oid: 3552,
+        name: "&&",
+        left: Some(ColType::Inet),
+        right: Some(ColType::Inet),
+        result: ColType::Bool,
+        procedure_oid: 3551,
+        procedure_name: "network_overlap",
+        commutator: 3552,
+        negator: 0,
+        merges: false,
+        hashes: false,
+        restriction: Some((3560, "networksel")),
+        join: Some((3561, "networkjoinsel")),
+    },
 ];
 
 fn builtin_regproc(entry: Option<(i32, &'static str)>) -> Datum<'static> {
@@ -3196,6 +4111,20 @@ const VARBIT_BTREE_OPERATOR_FAMILY_OID: i32 = 2002;
 const VARBIT_BTREE_OPERATOR_CLASS_OID: i32 = 10043;
 const BYTEA_HASH_OPERATOR_FAMILY_OID: i32 = 2223;
 const BYTEA_HASH_OPERATOR_CLASS_OID: i32 = 10049;
+const NETWORK_BTREE_OPERATOR_FAMILY_OID: i32 = 1974;
+const NETWORK_HASH_OPERATOR_FAMILY_OID: i32 = 1975;
+const MACADDR_BTREE_OPERATOR_FAMILY_OID: i32 = 1984;
+const MACADDR_HASH_OPERATOR_FAMILY_OID: i32 = 1985;
+const MACADDR8_BTREE_OPERATOR_FAMILY_OID: i32 = 3371;
+const MACADDR8_HASH_OPERATOR_FAMILY_OID: i32 = 3372;
+const CIDR_BTREE_OPERATOR_CLASS_OID: i32 = 10009;
+const CIDR_HASH_OPERATOR_CLASS_OID: i32 = 10010;
+const INET_BTREE_OPERATOR_CLASS_OID: i32 = 10015;
+const INET_HASH_OPERATOR_CLASS_OID: i32 = 10016;
+const MACADDR_BTREE_OPERATOR_CLASS_OID: i32 = 10024;
+const MACADDR_HASH_OPERATOR_CLASS_OID: i32 = 10025;
+const MACADDR8_BTREE_OPERATOR_CLASS_OID: i32 = 10026;
+const MACADDR8_HASH_OPERATOR_CLASS_OID: i32 = 10027;
 const MONEY_CMP_OID: i32 = 377;
 const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
@@ -6256,8 +7185,8 @@ pub(crate) fn operator_oid_by_name(
         let mut found = None;
         for operator in CATALOG_OPERATORS {
             let builtin_signature = crate::storage::OperatorSignature {
-                left: Some(crate::storage::RoutineResult::builtin(operator.left)),
-                right: Some(crate::storage::RoutineResult::builtin(operator.right)),
+                left: operator.left.map(crate::storage::RoutineResult::builtin),
+                right: operator.right.map(crate::storage::RoutineResult::builtin),
             };
             if !identifier_spelling_matches(written_name, operator.name)
                 || arguments.is_some_and(|signature| signature != builtin_signature)
@@ -6320,7 +7249,7 @@ pub(crate) fn operator_oid_by_name(
 
 pub(crate) fn operator_oid_for_types(name: &str, left: ColType, right: ColType) -> Option<i32> {
     CATALOG_OPERATORS.iter().find_map(|operator| {
-        (operator.name == name && operator.left == left && operator.right == right)
+        (operator.name == name && operator.left == Some(left) && operator.right == Some(right))
             .then_some(operator.oid)
     })
 }
@@ -6350,14 +7279,17 @@ pub(crate) fn operator_name_by_oid<'a>(
         }
         let mut text = StackStr::<96>::new();
         use core::fmt::Write;
-        write!(
-            text,
-            "{}({},{})",
-            operator.name,
-            operator.left.name(),
-            operator.right.name()
-        )
-        .map_err(|_| super::eval::arena_full())?;
+        write!(text, "{}(", operator.name).map_err(|_| super::eval::arena_full())?;
+        for (index, operand) in [operator.left, operator.right].into_iter().enumerate() {
+            if index != 0 {
+                text.write_char(',')
+                    .map_err(|_| super::eval::arena_full())?;
+            }
+            text.write_str(operand.map_or("NONE", ColType::name))
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        text.write_char(')')
+            .map_err(|_| super::eval::arena_full())?;
         return arena
             .alloc_str(text.as_str())
             .map(Some)
@@ -14199,6 +15131,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::NUMERIC,
             3823,
             "a",
+            "f",
         ),
         (
             10_002,
@@ -14206,6 +15139,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::MONEY,
             3824,
             "a",
+            "f",
         ),
         (
             10_003,
@@ -14213,6 +15147,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::MONEY,
             3811,
             "a",
+            "f",
         ),
         (
             10_004,
@@ -14220,6 +15155,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::MONEY,
             3812,
             "a",
+            "f",
         ),
         (
             10143,
@@ -14227,6 +15163,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::BYTEA,
             6367,
             "e",
+            "f",
         ),
         (
             10144,
@@ -14234,6 +15171,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::BYTEA,
             6368,
             "e",
+            "f",
         ),
         (
             10145,
@@ -14241,6 +15179,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::BYTEA,
             6369,
             "e",
+            "f",
         ),
         (
             10146,
@@ -14248,6 +15187,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::INT2,
             6370,
             "e",
+            "f",
         ),
         (
             10147,
@@ -14255,6 +15195,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::INT4,
             6371,
             "e",
+            "f",
         ),
         (
             10148,
@@ -14262,9 +15203,91 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             super::types::oid::INT8,
             6372,
             "e",
+            "f",
+        ),
+        (
+            10185,
+            super::types::oid::MACADDR,
+            super::types::oid::MACADDR8,
+            4123,
+            "i",
+            "f",
+        ),
+        (
+            10186,
+            super::types::oid::MACADDR8,
+            super::types::oid::MACADDR,
+            4124,
+            "i",
+            "f",
+        ),
+        (
+            10187,
+            super::types::oid::CIDR,
+            super::types::oid::INET,
+            0,
+            "i",
+            "b",
+        ),
+        (
+            10188,
+            super::types::oid::INET,
+            super::types::oid::CIDR,
+            1715,
+            "a",
+            "f",
+        ),
+        (
+            10195,
+            super::types::oid::CIDR,
+            super::types::oid::TEXT,
+            730,
+            "a",
+            "f",
+        ),
+        (
+            10196,
+            super::types::oid::INET,
+            super::types::oid::TEXT,
+            730,
+            "a",
+            "f",
+        ),
+        (
+            10200,
+            super::types::oid::CIDR,
+            super::types::oid::VARCHAR,
+            730,
+            "a",
+            "f",
+        ),
+        (
+            10201,
+            super::types::oid::INET,
+            super::types::oid::VARCHAR,
+            730,
+            "a",
+            "f",
+        ),
+        (
+            10205,
+            super::types::oid::CIDR,
+            super::types::oid::BPCHAR,
+            730,
+            "a",
+            "f",
+        ),
+        (
+            10206,
+            super::types::oid::INET,
+            super::types::oid::BPCHAR,
+            730,
+            "a",
+            "f",
         ),
     ];
-    for (index, (oid, source, target, function, context)) in builtin.into_iter().enumerate() {
+    for (index, (oid, source, target, function, context, method)) in builtin.into_iter().enumerate()
+    {
         rows[index] = row(
             &[
                 Datum::Int4(2605),
@@ -14273,7 +15296,7 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(target),
                 Datum::Int4(function),
                 Datum::Bpchar(context),
-                Datum::Bpchar("f"),
+                Datum::Bpchar(method),
             ],
             arena,
         )?;
@@ -14347,11 +15370,15 @@ fn pg_operator<'a>(
                 text(operator.name, arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
-                Datum::Bpchar("b"),
+                Datum::Bpchar(match (operator.left, operator.right) {
+                    (None, Some(_)) => "l",
+                    (Some(_), None) => "r",
+                    _ => "b",
+                }),
                 Datum::Bool(operator.merges),
                 Datum::Bool(operator.hashes),
-                Datum::Int4(operator.left.oid()),
-                Datum::Int4(operator.right.oid()),
+                Datum::Int4(operator.left.map_or(0, ColType::oid)),
+                Datum::Int4(operator.right.map_or(0, ColType::oid)),
                 Datum::Int4(operator.result.oid()),
                 Datum::Int4(operator.commutator),
                 Datum::Int4(operator.negator),
@@ -14503,7 +15530,30 @@ fn pg_opfamily<'a>(
             arena,
         )?;
     }
-    let mut count = 9usize;
+    for (index, (oid, method, name)) in [
+        (NETWORK_BTREE_OPERATOR_FAMILY_OID, 403, "network_ops"),
+        (NETWORK_HASH_OPERATOR_FAMILY_OID, 405, "network_ops"),
+        (MACADDR_BTREE_OPERATOR_FAMILY_OID, 403, "macaddr_ops"),
+        (MACADDR_HASH_OPERATOR_FAMILY_OID, 405, "macaddr_ops"),
+        (MACADDR8_BTREE_OPERATOR_FAMILY_OID, 403, "macaddr8_ops"),
+        (MACADDR8_HASH_OPERATOR_FAMILY_OID, 405, "macaddr8_ops"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 9] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 15usize;
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -14666,7 +15716,92 @@ fn pg_opclass<'a>(
             arena,
         )?;
     }
-    let mut count = 9usize;
+    for (index, (oid, method, name, family, input, default)) in [
+        (
+            CIDR_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "cidr_ops",
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            false,
+        ),
+        (
+            CIDR_HASH_OPERATOR_CLASS_OID,
+            405,
+            "cidr_ops",
+            NETWORK_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            false,
+        ),
+        (
+            INET_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "inet_ops",
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            true,
+        ),
+        (
+            INET_HASH_OPERATOR_CLASS_OID,
+            405,
+            "inet_ops",
+            NETWORK_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            true,
+        ),
+        (
+            MACADDR_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "macaddr_ops",
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            true,
+        ),
+        (
+            MACADDR_HASH_OPERATOR_CLASS_OID,
+            405,
+            "macaddr_ops",
+            MACADDR_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            true,
+        ),
+        (
+            MACADDR8_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "macaddr8_ops",
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            true,
+        ),
+        (
+            MACADDR8_HASH_OPERATOR_CLASS_OID,
+            405,
+            "macaddr8_ops",
+            MACADDR8_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 9] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Bool(default),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 17usize;
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -14976,6 +16111,169 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         count += 1;
     }
+    for (oid, family, input, strategy, operator, method) in [
+        (
+            10190,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            1,
+            1203,
+            403,
+        ),
+        (
+            10191,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            2,
+            1204,
+            403,
+        ),
+        (
+            10192,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            3,
+            1201,
+            403,
+        ),
+        (
+            10193,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            4,
+            1206,
+            403,
+        ),
+        (
+            10194,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            5,
+            1205,
+            403,
+        ),
+        (
+            10262,
+            NETWORK_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            1,
+            1201,
+            405,
+        ),
+        (
+            10180,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            1,
+            1222,
+            403,
+        ),
+        (
+            10181,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            2,
+            1223,
+            403,
+        ),
+        (
+            10182,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            3,
+            1220,
+            403,
+        ),
+        (
+            10183,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            4,
+            1225,
+            403,
+        ),
+        (
+            10184,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            5,
+            1224,
+            403,
+        ),
+        (
+            10273,
+            MACADDR_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            1,
+            1220,
+            405,
+        ),
+        (
+            10185,
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            1,
+            3364,
+            403,
+        ),
+        (
+            10186,
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            2,
+            3365,
+            403,
+        ),
+        (
+            10187,
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            3,
+            3362,
+            403,
+        ),
+        (
+            10188,
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            4,
+            3367,
+            403,
+        ),
+        (
+            10189,
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            5,
+            3366,
+            403,
+        ),
+        (
+            10274,
+            MACADDR8_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            1,
+            3362,
+            405,
+        ),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(method),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -15233,6 +16531,134 @@ fn pg_amproc<'a>(
         )?;
     }
     let mut count = 19usize;
+    for (oid, family, input, number, procedure, name) in [
+        (
+            10044,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            1,
+            926,
+            "network_cmp",
+        ),
+        (
+            10045,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            2,
+            5033,
+            "network_sortsupport",
+        ),
+        (
+            10046,
+            NETWORK_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10144,
+            NETWORK_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            1,
+            422,
+            "hashinet",
+        ),
+        (
+            10145,
+            NETWORK_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::INET,
+            2,
+            779,
+            "hashinetextended",
+        ),
+        (
+            10074,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            1,
+            836,
+            "macaddr_cmp",
+        ),
+        (
+            10075,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            2,
+            3359,
+            "macaddr_sortsupport",
+        ),
+        (
+            10076,
+            MACADDR_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10154,
+            MACADDR_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            1,
+            399,
+            "hashmacaddr",
+        ),
+        (
+            10155,
+            MACADDR_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR,
+            2,
+            778,
+            "hashmacaddrextended",
+        ),
+        (
+            10120,
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            1,
+            4119,
+            "macaddr8_cmp",
+        ),
+        (
+            10121,
+            MACADDR8_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10198,
+            MACADDR8_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            1,
+            328,
+            "hashmacaddr8",
+        ),
+        (
+            10199,
+            MACADDR8_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::MACADDR8,
+            2,
+            781,
+            "hashmacaddr8extended",
+        ),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .functions
@@ -15916,7 +17342,10 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(routine.result_oid),
                 Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
                 Datum::Bpchar(
-                    if matches!(routine.oid, 2901 | 2112 | 2125 | 2141 | 2797 | 2798) {
+                    if matches!(
+                        routine.oid,
+                        2901 | 2112 | 2125 | 2141 | 2797 | 2798 | 3564 | 3565
+                    ) {
                         "a"
                     } else {
                         "f"
@@ -16338,7 +17767,7 @@ fn pg_aggregate<'a>(
             ("aggminitval", ColType::Text),
         ],
     );
-    let count = 12
+    let count = 14
         + (0..storage.routine_count())
             .filter(|slot| {
                 storage.routine_slot_visible_to(*slot, txid)
@@ -16557,7 +17986,40 @@ fn pg_aggregate<'a>(
         ],
         arena,
     )?;
-    let mut index = 12usize;
+    for (index, (aggregate_oid, transition_oid, sort_operator_oid)) in
+        [(3564, 3562, 1205), (3565, 3563, 1203)]
+            .into_iter()
+            .enumerate()
+    {
+        rows[index + 12] = row(
+            &[
+                regproc(aggregate_oid)?,
+                Datum::Bpchar("n"),
+                Datum::Int2(0),
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bpchar("r"),
+                Datum::Bpchar("r"),
+                Datum::Int4(sort_operator_oid),
+                Datum::Int4(super::types::oid::INET),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    let mut index = 14usize;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {

@@ -181,8 +181,8 @@ impl NetAddr {
         Some(self)
     }
 
-    /// Ordering key matching PostgreSQL's `network_cmp`: family, then address
-    /// bytes, then mask length.
+    /// Stable bytes for internal hash tables. PostgreSQL ordering is not a
+    /// lexicographic ordering of these bytes; use [`network_cmp`] for that.
     pub fn cmp_key(&self) -> [u8; 18] {
         let mut key = [0u8; 18];
         key[0] = self.family();
@@ -190,6 +190,55 @@ impl NetAddr {
         key[17] = self.bits;
         key
     }
+}
+
+/// Compares the first `bits` address bits in network order. PostgreSQL uses
+/// bytewise comparison for complete octets and a single-bit result for the
+/// final partial octet.
+fn bitncmp(left: &[u8; 16], right: &[u8; 16], bits: u8) -> i32 {
+    let bytes = usize::from(bits / 8);
+    for index in 0..bytes {
+        let difference = i32::from(left[index]) - i32::from(right[index]);
+        if difference != 0 {
+            return difference;
+        }
+    }
+    let remaining = bits % 8;
+    if remaining == 0 {
+        return 0;
+    }
+    let (mut left, mut right) = (left[bytes], right[bytes]);
+    for _ in 0..remaining {
+        let left_set = left & 0x80 != 0;
+        let right_set = right & 0x80 != 0;
+        if left_set != right_set {
+            return if left_set { 1 } else { -1 };
+        }
+        left <<= 1;
+        right <<= 1;
+    }
+    0
+}
+
+/// PostgreSQL's `network_cmp_internal`: common network bits first, then mask
+/// length, then the complete address. IPv4 sorts before IPv6.
+pub fn network_cmp(left: &NetAddr, right: &NetAddr) -> i32 {
+    if left.family == right.family {
+        let prefix = bitncmp(left.addr(), right.addr(), left.bits().min(right.bits()));
+        if prefix != 0 {
+            return prefix;
+        }
+        let mask = i32::from(left.bits()) - i32::from(right.bits());
+        if mask != 0 {
+            return mask;
+        }
+        return bitncmp(left.addr(), right.addr(), left.max_bits());
+    }
+    let code = |family| match family {
+        AddressFamily::V4 => 2_i32,
+        AddressFamily::V6 => 3_i32,
+    };
+    code(left.family) - code(right.family)
 }
 
 /// Whether byte `b`'s low `keep` bits (from the most-significant end) are the
@@ -703,6 +752,18 @@ mod tests {
         noncanonical_ipv4[4] = 1;
         assert!(NetAddr::new(4, 32, noncanonical_ipv4).is_none());
         assert!(NetAddr::new_cidr(4, 24, ipv4).is_none());
+    }
+
+    #[test]
+    fn network_comparison_uses_prefix_then_mask_then_host_bits() {
+        let compare = |left: &str, right: &str| {
+            network_cmp(&parse_inet(left).unwrap(), &parse_inet(right).unwrap())
+        };
+        assert_eq!(compare("10.0.0.1/8", "10.0.0.0/24"), -16);
+        assert_eq!(compare("10.0.0.0/8", "10.0.0.0/24"), -16);
+        assert_eq!(compare("10.0.0.1/24", "10.0.0.2/8"), 16);
+        assert_eq!(compare("10.0.0.0/24", "10.0.0.0/25"), -1);
+        assert_eq!(compare("::1", "0.0.0.0"), 1);
     }
 
     #[test]

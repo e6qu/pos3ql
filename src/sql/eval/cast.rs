@@ -204,6 +204,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 // bit -> integer: the bits are the low bits of the result
                 // (two's complement), so a full 32-bit string round-trips.
                 Datum::Int4(bits_to_uint(bits, 32, "integer")? as u32 as i32)
+            } else if let Datum::Bytea(bytes) = v {
+                Datum::Int4(bytes_to_uint(bytes, 4, "integer")? as u32 as i32)
             } else if let Datum::Text(s) = v {
                 // Text input names the offending value on overflow, where a
                 // value-to-value cast does not.
@@ -250,6 +252,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Int8 => {
             if let Datum::Bit { bits, .. } = v {
                 Datum::Int8(bits_to_uint(bits, 64, "bigint")? as i64)
+            } else if let Datum::Bytea(bytes) = v {
+                Datum::Int8(bytes_to_uint(bytes, 8, "bigint")? as i64)
             } else if let Datum::Text(s) = v {
                 Datum::Int8(parse_int_bounded(s, i64::MIN, i64::MAX, "bigint")?)
             } else {
@@ -329,6 +333,11 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Text(&s[..end])
         }
         ColType::Int2 => {
+            if let Datum::Bytea(bytes) = v {
+                return Ok(Datum::Int2(
+                    bytes_to_uint(bytes, 2, "smallint")? as u16 as i16
+                ));
+            }
             let x = if let Datum::Text(s) = v {
                 parse_int_bounded(s, -32768, 32767, "smallint")?
             } else {
@@ -494,6 +503,21 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Bytea => match v {
             Datum::Bytea(_) => v,
             Datum::Text(s) => Datum::Bytea(parse_bytea(s, arena)?),
+            Datum::Int2(value) => Datum::Bytea(
+                arena
+                    .alloc_slice_copy(&value.to_be_bytes())
+                    .map_err(|_| arena_full())?,
+            ),
+            Datum::Int4(value) => Datum::Bytea(
+                arena
+                    .alloc_slice_copy(&value.to_be_bytes())
+                    .map_err(|_| arena_full())?,
+            ),
+            Datum::Int8(value) => Datum::Bytea(
+                arena
+                    .alloc_slice_copy(&value.to_be_bytes())
+                    .map_err(|_| arena_full())?,
+            ),
             _ => return Err(cast_unsupported(&v, "bytea")),
         },
         ColType::Numeric => match v {
@@ -774,6 +798,19 @@ fn bits_to_uint(bits: &str, max_bits: usize, target: &'static str) -> Result<u64
     let mut value = 0u64;
     for c in bits.bytes() {
         value = (value << 1) | u64::from(c == b'1');
+    }
+    Ok(value)
+}
+
+/// PostgreSQL 18's integer/bytea casts use network byte order. Inputs shorter
+/// than the destination are zero-extended; wider inputs are out of range.
+fn bytes_to_uint(bytes: &[u8], max_bytes: usize, target: &'static str) -> Result<u64, SqlError> {
+    if bytes.len() > max_bytes {
+        return Err(overflow(target));
+    }
+    let mut value = 0_u64;
+    for &byte in bytes {
+        value = (value << 8) | u64::from(byte);
     }
     Ok(value)
 }

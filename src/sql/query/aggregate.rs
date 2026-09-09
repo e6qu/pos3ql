@@ -193,10 +193,12 @@ pub(crate) struct AggState<'a> {
     vals_cap: usize,
     // string_agg: the delimiter (captured on first input, for the DISTINCT
     // fold) and a doubling arena-backed byte buffer of the joined output.
-    sep: Option<&'a str>,
+    sep: Option<&'a [u8]>,
+    binary_string_agg: bool,
     str_buf: *mut u8,
     str_len: usize,
     str_cap: usize,
+    str_elements: usize,
     // string_agg(x ORDER BY k): each row's `[value, keys...]` tuple is buffered
     // self-describing-encoded, then sorted by the key columns and concatenated
     // in `finish`. `ordered` is only set for string_agg (ORDER BY cannot change
@@ -443,9 +445,11 @@ impl Default for AggState<'_> {
             vals_len: 0,
             vals_cap: 0,
             sep: None,
+            binary_string_agg: false,
             str_buf: core::ptr::null_mut(),
             str_len: 0,
             str_cap: 0,
+            str_elements: 0,
             ordered: false,
             elem_hint: None,
             array_input: false,
@@ -882,9 +886,15 @@ impl<'a> AggState<'a> {
                 ));
             }
         };
+        if self.kind == AggKind::StringAgg {
+            self.binary_string_agg = argument_oids.first() == Some(&crate::sql::types::oid::BYTEA);
+        }
         self.star = *star;
         self.distinct = *distinct;
         debug_assert!(!(*distinct && *star));
+        if self.kind == AggKind::StringAgg && *distinct {
+            self.ordered = true;
+        }
         // ORDER BY only affects string_agg (other aggregates are commutative,
         // so their result is identical regardless of input order).
         if !order_by.is_empty()
@@ -1490,15 +1500,25 @@ impl<'a> AggState<'a> {
             // Only reached through the DISTINCT fold; the streaming path handles
             // string_agg directly (it needs the per-row delimiter).
             AggKind::StringAgg => {
-                let v = crate::sql::eval::text_view(v);
-                let Datum::Text(s) = v else {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "string_agg requires text arguments"
-                    ));
+                let bytes = if self.binary_string_agg {
+                    let Datum::Bytea(bytes) = v else {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "string_agg requires matching bytea arguments"
+                        ));
+                    };
+                    bytes
+                } else {
+                    let Datum::Text(text) = crate::sql::eval::text_view(v) else {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "string_agg requires text arguments"
+                        ));
+                    };
+                    text.as_bytes()
                 };
-                let sep = self.sep.unwrap_or("");
-                self.append_str_elem(sep, s, arena)?;
+                let sep = self.sep.unwrap_or(&[]);
+                self.append_str_elem(sep, bytes, arena)?;
             }
             // Single-argument statistical aggregates fold Σx and Σx². Over
             // integer/numeric inputs PostgreSQL computes and returns an exact
@@ -1595,47 +1615,87 @@ impl<'a> AggState<'a> {
                 "string_agg requires exactly two arguments"
             ));
         }
-        let value = crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?);
+        let value = eval_full(args[0], arena, params, row, hooks)?;
         if value.is_null() {
             return Ok(());
         }
-        let Datum::Text(val_str) = value else {
-            return Err(sql_err!(
-                sqlstate::DATATYPE_MISMATCH,
-                "string_agg value must be text"
-            ));
-        };
-        let sep = eval_full(args[1], arena, params, row, hooks)?;
-        let sep_str = match crate::sql::eval::text_view(sep) {
-            Datum::Text(s) => s,
-            Datum::Null => "",
-            _ => {
+        let value = if self.binary_string_agg {
+            let Datum::Bytea(bytes) = value else {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
-                    "string_agg delimiter must be text"
+                    "string_agg value must be bytea"
                 ));
+            };
+            Datum::Bytea(bytes)
+        } else {
+            let Datum::Text(text) = crate::sql::eval::text_view(value) else {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "string_agg value must be text"
+                ));
+            };
+            Datum::Text(text)
+        };
+        let separator = eval_full(args[1], arena, params, row, hooks)?;
+        self.ord_collations[0] = resolved_expression_collation(args[0], row, hooks.catalog)?;
+        self.ord_collations[1] = resolved_expression_collation(args[1], row, hooks.catalog)?;
+        let separator = if self.binary_string_agg {
+            match separator {
+                Datum::Bytea(bytes) => Datum::Bytea(bytes),
+                Datum::Null => Datum::Null,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "string_agg delimiter must be bytea"
+                    ));
+                }
             }
+        } else {
+            match crate::sql::eval::text_view(separator) {
+                Datum::Text(text) => Datum::Text(text),
+                Datum::Null => Datum::Null,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "string_agg delimiter must be text"
+                    ));
+                }
+            }
+        };
+        let sep_bytes = match separator {
+            Datum::Bytea(bytes) => bytes,
+            Datum::Text(text) => text.as_bytes(),
+            Datum::Null => &[],
+            _ => unreachable!("string_agg delimiter was normalized above"),
         };
         // Stash the first delimiter so the DISTINCT/ORDER BY fold can reuse it.
         if self.sep.is_none() {
-            self.sep = Some(sep_str);
+            self.sep = Some(sep_bytes);
         }
         if self.ordered {
-            // Buffer `[value, sort-keys...]` to sort and concatenate in finish.
-            let mut tuple = [Datum::Null; 1 + MAX_PROJ];
-            tuple[0] = Datum::Text(val_str);
+            // Keep each row's delimiter with its value: PostgreSQL applies the
+            // delimiter belonging to the row after aggregate ordering.
+            let mut tuple = [Datum::Null; 2 + MAX_PROJ];
+            tuple[0] = value;
+            tuple[1] = separator;
             for (i, o) in self.ord_spec.iter().enumerate() {
                 self.ord_collations[i] =
                     resolved_expression_collation(o.expression, row, hooks.catalog)?;
-                tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
+                tuple[2 + i] = eval_full(o.expression, arena, params, row, hooks)?;
             }
             let enc =
-                crate::sql::exec::encode_projected_pub(&tuple[..1 + self.ord_spec.len()], arena)?;
-            // DISTINCT (the sort key is the value itself, enforced in init):
-            // encoded-tuple equality is value equality, so skip duplicates.
+                crate::sql::exec::encode_projected_pub(&tuple[..2 + self.ord_spec.len()], arena)?;
+            // DISTINCT applies to both aggregate arguments, including the
+            // delimiter. The encoded prefix retains exactly that pair.
             if self.distinct && self.ord_len > 0 {
                 let seen = unsafe { core::slice::from_raw_parts(self.ord, self.ord_len) };
-                if seen.contains(&enc) {
+                let duplicate = seen.iter().any(|prior| {
+                    crate::sql::exec::decode_projected_pub(prior, 0)
+                        == crate::sql::exec::decode_projected_pub(enc, 0)
+                        && crate::sql::exec::decode_projected_pub(prior, 1)
+                            == crate::sql::exec::decode_projected_pub(enc, 1)
+                });
+                if duplicate {
                     return Ok(());
                 }
             }
@@ -1644,9 +1704,14 @@ impl<'a> AggState<'a> {
             return Ok(());
         }
         if self.distinct {
-            return self.push_distinct(Datum::Text(val_str), arena);
+            return self.push_distinct(value, arena);
         }
-        self.append_str_elem(sep_str, val_str, arena)?;
+        let value_bytes = match value {
+            Datum::Bytea(bytes) => bytes,
+            Datum::Text(text) => text.as_bytes(),
+            _ => unreachable!("string_agg value was normalized above"),
+        };
+        self.append_str_elem(sep_bytes, value_bytes, arena)?;
         self.count += 1;
         Ok(())
     }
@@ -1676,18 +1741,18 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
-    /// Append `value` to the string_agg buffer, prefixing `sep` for every element
-    /// after the first (first = buffer still empty).
+    /// Append `value` to the string_agg buffer, prefixing `sep` after the first.
     fn append_str_elem(
         &mut self,
-        sep: &str,
-        value: &str,
+        sep: &[u8],
+        value: &[u8],
         arena: &'a Arena,
     ) -> Result<(), SqlError> {
-        if self.str_len > 0 {
-            self.push_bytes(sep.as_bytes(), arena)?;
+        if self.str_elements > 0 {
+            self.push_bytes(sep, arena)?;
         }
-        self.push_bytes(value.as_bytes(), arena)?;
+        self.push_bytes(value, arena)?;
+        self.str_elements += 1;
         Ok(())
     }
 
@@ -1721,8 +1786,6 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
-    /// Append a non-null value to the DISTINCT buffer, growing it (doubling)
-    /// in the arena when full. The prior region becomes dead bump-arena space.
     /// Reduces the buffered `WITHIN GROUP` values for an ordered-set aggregate.
     fn finish_ordered_set(
         &mut self,
@@ -1895,31 +1958,65 @@ impl<'a> AggState<'a> {
         let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
         let spec = self.ord_spec;
         let mut cmp_err: Option<SqlError> = None;
-        rows.sort_unstable_by(|left, right| {
-            compare_ordered_aggregate_rows(
-                left,
-                right,
-                spec,
-                1,
-                &self.ord_collations[..spec.len()],
-                catalog,
-                &mut cmp_err,
-            )
-        });
+        if spec.is_empty() && self.distinct {
+            rows.sort_unstable_by(|left, right| {
+                compare_custom_aggregate_rows(
+                    left,
+                    right,
+                    2,
+                    &self.ord_collations[..2],
+                    catalog,
+                    &mut cmp_err,
+                )
+            });
+        } else {
+            rows.sort_unstable_by(|left, right| {
+                compare_ordered_aggregate_rows(
+                    left,
+                    right,
+                    spec,
+                    2,
+                    &self.ord_collations[..spec.len()],
+                    catalog,
+                    &mut cmp_err,
+                )
+            });
+        }
         if let Some(e) = cmp_err {
             return Err(e);
         }
-        let sep = self.sep.unwrap_or("");
         for &row in rows.iter() {
-            let Datum::Text(s) =
-                crate::sql::eval::text_view(crate::sql::exec::decode_projected_pub(row, 0))
-            else {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "string_agg value must be text"
-                ));
+            let value = crate::sql::exec::decode_projected_pub(row, 0);
+            let bytes = if self.binary_string_agg {
+                let Datum::Bytea(bytes) = value else {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "string_agg value must be bytea"
+                    ));
+                };
+                bytes
+            } else {
+                let Datum::Text(text) = crate::sql::eval::text_view(value) else {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "string_agg value must be text"
+                    ));
+                };
+                text.as_bytes()
             };
-            self.append_str_elem(sep, s, arena)?;
+            let separator = crate::sql::exec::decode_projected_pub(row, 1);
+            let separator = match separator {
+                Datum::Bytea(bytes) if self.binary_string_agg => bytes,
+                Datum::Text(text) if !self.binary_string_agg => text.as_bytes(),
+                Datum::Null => &[],
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "string_agg delimiter type changed during ordering"
+                    ));
+                }
+            };
+            self.append_str_elem(separator, bytes, arena)?;
         }
         Ok(())
     }
@@ -1975,9 +2072,15 @@ impl<'a> AggState<'a> {
             AggKind::RegrCount => Datum::Int8(self.count as i64),
             // Min/Max and the bitwise aggregates return the running value in
             // `best` (NULL for an all-NULL or empty group).
-            AggKind::Min | AggKind::Max | AggKind::BitAnd | AggKind::BitOr | AggKind::BitXor => {
-                self.best.unwrap_or(Datum::Null)
-            }
+            AggKind::Min | AggKind::Max => self.best.unwrap_or(Datum::Null),
+            AggKind::BitAnd | AggKind::BitOr | AggKind::BitXor => match self.best {
+                Some(Datum::Bit { bits, .. }) => Datum::Bit {
+                    bits,
+                    varying: false,
+                },
+                Some(value) => value,
+                None => Datum::Null,
+            },
             _ if self.count == 0 => Datum::Null,
             // Statistical aggregates (count >= 1 here). `Sxx`/`Syy`/`Sxy` are the
             // corrected sums of squares/products; `_samp` needs count >= 2.
@@ -2100,7 +2203,11 @@ impl<'a> AggState<'a> {
             },
             AggKind::StringAgg => {
                 let bytes = unsafe { core::slice::from_raw_parts(self.str_buf, self.str_len) };
-                Datum::Text(unsafe { core::str::from_utf8_unchecked(bytes) })
+                if self.binary_string_agg {
+                    Datum::Bytea(bytes)
+                } else {
+                    Datum::Text(unsafe { core::str::from_utf8_unchecked(bytes) })
+                }
             }
             // Handled by `finish_ordered_set` before this match.
             AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::Mode => Datum::Null,

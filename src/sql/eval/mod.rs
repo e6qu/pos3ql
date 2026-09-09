@@ -2260,18 +2260,54 @@ pub fn eval_full<'a>(
         } => {
             let v = eval_full(operand, arena, params, row, hooks)?;
             let p = eval_full(pattern, arena, params, row, hooks)?;
+            let binary = matches!(v, Datum::Bytea(_));
             let escape = match escape {
-                Some(e) => match eval_full(e, arena, params, row, hooks)? {
-                    Datum::Null => return Ok(Datum::Null),
-                    d => Some(escape_char(d)?),
-                },
+                Some(e) => {
+                    let value = eval_full(e, arena, params, row, hooks)?;
+                    if value.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    if binary {
+                        let bytes = match value {
+                            Datum::Bytea(bytes) => bytes,
+                            Datum::Text(text) | Datum::Bpchar(text) => text.as_bytes(),
+                            other => {
+                                return Err(sql_err!(
+                                    sqlstate::DATATYPE_MISMATCH,
+                                    "ESCAPE requires a bytea operand, not {}",
+                                    type_name_of(&other)
+                                ));
+                            }
+                        };
+                        match bytes {
+                            [] => Some(None),
+                            [byte] => Some(Some(char::from(*byte))),
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::INVALID_ESCAPE_SEQUENCE,
+                                    "invalid escape string"
+                                ));
+                            }
+                        }
+                    } else {
+                        Some(escape_char(value)?)
+                    }
+                }
                 None => None,
             };
             match (v, p) {
                 (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
+                (Datum::Bytea(text), Datum::Bytea(pattern)) if !case_insensitive => {
+                    let matched = pattern::like_match_bytes(
+                        text,
+                        pattern,
+                        escape.unwrap_or(Some('\\')).map(|value| value as u8),
+                    )?;
+                    Ok(Datum::Bool(matched != negated))
+                }
                 (Datum::Text(s) | Datum::Bpchar(s), Datum::Text(pat) | Datum::Bpchar(pat)) => {
                     let matched =
-                        like_match(s, pat, case_insensitive, escape.unwrap_or(Some('\\')));
+                        like_match(s, pat, case_insensitive, escape.unwrap_or(Some('\\')))?;
                     Ok(Datum::Bool(matched != negated))
                 }
                 (l, r) => Err(sql_err!(
@@ -4608,6 +4644,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Float(_) => Some(ColType::Float8),
         Expr::NumericLit(_) => Some(ColType::Numeric),
         Expr::Str(_) => Some(ColType::Text),
+        Expr::BitLit(_) => Some(ColType::Bit { varying: false }),
         Expr::Column { qualifier, name } => row.col_type(*qualifier, name),
         Expr::SchemaColumn { table, name, .. } => row.col_type(Some(table), name),
         Expr::Cast { type_name, .. } => ColType::from_sql_name(type_name),
@@ -4645,7 +4682,13 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             | BinaryOp::GtEq
             | BinaryOp::And
             | BinaryOp::Or => Some(ColType::Bool),
-            BinaryOp::Concat => Some(ColType::Text),
+            BinaryOp::Concat => match (static_type(left, row), static_type(right, row)) {
+                (Some(ColType::Bytea), Some(ColType::Bytea)) => Some(ColType::Bytea),
+                (Some(ColType::Bit { .. }), Some(ColType::Bit { .. })) => {
+                    Some(ColType::Bit { varying: true })
+                }
+                _ => Some(ColType::Text),
+            },
             _ => {
                 let l = static_type(left, row)?;
                 let r = static_type(right, row)?;
@@ -4655,6 +4698,55 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Case {
             whens, otherwise, ..
         } => case_result_type(whens, otherwise, row),
+        // Overloaded binary-string functions must retain their input family
+        // when nested.  The evaluator's function router uses this same static
+        // identity before evaluating arguments, so a bytea-producing call
+        // cannot fall through to the text overload merely because it is not a
+        // column or cast.
+        Expr::Call { name, args, .. } => match *name {
+            "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "convert_to"
+            | "convert" | "byteacat" | "byteasend" | "bytea_larger" | "bytea_smaller"
+            | "byteain" | "bit_send" | "varbit_send" | "bytea" => Some(ColType::Bytea),
+            "set_bit" => match args.first().and_then(|argument| static_type(argument, row)) {
+                Some(ColType::Bit { .. }) => Some(ColType::Bit { varying: false }),
+                _ => Some(ColType::Bytea),
+            },
+            "overlay" | "substr" | "substring" => {
+                match args.first().and_then(|argument| static_type(argument, row)) {
+                    Some(ColType::Bytea) => Some(ColType::Bytea),
+                    Some(ColType::Bit { .. }) => Some(ColType::Bit { varying: false }),
+                    Some(_) => Some(ColType::Text),
+                    None => None,
+                }
+            }
+            "reverse" | "btrim" | "ltrim" | "rtrim" => {
+                match args.first().and_then(|argument| static_type(argument, row)) {
+                    Some(ColType::Bytea) => Some(ColType::Bytea),
+                    Some(_) => Some(ColType::Text),
+                    None => None,
+                }
+            }
+            "encode" | "convert_from" | "md5" | "byteaout" | "bit_out" | "varbit_out" => {
+                Some(ColType::Text)
+            }
+            "get_byte" | "get_bit" | "position" | "byteacmp" | "bitcmp" | "varbitcmp" => {
+                Some(ColType::Int4)
+            }
+            "bit_count" | "crc32" | "crc32c" | "hashbyteaextended" => Some(ColType::Int8),
+            "hashbytea" => Some(ColType::Int4),
+            "byteaeq" | "byteane" | "bytealt" | "byteale" | "byteagt" | "byteage" | "bytealike"
+            | "byteanlike" | "biteq" | "bitne" | "bitlt" | "bitle" | "bitgt" | "bitge"
+            | "varbiteq" | "varbitne" | "varbitlt" | "varbitle" | "varbitgt" | "varbitge" => {
+                Some(ColType::Bool)
+            }
+            "bitand" | "bitor" | "bitxor" | "bitnot" | "bitshiftleft" | "bitshiftright"
+            | "bit_in" => Some(ColType::Bit { varying: false }),
+            "bitcat" | "varbit_in" => Some(ColType::Bit { varying: true }),
+            "int2" => Some(ColType::Int2),
+            "int4" => Some(ColType::Int4),
+            "int8" => Some(ColType::Int8),
+            _ => None,
+        },
         Expr::Subscript { base, .. } => match static_type(base, row) {
             Some(ColType::Array(element)) => Some(element.to_coltype()),
             Some(ColType::Int2Vector) => Some(ColType::Int2),

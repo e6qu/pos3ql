@@ -5972,7 +5972,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
         "CREATE TABLE operator_class_index(value integer)",
         "CREATE INDEX operator_class_index_idx ON operator_class_index (value public.int_class)",
         "SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype",
-        "SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; SELECT count(*) FROM pg_operator WHERE oprname='==='; SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amopstrategy=3; SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1",
+        "SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype; SELECT count(*) FROM pg_operator WHERE oprname='==='; SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amopstrategy=3; SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1",
         "SELECT 1 === 1, 1 OPERATOR(public.===) 2",
         "BEGIN; ALTER OPERATOR CLASS public.int_class USING btree RENAME TO abandoned; ROLLBACK",
         "ALTER OPERATOR CLASS public.int_class USING btree RENAME TO int_class_renamed",
@@ -6275,7 +6275,7 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         "DROP FUNCTION public.mood_compare(public.mood, public.mood) CASCADE; \
          DROP FUNCTION public.mood_same(public.mood, public.mood) CASCADE; \
          DROP FUNCTION public.mood_text(public.mood) CASCADE; \
-         SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; \
+         SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype; \
          SELECT count(*) FROM pg_operator WHERE oprname='==='; \
          SELECT count(*) FROM pg_opclass WHERE opcname='mood_class'; \
          SELECT count(*) FROM pg_amop WHERE amopfamily = \
@@ -6304,7 +6304,7 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         &mut engine,
         &mut budget,
         "DROP TYPE public.tone CASCADE; \
-         SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; \
+         SELECT count(*) FROM pg_cast WHERE casttarget = 'text'::regtype; \
          SELECT count(*) FROM pg_operator WHERE oprname='@='",
     );
     let text = String::from_utf8_lossy(&dropped);
@@ -6509,7 +6509,7 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
         SELECT same FROM public.catalog_operator_view; \
         SELECT value FROM public.catalog_prefix_view; \
         SELECT value FROM public.catalog_index_values; \
-        SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; \
+        SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype; \
         SELECT count(*) FROM pg_operator WHERE oprname='==='; \
         SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; \
         SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; \
@@ -6517,7 +6517,7 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
         SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1; \
         SELECT count(*) FROM pg_depend WHERE classid='pg_class'::regclass AND objid='catalog_index_values_mod10'::regclass AND refclassid='pg_opclass'::regclass; \
         SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast \
-          WHERE castsource <> 790 AND casttarget <> 790; \
+          WHERE castsource = 'public.mood'::regtype; \
         SELECT obj_description(oid, 'pg_cast') FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype; \
         SELECT obj_description(oid, 'pg_operator') FROM pg_operator WHERE oprname = '===' AND oprleft = 'integer'::regtype; \
         SELECT obj_description(oid, 'pg_opfamily') FROM pg_opfamily WHERE opfname = 'int_family'; \
@@ -9279,6 +9279,103 @@ fn money_survives_checkpoint_wal_and_object_cold_recovery() {
             "2|-$12.34|{}",
             "$1,222.23|-$12.34|$1,234.57",
             "money WAL tail",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn binary_and_bit_strings_survive_checkpoint_wal_and_object_cold_recovery() {
+    let mut config = test_config("binary-bit-string-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace =
+        format!("binary-bit-string-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_binary_strings (
+             id integer PRIMARY KEY,
+             payload bytea NOT NULL UNIQUE,
+             flags bit(8) NOT NULL,
+             flexible varbit NOT NULL,
+             tail bytea GENERATED ALWAYS AS (substring(payload FROM 2)) STORED,
+             CHECK (crc32(payload) >= 0)
+         );
+         CREATE INDEX durable_binary_flags_idx ON durable_binary_strings (flags);
+         INSERT INTO durable_binary_strings VALUES
+             (1, '\\x001122', B'10101010', B'101', DEFAULT);
+         CREATE VIEW durable_binary_rollup AS
+             SELECT encode(string_agg(payload, '\\xff'::bytea ORDER BY id), 'hex') AS joined,
+                    bit_and(flags) AS all_flags,
+                    bit_or(flags) AS any_flags,
+                    bit_xor(flags) AS changed_flags,
+                    min(payload) AS smallest,
+                    max(payload) AS largest
+             FROM durable_binary_strings",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let wal_tail = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE durable_binary_strings
+            SET payload = set_byte(payload, 0, 1),
+                flags = set_bit(flags, 1, 1),
+                flexible = flexible || B'0'
+          WHERE id = 1;
+         INSERT INTO durable_binary_strings (id, payload, flags, flexible) VALUES
+             (2, '\\xff00', B'00001111', B'11');
+         COMMENT ON TABLE durable_binary_strings IS 'binary WAL tail'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&wal_tail).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&wal_tail)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id, encode(payload, 'hex'), flags, flexible, encode(tail, 'hex')
+           FROM durable_binary_strings ORDER BY id;
+         SELECT id FROM durable_binary_strings WHERE payload = '\\xff00'::bytea;
+         SELECT joined, all_flags, any_flags, changed_flags,
+                encode(smallest, 'hex'), encode(largest, 'hex')
+           FROM durable_binary_rollup;
+         SELECT obj_description('durable_binary_strings'::regclass, 'pg_class');
+         SELECT count(*) FROM pg_opclass
+          WHERE oid IN (10002, 10006, 10043, 10049)",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "1|011122|11101010|1010|1122",
+            "2|ff00|00001111|11|00",
+            "2",
+            "011122ffff00|00001010|11101111|11100101|011122|ff00",
+            "binary WAL tail",
+            "4",
         ],
         "{}",
         String::from_utf8_lossy(&recovered)
@@ -43290,6 +43387,21 @@ fn scalar_functions() {
     );
     assert_eq!(r(&mut e, &mut b, "SELECT repeat('ab', 3)"), ["ababab"]);
     assert_eq!(r(&mut e, &mut b, "SELECT reverse('abc')"), ["cba"]);
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT encode(reverse(substring(reverse('\\x00112233'::bytea) FROM 2 FOR 2)), 'hex')",
+        ),
+        ["1122"]
+    );
+    for sql in [
+        "SELECT 'a' LIKE E'\\\\'",
+        "SELECT '\\x61'::bytea LIKE '\\x5c'::bytea",
+    ] {
+        let output = run_with(&mut e, &mut b, sql);
+        assert!(String::from_utf8_lossy(&output).contains("22025"), "{sql}");
+    }
     assert_eq!(r(&mut e, &mut b, "SELECT left('hello', 3)"), ["hel"]);
     assert_eq!(r(&mut e, &mut b, "SELECT left('hello', -2)"), ["hel"]);
     assert_eq!(r(&mut e, &mut b, "SELECT right('hello', 3)"), ["llo"]);
@@ -55103,6 +55215,27 @@ fn string_agg_ordered() {
             "SELECT g, string_agg(v, ',' ORDER BY v DESC) FROM s GROUP BY g ORDER BY g"
         )),
         ["1|c,b,a", "2|z"]
+    );
+    // An empty first value is still an element: the following row contributes
+    // its own delimiter before its non-empty value.
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT string_agg(v, sep ORDER BY ord) FROM
+             (VALUES (1, '', ','), (2, 'a', ';')) AS inputs(ord, v, sep)"
+        )),
+        [";a"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT encode(string_agg(v, sep ORDER BY ord), 'hex') FROM
+             (VALUES (1, ''::bytea, '\\x2d'::bytea),
+                     (2, '\\x61'::bytea, '\\x2f'::bytea)) AS inputs(ord, v, sep)"
+        )),
+        ["2f61"]
     );
 }
 

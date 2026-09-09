@@ -4661,6 +4661,16 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             operand,
         } => static_type(operand, row),
         Expr::Unary {
+            operator: UnaryOp::BitNot,
+            operand,
+        } => static_type(operand, row).map(|ctype| {
+            if matches!(ctype, ColType::Inet | ColType::Cidr) {
+                ColType::Inet
+            } else {
+                ctype
+            }
+        }),
+        Expr::Unary {
             operator: UnaryOp::Not,
             ..
         }
@@ -4706,7 +4716,8 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         Expr::Call { name, args, .. } => match *name {
             "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "convert_to"
             | "convert" | "byteacat" | "byteasend" | "bytea_larger" | "bytea_smaller"
-            | "byteain" | "bit_send" | "varbit_send" | "bytea" => Some(ColType::Bytea),
+            | "byteain" | "bit_send" | "varbit_send" | "bytea" | "inet_send" | "cidr_send"
+            | "macaddr_send" | "macaddr8_send" => Some(ColType::Bytea),
             "set_bit" => match args.first().and_then(|argument| static_type(argument, row)) {
                 Some(ColType::Bit { .. }) => Some(ColType::Bit { varying: false }),
                 _ => Some(ColType::Bytea),
@@ -4726,17 +4737,30 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
                     None => None,
                 }
             }
-            "encode" | "convert_from" | "md5" | "byteaout" | "bit_out" | "varbit_out" => {
-                Some(ColType::Text)
-            }
-            "get_byte" | "get_bit" | "position" | "byteacmp" | "bitcmp" | "varbitcmp" => {
+            "encode" | "convert_from" | "md5" | "byteaout" | "bit_out" | "varbit_out"
+            | "inet_out" | "cidr_out" | "macaddr_out" | "macaddr8_out" | "host" | "abbrev"
+            | "text" => Some(ColType::Text),
+            "get_byte" | "get_bit" | "position" | "byteacmp" | "bitcmp" | "varbitcmp"
+            | "network_cmp" | "macaddr_cmp" | "macaddr8_cmp" | "family" | "masklen" => {
                 Some(ColType::Int4)
             }
-            "bit_count" | "crc32" | "crc32c" | "hashbyteaextended" => Some(ColType::Int8),
-            "hashbytea" => Some(ColType::Int4),
+            "bit_count"
+            | "crc32"
+            | "crc32c"
+            | "hashbyteaextended"
+            | "hashinetextended"
+            | "hashmacaddrextended"
+            | "hashmacaddr8extended"
+            | "inetmi" => Some(ColType::Int8),
+            "hashbytea" | "hashinet" | "hashmacaddr" | "hashmacaddr8" => Some(ColType::Int4),
             "byteaeq" | "byteane" | "bytealt" | "byteale" | "byteagt" | "byteage" | "bytealike"
             | "byteanlike" | "biteq" | "bitne" | "bitlt" | "bitle" | "bitgt" | "bitge"
-            | "varbiteq" | "varbitne" | "varbitlt" | "varbitle" | "varbitgt" | "varbitge" => {
+            | "varbiteq" | "varbitne" | "varbitlt" | "varbitle" | "varbitgt" | "varbitge"
+            | "network_eq" | "network_ne" | "network_lt" | "network_le" | "network_gt"
+            | "network_ge" | "network_sub" | "network_subeq" | "network_sup" | "network_supeq"
+            | "network_overlap" | "inet_same_family" | "macaddr_eq" | "macaddr_ne"
+            | "macaddr_lt" | "macaddr_le" | "macaddr_gt" | "macaddr_ge" | "macaddr8_eq"
+            | "macaddr8_ne" | "macaddr8_lt" | "macaddr8_le" | "macaddr8_gt" | "macaddr8_ge" => {
                 Some(ColType::Bool)
             }
             "bitand" | "bitor" | "bitxor" | "bitnot" | "bitshiftleft" | "bitshiftright"
@@ -4745,6 +4769,15 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             "int2" => Some(ColType::Int2),
             "int4" => Some(ColType::Int4),
             "int8" => Some(ColType::Int8),
+            "inet_in" | "broadcast" | "netmask" | "hostmask" | "set_masklen" | "network_larger"
+            | "network_smaller" | "inetnot" | "inetand" | "inetor" | "inetpl" | "int8pl_inet"
+            | "inetmi_int8" => Some(ColType::Inet),
+            "cidr_in" | "cidr" | "network" | "inet_merge" => Some(ColType::Cidr),
+            "macaddr_in" | "macaddr" | "macaddr_not" | "macaddr_and" | "macaddr_or" => {
+                Some(ColType::Macaddr)
+            }
+            "macaddr8_in" | "macaddr8" | "macaddr8_set7bit" | "macaddr8_not" | "macaddr8_and"
+            | "macaddr8_or" => Some(ColType::Macaddr8),
             _ => None,
         },
         Expr::Subscript { base, .. } => match static_type(base, row) {

@@ -6304,7 +6304,8 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         &mut engine,
         &mut budget,
         "DROP TYPE public.tone CASCADE; \
-         SELECT count(*) FROM pg_cast WHERE casttarget = 'text'::regtype; \
+         SELECT count(*) FROM pg_cast
+          WHERE casttarget = 'text'::regtype AND oid >= 600000; \
          SELECT count(*) FROM pg_operator WHERE oprname='@='",
     );
     let text = String::from_utf8_lossy(&dropped);
@@ -38635,6 +38636,224 @@ fn network_operators_match_postgres() {
         data_rows(&bytes),
         ["t|t|t|t|63.87.254.250|0.0.0.5|192.168.1.5|192.168.1.15|192.168.0.251|15"]
     );
+}
+
+#[test]
+fn network_support_functions_catalogs_and_extrema_match_postgres() {
+    let (mut e, mut b) = test_engine();
+    let described = describe_with(
+        &mut e,
+        &mut b,
+        "SELECT network_larger('10.0.0.1/8', '10.0.0.0/24'),
+                cidr('192.168.1.5/24'::inet),
+                text('192.168.1.5/24'::inet),
+                macaddr_not('08:00:2b:01:02:03'),
+                macaddr8_or('08:00:2b:01:02:03:04:05', '00:00:00:00:00:00:00:01'),
+                inetmi('192.168.1.20', '192.168.1.5'),
+                inet_send('192.168.1.5/24'::inet)",
+    );
+    assert_eq!(
+        row_description_type_oids(&described),
+        [
+            crate::sql::types::oid::INET,
+            crate::sql::types::oid::CIDR,
+            crate::sql::types::oid::TEXT,
+            crate::sql::types::oid::MACADDR,
+            crate::sql::types::oid::MACADDR8,
+            crate::sql::types::oid::INT8,
+            crate::sql::types::oid::BYTEA,
+        ]
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT inet_out(inet_in('192.168.1.5/24')), cidr_out(cidr_in('192.168.1.0/24')),
+                text('2001:db8::1/64'::inet),
+                encode(inet_send('192.168.1.5/24'::inet), 'hex'),
+                encode(cidr_send('192.168.1.0/24'::cidr), 'hex'),
+                encode(macaddr_send('08:00:2b:01:02:03'::macaddr), 'hex'),
+                encode(macaddr8_send('08:00:2b:01:02:03:04:05'::macaddr8), 'hex');
+         SELECT network_cmp('10.0.0.1/8', '10.0.0.0/24'),
+                network_sub('192.168.1.5', '192.168.1.0/24'),
+                network_overlap('192.168.1.0/24', '192.168.1.128/25'),
+                network_larger('10.0.0.1/8', '10.0.0.0/24'),
+                network_smaller('10.0.0.1/8', '10.0.0.0/24');
+         SELECT hashinet('192.168.1.5/24'), hashinetextended('192.168.1.5/24', 123),
+                hashmacaddr('08:00:2b:01:02:03'),
+                hashmacaddrextended('08:00:2b:01:02:03', 123),
+                hashmacaddr8('08:00:2b:01:02:03:04:05'),
+                hashmacaddr8extended('08:00:2b:01:02:03:04:05', 123);
+         SELECT macaddr_not('08:00:2b:01:02:03'),
+                macaddr_and('08:00:2b:01:02:03', 'ff:00:ff:00:ff:00'),
+                macaddr_or('08:00:2b:01:02:03', '00:ff:00:ff:00:ff'),
+                macaddr8_not('08:00:2b:01:02:03:04:05'),
+                ~ '08:00:2b:01:02:03'::macaddr,
+                '08:00:2b:01:02:03:04:05'::macaddr8 & 'ff:00:ff:00:ff:00:ff:00'::macaddr8;
+         SELECT min(x), max(x) FROM (VALUES ('10.0.0.0/24'::inet),
+                ('10.0.0.1/8'::inet), ('10.0.0.0/25'::inet)) AS values(x)",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        [
+            "192.168.1.5/24|192.168.1.0/24|2001:db8::1/64|02180004c0a80105|02180104c0a80100|08002b010203|08002b0102030405",
+            "-16|t|t|10.0.0.0/24|10.0.0.1/8",
+            "-121925536|4566994083548349140|294987870|-1336091975363722200|-445665214|-6012563120681635874",
+            "f7:ff:d4:fe:fd:fc|08:00:2b:00:02:00|08:ff:2b:ff:02:ff|f7:ff:d4:fe:fd:fc:fb:fa|f7:ff:d4:fe:fd:fc|08:00:2b:00:02:00:04:00",
+            "10.0.0.1/8|10.0.0.0/25",
+        ],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let catalog = run_with(
+        &mut e,
+        &mut b,
+        "SELECT count(*) FROM pg_proc WHERE oid IN (328,399,422,436,437,598,599,605,635,
+             683,696,697,698,699,711,730,753,778,779,781,830,831,832,833,834,835,
+             836,910,911,920,921,922,923,924,925,926,927,928,929,930,1267,1362,
+             1427,1715,2494,2495,2496,2497,2498,2499);
+         SELECT count(*) FROM pg_proc WHERE oid IN (2627,2628,2629,2630,2631,
+             2632,2633,3144,3145,3146,3359,3446,3447,3551,3562,3563,3564,3565,
+             4063,4071,4110,4111,4112,4113,4114,4115,4116,4117,4118,4119,4120,
+             4121,4122,4123,4124,4125,5033,5051);
+         SELECT count(*) FROM pg_operator WHERE oid IN (931,932,933,934,1201,1202,1203,
+             1204,1205,1206,1220,1221,1222,1223,1224,1225,2634,2635,2636,2637,
+             2638,2639,2640,3147,3148,3149,3362,3363,3364,3365,3366,3367,3368,
+             3369,3370,3552);
+         SELECT count(*) FROM pg_cast WHERE oid IN (10185,10186,10187,10188,10195,10196,
+             10200,10201,10205,10206);
+         SELECT count(*) FROM pg_aggregate WHERE aggfnoid::oid IN (3564,3565);
+         SELECT count(*) FROM pg_opfamily WHERE oid IN (1974,1975,1984,1985,3371,3372);
+         SELECT count(*) FROM pg_opclass WHERE oid IN (10009,10010,10015,10016,10024,10025,
+             10026,10027);
+         SELECT count(*) FROM pg_amop WHERE amopfamily IN (1974,1975,1984,1985,3371,3372);
+         SELECT count(*) FROM pg_amproc WHERE amprocfamily IN (1974,1975,1984,1985,3371,3372)",
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        ["50", "38", "36", "10", "2", "6", "8", "18", "14"],
+        "{}",
+        String::from_utf8_lossy(&catalog)
+    );
+
+    let boundary = run_with(
+        &mut e,
+        &mut b,
+        "SELECT 'ffff::1'::inet + (-9223372036854775807::bigint - 1),
+                inetpl('ffff::1', (-9223372036854775807::bigint - 1));
+         SELECT '::1'::inet - (-9223372036854775807::bigint - 1)",
+    );
+    assert_eq!(
+        data_rows(&boundary),
+        ["fffe:ffff:ffff:ffff:8000::1|fffe:ffff:ffff:ffff:8000::1"]
+    );
+    assert!(
+        String::from_utf8_lossy(&boundary).contains("22003"),
+        "{}",
+        String::from_utf8_lossy(&boundary)
+    );
+}
+
+#[test]
+fn network_family_survives_checkpoint_wal_and_object_cold_recovery() {
+    let mut config = test_config("network-family-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("network-family-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_network (
+             id integer PRIMARY KEY,
+             address inet NOT NULL UNIQUE,
+             subnet cidr NOT NULL,
+             hardware macaddr NOT NULL,
+             hardware8 macaddr8 NOT NULL,
+             masked inet GENERATED ALWAYS AS (address & '255.255.255.0'::inet) STORED,
+             CHECK (address <<= subnet)
+         );
+         CREATE INDEX durable_network_subnet_idx ON durable_network (subnet);
+         CREATE INDEX durable_network_hardware_idx ON durable_network (hardware);
+         CREATE INDEX durable_network_hardware8_idx ON durable_network (hardware8);
+         INSERT INTO durable_network (id,address,subnet,hardware,hardware8) VALUES
+             (1,'10.0.0.1/8','10.0.0.0/8','08:00:2b:01:02:03','08:00:2b:01:02:03:04:05'),
+             (2,'10.0.0.0/24','10.0.0.0/8','08:00:2b:01:02:04','08:00:2b:01:02:03:04:06'),
+             (3,'10.0.0.0/25','10.0.0.0/8','08:00:2b:01:02:05','08:00:2b:01:02:03:04:07');
+         CREATE VIEW durable_network_rollup AS
+             SELECT min(address) AS first_address, max(address) AS last_address,
+                    count(DISTINCT hardware) AS hardware_count
+               FROM durable_network",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let wal_tail = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE durable_network
+             SET address = inetpl(address, 16),
+                 hardware = macaddr_or(hardware, '00:00:00:00:00:10')
+           WHERE id = 1;
+         INSERT INTO durable_network (id,address,subnet,hardware,hardware8) VALUES
+             (4,'10.0.1.1/8','10.0.0.0/8','08:00:2b:01:02:06','08:00:2b:01:02:03:04:08');
+         COMMENT ON TABLE durable_network IS 'network WAL tail'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&wal_tail).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&wal_tail)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id,address,subnet,hardware,hardware8,masked
+           FROM durable_network ORDER BY address;
+         SELECT * FROM durable_network_rollup;
+         SELECT id FROM durable_network WHERE subnet = '10.0.0.0/8'::cidr ORDER BY id;
+         SELECT id FROM durable_network
+          WHERE hardware >= '08:00:2b:01:02:04'::macaddr ORDER BY id;
+         SELECT obj_description('durable_network'::regclass, 'pg_class')",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "1|10.0.0.17/8|10.0.0.0/8|08:00:2b:01:02:13|08:00:2b:01:02:03:04:05|10.0.0.0",
+            "4|10.0.1.1/8|10.0.0.0/8|08:00:2b:01:02:06|08:00:2b:01:02:03:04:08|10.0.1.0",
+            "2|10.0.0.0/24|10.0.0.0/8|08:00:2b:01:02:04|08:00:2b:01:02:03:04:06|10.0.0.0",
+            "3|10.0.0.0/25|10.0.0.0/8|08:00:2b:01:02:05|08:00:2b:01:02:03:04:07|10.0.0.0",
+            "10.0.0.17/8|10.0.0.0/25|4",
+            "1",
+            "2",
+            "3",
+            "4",
+            "1",
+            "2",
+            "3",
+            "4",
+            "network WAL tail",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

@@ -55,6 +55,14 @@ agree with PostgreSQL; binary wire/COPY and driver values, generated and check
 expressions, indexes, WAL, checkpoints, and object-cold recovery retain the
 same bounded byte representation.
 
+PostgreSQL 18 network addresses include `inet`, `cidr`, `macaddr`, and
+`macaddr8` parsing, formatting, inspection, containment, arithmetic, bitwise
+operations, hashes, and `inet` extrema. Exact procedure, operator, cast,
+aggregate, btree, and hash catalogs share PostgreSQL's prefix-first network
+ordering. Binary wire/COPY, arrays, indexes, constraints, generated columns,
+views, WAL, checkpoints, and object-cold recovery retain the same bounded
+canonical address representation.
+
 PostgreSQL `tid` and `cid` values and arrays retain their exact unsigned tuple
 and command identity through SQL, btree/hash support, text and binary wire/COPY,
 rows, spills, WAL, checkpoints, and object-cold recovery. Their PostgreSQL 18

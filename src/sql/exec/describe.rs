@@ -2521,6 +2521,13 @@ fn is_network_oid(oid: i32) -> bool {
     )
 }
 
+fn is_mac_oid(oid: i32) -> bool {
+    matches!(
+        oid,
+        crate::sql::types::oid::MACADDR | crate::sql::types::oid::MACADDR8
+    )
+}
+
 fn comparable(a: ColType, b: ColType) -> bool {
     use ColType::*;
     // `json` has no equality operator in PostgreSQL — two documents that differ
@@ -2804,6 +2811,8 @@ pub fn infer_type_res(
                         | ColType::Bit { .. }
                         | ColType::Inet
                         | ColType::Cidr
+                        | ColType::Macaddr
+                        | ColType::Macaddr8
                 ) {
                     return Err(unary_operator_undefined("~", ctype));
                 }
@@ -2871,6 +2880,19 @@ pub fn infer_type_res(
                 Shl | Shr if is_network_oid(lo) || is_network_oid(ro) => of(ColType::Bool),
                 // `inet & inet` / `inet | inet` return inet.
                 BitAnd | BitOr if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
+                // MAC bitwise operators preserve their concrete width.
+                BitAnd | BitOr if is_mac_oid(lo) || is_mac_oid(ro) => {
+                    if lo != ro {
+                        let left = coltype_of_oid(lo).unwrap_or(ColType::Text);
+                        let right = coltype_of_oid(ro).unwrap_or(ColType::Text);
+                        return Err(operator_undefined(
+                            left,
+                            operator.operator_name().unwrap(),
+                            right,
+                        ));
+                    }
+                    (lo, coltype_of_oid(lo).map_or(-1, ColType::typlen))
+                }
                 // `inet - inet` is int8; `inet ± integer` is inet.
                 Sub if is_network_oid(lo) && is_network_oid(ro) => of(ColType::Int8),
                 Add | Sub if is_network_oid(lo) || is_network_oid(ro) => (oid::INET, -1),
@@ -3387,11 +3409,29 @@ pub fn infer_type_res(
             }
             // Network address functions.
             "family" | "masklen" => of(ColType::Int4),
-            "host" | "abbrev" => of(ColType::Text),
-            "broadcast" | "netmask" | "hostmask" | "set_masklen" => of(ColType::Inet),
+            "host" | "abbrev" | "text" | "inet_out" | "cidr_out" | "macaddr_out"
+            | "macaddr8_out" => of(ColType::Text),
+            "broadcast" | "netmask" | "hostmask" | "set_masklen" | "inet_in" | "network_larger"
+            | "network_smaller" | "inetnot" | "inetand" | "inetor" | "inetpl" | "int8pl_inet"
+            | "inetmi_int8" => of(ColType::Inet),
+            "inet_send" | "cidr_send" | "macaddr_send" | "macaddr8_send" => of(ColType::Bytea),
             "network" | "inet_merge" => of(ColType::Cidr),
-            "inet_same_family" => of(ColType::Bool),
-            "macaddr8_set7bit" => of(ColType::Macaddr8),
+            "cidr_in" | "cidr" => of(ColType::Cidr),
+            "inet_same_family" | "network_eq" | "network_ne" | "network_lt" | "network_le"
+            | "network_gt" | "network_ge" | "network_sub" | "network_subeq" | "network_sup"
+            | "network_supeq" | "network_overlap" | "macaddr_eq" | "macaddr_ne" | "macaddr_lt"
+            | "macaddr_le" | "macaddr_gt" | "macaddr_ge" | "macaddr8_eq" | "macaddr8_ne"
+            | "macaddr8_lt" | "macaddr8_le" | "macaddr8_gt" | "macaddr8_ge" => of(ColType::Bool),
+            "network_cmp" | "macaddr_cmp" | "macaddr8_cmp" | "hashinet" | "hashmacaddr"
+            | "hashmacaddr8" => of(ColType::Int4),
+            "inetmi" | "hashinetextended" | "hashmacaddrextended" | "hashmacaddr8extended" => {
+                of(ColType::Int8)
+            }
+            "macaddr_in" | "macaddr" | "macaddr_not" | "macaddr_and" | "macaddr_or" => {
+                of(ColType::Macaddr)
+            }
+            "macaddr8_in" | "macaddr8" | "macaddr8_set7bit" | "macaddr8_not" | "macaddr8_and"
+            | "macaddr8_or" => of(ColType::Macaddr8),
             "array_dims" => of(ColType::Text),
             "current_schemas" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
             "array_to_json" => of(ColType::Json),

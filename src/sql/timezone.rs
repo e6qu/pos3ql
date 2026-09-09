@@ -97,6 +97,29 @@ impl Timezone {
             Timezone::Tzif(slot) => super::tzif::resolve(*slot, utc),
         }
     }
+
+    /// Converts a local wall-clock timestamp to UTC. Around a backward clock
+    /// change PostgreSQL chooses the later (standard-time) interpretation; in
+    /// a forward gap it keeps the pre-transition offset. Both choices are the
+    /// latest UTC candidate among the offsets surrounding the local time.
+    pub fn resolve_local(&self, local: i64) -> Option<i64> {
+        let probes = [
+            local.checked_sub(2 * DAY_US).unwrap_or(local),
+            local,
+            local.checked_add(2 * DAY_US).unwrap_or(local),
+        ];
+        let mut matching: Option<i64> = None;
+        let mut fallback: Option<i64> = None;
+        for probe in probes {
+            let offset = self.resolve(probe).0;
+            let candidate = local.checked_sub(i64::from(offset).checked_mul(1_000_000)?)?;
+            fallback = Some(fallback.map_or(candidate, |previous| previous.max(candidate)));
+            if self.resolve(candidate).0 == offset {
+                matching = Some(matching.map_or(candidate, |previous| previous.max(candidate)));
+            }
+        }
+        matching.or(fallback)
+    }
 }
 
 impl PosixZone {
@@ -328,6 +351,22 @@ mod tests {
         assert_eq!(ny.resolve(ts(2021, 3, 14, 8)).0, -4 * H);
         // Just before is standard.
         assert_eq!(ny.resolve(ts(2021, 3, 14, 6)).0, -5 * H);
+    }
+
+    #[test]
+    fn local_resolution_matches_postgresql_at_dst_boundaries() {
+        let ny = zone("America/New_York");
+        // PostgreSQL 18.4 uses the pre-transition standard offset for a
+        // nonexistent spring time and the later standard occurrence for an
+        // ambiguous autumn time.
+        assert_eq!(
+            ny.resolve_local(ts(2024, 3, 10, 2) + 30 * 60 * 1_000_000),
+            Some(ts(2024, 3, 10, 7) + 30 * 60 * 1_000_000)
+        );
+        assert_eq!(
+            ny.resolve_local(ts(2024, 11, 3, 1) + 30 * 60 * 1_000_000),
+            Some(ts(2024, 11, 3, 6) + 30 * 60 * 1_000_000)
+        );
     }
 
     #[test]

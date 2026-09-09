@@ -3749,6 +3749,11 @@ fn call<'a>(
     {
         return result;
     }
+    if let Some(result) =
+        funcs::uuid::dispatch(name, args, argument_names, star, arena, params, row, hooks)
+    {
+        return result;
+    }
     if argument_names.is_empty()
         && let Some(result) = funcs::identity::dispatch(name, args, star, arena, params, row, hooks)
     {

@@ -910,6 +910,38 @@ impl<'a> Parser<'a> {
                 if self.peeked == Tok::Op("(") {
                     return self.call(name);
                 }
+                // The unmodified SQL-standard temporal spelling keeps its
+                // `WITH[OUT] TIME ZONE` words between the type name and the
+                // literal. Modifier-bearing forms take the parallel path
+                // above after their closing parenthesis.
+                if (name.eq_ignore_ascii_case("timestamp") || name.eq_ignore_ascii_case("time"))
+                    && (self.peeked == Tok::Ident("with") || self.peeked == Tok::Ident("without"))
+                {
+                    let with_timezone = self.eat_ident("with")?;
+                    if !with_timezone {
+                        self.expect_ident("without")?;
+                    }
+                    self.expect_ident("time")?;
+                    self.expect_ident("zone")?;
+                    let Tok::Str(lit) = self.peeked else {
+                        return Err(self.unexpected("expected a string literal after type name"));
+                    };
+                    self.advance()?;
+                    let operand = self.arena_expr(Expr::Str(lit))?;
+                    return self.arena_expr(Expr::Cast {
+                        operand,
+                        type_name: if with_timezone {
+                            if name.eq_ignore_ascii_case("timestamp") {
+                                "timestamptz"
+                            } else {
+                                "timetz"
+                            }
+                        } else {
+                            name
+                        },
+                        type_mod: -1,
+                    });
+                }
                 // Typed literal, SQL-standard: `DATE '2020-01-01'` is
                 // exactly `'2020-01-01'::date`. Only fires when the name is a
                 // known type immediately followed by a string.

@@ -3,8 +3,8 @@
 //! Storage matches PostgreSQL's on-disk convention: dates are days since
 //! 2000-01-01, timestamps are microseconds since 2000-01-01 00:00:00.
 //! Civil-date math is Howard Hinnant's public-domain algorithms
-//! (<https://howardhinnant.github.io/date_algorithms.html>). The session
-//! time zone is fixed at UTC.
+//! (<https://howardhinnant.github.io/date_algorithms.html>). Time-zone-aware
+//! operations resolve through the session's fixed-capacity TZif state.
 
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
@@ -19,6 +19,10 @@ pub const PG_EPOCH_SECS: i64 = 946_684_800;
 /// PostgreSQL's binary timestamp sentinels.
 pub const TIMESTAMP_NEG_INFINITY: i64 = i64::MIN;
 pub const TIMESTAMP_INFINITY: i64 = i64::MAX;
+
+fn timestamp_out_of_range() -> SqlError {
+    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+}
 
 pub fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let shifted = days_since_epoch + 719_468;
@@ -835,10 +839,15 @@ pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
         value.minute,
         value.second as f64 + value.microsecond as f64 / 1_000_000.0,
     )?;
-    let offset = value
-        .timezone_offset_seconds
-        .unwrap_or_else(|| super::timezone::session().resolve(local).0);
-    Ok(local - i64::from(offset) * 1_000_000)
+    if let Some(offset) = value.timezone_offset_seconds {
+        local
+            .checked_sub(i64::from(offset) * 1_000_000)
+            .ok_or_else(timestamp_out_of_range)
+    } else {
+        super::timezone::session()
+            .resolve_local(local)
+            .ok_or_else(timestamp_out_of_range)
+    }
 }
 
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
@@ -887,7 +896,9 @@ pub fn make_timestamp(
 ) -> Result<i64, SqlError> {
     let days = make_date(year, month, day)? as i64;
     let time_of_day = make_time(hour, minute, sec)?;
-    Ok(days * 86_400_000_000 + time_of_day)
+    days.checked_mul(86_400_000_000)
+        .and_then(|date| date.checked_add(time_of_day))
+        .ok_or_else(timestamp_out_of_range)
 }
 
 /// Parses `YYYY-MM-DD[ |T]HH:MM[:SS[.ffffff]][Z|±HH[:MM]]` into
@@ -941,7 +952,16 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
     }
 
     if rest.is_empty() {
-        return Ok(date_days * 86_400 * 1_000_000);
+        let local = date_days
+            .checked_mul(86_400_000_000)
+            .ok_or_else(timestamp_out_of_range)?;
+        return if apply_timezone {
+            super::timezone::session()
+                .resolve_local(local)
+                .ok_or_else(timestamp_out_of_range)
+        } else {
+            Ok(local)
+        };
     }
 
     // Trailing *named* zone (`... Europe/Moscow`, `... EST`, `... UTC`): the
@@ -1034,20 +1054,29 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
             s
         ));
     }
-    let mut total = date_days * 86_400_000_000 + (h * 3600 + m * 60 + sec) * 1_000_000 + micros;
+    let mut total = date_days
+        .checked_mul(86_400_000_000)
+        .and_then(|date| {
+            (h * 3600 + m * 60 + sec)
+                .checked_mul(1_000_000)
+                .and_then(|time| date.checked_add(time))
+        })
+        .and_then(|timestamp| timestamp.checked_add(micros))
+        .ok_or_else(timestamp_out_of_range)?;
     if apply_timezone {
         if let Some(zone) = named_zone {
-            // The offset in effect at the given wall time (resolved with the
-            // wall instant standing in for UTC — exact away from the sub-hour
-            // transition windows, as the AT TIME ZONE conversion has it).
-            let (offset_seconds, _) = zone.resolve(total);
-            total -= i64::from(offset_seconds) * 1_000_000;
+            total = zone
+                .resolve_local(total)
+                .ok_or_else(timestamp_out_of_range)?;
         } else if explicit_offset {
-            total -= timezone_seconds * 1_000_000;
+            total = total
+                .checked_sub(timezone_seconds * 1_000_000)
+                .ok_or_else(timestamp_out_of_range)?;
         } else {
             // No zone written: the wall time reads in the session zone.
-            let (offset_seconds, _) = super::timezone::session().resolve(total);
-            total -= i64::from(offset_seconds) * 1_000_000;
+            total = super::timezone::session()
+                .resolve_local(total)
+                .ok_or_else(timestamp_out_of_range)?;
         }
     }
     Ok(total)
@@ -1631,21 +1660,55 @@ fn format_interval_iso8601(interval: super::types::Interval) -> StackStr<96> {
 /// calendar (clamping the day into the target month), days are 24h each, and
 /// microseconds add directly.
 pub fn add_interval(micros_epoch: i64, interval: super::types::Interval) -> i64 {
+    checked_add_interval(micros_epoch, interval).expect("timestamp interval addition overflow")
+}
+
+/// Checked form of [`add_interval`], for boundaries such as UUIDv7 whose
+/// timestamp field has a smaller, explicitly validated range.
+pub fn checked_add_interval(micros_epoch: i64, interval: super::types::Interval) -> Option<i64> {
     let mut m = micros_epoch;
     if interval.months != 0 {
         // Break into date + time-of-day, advance the calendar month, clamp day.
         let days = m.div_euclid(DAY_US);
         let time_of_day = m.rem_euclid(DAY_US);
         let (y, month, d) = civil_from_days(days + PG_EPOCH_DAYS);
-        let total = y * 12 + (month as i64 - 1) + interval.months as i64;
+        let total = y
+            .checked_mul(12)?
+            .checked_add(i64::from(month) - 1)?
+            .checked_add(i64::from(interval.months))?;
         let new_year = total.div_euclid(12);
         let new_month = (total.rem_euclid(12) + 1) as u32;
         let days_in_month_count = days_in_month(new_year, new_month);
         let new_day = d.min(days_in_month_count);
         let new_days = days_from_civil(new_year, new_month, new_day) - PG_EPOCH_DAYS;
-        m = new_days * DAY_US + time_of_day;
+        m = new_days.checked_mul(DAY_US)?.checked_add(time_of_day)?;
     }
-    m + interval.days as i64 * DAY_US + interval.micros
+    m.checked_add(i64::from(interval.days).checked_mul(DAY_US)?)?
+        .checked_add(interval.micros)
+}
+
+/// Adds an interval to a `timestamptz` in the session time zone. PostgreSQL
+/// applies month/day fields in local civil time, then the microsecond field on
+/// the UTC timeline, so crossing a daylight-saving boundary is not the same
+/// as adding a fixed number of 24-hour days.
+pub fn checked_add_timestamptz(utc_micros: i64, interval: super::types::Interval) -> Option<i64> {
+    if interval.months == 0 && interval.days == 0 {
+        return utc_micros.checked_add(interval.micros);
+    }
+    let zone = super::timezone::session();
+    let source_offset = i64::from(zone.resolve(utc_micros).0).checked_mul(1_000_000)?;
+    let local = utc_micros.checked_add(source_offset)?;
+    let shifted_local = checked_add_interval(
+        local,
+        super::types::Interval {
+            months: interval.months,
+            days: interval.days,
+            micros: 0,
+        },
+    )?;
+
+    let utc = zone.resolve_local(shifted_local)?;
+    utc.checked_add(interval.micros)
 }
 
 /// `interval * factor` (and `interval / factor` when `div`), matching
@@ -2073,6 +2136,21 @@ mod tests {
             days,
             micros,
         }
+    }
+
+    #[test]
+    fn timestamptz_interval_keeps_local_civil_time_across_dst() {
+        crate::sql::tzif::init_catalog();
+        let zone = crate::sql::timezone::lookup("America/New_York").unwrap();
+        crate::sql::timezone::set_session(zone);
+        let before = parse_timestamp("2024-03-09 12:00:00-05", true).unwrap();
+        let after = checked_add_timestamptz(before, interval(0, 1, 0)).unwrap();
+        assert_eq!(
+            format_timestamp_styled(after, true, DateStyle::default(), zone).as_str(),
+            "2024-03-10 12:00:00-04"
+        );
+        assert_eq!(after - before, 23 * 3_600_000_000);
+        crate::sql::timezone::set_session(crate::sql::timezone::Timezone::utc());
     }
 
     // Reference values captured from PostgreSQL 18.4.

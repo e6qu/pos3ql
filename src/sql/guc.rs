@@ -482,6 +482,7 @@ struct GucValues {
     session_authorization: StackStr<64>,
     datestyle: StackStr<48>,
     intervalstyle: IntervalStyle,
+    lc_monetary: StackStr<16>,
     timezone: StackStr<64>,
     /// Parsed current time zone, so rendering does not re-parse it.
     parsed_timezone: super::timezone::Timezone,
@@ -566,6 +567,7 @@ impl GucValues {
             session_authorization: StackStr::from_str("postgres"),
             datestyle: StackStr::new(),
             intervalstyle: IntervalStyle::Postgres,
+            lc_monetary: StackStr::from_str("C.UTF-8"),
             timezone: StackStr::new(),
             parsed_timezone: super::timezone::Timezone::utc(),
             client_encoding: StackStr::new(),
@@ -626,13 +628,16 @@ const GUC_TRANSACTION_TIMEOUT: u32 = 1 << 22;
 const GUC_EVENT_TRIGGERS: u32 = 1 << 23;
 const GUC_DEFAULT_TEXT_SEARCH_CONFIG: u32 = 1 << 24;
 const GUC_PASSWORD_ENCRYPTION: u32 = 1 << 25;
-const GUC_ALL: u32 = (1 << 26) - 1;
+const GUC_LC_MONETARY: u32 = 1 << 26;
+const GUC_ALL: u32 = (1 << 27) - 1;
 
 fn guc_bit(name: &str) -> u32 {
     if name.eq_ignore_ascii_case("datestyle") {
         GUC_DATESTYLE
     } else if name.eq_ignore_ascii_case("intervalstyle") {
         GUC_INTERVALSTYLE
+    } else if name.eq_ignore_ascii_case("lc_monetary") {
+        GUC_LC_MONETARY
     } else if name.eq_ignore_ascii_case("timezone") {
         GUC_TIMEZONE
     } else if name.eq_ignore_ascii_case("client_encoding") {
@@ -704,6 +709,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     }
     copy!(GUC_DATESTYLE, datestyle);
     copy!(GUC_INTERVALSTYLE, intervalstyle);
+    copy!(GUC_LC_MONETARY, lc_monetary);
     if mask & GUC_TIMEZONE != 0 {
         target.timezone = source.timezone;
         target.parsed_timezone = source.parsed_timezone;
@@ -861,6 +867,7 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(session_authorization);
     changed!(datestyle);
     changed!(intervalstyle);
+    changed!(lc_monetary);
     if before.timezone != after.timezone {
         target.timezone = after.timezone;
         target.parsed_timezone = after.parsed_timezone;
@@ -918,6 +925,8 @@ impl GucState {
             Some(StackStr::from_str(values.datestyle.as_str()))
         } else if name.eq_ignore_ascii_case("intervalstyle") {
             Some(StackStr::from_str(values.intervalstyle.as_str()))
+        } else if name.eq_ignore_ascii_case("lc_monetary") {
+            Some(StackStr::from_str(values.lc_monetary.as_str()))
         } else if name.eq_ignore_ascii_case("timezone") {
             Some(StackStr::from_str(values.timezone.as_str()))
         } else if name.eq_ignore_ascii_case("client_encoding") {
@@ -1717,6 +1726,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
     } else if name.eq_ignore_ascii_case("timezone") {
         values.timezone = defaults.timezone;
         values.parsed_timezone = defaults.parsed_timezone;
+    } else if name.eq_ignore_ascii_case("lc_monetary") {
+        values.lc_monetary = defaults.lc_monetary;
     } else if name.eq_ignore_ascii_case("client_encoding") {
         values.client_encoding = defaults.client_encoding;
     } else if name.eq_ignore_ascii_case("application_name") {
@@ -1895,6 +1906,25 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
             })?
         };
         return Ok(());
+    }
+    if name.eq_ignore_ascii_case("lc_monetary") {
+        let canonical = if is_default
+            || v.eq_ignore_ascii_case("C.UTF-8")
+            || v.eq_ignore_ascii_case("C.utf8")
+        {
+            "C.UTF-8"
+        } else if v.eq_ignore_ascii_case("C") || v.eq_ignore_ascii_case("POSIX") {
+            "C"
+        } else if v.eq_ignore_ascii_case("en_US.UTF-8") || v.eq_ignore_ascii_case("en_US.utf8") {
+            "en_US.UTF-8"
+        } else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"lc_monetary\": \"{}\"",
+                v
+            ));
+        };
+        return store(&mut values.lc_monetary, canonical);
     }
     if name.eq_ignore_ascii_case("synchronize_seqscans") {
         if is_default || v.eq_ignore_ascii_case("off") {
@@ -2159,6 +2189,8 @@ impl GucState {
             Some(StackStr::from_str("heap"))
         } else if name.eq_ignore_ascii_case("intervalstyle") {
             Some(StackStr::from_str(values.intervalstyle.as_str()))
+        } else if name.eq_ignore_ascii_case("lc_monetary") {
+            Some(StackStr::from_str(values.lc_monetary.as_str()))
         } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
             Some(StackStr::from_str("off"))
         } else if name.eq_ignore_ascii_case("default_transaction_isolation") {

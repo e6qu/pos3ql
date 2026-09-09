@@ -51068,6 +51068,10 @@ fn decode_binary_field_with_context<'a>(
             let value: [u8; 8] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::PgLsn(u64::from_be_bytes(value)))
         }
+        ColType::Money => {
+            let value: [u8; 8] = bytes.try_into().map_err(|_| bad())?;
+            Ok(Datum::Money(i64::from_be_bytes(value)))
+        }
         ColType::Regtype => {
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             crate::sql::eval::regtype_of_oid(i64::from(i32::from_be_bytes(bytes)), arena)

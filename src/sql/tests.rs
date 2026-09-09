@@ -5904,7 +5904,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
         "CREATE TABLE operator_class_index(value integer)",
         "CREATE INDEX operator_class_index_idx ON operator_class_index (value public.int_class)",
         "SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype",
-        "SELECT count(*) FROM pg_cast; SELECT count(*) FROM pg_operator WHERE oprname='==='; SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amopstrategy=3; SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1",
+        "SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; SELECT count(*) FROM pg_operator WHERE oprname='==='; SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amopstrategy=3; SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1",
         "SELECT 1 === 1, 1 OPERATOR(public.===) 2",
         "BEGIN; ALTER OPERATOR CLASS public.int_class USING btree RENAME TO abandoned; ROLLBACK",
         "ALTER OPERATOR CLASS public.int_class USING btree RENAME TO int_class_renamed",
@@ -5933,7 +5933,9 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
             "SELECT 'sad'::public.mood::text" | "SELECT value FROM cast_assignment"
         ) {
             assert_eq!(rows, ["sad-cast"], "{sql}: {text}");
-        } else if sql.contains("WHERE castsource") {
+        } else if sql
+            == "SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype"
+        {
             assert_eq!(rows, ["1"], "{sql}: {text}");
         } else if sql.starts_with("SELECT count(*) FROM pg_cast") {
             assert_eq!(rows, ["1", "1", "1", "1", "1", "1"], "{sql}: {text}");
@@ -6205,7 +6207,7 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         "DROP FUNCTION public.mood_compare(public.mood, public.mood) CASCADE; \
          DROP FUNCTION public.mood_same(public.mood, public.mood) CASCADE; \
          DROP FUNCTION public.mood_text(public.mood) CASCADE; \
-         SELECT count(*) FROM pg_cast; \
+         SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; \
          SELECT count(*) FROM pg_operator WHERE oprname='==='; \
          SELECT count(*) FROM pg_opclass WHERE opcname='mood_class'; \
          SELECT count(*) FROM pg_amop WHERE amopfamily = \
@@ -6234,7 +6236,7 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         &mut engine,
         &mut budget,
         "DROP TYPE public.tone CASCADE; \
-         SELECT count(*) FROM pg_cast; \
+         SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; \
          SELECT count(*) FROM pg_operator WHERE oprname='@='",
     );
     let text = String::from_utf8_lossy(&dropped);
@@ -6439,14 +6441,15 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
         SELECT same FROM public.catalog_operator_view; \
         SELECT value FROM public.catalog_prefix_view; \
         SELECT value FROM public.catalog_index_values; \
-        SELECT count(*) FROM pg_cast; \
+        SELECT count(*) FROM pg_cast WHERE castsource <> 790 AND casttarget <> 790; \
         SELECT count(*) FROM pg_operator WHERE oprname='==='; \
         SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; \
         SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; \
         SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amopstrategy=3; \
         SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family') AND amprocnum=1; \
         SELECT count(*) FROM pg_depend WHERE classid='pg_class'::regclass AND objid='catalog_index_values_mod10'::regclass AND refclassid='pg_opclass'::regclass; \
-        SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast; \
+        SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast \
+          WHERE castsource <> 790 AND casttarget <> 790; \
         SELECT obj_description(oid, 'pg_cast') FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype; \
         SELECT obj_description(oid, 'pg_operator') FROM pg_operator WHERE oprname = '===' AND oprleft = 'integer'::regtype; \
         SELECT obj_description(oid, 'pg_opfamily') FROM pg_opfamily WHERE opfname = 'int_family'; \
@@ -9025,6 +9028,196 @@ fn pg_lsn_is_a_cataloged_storable_indexable_binary_safe_type() {
         "INSERT INTO lsn_values(position) VALUES ('1/10')",
     );
     assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+}
+
+#[test]
+fn money_is_exact_cataloged_storable_indexable_and_aggregatable() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid, typname, typlen, typcategory, typarray, typelem \
+           FROM pg_type WHERE oid IN (790, 791) ORDER BY oid; \
+         SELECT '$1,234.565'::money, '(1,234.565)'::money, \
+                1.005::numeric::money, (-1.005)::numeric::money, \
+                12.34::money::numeric; \
+         SELECT 10::money + 2.50::money, 10::money - 2.50::money, \
+                10::money / 4::money, 10::money * 3::int2, \
+                3::int4 * 10::money, 10::money / 4::int8, \
+                1.01::money * 1.5::float8, 1.01::money / 2::float8; \
+         SELECT cash_words(1234.56::money); \
+         SELECT ARRAY[1.23::money, NULL, '-4.56'::money]::text, \
+                pg_typeof(ARRAY[1.23::money]); \
+         CREATE TABLE money_values (id integer PRIMARY KEY, amount money UNIQUE, history money[]); \
+         INSERT INTO money_values VALUES \
+             (1, 2.02::money, ARRAY[1.01::money, 2.02::money]), \
+             (2, 1.01::money, ARRAY[]::money[]), \
+             (3, NULL, NULL); \
+         SELECT id, amount, history::text FROM money_values ORDER BY amount NULLS LAST; \
+         SELECT sum(amount), min(amount), max(amount) FROM money_values; \
+         SELECT opcname, opcfamily, opcintype FROM pg_opclass WHERE oid = 10047; \
+         SELECT amopstrategy, amopopr FROM pg_amop WHERE amopfamily = 2099 ORDER BY amopstrategy; \
+         SELECT amprocnum, amproc FROM pg_amproc WHERE amprocfamily = 2099 ORDER BY amprocnum",
+    );
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(!rendered.contains("ERROR"), "{rendered}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "790|money|8|N|791|0",
+            "791|_money|-1|A|0|790",
+            "$1,234.57|-$1,234.57|$1.01|-$1.01|12.34",
+            "$12.50|$7.50|2.5|$30.00|$30.00|$2.50|$1.52|$0.50",
+            "One thousand two hundred thirty four dollars and fifty six cents",
+            "{$1.23,NULL,-$4.56}|money[]",
+            "2|$1.01|{}",
+            "1|$2.02|{$1.01,$2.02}",
+            "3|NULL|NULL",
+            "$3.03|$1.01|$2.02",
+            "money_ops|2099|790",
+            "1|902",
+            "2|904",
+            "3|900",
+            "4|905",
+            "5|903",
+            "1|cash_cmp",
+            "4|btequalimage",
+        ],
+        "{rendered}"
+    );
+
+    let description = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 1.23::money AS amount, ARRAY[1.23::money] AS amounts",
+    );
+    assert_eq!(
+        row_description_type_oids(&description),
+        [
+            crate::sql::types::oid::MONEY,
+            crate::sql::types::oid::MONEY_ARRAY
+        ]
+    );
+
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT amount, history FROM money_values ORDER BY id) TO STDOUT",
+    );
+    assert_eq!(
+        copy_data_rows(&copied),
+        ["$2.02\t{$1.01,$2.02}", "$1.01\t{}", "\\N\t\\N"]
+    );
+
+    for (sql, sqlstate) in [
+        ("SELECT 'not money'::money", "22P02"),
+        ("SELECT 92233720368547758.08::numeric::money", "22003"),
+        ("SELECT 1::money / 0::integer", "22012"),
+        ("SELECT avg(amount) FROM money_values", "42883"),
+    ] {
+        let rejected = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains(sqlstate),
+            "{sql}: {}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
+
+    let mut guc = GucState::new();
+    let locale = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SHOW lc_monetary; SET lc_monetary = 'C'; SHOW lc_monetary; SELECT 1234.56::money",
+        1 << 18,
+        &mut guc,
+    );
+    assert_eq!(data_rows(&locale), ["C.UTF-8", "C", "$1,234.56"]);
+    let unsupported_locale = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SET lc_monetary = 'de_DE.UTF-8'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(String::from_utf8_lossy(&unsupported_locale).contains("22023"));
+}
+
+#[test]
+fn money_survives_checkpoint_wal_and_object_cold_recovery() {
+    let mut config = test_config("money-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("money-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_money (
+             id integer PRIMARY KEY,
+             amount money NOT NULL UNIQUE,
+             history money[] NOT NULL
+         );
+         INSERT INTO durable_money VALUES
+             (1, '$1,234.56', ARRAY['$1.23'::money, '-$4.56'::money]);
+         CREATE VIEW durable_money_totals AS
+             SELECT sum(amount) AS total, min(amount) AS smallest, max(amount) AS largest
+             FROM durable_money",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let after_checkpoint = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE durable_money
+            SET amount = amount + 0.01::money,
+                history = ARRAY[amount, amount + 0.01::money]
+         WHERE id = 1;
+         INSERT INTO durable_money VALUES
+             (2, '-$12.34', ARRAY[]::money[]);
+         COMMENT ON TABLE durable_money IS 'money WAL tail'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&after_checkpoint).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&after_checkpoint)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id, amount, history::text FROM durable_money ORDER BY id;
+         SELECT total, smallest, largest FROM durable_money_totals;
+         SELECT obj_description('durable_money'::regclass, 'pg_class')",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "1|$1,234.57|{\"$1,234.56\",\"$1,234.57\"}",
+            "2|-$12.34|{}",
+            "$1,222.23|-$12.34|$1,234.57",
+            "money WAL tail",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {

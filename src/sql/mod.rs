@@ -24,6 +24,7 @@ pub mod lexer;
 pub(crate) mod lock;
 pub(crate) mod logical_replication;
 pub mod md5;
+pub mod money;
 pub mod net;
 pub mod notify;
 pub mod numeric;
@@ -17320,6 +17321,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "integer_datetimes",
     "IntervalStyle",
     "is_superuser",
+    "lc_monetary",
     "lock_timeout",
     "max_connections",
     "max_prepared_transactions",

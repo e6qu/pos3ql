@@ -9913,6 +9913,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Int8(_))
         | Some(OwnedDatum::Xid8(_))
         | Some(OwnedDatum::PgLsn(_))
+        | Some(OwnedDatum::Money(_))
         | Some(OwnedDatum::Float8(_)) => 8,
         Some(OwnedDatum::Snapshot { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
@@ -10064,6 +10065,11 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         }
         Some(OwnedDatum::PgLsn(v)) => {
             out[0] = 33;
+            out[1..9].copy_from_slice(&v.to_le_bytes());
+            9
+        }
+        Some(OwnedDatum::Money(v)) => {
+            out[0] = 37;
             out[1..9].copy_from_slice(&v.to_le_bytes());
             9
         }
@@ -10339,6 +10345,11 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = payload.get(*at..*at + 8)?;
             *at += 8;
             Some(OwnedDatum::PgLsn(u64::from_le_bytes(b.try_into().unwrap())))
+        }
+        37 => {
+            let b = payload.get(*at..*at + 8)?;
+            *at += 8;
+            Some(OwnedDatum::Money(i64::from_le_bytes(b.try_into().unwrap())))
         }
         5 => {
             let b = payload.get(*at..*at + 8)?;

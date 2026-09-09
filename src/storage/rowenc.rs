@@ -36,6 +36,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Int8(_)
             | Datum::Xid8(_)
             | Datum::PgLsn(_)
+            | Datum::Money(_)
             | Datum::Float4(_)
             | Datum::Float8(_)
             | Datum::Timestamp(_)
@@ -159,6 +160,10 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 take = 4 + value.raw().len();
             }
             Datum::PgLsn(x) => {
+                rest[..8].copy_from_slice(&x.to_le_bytes());
+                take = 8;
+            }
+            Datum::Money(x) => {
                 rest[..8].copy_from_slice(&x.to_le_bytes());
                 take = 8;
             }
@@ -331,6 +336,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         ColType::Int8
         | ColType::Xid8
         | ColType::PgLsn
+        | ColType::Money
         | ColType::Float4
         | ColType::Float8
         | ColType::Timestamp
@@ -508,6 +514,15 @@ pub(crate) fn decode<'a>(
                     .try_into()
                     .unwrap();
                 out[i] = Datum::Xid8(u64::from_le_bytes(raw));
+                at += 8;
+            }
+            ColType::Money => {
+                let raw: [u8; 8] = bytes
+                    .get(at..at + 8)
+                    .ok_or_else(corrupt)?
+                    .try_into()
+                    .unwrap();
+                out[i] = Datum::Money(i64::from_le_bytes(raw));
                 at += 8;
             }
             snapshot_type @ (ColType::PgSnapshot | ColType::TxidSnapshot) => {

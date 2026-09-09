@@ -17,6 +17,7 @@ pub(crate) mod geometry;
 pub(crate) mod json;
 pub(super) mod math;
 pub(super) mod misc;
+pub(super) mod money;
 pub(super) mod net;
 pub(super) mod range;
 pub(super) mod regex;

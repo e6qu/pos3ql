@@ -351,6 +351,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Int8(_)
         | Datum::Xid8(_)
         | Datum::PgLsn(_)
+        | Datum::Money(_)
         | Datum::Timestamp(_)
         | Datum::Timestamptz(_)
         | Datum::Time(_)
@@ -1310,6 +1311,10 @@ impl<'b> Responder<'b> {
                     m.i32(8);
                     m.bytes(&x.to_be_bytes());
                 }
+                Datum::Money(x) => {
+                    m.i32(8);
+                    m.bytes(&x.to_be_bytes());
+                }
                 Datum::Regtype { referenced_oid, .. } => {
                     m.i32(4);
                     m.bytes(&referenced_oid.to_be_bytes());
@@ -2085,6 +2090,17 @@ mod tests {
         assert_eq!(&bytes[9..17], &u64::MAX.to_be_bytes());
         assert_eq!(&bytes[17..21], &36i32.to_be_bytes());
         assert_eq!(&bytes[21..], snapshot.raw());
+    }
+
+    #[test]
+    fn binary_money_results_are_exact_signed_big_endian_cents() {
+        let mut budget = Budget::new(128);
+        let mut buffer = FixedBuf::new(&mut budget, "money result", 32).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(&mut message, &Datum::Money(-123_456));
+        message.finish().unwrap();
+        assert_eq!(&buffer.readable()[..9], &[b'd', 0, 0, 0, 16, 0, 0, 0, 8]);
+        assert_eq!(&buffer.readable()[9..], &(-123_456_i64).to_be_bytes());
     }
 
     #[test]

@@ -2058,6 +2058,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
             legacy: ct == ColType::TxidSnapshot,
         },
         ColType::PgLsn => Datum::PgLsn(0),
+        ColType::Money => Datum::Money(0),
         ColType::Regtype => Datum::Regtype {
             referenced_oid: 0,
             name: "-",

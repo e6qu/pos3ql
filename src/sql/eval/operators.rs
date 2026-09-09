@@ -611,6 +611,10 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[41]);
             hasher.write(&v.to_le_bytes());
         }
+        Datum::Money(v) => {
+            hasher.write(&[46]);
+            hasher.write(&v.to_le_bytes());
+        }
         Datum::Int8(v) => {
             hasher.write(&[2]);
             hasher.write(&v.to_le_bytes());
@@ -742,6 +746,7 @@ pub(crate) fn compare_datums_as(
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
         (Datum::Xid8(a), Datum::Xid8(b)) => a.cmp(b),
         (Datum::PgLsn(a), Datum::PgLsn(b)) => a.cmp(b),
+        (Datum::Money(a), Datum::Money(b)) => a.cmp(b),
         (Datum::Char(a), Datum::Char(b)) => a.cmp(b),
         (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
         (Datum::TsVector(a), Datum::TsVector(b)) => {
@@ -1014,6 +1019,7 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
         Datum::Int4(_) => Datum::Int4(s.trim().parse().map_err(|_| bad_text(s, "integer"))?),
         Datum::Oid(_) => Datum::Oid(super::cast::parse_oid(s)?),
         Datum::Int8(_) => Datum::Int8(s.trim().parse().map_err(|_| bad_text(s, "bigint"))?),
+        Datum::Money(_) => Datum::Money(crate::sql::money::parse(s)?),
         Datum::Float8(_) => Datum::Float8(
             s.trim()
                 .parse()
@@ -1160,6 +1166,55 @@ pub(crate) fn arithmetic<'a>(
     }
     let l = if l_unknown { coerce_unknown(l, &r)? } else { l };
     let r = if r_unknown { coerce_unknown(r, &l)? } else { r };
+    match (operator, l, r) {
+        (BinaryOp::Add, Datum::Money(left), Datum::Money(right)) => {
+            return crate::sql::money::add(left, right).map(Datum::Money);
+        }
+        (BinaryOp::Sub, Datum::Money(left), Datum::Money(right)) => {
+            return crate::sql::money::sub(left, right).map(Datum::Money);
+        }
+        (BinaryOp::Div, Datum::Money(left), Datum::Money(right)) => {
+            return crate::sql::money::ratio(left, right).map(Datum::Float8);
+        }
+        (BinaryOp::Mul | BinaryOp::Div, Datum::Money(value), factor)
+            if as_i64(&factor).is_some() =>
+        {
+            let factor = as_i64(&factor).expect("guarded integer");
+            return if operator == BinaryOp::Mul {
+                crate::sql::money::mul_integer(value, factor)
+            } else {
+                crate::sql::money::div_integer(value, factor)
+            }
+            .map(Datum::Money);
+        }
+        (BinaryOp::Mul, factor, Datum::Money(value)) if as_i64(&factor).is_some() => {
+            return crate::sql::money::mul_integer(
+                value,
+                as_i64(&factor).expect("guarded integer"),
+            )
+            .map(Datum::Money);
+        }
+        (BinaryOp::Mul | BinaryOp::Div, Datum::Money(value), Datum::Float4(factor)) => {
+            return crate::sql::money::scale_float(
+                value,
+                f64::from(factor),
+                operator == BinaryOp::Div,
+            )
+            .map(Datum::Money);
+        }
+        (BinaryOp::Mul | BinaryOp::Div, Datum::Money(value), Datum::Float8(factor)) => {
+            return crate::sql::money::scale_float(value, factor, operator == BinaryOp::Div)
+                .map(Datum::Money);
+        }
+        (BinaryOp::Mul, Datum::Float4(factor), Datum::Money(value)) => {
+            return crate::sql::money::scale_float(value, f64::from(factor), false)
+                .map(Datum::Money);
+        }
+        (BinaryOp::Mul, Datum::Float8(factor), Datum::Money(value)) => {
+            return crate::sql::money::scale_float(value, factor, false).map(Datum::Money);
+        }
+        _ => {}
+    }
     // Date arithmetic (PostgreSQL): `date + int` / `date - int` -> date;
     // `date - date` -> int (days). Handled before the generic integer path,
     // which would otherwise coerce a date to a bare day count.

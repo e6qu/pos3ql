@@ -41,6 +41,12 @@ historical `txid` aliases, snapshot set-returning functions, current-ID and
 status functions, arrays, indexing, text/binary protocol values, and durable
 ordinary and prepared-transaction status across object-cold recovery.
 
+PostgreSQL `money` is an exact signed-cent type with C/en_US monetary text,
+scalar and array binary wire formats, casts, comparisons, arithmetic, support
+functions, aggregates, btree indexes and catalogs. Values retain that identity
+through COPY, stored rows, WAL, checkpoints, and object-cold recovery;
+unsupported monetary locales fail explicitly.
+
 Permanent, unlogged, and session-temporary tables, views, indexes, identity sequences, standalone sequences, CTAS, and `SELECT INTO` have distinct PostgreSQL lifetimes. A view becomes temporary when requested or when any captured relation is temporary, including through another view. Temporary relations use isolated per-connection namespaces and `ON COMMIT` actions and never enter WAL, checkpoints, object storage, template clones, or logical publications. Committed temporary rows spill to a bounded, startup-sized local store (`temporary_spill_bytes`, or `0` to keep them resident-only) that is recreated empty on restart. Unlogged definitions are durable, retain rows after a clean shutdown, and reset table and sequence state after an unclean restart.
 
 Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.

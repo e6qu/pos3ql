@@ -63,6 +63,14 @@ ordering. Binary wire/COPY, arrays, indexes, constraints, generated columns,
 views, WAL, checkpoints, and object-cold recovery retain the same bounded
 canonical address representation.
 
+PostgreSQL 18 ranges and multiranges include all six built-in subtype
+families, cross range/multirange containment and positional operators, direct
+comparison/set/hash/canonical/subdiff support routines, union and intersection
+aggregates, and multirange `unnest`. Exact polymorphic procedure, operator,
+aggregate, btree, and hash catalogs agree with PostgreSQL. Values keep their
+type through arrays, binary wire/COPY, rows, indexes, constraints, generated
+columns, views, WAL, checkpoints, and object-cold recovery.
+
 PostgreSQL `tid` and `cid` values and arrays retain their exact unsigned tuple
 and command identity through SQL, btree/hash support, text and binary wire/COPY,
 rows, spills, WAL, checkpoints, and object-cold recovery. Their PostgreSQL 18

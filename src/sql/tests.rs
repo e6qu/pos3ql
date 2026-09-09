@@ -13495,6 +13495,37 @@ fn range_and_multirange_arrays_keep_catalog_and_durable_identity() {
 }
 
 #[test]
+fn range_multirange_support_aggregates_and_expansion_are_typed() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT int4multirange(VARIADIC ARRAY['[1,3)'::int4range, '[5,7)']), \
+                multirange('[1,3)'::int4range); \
+         SELECT range_agg(value), range_intersect_agg(value) \
+           FROM (VALUES ('[1,5)'::int4range), ('[3,7)'), (NULL)) input(value); \
+         SELECT value FROM unnest('{[1,3),[5,7)}'::int4multirange) expanded(value); \
+         SELECT pg_typeof(ARRAY[NULL]), \
+                pg_typeof(ARRAY['[1,3)'::int4range, NULL])",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "{[1,3),[5,7)}|{[1,3)}",
+            "{[1,7)}|[3,5)",
+            "[1,3)",
+            "[5,7)",
+            "text[]|int4range[]"
+        ]
+    );
+}
+
+#[test]
 fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
     let config = test_config("range-array-restart");
     {

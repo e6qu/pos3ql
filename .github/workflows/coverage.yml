@@ -181,7 +181,8 @@ jobs:
           - { name: exact, corpus_shard: "none", auxiliary: exact }
           - { name: copy, corpus_shard: "none", auxiliary: copy }
           - { name: types, corpus_shard: "none", auxiliary: types }
-          - { name: slt, corpus_shard: "none", auxiliary: slt }
+          - { name: slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "2" }
+          - { name: slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "2" }
     services:
       postgres:
         image: postgres:18
@@ -228,6 +229,8 @@ jobs:
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
           POS3QL_DIFF_CORPUS_SHARD: ${{ matrix.corpus_shard }}
           POS3QL_DIFF_AUXILIARY: ${{ matrix.auxiliary }}
+          POS3QL_SLT_QUERY_SHARD: ${{ matrix.slt_query_shard || '0' }}
+          POS3QL_SLT_QUERY_SHARDS: ${{ matrix.slt_query_shards || '1' }}
           COVERAGE_SHARD: runtest:spilldiff
         run: sh tools/coverage.sh
 

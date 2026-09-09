@@ -2623,7 +2623,12 @@ pub fn eval_full<'a>(
             let mut element: Option<super::types::ArrElem> = None;
             for (i, e) in items.iter().enumerate() {
                 let v = eval_full(e, arena, params, row, hooks)?;
-                if let Some(el) = super::types::ArrElem::from_datum(&v) {
+                // `unknown` literals adopt the array's resolved common type;
+                // they must not force a typed range/enum/etc. constructor to
+                // text merely because their runtime carrier is `Datum::Text`.
+                if !is_unknown_literal(e)
+                    && let Some(el) = super::types::ArrElem::from_datum(&v)
+                {
                     element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
                 }
                 vals[i] = v;
@@ -2711,7 +2716,13 @@ pub fn eval_full<'a>(
                     )?,
                 });
             }
-            let element = element.unwrap_or(super::types::ArrElem::Int4);
+            let element = element.unwrap_or_else(|| {
+                if items.iter().any(|item| is_unknown_literal(item)) {
+                    super::types::ArrElem::Text
+                } else {
+                    super::types::ArrElem::Int4
+                }
+            });
             // Coerce each element to the unified type.
             let ct = element.to_coltype();
             for v in vals.iter_mut().take(items.len()) {
@@ -3826,7 +3837,8 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
-        && let Some(result) = funcs::range::dispatch(name, args, star, arena, params, row, hooks)
+        && let Some(result) =
+            funcs::range::dispatch(name, args, star, variadic, arena, params, row, hooks)
     {
         return result;
     }
@@ -3909,8 +3921,17 @@ fn call<'a>(
         }
     }
     match name {
-        "count" | "sum" | "avg" | "min" | "max" | "bool_and" | "bool_or" | "every"
-        | "string_agg" => Err(sql_err!(
+        "count"
+        | "sum"
+        | "avg"
+        | "min"
+        | "max"
+        | "bool_and"
+        | "bool_or"
+        | "every"
+        | "string_agg"
+        | "range_agg"
+        | "range_intersect_agg" => Err(sql_err!(
             sqlstate::GROUPING_ERROR,
             "aggregate functions are not allowed here"
         )),
@@ -3977,18 +3998,31 @@ fn call<'a>(
         "unnest" => {
             arity(1)?;
             let a = eval_full(args[0], arena, params, row, hooks)?;
-            let (element, raw) = match a {
-                Datum::Array { element, raw } => (element, raw),
-                Datum::Null => return Ok(Datum::Null),
-                _ => return Err(type_mismatch("unnest requires an array", &a)),
-            };
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "set-returning function called where not allowed"
                 )
             })?;
-            Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
+            match a {
+                Datum::Array { element, raw } => {
+                    Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
+                }
+                Datum::Multirange { text, kind } => {
+                    let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
+                    let count = crate::sql::range::split_components(text, &mut components)?;
+                    Ok(if k <= count {
+                        Datum::Range {
+                            text: components[k - 1],
+                            kind,
+                        }
+                    } else {
+                        Datum::Null
+                    })
+                }
+                Datum::Null => Ok(Datum::Null),
+                _ => Err(type_mismatch("unnest requires an array or multirange", &a)),
+            }
         }
         "generate_series" => {
             if !(2..=3).contains(&args.len()) {
@@ -4792,11 +4826,11 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
     }
 }
 
-/// A string literal or a parameter is PostgreSQL's "unknown" type, which
+/// A string literal, NULL constant, or parameter is PostgreSQL's "unknown" type, which
 /// coerces to whatever it is compared/combined with. A real typed value
 /// (column, function result, cast) does not.
 fn is_unknown_literal(expression: &Expr) -> bool {
-    matches!(expression, Expr::Str(_) | Expr::Param(_))
+    matches!(expression, Expr::Str(_) | Expr::Null | Expr::Param(_))
 }
 
 #[allow(clippy::too_many_arguments)]

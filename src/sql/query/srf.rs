@@ -1603,6 +1603,10 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         }
         match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
             Datum::Array { raw, .. } => Ok(crate::sql::array::len(raw)),
+            Datum::Multirange { text, .. } => {
+                let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
+                crate::sql::range::split_components(text, &mut components)
+            }
             Datum::Int2Vector(raw) => Ok(raw.len() / 2),
             Datum::OidVector(raw) => Ok(raw.len() / 4),
             Datum::Null => Ok(0),
@@ -2818,15 +2822,20 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 ));
             }
             for (index, argument) in args.iter().enumerate() {
-                let element = match crate::sql::eval::static_type_pub(argument, columns) {
-                    Some(ColType::Array(element)) => element,
-                    Some(_) => crate::sql::types::ArrElem::Text,
-                    None => match crate::sql::eval::eval(argument, arena, params, columns)? {
-                        Datum::Array { element, .. } => element,
-                        _ => crate::sql::types::ArrElem::Text,
+                let (ctype, user_type) = match crate::sql::eval::static_type_pub(argument, columns)
+                {
+                    Some(ColType::Array(element)) => {
+                        table_function_array_element_type(storage, txid, element)
+                    }
+                    Some(ColType::Multirange(kind)) => (ColType::Range(kind), None),
+                    _ => match crate::sql::eval::eval(argument, arena, params, columns)? {
+                        Datum::Array { element, .. } => {
+                            table_function_array_element_type(storage, txid, element)
+                        }
+                        Datum::Multirange { kind, .. } => (ColType::Range(kind), None),
+                        _ => (ColType::Text, None),
                     },
                 };
-                let (ctype, user_type) = table_function_array_element_type(storage, txid, element);
                 let type_mod = match argument {
                     Expr::Cast { type_mod, .. } => *type_mod,
                     _ => -1,
@@ -4181,11 +4190,15 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         for value in &arrays[..args.len()] {
             match *value {
                 Datum::Array { raw, .. } => count = count.max(crate::sql::array::len(raw)),
+                Datum::Multirange { text, .. } => {
+                    let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
+                    count = count.max(crate::sql::range::split_components(text, &mut components)?);
+                }
                 Datum::Null => {}
                 _ => {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
-                        "unnest requires an array argument"
+                        "unnest requires an array or multirange argument"
                     ));
                 }
             }
@@ -4200,6 +4213,19 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 values[column] = match *array {
                     Datum::Array { element, raw } => {
                         crate::sql::array::get(raw, element, row_index).unwrap_or(Datum::Null)
+                    }
+                    Datum::Multirange { text, kind } => {
+                        let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
+                        let component_count =
+                            crate::sql::range::split_components(text, &mut components)?;
+                        if row_index < component_count {
+                            Datum::Range {
+                                text: components[row_index],
+                                kind,
+                            }
+                        } else {
+                            Datum::Null
+                        }
                     }
                     Datum::Null => Datum::Null,
                     _ => {

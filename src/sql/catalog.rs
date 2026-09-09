@@ -2426,6 +2426,221 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     ),
     intrinsic!(5033, "network_sortsupport", 2278, "2281", 1, "i"),
     intrinsic!(5051, "btequalimage", super::types::oid::BOOL, "26", 1, "i"),
+    // PostgreSQL 18 range and multirange scalar, constructor, aggregate, and
+    // set-returning boundary.  Pseudo-type OIDs are retained verbatim so the
+    // catalogs describe the same polymorphic contracts as PostgreSQL.
+    intrinsic!(1293, "unnest", 3831, "4537", 1, "i"),
+    intrinsic!(3840, "int4range", 3904, "23 23", 2, "i"),
+    intrinsic!(3841, "int4range", 3904, "23 23 25", 3, "i"),
+    intrinsic!(3844, "numrange", 3906, "1700 1700", 2, "i"),
+    intrinsic!(3845, "numrange", 3906, "1700 1700 25", 3, "i"),
+    intrinsic!(3933, "tsrange", 3908, "1114 1114", 2, "i"),
+    intrinsic!(3934, "tsrange", 3908, "1114 1114 25", 3, "i"),
+    intrinsic!(3937, "tstzrange", 3910, "1184 1184", 2, "i"),
+    intrinsic!(3938, "tstzrange", 3910, "1184 1184 25", 3, "i"),
+    intrinsic!(3941, "daterange", 3912, "1082 1082", 2, "i"),
+    intrinsic!(3942, "daterange", 3912, "1082 1082 25", 3, "i"),
+    intrinsic!(3945, "int8range", 3926, "20 20", 2, "i"),
+    intrinsic!(3946, "int8range", 3926, "20 20 25", 3, "i"),
+    intrinsic!(3848, "lower", 2283, "3831", 1, "i"),
+    intrinsic!(3849, "upper", 2283, "3831", 1, "i"),
+    intrinsic!(3850, "isempty", 16, "3831", 1, "i"),
+    intrinsic!(3851, "lower_inc", 16, "3831", 1, "i"),
+    intrinsic!(3852, "upper_inc", 16, "3831", 1, "i"),
+    intrinsic!(3853, "lower_inf", 16, "3831", 1, "i"),
+    intrinsic!(3854, "upper_inf", 16, "3831", 1, "i"),
+    intrinsic!(3855, "range_eq", 16, "3831 3831", 2, "i"),
+    intrinsic!(3856, "range_ne", 16, "3831 3831", 2, "i"),
+    intrinsic!(3857, "range_overlaps", 16, "3831 3831", 2, "i"),
+    intrinsic!(3858, "range_contains_elem", 16, "3831 2283", 2, "i"),
+    intrinsic!(3859, "range_contains", 16, "3831 3831", 2, "i"),
+    intrinsic!(3860, "elem_contained_by_range", 16, "2283 3831", 2, "i"),
+    intrinsic!(3861, "range_contained_by", 16, "3831 3831", 2, "i"),
+    intrinsic!(3862, "range_adjacent", 16, "3831 3831", 2, "i"),
+    intrinsic!(3863, "range_before", 16, "3831 3831", 2, "i"),
+    intrinsic!(3864, "range_after", 16, "3831 3831", 2, "i"),
+    intrinsic!(3865, "range_overleft", 16, "3831 3831", 2, "i"),
+    intrinsic!(3866, "range_overright", 16, "3831 3831", 2, "i"),
+    intrinsic!(3867, "range_union", 3831, "3831 3831", 2, "i"),
+    intrinsic!(3868, "range_intersect", 3831, "3831 3831", 2, "i"),
+    intrinsic!(3869, "range_minus", 3831, "3831 3831", 2, "i"),
+    intrinsic!(3870, "range_cmp", 23, "3831 3831", 2, "i"),
+    intrinsic!(3871, "range_lt", 16, "3831 3831", 2, "i"),
+    intrinsic!(3872, "range_le", 16, "3831 3831", 2, "i"),
+    intrinsic!(3873, "range_ge", 16, "3831 3831", 2, "i"),
+    intrinsic!(3874, "range_gt", 16, "3831 3831", 2, "i"),
+    intrinsic!(3902, "hash_range", 23, "3831", 1, "i"),
+    intrinsic!(3417, "hash_range_extended", 20, "3831 20", 2, "i"),
+    intrinsic!(3914, "int4range_canonical", 3904, "3904", 1, "i"),
+    intrinsic!(3915, "daterange_canonical", 3912, "3912", 1, "i"),
+    intrinsic!(3928, "int8range_canonical", 3926, "3926", 1, "i"),
+    intrinsic!(3922, "int4range_subdiff", 701, "23 23", 2, "i"),
+    intrinsic!(3923, "int8range_subdiff", 701, "20 20", 2, "i"),
+    intrinsic!(3924, "numrange_subdiff", 701, "1700 1700", 2, "i"),
+    intrinsic!(3925, "daterange_subdiff", 701, "1082 1082", 2, "i"),
+    intrinsic!(3929, "tsrange_subdiff", 701, "1114 1114", 2, "i"),
+    intrinsic!(3930, "tstzrange_subdiff", 701, "1184 1184", 2, "i"),
+    intrinsic!(4057, "range_merge", 3831, "3831 3831", 2, "i"),
+    intrinsic!(4228, "range_merge", 3831, "4537", 1, "i"),
+    intrinsic!(4235, "lower", 2283, "4537", 1, "i"),
+    intrinsic!(4236, "upper", 2283, "4537", 1, "i"),
+    intrinsic!(4237, "isempty", 16, "4537", 1, "i"),
+    intrinsic!(4238, "lower_inc", 16, "4537", 1, "i"),
+    intrinsic!(4239, "upper_inc", 16, "4537", 1, "i"),
+    intrinsic!(4240, "lower_inf", 16, "4537", 1, "i"),
+    intrinsic!(4241, "upper_inf", 16, "4537", 1, "i"),
+    intrinsic!(4244, "multirange_eq", 16, "4537 4537", 2, "i"),
+    intrinsic!(4245, "multirange_ne", 16, "4537 4537", 2, "i"),
+    intrinsic!(4246, "range_overlaps_multirange", 16, "3831 4537", 2, "i"),
+    intrinsic!(4247, "multirange_overlaps_range", 16, "4537 3831", 2, "i"),
+    intrinsic!(
+        4248,
+        "multirange_overlaps_multirange",
+        16,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(4249, "multirange_contains_elem", 16, "4537 2283", 2, "i"),
+    intrinsic!(4250, "multirange_contains_range", 16, "4537 3831", 2, "i"),
+    intrinsic!(
+        4251,
+        "multirange_contains_multirange",
+        16,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4252,
+        "elem_contained_by_multirange",
+        16,
+        "2283 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4253,
+        "range_contained_by_multirange",
+        16,
+        "3831 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4254,
+        "multirange_contained_by_multirange",
+        16,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(4255, "range_adjacent_multirange", 16, "3831 4537", 2, "i"),
+    intrinsic!(
+        4256,
+        "multirange_adjacent_multirange",
+        16,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(4257, "multirange_adjacent_range", 16, "4537 3831", 2, "i"),
+    intrinsic!(4258, "range_before_multirange", 16, "3831 4537", 2, "i"),
+    intrinsic!(4259, "multirange_before_range", 16, "4537 3831", 2, "i"),
+    intrinsic!(
+        4260,
+        "multirange_before_multirange",
+        16,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(4261, "range_after_multirange", 16, "3831 4537", 2, "i"),
+    intrinsic!(4262, "multirange_after_range", 16, "4537 3831", 2, "i"),
+    intrinsic!(4263, "multirange_after_multirange", 16, "4537 4537", 2, "i"),
+    intrinsic!(4264, "range_overleft_multirange", 16, "3831 4537", 2, "i"),
+    intrinsic!(4265, "multirange_overleft_range", 16, "4537 3831", 2, "i"),
+    intrinsic!(
+        4266,
+        "multirange_overleft_multirange",
+        16,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(4267, "range_overright_multirange", 16, "3831 4537", 2, "i"),
+    intrinsic!(4268, "multirange_overright_range", 16, "4537 3831", 2, "i"),
+    intrinsic!(
+        4269,
+        "multirange_overright_multirange",
+        16,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(4270, "multirange_union", 4537, "4537 4537", 2, "i"),
+    intrinsic!(4271, "multirange_minus", 4537, "4537 4537", 2, "i"),
+    intrinsic!(4272, "multirange_intersect", 4537, "4537 4537", 2, "i"),
+    intrinsic!(4273, "multirange_cmp", 23, "4537 4537", 2, "i"),
+    intrinsic!(4274, "multirange_lt", 16, "4537 4537", 2, "i"),
+    intrinsic!(4275, "multirange_le", 16, "4537 4537", 2, "i"),
+    intrinsic!(4276, "multirange_ge", 16, "4537 4537", 2, "i"),
+    intrinsic!(4277, "multirange_gt", 16, "4537 4537", 2, "i"),
+    intrinsic!(4278, "hash_multirange", 23, "4537", 1, "i"),
+    intrinsic!(4279, "hash_multirange_extended", 20, "4537 20", 2, "i"),
+    intrinsic!(4541, "range_contains_multirange", 16, "3831 4537", 2, "i"),
+    intrinsic!(
+        4542,
+        "multirange_contained_by_range",
+        16,
+        "4537 3831",
+        2,
+        "i"
+    ),
+    intrinsic!(4280, "int4multirange", 4451, "", 0, "i"),
+    intrinsic!(4281, "int4multirange", 4451, "3904", 1, "i"),
+    intrinsic!(4282, "int4multirange", 4451, "3905", 1, "i"),
+    intrinsic!(4283, "nummultirange", 4532, "", 0, "i"),
+    intrinsic!(4284, "nummultirange", 4532, "3906", 1, "i"),
+    intrinsic!(4285, "nummultirange", 4532, "3907", 1, "i"),
+    intrinsic!(4286, "tsmultirange", 4533, "", 0, "i"),
+    intrinsic!(4287, "tsmultirange", 4533, "3908", 1, "i"),
+    intrinsic!(4288, "tsmultirange", 4533, "3909", 1, "i"),
+    intrinsic!(4289, "tstzmultirange", 4534, "", 0, "i"),
+    intrinsic!(4290, "tstzmultirange", 4534, "3910", 1, "i"),
+    intrinsic!(4291, "tstzmultirange", 4534, "3911", 1, "i"),
+    intrinsic!(4292, "datemultirange", 4535, "", 0, "i"),
+    intrinsic!(4293, "datemultirange", 4535, "3912", 1, "i"),
+    intrinsic!(4294, "datemultirange", 4535, "3913", 1, "i"),
+    intrinsic!(4295, "int8multirange", 4536, "", 0, "i"),
+    intrinsic!(4296, "int8multirange", 4536, "3926", 1, "i"),
+    intrinsic!(4297, "int8multirange", 4536, "3927", 1, "i"),
+    intrinsic!(4298, "multirange", 4537, "3831", 1, "i"),
+    intrinsic!(4299, "range_agg_transfn", 2281, "2281 3831", 2, "i"),
+    intrinsic!(4300, "range_agg_finalfn", 4537, "2281 3831", 2, "i"),
+    intrinsic!(
+        4388,
+        "multirange_intersect_agg_transfn",
+        4537,
+        "4537 4537",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4401,
+        "range_intersect_agg_transfn",
+        3831,
+        "3831 3831",
+        2,
+        "i"
+    ),
+    intrinsic!(6225, "multirange_agg_transfn", 2281, "2281 4537", 2, "i"),
+    intrinsic!(6226, "multirange_agg_finalfn", 4537, "2281 4537", 2, "i"),
+    intrinsic!(6391, "range_sortsupport", 2278, "2281", 1, "i"),
+    intrinsic!(4301, "range_agg", 4537, "3831", 1, "i"),
+    intrinsic!(4389, "range_intersect_agg", 4537, "4537", 1, "i"),
+    intrinsic!(4450, "range_intersect_agg", 3831, "3831", 1, "i"),
+    intrinsic!(6227, "range_agg", 4537, "4537", 1, "i"),
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -2477,13 +2692,21 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 6167
             | 3564
             | 3565
+            | 4301
+            | 4389
+            | 4450
+            | 6227
+            | 4299
+            | 4300
+            | 6225
+            | 6226
     )
 }
 
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
-        1179 | 2947 | 3205 | 3475 | 3491 | 3961 | 4006 | 5064 | 6119 | 4568 | 3566
+        1293 | 1179 | 2947 | 3205 | 3475 | 3491 | 3961 | 4006 | 5064 | 6119 | 4568 | 3566
     )
 }
 
@@ -2566,6 +2789,803 @@ struct CatalogOperator {
     restriction: Option<(i32, &'static str)>,
     join: Option<(i32, &'static str)>,
 }
+
+/// Operators whose catalog signatures use PostgreSQL pseudo-types.  They are
+/// kept separate from the concrete evaluator lookup table: pretending
+/// `anyrange` is one concrete `ColType` would make overload resolution accept
+/// mismatched range subtypes.
+#[derive(Clone, Copy)]
+struct PolymorphicOperator {
+    oid: i32,
+    name: &'static str,
+    left_oid: i32,
+    right_oid: i32,
+    result_oid: i32,
+    procedure_oid: i32,
+    procedure_name: &'static str,
+    commutator: i32,
+    negator: i32,
+    merges: bool,
+    hashes: bool,
+    restriction: Option<(i32, &'static str)>,
+    join: Option<(i32, &'static str)>,
+}
+
+macro_rules! polymorphic_operator {
+    ($oid:literal,$name:literal,$left:literal,$right:literal,$result:literal,$proc:literal,$procname:literal,$com:literal,$neg:literal,$merge:literal,$hash:literal,$rest:expr,$join:expr) => {
+        PolymorphicOperator {
+            oid: $oid,
+            name: $name,
+            left_oid: $left,
+            right_oid: $right,
+            result_oid: $result,
+            procedure_oid: $proc,
+            procedure_name: $procname,
+            commutator: $com,
+            negator: $neg,
+            merges: $merge,
+            hashes: $hash,
+            restriction: $rest,
+            join: $join,
+        }
+    };
+}
+
+const EQSEL: Option<(i32, &str)> = Some((101, "eqsel"));
+const EQJOIN: Option<(i32, &str)> = Some((105, "eqjoinsel"));
+const NEQSEL: Option<(i32, &str)> = Some((102, "neqsel"));
+const NEQJOIN: Option<(i32, &str)> = Some((106, "neqjoinsel"));
+const RANGESEL: Option<(i32, &str)> = Some((3169, "rangesel"));
+const MULTIRANGESEL: Option<(i32, &str)> = Some((4243, "multirangesel"));
+const LTJOIN: Option<(i32, &str)> = Some((107, "scalarltjoinsel"));
+const LEJOIN: Option<(i32, &str)> = Some((386, "scalarlejoinsel"));
+const GEJOIN: Option<(i32, &str)> = Some((398, "scalargejoinsel"));
+const GTJOIN: Option<(i32, &str)> = Some((108, "scalargtjoinsel"));
+const AREAJOIN: Option<(i32, &str)> = Some((140, "areajoinsel"));
+const CONTJOIN: Option<(i32, &str)> = Some((1303, "contjoinsel"));
+const MATCHSEL: Option<(i32, &str)> = Some((5040, "matchingsel"));
+const MATCHJOIN: Option<(i32, &str)> = Some((5041, "matchingjoinsel"));
+
+const POLYMORPHIC_RANGE_OPERATORS: &[PolymorphicOperator] = &[
+    polymorphic_operator!(
+        2860,
+        "=",
+        4537,
+        4537,
+        16,
+        4244,
+        "multirange_eq",
+        2860,
+        2861,
+        true,
+        true,
+        EQSEL,
+        EQJOIN
+    ),
+    polymorphic_operator!(
+        2861,
+        "<>",
+        4537,
+        4537,
+        16,
+        4245,
+        "multirange_ne",
+        2861,
+        2860,
+        false,
+        false,
+        NEQSEL,
+        NEQJOIN
+    ),
+    polymorphic_operator!(
+        2862,
+        "<",
+        4537,
+        4537,
+        16,
+        4274,
+        "multirange_lt",
+        2865,
+        2864,
+        false,
+        false,
+        MULTIRANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        2863,
+        "<=",
+        4537,
+        4537,
+        16,
+        4275,
+        "multirange_le",
+        2864,
+        2865,
+        false,
+        false,
+        MULTIRANGESEL,
+        LEJOIN
+    ),
+    polymorphic_operator!(
+        2864,
+        ">=",
+        4537,
+        4537,
+        16,
+        4276,
+        "multirange_ge",
+        2863,
+        2862,
+        false,
+        false,
+        MULTIRANGESEL,
+        GEJOIN
+    ),
+    polymorphic_operator!(
+        2865,
+        ">",
+        4537,
+        4537,
+        16,
+        4277,
+        "multirange_gt",
+        2862,
+        2863,
+        false,
+        false,
+        MULTIRANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        2866,
+        "&&",
+        3831,
+        4537,
+        16,
+        4246,
+        "range_overlaps_multirange",
+        2867,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        AREAJOIN
+    ),
+    polymorphic_operator!(
+        2867,
+        "&&",
+        4537,
+        3831,
+        16,
+        4247,
+        "multirange_overlaps_range",
+        2866,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        AREAJOIN
+    ),
+    polymorphic_operator!(
+        2868,
+        "&&",
+        4537,
+        4537,
+        16,
+        4248,
+        "multirange_overlaps_multirange",
+        2868,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        AREAJOIN
+    ),
+    polymorphic_operator!(
+        2869,
+        "@>",
+        4537,
+        2283,
+        16,
+        4249,
+        "multirange_contains_elem",
+        2872,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        2870,
+        "@>",
+        4537,
+        3831,
+        16,
+        4250,
+        "multirange_contains_range",
+        2873,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        2871,
+        "@>",
+        4537,
+        4537,
+        16,
+        4251,
+        "multirange_contains_multirange",
+        2874,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        2872,
+        "<@",
+        2283,
+        4537,
+        16,
+        4252,
+        "elem_contained_by_multirange",
+        2869,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        2873,
+        "<@",
+        3831,
+        4537,
+        16,
+        4253,
+        "range_contained_by_multirange",
+        2870,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        2874,
+        "<@",
+        4537,
+        4537,
+        16,
+        4254,
+        "multirange_contained_by_multirange",
+        2871,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        2875,
+        "&<",
+        3831,
+        4537,
+        16,
+        4264,
+        "range_overleft_multirange",
+        0,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        2876,
+        "&<",
+        4537,
+        3831,
+        16,
+        4265,
+        "multirange_overleft_range",
+        0,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        2877,
+        "&<",
+        4537,
+        4537,
+        16,
+        4266,
+        "multirange_overleft_multirange",
+        0,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        3585,
+        "&>",
+        3831,
+        4537,
+        16,
+        4267,
+        "range_overright_multirange",
+        0,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        3882, "=", 3831, 3831, 16, 3855, "range_eq", 3882, 3883, true, true, EQSEL, EQJOIN
+    ),
+    polymorphic_operator!(
+        3883, "<>", 3831, 3831, 16, 3856, "range_ne", 3883, 3882, false, false, NEQSEL, NEQJOIN
+    ),
+    polymorphic_operator!(
+        3884, "<", 3831, 3831, 16, 3871, "range_lt", 3887, 3886, false, false, RANGESEL, LTJOIN
+    ),
+    polymorphic_operator!(
+        3885, "<=", 3831, 3831, 16, 3872, "range_le", 3886, 3887, false, false, RANGESEL, LEJOIN
+    ),
+    polymorphic_operator!(
+        3886, ">=", 3831, 3831, 16, 3873, "range_ge", 3885, 3884, false, false, RANGESEL, GEJOIN
+    ),
+    polymorphic_operator!(
+        3887, ">", 3831, 3831, 16, 3874, "range_gt", 3884, 3885, false, false, RANGESEL, GTJOIN
+    ),
+    polymorphic_operator!(
+        3888,
+        "&&",
+        3831,
+        3831,
+        16,
+        3857,
+        "range_overlaps",
+        3888,
+        0,
+        false,
+        false,
+        RANGESEL,
+        AREAJOIN
+    ),
+    polymorphic_operator!(
+        3889,
+        "@>",
+        3831,
+        2283,
+        16,
+        3858,
+        "range_contains_elem",
+        3891,
+        0,
+        false,
+        false,
+        RANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        3890,
+        "@>",
+        3831,
+        3831,
+        16,
+        3859,
+        "range_contains",
+        3892,
+        0,
+        false,
+        false,
+        RANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        3891,
+        "<@",
+        2283,
+        3831,
+        16,
+        3860,
+        "elem_contained_by_range",
+        3889,
+        0,
+        false,
+        false,
+        RANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        3892,
+        "<@",
+        3831,
+        3831,
+        16,
+        3861,
+        "range_contained_by",
+        3890,
+        0,
+        false,
+        false,
+        RANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        3893,
+        "<<",
+        3831,
+        3831,
+        16,
+        3863,
+        "range_before",
+        3894,
+        0,
+        false,
+        false,
+        RANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        3894,
+        ">>",
+        3831,
+        3831,
+        16,
+        3864,
+        "range_after",
+        3893,
+        0,
+        false,
+        false,
+        RANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        3895,
+        "&<",
+        3831,
+        3831,
+        16,
+        3865,
+        "range_overleft",
+        0,
+        0,
+        false,
+        false,
+        RANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        3896,
+        "&>",
+        3831,
+        3831,
+        16,
+        3866,
+        "range_overright",
+        0,
+        0,
+        false,
+        false,
+        RANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        3897,
+        "-|-",
+        3831,
+        3831,
+        16,
+        3862,
+        "range_adjacent",
+        3897,
+        0,
+        false,
+        false,
+        MATCHSEL,
+        MATCHJOIN
+    ),
+    polymorphic_operator!(
+        3898,
+        "+",
+        3831,
+        3831,
+        3831,
+        3867,
+        "range_union",
+        3898,
+        0,
+        false,
+        false,
+        None,
+        None
+    ),
+    polymorphic_operator!(
+        3899,
+        "-",
+        3831,
+        3831,
+        3831,
+        3869,
+        "range_minus",
+        0,
+        0,
+        false,
+        false,
+        None,
+        None
+    ),
+    polymorphic_operator!(
+        3900,
+        "*",
+        3831,
+        3831,
+        3831,
+        3868,
+        "range_intersect",
+        3900,
+        0,
+        false,
+        false,
+        None,
+        None
+    ),
+    polymorphic_operator!(
+        4035,
+        "&>",
+        4537,
+        3831,
+        16,
+        4268,
+        "multirange_overright_range",
+        0,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        4142,
+        "&>",
+        4537,
+        4537,
+        16,
+        4269,
+        "multirange_overright_multirange",
+        0,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        4179,
+        "-|-",
+        3831,
+        4537,
+        16,
+        4255,
+        "range_adjacent_multirange",
+        4180,
+        0,
+        false,
+        false,
+        MATCHSEL,
+        MATCHJOIN
+    ),
+    polymorphic_operator!(
+        4180,
+        "-|-",
+        4537,
+        3831,
+        16,
+        4257,
+        "multirange_adjacent_range",
+        4179,
+        0,
+        false,
+        false,
+        MATCHSEL,
+        MATCHJOIN
+    ),
+    polymorphic_operator!(
+        4198,
+        "-|-",
+        4537,
+        4537,
+        16,
+        4256,
+        "multirange_adjacent_multirange",
+        4198,
+        0,
+        false,
+        false,
+        MATCHSEL,
+        MATCHJOIN
+    ),
+    polymorphic_operator!(
+        4392,
+        "+",
+        4537,
+        4537,
+        4537,
+        4270,
+        "multirange_union",
+        4392,
+        0,
+        false,
+        false,
+        None,
+        None
+    ),
+    polymorphic_operator!(
+        4393,
+        "-",
+        4537,
+        4537,
+        4537,
+        4271,
+        "multirange_minus",
+        0,
+        0,
+        false,
+        false,
+        None,
+        None
+    ),
+    polymorphic_operator!(
+        4394,
+        "*",
+        4537,
+        4537,
+        4537,
+        4272,
+        "multirange_intersect",
+        4394,
+        0,
+        false,
+        false,
+        None,
+        None
+    ),
+    polymorphic_operator!(
+        4395,
+        "<<",
+        3831,
+        4537,
+        16,
+        4258,
+        "range_before_multirange",
+        4399,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        4396,
+        "<<",
+        4537,
+        3831,
+        16,
+        4259,
+        "multirange_before_range",
+        4398,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        4397,
+        "<<",
+        4537,
+        4537,
+        16,
+        4260,
+        "multirange_before_multirange",
+        4400,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        LTJOIN
+    ),
+    polymorphic_operator!(
+        4398,
+        ">>",
+        3831,
+        4537,
+        16,
+        4261,
+        "range_after_multirange",
+        4396,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        4399,
+        ">>",
+        4537,
+        3831,
+        16,
+        4262,
+        "multirange_after_range",
+        4395,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        4400,
+        ">>",
+        4537,
+        4537,
+        16,
+        4263,
+        "multirange_after_multirange",
+        4397,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        GTJOIN
+    ),
+    polymorphic_operator!(
+        4539,
+        "@>",
+        3831,
+        4537,
+        16,
+        4541,
+        "range_contains_multirange",
+        4540,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+    polymorphic_operator!(
+        4540,
+        "<@",
+        4537,
+        3831,
+        16,
+        4542,
+        "multirange_contained_by_range",
+        4539,
+        0,
+        false,
+        false,
+        MULTIRANGESEL,
+        CONTJOIN
+    ),
+];
 
 macro_rules! catalog_operator {
     ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal, $procedure_name:literal) => {
@@ -4117,6 +5137,14 @@ const MACADDR_BTREE_OPERATOR_FAMILY_OID: i32 = 1984;
 const MACADDR_HASH_OPERATOR_FAMILY_OID: i32 = 1985;
 const MACADDR8_BTREE_OPERATOR_FAMILY_OID: i32 = 3371;
 const MACADDR8_HASH_OPERATOR_FAMILY_OID: i32 = 3372;
+const RANGE_BTREE_OPERATOR_FAMILY_OID: i32 = 3901;
+const RANGE_HASH_OPERATOR_FAMILY_OID: i32 = 3903;
+const MULTIRANGE_BTREE_OPERATOR_FAMILY_OID: i32 = 4199;
+const MULTIRANGE_HASH_OPERATOR_FAMILY_OID: i32 = 4225;
+const RANGE_BTREE_OPERATOR_CLASS_OID: i32 = 10076;
+const RANGE_HASH_OPERATOR_CLASS_OID: i32 = 10077;
+const MULTIRANGE_BTREE_OPERATOR_CLASS_OID: i32 = 10080;
+const MULTIRANGE_HASH_OPERATOR_CLASS_OID: i32 = 10081;
 const CIDR_BTREE_OPERATOR_CLASS_OID: i32 = 10009;
 const CIDR_HASH_OPERATOR_CLASS_OID: i32 = 10010;
 const INET_BTREE_OPERATOR_CLASS_OID: i32 = 10015;
@@ -7157,17 +8185,53 @@ fn parse_operator_signature<'a>(
     (signature.arity() != 0).then_some((name.trim(), signature))
 }
 
+fn parse_polymorphic_operator_signature(written: &str) -> Option<(&str, i32, i32)> {
+    let (name, arguments) = written.strip_suffix(')')?.split_once('(')?;
+    let (left, right) = arguments.split_once(',')?;
+    let type_oid = |written: &str| {
+        let written = written
+            .trim()
+            .strip_prefix("pg_catalog.")
+            .unwrap_or(written.trim());
+        [
+            (super::types::oid::ANYELEMENT, "anyelement"),
+            (super::types::oid::ANYRANGE, "anyrange"),
+            (super::types::oid::ANYMULTIRANGE, "anymultirange"),
+        ]
+        .into_iter()
+        .find_map(|(oid, name)| identifier_spelling_matches(written, name).then_some(oid))
+    };
+    Some((name.trim(), type_oid(left)?, type_oid(right)?))
+}
+
+fn polymorphic_type_name(oid: i32) -> Option<&'static str> {
+    match oid {
+        super::types::oid::ANYELEMENT => Some("anyelement"),
+        super::types::oid::ANYRANGE => Some("anyrange"),
+        super::types::oid::ANYMULTIRANGE => Some("anymultirange"),
+        _ => None,
+    }
+}
+
 pub(crate) fn operator_oid_by_name(
     storage: &Storage,
     txid: u32,
     written: &str,
     signature: bool,
 ) -> Result<Option<i32>, SqlError> {
+    let polymorphic_arguments = signature
+        .then(|| parse_polymorphic_operator_signature(written))
+        .flatten();
     let (name, arguments) = if signature {
-        let Some((name, signature)) = parse_operator_signature(written, storage, txid) else {
+        let parsed = parse_operator_signature(written, storage, txid);
+        let Some(name) = parsed
+            .as_ref()
+            .map(|(name, _)| *name)
+            .or_else(|| polymorphic_arguments.map(|(name, _, _)| name))
+        else {
             return Ok(None);
         };
-        (name, Some(signature))
+        (name, parsed.map(|(_, signature)| signature))
     } else {
         (written.trim(), None)
     };
@@ -7183,6 +8247,18 @@ pub(crate) fn operator_oid_by_name(
     };
     let builtin = || -> Result<Option<i32>, SqlError> {
         let mut found = None;
+        if let Some((_, left_oid, right_oid)) = polymorphic_arguments {
+            for operator in POLYMORPHIC_RANGE_OPERATORS {
+                if identifier_spelling_matches(written_name, operator.name)
+                    && operator.left_oid == left_oid
+                    && operator.right_oid == right_oid
+                    && found.replace(operator.oid).is_some()
+                {
+                    return Err(ambiguous());
+                }
+            }
+            return Ok(found);
+        }
         for operator in CATALOG_OPERATORS {
             let builtin_signature = crate::storage::OperatorSignature {
                 left: operator.left.map(crate::storage::RoutineResult::builtin),
@@ -7203,6 +8279,9 @@ pub(crate) fn operator_oid_by_name(
         Ok(found)
     };
     let user = |schema: &str| -> Result<Option<i32>, SqlError> {
+        if polymorphic_arguments.is_some() {
+            return Ok(None);
+        }
         let mut found = None;
         for (slot, operator) in storage.operators_visible_to(txid) {
             if operator.schema.as_str() != schema
@@ -7292,6 +8371,35 @@ pub(crate) fn operator_name_by_oid<'a>(
             .map_err(|_| super::eval::arena_full())?;
         return arena
             .alloc_str(text.as_str())
+            .map(Some)
+            .map_err(|_| super::eval::arena_full());
+    }
+    if let Some(operator) = POLYMORPHIC_RANGE_OPERATORS
+        .iter()
+        .find(|operator| operator.oid == oid)
+    {
+        if !signature {
+            return arena
+                .alloc_str_display(format_args!("pg_catalog.{}", operator.name))
+                .map(Some)
+                .map_err(|_| super::eval::arena_full());
+        }
+        let left = polymorphic_type_name(operator.left_oid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "unknown polymorphic operator type OID {}",
+                operator.left_oid
+            )
+        })?;
+        let right = polymorphic_type_name(operator.right_oid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "unknown polymorphic operator type OID {}",
+                operator.right_oid
+            )
+        })?;
+        return arena
+            .alloc_str_display(format_args!("{}({},{})", operator.name, left, right))
             .map(Some)
             .map_err(|_| super::eval::arena_full());
     }
@@ -15394,6 +16502,37 @@ fn pg_operator<'a>(
         )?;
     }
     let mut count = CATALOG_OPERATORS.len();
+    for operator in POLYMORPHIC_RANGE_OPERATORS {
+        if count == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_operator"));
+        }
+        rows[count] = row(
+            &[
+                Datum::Int4(2617),
+                Datum::Int4(operator.oid),
+                text(operator.name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Bpchar("b"),
+                Datum::Bool(operator.merges),
+                Datum::Bool(operator.hashes),
+                Datum::Int4(operator.left_oid),
+                Datum::Int4(operator.right_oid),
+                Datum::Int4(operator.result_oid),
+                Datum::Int4(operator.commutator),
+                Datum::Int4(operator.negator),
+                Datum::RegObject {
+                    type_oid: super::types::oid::REGPROC,
+                    referenced_oid: operator.procedure_oid,
+                    name: operator.procedure_name,
+                },
+                builtin_regproc(operator.restriction),
+                builtin_regproc(operator.join),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (slot, operator) in storage.operators_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_operator"));
@@ -15553,7 +16692,28 @@ fn pg_opfamily<'a>(
             arena,
         )?;
     }
-    let mut count = 15usize;
+    for (index, (oid, method, name)) in [
+        (RANGE_BTREE_OPERATOR_FAMILY_OID, 403, "range_ops"),
+        (RANGE_HASH_OPERATOR_FAMILY_OID, 405, "range_ops"),
+        (MULTIRANGE_BTREE_OPERATOR_FAMILY_OID, 403, "multirange_ops"),
+        (MULTIRANGE_HASH_OPERATOR_FAMILY_OID, 405, "multirange_ops"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[15 + index] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 19usize;
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -15801,7 +16961,56 @@ fn pg_opclass<'a>(
             arena,
         )?;
     }
-    let mut count = 17usize;
+    for (index, (oid, method, name, family, input)) in [
+        (
+            RANGE_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "range_ops",
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+        ),
+        (
+            RANGE_HASH_OPERATOR_CLASS_OID,
+            405,
+            "range_ops",
+            RANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+        ),
+        (
+            MULTIRANGE_BTREE_OPERATOR_CLASS_OID,
+            403,
+            "multirange_ops",
+            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+        ),
+        (
+            MULTIRANGE_HASH_OPERATOR_CLASS_OID,
+            405,
+            "multirange_ops",
+            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[17 + index] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Bool(true),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 21usize;
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -16274,6 +17483,121 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         count += 1;
     }
+    for (oid, family, input, strategy, operator, method) in [
+        (
+            10374,
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            1,
+            3884,
+            403,
+        ),
+        (
+            10375,
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            2,
+            3885,
+            403,
+        ),
+        (
+            10376,
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            3,
+            3882,
+            403,
+        ),
+        (
+            10377,
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            4,
+            3886,
+            403,
+        ),
+        (
+            10378,
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            5,
+            3887,
+            403,
+        ),
+        (
+            10379,
+            RANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            1,
+            3882,
+            405,
+        ),
+        (
+            10416,
+            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            1,
+            2862,
+            403,
+        ),
+        (
+            10417,
+            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            2,
+            2863,
+            403,
+        ),
+        (
+            10418,
+            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            3,
+            2860,
+            403,
+        ),
+        (
+            10419,
+            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            4,
+            2864,
+            403,
+        ),
+        (
+            10420,
+            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            5,
+            2865,
+            403,
+        ),
+        (
+            10421,
+            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            1,
+            2860,
+            405,
+        ),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(method),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -16643,6 +17967,78 @@ fn pg_amproc<'a>(
             2,
             781,
             "hashmacaddr8extended",
+        ),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, family, input, number, procedure, name) in [
+        (
+            10126,
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            1,
+            3870,
+            "range_cmp",
+        ),
+        (
+            10127,
+            RANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            2,
+            6391,
+            "range_sortsupport",
+        ),
+        (
+            10202,
+            RANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            1,
+            3902,
+            "hash_range",
+        ),
+        (
+            10203,
+            RANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYRANGE,
+            2,
+            3417,
+            "hash_range_extended",
+        ),
+        (
+            10128,
+            MULTIRANGE_BTREE_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            1,
+            4273,
+            "multirange_cmp",
+        ),
+        (
+            10204,
+            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            1,
+            4278,
+            "hash_multirange",
+        ),
+        (
+            10205,
+            MULTIRANGE_HASH_OPERATOR_FAMILY_OID,
+            super::types::oid::ANYMULTIRANGE,
+            2,
+            4279,
+            "hash_multirange_extended",
         ),
     ] {
         rows[count] = row(
@@ -17291,7 +18687,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("prosqlbody", ColType::PgNodeTree),
         ],
     );
-    const MAX_ROWS: usize = 512;
+    const MAX_ROWS: usize = 640;
     let mut rows: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
     for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
         let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -17344,7 +18740,17 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar(
                     if matches!(
                         routine.oid,
-                        2901 | 2112 | 2125 | 2141 | 2797 | 2798 | 3564 | 3565
+                        2901 | 2112
+                            | 2125
+                            | 2141
+                            | 2797
+                            | 2798
+                            | 3564
+                            | 3565
+                            | 4301
+                            | 4389
+                            | 4450
+                            | 6227
                     ) {
                         "a"
                     } else {
@@ -17397,10 +18803,15 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     3960 | 3961 => 1,
                     _ => 0,
                 }),
-                Datum::Int4(if routine.oid == 6119 {
-                    super::types::oid::TEXT
-                } else {
-                    0
+                Datum::Int4(match routine.oid {
+                    6119 => super::types::oid::TEXT,
+                    4282 => 3904,
+                    4285 => 3906,
+                    4288 => 3908,
+                    4291 => 3910,
+                    4294 => 3912,
+                    4297 => 3926,
+                    _ => 0,
                 }),
                 match record_outputs {
                     Some((output_oids, _)) => Datum::Array {
@@ -17710,7 +19121,14 @@ fn pg_aggregate<'a>(
         } else if oid == 2901 {
             "xmlagg"
         } else if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
-            routine.name
+            if matches!(oid, 4301 | 4389 | 4450 | 6227) {
+                match oid {
+                    4301 | 6227 => "pg_catalog.range_agg",
+                    _ => "pg_catalog.range_intersect_agg",
+                }
+            } else {
+                routine.name
+            }
         } else {
             let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {
                 sql_err!(
@@ -17767,7 +19185,7 @@ fn pg_aggregate<'a>(
             ("aggminitval", ColType::Text),
         ],
     );
-    let count = 14
+    let count = 18
         + (0..storage.routine_count())
             .filter(|slot| {
                 storage.routine_slot_visible_to(*slot, txid)
@@ -18019,7 +19437,45 @@ fn pg_aggregate<'a>(
             arena,
         )?;
     }
-    let mut index = 14usize;
+    for (offset, (aggregate_oid, transition_oid, final_oid, combine_oid, final_extra, state_oid)) in
+        [
+            (4301, 4299, 4300, 0, true, super::types::oid::INTERNAL),
+            (4389, 4388, 0, 4388, false, super::types::oid::ANYMULTIRANGE),
+            (4450, 4401, 0, 4401, false, super::types::oid::ANYRANGE),
+            (6227, 6225, 6226, 0, true, super::types::oid::INTERNAL),
+        ]
+        .into_iter()
+        .enumerate()
+    {
+        rows[14 + offset] = row(
+            &[
+                regproc(aggregate_oid)?,
+                Datum::Bpchar("n"),
+                Datum::Int2(0),
+                regproc(transition_oid)?,
+                regproc(final_oid)?,
+                regproc(combine_oid)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                Datum::Bool(final_extra),
+                Datum::Bool(false),
+                Datum::Bpchar("r"),
+                Datum::Bpchar("r"),
+                Datum::Int4(0),
+                Datum::Int4(state_oid),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    let mut index = 18usize;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {

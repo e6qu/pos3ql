@@ -46,7 +46,8 @@ for spill_entry in \
     '- { name: exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \
-    '- { name: slt, corpus_shard: "none", auxiliary: slt }'; do
+    '- { name: slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "2" }' \
+    '- { name: slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "2" }'; do
     if ! grep -Fq -- "$spill_entry" "$spill_matrix"; then
         printf 'CI timeout guard: missing forced-spill shard definition %s\n' "$spill_entry" >&2
         failed=1

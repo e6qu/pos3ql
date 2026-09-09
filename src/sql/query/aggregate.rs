@@ -312,6 +312,7 @@ enum ArgKind {
     None,
     Int4,
     Int8,
+    Money,
     Numeric,
     Float4,
     Float,
@@ -1409,6 +1410,12 @@ impl<'a> AggState<'a> {
                     self.arg_kind = self.arg_kind.max(ArgKind::Int8);
                     self.sum_int += i128::from(x);
                 }
+                Datum::Money(x) if self.kind == AggKind::Sum => {
+                    self.arg_kind = ArgKind::Money;
+                    self.sum_int = self.sum_int.checked_add(i128::from(x)).ok_or_else(|| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "money out of range")
+                    })?;
+                }
                 Datum::Numeric(n) => {
                     self.arg_kind = self.arg_kind.max(ArgKind::Numeric);
                     let running = self
@@ -2054,16 +2061,21 @@ impl<'a> AggState<'a> {
             }
             // SUM result type: int4->int8, int8->numeric, numeric->numeric,
             // float8->float8 (PostgreSQL's aggregate signatures).
-            AggKind::Sum => match self.arg_kind {
-                ArgKind::Float4 => Datum::Float4(self.sum_float4),
-                ArgKind::Float => Datum::Float8(self.sum_float),
-                ArgKind::Int4 => Datum::Int8(i64::try_from(self.sum_int).map_err(|_| {
-                    sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range")
-                })?),
-                ArgKind::Int8 => Datum::Numeric(Numeric::from_i128(self.sum_int, arena)?),
-                ArgKind::Numeric => Datum::Numeric(self.sum_numeric.unwrap_or(Numeric::ZERO)),
-                ArgKind::None => Datum::Null,
-            },
+            AggKind::Sum => {
+                match self.arg_kind {
+                    ArgKind::Float4 => Datum::Float4(self.sum_float4),
+                    ArgKind::Float => Datum::Float8(self.sum_float),
+                    ArgKind::Int4 => Datum::Int8(i64::try_from(self.sum_int).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range")
+                    })?),
+                    ArgKind::Int8 => Datum::Numeric(Numeric::from_i128(self.sum_int, arena)?),
+                    ArgKind::Money => Datum::Money(i64::try_from(self.sum_int).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "money out of range")
+                    })?),
+                    ArgKind::Numeric => Datum::Numeric(self.sum_numeric.unwrap_or(Numeric::ZERO)),
+                    ArgKind::None => Datum::Null,
+                }
+            }
             // AVG: numeric for int/int8/numeric, float8 for float8.
             AggKind::Avg => match self.arg_kind {
                 ArgKind::Float4 | ArgKind::Float => {
@@ -2079,6 +2091,7 @@ impl<'a> AggState<'a> {
                     let cnt = Numeric::from_i64(self.count as i64, arena)?;
                     Datum::Numeric(num::div(&sum, &cnt, arena)?)
                 }
+                ArgKind::Money => unreachable!("PostgreSQL has no avg(money)"),
                 ArgKind::None => Datum::Null,
             },
             AggKind::BoolAnd | AggKind::BoolOr => match self.bool_acc {

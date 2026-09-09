@@ -382,6 +382,7 @@ pub enum OwnedDatum {
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     PgLsn(u64),
+    Money(i64),
     Int8(i64),
     Regtype {
         referenced_oid: i32,
@@ -596,6 +597,7 @@ impl OwnedDatum {
                 }
             }
             Datum::PgLsn(v) => Self::PgLsn(*v),
+            Datum::Money(v) => Self::Money(*v),
             Datum::Int2(v) => Self::Int4(*v as i32),
             Datum::Int8(v) => Self::Int8(*v),
             // Widened like int2→int4; the column re-coerces the default back to
@@ -722,6 +724,7 @@ impl OwnedDatum {
                 legacy: *legacy,
             },
             Self::PgLsn(v) => Datum::PgLsn(*v),
+            Self::Money(v) => Datum::Money(*v),
             Self::Int8(v) => Datum::Int8(*v),
             Self::Regtype {
                 referenced_oid,

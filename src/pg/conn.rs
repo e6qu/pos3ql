@@ -4591,6 +4591,10 @@ pub(crate) fn decode_binary_param<'a>(
             let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Int8(i64::from_be_bytes(b)))
         }
+        oids::MONEY => {
+            let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Money(i64::from_be_bytes(b)))
+        }
         oids::FLOAT4 => {
             let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Float4(f32::from_be_bytes(b)))
@@ -5527,6 +5531,22 @@ mod tests {
         assert!(
             decode_binary_param(crate::sql::types::oid::PG_SNAPSHOT, &snapshot, &arena).is_err()
         );
+    }
+
+    #[test]
+    fn binary_money_parameters_require_one_signed_big_endian_int64() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "binary money test", 64).expect("test arena");
+        assert_eq!(
+            decode_binary_param(
+                crate::sql::types::oid::MONEY,
+                &(-123_456_i64).to_be_bytes(),
+                &arena
+            )
+            .unwrap(),
+            Datum::Money(-123_456)
+        );
+        assert!(decode_binary_param(crate::sql::types::oid::MONEY, &[0; 7], &arena).is_err());
     }
 
     #[test]

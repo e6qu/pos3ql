@@ -26,6 +26,8 @@ pub mod oid {
     pub const BYTEA: i32 = 17;
     pub const CHAR: i32 = 18;
     pub const INT8: i32 = 20;
+    pub const MONEY: i32 = 790;
+    pub const MONEY_ARRAY: i32 = 791;
     pub const INT2: i32 = 21;
     pub const INT2VECTOR: i32 = 22;
     pub const OIDVECTOR: i32 = 30;
@@ -343,6 +345,8 @@ pub enum ColType {
     /// PostgreSQL WAL position (`pg_lsn`, OID 3220), retained as an unsigned
     /// 64-bit value so the high half cannot become a negative SQL integer.
     PgLsn,
+    /// PostgreSQL `money`, stored as an exact signed count of cents.
+    Money,
     /// `regtype`: a catalog type reference with OID storage and catalog-name
     /// text output, not ordinary text.
     Regtype,
@@ -490,6 +494,7 @@ pub enum BtreeOperatorClass {
     /// Appended to preserve the persisted codes of earlier operator classes.
     PgLsn,
     Xid8,
+    Money,
 }
 
 impl BtreeOperatorClass {
@@ -523,6 +528,7 @@ impl BtreeOperatorClass {
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
             PgLsn => Self::PgLsn,
+            Money => Self::Money,
             Char | Geometry(_) | PgSnapshot | TxidSnapshot => return None,
             Time => Self::Time,
             Timestamp => Self::Timestamp,
@@ -573,6 +579,7 @@ impl BtreeOperatorClass {
             "tsvector_ops" => Self::TsVector,
             "pg_lsn_ops" => Self::PgLsn,
             "xid8_ops" => Self::Xid8,
+            "money_ops" => Self::Money,
             "uuid_ops" => Self::Uuid,
             "varbit_ops" => Self::Varbit,
             _ => return None,
@@ -615,6 +622,7 @@ impl BtreeOperatorClass {
             32 => Self::TsVector,
             33 => Self::PgLsn,
             34 => Self::Xid8,
+            35 => Self::Money,
             _ => return None,
         })
     }
@@ -657,6 +665,7 @@ impl BtreeOperatorClass {
             Self::TsVector => "tsvector_ops",
             Self::PgLsn => "pg_lsn_ops",
             Self::Xid8 => "xid8_ops",
+            Self::Money => "money_ops",
             Self::Uuid => "uuid_ops",
             Self::Varbit => "varbit_ops",
         }
@@ -696,6 +705,7 @@ impl BtreeOperatorClass {
             Self::TsVector => 10071,
             Self::PgLsn => 10067,
             Self::Xid8 => 10053,
+            Self::Money => 10047,
             Self::Uuid => 10065,
             Self::Varbit => 10043,
         }
@@ -796,6 +806,7 @@ impl ColType {
             "pg_snapshot" => Self::PgSnapshot,
             "txid_snapshot" => Self::TxidSnapshot,
             "pg_lsn" => Self::PgLsn,
+            "money" => Self::Money,
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
             "date" => Self::Date,
@@ -845,6 +856,7 @@ impl ColType {
             Self::PgSnapshot => oid::PG_SNAPSHOT,
             Self::TxidSnapshot => oid::TXID_SNAPSHOT,
             Self::PgLsn => oid::PG_LSN,
+            Self::Money => oid::MONEY,
             Self::Regtype => oid::REGTYPE,
             Self::Regproc => oid::REGPROC,
             Self::Regprocedure => oid::REGPROCEDURE,
@@ -918,6 +930,7 @@ impl ColType {
             oid::PG_SNAPSHOT => Some(Self::PgSnapshot),
             oid::TXID_SNAPSHOT => Some(Self::TxidSnapshot),
             oid::PG_LSN => Some(Self::PgLsn),
+            oid::MONEY => Some(Self::Money),
             oid::REGPROC => Some(Self::Regproc),
             oid::REGPROCEDURE => Some(Self::Regprocedure),
             oid::REGOPER => Some(Self::Regoper),
@@ -1051,6 +1064,7 @@ impl ColType {
             Self::Int8
             | Self::Xid8
             | Self::PgLsn
+            | Self::Money
             | Self::Float8
             | Self::Timestamp
             | Self::Timestamptz
@@ -1100,6 +1114,7 @@ impl ColType {
             | Self::PgStatisticArray => Self::Text,
             Self::Oid | Self::Xid => Self::Int4,
             Self::Xid8 => self,
+            Self::Money => self,
             Self::PgSnapshot | Self::TxidSnapshot => self,
             Self::Geometry(_) => self,
             Self::Regtype
@@ -1138,6 +1153,7 @@ impl ColType {
             Self::PgSnapshot => "pg_snapshot",
             Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
+            Self::Money => "money",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -1219,6 +1235,7 @@ impl ColType {
             Self::PgSnapshot => "pg_snapshot",
             Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
+            Self::Money => "money",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -1287,6 +1304,7 @@ impl ColType {
             Self::PgSnapshot => 236,
             Self::TxidSnapshot => 237,
             Self::PgLsn => 79,
+            Self::Money => 238,
             Self::Regtype => 58,
             Self::Regproc => 59,
             Self::Regprocedure => 60,
@@ -1374,6 +1392,7 @@ impl ColType {
             236 => Self::PgSnapshot,
             237 => Self::TxidSnapshot,
             79 => Self::PgLsn,
+            238 => Self::Money,
             58 => Self::Regtype,
             59 => Self::Regproc,
             60 => Self::Regprocedure,
@@ -1458,6 +1477,7 @@ pub enum ArrElem {
     PgSnapshot,
     TxidSnapshot,
     PgLsn,
+    Money,
     Int8,
     Float8,
     Text,
@@ -1539,7 +1559,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 68] = [
+    pub const BUILTIN: [Self; 69] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1550,6 +1570,7 @@ impl ArrElem {
         Self::PgSnapshot,
         Self::TxidSnapshot,
         Self::PgLsn,
+        Self::Money,
         Self::Int8,
         Self::Float4,
         Self::Float8,
@@ -1648,6 +1669,7 @@ impl ArrElem {
             ArrElem::PgSnapshot => "_pg_snapshot",
             ArrElem::TxidSnapshot => "_txid_snapshot",
             ArrElem::PgLsn => "_pg_lsn",
+            ArrElem::Money => "_money",
             ArrElem::Int8 => "_int8",
             ArrElem::Float8 => "_float8",
             ArrElem::Text => "_text",
@@ -1734,6 +1756,7 @@ impl ArrElem {
             ArrElem::PgSnapshot => "pg_snapshot[]",
             ArrElem::TxidSnapshot => "txid_snapshot[]",
             ArrElem::PgLsn => "pg_lsn[]",
+            ArrElem::Money => "money[]",
             ArrElem::Int8 => "bigint[]",
             ArrElem::Float8 => "double precision[]",
             ArrElem::Text => "text[]",
@@ -1826,6 +1849,7 @@ impl ArrElem {
             Datum::Snapshot { legacy: false, .. } => ArrElem::PgSnapshot,
             Datum::Snapshot { legacy: true, .. } => ArrElem::TxidSnapshot,
             Datum::PgLsn(_) => ArrElem::PgLsn,
+            Datum::Money(_) => ArrElem::Money,
             Datum::Int8(_) => ArrElem::Int8,
             Datum::Float4(_) => ArrElem::Float4,
             Datum::Float8(_) => ArrElem::Float8,
@@ -1893,6 +1917,7 @@ impl ArrElem {
             ColType::PgSnapshot => return Some(ArrElem::PgSnapshot),
             ColType::TxidSnapshot => return Some(ArrElem::TxidSnapshot),
             ColType::PgLsn => return Some(ArrElem::PgLsn),
+            ColType::Money => return Some(ArrElem::Money),
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
             ColType::Bit { varying: false } => return Some(ArrElem::Bit),
@@ -1922,6 +1947,7 @@ impl ArrElem {
             ColType::Int2 => ArrElem::Int2,
             ColType::Int4 => ArrElem::Int4,
             ColType::Int8 => ArrElem::Int8,
+            ColType::Money => ArrElem::Money,
             ColType::Float8 => ArrElem::Float8,
             ColType::Text => ArrElem::Text,
             ColType::Numeric => ArrElem::Numeric,
@@ -1959,6 +1985,7 @@ impl ArrElem {
             ArrElem::PgSnapshot => ColType::PgSnapshot,
             ArrElem::TxidSnapshot => ColType::TxidSnapshot,
             ArrElem::PgLsn => ColType::PgLsn,
+            ArrElem::Money => ColType::Money,
             ArrElem::Int8 => ColType::Int8,
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
@@ -2033,6 +2060,7 @@ impl ArrElem {
             ArrElem::PgSnapshot => oid::PG_SNAPSHOT_ARRAY,
             ArrElem::TxidSnapshot => oid::TXID_SNAPSHOT_ARRAY,
             ArrElem::PgLsn => oid::PG_LSN_ARRAY,
+            ArrElem::Money => oid::MONEY_ARRAY,
             ArrElem::Int8 => 1016,
             ArrElem::Float8 => 1022,
             ArrElem::Text => 1009,
@@ -2106,6 +2134,7 @@ impl ArrElem {
             ArrElem::PgSnapshot => 153,
             ArrElem::TxidSnapshot => 154,
             ArrElem::PgLsn => 123,
+            ArrElem::Money => 159,
             ArrElem::Int8 => 2,
             ArrElem::Float8 => 3,
             ArrElem::Text => 4,
@@ -2173,6 +2202,7 @@ impl ArrElem {
             153 => ArrElem::PgSnapshot,
             154 => ArrElem::TxidSnapshot,
             123 => ArrElem::PgLsn,
+            159 => ArrElem::Money,
             2 => ArrElem::Int8,
             3 => ArrElem::Float8,
             4 => ArrElem::Text,
@@ -2753,6 +2783,8 @@ pub enum Datum<'a> {
         legacy: bool,
     },
     PgLsn(u64),
+    /// Exact cents for PostgreSQL's locale-rendered `money` type.
+    Money(i64),
     Int8(i64),
     /// `real`/`float4`. The width is the type: an f32 holds exactly what
     /// PostgreSQL's real does, so casts round through it and arithmetic between
@@ -2923,6 +2955,7 @@ impl<'a> Datum<'a> {
             Datum::Snapshot { legacy: false, .. } => oid::PG_SNAPSHOT,
             Datum::Snapshot { legacy: true, .. } => oid::TXID_SNAPSHOT,
             Datum::PgLsn(_) => oid::PG_LSN,
+            Datum::Money(_) => oid::MONEY,
             Datum::Int8(_) => oid::INT8,
             Datum::Float4(_) => oid::FLOAT4,
             Datum::Float8(_) => oid::FLOAT8,
@@ -3098,6 +3131,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Xid8(v) => write!(f, "{v}"),
             Datum::Snapshot { value, .. } => write!(f, "{value}"),
             Datum::PgLsn(v) => write!(f, "{:X}/{:X}", v >> 32, v & u64::from(u32::MAX)),
+            Datum::Money(v) => write!(f, "{}", super::money::Display(*v)),
             Datum::Int8(v) => write!(f, "{v}"),
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
@@ -3622,12 +3656,25 @@ mod tests {
         let mut types = vec![
             ColType::Void,
             ColType::Internal,
+            ColType::PgDdlCommand,
+            ColType::Char,
             ColType::Bool,
             ColType::Int2,
             ColType::Int2Vector,
             ColType::OidVector,
+            ColType::PgNodeTree,
+            ColType::PgNdistinct,
+            ColType::PgDependencies,
+            ColType::PgMcvList,
+            ColType::PgStatisticArray,
             ColType::Int4,
             ColType::Oid,
+            ColType::Xid,
+            ColType::Xid8,
+            ColType::PgSnapshot,
+            ColType::TxidSnapshot,
+            ColType::PgLsn,
+            ColType::Money,
             ColType::Regtype,
             ColType::Regproc,
             ColType::Regprocedure,
@@ -3636,6 +3683,8 @@ mod tests {
             ColType::Regclass,
             ColType::Regnamespace,
             ColType::Regrole,
+            ColType::Regconfig,
+            ColType::Regdictionary,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
@@ -3650,7 +3699,11 @@ mod tests {
             ColType::Timetz,
             ColType::Interval,
             ColType::Json,
+            ColType::Xml,
             ColType::Jsonb,
+            ColType::Jsonpath,
+            ColType::TsVector,
+            ColType::TsQuery,
             ColType::Uuid,
             ColType::Bytea,
             ColType::Numeric,
@@ -3750,6 +3803,17 @@ mod code_roundtrip_tests {
         ] {
             types.push(ColType::Range(k));
             types.push(ColType::Multirange(k));
+        }
+        for kind in [
+            GeometryKind::Point,
+            GeometryKind::Lseg,
+            GeometryKind::Path,
+            GeometryKind::Box,
+            GeometryKind::Polygon,
+            GeometryKind::Line,
+            GeometryKind::Circle,
+        ] {
+            types.push(ColType::Geometry(kind));
         }
         for e in ArrElem::BUILTIN {
             types.push(ColType::Array(e));

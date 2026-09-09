@@ -2576,6 +2576,15 @@ fn operator_undefined(l: ColType, operator: &str, r: ColType) -> SqlError {
     )
 }
 
+fn unary_operator_undefined(operator: &str, operand: ColType) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_FUNCTION,
+        "operator does not exist: {} {}",
+        operator,
+        operand.name()
+    )
+}
+
 pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32, i16), SqlError> {
     match def {
         Some(d) => infer_type_res(expression, &DefCols(d)),
@@ -2768,8 +2777,37 @@ pub fn infer_type_res(
         },
         Expr::Unary { operator, operand } => match operator {
             crate::sql::ast::UnaryOp::Not => of(ColType::Bool),
-            crate::sql::ast::UnaryOp::Neg | crate::sql::ast::UnaryOp::BitNot => {
-                infer_type_res(operand, columns)?
+            crate::sql::ast::UnaryOp::Neg => {
+                let inferred = infer_type_res(operand, columns)?;
+                let ctype = coltype_of_oid(inferred.0).unwrap_or(ColType::Text);
+                if !matches!(
+                    ctype,
+                    ColType::Int2
+                        | ColType::Int4
+                        | ColType::Int8
+                        | ColType::Float4
+                        | ColType::Float8
+                        | ColType::Numeric
+                ) {
+                    return Err(unary_operator_undefined("-", ctype));
+                }
+                inferred
+            }
+            crate::sql::ast::UnaryOp::BitNot => {
+                let inferred = infer_type_res(operand, columns)?;
+                let ctype = coltype_of_oid(inferred.0).unwrap_or(ColType::Text);
+                if !matches!(
+                    ctype,
+                    ColType::Int2
+                        | ColType::Int4
+                        | ColType::Int8
+                        | ColType::Bit { .. }
+                        | ColType::Inet
+                        | ColType::Cidr
+                ) {
+                    return Err(unary_operator_undefined("~", ctype));
+                }
+                inferred
             }
             crate::sql::ast::UnaryOp::SquareRoot | crate::sql::ast::UnaryOp::CubeRoot => {
                 of(ColType::Float8)
@@ -2934,6 +2972,30 @@ pub fn infer_type_res(
                     };
                     let int_like =
                         |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
+                    if lo == oid::MONEY || ro == oid::MONEY {
+                        let result = match (operator, lo, ro) {
+                            (Add | Sub, oid::MONEY, oid::MONEY) => Some(ColType::Money),
+                            (Div, oid::MONEY, oid::MONEY) => Some(ColType::Float8),
+                            (Mul | Div, oid::MONEY, oid::INT2 | oid::INT4 | oid::INT8)
+                            | (Mul | Div, oid::MONEY, oid::FLOAT4 | oid::FLOAT8)
+                            | (Mul, oid::INT2 | oid::INT4 | oid::INT8, oid::MONEY)
+                            | (Mul, oid::FLOAT4 | oid::FLOAT8, oid::MONEY) => Some(ColType::Money),
+                            _ => None,
+                        };
+                        return result.map(of).ok_or_else(|| {
+                            operator_undefined(
+                                coltype_of_oid(lo).unwrap_or(ColType::Money),
+                                match operator {
+                                    Add => "+",
+                                    Sub => "-",
+                                    Mul => "*",
+                                    Div => "/",
+                                    _ => "%",
+                                },
+                                coltype_of_oid(ro).unwrap_or(ColType::Money),
+                            )
+                        });
+                    }
                     // Date arithmetic: date - date -> int4; date +/- int -> date;
                     // int + date -> date.
                     if lo == oid::DATE && ro == oid::DATE && matches!(operator, Sub) {
@@ -3481,6 +3543,7 @@ pub fn infer_type_res(
                     .transpose()?
                     .map(|t| t.0);
                 match a {
+                    Some(oid::MONEY) if *name == "sum" => of(ColType::Money),
                     Some(oid::INT2 | oid::INT4) if *name == "sum" => of(ColType::Int8),
                     Some(oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC) => of(ColType::Numeric),
                     // sum(real) stays real; avg(real) widens to double precision.
@@ -3521,6 +3584,18 @@ pub fn infer_type_res(
                 }
                 t.unwrap_or_else(|| of(ColType::Int8))
             }
+            "cash_in" | "money" | "cash_pl" | "cash_mi" | "cash_mul_int2" | "cash_mul_int4"
+            | "cash_mul_int8" | "int2_mul_cash" | "int4_mul_cash" | "int8_mul_cash"
+            | "cash_div_int2" | "cash_div_int4" | "cash_div_int8" | "cash_mul_flt4"
+            | "cash_mul_flt8" | "flt4_mul_cash" | "flt8_mul_cash" | "cash_div_flt4"
+            | "cash_div_flt8" | "cashlarger" | "cashsmaller" => of(ColType::Money),
+            "cash_cmp" => of(ColType::Int4),
+            "cash_eq" | "cash_ne" | "cash_lt" | "cash_le" | "cash_gt" | "cash_ge" => {
+                of(ColType::Bool)
+            }
+            "cash_div_cash" => of(ColType::Float8),
+            "cash_out" | "cash_words" => of(ColType::Text),
+            "cash_send" => of(ColType::Bytea),
             // Functions returning the common type of their arguments (numeric
             // tower: float8 > numeric > int8 > int4), so a NULL of a wider type
             // still widens the result — matching PostgreSQL and the runtime

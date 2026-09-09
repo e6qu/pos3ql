@@ -141,6 +141,19 @@ struct IntrinsicRoutine {
     volatility: &'static str,
 }
 
+macro_rules! intrinsic {
+    ($oid:literal, $name:literal, $result:expr, $args:literal, $count:literal, $volatility:literal) => {
+        IntrinsicRoutine {
+            oid: $oid,
+            name: $name,
+            result_oid: $result,
+            argument_types: $args,
+            argument_count: $count,
+            volatility: $volatility,
+        }
+    };
+}
+
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
         oid: 2895,
@@ -1430,6 +1443,171 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "v",
     },
+    intrinsic!(377, "cash_cmp", super::types::oid::INT4, "790 790", 2, "i"),
+    intrinsic!(
+        846,
+        "cash_mul_flt4",
+        super::types::oid::MONEY,
+        "790 700",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        847,
+        "cash_div_flt4",
+        super::types::oid::MONEY,
+        "790 700",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        848,
+        "flt4_mul_cash",
+        super::types::oid::MONEY,
+        "700 790",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        862,
+        "int4_mul_cash",
+        super::types::oid::MONEY,
+        "23 790",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        863,
+        "int2_mul_cash",
+        super::types::oid::MONEY,
+        "21 790",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        864,
+        "cash_mul_int4",
+        super::types::oid::MONEY,
+        "790 23",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        865,
+        "cash_div_int4",
+        super::types::oid::MONEY,
+        "790 23",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        866,
+        "cash_mul_int2",
+        super::types::oid::MONEY,
+        "790 21",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        867,
+        "cash_div_int2",
+        super::types::oid::MONEY,
+        "790 21",
+        2,
+        "i"
+    ),
+    intrinsic!(886, "cash_in", super::types::oid::MONEY, "2275", 1, "s"),
+    intrinsic!(887, "cash_out", 2275, "790", 1, "s"),
+    intrinsic!(888, "cash_eq", super::types::oid::BOOL, "790 790", 2, "i"),
+    intrinsic!(889, "cash_ne", super::types::oid::BOOL, "790 790", 2, "i"),
+    intrinsic!(890, "cash_lt", super::types::oid::BOOL, "790 790", 2, "i"),
+    intrinsic!(891, "cash_le", super::types::oid::BOOL, "790 790", 2, "i"),
+    intrinsic!(892, "cash_gt", super::types::oid::BOOL, "790 790", 2, "i"),
+    intrinsic!(893, "cash_ge", super::types::oid::BOOL, "790 790", 2, "i"),
+    intrinsic!(894, "cash_pl", super::types::oid::MONEY, "790 790", 2, "i"),
+    intrinsic!(895, "cash_mi", super::types::oid::MONEY, "790 790", 2, "i"),
+    intrinsic!(
+        896,
+        "cash_mul_flt8",
+        super::types::oid::MONEY,
+        "790 701",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        897,
+        "cash_div_flt8",
+        super::types::oid::MONEY,
+        "790 701",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        898,
+        "cashlarger",
+        super::types::oid::MONEY,
+        "790 790",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        899,
+        "cashsmaller",
+        super::types::oid::MONEY,
+        "790 790",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        919,
+        "flt8_mul_cash",
+        super::types::oid::MONEY,
+        "701 790",
+        2,
+        "i"
+    ),
+    intrinsic!(935, "cash_words", super::types::oid::TEXT, "790", 1, "i"),
+    intrinsic!(2112, "sum", super::types::oid::MONEY, "790", 1, "i"),
+    intrinsic!(2125, "max", super::types::oid::MONEY, "790", 1, "i"),
+    intrinsic!(2141, "min", super::types::oid::MONEY, "790", 1, "i"),
+    intrinsic!(2492, "cash_recv", super::types::oid::MONEY, "2281", 1, "i"),
+    intrinsic!(2493, "cash_send", super::types::oid::BYTEA, "790", 1, "i"),
+    intrinsic!(
+        3344,
+        "cash_mul_int8",
+        super::types::oid::MONEY,
+        "790 20",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3345,
+        "cash_div_int8",
+        super::types::oid::MONEY,
+        "790 20",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3399,
+        "int8_mul_cash",
+        super::types::oid::MONEY,
+        "20 790",
+        2,
+        "i"
+    ),
+    intrinsic!(3811, "money", super::types::oid::MONEY, "23", 1, "s"),
+    intrinsic!(3812, "money", super::types::oid::MONEY, "20", 1, "s"),
+    intrinsic!(
+        3822,
+        "cash_div_cash",
+        super::types::oid::FLOAT8,
+        "790 790",
+        2,
+        "i"
+    ),
+    intrinsic!(3823, "numeric", super::types::oid::NUMERIC, "790", 1, "s"),
+    intrinsic!(3824, "money", super::types::oid::MONEY, "1700", 1, "s"),
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -1465,6 +1643,9 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 5064
             | 5065
             | 5066
+            | 2112
+            | 2125
+            | 2141
     )
 }
 
@@ -1575,6 +1756,26 @@ macro_rules! catalog_operator {
     };
 }
 
+macro_rules! catalog_operator_with_commutator {
+    ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal, $procedure_name:literal, $commutator:literal) => {
+        CatalogOperator {
+            oid: $oid,
+            name: $name,
+            left: $left,
+            right: $right,
+            result: $result,
+            procedure_oid: $procedure_oid,
+            procedure_name: $procedure_name,
+            commutator: $commutator,
+            negator: 0,
+            merges: false,
+            hashes: false,
+            restriction: None,
+            join: None,
+        }
+    };
+}
+
 macro_rules! catalog_comparison_operator {
     ($oid:literal, $name:literal, $type:expr, $procedure_oid:literal, $procedure_name:literal,
      $commutator:literal, $negator:literal, $merges:literal, $hashes:literal,
@@ -1598,6 +1799,269 @@ macro_rules! catalog_comparison_operator {
 }
 
 const CATALOG_OPERATORS: &[CatalogOperator] = &[
+    catalog_comparison_operator!(
+        900,
+        "=",
+        ColType::Money,
+        888,
+        "cash_eq",
+        900,
+        901,
+        true,
+        false,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        901,
+        "<>",
+        ColType::Money,
+        889,
+        "cash_ne",
+        901,
+        900,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        902,
+        "<",
+        ColType::Money,
+        890,
+        "cash_lt",
+        903,
+        905,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        903,
+        ">",
+        ColType::Money,
+        892,
+        "cash_gt",
+        902,
+        904,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        904,
+        "<=",
+        ColType::Money,
+        891,
+        "cash_le",
+        905,
+        903,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        905,
+        ">=",
+        ColType::Money,
+        893,
+        "cash_ge",
+        904,
+        902,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_operator_with_commutator!(
+        843,
+        "*",
+        ColType::Money,
+        ColType::Float4,
+        ColType::Money,
+        846,
+        "cash_mul_flt4",
+        845
+    ),
+    catalog_operator!(
+        844,
+        "/",
+        ColType::Money,
+        ColType::Float4,
+        ColType::Money,
+        847,
+        "cash_div_flt4"
+    ),
+    catalog_operator_with_commutator!(
+        845,
+        "*",
+        ColType::Float4,
+        ColType::Money,
+        ColType::Money,
+        848,
+        "flt4_mul_cash",
+        843
+    ),
+    catalog_operator_with_commutator!(
+        906,
+        "+",
+        ColType::Money,
+        ColType::Money,
+        ColType::Money,
+        894,
+        "cash_pl",
+        906
+    ),
+    catalog_operator!(
+        907,
+        "-",
+        ColType::Money,
+        ColType::Money,
+        ColType::Money,
+        895,
+        "cash_mi"
+    ),
+    catalog_operator_with_commutator!(
+        908,
+        "*",
+        ColType::Money,
+        ColType::Float8,
+        ColType::Money,
+        896,
+        "cash_mul_flt8",
+        916
+    ),
+    catalog_operator!(
+        909,
+        "/",
+        ColType::Money,
+        ColType::Float8,
+        ColType::Money,
+        897,
+        "cash_div_flt8"
+    ),
+    catalog_operator_with_commutator!(
+        912,
+        "*",
+        ColType::Money,
+        ColType::Int4,
+        ColType::Money,
+        864,
+        "cash_mul_int4",
+        917
+    ),
+    catalog_operator!(
+        913,
+        "/",
+        ColType::Money,
+        ColType::Int4,
+        ColType::Money,
+        865,
+        "cash_div_int4"
+    ),
+    catalog_operator_with_commutator!(
+        914,
+        "*",
+        ColType::Money,
+        ColType::Int2,
+        ColType::Money,
+        866,
+        "cash_mul_int2",
+        918
+    ),
+    catalog_operator!(
+        915,
+        "/",
+        ColType::Money,
+        ColType::Int2,
+        ColType::Money,
+        867,
+        "cash_div_int2"
+    ),
+    catalog_operator_with_commutator!(
+        916,
+        "*",
+        ColType::Float8,
+        ColType::Money,
+        ColType::Money,
+        919,
+        "flt8_mul_cash",
+        908
+    ),
+    catalog_operator_with_commutator!(
+        917,
+        "*",
+        ColType::Int4,
+        ColType::Money,
+        ColType::Money,
+        862,
+        "int4_mul_cash",
+        912
+    ),
+    catalog_operator_with_commutator!(
+        918,
+        "*",
+        ColType::Int2,
+        ColType::Money,
+        ColType::Money,
+        863,
+        "int2_mul_cash",
+        914
+    ),
+    catalog_operator_with_commutator!(
+        3346,
+        "*",
+        ColType::Money,
+        ColType::Int8,
+        ColType::Money,
+        3344,
+        "cash_mul_int8",
+        3349
+    ),
+    catalog_operator!(
+        3347,
+        "/",
+        ColType::Money,
+        ColType::Int8,
+        ColType::Money,
+        3345,
+        "cash_div_int8"
+    ),
+    catalog_operator_with_commutator!(
+        3349,
+        "*",
+        ColType::Int8,
+        ColType::Money,
+        ColType::Money,
+        3399,
+        "int8_mul_cash",
+        3346
+    ),
+    catalog_operator!(
+        3825,
+        "/",
+        ColType::Money,
+        ColType::Money,
+        ColType::Float8,
+        3822,
+        "cash_div_cash"
+    ),
     catalog_comparison_operator!(
         96,
         "=",
@@ -1855,6 +2319,9 @@ fn builtin_regproc(entry: Option<(i32, &'static str)>) -> Datum<'static> {
 const XID8_BTREE_OPERATOR_FAMILY_OID: i32 = 5067;
 const XID8_BTREE_OPERATOR_CLASS_OID: i32 = 10053;
 const XID8_CMP_OID: i32 = 5096;
+const MONEY_BTREE_OPERATOR_FAMILY_OID: i32 = 2099;
+const MONEY_BTREE_OPERATOR_CLASS_OID: i32 = 10047;
+const MONEY_CMP_OID: i32 = 377;
 const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
 const CATALOG_RELATIONS: &[(&str, i32)] = &[
@@ -12850,7 +13317,47 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ],
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
-    let mut count = 0usize;
+    let builtin = [
+        (
+            10_001,
+            super::types::oid::MONEY,
+            super::types::oid::NUMERIC,
+            3823,
+        ),
+        (
+            10_002,
+            super::types::oid::NUMERIC,
+            super::types::oid::MONEY,
+            3824,
+        ),
+        (
+            10_003,
+            super::types::oid::INT4,
+            super::types::oid::MONEY,
+            3811,
+        ),
+        (
+            10_004,
+            super::types::oid::INT8,
+            super::types::oid::MONEY,
+            3812,
+        ),
+    ];
+    for (index, (oid, source, target, function)) in builtin.into_iter().enumerate() {
+        rows[index] = row(
+            &[
+                Datum::Int4(2605),
+                Datum::Int4(oid),
+                Datum::Int4(source),
+                Datum::Int4(target),
+                Datum::Int4(function),
+                Datum::Bpchar("a"),
+                Datum::Bpchar("f"),
+            ],
+            arena,
+        )?;
+    }
+    let mut count = builtin.len();
     for (_, cast) in storage.casts_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_cast"));
@@ -13023,7 +13530,18 @@ fn pg_opfamily<'a>(
         ],
         arena,
     )?;
-    let mut count = 1usize;
+    rows[1] = row(
+        &[
+            Datum::Int4(2753),
+            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(403),
+            text("money_ops", arena)?,
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Int4(10),
+        ],
+        arena,
+    )?;
+    let mut count = 2usize;
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -13080,7 +13598,22 @@ fn pg_opclass<'a>(
         ],
         arena,
     )?;
-    let mut count = 1usize;
+    rows[1] = row(
+        &[
+            Datum::Int4(2616),
+            Datum::Int4(MONEY_BTREE_OPERATOR_CLASS_OID),
+            Datum::Int4(403),
+            text("money_ops", arena)?,
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Int4(10),
+            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::MONEY),
+            Datum::Bool(true),
+            Datum::Int4(0),
+        ],
+        arena,
+    )?;
+    let mut count = 2usize;
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -13143,6 +13676,13 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         (10053, 4, 5076),
         (10054, 5, 5074),
     ];
+    const MONEY_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
+        (10225, 1, 902),
+        (10226, 2, 904),
+        (10227, 3, 900),
+        (10228, 4, 905),
+        (10229, 5, 903),
+    ];
     let mut count = 0usize;
     for (oid, strategy, operator) in XID8_BTREE_OPERATORS {
         rows[count] = row(
@@ -13152,6 +13692,24 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
                 Datum::Int4(super::types::oid::XID8),
                 Datum::Int4(super::types::oid::XID8),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(403),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, strategy, operator) in MONEY_BTREE_OPERATORS {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
+                Datum::Int4(super::types::oid::MONEY),
+                Datum::Int4(super::types::oid::MONEY),
                 Datum::Int2(strategy),
                 Datum::Bpchar("s"),
                 Datum::Int4(operator),
@@ -13238,7 +13796,31 @@ fn pg_amproc<'a>(
         ],
         arena,
     )?;
-    let mut count = 2usize;
+    rows[2] = row(
+        &[
+            Datum::Int4(2603),
+            Datum::Int4(10108),
+            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::MONEY),
+            Datum::Int4(super::types::oid::MONEY),
+            Datum::Int2(1),
+            builtin_regproc(Some((MONEY_CMP_OID, "cash_cmp"))),
+        ],
+        arena,
+    )?;
+    rows[3] = row(
+        &[
+            Datum::Int4(2603),
+            Datum::Int4(10109),
+            Datum::Int4(MONEY_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::MONEY),
+            Datum::Int4(super::types::oid::MONEY),
+            Datum::Int2(4),
+            builtin_regproc(Some((BT_EQUAL_IMAGE_OID, "btequalimage"))),
+        ],
+        arena,
+    )?;
+    let mut count = 4usize;
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .functions
@@ -13921,7 +14503,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(routine.argument_count),
                 Datum::Int4(routine.result_oid),
                 Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
-                Datum::Bpchar(if routine.oid == 2901 { "a" } else { "f" }),
+                Datum::Bpchar(if matches!(routine.oid, 2901 | 2112 | 2125 | 2141) {
+                    "a"
+                } else {
+                    "f"
+                }),
                 oidvector(&argument_oids[..argument_count], arena)?,
                 Datum::Bpchar(routine.volatility),
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
@@ -14272,6 +14858,8 @@ fn pg_aggregate<'a>(
             "xmlconcat2"
         } else if oid == 2901 {
             "xmlagg"
+        } else if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+            routine.name
         } else {
             let slot = storage.routine_slot_by_oid(oid, txid).ok_or_else(|| {
                 sql_err!(
@@ -14328,7 +14916,7 @@ fn pg_aggregate<'a>(
             ("aggminitval", ColType::Text),
         ],
     );
-    let count = 1
+    let count = 4
         + (0..storage.routine_count())
             .filter(|slot| {
                 storage.routine_slot_visible_to(*slot, txid)
@@ -14373,7 +14961,56 @@ fn pg_aggregate<'a>(
         ],
         arena,
     )?;
-    let mut index = 1usize;
+    for (
+        index,
+        (
+            aggregate_oid,
+            transition_oid,
+            moving_transition_oid,
+            moving_inverse_oid,
+            sort_operator_oid,
+        ),
+    ) in [
+        (2112, 894, 894, 895, 0),
+        (2125, 898, 0, 0, 903),
+        (2141, 899, 0, 0, 902),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[index + 1] = row(
+            &[
+                regproc(aggregate_oid)?,
+                Datum::Bpchar("n"),
+                Datum::Int2(0),
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(moving_transition_oid)?,
+                regproc(moving_inverse_oid)?,
+                regproc(0)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bpchar("r"),
+                Datum::Bpchar("r"),
+                Datum::Int4(sort_operator_oid),
+                Datum::Int4(super::types::oid::MONEY),
+                Datum::Int4(0),
+                Datum::Int4(if moving_transition_oid == 0 {
+                    0
+                } else {
+                    super::types::oid::MONEY
+                }),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    let mut index = 4usize;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {
@@ -14960,6 +15597,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::PgSnapshot,
         ColType::TxidSnapshot,
         ColType::PgLsn,
+        ColType::Money,
         ColType::Regtype,
         ColType::Regproc,
         ColType::Regprocedure,
@@ -15028,7 +15666,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::Int8
         | ColType::Float4
         | ColType::Float8
-        | ColType::Numeric => "N",
+        | ColType::Numeric
+        | ColType::Money => "N",
         ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
         ColType::Interval => "T",
         ColType::Xid
@@ -15078,8 +15717,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1), // typtypmod
                 Datum::Bool(false),
                 Datum::Null, // typdefault
-                text("", arena)?,
-                text("", arena)?,
+                text(if *t == ColType::Money { "cash_in" } else { "" }, arena)?,
+                text(if *t == ColType::Money { "cash_out" } else { "" }, arena)?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),
@@ -15296,8 +15935,22 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
-                text("", arena)?,
-                text("", arena)?,
+                text(
+                    if element == super::types::ArrElem::Money {
+                        "array_in"
+                    } else {
+                        ""
+                    },
+                    arena,
+                )?,
+                text(
+                    if element == super::types::ArrElem::Money {
+                        "array_out"
+                    } else {
+                        ""
+                    },
+                    arena,
+                )?,
                 Datum::Null,
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),
@@ -16600,6 +17253,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             | "statement_timeout"
             | "transaction_timeout" => "0",
             "IntervalStyle" => "postgres",
+            "lc_monetary" => "C.UTF-8",
             "is_superuser" => "on",
             "max_connections" => "100",
             "max_prepared_transactions" => "0",

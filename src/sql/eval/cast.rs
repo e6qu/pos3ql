@@ -229,6 +229,14 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Text(s) => Datum::PgLsn(parse_pg_lsn(s)?),
             _ => return Err(cast_unsupported(&v, "pg_lsn")),
         },
+        ColType::Money => match v {
+            Datum::Money(_) => v,
+            Datum::Int4(value) => Datum::Money(crate::sql::money::from_integer(value.into())?),
+            Datum::Int8(value) => Datum::Money(crate::sql::money::from_integer(value)?),
+            Datum::Numeric(value) => Datum::Money(crate::sql::money::from_numeric(&value, arena)?),
+            Datum::Text(text) => Datum::Money(crate::sql::money::parse(text)?),
+            _ => return Err(cast_unsupported(&v, "money")),
+        },
         ColType::Int8 => {
             if let Datum::Bit { bits, .. } = v {
                 Datum::Int8(bits_to_uint(bits, 64, "bigint")? as i64)
@@ -239,6 +247,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             }
         }
         ColType::Float8 => match v {
+            Datum::Int2(x) => Datum::Float8(f64::from(x)),
             Datum::Int4(x) => Datum::Float8(f64::from(x)),
             Datum::Oid(x) => Datum::Float8(f64::from(x)),
             Datum::Int8(x) => Datum::Float8(x as f64),
@@ -258,6 +267,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Float4 => {
             let f = match v {
                 Datum::Float4(_) => return Ok(v),
+                Datum::Int2(x) => x as f32,
                 Datum::Int4(x) => x as f32,
                 Datum::Oid(x) => x as f32,
                 Datum::Int8(x) => x as f32,
@@ -478,6 +488,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::Numeric => match v {
             Datum::Numeric(_) => v,
+            Datum::Money(value) => Datum::Numeric(crate::sql::money::to_numeric(value, arena)?),
             Datum::Int4(x) => Datum::Numeric(Numeric::from_i64(i64::from(x), arena)?),
             Datum::Oid(x) => Datum::Numeric(Numeric::from_i64(i64::from(x), arena)?),
             Datum::Int8(x) => Datum::Numeric(Numeric::from_i64(x, arena)?),

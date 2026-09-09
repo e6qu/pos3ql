@@ -137,6 +137,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Int8(_)
         | Datum::Xid8(_)
         | Datum::PgLsn(_)
+        | Datum::Money(_)
         | Datum::Float8(_)
         | Datum::Timestamp(_)
         | Datum::Timestamptz(_)
@@ -251,6 +252,11 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         }
         Datum::PgLsn(x) => {
             out[0] = 41;
+            out[1..9].copy_from_slice(&x.to_le_bytes());
+            9
+        }
+        Datum::Money(x) => {
+            out[0] = 46;
             out[1..9].copy_from_slice(&x.to_le_bytes());
             9
         }
@@ -598,6 +604,10 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         }
         41 => (
             Datum::PgLsn(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
+            8,
+        ),
+        46 => (
+            Datum::Money(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
             8,
         ),
         3 => (

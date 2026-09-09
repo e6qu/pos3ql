@@ -1237,6 +1237,157 @@ pub fn multirange_contains_elem(a: &str, kind: RangeKind, element: &str) -> Resu
     Ok(false)
 }
 
+/// Positional predicates compare the outer component ranges.  Canonical
+/// multiranges are ordered and non-adjacent, so their first and last
+/// components carry exactly the bounds PostgreSQL's multirange predicates use.
+pub fn multirange_position(
+    a: &str,
+    b: &str,
+    kind: RangeKind,
+    predicate: MultirangePosition,
+) -> Result<bool, SqlError> {
+    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
+    let na = split_components(a, &mut ca)?;
+    let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
+    let nb = split_components(b, &mut cb)?;
+    if na == 0 || nb == 0 {
+        return Ok(false);
+    }
+    Ok(match predicate {
+        MultirangePosition::Before => strictly_before(ca[na - 1], cb[0], kind)?,
+        MultirangePosition::After => strictly_after(ca[0], cb[nb - 1], kind)?,
+        MultirangePosition::NotRightOf => not_right_of(ca[na - 1], cb[nb - 1], kind)?,
+        MultirangePosition::NotLeftOf => not_left_of(ca[0], cb[0], kind)?,
+        MultirangePosition::Adjacent => {
+            adjacent(ca[na - 1], cb[0], kind)? || adjacent(ca[0], cb[nb - 1], kind)?
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+pub enum MultirangePosition {
+    Before,
+    After,
+    NotRightOf,
+    NotLeftOf,
+    Adjacent,
+}
+
+fn flags(parsed: &Parsed<'_>) -> u8 {
+    if parsed.empty {
+        return 0x01;
+    }
+    (if parsed.lower_inc { 0x02 } else { 0 })
+        | (if parsed.upper_inc { 0x04 } else { 0 })
+        | (if parsed.lower.is_none() { 0x08 } else { 0 })
+        | (if parsed.upper.is_none() { 0x10 } else { 0 })
+}
+
+fn bound_hash(
+    text: &str,
+    kind: RangeKind,
+    seed: Option<i64>,
+    arena: &Arena,
+) -> Result<u64, SqlError> {
+    let integer = match kind {
+        RangeKind::Int4 => u32::from_ne_bytes(
+            text.trim()
+                .parse::<i32>()
+                .map_err(|_| bad_element(kind, text))?
+                .to_ne_bytes(),
+        ),
+        RangeKind::Date => {
+            u32::from_ne_bytes(super::datetime::parse_date(text.trim())?.to_ne_bytes())
+        }
+        RangeKind::Int8 => crate::sql::identity::hash_int64_input(
+            text.trim()
+                .parse::<i64>()
+                .map_err(|_| bad_element(kind, text))?,
+        ),
+        RangeKind::Ts => crate::sql::identity::hash_int64_input(super::datetime::parse_timestamp(
+            text.trim_matches('"'),
+            false,
+        )?),
+        RangeKind::Tstz => crate::sql::identity::hash_int64_input(
+            super::datetime::parse_timestamp(text.trim_matches('"'), true)?,
+        ),
+        RangeKind::Num => {
+            let numeric = Numeric::parse(text.trim(), arena)?;
+            if numeric.is_nan() {
+                return Ok(seed.map_or(0, |value| value as u64));
+            }
+            if numeric.is_zero() {
+                return Ok(seed.map_or(u64::from(u32::MAX), |value| value.wrapping_sub(1) as u64));
+            }
+            let weight = numeric.weight as i64 as u64;
+            return Ok(match seed {
+                Some(seed) => {
+                    (crate::sql::identity::hash_bytea_extended(numeric.digits, seed) as u64)
+                        ^ weight
+                }
+                None => u64::from(
+                    (crate::sql::identity::hash_bytea(numeric.digits) as u32)
+                        ^ numeric.weight as u32,
+                ),
+            });
+        }
+    };
+    Ok(match seed {
+        Some(seed) => crate::sql::identity::hash_uint32_extended(integer, seed),
+        None => u64::from(crate::sql::identity::hash_uint32(integer)),
+    })
+}
+
+pub fn hash_range(
+    text: &str,
+    kind: RangeKind,
+    seed: Option<i64>,
+    arena: &Arena,
+) -> Result<u64, SqlError> {
+    let parsed = parse(text)?;
+    let lower = parsed
+        .lower
+        .map(|value| bound_hash(value, kind, seed, arena))
+        .transpose()?
+        .unwrap_or(0);
+    let upper = parsed
+        .upper
+        .map(|value| bound_hash(value, kind, seed, arena))
+        .transpose()?
+        .unwrap_or(0);
+    let flag_hash = match seed {
+        Some(seed) => crate::sql::identity::hash_uint32_extended(u32::from(flags(&parsed)), seed),
+        None => u64::from(crate::sql::identity::hash_uint32(u32::from(flags(&parsed)))),
+    };
+    Ok(if seed.is_some() {
+        let combined = flag_hash ^ lower;
+        (((combined << 1) & 0xffff_fffe_ffff_fffe) | ((combined >> 31) & 0x0000_0001_0000_0001))
+            ^ upper
+    } else {
+        u64::from((((flag_hash as u32) ^ lower as u32).rotate_left(1)) ^ upper as u32)
+    })
+}
+
+pub fn hash_multirange(
+    text: &str,
+    kind: RangeKind,
+    seed: Option<i64>,
+    arena: &Arena,
+) -> Result<u64, SqlError> {
+    let mut components = [""; MAX_MULTIRANGE];
+    let count = split_components(text, &mut components)?;
+    let mut result = 1u64;
+    for component in &components[..count] {
+        result = result
+            .wrapping_mul(31)
+            .wrapping_add(hash_range(component, kind, seed, arena)?);
+        if seed.is_none() {
+            result &= u64::from(u32::MAX);
+        }
+    }
+    Ok(result)
+}
+
 /// Total order over two canonical multiranges: compare component ranges
 /// pairwise; when one is a prefix of the other, the shorter sorts first.
 pub fn cmp_multiranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {

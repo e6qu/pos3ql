@@ -1613,16 +1613,15 @@ pub(crate) fn multirange_setop<'a>(
     Ok(Datum::Multirange { text, kind: lk })
 }
 
-/// Multirange predicate operators: `@>` (contains), `<@` (contained by), `&&`
-/// (overlaps). `@>`/`<@` accept a multirange, a range, or a bare element on the
-/// contained side; `&&` accepts a multirange or a range on either side.
+/// Multirange predicate operators. Cross range/multirange forms are normalized
+/// to multiranges at this boundary; element containment remains asymmetric.
 pub(crate) fn multirange_op<'a>(
     operator: BinaryOp,
     l: Datum<'a>,
     r: Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    use BinaryOp::{ContainedBy, Contains, Overlaps};
+    use BinaryOp::{Adjacent, ContainedBy, Contains, NotLeftOf, NotRightOf, Overlaps, Shl, Shr};
     if l.is_null() || r.is_null() {
         return Ok(Datum::Null);
     }
@@ -1637,6 +1636,24 @@ pub(crate) fn multirange_op<'a>(
             }
             Ok(Datum::Bool(range::multirange_overlaps(lt, rt, lk)?))
         }
+        Shl | Shr | NotRightOf | NotLeftOf | Adjacent => {
+            let (lt, lk) = as_multirange_coerce(&l, arena)?;
+            let (rt, rk) = as_multirange_coerce(&r, arena)?;
+            if lk != rk {
+                return Err(range_mismatch());
+            }
+            let predicate = match operator {
+                Shl => range::MultirangePosition::Before,
+                Shr => range::MultirangePosition::After,
+                NotRightOf => range::MultirangePosition::NotRightOf,
+                NotLeftOf => range::MultirangePosition::NotLeftOf,
+                Adjacent => range::MultirangePosition::Adjacent,
+                _ => unreachable!(),
+            };
+            Ok(Datum::Bool(range::multirange_position(
+                lt, rt, lk, predicate,
+            )?))
+        }
         _ => Err(type_mismatch("multirange operator", &l)),
     }
 }
@@ -1648,7 +1665,7 @@ fn multirange_contains<'a>(
     contained: Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let (ct, ck) = as_multirange(&container)?;
+    let (ct, ck) = as_multirange_coerce(&container, arena)?;
     let held = match contained {
         Datum::Multirange { text, kind } => {
             if kind != ck {
@@ -2290,6 +2307,9 @@ pub(crate) fn binary<'a>(
         JsonPathExists => jsonpath_operator(l, r, false, arena),
         Shl | Shr if is_network(&l) || is_network(&r) => network_op(operator, l, r),
         Shl | Shr => match (l, r) {
+            (Datum::Multirange { .. }, _) | (_, Datum::Multirange { .. }) => {
+                multirange_op(operator, l, r, arena)
+            }
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => range_op(operator, l, r, arena),
             (Datum::Bit { .. }, _) => bit_shift(operator, l, r, arena),
             _ => bitwise(operator, l, r),

@@ -334,6 +334,10 @@ enum AggKind {
     BitAnd,
     BitOr,
     BitXor,
+    /// Union range inputs into a canonical multirange.
+    RangeAgg,
+    /// Intersect range or multirange inputs, preserving the input family.
+    RangeIntersectAgg,
     StringAgg,
     /// `array_agg(expr [ORDER BY ...])`: buffers every value (NULLs kept),
     /// optionally sorted / DISTINCT, then builds an array.
@@ -779,6 +783,8 @@ impl<'a> AggState<'a> {
             "bit_and" => AggKind::BitAnd,
             "bit_or" => AggKind::BitOr,
             "bit_xor" => AggKind::BitXor,
+            "range_agg" => AggKind::RangeAgg,
+            "range_intersect_agg" => AggKind::RangeIntersectAgg,
             "string_agg" => AggKind::StringAgg,
             "array_agg" => AggKind::ArrayAgg,
             "xmlagg" => AggKind::XmlAgg,
@@ -1497,6 +1503,64 @@ impl<'a> AggState<'a> {
                     Some(acc) => crate::sql::eval::bit_aggregate(operator, acc, v, arena)?,
                 });
             }
+            AggKind::RangeAgg => {
+                let (text, kind) = match v {
+                    Datum::Range { text, kind } => (
+                        crate::sql::range::multirange_from_range(text, kind, arena)?,
+                        kind,
+                    ),
+                    Datum::Multirange { text, kind } => (text, kind),
+                    other => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "range_agg requires a range or multirange argument, got {:?}",
+                            other
+                        ));
+                    }
+                };
+                self.best = Some(match self.best {
+                    None => Datum::Multirange { text, kind },
+                    Some(Datum::Multirange {
+                        text: accumulated,
+                        kind: accumulated_kind,
+                    }) if accumulated_kind == kind => Datum::Multirange {
+                        text: crate::sql::range::multirange_union(accumulated, text, kind, arena)?,
+                        kind,
+                    },
+                    Some(_) => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "range types do not match"
+                        ));
+                    }
+                });
+            }
+            AggKind::RangeIntersectAgg => {
+                self.best = Some(match (self.best, v) {
+                    (None, value @ Datum::Range { .. })
+                    | (None, value @ Datum::Multirange { .. }) => value,
+                    (
+                        Some(Datum::Range { text: a, kind: ak }),
+                        Datum::Range { text: b, kind: bk },
+                    ) if ak == bk => Datum::Range {
+                        text: crate::sql::range::intersect(a, b, ak, arena)?,
+                        kind: ak,
+                    },
+                    (
+                        Some(Datum::Multirange { text: a, kind: ak }),
+                        Datum::Multirange { text: b, kind: bk },
+                    ) if ak == bk => Datum::Multirange {
+                        text: crate::sql::range::multirange_intersect(a, b, ak, arena)?,
+                        kind: ak,
+                    },
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "range types do not match"
+                        ));
+                    }
+                });
+            }
             // Only reached through the DISTINCT fold; the streaming path handles
             // string_agg directly (it needs the per-row delimiter).
             AggKind::StringAgg => {
@@ -2072,7 +2136,9 @@ impl<'a> AggState<'a> {
             AggKind::RegrCount => Datum::Int8(self.count as i64),
             // Min/Max and the bitwise aggregates return the running value in
             // `best` (NULL for an all-NULL or empty group).
-            AggKind::Min | AggKind::Max => self.best.unwrap_or(Datum::Null),
+            AggKind::Min | AggKind::Max | AggKind::RangeAgg | AggKind::RangeIntersectAgg => {
+                self.best.unwrap_or(Datum::Null)
+            }
             AggKind::BitAnd | AggKind::BitOr | AggKind::BitXor => match self.best {
                 Some(Datum::Bit { bits, .. }) => Datum::Bit {
                     bits,

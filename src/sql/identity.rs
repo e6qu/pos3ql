@@ -164,6 +164,20 @@ fn hash_u32(value: u32, seed: u64) -> (u32, u32) {
     final_mix(a.wrapping_add(value), b, c)
 }
 
+pub(crate) fn hash_uint32(value: u32) -> u32 {
+    hash_u32(value, 0).1
+}
+
+pub(crate) fn hash_uint32_extended(value: u32, seed: i64) -> u64 {
+    let (high, low) = hash_u32(value, seed as u64);
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+pub(crate) fn hash_int64_input(value: i64) -> u32 {
+    let high = (value >> 32) as u32;
+    (value as u32) ^ if value >= 0 { high } else { !high }
+}
+
 fn tid_native_bytes(value: Tid) -> [u8; 6] {
     let high = (value.block >> 16) as u16;
     let low = value.block as u16;

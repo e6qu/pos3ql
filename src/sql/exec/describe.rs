@@ -3977,6 +3977,7 @@ pub fn infer_type_res(
                 {
                     Some(o) => match coltype_of_oid(o) {
                         Some(ColType::Array(element)) => of(element.to_coltype()),
+                        Some(ColType::Multirange(kind)) => of(ColType::Range(kind)),
                         _ => of(ColType::Text),
                     },
                     None => of(ColType::Text),
@@ -4078,8 +4079,85 @@ pub fn infer_type_res(
             | "tsmultirange" | "tstzmultirange" => of(ColType::Multirange(
                 crate::sql::types::RangeKind::from_multirange_name(name).expect("multirange name"),
             )),
-            "similar_to" | "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => {
-                of(ColType::Bool)
+            "similar_to"
+            | "isempty"
+            | "lower_inc"
+            | "upper_inc"
+            | "lower_inf"
+            | "upper_inf"
+            | "range_eq"
+            | "range_ne"
+            | "range_lt"
+            | "range_le"
+            | "range_ge"
+            | "range_gt"
+            | "range_overlaps"
+            | "range_contains_elem"
+            | "range_contains"
+            | "elem_contained_by_range"
+            | "range_contained_by"
+            | "range_adjacent"
+            | "range_before"
+            | "range_after"
+            | "range_overleft"
+            | "range_overright"
+            | "multirange_eq"
+            | "multirange_ne"
+            | "multirange_lt"
+            | "multirange_le"
+            | "multirange_ge"
+            | "multirange_gt"
+            | "multirange_overlaps_range"
+            | "range_overlaps_multirange"
+            | "multirange_overlaps_multirange"
+            | "multirange_contains_elem"
+            | "multirange_contains_range"
+            | "multirange_contains_multirange"
+            | "elem_contained_by_multirange"
+            | "range_contained_by_multirange"
+            | "multirange_contained_by_multirange"
+            | "range_contains_multirange"
+            | "multirange_contained_by_range"
+            | "range_adjacent_multirange"
+            | "multirange_adjacent_range"
+            | "multirange_adjacent_multirange"
+            | "range_before_multirange"
+            | "multirange_before_range"
+            | "multirange_before_multirange"
+            | "range_after_multirange"
+            | "multirange_after_range"
+            | "multirange_after_multirange"
+            | "range_overleft_multirange"
+            | "multirange_overleft_range"
+            | "multirange_overleft_multirange"
+            | "range_overright_multirange"
+            | "multirange_overright_range"
+            | "multirange_overright_multirange" => of(ColType::Bool),
+            "range_cmp" | "multirange_cmp" | "hash_range" | "hash_multirange" => of(ColType::Int4),
+            "hash_range_extended" | "hash_multirange_extended" => of(ColType::Int8),
+            "int4range_subdiff" | "int8range_subdiff" | "numrange_subdiff"
+            | "daterange_subdiff" | "tsrange_subdiff" | "tstzrange_subdiff" => of(ColType::Float8),
+            "range_union"
+            | "range_intersect"
+            | "range_minus"
+            | "int4range_canonical"
+            | "int8range_canonical"
+            | "daterange_canonical" => args
+                .first()
+                .map(|arg| infer_type_res(arg, columns))
+                .transpose()?
+                .unwrap_or((oid::UNKNOWN, -1)),
+            "multirange_union" | "multirange_intersect" | "multirange_minus" | "multirange" => {
+                match args
+                    .first()
+                    .map(|arg| infer_type_res(arg, columns))
+                    .transpose()?
+                    .and_then(|resolved| coltype_of_oid(resolved.0))
+                {
+                    Some(ColType::Range(kind)) => of(ColType::Multirange(kind)),
+                    Some(ColType::Multirange(kind)) => of(ColType::Multirange(kind)),
+                    _ => (oid::UNKNOWN, -1),
+                }
             }
             "range_merge" => {
                 // Same range type as its arguments.
@@ -4090,9 +4168,24 @@ pub fn infer_type_res(
                     .map(|t| t.0)
                 {
                     Some(o) if is_range_oid(o) => (o, -1),
+                    Some(o) => match coltype_of_oid(o) {
+                        Some(ColType::Multirange(kind)) => (ColType::Range(kind).oid(), -1),
+                        _ => (oid::TEXT, -1),
+                    },
                     _ => (oid::TEXT, -1),
                 }
             }
+            "range_agg" | "range_intersect_agg" => match args
+                .first()
+                .map(|a| infer_type_res(a, columns))
+                .transpose()?
+                .and_then(|t| coltype_of_oid(t.0))
+            {
+                Some(ColType::Range(kind)) if *name == "range_agg" => of(ColType::Multirange(kind)),
+                Some(ColType::Range(kind)) => of(ColType::Range(kind)),
+                Some(ColType::Multirange(kind)) => of(ColType::Multirange(kind)),
+                _ => (oid::UNKNOWN, -1),
+            },
             "lower" | "upper" => {
                 // A range argument yields its element type; otherwise text.
                 match args

@@ -121,6 +121,14 @@ all | none | exact | copy | types | slt) ;;
   exit 1
   ;;
 esac
+SLT_QUERY_SHARD=${POS3QL_SLT_QUERY_SHARD:-0}
+SLT_QUERY_SHARDS=${POS3QL_SLT_QUERY_SHARDS:-1}
+if ! [[ "$SLT_QUERY_SHARD" =~ ^[0-9]+$ && "$SLT_QUERY_SHARDS" =~ ^[1-9][0-9]*$ ]] \
+    || (( SLT_QUERY_SHARD >= SLT_QUERY_SHARDS )); then
+  printf 'FAIL: POS3QL_SLT_QUERY_SHARD must be in [0, POS3QL_SLT_QUERY_SHARDS) (got %q/%q)\n' \
+    "$SLT_QUERY_SHARD" "$SLT_QUERY_SHARDS"
+  exit 1
+fi
 want_auxiliary() { [[ "$DIFF_AUXILIARY" == all || "$DIFF_AUXILIARY" == "$1" ]]; }
 
 corpus_file_count=0
@@ -469,6 +477,7 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
   SLT_LIMIT=${POS3QL_SLT_LIMIT:-600}
   if "$SLT_VENV/bin/python" "$EXT/slt_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
        --limit "$SLT_LIMIT" \
+       --query-shards "$SLT_QUERY_SHARDS" --query-shard "$SLT_QUERY_SHARD" \
        vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
        "$EXT"/sqllogictest/*.test \
        > "$WORK/slt.out" 2>&1; then

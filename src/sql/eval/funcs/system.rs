@@ -546,6 +546,20 @@ pub(crate) fn dispatch<'a>(
             | "pg_encoding_to_char"
             | "pg_char_to_encoding"
             | "getdatabaseencoding"
+            | "pg_current_xact_id"
+            | "pg_current_xact_id_if_assigned"
+            | "txid_current"
+            | "txid_current_if_assigned"
+            | "pg_current_snapshot"
+            | "txid_current_snapshot"
+            | "pg_snapshot_xmin"
+            | "pg_snapshot_xmax"
+            | "txid_snapshot_xmin"
+            | "txid_snapshot_xmax"
+            | "pg_visible_in_snapshot"
+            | "txid_visible_in_snapshot"
+            | "pg_xact_status"
+            | "txid_status"
             | "pg_typeof"
             | "current_setting"
             | "set_config"
@@ -567,6 +581,132 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "pg_current_xact_id"
+            | "pg_current_xact_id_if_assigned"
+            | "txid_current"
+            | "txid_current_if_assigned" => {
+                arity(0)?;
+                let assign = matches!(name, "pg_current_xact_id" | "txid_current");
+                let transaction_id = hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "transaction identity access is unavailable"
+                        )
+                    })?
+                    .current_transaction_id(assign)?;
+                let Some(transaction_id) = transaction_id else {
+                    return Ok(Datum::Null);
+                };
+                if name.starts_with("txid_") {
+                    Ok(Datum::Int8(i64::try_from(transaction_id).map_err(
+                        |_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range"),
+                    )?))
+                } else {
+                    Ok(Datum::Xid8(transaction_id))
+                }
+            }
+            "pg_current_snapshot" | "txid_current_snapshot" => {
+                arity(0)?;
+                let snapshot = hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "transaction snapshot access is unavailable"
+                        )
+                    })?
+                    .current_transaction_snapshot(arena)?;
+                Ok(Datum::Snapshot {
+                    value: snapshot,
+                    legacy: name == "txid_current_snapshot",
+                })
+            }
+            "pg_snapshot_xmin" | "pg_snapshot_xmax" | "txid_snapshot_xmin"
+            | "txid_snapshot_xmax" => {
+                arity(1)?;
+                let expected_legacy = name.starts_with("txid_");
+                let snapshot = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                let value = if name.ends_with("xmin") {
+                    snapshot.xmin()
+                } else {
+                    snapshot.xmax()
+                };
+                if expected_legacy {
+                    Ok(Datum::Int8(i64::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range")
+                    })?))
+                } else {
+                    Ok(Datum::Xid8(value))
+                }
+            }
+            "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => {
+                arity(2)?;
+                let expected_legacy = name.starts_with("txid_");
+                let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Xid8(value) if !expected_legacy => value,
+                    Datum::Int8(value) if expected_legacy => {
+                        u64::try_from(value).map_err(|_| {
+                            sql_err!(
+                                sqlstate::NUMERIC_OUT_OF_RANGE,
+                                "transaction ID must be nonnegative"
+                            )
+                        })?
+                    }
+                    Datum::Int4(value) if expected_legacy => {
+                        u64::try_from(value).map_err(|_| {
+                            sql_err!(
+                                sqlstate::NUMERIC_OUT_OF_RANGE,
+                                "transaction ID must be nonnegative"
+                            )
+                        })?
+                    }
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                let snapshot = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Snapshot { value, legacy } if legacy == expected_legacy => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                Ok(Datum::Bool(snapshot.visible(transaction_id)))
+            }
+            "pg_xact_status" | "txid_status" => {
+                arity(1)?;
+                let legacy = name == "txid_status";
+                let transaction_id = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Xid8(value) if !legacy => value,
+                    Datum::Int8(value) if legacy => u64::try_from(value).map_err(|_| {
+                        sql_err!(
+                            sqlstate::NUMERIC_OUT_OF_RANGE,
+                            "transaction ID must be nonnegative"
+                        )
+                    })?,
+                    Datum::Int4(value) if legacy => u64::try_from(value).map_err(|_| {
+                        sql_err!(
+                            sqlstate::NUMERIC_OUT_OF_RANGE,
+                            "transaction ID must be nonnegative"
+                        )
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                Ok(hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "transaction status access is unavailable"
+                        )
+                    })?
+                    .transaction_status(transaction_id)?
+                    .map_or(Datum::Null, Datum::Text))
+            }
             "pg_get_replica_identity_index" => {
                 arity(1)?;
                 let relation_oid = match eval_full(args[0], arena, params, row, hooks)? {
@@ -1665,6 +1805,9 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int2(_) => "smallint",
                     Datum::Int4(_) => "integer",
                     Datum::Oid(_) => "oid",
+                    Datum::Xid8(_) => "xid8",
+                    Datum::Snapshot { legacy: false, .. } => "pg_snapshot",
+                    Datum::Snapshot { legacy: true, .. } => "txid_snapshot",
                     Datum::PgLsn(_) => "pg_lsn",
                     Datum::Int8(_) => "bigint",
                     Datum::Float4(_) => "real",

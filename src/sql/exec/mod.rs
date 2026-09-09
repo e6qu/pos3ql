@@ -51056,6 +51056,14 @@ fn decode_binary_field_with_context<'a>(
             let value: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::Oid(u32::from_be_bytes(value)))
         }
+        ColType::Xid8 => {
+            let value: [u8; 8] = bytes.try_into().map_err(|_| bad())?;
+            Ok(Datum::Xid8(u64::from_be_bytes(value)))
+        }
+        ColType::PgSnapshot | ColType::TxidSnapshot => Ok(Datum::Snapshot {
+            value: crate::sql::snapshot::Snapshot::from_binary(bytes, arena).map_err(|_| bad())?,
+            legacy: ctype == ColType::TxidSnapshot,
+        }),
         ColType::PgLsn => {
             let value: [u8; 8] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::PgLsn(u64::from_be_bytes(value)))

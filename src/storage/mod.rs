@@ -375,6 +375,12 @@ pub enum OwnedDatum {
     Char(u8),
     Int4(i32),
     Oid(u32),
+    Xid8(u64),
+    Snapshot {
+        legacy: bool,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     PgLsn(u64),
     Int8(i64),
     Regtype {
@@ -580,6 +586,15 @@ impl OwnedDatum {
             Datum::Char(byte) => Self::Char(*byte),
             Datum::Int4(v) => Self::Int4(*v),
             Datum::Oid(v) => Self::Oid(*v),
+            Datum::Xid8(v) => Self::Xid8(*v),
+            Datum::Snapshot { value, legacy } => {
+                let (len, bytes) = Self::bytes(value.raw(), "transaction snapshot")?;
+                Self::Snapshot {
+                    legacy: *legacy,
+                    len,
+                    bytes,
+                }
+            }
             Datum::PgLsn(v) => Self::PgLsn(*v),
             Datum::Int2(v) => Self::Int4(*v as i32),
             Datum::Int8(v) => Self::Int8(*v),
@@ -700,6 +715,12 @@ impl OwnedDatum {
             Self::Char(byte) => Datum::Char(*byte),
             Self::Int4(v) => Datum::Int4(*v),
             Self::Oid(v) => Datum::Oid(*v),
+            Self::Xid8(v) => Datum::Xid8(*v),
+            Self::Snapshot { legacy, len, bytes } => Datum::Snapshot {
+                value: crate::sql::snapshot::Snapshot::restore(&bytes[..*len as usize])
+                    .expect("stored transaction snapshot was validated"),
+                legacy: *legacy,
+            },
             Self::PgLsn(v) => Datum::PgLsn(*v),
             Self::Int8(v) => Datum::Int8(*v),
             Self::Regtype {
@@ -8382,7 +8403,7 @@ impl SequenceDef {
         log_count: &Cell<i64>,
         dirty: Option<&Cell<bool>>,
         requested: i64,
-    ) -> Result<(i64, i64), SqlError> {
+    ) -> Result<(i64, i64, bool), SqlError> {
         debug_assert!(requested > 0);
         let first = if is_called.get() {
             self.next_after(last_value.get())?
@@ -8402,7 +8423,8 @@ impl SequenceDef {
         last_value.set(i64::try_from(last).expect("sequence bounds constrain reserved value"));
         is_called.set(true);
         let previous_log_count = log_count.get();
-        log_count.set(if previous_log_count < reserved {
+        let prelogged = previous_log_count < reserved;
+        log_count.set(if prelogged {
             let trailing = if step > 0 {
                 (i128::from(self.max_value) - last) / step
             } else {
@@ -8415,7 +8437,7 @@ impl SequenceDef {
         if let Some(dirty) = dirty {
             dirty.set(true);
         }
-        Ok((first, reserved))
+        Ok((first, reserved, prelogged))
     }
 
     /// Validates a `setval` target is within `[min, max]` (22003), without
@@ -10583,6 +10605,18 @@ struct ForeignStatementContext {
     savepoint_count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ActiveTransactionIdentity {
+    transaction_id: u32,
+    assigned: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RecentTransactionStatus {
+    transaction_id: u64,
+    committed: bool,
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -10668,6 +10702,13 @@ pub struct Storage {
     /// Repeatable-read snapshots held by live connections. This registry is
     /// startup-sized to max_connections and drives version/WAL/SST retention.
     active_snapshots: FixedVec<(u32, u64)>,
+    /// Assigned top-level transaction identities visible to SQL snapshots.
+    /// The registry includes prepared transactions and is startup-bounded by
+    /// the same connection/prepared-transaction capacity as MVCC snapshots.
+    transaction_identities: std::cell::RefCell<FixedVec<ActiveTransactionIdentity>>,
+    recent_transaction_statuses: std::cell::RefCell<FixedVec<RecentTransactionStatus>>,
+    recent_transaction_status_cursor: Cell<usize>,
+    latest_transaction_id: Cell<u64>,
     /// PostgreSQL relation locks. Each mode is tracked independently because
     /// SHARE and SHARE UPDATE EXCLUSIVE are incomparable, and savepoint
     /// rollback releases only modes acquired by the rolled-back
@@ -13265,6 +13306,16 @@ impl Storage {
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
+        let transaction_identities = std::cell::RefCell::new(FixedVec::new(
+            budget,
+            "transaction_identities",
+            transaction_capacity,
+        )?);
+        let recent_transaction_statuses = std::cell::RefCell::new(FixedVec::new(
+            budget,
+            "recent_transaction_statuses",
+            transaction_capacity.saturating_mul(8).max(64),
+        )?);
         let temporary_transactions = std::cell::RefCell::new(FixedVec::new(
             budget,
             "temporary_transactions",
@@ -13355,6 +13406,10 @@ impl Storage {
             read_snapshot: SNAPSHOT_ALL,
             commit_snapshot: u64::MAX,
             active_snapshots,
+            transaction_identities,
+            recent_transaction_statuses,
+            recent_transaction_status_cursor: Cell::new(0),
+            latest_transaction_id: Cell::new(0),
             table_locks,
             row_locks,
             lock_sequence: Cell::new(0),
@@ -27277,7 +27332,7 @@ impl Storage {
         slot: usize,
         txid: u32,
         requested: i64,
-    ) -> Result<(i64, i64), SqlError> {
+    ) -> Result<(i64, i64, bool), SqlError> {
         let sequence = &self.sequences[slot];
         if sequence
             .pending_definition
@@ -34971,6 +35026,198 @@ impl Storage {
 
     pub fn set_commit_snapshot(&mut self, snapshot: u64) {
         self.commit_snapshot = snapshot;
+    }
+
+    pub(crate) fn begin_transaction_identity(&self, transaction_id: u32) {
+        self.latest_transaction_id.set(
+            self.latest_transaction_id
+                .get()
+                .max(u64::from(transaction_id)),
+        );
+        let mut active = self.transaction_identities.borrow_mut();
+        if active
+            .iter()
+            .any(|identity| identity.transaction_id == transaction_id)
+        {
+            return;
+        }
+        active
+            .push(ActiveTransactionIdentity {
+                transaction_id,
+                assigned: false,
+            })
+            .expect("transaction identity registry matches configured capacity");
+    }
+
+    pub(crate) fn latest_transaction_identity(&self) -> u64 {
+        self.latest_transaction_id.get()
+    }
+
+    pub(crate) fn observe_transaction_identity(&self, transaction_id: u64) {
+        self.latest_transaction_id
+            .set(self.latest_transaction_id.get().max(transaction_id));
+    }
+
+    pub(crate) fn assign_transaction_identity(&self, transaction_id: u32) -> u64 {
+        let mut active = self.transaction_identities.borrow_mut();
+        if let Some(identity) = active
+            .iter_mut()
+            .find(|identity| identity.transaction_id == transaction_id)
+        {
+            identity.assigned = true;
+        }
+        u64::from(transaction_id)
+    }
+
+    pub(crate) fn assigned_transaction_identity(&self, transaction_id: u32) -> Option<u64> {
+        self.transaction_identities
+            .borrow()
+            .iter()
+            .find(|identity| identity.transaction_id == transaction_id && identity.assigned)
+            .map(|identity| u64::from(identity.transaction_id))
+    }
+
+    pub(crate) fn current_transaction_snapshot<'a>(
+        &self,
+        transaction_id: u32,
+        arena: &'a crate::mem::arena::Arena,
+    ) -> Result<crate::sql::snapshot::Snapshot<'a>, SqlError> {
+        let active = self.transaction_identities.borrow();
+        let minimum_active = active
+            .iter()
+            .filter(|identity| identity.assigned)
+            .map(|identity| u64::from(identity.transaction_id))
+            .min();
+        let completed_xmax = self
+            .recent_transaction_statuses
+            .borrow()
+            .iter()
+            .map(|status| status.transaction_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        // PostgreSQL's xmax is one past the highest completed identity, not
+        // one past an identity that is merely in progress. Internal virtual
+        // transactions can leave gaps, so an active identity is also the
+        // lower bound needed to keep the canonical snapshot range valid.
+        let xmax = completed_xmax.max(minimum_active.unwrap_or(0)).max(1);
+        let count = active
+            .iter()
+            .filter(|identity| {
+                identity.assigned
+                    && identity.transaction_id != transaction_id
+                    && u64::from(identity.transaction_id) < xmax
+            })
+            .count();
+        let xmin = minimum_active.unwrap_or(xmax);
+        crate::sql::snapshot::Snapshot::from_parts(
+            xmin,
+            xmax,
+            count,
+            active.iter().filter_map(|identity| {
+                (identity.assigned
+                    && identity.transaction_id != transaction_id
+                    && u64::from(identity.transaction_id) < xmax)
+                    .then_some(u64::from(identity.transaction_id))
+            }),
+            arena,
+        )
+    }
+
+    pub(crate) fn finish_transaction_identity(&self, transaction_id: u32, committed: bool) {
+        let mut active = self.transaction_identities.borrow_mut();
+        let assigned = active
+            .iter()
+            .position(|identity| identity.transaction_id == transaction_id)
+            .map(|index| active.swap_remove(index).assigned)
+            .unwrap_or(false);
+        drop(active);
+        if !assigned {
+            return;
+        }
+        self.record_transaction_status(u64::from(transaction_id), committed);
+    }
+
+    fn record_transaction_status(&self, transaction_id: u64, committed: bool) {
+        let status = RecentTransactionStatus {
+            transaction_id,
+            committed,
+        };
+        let mut recent = self.recent_transaction_statuses.borrow_mut();
+        if let Some(existing) = recent
+            .iter_mut()
+            .find(|existing| existing.transaction_id == transaction_id)
+        {
+            existing.committed = committed;
+            return;
+        }
+        if recent.len() < recent.capacity() {
+            recent
+                .push(status)
+                .expect("transaction status registry has free capacity");
+        } else {
+            let cursor = self.recent_transaction_status_cursor.get();
+            recent[cursor] = status;
+            self.recent_transaction_status_cursor
+                .set((cursor + 1) % recent.capacity());
+        }
+    }
+
+    pub(crate) fn restore_transaction_status(
+        &self,
+        transaction_id: u64,
+        committed: bool,
+    ) -> Result<(), SqlError> {
+        if self
+            .recent_transaction_statuses
+            .borrow()
+            .iter()
+            .any(|status| status.transaction_id == transaction_id)
+        {
+            return Err(sql_err!(
+                sqlstate::DATA_EXCEPTION,
+                "duplicate retained transaction status"
+            ));
+        }
+        self.observe_transaction_identity(transaction_id);
+        self.record_transaction_status(transaction_id, committed);
+        Ok(())
+    }
+
+    pub(crate) fn visit_recent_transaction_statuses(&self, mut visit: impl FnMut(u64, bool)) {
+        for status in self.recent_transaction_statuses.borrow().iter() {
+            visit(status.transaction_id, status.committed);
+        }
+    }
+
+    pub(crate) fn transaction_status(
+        &self,
+        transaction_id: u64,
+    ) -> Result<Option<&'static str>, SqlError> {
+        if transaction_id > self.latest_transaction_id.get() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "transaction ID {} is in the future",
+                transaction_id
+            ));
+        }
+        if self.transaction_identities.borrow().iter().any(|identity| {
+            identity.assigned && u64::from(identity.transaction_id) == transaction_id
+        }) {
+            return Ok(Some("in progress"));
+        }
+        Ok(self
+            .recent_transaction_statuses
+            .borrow()
+            .iter()
+            .find(|status| status.transaction_id == transaction_id)
+            .map(|status| {
+                if status.committed {
+                    "committed"
+                } else {
+                    "aborted"
+                }
+            }))
     }
 
     pub fn register_snapshot(&mut self, txid: u32, snapshot: u64) -> Result<(), SqlError> {

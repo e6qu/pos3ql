@@ -5486,8 +5486,8 @@ fn is_volatile_function(name: &str) -> bool {
         "gen_random_uuid",
         "uuid_generate_v1",
         "uuid_generate_v4",
-        "txid_current",
-        "pg_current_xact_id",
+        "txid_status",
+        "pg_xact_status",
         "pg_is_in_recovery",
         "pg_reload_conf",
         "set_config",
@@ -5544,6 +5544,12 @@ fn is_nonimmutable_function(name: &str) -> bool {
         "current_catalog",
         "pg_backend_pid",
         "current_setting",
+        "txid_current",
+        "txid_current_if_assigned",
+        "txid_current_snapshot",
+        "pg_current_xact_id",
+        "pg_current_xact_id_if_assigned",
+        "pg_current_snapshot",
     ];
     is_volatile_function(name)
         || STABLE_NAMES

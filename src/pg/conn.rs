@@ -4565,6 +4565,14 @@ pub(crate) fn decode_binary_param<'a>(
             let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Oid(u32::from_be_bytes(b)))
         }
+        oids::XID => {
+            let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Oid(u32::from_be_bytes(b)))
+        }
+        oids::XID8 => {
+            let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
+            Ok(Datum::Xid8(u64::from_be_bytes(b)))
+        }
         oids::INT4
         | oids::REGPROC
         | oids::REGPROCEDURE
@@ -4729,6 +4737,8 @@ pub(crate) fn decode_binary_param<'a>(
                 | crate::sql::types::ColType::Range(_)
                 | crate::sql::types::ColType::Multirange(_)
                 | crate::sql::types::ColType::Bit { .. }
+                | crate::sql::types::ColType::PgSnapshot
+                | crate::sql::types::ColType::TxidSnapshot
                 | crate::sql::types::ColType::Geometry(_)),
             ) => crate::sql::exec::decode_binary_field(ctype, bytes, arena)
                 .map_err(|_| "invalid binary composite parameter"),
@@ -5478,6 +5488,44 @@ mod tests {
             decode_binary_param(crate::sql::types::oid::TIMETZ, &bytes, &arena)
                 .expect("timetz decodes"),
             Datum::Timetz(time, -west)
+        );
+    }
+
+    #[test]
+    fn binary_transaction_identity_parameters_validate_postgresql_payloads() {
+        let mut budget = Budget::new(2048);
+        let arena =
+            Arena::new(&mut budget, "binary transaction identity test", 512).expect("test arena");
+        assert_eq!(
+            decode_binary_param(
+                crate::sql::types::oid::XID8,
+                &u64::MAX.to_be_bytes(),
+                &arena
+            )
+            .unwrap(),
+            Datum::Xid8(u64::MAX)
+        );
+        let mut snapshot = [0u8; 36];
+        snapshot[..4].copy_from_slice(&2u32.to_be_bytes());
+        snapshot[4..12].copy_from_slice(&10u64.to_be_bytes());
+        snapshot[12..20].copy_from_slice(&20u64.to_be_bytes());
+        snapshot[20..28].copy_from_slice(&11u64.to_be_bytes());
+        snapshot[28..36].copy_from_slice(&14u64.to_be_bytes());
+        for (type_oid, legacy) in [
+            (crate::sql::types::oid::PG_SNAPSHOT, false),
+            (crate::sql::types::oid::TXID_SNAPSHOT, true),
+        ] {
+            let Datum::Snapshot { value, legacy: got } =
+                decode_binary_param(type_oid, &snapshot, &arena).unwrap()
+            else {
+                panic!("snapshot parameter has the wrong runtime type")
+            };
+            assert_eq!(got, legacy);
+            assert_eq!(value.to_string(), "10:20:11,14");
+        }
+        snapshot[28..36].copy_from_slice(&11u64.to_be_bytes());
+        assert!(
+            decode_binary_param(crate::sql::types::oid::PG_SNAPSHOT, &snapshot, &arena).is_err()
         );
     }
 

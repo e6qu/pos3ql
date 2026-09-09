@@ -44,6 +44,8 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("regexp_split_to_table")
         || name.eq_ignore_ascii_case("string_to_table")
         || name.eq_ignore_ascii_case("generate_subscripts")
+        || name.eq_ignore_ascii_case("pg_snapshot_xip")
+        || name.eq_ignore_ascii_case("txid_snapshot_xip")
         || name.eq_ignore_ascii_case("pg_options_to_table")
         || name.eq_ignore_ascii_case("pg_get_sequence_data")
         || name.eq_ignore_ascii_case("pg_get_publication_tables")
@@ -1038,6 +1040,35 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 *value = crate::sql::eval::funcs::json::populate_record_from_json(
                     args[0], base, *item, arena, row, hooks,
                 )?;
+            }
+            return Ok(values);
+        }
+        if name.eq_ignore_ascii_case("pg_snapshot_xip")
+            || name.eq_ignore_ascii_case("txid_snapshot_xip")
+        {
+            if args.len() != 1 || *variadic {
+                return Err(srf_signature_error(name));
+            }
+            let legacy = name.eq_ignore_ascii_case("txid_snapshot_xip");
+            let snapshot = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Snapshot {
+                    value,
+                    legacy: actual,
+                } if actual == legacy => value,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(name)),
+            };
+            let values = arena
+                .alloc_slice_with(snapshot.xip().len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (value, transaction_id) in values.iter_mut().zip(snapshot.xip()) {
+                *value = if legacy {
+                    Datum::Int8(i64::try_from(transaction_id).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range")
+                    })?)
+                } else {
+                    Datum::Xid8(transaction_id)
+                };
             }
             return Ok(values);
         }
@@ -2344,6 +2375,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_each = is_json_each_name(tref.table);
     let is_rstt = tref.table.eq_ignore_ascii_case("regexp_split_to_table");
     let is_gsub = tref.table.eq_ignore_ascii_case("generate_subscripts");
+    let is_snapshot_xip = tref.table.eq_ignore_ascii_case("pg_snapshot_xip")
+        || tref.table.eq_ignore_ascii_case("txid_snapshot_xip");
     let is_stt = tref.table.eq_ignore_ascii_case("string_to_table");
     let is_options = tref.table.eq_ignore_ascii_case("pg_options_to_table");
     let is_sequence_data = tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
@@ -2367,6 +2400,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_each
         || is_rstt
         || is_gsub
+        || is_snapshot_xip
         || is_stt
         || is_options
         || is_sequence_data
@@ -2832,6 +2866,12 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             crate::sql::eval::generate_series_result_type(start, has_numeric, has_int8)
         } else if is_gsub {
             ColType::Int4
+        } else if is_snapshot_xip {
+            if tref.table.eq_ignore_ascii_case("txid_snapshot_xip") {
+                ColType::Int8
+            } else {
+                ColType::Xid8
+            }
         } else if is_re {
             ColType::Array(crate::sql::types::ArrElem::Text)
         } else if is_keys || is_rstt || is_stt {
@@ -3148,6 +3188,38 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
         None => crate::sql::eval::eval(argument, arena, params, columns),
     };
+    if tref.table.eq_ignore_ascii_case("pg_snapshot_xip")
+        || tref.table.eq_ignore_ascii_case("txid_snapshot_xip")
+    {
+        if args.len() != 1 {
+            return Err(srf_signature_error(tref.table));
+        }
+        let legacy = tref.table.eq_ignore_ascii_case("txid_snapshot_xip");
+        let snapshot = match eval_argument(args[0])? {
+            Datum::Snapshot {
+                value,
+                legacy: actual,
+            } if actual == legacy => value,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(srf_signature_error(tref.table)),
+        };
+        const EMPTY: &[u8] = &[];
+        let rows = arena
+            .alloc_slice_with(snapshot.xip().len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (row, transaction_id) in rows.iter_mut().zip(snapshot.xip()) {
+            let value =
+                if legacy {
+                    Datum::Int8(i64::try_from(transaction_id).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "bigint out of range")
+                    })?)
+                } else {
+                    Datum::Xid8(transaction_id)
+                };
+            *row = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+        }
+        return Ok(&*rows);
+    }
     if tref.table.eq_ignore_ascii_case("json_table") {
         let catalog = super::storage_catalog(storage, arena, txid);
         let hooks = EvalHooks {

@@ -798,9 +798,11 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
     },
     /// Marks every preceding record in the committed batch as one atomic
-    /// transaction. It has no storage replay effect of its own.
+    /// transaction. `assigned_transaction_identity` preserves whether SQL
+    /// exposed this internal transaction number as a PostgreSQL full XID.
     Commit {
         transaction_id: u32,
+        assigned_transaction_identity: bool,
     },
     /// Terminates a durable batch without making its preceding operations
     /// visible. The batch remains addressable by `gid` until a later typed
@@ -1600,7 +1602,11 @@ impl Wal {
     }
 
     pub(crate) fn commit_boundary_bytes() -> usize {
-        HEADER_LEN + encoded_payload_len(&WalOp::Commit { transaction_id: 0 })
+        HEADER_LEN
+            + encoded_payload_len(&WalOp::Commit {
+                transaction_id: 0,
+                assigned_transaction_identity: false,
+            })
     }
 
     pub(crate) fn prepare_boundary_bytes(
@@ -1661,10 +1667,22 @@ impl Wal {
     /// batch, assigning monotonically increasing commit-order LSNs. Returns
     /// the last assigned LSN, or `lsn_floor` for a transaction with no WAL.
     pub fn commit_stage(&mut self, transaction_id: u32, lsn_floor: u64) -> Result<u64, SqlError> {
+        self.commit_stage_with_transaction_identity(transaction_id, lsn_floor, false)
+    }
+
+    pub(crate) fn commit_stage_with_transaction_identity(
+        &mut self,
+        transaction_id: u32,
+        lsn_floor: u64,
+        assigned_transaction_identity: bool,
+    ) -> Result<u64, SqlError> {
         self.finish_stage(
             transaction_id,
             lsn_floor,
-            &WalOp::Commit { transaction_id },
+            &WalOp::Commit {
+                transaction_id,
+                assigned_transaction_identity,
+            },
             None,
         )
     }
@@ -2649,7 +2667,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             name,
         } => 1 + schema.len() + 1 + table.len() + 1 + name.len(),
-        WalOp::Commit { .. } => 4,
+        WalOp::Commit { .. } => 5,
         WalOp::PrepareTransaction { gid, .. } => 4 + 2 + 4 + 8 + 1 + gid.len(),
         WalOp::PreparedLocks { encoded, .. } => 4 + 4 + encoded.len(),
         WalOp::CommitPrepared { gid } | WalOp::RollbackPrepared { gid } => 1 + gid.len(),
@@ -4409,7 +4427,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::RenameSubscription { name, new_name } => {
             name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
-        WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
+        WalOp::Commit {
+            transaction_id,
+            assigned_transaction_identity,
+        } => {
+            buffer.append(&transaction_id.to_le_bytes())
+                && buffer.append(&[u8::from(*assigned_transaction_identity)])
+        }
         WalOp::PrepareTransaction {
             transaction_id,
             owner,
@@ -7651,10 +7675,24 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
             })
         }
-        KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit { transaction_id: 0 }),
+        KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit {
+            transaction_id: 0,
+            assigned_transaction_identity: false,
+        }),
         KIND_COMMIT => {
             let transaction_id = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
-            (payload.len() == 4).then_some(WalOp::Commit { transaction_id })
+            let assigned_transaction_identity = match payload.get(4..) {
+                // Commit records written before transaction introspection had
+                // no client-visible full-XID state to recover.
+                Some([]) => false,
+                Some([0]) => false,
+                Some([1]) => true,
+                _ => return None,
+            };
+            Some(WalOp::Commit {
+                transaction_id,
+                assigned_transaction_identity,
+            })
         }
         KIND_PREPARE_TRANSACTION => {
             let transaction_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -9872,7 +9910,11 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Bool(_)) => 1,
         Some(OwnedDatum::Char(_)) => 1,
         Some(OwnedDatum::Int4(_)) | Some(OwnedDatum::Oid(_)) => 4,
-        Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::PgLsn(_)) | Some(OwnedDatum::Float8(_)) => 8,
+        Some(OwnedDatum::Int8(_))
+        | Some(OwnedDatum::Xid8(_))
+        | Some(OwnedDatum::PgLsn(_))
+        | Some(OwnedDatum::Float8(_)) => 8,
+        Some(OwnedDatum::Snapshot { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
         Some(OwnedDatum::RegObject { len, .. }) => 9 + *len as usize,
         Some(OwnedDatum::Date(_)) => 4,
@@ -10002,6 +10044,18 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[0] = 27;
             out[1..5].copy_from_slice(&v.to_le_bytes());
             5
+        }
+        Some(OwnedDatum::Xid8(v)) => {
+            out[0] = 35;
+            out[1..9].copy_from_slice(&v.to_le_bytes());
+            9
+        }
+        Some(OwnedDatum::Snapshot { legacy, len, bytes }) => {
+            out[0] = 36;
+            out[1] = u8::from(*legacy);
+            out[2] = *len;
+            out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            3 + *len as usize
         }
         Some(OwnedDatum::Int8(v)) => {
             out[0] = 4;
@@ -10254,6 +10308,27 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = payload.get(*at..*at + 4)?;
             *at += 4;
             Some(OwnedDatum::Oid(u32::from_le_bytes(b.try_into().unwrap())))
+        }
+        35 => {
+            let b = payload.get(*at..*at + 8)?;
+            *at += 8;
+            Some(OwnedDatum::Xid8(u64::from_le_bytes(b.try_into().unwrap())))
+        }
+        36 => {
+            let legacy = match *payload.get(*at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let len = *payload.get(*at + 1)? as usize;
+            *at += 2;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            crate::sql::snapshot::Snapshot::restore(&bytes[..len]).ok()?;
+            Some(OwnedDatum::Snapshot {
+                legacy,
+                len: len as u8,
+                bytes,
+            })
         }
         4 => {
             let b = payload.get(*at..*at + 8)?;
@@ -11265,8 +11340,14 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append_committed(3, &WalOp::Commit { transaction_id: 1 })
-                .unwrap();
+            wal.append_committed(
+                3,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut replay_budget = Budget::new(1 << 20);
@@ -12356,8 +12437,14 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append_committed(25, &WalOp::Commit { transaction_id: 1 })
-                .unwrap();
+            wal.append_committed(
+                25,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
@@ -12462,8 +12549,14 @@ mod tests {
             },
         )
         .unwrap();
-        wal.append_committed(27, &WalOp::Commit { transaction_id: 2 })
-            .unwrap();
+        wal.append_committed(
+            27,
+            &WalOp::Commit {
+                transaction_id: 2,
+                assigned_transaction_identity: false,
+            },
+        )
+        .unwrap();
         wal.commit();
     }
 
@@ -12495,8 +12588,14 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append_committed(2, &WalOp::Commit { transaction_id: 1 })
-                .unwrap();
+            wal.append_committed(
+                2,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut replay_budget = Budget::new(1 << 20);
@@ -12871,8 +12970,14 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append_committed(2, &WalOp::Commit { transaction_id: 1 })
-                .unwrap();
+            wal.append_committed(
+                2,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             for lsn in 3..=5 {
                 wal.append_committed(
                     lsn,
@@ -12886,8 +12991,14 @@ mod tests {
                 )
                 .unwrap();
             }
-            wal.append_committed(6, &WalOp::Commit { transaction_id: 2 })
-                .unwrap();
+            wal.append_committed(
+                6,
+                &WalOp::Commit {
+                    transaction_id: 2,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         // Flip one byte in the second transaction's second record.
@@ -12901,7 +13012,11 @@ mod tests {
                 old_row: None,
                 command_id: 0,
             });
-        let commit_len = HEADER_LEN + encoded_payload_len(&WalOp::Commit { transaction_id: 1 });
+        let commit_len = HEADER_LEN
+            + encoded_payload_len(&WalOp::Commit {
+                transaction_id: 1,
+                assigned_transaction_identity: false,
+            });
         bytes[record_len + commit_len + record_len + HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
@@ -12935,8 +13050,14 @@ mod tests {
                 )
                 .unwrap();
             }
-            wal.append_committed(6, &WalOp::Commit { transaction_id: 1 })
-                .unwrap();
+            wal.append_committed(
+                6,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
@@ -12967,8 +13088,14 @@ mod tests {
                 )
                 .unwrap();
             }
-            wal.append_committed(11, &WalOp::Commit { transaction_id: 1 })
-                .unwrap();
+            wal.append_committed(
+                11,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             wal.commit();
             // Checkpoint at lsn 11; journal restarts with two tail records.
             wal.reset_after_checkpoint();
@@ -12994,8 +13121,14 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append_committed(14, &WalOp::Commit { transaction_id: 2 })
-                .unwrap();
+            wal.append_committed(
+                14,
+                &WalOp::Commit {
+                    transaction_id: 2,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
@@ -13145,9 +13278,10 @@ mod tests {
         assert_eq!(seen[2].1, KIND_COMMIT);
         let mut transaction_id = 0;
         wal.next_committed_after(0, &mut scratch, |_, transaction| {
-            let commit = &transaction[transaction.len() - (HEADER_LEN + 4)..];
+            let commit = &transaction[transaction.len() - Wal::commit_boundary_bytes()..];
             if let WalOp::Commit {
                 transaction_id: value,
+                ..
             } = decode_record(&commit[16..]).unwrap()
             {
                 transaction_id = value;

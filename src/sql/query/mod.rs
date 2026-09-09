@@ -1624,6 +1624,33 @@ impl StorageCatalog<'_, '_, '_, '_> {
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn current_transaction_id(&self, assign: bool) -> Result<Option<u64>, SqlError> {
+        Ok(if assign {
+            Some(self.storage.assign_transaction_identity(self.txid))
+        } else {
+            self.storage.assigned_transaction_identity(self.txid)
+        })
+    }
+
+    fn current_transaction_snapshot<'a>(
+        &self,
+        arena: &'a Arena,
+    ) -> Result<super::snapshot::Snapshot<'a>, SqlError> {
+        self.storage.current_transaction_snapshot(self.txid, arena)
+    }
+
+    fn transaction_status(&self, transaction_id: u64) -> Result<Option<&'static str>, SqlError> {
+        self.storage.transaction_status(transaction_id)
+    }
+
+    fn transaction_id_age(&self, transaction_id: u32) -> Result<i32, SqlError> {
+        if transaction_id < 3 {
+            return Ok(i32::MAX);
+        }
+        let next = self.storage.latest_transaction_identity().wrapping_add(1) as u32;
+        Ok(next.wrapping_sub(transaction_id) as i32)
+    }
+
     fn replica_identity_index_oid(&self, relation_oid: i32) -> Option<i32> {
         super::catalog::replica_identity_index_oid(self.storage, self.txid, relation_oid)
     }

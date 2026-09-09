@@ -1294,6 +1294,142 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 2,
         volatility: "s",
     },
+    IntrinsicRoutine {
+        oid: 1181,
+        name: "age",
+        result_oid: super::types::oid::INT4,
+        argument_types: "28",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2943,
+        name: "txid_current",
+        result_oid: super::types::oid::INT8,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3348,
+        name: "txid_current_if_assigned",
+        result_oid: super::types::oid::INT8,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2944,
+        name: "txid_current_snapshot",
+        result_oid: super::types::oid::TXID_SNAPSHOT,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2945,
+        name: "txid_snapshot_xmin",
+        result_oid: super::types::oid::INT8,
+        argument_types: "2970",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 2946,
+        name: "txid_snapshot_xmax",
+        result_oid: super::types::oid::INT8,
+        argument_types: "2970",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 2947,
+        name: "txid_snapshot_xip",
+        result_oid: super::types::oid::INT8,
+        argument_types: "2970",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 2948,
+        name: "txid_visible_in_snapshot",
+        result_oid: super::types::oid::BOOL,
+        argument_types: "20 2970",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3360,
+        name: "txid_status",
+        result_oid: super::types::oid::TEXT,
+        argument_types: "20",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 5059,
+        name: "pg_current_xact_id",
+        result_oid: super::types::oid::XID8,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 5060,
+        name: "pg_current_xact_id_if_assigned",
+        result_oid: super::types::oid::XID8,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 5061,
+        name: "pg_current_snapshot",
+        result_oid: super::types::oid::PG_SNAPSHOT,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 5062,
+        name: "pg_snapshot_xmin",
+        result_oid: super::types::oid::XID8,
+        argument_types: "5038",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 5063,
+        name: "pg_snapshot_xmax",
+        result_oid: super::types::oid::XID8,
+        argument_types: "5038",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 5064,
+        name: "pg_snapshot_xip",
+        result_oid: super::types::oid::XID8,
+        argument_types: "5038",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 5065,
+        name: "pg_visible_in_snapshot",
+        result_oid: super::types::oid::BOOL,
+        argument_types: "5069 5038",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 5066,
+        name: "pg_xact_status",
+        result_oid: super::types::oid::TEXT,
+        argument_types: "5069",
+        argument_count: 1,
+        volatility: "v",
+    },
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -1313,13 +1449,29 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 4568
             | 6170
             | 6232
+            | 2943
+            | 3348
+            | 2944
+            | 2945
+            | 2946
+            | 2947
+            | 2948
+            | 3360
+            | 5059
+            | 5060
+            | 5061
+            | 5062
+            | 5063
+            | 5064
+            | 5065
+            | 5066
     )
 }
 
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
-        1179 | 3205 | 3475 | 3491 | 3961 | 4006 | 6119 | 4568 | 3566
+        1179 | 2947 | 3205 | 3475 | 3491 | 3961 | 4006 | 5064 | 6119 | 4568 | 3566
     )
 }
 
@@ -1327,8 +1479,8 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
         715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
         | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
-        | 4223 | 4224 | 1402 | 1403 | 2078 | 3086 | 6119 | 6120 => "u",
-        1641 | 3566 | 4568 => "r",
+        | 4223 | 4224 | 1402 | 1403 | 2078 | 2943 | 3348 | 5059 | 5060 | 3086 | 6119 | 6120 => "u",
+        1181 | 1641 | 3566 | 4568 => "r",
         _ => "s",
     }
 }
@@ -1392,88 +1544,318 @@ struct CatalogOperator {
     name: &'static str,
     left: ColType,
     right: ColType,
+    result: ColType,
+    procedure_oid: i32,
+    procedure_name: &'static str,
+    commutator: i32,
+    negator: i32,
+    merges: bool,
+    hashes: bool,
+    restriction: Option<(i32, &'static str)>,
+    join: Option<(i32, &'static str)>,
+}
+
+macro_rules! catalog_operator {
+    ($oid:literal, $name:literal, $left:expr, $right:expr, $result:expr, $procedure_oid:literal, $procedure_name:literal) => {
+        CatalogOperator {
+            oid: $oid,
+            name: $name,
+            left: $left,
+            right: $right,
+            result: $result,
+            procedure_oid: $procedure_oid,
+            procedure_name: $procedure_name,
+            commutator: 0,
+            negator: 0,
+            merges: false,
+            hashes: false,
+            restriction: None,
+            join: None,
+        }
+    };
+}
+
+macro_rules! catalog_comparison_operator {
+    ($oid:literal, $name:literal, $type:expr, $procedure_oid:literal, $procedure_name:literal,
+     $commutator:literal, $negator:literal, $merges:literal, $hashes:literal,
+     $restriction_oid:literal, $restriction_name:literal, $join_oid:literal, $join_name:literal) => {
+        CatalogOperator {
+            oid: $oid,
+            name: $name,
+            left: $type,
+            right: $type,
+            result: ColType::Bool,
+            procedure_oid: $procedure_oid,
+            procedure_name: $procedure_name,
+            commutator: $commutator,
+            negator: $negator,
+            merges: $merges,
+            hashes: $hashes,
+            restriction: Some(($restriction_oid, $restriction_name)),
+            join: Some(($join_oid, $join_name)),
+        }
+    };
 }
 
 const CATALOG_OPERATORS: &[CatalogOperator] = &[
-    CatalogOperator {
-        oid: 96,
-        name: "=",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 97,
-        name: "<",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 518,
-        name: "<>",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 521,
-        name: ">",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 523,
-        name: "<=",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 525,
-        name: ">=",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 514,
-        name: "*",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 528,
-        name: "/",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 530,
-        name: "%",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 551,
-        name: "+",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 555,
-        name: "-",
-        left: ColType::Int4,
-        right: ColType::Int4,
-    },
-    CatalogOperator {
-        oid: 4012,
-        name: "@?",
-        left: ColType::Jsonb,
-        right: ColType::Jsonpath,
-    },
-    CatalogOperator {
-        oid: 4013,
-        name: "@@",
-        left: ColType::Jsonb,
-        right: ColType::Jsonpath,
-    },
+    catalog_comparison_operator!(
+        96,
+        "=",
+        ColType::Int4,
+        65,
+        "int4eq",
+        96,
+        518,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        97,
+        "<",
+        ColType::Int4,
+        66,
+        "int4lt",
+        521,
+        525,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        518,
+        "<>",
+        ColType::Int4,
+        144,
+        "int4ne",
+        518,
+        96,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        521,
+        ">",
+        ColType::Int4,
+        147,
+        "int4gt",
+        97,
+        523,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        523,
+        "<=",
+        ColType::Int4,
+        149,
+        "int4le",
+        525,
+        521,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        525,
+        ">=",
+        ColType::Int4,
+        150,
+        "int4ge",
+        523,
+        97,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_operator!(
+        514,
+        "*",
+        ColType::Int4,
+        ColType::Int4,
+        ColType::Int4,
+        141,
+        "int4mul"
+    ),
+    catalog_operator!(
+        528,
+        "/",
+        ColType::Int4,
+        ColType::Int4,
+        ColType::Int4,
+        154,
+        "int4div"
+    ),
+    catalog_operator!(
+        530,
+        "%",
+        ColType::Int4,
+        ColType::Int4,
+        ColType::Int4,
+        156,
+        "int4mod"
+    ),
+    catalog_operator!(
+        551,
+        "+",
+        ColType::Int4,
+        ColType::Int4,
+        ColType::Int4,
+        177,
+        "int4pl"
+    ),
+    catalog_operator!(
+        555,
+        "-",
+        ColType::Int4,
+        ColType::Int4,
+        ColType::Int4,
+        181,
+        "int4mi"
+    ),
+    catalog_comparison_operator!(
+        5068,
+        "=",
+        ColType::Xid8,
+        5084,
+        "xid8eq",
+        5068,
+        5072,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        5072,
+        "<>",
+        ColType::Xid8,
+        5085,
+        "xid8ne",
+        5072,
+        5068,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        5073,
+        "<",
+        ColType::Xid8,
+        5034,
+        "xid8lt",
+        5074,
+        5076,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        5074,
+        ">",
+        ColType::Xid8,
+        5035,
+        "xid8gt",
+        5073,
+        5075,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        5075,
+        "<=",
+        ColType::Xid8,
+        5036,
+        "xid8le",
+        5076,
+        5074,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        5076,
+        ">=",
+        ColType::Xid8,
+        5037,
+        "xid8ge",
+        5075,
+        5073,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_operator!(
+        4012,
+        "@?",
+        ColType::Jsonb,
+        ColType::Jsonpath,
+        ColType::Bool,
+        4010,
+        "jsonb_path_exists_opr"
+    ),
+    catalog_operator!(
+        4013,
+        "@@",
+        ColType::Jsonb,
+        ColType::Jsonpath,
+        ColType::Bool,
+        4011,
+        "jsonb_path_match_opr"
+    ),
 ];
+
+fn builtin_regproc(entry: Option<(i32, &'static str)>) -> Datum<'static> {
+    let (referenced_oid, name) = entry.unwrap_or((0, "-"));
+    Datum::RegObject {
+        type_oid: super::types::oid::REGPROC,
+        referenced_oid,
+        name,
+    }
+}
+
+const XID8_BTREE_OPERATOR_FAMILY_OID: i32 = 5067;
+const XID8_BTREE_OPERATOR_CLASS_OID: i32 = 10053;
+const XID8_CMP_OID: i32 = 5096;
+const BT_EQUAL_IMAGE_OID: i32 = 5051;
 
 const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_type", PG_TYPE_OID),
@@ -12528,24 +12910,6 @@ fn pg_operator<'a>(
             ("oprjoin", ColType::Regproc),
         ],
     );
-    const OPCODES: [i32; 13] = [
-        65, 66, 144, 147, 149, 150, 141, 154, 156, 177, 181, 4010, 4011,
-    ];
-    const OPCODE_NAMES: [&str; 13] = [
-        "int4eq",
-        "int4lt",
-        "int4ne",
-        "int4gt",
-        "int4le",
-        "int4ge",
-        "int4mul",
-        "int4div",
-        "int4mod",
-        "int4pl",
-        "int4mi",
-        "jsonb_path_exists_opr",
-        "jsonb_path_match_opr",
-    ];
     let mut rows: [&[Datum]; 512] = [&[]; 512];
     for (index, operator) in CATALOG_OPERATORS.iter().enumerate() {
         rows[index] = row(
@@ -12556,24 +12920,20 @@ fn pg_operator<'a>(
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
                 Datum::Bpchar("b"),
-                Datum::Bool(index < 6),
-                Datum::Bool(index == 0),
+                Datum::Bool(operator.merges),
+                Datum::Bool(operator.hashes),
                 Datum::Int4(operator.left.oid()),
                 Datum::Int4(operator.right.oid()),
-                Datum::Int4(if index < 6 || matches!(operator.oid, 4012 | 4013) {
-                    ColType::Bool.oid()
-                } else {
-                    ColType::Int4.oid()
-                }),
-                Datum::Int4(0),
-                Datum::Int4(0),
+                Datum::Int4(operator.result.oid()),
+                Datum::Int4(operator.commutator),
+                Datum::Int4(operator.negator),
                 Datum::RegObject {
                     type_oid: super::types::oid::REGPROC,
-                    referenced_oid: OPCODES[index],
-                    name: OPCODE_NAMES[index],
+                    referenced_oid: operator.procedure_oid,
+                    name: operator.procedure_name,
                 },
-                catalog_regproc(storage, txid, 0, arena)?,
-                catalog_regproc(storage, txid, 0, arena)?,
+                builtin_regproc(operator.restriction),
+                builtin_regproc(operator.join),
             ],
             arena,
         )?;
@@ -12652,7 +13012,18 @@ fn pg_opfamily<'a>(
         ],
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
-    let mut count = 0usize;
+    rows[0] = row(
+        &[
+            Datum::Int4(2753),
+            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(403),
+            text("xid8_ops", arena)?,
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Int4(10),
+        ],
+        arena,
+    )?;
+    let mut count = 1usize;
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -12694,7 +13065,22 @@ fn pg_opclass<'a>(
         ],
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
-    let mut count = 0usize;
+    rows[0] = row(
+        &[
+            Datum::Int4(2616),
+            Datum::Int4(XID8_BTREE_OPERATOR_CLASS_OID),
+            Datum::Int4(403),
+            text("xid8_ops", arena)?,
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Int4(10),
+            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::XID8),
+            Datum::Bool(true),
+            Datum::Int4(0),
+        ],
+        arena,
+    )?;
+    let mut count = 1usize;
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -12750,7 +13136,32 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ],
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
+    const XID8_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
+        (10050, 1, 5073),
+        (10051, 2, 5075),
+        (10052, 3, 5068),
+        (10053, 4, 5076),
+        (10054, 5, 5074),
+    ];
     let mut count = 0usize;
+    for (oid, strategy, operator) in XID8_BTREE_OPERATORS {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
+                Datum::Int4(super::types::oid::XID8),
+                Datum::Int4(super::types::oid::XID8),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(403),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -12803,7 +13214,31 @@ fn pg_amproc<'a>(
         ],
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
-    let mut count = 0usize;
+    rows[0] = row(
+        &[
+            Datum::Int4(2603),
+            Datum::Int4(10130),
+            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::XID8),
+            Datum::Int4(super::types::oid::XID8),
+            Datum::Int2(1),
+            builtin_regproc(Some((XID8_CMP_OID, "xid8cmp"))),
+        ],
+        arena,
+    )?;
+    rows[1] = row(
+        &[
+            Datum::Int4(2603),
+            Datum::Int4(10131),
+            Datum::Int4(XID8_BTREE_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::XID8),
+            Datum::Int4(super::types::oid::XID8),
+            Datum::Int2(4),
+            builtin_regproc(Some((BT_EQUAL_IMAGE_OID, "btequalimage"))),
+        ],
+        arena,
+    )?;
+    let mut count = 2usize;
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .functions
@@ -13511,7 +13946,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bool(false),
                 Datum::Null,
                 Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
-                Datum::Float8(if routine.oid == 6119 { 1000.0 } else { 0.0 }),
+                Datum::Float8(match routine.oid {
+                    2947 | 5064 => 50.0,
+                    6119 => 1000.0,
+                    _ => 0.0,
+                }),
                 Datum::Null,
                 Datum::RegObject {
                     type_oid: super::types::oid::REGPROC,
@@ -14517,6 +14956,9 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Int4,
         ColType::Oid,
         ColType::Xid,
+        ColType::Xid8,
+        ColType::PgSnapshot,
+        ColType::TxidSnapshot,
         ColType::PgLsn,
         ColType::Regtype,
         ColType::Regproc,
@@ -14590,6 +15032,9 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
         ColType::Interval => "T",
         ColType::Xid
+        | ColType::Xid8
+        | ColType::PgSnapshot
+        | ColType::TxidSnapshot
         | ColType::PgLsn
         | ColType::Uuid
         | ColType::Bytea

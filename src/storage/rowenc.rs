@@ -34,6 +34,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             // float4 keeps the historical 8-byte float8 layout (see the decode
             // side); the schema narrows it back to f32.
             Datum::Int8(_)
+            | Datum::Xid8(_)
             | Datum::PgLsn(_)
             | Datum::Float4(_)
             | Datum::Float8(_)
@@ -54,6 +55,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             | Datum::Range { text, .. }
             | Datum::Multirange { text, .. }
             | Datum::Geometry { text, .. } => 4 + text.len(),
+            Datum::Snapshot { value, .. } => 4 + value.raw().len(),
             Datum::TsVector(text) => 4 + text.len(),
             Datum::TsQuery(text) => 4 + text.len(),
             // 4-byte payload length, 1 flag byte (varying), then the bit chars.
@@ -146,6 +148,15 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             Datum::Int8(x) => {
                 rest[..8].copy_from_slice(&x.to_le_bytes());
                 take = 8;
+            }
+            Datum::Xid8(x) => {
+                rest[..8].copy_from_slice(&x.to_le_bytes());
+                take = 8;
+            }
+            Datum::Snapshot { value, .. } => {
+                rest[..4].copy_from_slice(&(value.raw().len() as u32).to_le_bytes());
+                rest[4..4 + value.raw().len()].copy_from_slice(value.raw());
+                take = 4 + value.raw().len();
             }
             Datum::PgLsn(x) => {
                 rest[..8].copy_from_slice(&x.to_le_bytes());
@@ -318,6 +329,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         ColType::Char => Some(1),
         ColType::Int2 | ColType::Int4 | ColType::Oid | ColType::Xid | ColType::Date => Some(4),
         ColType::Int8
+        | ColType::Xid8
         | ColType::PgLsn
         | ColType::Float4
         | ColType::Float8
@@ -346,6 +358,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Range(_)
         | ColType::Multirange(_)
         | ColType::Geometry(_)
+        | ColType::PgSnapshot
+        | ColType::TxidSnapshot
         | ColType::Bytea => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
             Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
@@ -486,6 +500,26 @@ pub(crate) fn decode<'a>(
                     .unwrap();
                 out[i] = Datum::PgLsn(u64::from_le_bytes(raw));
                 at += 8;
+            }
+            ColType::Xid8 => {
+                let raw: [u8; 8] = bytes
+                    .get(at..at + 8)
+                    .ok_or_else(corrupt)?
+                    .try_into()
+                    .unwrap();
+                out[i] = Datum::Xid8(u64::from_le_bytes(raw));
+                at += 8;
+            }
+            snapshot_type @ (ColType::PgSnapshot | ColType::TxidSnapshot) => {
+                let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+                at += 4;
+                let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
+                at += len;
+                out[i] = Datum::Snapshot {
+                    value: crate::sql::snapshot::Snapshot::restore(raw).map_err(|_| corrupt())?,
+                    legacy: snapshot_type == ColType::TxidSnapshot,
+                };
             }
             ColType::Regtype => {
                 let oid = i32::from_le_bytes(

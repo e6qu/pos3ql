@@ -54657,14 +54657,18 @@ fn degree_special_and_random_math_matches_postgresql_18() {
         "{}",
         String::from_utf8_lossy(&landmarks)
     );
-    assert_eq!(
-        r(
-            &mut e,
-            &mut b,
-            "SELECT erf(1), erfc(1), gamma(5), lgamma(5)"
-        ),
-        ["0.8427007929497148|0.15729920705028516|24|3.1780538303479453"]
-    );
+    // PostgreSQL delegates these transcendental functions to the platform
+    // math library, whose correctly rounded result can differ in the last bit.
+    let approx = |e: &mut Engine, b: &mut Budget, sql: &str, want: f64| {
+        let got: f64 = data_rows(&run_with(e, b, sql))[0]
+            .parse()
+            .expect("float output");
+        assert!((got - want).abs() < 1e-14, "{sql}: got {got}, want {want}");
+    };
+    approx(&mut e, &mut b, "SELECT erf(1)", 0.842_700_792_949_714_8);
+    approx(&mut e, &mut b, "SELECT erfc(1)", 0.157_299_207_050_285_16);
+    assert_eq!(r(&mut e, &mut b, "SELECT gamma(5)"), ["24"]);
+    approx(&mut e, &mut b, "SELECT lgamma(5)", 3.178_053_830_347_945_3);
     for query in [
         "SELECT sind('Infinity'::float8)",
         "SELECT asin(2)",

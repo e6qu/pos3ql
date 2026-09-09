@@ -54640,6 +54640,127 @@ fn trig_and_rounding_functions() {
 }
 
 #[test]
+fn degree_special_and_random_math_matches_postgresql_18() {
+    let (mut e, mut b) = test_engine();
+    let r = |e: &mut Engine, b: &mut Budget, sql: &str| data_rows(&run_with(e, b, sql));
+
+    let landmarks = run_with(
+        &mut e,
+        &mut b,
+        "SELECT sind(30), sind(90), sind(180), cosd(60), cosd(90),
+                tand(45), tand(90), cotd(45), cotd(0),
+                asind(.5), acosd(.5), atand(1), atan2d(1,1)",
+    );
+    assert_eq!(
+        data_rows(&landmarks),
+        ["0.5|1|0|0.5|0|1|Infinity|1|Infinity|30|60|45|45"],
+        "{}",
+        String::from_utf8_lossy(&landmarks)
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT erf(1), erfc(1), gamma(5), lgamma(5)"
+        ),
+        ["0.8427007929497148|0.15729920705028516|24|3.1780538303479453"]
+    );
+    for query in [
+        "SELECT sind('Infinity'::float8)",
+        "SELECT asin(2)",
+        "SELECT acosd(-2)",
+        "SELECT acosh(0)",
+        "SELECT atanh(2)",
+        "SELECT gamma(0)",
+    ] {
+        let output = run_with(&mut e, &mut b, query);
+        assert!(
+            String::from_utf8_lossy(&output).contains("22003"),
+            "{query}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT setseed(0.5); SELECT random(1,10), pg_typeof(random(1,10))"
+        ),
+        ["", "3|integer"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT setseed(0.5); SELECT random(1.20::numeric,2.40::numeric)"
+        ),
+        ["", "2.25"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT random(2.20::numeric,2.20::numeric),
+                    scale(random(2.20::numeric,2.20::numeric))"
+        ),
+        ["2.20|2"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT setseed(0.5); SELECT random_normal()"
+        ),
+        ["", "2.5832426701605056"]
+    );
+}
+
+#[test]
+fn numeric_math_catalog_has_postgresql_18_identities() {
+    let (mut e, mut b) = test_engine();
+    let output = run_with(
+        &mut e,
+        &mut b,
+        "SELECT oid, proname, prorettype, proargtypes, pronargdefaults,
+                provolatile, proparallel, prosrc
+           FROM pg_proc
+          WHERE oid IN (2731,2732,2733,2734,2735,2736,2737,2738,
+                        6212,6219,6220,6339,6340,6341,6383,6384)
+          ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "2731|asind|701|701|0|i|s|dasind",
+            "2732|acosd|701|701|0|i|s|dacosd",
+            "2733|atand|701|701|0|i|s|datand",
+            "2734|atan2d|701|701 701|0|i|s|datan2d",
+            "2735|sind|701|701|0|i|s|dsind",
+            "2736|cosd|701|701|0|i|s|dcosd",
+            "2737|tand|701|701|0|i|s|dtand",
+            "2738|cotd|701|701|0|i|s|dcotd",
+            "6212|random_normal|701|701 701|2|v|r|drandom_normal",
+            "6219|erf|701|701|0|i|s|derf",
+            "6220|erfc|701|701|0|i|s|derfc",
+            "6339|random|23|23 23|0|v|r|int4random",
+            "6340|random|20|20 20|0|v|r|int8random",
+            "6341|random|1700|1700 1700|0|v|r|numeric_random",
+            "6383|gamma|701|701|0|i|s|dgamma",
+            "6384|lgamma|701|701|0|i|s|dlgamma",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT pg_get_function_arguments(6212), pg_get_function_result(6212)"
+        )),
+        ["mean double precision DEFAULT 0, stddev double precision DEFAULT 1|double precision"]
+    );
+}
+
+#[test]
 fn ordered_and_distinct_row_sources() {
     // DISTINCT / ORDER BY / LIMIT inside a derived table or CTE must be
     // honored (top-N, dedup), not dropped. Validated against PG 18.4.

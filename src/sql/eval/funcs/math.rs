@@ -3,9 +3,9 @@
 //! Covers absolute value and sign, rounding (`floor`/`ceil`/`round`/`trunc`),
 //! roots and exponentials (`sqrt`/`exp`/`ln`/`log`/`power`), integer arithmetic
 //! (`mod`/`gcd`/`lcm`/`div`), numeric-scale inspection (`scale`/`min_scale`/
-//! `trim_scale`), `width_bucket`, the trigonometric family, `atan2`, `pi`, and
-//! `factorial`. These share the numeric-domain helpers (`datum_numeric`,
-//! `datum_f64`, `num_f64`) and the arbitrary-precision `numeric` module.
+//! `trim_scale`), `width_bucket`, trigonometric and special functions, random
+//! distributions, `pi`, and `factorial`. These share the numeric-domain
+//! helpers and the arbitrary-precision `numeric` module.
 
 use crate::sql::array;
 use crate::sql::ast::Expr;
@@ -14,10 +14,295 @@ use crate::sql::types::Datum;
 use crate::{sql_err, stack_format};
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arity_err, compare_datums, datum_f64, datum_numeric,
-    eval_full, int_arg, log_domain_check, num_f64, overflow, sqlstate, type_mismatch,
-    width_bucket_f64, width_bucket_numeric,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, compare_datums, datum_f64,
+    datum_numeric, eval_full, int_arg, log_domain_check, num_f64, overflow, sqlstate,
+    type_mismatch, width_bucket_f64, width_bucket_numeric,
 };
+
+unsafe extern "C" {
+    #[link_name = "erf"]
+    fn libc_erf(value: f64) -> f64;
+    #[link_name = "erfc"]
+    fn libc_erfc(value: f64) -> f64;
+    #[link_name = "tgamma"]
+    fn libc_tgamma(value: f64) -> f64;
+    #[link_name = "lgamma"]
+    fn libc_lgamma(value: f64) -> f64;
+}
+
+fn input_out_of_range() -> SqlError {
+    sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "input is out of range")
+}
+
+fn special_f64(name: &str, value: f64) -> Result<f64, SqlError> {
+    // These are C99 libm calls on every supported target, just as in
+    // PostgreSQL.  They neither retain the pointer nor access Rust memory.
+    let result = unsafe {
+        match name {
+            "erf" => libc_erf(value),
+            "erfc" => libc_erfc(value),
+            "gamma" => libc_tgamma(value),
+            "lgamma" => libc_lgamma(value),
+            _ => unreachable!("special-function router admitted {name}"),
+        }
+    };
+    match name {
+        "gamma" if value == f64::NEG_INFINITY => Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "value out of range: overflow"
+        )),
+        "gamma" if value.is_finite() && (result.is_infinite() || result.is_nan()) => Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "value out of range: overflow"
+        )),
+        "gamma" if value.is_finite() && result == 0.0 => Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "value out of range: underflow"
+        )),
+        "lgamma" if result.is_infinite() && value.is_finite() => Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "value out of range: overflow"
+        )),
+        _ => Ok(result),
+    }
+}
+
+fn degree_constants() -> (f64, f64, f64, f64, f64, f64, f64) {
+    let radians = core::f64::consts::PI / 180.0;
+    let sin_30 = (30.0 * radians).sin();
+    let one_minus_cos_60 = 1.0 - (60.0 * radians).cos();
+    let asin_half = 0.5_f64.asin();
+    let acos_half = 0.5_f64.acos();
+    let atan_one = 1.0_f64.atan();
+    let sin_45 = sind_q1(45.0, sin_30, one_minus_cos_60);
+    let cos_45 = cosd_q1(45.0, sin_30, one_minus_cos_60);
+    (
+        sin_30,
+        one_minus_cos_60,
+        asin_half,
+        acos_half,
+        atan_one,
+        sin_45 / cos_45,
+        cos_45 / sin_45,
+    )
+}
+
+fn sind_q1(value: f64, sin_30: f64, one_minus_cos_60: f64) -> f64 {
+    if value <= 30.0 {
+        (value.to_radians().sin() / sin_30) / 2.0
+    } else {
+        let complement = 90.0 - value;
+        1.0 - ((1.0 - complement.to_radians().cos()) / one_minus_cos_60) / 2.0
+    }
+}
+
+fn cosd_q1(value: f64, sin_30: f64, one_minus_cos_60: f64) -> f64 {
+    if value <= 60.0 {
+        1.0 - ((1.0 - value.to_radians().cos()) / one_minus_cos_60) / 2.0
+    } else {
+        ((90.0 - value).to_radians().sin() / sin_30) / 2.0
+    }
+}
+
+fn degree_trig(name: &str, mut value: f64) -> Result<f64, SqlError> {
+    if value.is_nan() {
+        return Ok(value);
+    }
+    let (sin_30, one_minus_cos_60, asin_half, acos_half, atan_one, tan_45, cot_45) =
+        degree_constants();
+    let asind_q1 = |x: f64| {
+        if x <= 0.5 {
+            (x.asin() / asin_half) * 30.0
+        } else {
+            90.0 - (x.acos() / acos_half) * 60.0
+        }
+    };
+    let acosd_q1 = |x: f64| {
+        if x <= 0.5 {
+            90.0 - (x.asin() / asin_half) * 30.0
+        } else {
+            (x.acos() / acos_half) * 60.0
+        }
+    };
+    match name {
+        "asind" | "acosd" if !(-1.0..=1.0).contains(&value) => Err(input_out_of_range()),
+        "asind" => Ok(if value >= 0.0 {
+            asind_q1(value)
+        } else {
+            -asind_q1(-value)
+        }),
+        "acosd" => Ok(if value >= 0.0 {
+            acosd_q1(value)
+        } else {
+            90.0 + asind_q1(-value)
+        }),
+        "atand" => Ok((value.atan() / atan_one) * 45.0),
+        "sind" | "cosd" | "tand" | "cotd" => {
+            if value.is_infinite() {
+                return Err(input_out_of_range());
+            }
+            value %= 360.0;
+            let mut sign = 1.0;
+            if value < 0.0 {
+                value = -value;
+                if name != "cosd" {
+                    sign = -sign;
+                }
+            }
+            if value > 180.0 {
+                value = 360.0 - value;
+                if name == "sind" || name == "tand" || name == "cotd" {
+                    sign = -sign;
+                }
+            }
+            if value > 90.0 {
+                value = 180.0 - value;
+                if name == "cosd" || name == "tand" || name == "cotd" {
+                    sign = -sign;
+                }
+            }
+            let sin = sind_q1(value, sin_30, one_minus_cos_60);
+            let cos = cosd_q1(value, sin_30, one_minus_cos_60);
+            let result = match name {
+                "sind" => sign * sin,
+                "cosd" => sign * cos,
+                "tand" => sign * (sin / cos) / tan_45,
+                _ => sign * (cos / sin) / cot_45,
+            };
+            if (name == "tand" || name == "cotd") && result == 0.0 {
+                Ok(0.0)
+            } else {
+                Ok(result)
+            }
+        }
+        _ => unreachable!("degree-function router admitted {name}"),
+    }
+}
+
+fn random_numeric<'a>(
+    min: &Numeric<'_>,
+    max: &Numeric<'_>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Numeric<'a>, SqlError> {
+    if min.is_nan() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "lower bound cannot be NaN"
+        ));
+    }
+    if max.is_nan() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "upper bound cannot be NaN"
+        ));
+    }
+    let rscale = min.dscale.max(max.dscale);
+    let length = numeric::sub(max, min, arena)?;
+    if length.sign == numeric::Sign::Neg {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "lower bound must be less than or equal to upper bound"
+        ));
+    }
+    if length.is_zero() {
+        let adjusted = Numeric {
+            dscale: rscale,
+            ..*min
+        };
+        return numeric::add(&Numeric::ZERO, &adjusted, arena);
+    }
+
+    let result_digits = i32::from(length.weight)
+        + 1
+        + (i32::from(rscale) + numeric::DEC_DIGITS as i32 - 1) / numeric::DEC_DIGITS as i32;
+    if result_digits <= 0 || result_digits as usize > numeric::MAX_NDIGITS {
+        return Err(overflow("numeric"));
+    }
+    let result_digits = result_digits as usize;
+    let partial_places = usize::from(rscale).div_ceil(numeric::DEC_DIGITS) * numeric::DEC_DIGITS
+        - usize::from(rscale);
+    let partial_multiple = 10_u64.pow(partial_places as u32);
+
+    let mut prefix = length.digit(0) as u64;
+    let mut prefix_digits = 1usize;
+    while prefix_digits < result_digits && prefix_digits < 4 {
+        prefix *= numeric::NBASE as u64;
+        if prefix_digits < length.ndigits() {
+            prefix += length.digit(prefix_digits) as u64;
+        }
+        prefix_digits += 1;
+    }
+
+    let mut raw = [0_u8; numeric::MAX_NDIGITS * 2];
+    loop {
+        let mut random = if prefix_digits == result_digits && partial_multiple != 1 {
+            crate::sql::guc::active_random_u64_range(0, prefix / partial_multiple)?
+                * partial_multiple
+        } else {
+            crate::sql::guc::active_random_u64_range(0, prefix)?
+        };
+        for index in (0..prefix_digits).rev() {
+            let digit = (random % numeric::NBASE as u64) as i16;
+            raw[index * 2..index * 2 + 2].copy_from_slice(&digit.to_le_bytes());
+            random /= numeric::NBASE as u64;
+        }
+        let whole_digits = result_digits - usize::from(partial_multiple != 1);
+        let mut index = prefix_digits;
+        while index + 4 <= whole_digits {
+            random = crate::sql::guc::active_random_u64_range(
+                0,
+                numeric::NBASE as u64
+                    * numeric::NBASE as u64
+                    * numeric::NBASE as u64
+                    * numeric::NBASE as u64
+                    - 1,
+            )?;
+            for _ in 0..4 {
+                let digit = (random % numeric::NBASE as u64) as i16;
+                raw[index * 2..index * 2 + 2].copy_from_slice(&digit.to_le_bytes());
+                random /= numeric::NBASE as u64;
+                index += 1;
+            }
+        }
+        while index < whole_digits {
+            let digit =
+                crate::sql::guc::active_random_u64_range(0, numeric::NBASE as u64 - 1)? as i16;
+            raw[index * 2..index * 2 + 2].copy_from_slice(&digit.to_le_bytes());
+            index += 1;
+        }
+        if index < result_digits {
+            let digit = (crate::sql::guc::active_random_u64_range(
+                0,
+                numeric::NBASE as u64 / partial_multiple - 1,
+            )? * partial_multiple) as i16;
+            raw[index * 2..index * 2 + 2].copy_from_slice(&digit.to_le_bytes());
+        }
+
+        let mut first = 0usize;
+        while first < result_digits && i16::from_le_bytes([raw[first * 2], raw[first * 2 + 1]]) == 0
+        {
+            first += 1;
+        }
+        let mut last = result_digits;
+        while last > first
+            && i16::from_le_bytes([raw[(last - 1) * 2], raw[(last - 1) * 2 + 1]]) == 0
+        {
+            last -= 1;
+        }
+        let digits = arena
+            .alloc_slice_copy(&raw[first * 2..last * 2])
+            .map_err(|_| arena_full())?;
+        let candidate = Numeric {
+            sign: numeric::Sign::Pos,
+            weight: length.weight - first as i16,
+            dscale: rscale,
+            digits,
+        };
+        if numeric::compare(&candidate, &length) != core::cmp::Ordering::Greater {
+            return numeric::add(&candidate, min, arena);
+        }
+    }
+}
 
 /// floor/ceil/round/trunc on an f64, shared by the float8 and (widened) real
 /// arms. PostgreSQL's `round(double precision)` ties to even.
@@ -85,8 +370,11 @@ pub(crate) fn dispatch<'a>(
             | "tan"
             | "cot"
             | "asin"
+            | "asind"
             | "acos"
+            | "acosd"
             | "atan"
+            | "atand"
             | "sinh"
             | "cosh"
             | "tanh"
@@ -96,8 +384,18 @@ pub(crate) fn dispatch<'a>(
             | "degrees"
             | "radians"
             | "atan2"
+            | "atan2d"
+            | "sind"
+            | "cosd"
+            | "tand"
+            | "cotd"
+            | "erf"
+            | "erfc"
+            | "gamma"
+            | "lgamma"
             | "pi"
             | "random"
+            | "random_normal"
             | "setseed"
             | "factorial"
     ) {
@@ -558,17 +856,24 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "sinh" | "cosh"
-            | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians" => {
+            | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians" | "asind" | "acosd"
+            | "atand" | "sind" | "cosd" | "tand" | "cotd" | "erf" | "erfc" | "gamma" | "lgamma" => {
                 arity(1)?;
                 let Some(x) = num_f64(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                Ok(Datum::Float8(match name {
+                let result = match name {
                     "cbrt" => x.cbrt(),
+                    "sin" | "cos" | "tan" | "cot" if x.is_infinite() => {
+                        return Err(input_out_of_range());
+                    }
                     "sin" => x.sin(),
                     "cos" => x.cos(),
                     "tan" => x.tan(),
                     "cot" => 1.0 / x.tan(),
+                    "asin" | "acos" if !x.is_nan() && !(-1.0..=1.0).contains(&x) => {
+                        return Err(input_out_of_range());
+                    }
                     "asin" => x.asin(),
                     "acos" => x.acos(),
                     "atan" => x.atan(),
@@ -576,13 +881,29 @@ pub(crate) fn dispatch<'a>(
                     "cosh" => x.cosh(),
                     "tanh" => x.tanh(),
                     "asinh" => x.asinh(),
+                    "acosh" if !x.is_nan() && x < 1.0 => return Err(input_out_of_range()),
                     "acosh" => x.acosh(),
+                    "atanh" if !x.is_nan() && !(-1.0..=1.0).contains(&x) => {
+                        return Err(input_out_of_range());
+                    }
                     "atanh" => x.atanh(),
                     "degrees" => x.to_degrees(),
-                    _ => x.to_radians(),
-                }))
+                    "radians" => x.to_radians(),
+                    "asind" | "acosd" | "atand" | "sind" | "cosd" | "tand" | "cotd" => {
+                        degree_trig(name, x)?
+                    }
+                    "erf" | "erfc" | "gamma" | "lgamma" => special_f64(name, x)?,
+                    _ => unreachable!(),
+                };
+                if matches!(name, "degrees" | "radians") && x.is_finite() && result.is_infinite() {
+                    return Err(sql_err!(
+                        sqlstate::NUMERIC_OUT_OF_RANGE,
+                        "value out of range: overflow"
+                    ));
+                }
+                Ok(Datum::Float8(result))
             }
-            "atan2" => {
+            "atan2" | "atan2d" => {
                 arity(2)?;
                 let (Some(a), Some(bb)) = (
                     num_f64(name, args, 0, arena, params, row, hooks)?,
@@ -590,15 +911,116 @@ pub(crate) fn dispatch<'a>(
                 ) else {
                     return Ok(Datum::Null);
                 };
-                Ok(Datum::Float8(a.atan2(bb)))
+                Ok(Datum::Float8(if name == "atan2d" {
+                    if a.is_nan() || bb.is_nan() {
+                        f64::NAN
+                    } else {
+                        let atan_one = 1.0_f64.atan();
+                        (a.atan2(bb) / atan_one) * 45.0
+                    }
+                } else {
+                    a.atan2(bb)
+                }))
             }
             "pi" => {
                 arity(0)?;
                 Ok(Datum::Float8(core::f64::consts::PI))
             }
             "random" => {
-                arity(0)?;
-                Ok(Datum::Float8(crate::sql::guc::active_random()?))
+                if args.is_empty() && !star {
+                    return Ok(Datum::Float8(crate::sql::guc::active_random()?));
+                }
+                arity(2)?;
+                let lower = eval_full(args[0], arena, params, row, hooks)?;
+                let upper = eval_full(args[1], arena, params, row, hooks)?;
+                if lower.is_null() || upper.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let bad_bounds = || {
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "lower bound must be less than or equal to upper bound"
+                    )
+                };
+                match (lower, upper) {
+                    (Datum::Int2(a), Datum::Int2(b)) => {
+                        if a > b {
+                            return Err(bad_bounds());
+                        }
+                        Ok(Datum::Int4(crate::sql::guc::active_random_i64_range(
+                            i64::from(a),
+                            i64::from(b),
+                        )? as i32))
+                    }
+                    (Datum::Int4(a), Datum::Int4(b)) => {
+                        if a > b {
+                            return Err(bad_bounds());
+                        }
+                        Ok(Datum::Int4(crate::sql::guc::active_random_i64_range(
+                            i64::from(a),
+                            i64::from(b),
+                        )? as i32))
+                    }
+                    (
+                        a @ (Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)),
+                        b @ (Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)),
+                    ) => {
+                        let a = match a {
+                            Datum::Int2(v) => i64::from(v),
+                            Datum::Int4(v) => i64::from(v),
+                            Datum::Int8(v) => v,
+                            _ => unreachable!(),
+                        };
+                        let b = match b {
+                            Datum::Int2(v) => i64::from(v),
+                            Datum::Int4(v) => i64::from(v),
+                            Datum::Int8(v) => v,
+                            _ => unreachable!(),
+                        };
+                        if a > b {
+                            return Err(bad_bounds());
+                        }
+                        Ok(Datum::Int8(crate::sql::guc::active_random_i64_range(a, b)?))
+                    }
+                    (a, b)
+                        if matches!(
+                            a,
+                            Datum::Numeric(_) | Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)
+                        ) && matches!(
+                            b,
+                            Datum::Numeric(_) | Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_)
+                        ) =>
+                    {
+                        let a = datum_numeric(name, a, arena)?;
+                        let b = datum_numeric(name, b, arena)?;
+                        Ok(Datum::Numeric(random_numeric(&a, &b, arena)?))
+                    }
+                    (other, _) => Err(type_mismatch(name, &other)),
+                }
+            }
+            "random_normal" => {
+                if args.len() > 2 || star {
+                    return Err(arity_err(name, args.len()));
+                }
+                let mean = if args.is_empty() {
+                    0.0
+                } else {
+                    let Some(value) = num_f64(name, args, 0, arena, params, row, hooks)? else {
+                        return Ok(Datum::Null);
+                    };
+                    value
+                };
+                let stddev = if args.len() < 2 {
+                    1.0
+                } else {
+                    let Some(value) = num_f64(name, args, 1, arena, params, row, hooks)? else {
+                        return Ok(Datum::Null);
+                    };
+                    value
+                };
+                Ok(Datum::Float8(crate::sql::guc::active_random_normal(
+                    mean, stddev,
+                )?))
             }
             "setseed" => {
                 arity(1)?;

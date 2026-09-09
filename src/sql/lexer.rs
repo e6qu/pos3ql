@@ -96,6 +96,7 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::Eof);
         };
         match c {
+            '.' if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) => self.number(),
             '(' | ')' | ',' | ';' | '.' | '[' | ']' => {
                 let operator = &self.text[self.at..self.at + 1];
                 self.at += 1;
@@ -630,9 +631,10 @@ mod tests {
     #[test]
     fn numbers() {
         assert_eq!(
-            lex_all("1 2.5 1e3 1.5e-2"),
+            lex_all("1 .5 2.5 1e3 1.5e-2"),
             [
                 "Num(\"1\")",
+                "Num(\".5\")",
                 "Num(\"2.5\")",
                 "Num(\"1e3\")",
                 "Num(\"1.5e-2\")"

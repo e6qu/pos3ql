@@ -3863,9 +3863,32 @@ pub fn infer_type_res(
             "factorial" => of(ColType::Numeric),
             "bit_length" => of(ColType::Int4),
             "starts_with" => of(ColType::Bool),
+            "random" => {
+                if args.is_empty() {
+                    of(ColType::Float8)
+                } else {
+                    let mut numeric = false;
+                    let mut int8 = false;
+                    for arg in args.iter().take(2) {
+                        match infer_type_res(arg, columns)?.0 {
+                            oid::NUMERIC => numeric = true,
+                            oid::INT8 => int8 = true,
+                            _ => {}
+                        }
+                    }
+                    if numeric {
+                        of(ColType::Numeric)
+                    } else if int8 {
+                        of(ColType::Int8)
+                    } else {
+                        of(ColType::Int4)
+                    }
+                }
+            }
             "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2"
             | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
-            | "pi" | "random" => of(ColType::Float8),
+            | "asind" | "acosd" | "atand" | "atan2d" | "sind" | "cosd" | "tand" | "cotd"
+            | "erf" | "erfc" | "gamma" | "lgamma" | "random_normal" | "pi" => of(ColType::Float8),
             "setseed" => of(ColType::Void),
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
             // Bitwise aggregates preserve the argument's (integer or bit) type.

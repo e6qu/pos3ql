@@ -8441,7 +8441,7 @@ impl<'a> Parser<'a> {
         ParseError {
             at: self.peek_at,
             message: stack_format!(96, "{} exceeds fixed limit of {}", what, max),
-            sqlstate: sqlstate::SYNTAX_ERROR,
+            sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
         }
     }
 }
@@ -10803,6 +10803,28 @@ mod tests {
         with_parser("SELECT FROM", |p| {
             let err = p.next_stmt().unwrap_err();
             assert_eq!(err.at, 7);
+        });
+    }
+
+    #[test]
+    fn fixed_parse_capacity_is_a_program_limit_not_a_syntax_error() {
+        let mut sql = String::from("SELECT 1 IN (");
+        for value in 0..=MAX_LIST {
+            if value != 0 {
+                sql.push(',');
+            }
+            sql.push_str(&value.to_string());
+        }
+        sql.push(')');
+        with_parser(&sql, |parser| {
+            let error = parser.next_stmt().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+            assert!(
+                error
+                    .message
+                    .as_str()
+                    .contains("IN list exceeds fixed limit")
+            );
         });
     }
 

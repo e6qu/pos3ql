@@ -19,6 +19,109 @@ pub const PG_EPOCH_SECS: i64 = 946_684_800;
 /// PostgreSQL's binary timestamp sentinels.
 pub const TIMESTAMP_NEG_INFINITY: i64 = i64::MIN;
 pub const TIMESTAMP_INFINITY: i64 = i64::MAX;
+pub const DATE_NEG_INFINITY: i32 = i32::MIN;
+pub const DATE_INFINITY: i32 = i32::MAX;
+pub const INTERVAL_NEG_INFINITY: super::types::Interval = super::types::Interval {
+    months: i32::MIN,
+    days: i32::MIN,
+    micros: i64::MIN,
+};
+pub const INTERVAL_INFINITY: super::types::Interval = super::types::Interval {
+    months: i32::MAX,
+    days: i32::MAX,
+    micros: i64::MAX,
+};
+
+pub(crate) fn is_comparison_function(name: &str) -> bool {
+    matches!(
+        name,
+        "date_eq"
+            | "date_ne"
+            | "date_lt"
+            | "date_le"
+            | "date_gt"
+            | "date_ge"
+            | "time_eq"
+            | "time_ne"
+            | "time_lt"
+            | "time_le"
+            | "time_gt"
+            | "time_ge"
+            | "timetz_eq"
+            | "timetz_ne"
+            | "timetz_lt"
+            | "timetz_le"
+            | "timetz_gt"
+            | "timetz_ge"
+            | "timestamp_eq"
+            | "timestamp_ne"
+            | "timestamp_lt"
+            | "timestamp_le"
+            | "timestamp_gt"
+            | "timestamp_ge"
+            | "timestamptz_eq"
+            | "timestamptz_ne"
+            | "timestamptz_lt"
+            | "timestamptz_le"
+            | "timestamptz_gt"
+            | "timestamptz_ge"
+            | "interval_eq"
+            | "interval_ne"
+            | "interval_lt"
+            | "interval_le"
+            | "interval_gt"
+            | "interval_ge"
+            | "date_eq_timestamp"
+            | "date_ne_timestamp"
+            | "date_lt_timestamp"
+            | "date_le_timestamp"
+            | "date_gt_timestamp"
+            | "date_ge_timestamp"
+            | "timestamp_eq_date"
+            | "timestamp_ne_date"
+            | "timestamp_lt_date"
+            | "timestamp_le_date"
+            | "timestamp_gt_date"
+            | "timestamp_ge_date"
+            | "date_eq_timestamptz"
+            | "date_ne_timestamptz"
+            | "date_lt_timestamptz"
+            | "date_le_timestamptz"
+            | "date_gt_timestamptz"
+            | "date_ge_timestamptz"
+            | "timestamptz_eq_date"
+            | "timestamptz_ne_date"
+            | "timestamptz_lt_date"
+            | "timestamptz_le_date"
+            | "timestamptz_gt_date"
+            | "timestamptz_ge_date"
+            | "timestamp_eq_timestamptz"
+            | "timestamp_ne_timestamptz"
+            | "timestamp_lt_timestamptz"
+            | "timestamp_le_timestamptz"
+            | "timestamp_gt_timestamptz"
+            | "timestamp_ge_timestamptz"
+            | "timestamptz_eq_timestamp"
+            | "timestamptz_ne_timestamp"
+            | "timestamptz_lt_timestamp"
+            | "timestamptz_le_timestamp"
+            | "timestamptz_gt_timestamp"
+            | "timestamptz_ge_timestamp"
+    )
+}
+
+pub const fn interval_infinity_sign(interval: super::types::Interval) -> i8 {
+    if interval.months == i32::MAX && interval.days == i32::MAX && interval.micros == i64::MAX {
+        1
+    } else if interval.months == i32::MIN
+        && interval.days == i32::MIN
+        && interval.micros == i64::MIN
+    {
+        -1
+    } else {
+        0
+    }
+}
 
 fn timestamp_out_of_range() -> SqlError {
     sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
@@ -86,6 +189,12 @@ pub fn parse_date(s: &str) -> Result<i32, SqlError> {
         )
     };
     let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("infinity") {
+        return Ok(DATE_INFINITY);
+    }
+    if trimmed.eq_ignore_ascii_case("-infinity") {
+        return Ok(DATE_NEG_INFINITY);
+    }
     let mut parts = trimmed.splitn(3, '-');
     let (year, month, day) = (
         parts
@@ -1226,6 +1335,12 @@ pub fn format_time(micros: i64) -> StackStr<24> {
 /// `90 minutes`, `-5 days`, `1 day 03:04:05`). Returns (months, days, micros).
 pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
     use super::types::Interval;
+    if s.trim().eq_ignore_ascii_case("infinity") {
+        return Ok(INTERVAL_INFINITY);
+    }
+    if s.trim().eq_ignore_ascii_case("-infinity") {
+        return Ok(INTERVAL_NEG_INFINITY);
+    }
     let bad = || {
         sql_err!(
             sqlstate::INVALID_DATETIME_FORMAT,
@@ -1383,6 +1498,11 @@ pub fn format_interval_styled(
     interval: super::types::Interval,
     style: IntervalStyle,
 ) -> StackStr<96> {
+    match interval_infinity_sign(interval) {
+        1 => return StackStr::from_str("infinity"),
+        -1 => return StackStr::from_str("-infinity"),
+        _ => {}
+    }
     match style {
         IntervalStyle::Postgres => format_interval_postgres(interval),
         IntervalStyle::PostgresVerbose => format_interval_verbose(interval),
@@ -1666,6 +1786,22 @@ pub fn add_interval(micros_epoch: i64, interval: super::types::Interval) -> i64 
 /// Checked form of [`add_interval`], for boundaries such as UUIDv7 whose
 /// timestamp field has a smaller, explicitly validated range.
 pub fn checked_add_interval(micros_epoch: i64, interval: super::types::Interval) -> Option<i64> {
+    let timestamp_sign = if micros_epoch == TIMESTAMP_INFINITY {
+        1
+    } else if micros_epoch == TIMESTAMP_NEG_INFINITY {
+        -1
+    } else {
+        0
+    };
+    let interval_sign = interval_infinity_sign(interval);
+    if timestamp_sign != 0 || interval_sign != 0 {
+        return match (timestamp_sign, interval_sign) {
+            (1, -1) | (-1, 1) => None,
+            (1, _) | (_, 1) => Some(TIMESTAMP_INFINITY),
+            (-1, _) | (_, -1) => Some(TIMESTAMP_NEG_INFINITY),
+            _ => unreachable!(),
+        };
+    }
     let mut m = micros_epoch;
     if interval.months != 0 {
         // Break into date + time-of-day, advance the calendar month, clamp day.
@@ -1692,10 +1828,35 @@ pub fn checked_add_interval(micros_epoch: i64, interval: super::types::Interval)
 /// the UTC timeline, so crossing a daylight-saving boundary is not the same
 /// as adding a fixed number of 24-hour days.
 pub fn checked_add_timestamptz(utc_micros: i64, interval: super::types::Interval) -> Option<i64> {
+    checked_add_timestamptz_in_zone(utc_micros, interval, super::timezone::session())
+}
+
+/// Zone-explicit form used by PostgreSQL 18's `date_add`, `date_subtract`, and
+/// three-argument `date_trunc` routines.
+pub fn checked_add_timestamptz_in_zone(
+    utc_micros: i64,
+    interval: super::types::Interval,
+    zone: super::timezone::Timezone,
+) -> Option<i64> {
+    let timestamp_sign = if utc_micros == TIMESTAMP_INFINITY {
+        1
+    } else if utc_micros == TIMESTAMP_NEG_INFINITY {
+        -1
+    } else {
+        0
+    };
+    let interval_sign = interval_infinity_sign(interval);
+    if timestamp_sign != 0 || interval_sign != 0 {
+        return match (timestamp_sign, interval_sign) {
+            (1, -1) | (-1, 1) => None,
+            (1, _) | (_, 1) => Some(TIMESTAMP_INFINITY),
+            (-1, _) | (_, -1) => Some(TIMESTAMP_NEG_INFINITY),
+            _ => unreachable!(),
+        };
+    }
     if interval.months == 0 && interval.days == 0 {
         return utc_micros.checked_add(interval.micros);
     }
-    let zone = super::timezone::session();
     let source_offset = i64::from(zone.resolve(utc_micros).0).checked_mul(1_000_000)?;
     let local = utc_micros.checked_add(source_offset)?;
     let shifted_local = checked_add_interval(
@@ -1719,30 +1880,105 @@ pub fn interval_scale(
     interval: super::types::Interval,
     factor: f64,
     div: bool,
-) -> super::types::Interval {
+) -> Result<super::types::Interval, SqlError> {
+    let out_of_range = || sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range");
+    if factor.is_nan() {
+        return Err(out_of_range());
+    }
+    if div && factor == 0.0 {
+        return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
+    }
+    let infinity = interval_infinity_sign(interval);
+    if infinity != 0 {
+        if (!div && factor == 0.0) || (div && factor.is_infinite()) {
+            return Err(out_of_range());
+        }
+        return Ok(if factor.is_sign_negative() {
+            if infinity > 0 {
+                INTERVAL_NEG_INFINITY
+            } else {
+                INTERVAL_INFINITY
+            }
+        } else {
+            interval
+        });
+    }
+    if factor.is_infinite() {
+        if div {
+            return Ok(super::types::Interval {
+                months: 0,
+                days: 0,
+                micros: 0,
+            });
+        }
+        let magnitude = i128::from(interval.months) * 30 * 86_400_000_000
+            + i128::from(interval.days) * 86_400_000_000
+            + i128::from(interval.micros);
+        if magnitude == 0 {
+            return Err(out_of_range());
+        }
+        let negative = magnitude.is_negative() != factor.is_sign_negative();
+        return Ok(if negative {
+            INTERVAL_NEG_INFINITY
+        } else {
+            INTERVAL_INFINITY
+        });
+    }
     let f = if div { 1.0 / factor } else { factor };
+    if !f.is_finite() {
+        return Err(out_of_range());
+    }
+    if f == 1.0 {
+        return Ok(interval);
+    }
+    if f == -1.0 {
+        return Ok(super::types::Interval {
+            months: interval.months.checked_neg().ok_or_else(out_of_range)?,
+            days: interval.days.checked_neg().ok_or_else(out_of_range)?,
+            micros: interval.micros.checked_neg().ok_or_else(out_of_range)?,
+        });
+    }
     const DAYS_PER_MONTH: f64 = 30.0;
     let month_double = interval.months as f64 * f;
+    if !month_double.is_finite()
+        || month_double.trunc() < f64::from(i32::MIN)
+        || month_double.trunc() > f64::from(i32::MAX)
+    {
+        return Err(out_of_range());
+    }
     let months = month_double as i32;
     let month_remainder_days = (month_double - months as f64) * DAYS_PER_MONTH;
     let day_double = interval.days as f64 * f;
+    if !day_double.is_finite()
+        || day_double.trunc() < f64::from(i32::MIN)
+        || day_double.trunc() > f64::from(i32::MAX)
+    {
+        return Err(out_of_range());
+    }
     let days_whole = day_double as i32;
     let sec_remainder = (day_double - days_whole as f64 + month_remainder_days
         - month_remainder_days as i64 as f64)
         * 86_400.0;
     // Round the spilled seconds to microsecond precision.
     let sec_remainder = (sec_remainder * 1_000_000.0).round() / 1_000_000.0;
-    let days = days_whole + month_remainder_days as i64 as i32;
-    let micros = (interval.micros as f64 * f + sec_remainder * 1_000_000.0).round() as i64;
-    super::types::Interval {
+    let days = i32::try_from(i64::from(days_whole) + month_remainder_days as i64)
+        .map_err(|_| out_of_range())?;
+    let micros = (interval.micros as f64 * f + sec_remainder * 1_000_000.0).round();
+    if !micros.is_finite() || micros < i64::MIN as f64 || micros >= -(i64::MIN as f64) {
+        return Err(out_of_range());
+    }
+    Ok(super::types::Interval {
         months,
         days,
-        micros,
-    }
+        micros: micros as i64,
+    })
 }
 
 /// `justify_hours`: carry whole days out of the time field.
 pub fn justify_hours(mut interval: super::types::Interval) -> super::types::Interval {
+    if interval_infinity_sign(interval) != 0 {
+        return interval;
+    }
     let wholeday = (interval.micros / DAY_US) as i32;
     interval.micros -= wholeday as i64 * DAY_US;
     interval.days += wholeday;
@@ -1758,6 +1994,9 @@ pub fn justify_hours(mut interval: super::types::Interval) -> super::types::Inte
 
 /// `justify_days`: carry whole 30-day months out of the day field.
 pub fn justify_days(mut interval: super::types::Interval) -> super::types::Interval {
+    if interval_infinity_sign(interval) != 0 {
+        return interval;
+    }
     let wholemonth = interval.days / 30;
     interval.days -= wholemonth * 30;
     interval.months += wholemonth;
@@ -1773,6 +2012,9 @@ pub fn justify_days(mut interval: super::types::Interval) -> super::types::Inter
 
 /// `justify_interval`: normalize so months/days/time share a sign.
 pub fn justify_interval(interval: super::types::Interval) -> super::types::Interval {
+    if interval_infinity_sign(interval) != 0 {
+        return interval;
+    }
     let mut r = justify_hours(interval);
     let wholemonth = r.days / 30;
     r.days -= wholemonth * 30;
@@ -1799,6 +2041,12 @@ pub fn justify_interval(interval: super::types::Interval) -> super::types::Inter
 /// field-wise subtraction with calendar borrow using the earlier date's month
 /// length.
 pub fn age_between(timestamp1: i64, timestamp2: i64) -> super::types::Interval {
+    if timestamp1 == TIMESTAMP_INFINITY || timestamp2 == TIMESTAMP_NEG_INFINITY {
+        return INTERVAL_INFINITY;
+    }
+    if timestamp1 == TIMESTAMP_NEG_INFINITY || timestamp2 == TIMESTAMP_INFINITY {
+        return INTERVAL_NEG_INFINITY;
+    }
     // Compute the positive age (larger minus smaller) with calendar borrow,
     // then negate if the arguments were in the other order — PostgreSQL's
     // `timestamp_age` normalizes the borrow to non-negative fields and recovers
@@ -1916,6 +2164,12 @@ pub fn format_timestamp(micros: i64, with_timezone: bool) -> StackStr<48> {
 /// Postgres `MM-DD-YYYY`/`DD-MM-YYYY`, SQL `MM/DD/YYYY`/`DD/MM/YYYY`, German
 /// `DD.MM.YYYY`.
 pub fn format_date_styled(days: i32, style: DateStyle) -> StackStr<16> {
+    if days == DATE_INFINITY {
+        return StackStr::from_str("infinity");
+    }
+    if days == DATE_NEG_INFINITY {
+        return StackStr::from_str("-infinity");
+    }
     let (y, m, d) = civil_from_days(days as i64 + PG_EPOCH_DAYS);
     let dmy = style.order == FieldOrder::Dmy;
     let mut out = StackStr::<16>::new();
@@ -2153,27 +2407,27 @@ mod tests {
         crate::sql::timezone::set_session(crate::sql::timezone::Timezone::utc());
     }
 
-    // Reference values captured from PostgreSQL 18.4.
+    // Reference values captured from PostgreSQL 18.6.
     #[test]
     fn interval_scale_matches_pg() {
         // interval '1 month' * 1.5 = 1 month 15 days (fractional month -> days).
         assert_eq!(
-            interval_scale(interval(1, 0, 0), 1.5, false),
+            interval_scale(interval(1, 0, 0), 1.5, false).unwrap(),
             interval(1, 15, 0)
         );
         // interval '1 day' / 2 = 12:00:00 (fractional day -> time).
         assert_eq!(
-            interval_scale(interval(0, 1, 0), 2.0, true),
+            interval_scale(interval(0, 1, 0), 2.0, true).unwrap(),
             interval(0, 0, 43_200_000_000)
         );
         // interval '10 days' / 3 = 3 days 08:00:00.
         assert_eq!(
-            interval_scale(interval(0, 10, 0), 3.0, true),
+            interval_scale(interval(0, 10, 0), 3.0, true).unwrap(),
             interval(0, 3, 28_800_000_000)
         );
         // interval '2 hours' * 2.5 = 05:00:00.
         assert_eq!(
-            interval_scale(interval(0, 0, 7_200_000_000), 2.5, false),
+            interval_scale(interval(0, 0, 7_200_000_000), 2.5, false).unwrap(),
             interval(0, 0, 18_000_000_000)
         );
     }

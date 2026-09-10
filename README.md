@@ -108,6 +108,15 @@ extraction, truncation, construction, `AT TIME ZONE`, JSON-path comparison, and
 calendar interval arithmetic share PostgreSQL's daylight-saving gap and
 ambiguity resolution.
 
+PostgreSQL 18 temporal values include date, time, time with time zone,
+timestamp, timestamp with time zone, and interval infinities where PostgreSQL
+defines them. Their casts, cross-type comparisons, arithmetic, `AT LOCAL`,
+zone-explicit `date_add`/`date_subtract` and `date_trunc`, constructors,
+extraction, hashes, extrema, interval sum/average, exact catalogs, binary wire,
+WAL, checkpoints, and object-cold recovery share one representation. Numeric
+positive and negative infinity use PostgreSQL's native numeric binary signs and
+remain distinct from `NaN` through storage and arithmetic.
+
 Permanent, unlogged, and session-temporary tables, views, indexes, identity sequences, standalone sequences, CTAS, and `SELECT INTO` have distinct PostgreSQL lifetimes. A view becomes temporary when requested or when any captured relation is temporary, including through another view. Temporary relations use isolated per-connection namespaces and `ON COMMIT` actions and never enter WAL, checkpoints, object storage, template clones, or logical publications. Committed temporary rows spill to a bounded, startup-sized local store (`temporary_spill_bytes`, or `0` to keep them resident-only) that is recreated empty on restart. Unlogged definitions are durable, retain rows after a clean shutdown, and reset table and sequence state after an unclean restart.
 
 Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.

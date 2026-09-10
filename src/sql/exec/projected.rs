@@ -453,6 +453,8 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
                 crate::sql::numeric::Sign::Pos => 0,
                 crate::sql::numeric::Sign::Neg => 1,
                 crate::sql::numeric::Sign::NaN => 2,
+                crate::sql::numeric::Sign::PosInf => 3,
+                crate::sql::numeric::Sign::NegInf => 4,
             };
             out[2..4].copy_from_slice(&nm.weight.to_le_bytes());
             out[4..6].copy_from_slice(&nm.dscale.to_le_bytes());
@@ -817,6 +819,8 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                 0 => crate::sql::numeric::Sign::Pos,
                 1 => crate::sql::numeric::Sign::Neg,
                 2 => crate::sql::numeric::Sign::NaN,
+                3 => crate::sql::numeric::Sign::PosInf,
+                4 => crate::sql::numeric::Sign::NegInf,
                 _ => panic!("projected numeric carries a valid sign tag"),
             };
             let weight = i16::from_le_bytes(bytes[at + 1..at + 3].try_into().unwrap());

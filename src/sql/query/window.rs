@@ -301,7 +301,7 @@ fn range_offset_negative(v: &Datum) -> bool {
         Datum::Int8(x) => *x < 0,
         Datum::Float4(x) => *x < 0.0,
         Datum::Float8(x) => *x < 0.0,
-        Datum::Numeric(n) => n.sign == crate::sql::numeric::Sign::Neg,
+        Datum::Numeric(n) => n.is_negative(),
         Datum::Interval(iv) => iv.months < 0 || iv.days < 0 || iv.micros < 0,
         _ => false,
     }

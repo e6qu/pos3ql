@@ -22,7 +22,7 @@ while IFS=: read -r file_path line text; do
 done < <(grep -rniE '^[[:space:]]*timeout-minutes:' .github/workflows --include='*.yml')
 
 # Coverage tracing and crash torture require separate release builds. A matrix
-# entry that combines their shards can exceed its fixed five-minute ceiling.
+# entry that combines their shards can exceed its bounded job ceiling.
 if grep -nE 'shards:.*(run:.*runtest:|runtest:.*run:)' .github/workflows/coverage.yml; then
     printf '%s\n' 'CI timeout guard: coverage and runtest shards must use separate matrix entries' >&2
     failed=1
@@ -36,7 +36,7 @@ if grep -nE 'shards:.*[/\\]' .github/workflows/coverage.yml; then
 fi
 
 # The forced-spill suite must distribute corpus work and its independent
-# auxiliary probes. Each worker has a fixed five-minute ceiling.
+# auxiliary probes. Each worker has a fixed ten-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
     '- { name: a, corpus_shard: "0-of-4", auxiliary: none }' \

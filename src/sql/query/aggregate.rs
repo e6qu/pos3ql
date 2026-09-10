@@ -165,6 +165,10 @@ pub(crate) struct AggState<'a> {
     star: bool,
     count: u64,
     sum_int: i128,
+    sum_interval_months: i128,
+    sum_interval_days: i128,
+    sum_interval_micros: i128,
+    sum_interval_infinity: i8,
     sum_float: f64,
     // `sum(real)` accumulates in single precision, matching PostgreSQL's
     // float4 sum (so a running total loses the same low bits it does there);
@@ -318,6 +322,7 @@ enum ArgKind {
     Numeric,
     Float4,
     Float,
+    Interval,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -432,6 +437,10 @@ impl Default for AggState<'_> {
             star: false,
             count: 0,
             sum_int: 0,
+            sum_interval_months: 0,
+            sum_interval_days: 0,
+            sum_interval_micros: 0,
+            sum_interval_infinity: 0,
             sum_float: 0.0,
             sum_float4: 0.0,
             sum_numeric: None,
@@ -1453,6 +1462,24 @@ impl<'a> AggState<'a> {
                     self.arg_kind = ArgKind::Float;
                     self.sum_float += x;
                 }
+                Datum::Interval(interval) => {
+                    self.arg_kind = ArgKind::Interval;
+                    let infinity = crate::sql::datetime::interval_infinity_sign(interval);
+                    if infinity != 0 {
+                        if self.sum_interval_infinity != 0 && self.sum_interval_infinity != infinity
+                        {
+                            return Err(sql_err!(
+                                sqlstate::INTERVAL_FIELD_OVERFLOW,
+                                "interval out of range"
+                            ));
+                        }
+                        self.sum_interval_infinity = infinity;
+                    } else if self.sum_interval_infinity == 0 {
+                        self.sum_interval_months += i128::from(interval.months);
+                        self.sum_interval_days += i128::from(interval.days);
+                        self.sum_interval_micros += i128::from(interval.micros);
+                    }
+                }
                 other => {
                     return Err(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,
@@ -1466,8 +1493,8 @@ impl<'a> AggState<'a> {
                     None => true,
                     Some(b) => {
                         let ord = compare_datums_with_catalog(self.collation, catalog, &v, b)?;
-                        (self.kind == AggKind::Min && ord.is_lt())
-                            || (self.kind == AggKind::Max && ord.is_gt())
+                        (self.kind == AggKind::Min && !ord.is_gt())
+                            || (self.kind == AggKind::Max && !ord.is_lt())
                     }
                 };
                 if replace {
@@ -2242,6 +2269,35 @@ impl<'a> AggState<'a> {
                         sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "money out of range")
                     })?),
                     ArgKind::Numeric => Datum::Numeric(self.sum_numeric.unwrap_or(Numeric::ZERO)),
+                    ArgKind::Interval => Datum::Interval(crate::sql::types::Interval {
+                        months: if self.sum_interval_infinity > 0 {
+                            i32::MAX
+                        } else if self.sum_interval_infinity < 0 {
+                            i32::MIN
+                        } else {
+                            i32::try_from(self.sum_interval_months).map_err(|_| {
+                                sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                            })?
+                        },
+                        days: if self.sum_interval_infinity > 0 {
+                            i32::MAX
+                        } else if self.sum_interval_infinity < 0 {
+                            i32::MIN
+                        } else {
+                            i32::try_from(self.sum_interval_days).map_err(|_| {
+                                sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                            })?
+                        },
+                        micros: if self.sum_interval_infinity > 0 {
+                            i64::MAX
+                        } else if self.sum_interval_infinity < 0 {
+                            i64::MIN
+                        } else {
+                            i64::try_from(self.sum_interval_micros).map_err(|_| {
+                                sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                            })?
+                        },
+                    }),
                     ArgKind::None => Datum::Null,
                 }
             }
@@ -2259,6 +2315,31 @@ impl<'a> AggState<'a> {
                     let sum = self.sum_numeric.unwrap_or(Numeric::ZERO);
                     let cnt = Numeric::from_i64(self.count as i64, arena)?;
                     Datum::Numeric(num::div(&sum, &cnt, arena)?)
+                }
+                ArgKind::Interval => {
+                    if self.sum_interval_infinity != 0 {
+                        return Ok(Datum::Interval(if self.sum_interval_infinity > 0 {
+                            crate::sql::datetime::INTERVAL_INFINITY
+                        } else {
+                            crate::sql::datetime::INTERVAL_NEG_INFINITY
+                        }));
+                    }
+                    let total = crate::sql::types::Interval {
+                        months: i32::try_from(self.sum_interval_months).map_err(|_| {
+                            sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                        })?,
+                        days: i32::try_from(self.sum_interval_days).map_err(|_| {
+                            sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                        })?,
+                        micros: i64::try_from(self.sum_interval_micros).map_err(|_| {
+                            sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                        })?,
+                    };
+                    Datum::Interval(crate::sql::datetime::interval_scale(
+                        total,
+                        self.count as f64,
+                        true,
+                    )?)
                 }
                 ArgKind::Money => unreachable!("PostgreSQL has no avg(money)"),
                 ArgKind::None => Datum::Null,

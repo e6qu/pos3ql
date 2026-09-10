@@ -79,6 +79,8 @@ pub fn number<'a>(
     float_source: Option<f64>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
+    let negative_sign_override =
+        negative_sign_override || (float_source.is_none() && value.is_negative());
     let mut toks = [Tok::Nine; MAX_TOKS];
     let mut ntok = 0usize;
     let mut fm = false;
@@ -470,7 +472,7 @@ fn render_eeee<'a>(
     // NaN/Infinity: a space, then `#` fill with the point after the integer
     // positions — `pre + post + 6` characters total, as PostgreSQL.
     let nonfinite = matches!(float_source, Some(x) if !x.is_finite())
-        || (float_source.is_none() && value.is_nan());
+        || (float_source.is_none() && value.is_special());
     if nonfinite {
         let total = int_digits.max(1) + frac_digits + 6;
         let mut out = [b'#'; 64];
@@ -622,7 +624,8 @@ fn render<'a>(
     // overflows every position (keeping its sign).
     let nan =
         matches!(float_source, Some(x) if x.is_nan()) || (float_source.is_none() && value.is_nan());
-    let infinite = matches!(float_source, Some(x) if x.is_infinite());
+    let infinite = matches!(float_source, Some(x) if x.is_infinite())
+        || (float_source.is_none() && value.is_infinite());
     if nan || infinite {
         return render_nonfinite(
             toks,
@@ -632,6 +635,7 @@ fn render<'a>(
             int_digits,
             nan,
             negative_sign_override,
+            float_source.is_none() && value.is_infinite(),
             arena,
         );
     }
@@ -960,9 +964,9 @@ fn point_index(toks: &[Tok]) -> usize {
 }
 
 /// NaN / Infinity through a plain digit format: NaN lays "NaN" into the
-/// integer positions (`#` on overflow); Infinity overflows every position.
-/// The decimal point and fractional positions disappear; the sign slot keeps
-/// its normal behavior (so `-Infinity` shows `-###`).
+/// integer positions (`#` on overflow); Infinity overflows the available
+/// positions. Numeric infinity retains fractional positions while float
+/// infinity follows PostgreSQL's float formatter and suppresses them.
 #[allow(clippy::too_many_arguments)]
 fn render_nonfinite<'a>(
     toks: &[Tok],
@@ -972,6 +976,7 @@ fn render_nonfinite<'a>(
     int_digits: usize,
     nan: bool,
     neg: bool,
+    fill_fraction: bool,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let image: &[u8] = if nan { b"NaN" } else { b"" };
@@ -1019,7 +1024,9 @@ fn render_nonfinite<'a>(
         match t {
             Tok::Nine | Tok::Zero => {
                 if int_idx >= int_digits {
-                    // Fractional position: suppressed for non-finite values.
+                    if fill_fraction {
+                        emit(&mut out, &mut olen, b'#')?;
+                    }
                     continue;
                 }
                 if !sign_trailing && !sign_emitted && int_idx == sig_start {
@@ -1041,7 +1048,11 @@ fn render_nonfinite<'a>(
                 emit(&mut out, &mut olen, ch)?;
                 int_idx += 1;
             }
-            Tok::Point => {}
+            Tok::Point => {
+                if fill_fraction {
+                    emit(&mut out, &mut olen, b'.')?;
+                }
+            }
             Tok::Group => {
                 if !fm {
                     emit(&mut out, &mut olen, b' ')?;

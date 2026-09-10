@@ -10399,6 +10399,9 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         }
         7 => {
             let sign = *payload.get(*at)?;
+            if sign > 4 {
+                return None;
+            }
             let weight = i16::from_le_bytes(payload.get(*at + 1..*at + 3)?.try_into().unwrap());
             let dscale = u16::from_le_bytes(payload.get(*at + 3..*at + 5)?.try_into().unwrap());
             let nbytes = *payload.get(*at + 5)? as usize;
@@ -11139,6 +11142,10 @@ mod tests {
         invalid_range[..4].copy_from_slice(&[22, 42, 0, 0]);
         let mut at = 0;
         assert_eq!(decode_default(&invalid_range[..4], &mut at), None);
+
+        let invalid_numeric_sign = [7, 5, 0, 0, 0, 0, 0];
+        let mut at = 0;
+        assert_eq!(decode_default(&invalid_numeric_sign, &mut at), None);
     }
 
     #[test]

@@ -204,27 +204,41 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
     }
     if kind.is_discrete() {
         // Convert to inclusive-lower, exclusive-upper (buffers hold any
-        // incremented bound text).
+        // incremented bound text). Date infinity cannot be incremented, so
+        // PostgreSQL preserves that bound's original inclusivity.
         let mut lo_buf = StackStr::<48>::new();
         let mut hi_buf = StackStr::<48>::new();
-        let lower_text: Option<&str> = match (p.lower, p.lower_inc) {
-            (None, _) => None,
-            (Some(v), true) => Some(v),
+        let date_infinite = |value: &str| {
+            kind == RangeKind::Date
+                && matches!(
+                    super::datetime::parse_date(value.trim()),
+                    Ok(super::datetime::DATE_INFINITY | super::datetime::DATE_NEG_INFINITY)
+                )
+        };
+        let (lower_text, lower_inc): (Option<&str>, bool) = match (p.lower, p.lower_inc) {
+            (None, _) => (None, false),
+            (Some(v), true) => (Some(v), true),
+            (Some(v), false) if date_infinite(v) => (Some(v), false),
             (Some(v), false) => {
                 incr_into(v, kind, &mut lo_buf)?;
-                Some(lo_buf.as_str())
+                (Some(lo_buf.as_str()), true)
             }
         };
-        let upper_text: Option<&str> = match (p.upper, p.upper_inc) {
-            (None, _) => None,
-            (Some(v), false) => Some(v),
+        let (upper_text, upper_inc): (Option<&str>, bool) = match (p.upper, p.upper_inc) {
+            (None, _) => (None, false),
+            (Some(v), false) => (Some(v), false),
+            (Some(v), true) if date_infinite(v) => (Some(v), true),
             (Some(v), true) => {
                 incr_into(v, kind, &mut hi_buf)?;
-                Some(hi_buf.as_str())
+                (Some(hi_buf.as_str()), false)
             }
         };
         if let (Some(l), Some(h)) = (lower_text, upper_text)
-            && cmp_elem(l, h, kind)? != Ordering::Less
+            && match cmp_elem(l, h, kind)? {
+                Ordering::Greater => true,
+                Ordering::Equal => !(lower_inc && upper_inc),
+                Ordering::Less => false,
+            }
         {
             return alloc(arena, "empty");
         }
@@ -232,7 +246,8 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
         // Each bound is normalized to its element text and quoted if it needs
         // it — a no-op for the discrete kinds (integers, dates), whose text is
         // already canonical and carries no character that would force quotes.
-        let lb = if lower_text.is_some() { '[' } else { '(' };
+        let lb = if lower_inc { '[' } else { '(' };
+        let ub = if upper_inc { ']' } else { ')' };
         let lower_out = match lower_text {
             Some(v) => bound_out(v, kind, arena)?,
             None => "",
@@ -241,7 +256,7 @@ pub fn canonical<'a>(p: &Parsed, kind: RangeKind, arena: &'a Arena) -> Result<&'
             Some(v) => bound_out(v, kind, arena)?,
             None => "",
         };
-        let text = stack_format!(160, "{}{},{})", lb, lower_out, upper_out);
+        let text = stack_format!(160, "{}{},{}{}", lb, lower_out, upper_out, ub);
         return alloc(arena, text.as_str());
     }
     // Continuous: empty when bounds are equal and not both inclusive.
@@ -1313,7 +1328,7 @@ fn bound_hash(
         ),
         RangeKind::Num => {
             let numeric = Numeric::parse(text.trim(), arena)?;
-            if numeric.is_nan() {
+            if numeric.is_special() {
                 return Ok(seed.map_or(0, |value| value as u64));
             }
             if numeric.is_zero() {

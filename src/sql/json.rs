@@ -1450,6 +1450,29 @@ pub fn write_datum_json_styled(
     match v {
         Datum::Null => out.write_str("null"),
         Datum::Bool(b) => out.write_str(if *b { "true" } else { "false" }),
+        Datum::Float4(value) if !value.is_finite() => write_json_raw_string(
+            if value.is_nan() {
+                "NaN"
+            } else if value.is_sign_negative() {
+                "-Infinity"
+            } else {
+                "Infinity"
+            },
+            out,
+        ),
+        Datum::Float8(value) if !value.is_finite() => write_json_raw_string(
+            if value.is_nan() {
+                "NaN"
+            } else if value.is_sign_negative() {
+                "-Infinity"
+            } else {
+                "Infinity"
+            },
+            out,
+        ),
+        Datum::Numeric(value) if value.is_special() => {
+            write_json_raw_string(crate::stack_format!(32, "{value}").as_str(), out)
+        }
         Datum::Int2(_)
         | Datum::Int4(_)
         | Datum::Int8(_)

@@ -273,6 +273,8 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                     crate::sql::numeric::Sign::Pos => 0,
                     crate::sql::numeric::Sign::Neg => 1,
                     crate::sql::numeric::Sign::NaN => 2,
+                    crate::sql::numeric::Sign::PosInf => 3,
+                    crate::sql::numeric::Sign::NegInf => 4,
                 };
                 rest[1..3].copy_from_slice(&nm.weight.to_le_bytes());
                 rest[3..5].copy_from_slice(&nm.dscale.to_le_bytes());
@@ -863,6 +865,8 @@ pub(crate) fn decode<'a>(
                     0 => crate::sql::numeric::Sign::Pos,
                     1 => crate::sql::numeric::Sign::Neg,
                     2 => crate::sql::numeric::Sign::NaN,
+                    3 => crate::sql::numeric::Sign::PosInf,
+                    4 => crate::sql::numeric::Sign::NegInf,
                     _ => return Err(corrupt()),
                 };
                 let weight = i16::from_le_bytes([h[1], h[2]]);

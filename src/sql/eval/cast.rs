@@ -16,6 +16,38 @@ use super::{
     parse_bool, session_zone_at, sqlstate,
 };
 
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+fn date_to_timestamp(date: i32) -> Result<i64, SqlError> {
+    match date {
+        crate::sql::datetime::DATE_INFINITY => Ok(crate::sql::datetime::TIMESTAMP_INFINITY),
+        crate::sql::datetime::DATE_NEG_INFINITY => Ok(crate::sql::datetime::TIMESTAMP_NEG_INFINITY),
+        finite => i64::from(finite)
+            .checked_mul(MICROS_PER_DAY)
+            .ok_or_else(|| overflow("timestamp")),
+    }
+}
+
+fn timestamp_to_date(timestamp: i64) -> Result<i32, SqlError> {
+    match timestamp {
+        crate::sql::datetime::TIMESTAMP_INFINITY => Ok(crate::sql::datetime::DATE_INFINITY),
+        crate::sql::datetime::TIMESTAMP_NEG_INFINITY => Ok(crate::sql::datetime::DATE_NEG_INFINITY),
+        finite => i32::try_from(finite.div_euclid(MICROS_PER_DAY)).map_err(|_| overflow("date")),
+    }
+}
+
+fn local_timestamp_to_utc(timestamp: i64) -> Result<i64, SqlError> {
+    if matches!(
+        timestamp,
+        crate::sql::datetime::TIMESTAMP_INFINITY | crate::sql::datetime::TIMESTAMP_NEG_INFINITY
+    ) {
+        return Ok(timestamp);
+    }
+    crate::sql::timezone::session()
+        .resolve_local(timestamp)
+        .ok_or_else(|| overflow("timestamp with time zone"))
+}
+
 pub fn cast<'a>(v: Datum<'a>, type_name: &str, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let Some(target) = ColType::from_sql_name(type_name) else {
         return Err(sql_err!(
@@ -351,23 +383,46 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         }
         ColType::Date => match v {
             Datum::Date(_) => v,
-            Datum::Timestamp(t) | Datum::Timestamptz(t) => {
-                Datum::Date(t.div_euclid(86_400_000_000) as i32)
+            Datum::Timestamp(t) => Datum::Date(timestamp_to_date(t)?),
+            Datum::Timestamptz(t) => {
+                if t == crate::sql::datetime::TIMESTAMP_INFINITY {
+                    Datum::Date(crate::sql::datetime::DATE_INFINITY)
+                } else if t == crate::sql::datetime::TIMESTAMP_NEG_INFINITY {
+                    Datum::Date(crate::sql::datetime::DATE_NEG_INFINITY)
+                } else {
+                    let local = t
+                        .checked_add(i64::from(session_zone_at(t)) * 1_000_000)
+                        .ok_or_else(|| overflow("date"))?;
+                    Datum::Date(timestamp_to_date(local)?)
+                }
             }
             Datum::Text(s) => Datum::Date(crate::sql::datetime::parse_date(s)?),
             _ => return Err(cast_unsupported(&v, "date")),
         },
         ColType::Timestamp => match v {
             Datum::Timestamp(_) => v,
-            Datum::Timestamptz(t) => Datum::Timestamp(t),
-            Datum::Date(d) => Datum::Timestamp(d as i64 * 86_400_000_000),
+            Datum::Timestamptz(t) => {
+                if matches!(
+                    t,
+                    crate::sql::datetime::TIMESTAMP_INFINITY
+                        | crate::sql::datetime::TIMESTAMP_NEG_INFINITY
+                ) {
+                    Datum::Timestamp(t)
+                } else {
+                    Datum::Timestamp(
+                        t.checked_add(i64::from(session_zone_at(t)) * 1_000_000)
+                            .ok_or_else(|| overflow("timestamp"))?,
+                    )
+                }
+            }
+            Datum::Date(d) => Datum::Timestamp(date_to_timestamp(d)?),
             Datum::Text(s) => Datum::Timestamp(crate::sql::datetime::parse_timestamp(s, false)?),
             _ => return Err(cast_unsupported(&v, "timestamp")),
         },
         ColType::Timestamptz => match v {
             Datum::Timestamptz(_) => v,
-            Datum::Timestamp(t) => Datum::Timestamptz(t),
-            Datum::Date(d) => Datum::Timestamptz(d as i64 * 86_400_000_000),
+            Datum::Timestamp(t) => Datum::Timestamptz(local_timestamp_to_utc(t)?),
+            Datum::Date(d) => Datum::Timestamptz(local_timestamp_to_utc(date_to_timestamp(d)?)?),
             Datum::Text(s) => Datum::Timestamptz(crate::sql::datetime::parse_timestamp(s, true)?),
             _ => return Err(cast_unsupported(&v, "timestamp with time zone")),
         },
@@ -375,9 +430,27 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Time(_) => v,
             Datum::Timetz(t, _) => Datum::Time(t),
             // The time-of-day portion of a timestamp (microseconds past midnight).
-            Datum::Timestamp(t) | Datum::Timestamptz(t) => {
-                Datum::Time(t.rem_euclid(86_400_000_000))
+            Datum::Timestamp(
+                crate::sql::datetime::TIMESTAMP_INFINITY
+                | crate::sql::datetime::TIMESTAMP_NEG_INFINITY,
+            ) => Datum::Null,
+            Datum::Timestamp(t) => Datum::Time(t.rem_euclid(86_400_000_000)),
+            Datum::Timestamptz(
+                crate::sql::datetime::TIMESTAMP_INFINITY
+                | crate::sql::datetime::TIMESTAMP_NEG_INFINITY,
+            ) => Datum::Null,
+            Datum::Timestamptz(t) => Datum::Time(
+                (t + i64::from(session_zone_at(t)) * 1_000_000).rem_euclid(86_400_000_000),
+            ),
+            Datum::Interval(interval)
+                if crate::sql::datetime::interval_infinity_sign(interval) != 0 =>
+            {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "cannot convert infinite interval to time"
+                ));
             }
+            Datum::Interval(interval) => Datum::Time(interval.micros.rem_euclid(86_400_000_000)),
             Datum::Text(s) => Datum::Time(crate::sql::datetime::parse_time(s)?),
             _ => return Err(cast_unsupported(&v, "time without time zone")),
         },
@@ -387,12 +460,15 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             // PostgreSQL does — for a timestamptz that means converting the
             // instant into that zone first.
             Datum::Time(t) => Datum::Timetz(t, session_zone_at(crate::sql::datetime::now_micros())),
+            Datum::Timestamptz(
+                crate::sql::datetime::TIMESTAMP_INFINITY
+                | crate::sql::datetime::TIMESTAMP_NEG_INFINITY,
+            ) => Datum::Null,
             Datum::Timestamptz(t) => {
                 let zone = session_zone_at(t);
                 let local = t + zone as i64 * 1_000_000;
                 Datum::Timetz(local.rem_euclid(86_400_000_000), zone)
             }
-            Datum::Timestamp(t) => Datum::Timetz(t.rem_euclid(86_400_000_000), session_zone_at(t)),
             Datum::Text(s) => {
                 let (t, zone) = crate::sql::datetime::parse_timetz(s)?;
                 Datum::Timetz(
@@ -404,6 +480,11 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::Interval => match v {
             Datum::Interval(_) => v,
+            Datum::Time(micros) => Datum::Interval(crate::sql::types::Interval {
+                months: 0,
+                days: 0,
+                micros,
+            }),
             Datum::Text(s) => Datum::Interval(crate::sql::datetime::parse_interval(s)?),
             _ => return Err(cast_unsupported(&v, "interval")),
         },

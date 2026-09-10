@@ -66329,6 +66329,12 @@ fn apply_numeric_typmod<'a>(
     if n.is_nan() {
         return Numeric::parse("NaN", arena);
     }
+    if n.is_infinite() {
+        return Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "numeric field overflow"
+        ));
+    }
     const DIG: usize = 2100;
     let text = stack_format!(2100, "{}", n);
     let s = text.as_str();

@@ -4966,6 +4966,19 @@ pub(crate) fn numeric_series_count(
     arena: &Arena,
 ) -> Result<usize, SqlError> {
     use core::cmp::Ordering;
+    for (value, label) in [
+        (start, "start value"),
+        (stop, "stop value"),
+        (step, "step size"),
+    ] {
+        if value.is_infinite() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "{} cannot be infinity",
+                label
+            ));
+        }
+    }
     if step.is_zero() || step.is_nan() {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,
@@ -5005,6 +5018,19 @@ pub(crate) fn numeric_series_at<'a>(
     use core::cmp::Ordering;
     if index == 0 {
         return Ok(None);
+    }
+    for (value, label) in [
+        (start, "start value"),
+        (stop, "stop value"),
+        (step, "step size"),
+    ] {
+        if value.is_infinite() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "{} cannot be infinity",
+                label
+            ));
+        }
     }
     if step.is_zero() || step.is_nan() {
         return Err(sql_err!(

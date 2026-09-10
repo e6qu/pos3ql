@@ -479,6 +479,26 @@ pub fn compare_datums(l: &Datum, r: &Datum) -> Result<core::cmp::Ordering, SqlEr
     compare_datums_as("=", l, r)
 }
 
+fn date_timestamp_for_compare(date: i32) -> i64 {
+    match date {
+        crate::sql::datetime::DATE_INFINITY => crate::sql::datetime::TIMESTAMP_INFINITY,
+        crate::sql::datetime::DATE_NEG_INFINITY => crate::sql::datetime::TIMESTAMP_NEG_INFINITY,
+        finite => i64::from(finite) * 86_400_000_000,
+    }
+}
+
+fn local_timestamp_for_compare(timestamp: i64) -> Result<i64, SqlError> {
+    if matches!(
+        timestamp,
+        crate::sql::datetime::TIMESTAMP_INFINITY | crate::sql::datetime::TIMESTAMP_NEG_INFINITY
+    ) {
+        return Ok(timestamp);
+    }
+    crate::sql::timezone::session()
+        .resolve_local(timestamp)
+        .ok_or_else(|| sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range"))
+}
+
 /// Compares values under a resolved SQL collation.  Text and blank-padded char
 /// share the database comparator; every other type retains its native order.
 pub fn compare_datums_collated(
@@ -839,9 +859,9 @@ pub(crate) fn compare_datums_as(
         }
         (Datum::Date(a), Datum::Date(b)) => a.cmp(b),
         (Datum::Timestamp(a), Datum::Timestamp(b))
-        | (Datum::Timestamptz(a), Datum::Timestamptz(b))
-        | (Datum::Timestamp(a), Datum::Timestamptz(b))
-        | (Datum::Timestamptz(a), Datum::Timestamp(b)) => a.cmp(b),
+        | (Datum::Timestamptz(a), Datum::Timestamptz(b)) => a.cmp(b),
+        (Datum::Timestamp(a), Datum::Timestamptz(b)) => local_timestamp_for_compare(*a)?.cmp(b),
+        (Datum::Timestamptz(a), Datum::Timestamp(b)) => a.cmp(&local_timestamp_for_compare(*b)?),
         (Datum::Time(a), Datum::Time(b)) => a.cmp(b),
         // PostgreSQL orders by the instant each denotes, then by zone, so two
         // values naming the same instant in different zones are ordered but
@@ -931,12 +951,14 @@ pub(crate) fn compare_datums_as(
             }
             shape_a.dimension_count().cmp(&shape_b.dimension_count())
         }
-        (Datum::Date(a), Datum::Timestamp(b) | Datum::Timestamptz(b)) => {
-            (i64::from(*a) * 86_400_000_000).cmp(b)
+        (Datum::Date(a), Datum::Timestamp(b)) => date_timestamp_for_compare(*a).cmp(b),
+        (Datum::Timestamp(a), Datum::Date(b)) => a.cmp(&date_timestamp_for_compare(*b)),
+        (Datum::Date(a), Datum::Timestamptz(b)) => {
+            local_timestamp_for_compare(date_timestamp_for_compare(*a))?.cmp(b)
         }
-        (Datum::Timestamp(a) | Datum::Timestamptz(a), Datum::Date(b)) => {
-            a.cmp(&(i64::from(*b) * 86_400_000_000))
-        }
+        (Datum::Timestamptz(a), Datum::Date(b)) => a.cmp(&local_timestamp_for_compare(
+            date_timestamp_for_compare(*b),
+        )?),
         (Datum::Uuid(a), Datum::Uuid(b)) => a.cmp(b),
         (Datum::Bytea(a), Datum::Bytea(b)) => a.cmp(b),
         // Network addresses compare common network bits before mask width and
@@ -1267,6 +1289,24 @@ pub(crate) fn arithmetic<'a>(
     // ± interval -> interval. Months add calendar months (day clamped).
     match (operator, l, r) {
         (BinaryOp::Add | BinaryOp::Sub, Datum::Interval(a), Datum::Interval(b)) => {
+            let left_sign = datetime::interval_infinity_sign(a);
+            let mut right_sign = datetime::interval_infinity_sign(b);
+            if operator == BinaryOp::Sub {
+                right_sign = -right_sign;
+            }
+            if left_sign != 0 || right_sign != 0 {
+                if left_sign != 0 && right_sign != 0 && left_sign != right_sign {
+                    return Err(sql_err!(
+                        sqlstate::INTERVAL_FIELD_OVERFLOW,
+                        "interval out of range"
+                    ));
+                }
+                return Ok(Datum::Interval(if left_sign > 0 || right_sign > 0 {
+                    datetime::INTERVAL_INFINITY
+                } else {
+                    datetime::INTERVAL_NEG_INFINITY
+                }));
+            }
             let combine_i32 = if operator == BinaryOp::Sub {
                 i32::checked_sub
             } else {
@@ -1291,25 +1331,16 @@ pub(crate) fn arithmetic<'a>(
         }
         // `interval * number` / `number * interval` / `interval / number`.
         (BinaryOp::Mul, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(datetime::interval_scale(
-                interval,
-                num_factor(&r).expect("checked"),
-                false,
-            )));
+            return datetime::interval_scale(interval, num_factor(&r).expect("checked"), false)
+                .map(Datum::Interval);
         }
         (BinaryOp::Mul, _, Datum::Interval(interval)) if num_factor(&l).is_some() => {
-            return Ok(Datum::Interval(datetime::interval_scale(
-                interval,
-                num_factor(&l).expect("checked"),
-                false,
-            )));
+            return datetime::interval_scale(interval, num_factor(&l).expect("checked"), false)
+                .map(Datum::Interval);
         }
         (BinaryOp::Div, Datum::Interval(interval), _) if num_factor(&r).is_some() => {
-            return Ok(Datum::Interval(datetime::interval_scale(
-                interval,
-                num_factor(&r).expect("checked"),
-                true,
-            )));
+            return datetime::interval_scale(interval, num_factor(&r).expect("checked"), true)
+                .map(Datum::Interval);
         }
         (
             BinaryOp::Add | BinaryOp::Sub,
@@ -1323,9 +1354,7 @@ pub(crate) fn arithmetic<'a>(
         ) => {
             let base = match dt {
                 Datum::Timestamp(t) | Datum::Timestamptz(t) => t,
-                Datum::Date(d) => i64::from(d).checked_mul(86_400_000_000).ok_or_else(|| {
-                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
-                })?,
+                Datum::Date(d) => date_timestamp_for_compare(d),
                 _ => unreachable!(),
             };
             let signed = if operator == BinaryOp::Sub {
@@ -1395,13 +1424,70 @@ pub(crate) fn arithmetic<'a>(
     }
     match (operator, l, r) {
         (BinaryOp::Sub, Datum::Date(a), Datum::Date(b)) => {
+            if matches!(a, datetime::DATE_INFINITY | datetime::DATE_NEG_INFINITY)
+                || matches!(b, datetime::DATE_INFINITY | datetime::DATE_NEG_INFINITY)
+            {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "cannot subtract infinite dates"
+                ));
+            }
             return Ok(Datum::Int4(a.checked_sub(b).ok_or_else(|| {
                 sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
             })?));
         }
+        (BinaryOp::Sub, Datum::Time(a), Datum::Time(b)) => {
+            return Ok(Datum::Interval(Interval {
+                months: 0,
+                days: 0,
+                micros: a - b,
+            }));
+        }
+        (BinaryOp::Add, Datum::Date(date), Datum::Time(time))
+        | (BinaryOp::Add, Datum::Time(time), Datum::Date(date)) => {
+            let base = date_timestamp_for_compare(date);
+            if matches!(
+                base,
+                datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+            ) {
+                return Ok(Datum::Timestamp(base));
+            }
+            return base.checked_add(time).map(Datum::Timestamp).ok_or_else(|| {
+                sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+            });
+        }
+        (BinaryOp::Add, Datum::Date(date), Datum::Timetz(time, offset))
+        | (BinaryOp::Add, Datum::Timetz(time, offset), Datum::Date(date)) => {
+            let base = date_timestamp_for_compare(date);
+            if matches!(
+                base,
+                datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+            ) {
+                return Ok(Datum::Timestamptz(base));
+            }
+            return base
+                .checked_add(time)
+                .and_then(|local| local.checked_sub(i64::from(offset) * 1_000_000))
+                .map(Datum::Timestamptz)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                });
+        }
         // timestamp - timestamp -> interval (days + time, no month folding).
         (BinaryOp::Sub, Datum::Timestamp(a), Datum::Timestamp(b))
         | (BinaryOp::Sub, Datum::Timestamptz(a), Datum::Timestamptz(b)) => {
+            if matches!(
+                a,
+                datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+            ) || matches!(
+                b,
+                datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+            ) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "cannot subtract infinite timestamps"
+                ));
+            }
             let diff = a.checked_sub(b).ok_or_else(|| {
                 sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
             })?;
@@ -1536,7 +1622,15 @@ pub(crate) fn arithmetic<'a>(
 /// Shift a date (days since the PostgreSQL epoch) by `days`, subtracting when
 /// `sub` is set. Out-of-range results error like PostgreSQL (22008).
 fn date_shift<'a>(date: i32, days: i64, sub: bool) -> Result<Datum<'a>, SqlError> {
-    let delta = if sub { -days } else { days };
+    if matches!(date, datetime::DATE_INFINITY | datetime::DATE_NEG_INFINITY) {
+        return Ok(Datum::Date(date));
+    }
+    let delta = if sub {
+        days.checked_neg()
+            .ok_or_else(|| sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "date out of range"))?
+    } else {
+        days
+    };
     let shifted = i64::from(date)
         .checked_add(delta)
         .and_then(|v| i32::try_from(v).ok());
@@ -1785,11 +1879,30 @@ pub(crate) fn unary<'a>(
                 match n.sign {
                     numeric::Sign::Pos => numeric::Sign::Neg,
                     numeric::Sign::Neg => numeric::Sign::Pos,
+                    numeric::Sign::PosInf => numeric::Sign::NegInf,
+                    numeric::Sign::NegInf => numeric::Sign::PosInf,
                     numeric::Sign::NaN => numeric::Sign::NaN,
                 }
             },
             ..n
         })),
+        (UnaryOp::Neg, Datum::Interval(interval)) => Ok(Datum::Interval(
+            match datetime::interval_infinity_sign(interval) {
+                1 => datetime::INTERVAL_NEG_INFINITY,
+                -1 => datetime::INTERVAL_INFINITY,
+                _ => Interval {
+                    months: interval.months.checked_neg().ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
+                    days: interval.days.checked_neg().ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
+                    micros: interval.micros.checked_neg().ok_or_else(|| {
+                        sql_err!(sqlstate::INTERVAL_FIELD_OVERFLOW, "interval out of range")
+                    })?,
+                },
+            },
+        )),
         (UnaryOp::Not, Datum::Bool(b)) => Ok(Datum::Bool(!b)),
         (UnaryOp::TextSearchNot, Datum::TsQuery(query)) => {
             crate::sql::full_text::not_query(query.as_str(), arena)

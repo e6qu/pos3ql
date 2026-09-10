@@ -6,7 +6,8 @@
 #
 # Coverage-producing runs retain separate lcov files for the merge gate.
 # Instrumented unit tests are partitioned after one build per worker so test
-# growth cannot consume the fixed five-minute job budget.
+# growth cannot consume the fixed ten-minute job budget. The budget includes a
+# cold release build, dependency setup, artifact upload, and runner cleanup.
 name: coverage
 on:
   push:
@@ -21,14 +22,14 @@ jobs:
   shard:
     name: shard ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         include:
           # Coverage and crash-torture builds use incompatible instrumentation.
           # Keep them in distinct jobs: serializing either pair can exceed the
-          # hard five-minute bound even though each workload fits on its own.
+          # hard ten-minute bound even though each workload fits on its own.
           - { name: lib-a, shards: "lib:0-of-3", needs_pg18: false }
           - { name: lib-b, shards: "lib:1-of-3", needs_pg18: false }
           - { name: lib-c, shards: "lib:2-of-3", needs_pg18: false }

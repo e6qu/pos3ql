@@ -3786,13 +3786,16 @@ pub fn infer_type_res(
             | "xpath_exists"
             | "xml_is_well_formed"
             | "xml_is_well_formed_document"
-            | "xml_is_well_formed_content" => of(ColType::Bool),
+            | "xml_is_well_formed_content"
+            | "is_normalized"
+            | "unicode_assigned" => of(ColType::Bool),
             "regexp_substr" => of(ColType::Text),
             "regexp_like" => of(ColType::Bool),
             "regexp_split_to_array" | "string_to_array" => {
                 of(ColType::Array(crate::sql::types::ArrElem::Text))
             }
-            "format" | "regexp_replace" => of(ColType::Text),
+            "format" | "regexp_replace" | "normalize" | "unicode_version" | "unistr"
+            | "casefold" | "to_ascii" => of(ColType::Text),
             "overlay" | "substr" | "substring" | "reverse" | "btrim" | "ltrim" | "rtrim" => {
                 match args
                     .first()
@@ -3859,7 +3862,9 @@ pub fn infer_type_res(
                     of(ColType::Int4)
                 }
             }
-            "to_hex" | "md5" | "to_char" | "pg_size_pretty" => of(ColType::Text),
+            "to_hex" | "to_bin" | "to_oct" | "md5" | "to_char" | "pg_size_pretty" => {
+                of(ColType::Text)
+            }
             "factorial" => of(ColType::Numeric),
             "bit_length" => of(ColType::Int4),
             "starts_with" => of(ColType::Bool),

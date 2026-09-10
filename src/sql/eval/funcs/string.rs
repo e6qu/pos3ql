@@ -10,17 +10,147 @@
 //! forms of `substring` reuse the shared `regex_substring` helpers.
 
 use crate::sql::array;
-use crate::sql::ast::Expr;
+use crate::sql::ast::{Collation, Expr};
 use crate::sql::range;
 use crate::sql::types::{ArrElem, Datum};
+use crate::sql::unicode::{self, NormalizationForm};
 use crate::sql_err;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, alloc_text, arena_full, arity_err, datum_to_text, eval_full,
     ident_needs_quotes, int_arg, overflow, parse_qualified_ident, quote_ident_str,
-    quote_literal_str, regex_substring, sql_regex_substring, sqlstate, text_arg, text_view,
-    type_mismatch,
+    quote_literal_str, regex_substring, resolved_expression_collation, sql_regex_substring,
+    sqlstate, text_arg, text_view, type_mismatch,
 };
+
+fn is_cased(character: char) -> bool {
+    unicode::cased(character)
+}
+
+fn is_final_sigma(input: &str, byte_offset: usize) -> bool {
+    if !input[byte_offset..].starts_with('Σ') {
+        return false;
+    }
+    let preceded = input[..byte_offset]
+        .chars()
+        .rev()
+        .find(|character| !unicode::case_ignorable(*character))
+        .is_some_and(is_cased);
+    let followed = input[byte_offset + 'Σ'.len_utf8()..]
+        .chars()
+        .find(|character| !unicode::case_ignorable(*character))
+        .is_some_and(is_cased);
+    preceded && !followed
+}
+
+fn unicode_case<'a>(
+    input: &str,
+    uppercase: bool,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a str, SqlError> {
+    let kind = if uppercase {
+        unicode::CaseKind::Upper
+    } else {
+        unicode::CaseKind::Lower
+    };
+    let output_len = input
+        .char_indices()
+        .map(|(offset, character)| {
+            let (mapping, count) =
+                unicode::case_mapping(character, kind, !uppercase && is_final_sigma(input, offset));
+            mapping[..usize::from(count)]
+                .iter()
+                .map(|codepoint| {
+                    char::from_u32(*codepoint)
+                        .expect("valid case map")
+                        .len_utf8()
+                })
+                .sum::<usize>()
+        })
+        .sum();
+    let output = arena
+        .alloc_slice_with(output_len, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    let mut at = 0;
+    for (offset, character) in input.char_indices() {
+        let (mapping, count) =
+            unicode::case_mapping(character, kind, !uppercase && is_final_sigma(input, offset));
+        for codepoint in &mapping[..usize::from(count)] {
+            let mapped = char::from_u32(*codepoint).expect("valid case map");
+            at += mapped.encode_utf8(&mut output[at..]).len();
+        }
+    }
+    Ok(unsafe { core::str::from_utf8_unchecked(output) })
+}
+
+fn ascii_case<'a>(
+    input: &str,
+    uppercase: bool,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a str, SqlError> {
+    let output = arena
+        .alloc_slice_with(input.len(), |index| {
+            if uppercase {
+                input.as_bytes()[index].to_ascii_uppercase()
+            } else {
+                input.as_bytes()[index].to_ascii_lowercase()
+            }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(unsafe { core::str::from_utf8_unchecked(output) })
+}
+
+fn uses_full_unicode_case_mapping(
+    collation: Collation,
+    hooks: &EvalHooks<'_, '_>,
+) -> Result<bool, SqlError> {
+    match hooks.catalog {
+        Some(catalog) => catalog.uses_full_unicode_case_mapping(collation),
+        None if collation == Collation::PgUnicodeFast => Ok(true),
+        None if matches!(collation, Collation::Catalog(_)) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "catalog collation casing is unavailable"
+        )),
+        None => Ok(false),
+    }
+}
+
+fn to_ascii<'a>(
+    input: &str,
+    encoding: crate::storage::PgEncoding,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a str, SqlError> {
+    const LATIN1: &[u8; 96] = b"  cL Y  \"Ca  -R     'u .,      ?AAAAAAACEEEEIIII NOOOOOxOUUUUYTBaaaaaaaceeeeiiii nooooo/ouuuuyty";
+    const LATIN2: &[u8; 96] = b" A L LS \"SSTZ-ZZ a,l'ls ,sstz\"zzRAAAALCCCEEEEIIDDNNOOOOxRUUUUYTBraaaalccceeeeiiddnnoooo/ruuuuyt.";
+    const LATIN9: &[u8; 96] = b"  cL YS sCa  -R     Zu .z   EeY?AAAAAAACEEEEIIII NOOOOOxOUUUUYTBaaaaaaaceeeeiiii nooooo/ouuuuyty";
+    const WIN1250: &[u8; 128] = b"  ' \"    %S<STZZ `'\"\".--  s>stzz   L A  \"CS  -RZ  ,l'u .,as L\"lzRAAAALCCCEEEEIIDDNNOOOOxRUUUUYTBraaaalccceeeeiiddnnoooo/ruuuuyt ";
+    let (mapping, first) = match encoding.code() {
+        8 => (&LATIN1[..], 160u8),
+        9 => (&LATIN2[..], 160u8),
+        16 => (&LATIN9[..], 160u8),
+        29 => (&WIN1250[..], 128u8),
+        _ => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "encoding conversion from {} to ASCII not supported",
+                encoding.name()
+            ));
+        }
+    };
+    let output = arena
+        .alloc_slice_with(input.len(), |index| {
+            let byte = input.as_bytes()[index];
+            if byte < 128 {
+                byte
+            } else if byte < first {
+                b' '
+            } else {
+                mapping[usize::from(byte - first)]
+            }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(unsafe { core::str::from_utf8_unchecked(output) })
+}
 
 /// Handles the scalar text family. Returns `None` if `name` is not one of these
 /// functions, leaving the router to keep matching.
@@ -71,6 +201,13 @@ pub(crate) fn dispatch<'a>(
             | "quote_literal"
             | "quote_nullable"
             | "parse_ident"
+            | "normalize"
+            | "is_normalized"
+            | "unicode_version"
+            | "unicode_assigned"
+            | "unistr"
+            | "casefold"
+            | "to_ascii"
     ) {
         return None;
     }
@@ -88,6 +225,94 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "normalize" | "is_normalized" => {
+                arity(2)?;
+                let (Some(input), Some(form)) = (
+                    text_arg(name, args, 0, arena, params, row, hooks)?,
+                    text_arg(name, args, 1, arena, params, row, hooks)?,
+                ) else {
+                    return Ok(Datum::Null);
+                };
+                let form = NormalizationForm::parse(form)?;
+                if name == "normalize" {
+                    unicode::normalize(input, form, arena).map(Datum::Text)
+                } else {
+                    unicode::is_normalized(input, form, arena).map(Datum::Bool)
+                }
+            }
+            "unicode_version" => {
+                arity(0)?;
+                Ok(Datum::Text("16.0"))
+            }
+            "unicode_assigned" => {
+                arity(1)?;
+                let Some(input) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                Ok(Datum::Bool(input.chars().all(unicode::assigned)))
+            }
+            "unistr" => {
+                arity(1)?;
+                let Some(input) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                unicode::unistr(input, arena).map(Datum::Text)
+            }
+            "casefold" => {
+                arity(1)?;
+                let Some(input) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let collation = resolved_expression_collation(args[0], row, hooks.catalog)?;
+                if uses_full_unicode_case_mapping(collation, hooks)? {
+                    unicode::casefold(input, arena).map(Datum::Text)
+                } else {
+                    let output = arena
+                        .alloc_slice_with(input.len(), |index| {
+                            input.as_bytes()[index].to_ascii_lowercase()
+                        })
+                        .map_err(|_| arena_full())?;
+                    Ok(Datum::Text(unsafe {
+                        core::str::from_utf8_unchecked(output)
+                    }))
+                }
+            }
+            "to_ascii" => {
+                if star || !(1..=2).contains(&args.len()) {
+                    return Err(arity_err(name, args.len()));
+                }
+                let Some(input) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let encoding = if args.len() == 1 {
+                    crate::storage::PgEncoding::UTF8
+                } else {
+                    match text_view(eval_full(args[1], arena, params, row, hooks)?) {
+                        Datum::Null => return Ok(Datum::Null),
+                        Datum::Text(value) => {
+                            crate::storage::PgEncoding::parse(value).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "{} is not a valid encoding name",
+                                    value
+                                )
+                            })?
+                        }
+                        Datum::Int4(value) => u8::try_from(value)
+                            .ok()
+                            .and_then(crate::storage::PgEncoding::from_code)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "{} is not a valid encoding code",
+                                    value
+                                )
+                            })?,
+                        other => return Err(type_mismatch(name, &other)),
+                    }
+                };
+                to_ascii(input, encoding, arena).map(Datum::Text)
+            }
             "length" | "char_length" | "character_length" => {
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
@@ -148,31 +373,12 @@ pub(crate) fn dispatch<'a>(
                     }
                     Datum::Text(s) => {
                         let upper = name == "upper";
-                        // Two passes: measure, then fill the arena slice.
-                        let map_len = |c: char| -> usize {
-                            if upper {
-                                c.to_uppercase().map(char::len_utf8).sum()
-                            } else {
-                                c.to_lowercase().map(char::len_utf8).sum()
-                            }
-                        };
-                        let out_len: usize = s.chars().map(map_len).sum();
-                        let out = arena
-                            .alloc_slice_with(out_len, |_| 0u8)
-                            .map_err(|_| arena_full())?;
-                        let mut at = 0;
-                        for c in s.chars() {
-                            if upper {
-                                for u in c.to_uppercase() {
-                                    at += u.encode_utf8(&mut out[at..]).len();
-                                }
-                            } else {
-                                for u in c.to_lowercase() {
-                                    at += u.encode_utf8(&mut out[at..]).len();
-                                }
-                            }
+                        let collation = resolved_expression_collation(args[0], row, hooks.catalog)?;
+                        if uses_full_unicode_case_mapping(collation, hooks)? {
+                            unicode_case(s, upper, arena).map(Datum::Text)
+                        } else {
+                            ascii_case(s, upper, arena).map(Datum::Text)
                         }
-                        Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
                     }
                     other => Err(type_mismatch(name, &other)),
                 }
@@ -469,34 +675,72 @@ pub(crate) fn dispatch<'a>(
                 let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                // Upper-case the first letter of each word (runs of alphanumerics),
-                // lower-casing the rest — PostgreSQL's rule.
-                let out_len: usize = s
-                    .chars()
-                    .map(|c| {
-                        c.to_uppercase()
-                            .map(char::len_utf8)
-                            .sum::<usize>()
-                            .max(c.len_utf8())
-                    })
-                    .sum::<usize>()
-                    .max(s.len());
+                let collation = resolved_expression_collation(args[0], row, hooks.catalog)?;
+                let unicode_full = uses_full_unicode_case_mapping(collation, hooks)?;
+                // Upper-case the first letter of each word (runs of
+                // alphanumerics), lower-casing the rest.
+                let out_len = if unicode_full {
+                    let mut previous_alphanumeric = false;
+                    s.char_indices()
+                        .map(|(offset, character)| {
+                            let alphanumeric = unicode::alphanumeric(character);
+                            let kind = if alphanumeric && !previous_alphanumeric {
+                                unicode::CaseKind::Title
+                            } else {
+                                unicode::CaseKind::Lower
+                            };
+                            let (mapping, count) =
+                                unicode::case_mapping(character, kind, is_final_sigma(s, offset));
+                            previous_alphanumeric = alphanumeric;
+                            mapping[..usize::from(count)]
+                                .iter()
+                                .map(|codepoint| {
+                                    char::from_u32(*codepoint)
+                                        .expect("valid case map")
+                                        .len_utf8()
+                                })
+                                .sum::<usize>()
+                        })
+                        .sum()
+                } else {
+                    s.len()
+                };
                 let out = arena
                     .alloc_slice_with(out_len, |_| 0u8)
                     .map_err(|_| arena_full())?;
                 let mut at = 0;
                 let mut prev_alnum = false;
-                for c in s.chars() {
-                    let mapped: &mut dyn Iterator<Item = char> =
-                        if c.is_alphanumeric() && !prev_alnum {
-                            &mut c.to_uppercase()
+                for (offset, c) in s.char_indices() {
+                    let alphanumeric = if unicode_full {
+                        unicode::alphanumeric(c)
+                    } else {
+                        c.is_ascii_alphanumeric()
+                    };
+                    if unicode_full {
+                        let kind = if alphanumeric && !prev_alnum {
+                            unicode::CaseKind::Title
                         } else {
-                            &mut c.to_lowercase()
+                            unicode::CaseKind::Lower
                         };
-                    for m in mapped {
-                        at += m.encode_utf8(&mut out[at..]).len();
+                        let (mapping, count) =
+                            unicode::case_mapping(c, kind, is_final_sigma(s, offset));
+                        for codepoint in &mapping[..usize::from(count)] {
+                            let mapped = char::from_u32(*codepoint).expect("valid case map");
+                            at += mapped.encode_utf8(&mut out[at..]).len();
+                        }
+                    } else {
+                        out[at..at + c.len_utf8()]
+                            .copy_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                        if c.is_ascii() {
+                            out[at] = if alphanumeric && !prev_alnum {
+                                out[at].to_ascii_uppercase()
+                            } else {
+                                out[at].to_ascii_lowercase()
+                            };
+                        }
+                        at += c.len_utf8();
                     }
-                    prev_alnum = c.is_alphanumeric();
+                    prev_alnum = alphanumeric;
                 }
                 Ok(Datum::Text(unsafe {
                     core::str::from_utf8_unchecked(&out[..at])

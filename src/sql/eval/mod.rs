@@ -933,6 +933,21 @@ pub trait CatalogAccess {
             "database collation comparator is unavailable"
         ))
     }
+
+    /// Whether this collation selects PostgreSQL's full Unicode case maps.
+    /// Catalog identities need the concrete catalog adapter; treating an
+    /// unknown copied collation as C casing would silently change results.
+    fn uses_full_unicode_case_mapping(&self, collation: Collation) -> Result<bool, SqlError> {
+        match collation {
+            Collation::PgUnicodeFast => Ok(true),
+            Collation::Catalog(_) => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "catalog collation casing is unavailable"
+            )),
+            _ => Ok(false),
+        }
+    }
+
     fn convert_encoding<'a>(
         &self,
         _source: crate::storage::PgEncoding,
@@ -3645,6 +3660,10 @@ pub(crate) fn described_expression_collation<'a>(
         ),
         Some(value) if value.explicit => (value.value, CollationDerivation::Explicit),
         Some(value) => (value.value, CollationDerivation::Implicit),
+        None if static_type(expression, row).is_some_and(ColType::is_collatable) => (
+            crate::sql::ast::Collation::Default,
+            CollationDerivation::Implicit,
+        ),
         None => (crate::sql::ast::Collation::None, CollationDerivation::None),
     })
 }
@@ -3673,6 +3692,9 @@ fn collation_preserving_call(name: &str) -> bool {
         "repeat",
         "concat",
         "concat_ws",
+        "normalize",
+        "casefold",
+        "unistr",
     ]
     .iter()
     .any(|candidate| name.eq_ignore_ascii_case(candidate))

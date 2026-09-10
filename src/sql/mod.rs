@@ -44,6 +44,8 @@ pub(crate) mod two_phase;
 pub mod txn;
 pub mod types;
 pub mod tzif;
+pub(crate) mod unicode;
+mod unicode_data;
 pub mod xml;
 
 use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
@@ -9879,7 +9881,10 @@ impl Engine {
         let transition_collation = |collation| -> Result<_, SqlError> {
             match collation {
                 ast::Collation::None | ast::Collation::Default => Ok(None),
-                ast::Collation::C | ast::Collation::Posix | ast::Collation::UcsBasic => {
+                ast::Collation::C
+                | ast::Collation::Posix
+                | ast::Collation::UcsBasic
+                | ast::Collation::PgUnicodeFast => {
                     Ok(Some(ast::ParsedCollation::Builtin(collation)))
                 }
                 ast::Collation::Catalog(slot) => {

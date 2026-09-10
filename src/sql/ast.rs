@@ -209,6 +209,7 @@ pub enum Collation {
     C,
     Posix,
     UcsBasic,
+    PgUnicodeFast,
     /// A database-local catalog slot. The slot, rather than a spelling, is the
     /// durable identity across rename and schema moves.
     Catalog(u8),
@@ -217,7 +218,13 @@ pub enum Collation {
 impl Collation {
     /// Every built-in catalog collation. `None` is an attribute state, not a
     /// catalog object, so it deliberately cannot appear in this list.
-    pub const BUILTIN: [Self; 4] = [Self::Default, Self::C, Self::Posix, Self::UcsBasic];
+    pub const BUILTIN: [Self; 5] = [
+        Self::Default,
+        Self::C,
+        Self::Posix,
+        Self::UcsBasic,
+        Self::PgUnicodeFast,
+    ];
 
     pub const fn oid(self) -> i32 {
         match self {
@@ -226,6 +233,7 @@ impl Collation {
             Self::C => 950,
             Self::Posix => 951,
             Self::UcsBasic => 962,
+            Self::PgUnicodeFast => 6411,
             Self::Catalog(slot) => 20_000 + slot as i32,
         }
     }
@@ -237,6 +245,7 @@ impl Collation {
             Self::C => "C",
             Self::Posix => "POSIX",
             Self::UcsBasic => "ucs_basic",
+            Self::PgUnicodeFast => "pg_unicode_fast",
             Self::Catalog(_) => "<catalog collation>",
         }
     }
@@ -246,14 +255,14 @@ impl Collation {
             Self::None => "",
             Self::Default => "d",
             Self::C | Self::Posix => "c",
-            Self::UcsBasic => "b",
+            Self::UcsBasic | Self::PgUnicodeFast => "b",
             Self::Catalog(_) => "",
         }
     }
 
     pub const fn encoding(self) -> i32 {
         match self {
-            Self::UcsBasic => 6,
+            Self::UcsBasic | Self::PgUnicodeFast => 6,
             Self::None | Self::Default | Self::C | Self::Posix => -1,
             Self::Catalog(_) => -1,
         }
@@ -263,7 +272,7 @@ impl Collation {
         match self {
             Self::C => "C",
             Self::Posix => "POSIX",
-            Self::None | Self::Default | Self::UcsBasic => "",
+            Self::None | Self::Default | Self::UcsBasic | Self::PgUnicodeFast => "",
             Self::Catalog(_) => "",
         }
     }
@@ -276,6 +285,7 @@ impl Collation {
             Self::UcsBasic => 3,
             Self::None => 4,
             Self::Catalog(slot) => 5 + slot,
+            Self::PgUnicodeFast => 133,
         }
     }
 
@@ -287,6 +297,7 @@ impl Collation {
             3 => Some(Self::UcsBasic),
             4 => Some(Self::None),
             5..=132 => Some(Self::Catalog(code - 5)),
+            133 => Some(Self::PgUnicodeFast),
             _ => None,
         }
     }

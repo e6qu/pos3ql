@@ -27713,6 +27713,14 @@ pub fn create_collation(
                     behavior: CollationBehavior::Bytewise,
                     ..CollationDefinition::EMPTY
                 },
+                crate::sql::ast::Collation::PgUnicodeFast => CollationDefinition {
+                    provider: CollationProvider::Builtin,
+                    encoding: Some(crate::storage::PgEncoding::UTF8),
+                    locale: StackStr::from_str("PG_UNICODE_FAST"),
+                    version: StackStr::from_str("1"),
+                    behavior: CollationBehavior::Bytewise,
+                    ..CollationDefinition::EMPTY
+                },
                 crate::sql::ast::Collation::Default => CollationDefinition {
                     provider: CollationProvider::Default,
                     behavior: CollationBehavior::Database,

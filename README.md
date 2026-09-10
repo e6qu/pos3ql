@@ -55,6 +55,16 @@ agree with PostgreSQL; binary wire/COPY and driver values, generated and check
 expressions, indexes, WAL, checkpoints, and object-cold recovery retain the
 same bounded byte representation.
 
+PostgreSQL 18 text execution includes the complete core scalar and
+set-returning string family, SQL-standard normalization syntax and predicates,
+Unicode 16 normalization/assignment/case folding, Unicode escapes,
+single-byte `to_ascii` transliteration, and integer binary/octal/hex rendering.
+The built-in `pg_unicode_fast` collation selects full Unicode casing while C,
+POSIX, and `ucs_basic` retain PostgreSQL's byte-oriented rules. Exact function
+and collation catalogs, generated/check expressions, indexes, stored views,
+prepared statements, WAL, checkpoints, and object-cold recovery share the same
+startup-bounded representation.
+
 PostgreSQL 18 network addresses include `inet`, `cidr`, `macaddr`, and
 `macaddr8` parsing, formatting, inspection, containment, arithmetic, bitwise
 operations, hashes, and `inet` extrema. Exact procedure, operator, cast,

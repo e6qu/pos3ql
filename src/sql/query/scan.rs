@@ -1169,15 +1169,16 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
         q: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
-        self.inner
-            .column_user_type(q, name)
-            .or_else(|| self.outer.and_then(|o| o.column_user_type(q, name)))
+        if self.inner.col_type(q, name).is_some() {
+            self.inner.column_user_type(q, name)
+        } else {
+            self.outer.and_then(|outer| outer.column_user_type(q, name))
+        }
     }
 
     fn collation(&self, q: Option<&str>, name: &str) -> crate::sql::ast::Collation {
-        let inner = self.inner.collation(q, name);
-        if inner != crate::sql::ast::Collation::None {
-            inner
+        if self.inner.col_type(q, name).is_some() {
+            self.inner.collation(q, name)
         } else {
             self.outer
                 .map(|outer| outer.collation(q, name))

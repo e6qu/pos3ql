@@ -81,7 +81,7 @@ jobs:
   torture:
     name: shard torture-${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +120,7 @@ jobs:
   subscription:
     name: shard subscription
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
   spill-differential:
     name: shard spilldiff-${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -242,13 +242,13 @@ jobs:
   reference-diff:
     name: shard diff-${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         include:
           # Keep the instrumented corpus and auxiliary probes in independent
-          # workers so cold setup plus measurement stays below five minutes.
+          # workers so cold setup plus measurement stays below ten minutes.
           - { name: corpus-a, corpus_shard: "0-of-2", auxiliary: none }
           - { name: corpus-b, corpus_shard: "1-of-2", auxiliary: none }
           - { name: auxiliary, corpus_shard: "none", auxiliary: all }

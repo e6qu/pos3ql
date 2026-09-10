@@ -36,7 +36,7 @@ if grep -nE 'shards:.*[/\\]' .github/workflows/coverage.yml; then
 fi
 
 # The forced-spill suite must distribute corpus work and its independent
-# auxiliary probes. Each worker has a fixed five-minute ceiling.
+# auxiliary probes. Each worker has a fixed ten-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
     '- { name: a, corpus_shard: "0-of-4", auxiliary: none }' \

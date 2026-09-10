@@ -7,6 +7,127 @@
 use super::*;
 
 #[test]
+fn postgresql_18_regular_expressions_are_complete_and_catalogued() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT regexp_replace('abc abc abc','abc','X',5), regexp_replace('abc abc abc','abc','X',5,2), regexp_replace('abc abc abc','abc','X',5,0,''); \
+         SELECT regexp_instr('abc123def456','([0-9]+)',1,2,0,'',1), regexp_instr('abc123def456','([0-9]+)',1,2,1,'',1), regexp_substr('abc123def456','([0-9]+)',1,2,'',1); \
+         SELECT regexp_match('abc-123','([a-z]+)-([0-9]+)'), regexp_match('abc','x') IS NULL; \
+         SELECT regexp_like('a.b','a.b','q'), regexp_like('ab','a # ignored' || chr(10) || ' b','x'), regexp_like(E'a\\nb','^b$','n'), regexp_like(E'a\\nb','a.b','p'), regexp_like(E'a\\nb','a.b','s'); \
+         SELECT 'bbbbb' ~ '^([bc])\\1*$', 'bbc' ~ '^([bc])\\1*$', regexp_match('abc 123','[[:alpha:]]+\\s+[[:digit:]]+'), regexp_match('foo bar','\\mbar\\M'), regexp_match('foobar','foo(?=bar)'), regexp_match('foobaz','foo(?!bar)'), regexp_match('foobar','(?<=foo)b+'); \
+         SELECT regexp_count('åβ',''), regexp_split_to_array('åβ',''); \
+         SELECT similar_to_escape('a%b'), textregexeq('abc','b'), texticregexeq('ABC','abc'); \
+         SELECT regexp_instr(subexpr => 1, flags => '', endoption => 0, \"N\" => 2, start => 1, pattern => '([0-9]+)', string => 'a1b22'), pg_catalog.regexp_count(flags => 'i', start => 1, pattern => 'a', string => 'Aa'); \
+         SELECT regexp_replace(flags => 'g', replacement => 'X', pattern => 'a', string => 'aba'); \
+         SELECT regexp_matches(flags => 'g', pattern => '([0-9]+)', string => 'a1b22'); \
+         SELECT * FROM pg_catalog.regexp_split_to_table(flags => '', pattern => '[0-9]+', string => 'a1b22'); \
+         SELECT count(*) FROM pg_proc WHERE oid IN (79,1024,1238,1239,1240,1241,1252,1254,1256,1364,1818,1820,1821,1823,1824,1826,1827,1829,1986,1987,2284,2285,2763,2764,2765,2766,2767,2768,3396,3397,6251,6252,6253,6254,6255,6256,6257,6258,6259,6260,6261,6262,6263,6264,6265,6266,6267,6268,6269); \
+         SELECT count(*) FROM pg_operator WHERE oid IN (639,640,641,642,1226,1227,1228,1229)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "abc X abc|abc abc X|abc X X",
+            "10|13|456",
+            "{abc,123}|t",
+            "t|t|t|f|t",
+            "t|f|{\"abc 123\"}|{bar}|{foo}|{foo}|{b}",
+            "3|{å,β}",
+            "^(?:a.*b)$|t|t",
+            "4|2",
+            "XbX",
+            "{1}",
+            "{22}",
+            "a",
+            "b",
+            "",
+            "49",
+            "8",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn regular_expression_expressions_survive_object_cold_recovery() {
+    let mut config = test_config("regex-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("regex-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_regex (
+             id integer PRIMARY KEY,
+             source text CHECK (source ~ '^[[:alpha:]]+[0-9]+$'),
+             captures text[] GENERATED ALWAYS AS
+                 (regexp_match(source, '([[:alpha:]]+)([0-9]+)')) STORED,
+             first_number text GENERATED ALWAYS AS
+                 (regexp_substr(source, '([0-9]+)', 1, 1, '', 1)) STORED
+         );
+         CREATE INDEX durable_regex_number ON durable_regex (first_number);
+         CREATE VIEW durable_regex_view AS
+           SELECT id, captures, first_number,
+                  regexp_count(source, '[0-9]') AS digit_count
+           FROM durable_regex;
+         PREPARE durable_regex_query(text) AS
+           SELECT regexp_match($1, '([a-z]+)([0-9]+)'),
+                  regexp_instr($1, '[0-9]+', 1, 1, 1);
+         EXECUTE durable_regex_query('xy42');
+         INSERT INTO durable_regex (id, source) VALUES (1, 'abc123')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let tail = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO durable_regex (id, source) VALUES (2, 'z9')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tail).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tail)
+    );
+    let before = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM durable_regex_view ORDER BY id; \
+         SELECT id FROM durable_regex WHERE first_number = '123'",
+    ));
+    assert_eq!(before, ["1|{abc,123}|123|3", "2|{z,9}|9|1", "1"]);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT * FROM durable_regex_view ORDER BY id; \
+             SELECT id FROM durable_regex WHERE first_number = '123'",
+        )),
+        before
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn postgresql_18_unicode_and_text_completion_is_typed_and_catalogued() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

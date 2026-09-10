@@ -23,8 +23,8 @@ mod operators;
 pub(crate) use args::*;
 
 mod pattern;
-pub(crate) use pattern::regex_split;
-pub use pattern::{like_match, regex_split_pub, regexp_flags};
+pub(crate) use pattern::regex_split_with_options;
+pub use pattern::{like_match, regex_split_pub_with_options, regexp_options};
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
 pub(crate) use operators::arithmetic;
@@ -3766,7 +3766,7 @@ impl CallSyntax<'static, 'static> {
 }
 
 fn call<'a>(
-    name: &str,
+    written_name: &str,
     args: &[&'a Expr<'a>],
     syntax: CallSyntax<'_, '_>,
     arena: &'a Arena,
@@ -3779,6 +3779,38 @@ fn call<'a>(
         variadic,
         star,
     } = syntax;
+    let regex_srf_name = match written_name.split_once('.') {
+        Some(("pg_catalog", name))
+            if matches!(name, "regexp_matches" | "regexp_split_to_table") =>
+        {
+            Some(name)
+        }
+        None if matches!(written_name, "regexp_matches" | "regexp_split_to_table") => {
+            Some(written_name)
+        }
+        _ => None,
+    };
+    let mut reordered = [&Expr::Null; 3];
+    let args = if let Some(name) = regex_srf_name
+        && argument_names.iter().any(Option::is_some)
+    {
+        let parameters: &[&str] = match args.len() {
+            2 => &["string", "pattern"],
+            3 => &["string", "pattern", "flags"],
+            _ => return Err(arity_err(name, args.len())),
+        };
+        reorder_required_arguments(
+            name,
+            args,
+            argument_names,
+            parameters,
+            &mut reordered[..args.len()],
+        )?;
+        &reordered[..args.len()]
+    } else {
+        args
+    };
+    let name = regex_srf_name.unwrap_or(written_name);
     let arity = |n: usize| -> Result<(), SqlError> {
         if args.len() != n || star {
             Err(sql_err!(
@@ -3875,8 +3907,8 @@ fn call<'a>(
     {
         return result;
     }
-    if argument_names.is_empty()
-        && let Some(result) = funcs::regex::dispatch(name, args, star, arena, params, row, hooks)
+    if let Some(result) =
+        funcs::regex::dispatch(name, args, argument_names, star, arena, params, row, hooks)
     {
         return result;
     }
@@ -4149,13 +4181,18 @@ fn call<'a>(
             } else {
                 ""
             };
-            let (global, ci) = regexp_flags(flags)?;
+            let parsed = regexp_options(flags)?;
             let mut spans = [(-1i64, -1i64); super::regex::MAX_GROUPS];
             let mut from = 0usize;
             let mut count = 0usize;
             loop {
-                let Some(((mstart, mend), ng)) =
-                    super::regex::find_captures(pattern, string, from, ci, &mut spans)?
+                let Some(((mstart, mend), ng)) = super::regex::find_captures_with_options(
+                    pattern,
+                    string,
+                    from,
+                    parsed.options,
+                    &mut spans,
+                )?
                 else {
                     return Ok(Datum::Null);
                 };
@@ -4181,13 +4218,13 @@ fn call<'a>(
                         raw: super::array::build(&elems[..n], arena)?,
                     });
                 }
-                if !global {
+                if !parsed.global {
                     return Ok(Datum::Null);
                 }
-                from = if mend > mstart { mend } else { mend + 1 };
-                if from > string.len() {
+                let Some(next) = super::regex::next_match_from(string, mstart, mend) else {
                     return Ok(Datum::Null);
-                }
+                };
+                from = next;
             }
         }
         // Set-returning `_pg_expandarray(array)` yields, for the current expansion
@@ -4235,15 +4272,21 @@ fn call<'a>(
             ) else {
                 return Ok(Datum::Null);
             };
-            let case_insensitive = if args.len() == 3 {
+            let parsed = if args.len() == 3 {
                 let Some(flags) = text_arg(name, args, 2, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                regexp_flags(flags)?.1
+                regexp_options(flags)?
             } else {
-                false
+                regexp_options("")?
             };
-            let pieces = regex_split_pub(src, pat, case_insensitive, arena)?;
+            if parsed.global {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "regexp_split_to_table() does not support the \"global\" option"
+                ));
+            }
+            let pieces = regex_split_pub_with_options(src, pat, parsed.options, arena)?;
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

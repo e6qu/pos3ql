@@ -30,7 +30,7 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("_pg_expandarray")
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
-        || name.eq_ignore_ascii_case("regexp_matches")
+        || regex_srf_name(name).is_some()
         || name.eq_ignore_ascii_case("jsonb_object_keys")
         || name.eq_ignore_ascii_case("json_object_keys")
         || name.eq_ignore_ascii_case("jsonb_array_elements")
@@ -41,7 +41,6 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("jsonb_path_query_tz")
         || name.eq_ignore_ascii_case("json_populate_recordset")
         || name.eq_ignore_ascii_case("jsonb_populate_recordset")
-        || name.eq_ignore_ascii_case("regexp_split_to_table")
         || name.eq_ignore_ascii_case("string_to_table")
         || name.eq_ignore_ascii_case("generate_subscripts")
         || name.eq_ignore_ascii_case("pg_snapshot_xip")
@@ -54,6 +53,19 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("ts_debug")
         || name.eq_ignore_ascii_case("ts_stat")
         || is_json_each_name(name)
+}
+
+fn regex_srf_name(name: &str) -> Option<&str> {
+    match name.split_once('.') {
+        Some((schema, routine))
+            if schema == "pg_catalog"
+                && matches!(routine, "regexp_matches" | "regexp_split_to_table") =>
+        {
+            Some(routine)
+        }
+        None if matches!(name, "regexp_matches" | "regexp_split_to_table") => Some(name),
+        _ => None,
+    }
 }
 
 fn is_event_trigger_introspection(name: &str) -> bool {
@@ -1207,9 +1219,47 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     row: &R,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<usize, SqlError> {
-    let Expr::Call { name, args, .. } = call else {
+    let Expr::Call {
+        name,
+        args,
+        argument_names,
+        ..
+    } = call
+    else {
         return Ok(1);
     };
+    let Some(regex_name) = regex_srf_name(name) else {
+        return srf_count_positional(name, args, arena, params, row, hooks);
+    };
+    let mut reordered = [&Expr::Null; 3];
+    let args = if argument_names.iter().any(Option::is_some) {
+        let parameters: &[&str] = match args.len() {
+            2 => &["string", "pattern"],
+            3 => &["string", "pattern", "flags"],
+            _ => return Err(srf_signature_error(regex_name)),
+        };
+        crate::sql::eval::reorder_required_arguments(
+            regex_name,
+            args,
+            argument_names,
+            parameters,
+            &mut reordered[..args.len()],
+        )?;
+        &reordered[..args.len()]
+    } else {
+        args
+    };
+    srf_count_positional(regex_name, args, arena, params, row, hooks)
+}
+
+fn srf_count_positional<'a, R: ColumnLookup<'a>>(
+    name: &str,
+    args: &[&'a Expr<'a>],
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<usize, SqlError> {
     if is_event_trigger_introspection(name) {
         require_no_arguments(name, args)?;
         return if name.eq_ignore_ascii_case("pg_event_trigger_ddl_commands") {
@@ -1343,21 +1393,25 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
         } else {
             ""
         };
-        let (global, ci) = crate::sql::eval::regexp_flags(flags)?;
+        let parsed = crate::sql::eval::regexp_options(flags)?;
         let mut spans = [(-1i64, -1i64); crate::sql::regex::MAX_GROUPS];
         let mut from = 0usize;
         let mut n = 0usize;
-        while let Some(((mstart, mend), _)) =
-            crate::sql::regex::find_captures(pattern, string, from, ci, &mut spans)?
-        {
+        while let Some(((mstart, mend), _)) = crate::sql::regex::find_captures_with_options(
+            pattern,
+            string,
+            from,
+            parsed.options,
+            &mut spans,
+        )? {
             n += 1;
-            if !global {
+            if !parsed.global {
                 break;
             }
-            from = if mend > mstart { mend } else { mend + 1 };
-            if from > string.len() {
+            let Some(next) = crate::sql::regex::next_match_from(string, mstart, mend) else {
                 break;
-            }
+            };
+            from = next;
         }
         Ok(n)
     } else if name.eq_ignore_ascii_case("jsonb_path_query")
@@ -1533,16 +1587,22 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
             (Datum::Null, _) | (_, Datum::Null) => return Ok(0),
             _ => return Err(srf_signature_error(name)),
         };
-        let ci = if args.len() == 3 {
+        let parsed = if args.len() == 3 {
             match crate::sql::eval::text_view(eval_full(args[2], arena, params, row, hooks)?) {
-                Datum::Text(f) => crate::sql::eval::regexp_flags(f)?.1,
+                Datum::Text(f) => crate::sql::eval::regexp_options(f)?,
                 Datum::Null => return Ok(0),
                 _ => return Err(srf_signature_error(name)),
             }
         } else {
-            false
+            crate::sql::eval::regexp_options("")?
         };
-        Ok(crate::sql::eval::regex_split_pub(src, pat, ci, arena)?.len())
+        if parsed.global {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "regexp_split_to_table() does not support the \"global\" option"
+            ));
+        }
+        Ok(crate::sql::eval::regex_split_pub_with_options(src, pat, parsed.options, arena)?.len())
     } else if name.eq_ignore_ascii_case("string_to_table") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
@@ -3189,7 +3249,34 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             statement_arena,
         );
     }
-    let args = tref.func_args.expect("table function carries arguments");
+    let written_args = tref.func_args.expect("table function carries arguments");
+    let regex_name = tref
+        .schema
+        .is_none_or(|schema| schema == "pg_catalog")
+        .then_some(tref.table)
+        .filter(|name| matches!(*name, "regexp_matches" | "regexp_split_to_table"));
+    let mut reordered = [&Expr::Null; 3];
+    let args = if let Some(name) = regex_name
+        && tref.func_argument_names.iter().any(Option::is_some)
+    {
+        let parameters: &[&str] = match written_args.len() {
+            2 => &["string", "pattern"],
+            3 => &["string", "pattern", "flags"],
+            _ => return Err(srf_signature_error(name)),
+        };
+        crate::sql::eval::reorder_required_arguments(
+            name,
+            written_args,
+            tref.func_argument_names,
+            parameters,
+            &mut reordered[..written_args.len()],
+        )?;
+        &*arena
+            .alloc_slice_copy(&reordered[..written_args.len()])
+            .map_err(|_| arena_full())?
+    } else {
+        written_args
+    };
     if is_event_trigger_introspection(tref.table) {
         return event_trigger_rows(tref.table, args, storage, txid, arena);
     }
@@ -3808,7 +3895,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         return Ok(&*rows);
     }
     // regexp_split_to_table(string, pattern [, flags]): one text row per piece.
-    if tref.table.eq_ignore_ascii_case("regexp_split_to_table") {
+    if regex_name == Some("regexp_split_to_table") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -3823,16 +3910,23 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             (Datum::Null, _) | (_, Datum::Null) => return Ok(&[]),
             _ => return Err(srf_signature_error(tref.table)),
         };
-        let case_insensitive = if args.len() == 3 {
+        let parsed = if args.len() == 3 {
             match crate::sql::eval::text_view(eval_argument(args[2])?) {
-                Datum::Text(f) => crate::sql::eval::regexp_flags(f)?.1,
+                Datum::Text(f) => crate::sql::eval::regexp_options(f)?,
                 Datum::Null => return Ok(&[]),
                 _ => return Err(srf_signature_error(tref.table)),
             }
         } else {
-            false
+            crate::sql::eval::regexp_options("")?
         };
-        let pieces = crate::sql::eval::regex_split_pub(src, pat, case_insensitive, arena)?;
+        if parsed.global {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "regexp_split_to_table() does not support the \"global\" option"
+            ));
+        }
+        let pieces =
+            crate::sql::eval::regex_split_pub_with_options(src, pat, parsed.options, arena)?;
         const EMPTY: &[u8] = &[];
         let rows = arena
             .alloc_slice_with(pieces.len(), |_| EMPTY)
@@ -3895,7 +3989,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     }
     // regexp_matches(string, pattern [, flags]): one row per match, each a
     // text[] of the capture groups (or the whole match when there are no groups).
-    if tref.table.eq_ignore_ascii_case("regexp_matches") {
+    if regex_name == Some("regexp_matches") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
@@ -3918,16 +4012,20 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         } else {
             ""
         };
-        let (global, ci) = crate::sql::eval::regexp_flags(flags)?;
+        let parsed = crate::sql::eval::regexp_options(flags)?;
         // Collect each match's encoded text[] row.
         const EMPTY: &[u8] = &[];
         let mut rows = [EMPTY; crate::sql::parser::MAX_LIST];
         let mut n = 0usize;
         let mut spans = [(-1i64, -1i64); crate::sql::regex::MAX_GROUPS];
         let mut from = 0usize;
-        while let Some(((mstart, mend), ng)) =
-            crate::sql::regex::find_captures(pattern, string, from, ci, &mut spans)?
-        {
+        while let Some(((mstart, mend), ng)) = crate::sql::regex::find_captures_with_options(
+            pattern,
+            string,
+            from,
+            parsed.options,
+            &mut spans,
+        )? {
             let mut elems = [Datum::Null; crate::sql::regex::MAX_GROUPS];
             let count = if ng == 0 {
                 elems[0] = Datum::Text(&string[mstart..mend]);
@@ -3954,13 +4052,13 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             }
             rows[n] = crate::sql::exec::encode_projected_pub(&[arr], arena)?;
             n += 1;
-            if !global {
+            if !parsed.global {
                 break;
             }
-            from = if mend > mstart { mend } else { mend + 1 };
-            if from > string.len() {
+            let Some(next) = crate::sql::regex::next_match_from(string, mstart, mend) else {
                 break;
-            }
+            };
+            from = next;
         }
         let out = arena
             .alloc_slice_with(n, |i| rows[i])

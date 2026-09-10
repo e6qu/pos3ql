@@ -364,6 +364,9 @@ pub enum ColType {
     /// PostgreSQL WAL position (`pg_lsn`, OID 3220), retained as an unsigned
     /// 64-bit value so the high half cannot become a negative SQL integer.
     PgLsn,
+    /// PostgreSQL access-control entry. Runtime values retain role OIDs and a
+    /// canonical text cache behind one bounded self-describing byte view.
+    AclItem,
     /// PostgreSQL `money`, stored as an exact signed count of cents.
     Money,
     /// PostgreSQL tuple physical-location value (`tid`, OID 27).
@@ -552,6 +555,7 @@ impl BtreeOperatorClass {
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
             PgLsn => Self::PgLsn,
+            AclItem => return None,
             Money => Self::Money,
             Tid => Self::Tid,
             Cid => return None,
@@ -836,6 +840,7 @@ impl ColType {
             "pg_snapshot" => Self::PgSnapshot,
             "txid_snapshot" => Self::TxidSnapshot,
             "pg_lsn" => Self::PgLsn,
+            "aclitem" => Self::AclItem,
             "money" => Self::Money,
             "tid" => Self::Tid,
             "cid" => Self::Cid,
@@ -888,6 +893,7 @@ impl ColType {
             Self::PgSnapshot => oid::PG_SNAPSHOT,
             Self::TxidSnapshot => oid::TXID_SNAPSHOT,
             Self::PgLsn => oid::PG_LSN,
+            Self::AclItem => oid::ACLITEM,
             Self::Money => oid::MONEY,
             Self::Tid => oid::TID,
             Self::Cid => oid::CID,
@@ -964,6 +970,7 @@ impl ColType {
             oid::PG_SNAPSHOT => Some(Self::PgSnapshot),
             oid::TXID_SNAPSHOT => Some(Self::TxidSnapshot),
             oid::PG_LSN => Some(Self::PgLsn),
+            oid::ACLITEM => Some(Self::AclItem),
             oid::MONEY => Some(Self::Money),
             oid::TID => Some(Self::Tid),
             oid::CID => Some(Self::Cid),
@@ -1109,6 +1116,7 @@ impl ColType {
             | Self::Time => 8,
             Self::Timetz => 12,
             Self::Interval => 16,
+            Self::AclItem => 16,
             Self::Uuid => 16,
             Self::Macaddr => 6,
             Self::Macaddr8 => 8,
@@ -1150,6 +1158,7 @@ impl ColType {
             | Self::PgDependencies
             | Self::PgMcvList
             | Self::PgStatisticArray => Self::Text,
+            Self::AclItem => Self::Text,
             Self::Oid | Self::Xid => Self::Int4,
             Self::Xid8 => self,
             Self::Money => self,
@@ -1192,6 +1201,7 @@ impl ColType {
             Self::PgSnapshot => "pg_snapshot",
             Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
+            Self::AclItem => "aclitem",
             Self::Money => "money",
             Self::Tid => "tid",
             Self::Cid => "cid",
@@ -1276,6 +1286,7 @@ impl ColType {
             Self::PgSnapshot => "pg_snapshot",
             Self::TxidSnapshot => "txid_snapshot",
             Self::PgLsn => "pg_lsn",
+            Self::AclItem => "aclitem",
             Self::Money => "money",
             Self::Tid => "tid",
             Self::Cid => "cid",
@@ -1347,6 +1358,7 @@ impl ColType {
             Self::PgSnapshot => 236,
             Self::TxidSnapshot => 237,
             Self::PgLsn => 79,
+            Self::AclItem => 244,
             Self::Money => 238,
             Self::Tid => 242,
             Self::Cid => 243,
@@ -1438,6 +1450,7 @@ impl ColType {
             236 => Self::PgSnapshot,
             237 => Self::TxidSnapshot,
             79 => Self::PgLsn,
+            244 => Self::AclItem,
             238 => Self::Money,
             242 => Self::Tid,
             243 => Self::Cid,
@@ -1978,6 +1991,7 @@ impl ArrElem {
             ColType::PgSnapshot => return Some(ArrElem::PgSnapshot),
             ColType::TxidSnapshot => return Some(ArrElem::TxidSnapshot),
             ColType::PgLsn => return Some(ArrElem::PgLsn),
+            ColType::AclItem => return Some(ArrElem::AclItem),
             ColType::Money => return Some(ArrElem::Money),
             // real keeps its identity — storage() would fold it to float8.
             ColType::Float4 => return Some(ArrElem::Float4),
@@ -2052,7 +2066,7 @@ impl ArrElem {
             ArrElem::Int8 => ColType::Int8,
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
-            ArrElem::AclItem => ColType::Text,
+            ArrElem::AclItem => ColType::AclItem,
             ArrElem::Numeric => ColType::Numeric,
             ArrElem::Date => ColType::Date,
             ArrElem::Timestamp => ColType::Timestamp,
@@ -2828,6 +2842,47 @@ impl RangeKind {
 }
 
 /// A runtime value. Text borrows from the statement arena or storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AclItem<'a> {
+    raw: &'a [u8],
+}
+
+impl<'a> AclItem<'a> {
+    pub const HEADER_LEN: usize = 12;
+
+    pub fn from_raw(raw: &'a [u8]) -> Option<Self> {
+        if raw.len() < Self::HEADER_LEN || core::str::from_utf8(&raw[Self::HEADER_LEN..]).is_err() {
+            return None;
+        }
+        let item = Self { raw };
+        (item.grant_options() & !item.privileges() == 0).then_some(item)
+    }
+
+    pub const fn raw(self) -> &'a [u8] {
+        self.raw
+    }
+
+    pub fn grantee(self) -> u32 {
+        u32::from_le_bytes(self.raw[..4].try_into().expect("aclitem header"))
+    }
+
+    pub fn grantor(self) -> u32 {
+        u32::from_le_bytes(self.raw[4..8].try_into().expect("aclitem header"))
+    }
+
+    pub fn privileges(self) -> u16 {
+        u16::from_le_bytes(self.raw[8..10].try_into().expect("aclitem header"))
+    }
+
+    pub fn grant_options(self) -> u16 {
+        u16::from_le_bytes(self.raw[10..12].try_into().expect("aclitem header"))
+    }
+
+    pub fn text(self) -> &'a str {
+        core::str::from_utf8(&self.raw[Self::HEADER_LEN..]).expect("validated aclitem text")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Datum<'a> {
     Null,
@@ -2870,6 +2925,8 @@ pub enum Datum<'a> {
     /// ASCII from being silently transformed or rejected.
     Char(u8),
     Text(&'a str),
+    /// PostgreSQL stores role OIDs, not role names, in an access-control item.
+    AclItem(AclItem<'a>),
     /// A `char(n)` value, blank-padded to its declared width. The padding is
     /// part of the value (PostgreSQL emits `max(c)` padded even when the
     /// result typmod is -1), but it is *semantically* insignificant: casts to
@@ -3036,6 +3093,7 @@ impl<'a> Datum<'a> {
             Datum::Float8(_) => oid::FLOAT8,
             Datum::Char(_) => oid::CHAR,
             Datum::Text(_) => oid::TEXT,
+            Datum::AclItem(_) => oid::ACLITEM,
             Datum::Bpchar(_) => oid::BPCHAR,
             Datum::Regtype { .. } => oid::REGTYPE,
             Datum::RegObject { type_oid, .. } => *type_oid,
@@ -3221,6 +3279,7 @@ impl fmt::Display for Datum<'_> {
             | Datum::Bpchar(s)
             | Datum::Regtype { name: s, .. }
             | Datum::RegObject { name: s, .. } => f.write_str(s),
+            Datum::AclItem(item) => f.write_str(item.text()),
             Datum::Date(d) => f.write_str(super::datetime::format_date(*d).as_str()),
             Datum::Timestamp(t) => {
                 f.write_str(super::datetime::format_timestamp(*t, false).as_str())

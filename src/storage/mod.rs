@@ -384,6 +384,10 @@ pub enum OwnedDatum {
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
     PgLsn(u64),
+    AclItem {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Money(i64),
     Int8(i64),
     Regtype {
@@ -601,6 +605,10 @@ impl OwnedDatum {
                 }
             }
             Datum::PgLsn(v) => Self::PgLsn(*v),
+            Datum::AclItem(item) => {
+                let (len, bytes) = Self::bytes(item.raw(), "aclitem")?;
+                Self::AclItem { len, bytes }
+            }
             Datum::Money(v) => Self::Money(*v),
             Datum::Int2(v) => Self::Int4(*v as i32),
             Datum::Int8(v) => Self::Int8(*v),
@@ -732,6 +740,10 @@ impl OwnedDatum {
                 legacy: *legacy,
             },
             Self::PgLsn(v) => Datum::PgLsn(*v),
+            Self::AclItem { len, bytes } => Datum::AclItem(
+                crate::sql::acl::from_stored(&bytes[..*len as usize])
+                    .expect("stored from a valid aclitem"),
+            ),
             Self::Money(v) => Datum::Money(*v),
             Self::Int8(v) => Datum::Int8(*v),
             Self::Regtype {
@@ -17227,6 +17239,10 @@ impl Storage {
         } else {
             (PrivilegeSet::NONE, PrivilegeSet::NONE)
         }
+    }
+
+    pub(crate) fn acl_entry_visible(&self, slot: usize, txid: u32) -> bool {
+        Self::acl_visible(&self.acl_entries[slot], txid).0
     }
 
     pub(crate) fn commit_acl(&mut self, slot: usize, txid: u32) {

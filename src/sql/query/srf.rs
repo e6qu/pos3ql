@@ -46,6 +46,7 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("pg_snapshot_xip")
         || name.eq_ignore_ascii_case("txid_snapshot_xip")
         || name.eq_ignore_ascii_case("pg_options_to_table")
+        || name.eq_ignore_ascii_case("aclexplode")
         || name.eq_ignore_ascii_case("pg_get_sequence_data")
         || name.eq_ignore_ascii_case("pg_get_publication_tables")
         || name.eq_ignore_ascii_case("ts_parse")
@@ -1336,6 +1337,18 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             };
             crate::sql::eval::numeric_series_count(start, stop, step, arena)
         }
+    } else if name.eq_ignore_ascii_case("aclexplode") {
+        if args.len() != 1 {
+            return Err(srf_signature_error(name));
+        }
+        match eval_full(args[0], arena, params, row, hooks)? {
+            Datum::Array {
+                element: crate::sql::types::ArrElem::AclItem,
+                raw,
+            } => crate::sql::acl::explode_count(raw),
+            Datum::Null => Ok(0),
+            _ => Err(srf_signature_error(name)),
+        }
     } else if name.eq_ignore_ascii_case("pg_options_to_table") {
         if args.len() != 1 {
             return Err(sql_err!(
@@ -2443,6 +2456,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || tref.table.eq_ignore_ascii_case("txid_snapshot_xip");
     let is_stt = tref.table.eq_ignore_ascii_case("string_to_table");
     let is_options = tref.table.eq_ignore_ascii_case("pg_options_to_table");
+    let is_acl_explode = tref.table.eq_ignore_ascii_case("aclexplode");
     let is_sequence_data = tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
     let is_publication_tables = tref.table.eq_ignore_ascii_case("pg_get_publication_tables");
     let is_ts_parse = tref.table.eq_ignore_ascii_case("ts_parse");
@@ -2467,6 +2481,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_snapshot_xip
         || is_stt
         || is_options
+        || is_acl_explode
         || is_sequence_data
         || is_publication_tables
         || is_ts_parse
@@ -2800,6 +2815,29 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             crate::sql::ast::Collation::None,
         );
         2
+    } else if is_acl_explode {
+        for (index, (name, ctype)) in [
+            ("grantor", ColType::Oid),
+            ("grantee", ColType::Oid),
+            ("privilege_type", ColType::Text),
+            ("is_grantable", ColType::Bool),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            default_cols[index] = table_function_column(
+                SqlName::parse(name)?,
+                ctype,
+                None,
+                -1,
+                if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            );
+        }
+        4
     } else if is_options {
         default_cols[0] = table_function_column(
             SqlName::parse("option_name")?,
@@ -3775,6 +3813,43 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             .alloc_slice_copy(&[encoded])
             .map(|rows| &*rows)
             .map_err(|_| arena_full());
+    }
+    if tref.table.eq_ignore_ascii_case("aclexplode") {
+        if args.len() != 1 {
+            return Err(srf_signature_error(tref.table));
+        }
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+        };
+        let raw = match eval_full(args[0], arena, params, columns, &hooks)? {
+            Datum::Array {
+                element: crate::sql::types::ArrElem::AclItem,
+                raw,
+            } => raw,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(srf_signature_error(tref.table)),
+        };
+        let count = crate::sql::acl::explode_count(raw)?;
+        const EMPTY: &[u8] = &[];
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (index, slot) in rows.iter_mut().enumerate() {
+            let value = crate::sql::acl::explode_at(raw, index, &catalog, arena)?
+                .expect("ACL count fixes every expansion index");
+            *slot = crate::sql::exec::encode_projected_pub(
+                &[
+                    Datum::Oid(value.grantor),
+                    Datum::Oid(value.grantee),
+                    Datum::Text(value.privilege),
+                    Datum::Bool(value.grantable),
+                ],
+                arena,
+            )?;
+        }
+        return Ok(&*rows);
     }
     // pg_options_to_table(text[]): split each `name=value` option into the
     // two catalog columns used by pg_dump for FDW and per-column options.

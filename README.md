@@ -97,6 +97,18 @@ are visible to clients. A local heap `ctid` system column is not synthesized:
 object-native row identities are not PostgreSQL heap-version addresses, so a
 reference fails explicitly instead of returning a stable but incorrect value.
 
+PostgreSQL `aclitem` values retain grantee and grantor OIDs independently from
+their rendered names, so scalar values, arrays, and defaults follow role renames
+and fall back to numeric OIDs after role removal across WAL, checkpoints, and
+object-cold recovery. ACL input/output, containment, equality, hashes,
+`makeaclitem`, `aclexplode`, and `pg_get_acl` share the object-privilege catalog
+boundary, including foreign-data wrappers, foreign servers, and large objects.
+
+PostgreSQL `pg_lsn` is a first-class unsigned WAL-position value across scalar
+and array SQL, comparisons, numeric arithmetic, hashes, extrema, indexes,
+catalogs, text wire/COPY, rows, WAL, checkpoints, and object-cold recovery.
+Physical WAL inspection remains an explicit object-native architecture boundary.
+
 PostgreSQL 18 UUIDs include strict flexible-form input, cryptographically
 random `gen_random_uuid()`/`uuidv4()`, monotonic sub-millisecond `uuidv7()`
 with timezone-aware interval shifts, and version/timestamp extraction for RFC

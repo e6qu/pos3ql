@@ -1,6 +1,7 @@
 //! SQL front end: lexer → parser → execution, and the engine entry point
 //! the wire protocol calls.
 
+pub mod acl;
 pub mod array;
 pub mod ast;
 pub mod catalog;
@@ -24,6 +25,7 @@ pub(crate) mod large_object;
 pub mod lexer;
 pub(crate) mod lock;
 pub(crate) mod logical_replication;
+pub mod lsn;
 pub mod md5;
 pub mod money;
 pub mod net;

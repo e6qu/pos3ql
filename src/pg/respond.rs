@@ -47,6 +47,14 @@ impl ResultFmt {
         self.n
     }
 
+    pub(crate) fn any_binary(&self) -> bool {
+        match self.n {
+            0 => false,
+            1 => self.codes[0],
+            n => self.codes[..usize::from(n)].iter().any(|code| *code),
+        }
+    }
+
     /// Whether column `col` is requested in binary.
     pub(crate) fn is_binary(&self, col: usize) -> bool {
         match self.n {
@@ -362,6 +370,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Timetz(..) => 12,
         Datum::Interval(_) | Datum::Uuid(_) => 16,
         Datum::Text(text) | Datum::Bpchar(text) => text.len(),
+        Datum::AclItem(_) => unreachable!("aclitem has no binary output function"),
         Datum::Xml(text) => {
             let mut length = 0usize;
             crate::sql::xml::write_output(text, |part| length = length.saturating_add(part.len()));
@@ -1287,6 +1296,9 @@ impl<'b> Responder<'b> {
                 }
                 Datum::PgDdlCommand => {
                     unreachable!("pg_ddl_command output is rejected before encoding")
+                }
+                Datum::AclItem(_) => {
+                    unreachable!("aclitem has no binary output function")
                 }
                 Datum::Bool(b) => {
                     m.i32(1);

@@ -8171,14 +8171,20 @@ fn apply_default_privileges_to_new_object(
                 .0
     });
 
-    for role_index in 0..=MAX_ROLES {
-        let grantee = if role_index == MAX_ROLES {
-            PUBLIC_ROLE
-        } else {
-            if !storage.role(role_index).visible_to(txn.txid) {
-                continue;
+    // PostgreSQL places a customized PUBLIC default before the owner entry,
+    // followed by named grantees. Preserve that construction order because
+    // aclitem arrays expose it, unlike grants made after object creation.
+    for role_index in 0..MAX_ROLES + 2 {
+        let grantee = match role_index {
+            0 => PUBLIC_ROLE,
+            1 => owner,
+            index => {
+                let index = index - 2;
+                if index == owner as usize || !storage.role(index).visible_to(txn.txid) {
+                    continue;
+                }
+                index as u16
             }
-            role_index as u16
         };
         let (global_defined, _, _) =
             storage.default_acl_state(owner, DEFAULT_ACL_ALL_SCHEMAS, class, grantee, txn.txid);
@@ -50943,7 +50949,23 @@ pub(crate) fn decode_binary_input<'a>(
 /// domains and user arrays merely because their identity is not a built-in
 /// [`ColType`].
 pub(crate) fn binary_output_type_supported(storage: &Storage, oid: i32, txid: u32) -> bool {
-    resolve_parameter_input_type(storage, oid, txid).is_ok()
+    match resolve_parameter_input_type(storage, oid, txid) {
+        Ok(ParameterInputType::Builtin(
+            ColType::AclItem | ColType::Array(crate::sql::types::ArrElem::AclItem),
+        ))
+        | Ok(ParameterInputType::Domain {
+            base: ColType::AclItem,
+            ..
+        })
+        | Ok(ParameterInputType::DomainArray(crate::sql::types::ArrElem::AclItem)) => false,
+        Ok(ParameterInputType::DomainArray(element))
+            if element.to_coltype() == ColType::AclItem =>
+        {
+            false
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 /// Decodes a UTF-8 text Bind value according to its declared PostgreSQL type.
@@ -51045,7 +51067,7 @@ fn decode_binary_field_with_context<'a>(
     };
     let via = |oid| crate::pg::conn::decode_binary_param(oid, bytes, arena).map_err(|_| bad());
     match ctype {
-        ColType::Void | ColType::Internal | ColType::PgDdlCommand => Err(bad()),
+        ColType::Void | ColType::Internal | ColType::PgDdlCommand | ColType::AclItem => Err(bad()),
         ColType::Bool => via(oids::BOOL),
         ColType::Int2 => {
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;
@@ -52002,6 +52024,15 @@ pub fn copy_out_query(
     if fmt.binary {
         for c in &columns[..n] {
             if !binary_output_type_supported(storage, c.type_oid, txid) {
+                if matches!(
+                    c.type_oid,
+                    crate::sql::types::oid::ACLITEM | crate::sql::types::oid::ACLITEM_ARRAY
+                ) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "no binary output function available for type aclitem"
+                    ));
+                }
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "COPY BINARY cannot send a column of type oid {}",

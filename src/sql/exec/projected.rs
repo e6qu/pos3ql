@@ -150,6 +150,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Macaddr(_) => 6,
         Datum::Macaddr8(_) => 8,
         Datum::Text(s) | Datum::Bpchar(s) | Datum::Xml(s) => 4 + s.len(),
+        Datum::AclItem(item) => 4 + item.raw().len(),
         Datum::TsVector(text) => 4 + text.len(),
         Datum::TsQuery(text) => 4 + text.len(),
         Datum::Regtype { name, .. } => 8 + name.len(),
@@ -271,6 +272,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[0] = 48;
             out[1..5].copy_from_slice(&x.to_le_bytes());
             5
+        }
+        Datum::AclItem(item) => {
+            out[0] = 49;
+            out[1..5].copy_from_slice(&(item.raw().len() as u32).to_le_bytes());
+            out[5..5 + item.raw().len()].copy_from_slice(item.raw());
+            5 + item.raw().len()
         }
         Datum::Int2(x) => {
             out[0] = 22;
@@ -635,6 +642,16 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             Datum::Cid(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),
             4,
         ),
+        49 => {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (
+                Datum::AclItem(
+                    crate::sql::acl::from_stored(&bytes[at + 4..at + 4 + len])
+                        .expect("encoded from a valid aclitem"),
+                ),
+                4 + len,
+            )
+        }
         3 => (
             Datum::Int8(i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())),
             8,

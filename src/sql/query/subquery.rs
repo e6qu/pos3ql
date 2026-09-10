@@ -2050,7 +2050,8 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         | ColType::PgNdistinct
         | ColType::PgDependencies
         | ColType::PgMcvList
-        | ColType::PgStatisticArray => Datum::Text(""),
+        | ColType::PgStatisticArray
+        | ColType::AclItem => Datum::Text(""),
         ColType::Oid | ColType::Xid => Datum::Oid(0),
         ColType::Xid8 => Datum::Xid8(0),
         ColType::PgSnapshot | ColType::TxidSnapshot => Datum::Snapshot {

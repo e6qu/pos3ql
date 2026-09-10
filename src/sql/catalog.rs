@@ -1537,6 +1537,219 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "v",
     },
+    // PostgreSQL 18 pg_lsn input/output, comparison, arithmetic, hash, cast,
+    // and ordered aggregate support.
+    intrinsic!(
+        3165,
+        "pg_wal_lsn_diff",
+        super::types::oid::NUMERIC,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(3229, "pg_lsn_in", super::types::oid::PG_LSN, "2275", 1, "i"),
+    intrinsic!(3230, "pg_lsn_out", 2275, "3220", 1, "i"),
+    intrinsic!(
+        3231,
+        "pg_lsn_lt",
+        super::types::oid::BOOL,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3232,
+        "pg_lsn_le",
+        super::types::oid::BOOL,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3233,
+        "pg_lsn_eq",
+        super::types::oid::BOOL,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3234,
+        "pg_lsn_ge",
+        super::types::oid::BOOL,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3235,
+        "pg_lsn_gt",
+        super::types::oid::BOOL,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3236,
+        "pg_lsn_ne",
+        super::types::oid::BOOL,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3237,
+        "pg_lsn_mi",
+        super::types::oid::NUMERIC,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        3238,
+        "pg_lsn_recv",
+        super::types::oid::PG_LSN,
+        "2281",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        3239,
+        "pg_lsn_send",
+        super::types::oid::BYTEA,
+        "3220",
+        1,
+        "i"
+    ),
+    intrinsic!(
+        3251,
+        "pg_lsn_cmp",
+        super::types::oid::INT4,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(3252, "pg_lsn_hash", super::types::oid::INT4, "3220", 1, "i"),
+    intrinsic!(
+        3413,
+        "pg_lsn_hash_extended",
+        super::types::oid::INT8,
+        "3220 20",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4187,
+        "pg_lsn_larger",
+        super::types::oid::PG_LSN,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        4188,
+        "pg_lsn_smaller",
+        super::types::oid::PG_LSN,
+        "3220 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(4189, "max", super::types::oid::PG_LSN, "3220", 1, "i"),
+    intrinsic!(4190, "min", super::types::oid::PG_LSN, "3220", 1, "i"),
+    intrinsic!(
+        5022,
+        "pg_lsn_pli",
+        super::types::oid::PG_LSN,
+        "3220 1700",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        5023,
+        "numeric_pl_pg_lsn",
+        super::types::oid::PG_LSN,
+        "1700 3220",
+        2,
+        "i"
+    ),
+    intrinsic!(
+        5024,
+        "pg_lsn_mii",
+        super::types::oid::PG_LSN,
+        "3220 1700",
+        2,
+        "i"
+    ),
+    intrinsic!(6103, "pg_lsn", super::types::oid::PG_LSN, "1700", 1, "i"),
+    intrinsic!(
+        3000,
+        "has_foreign_data_wrapper_privilege",
+        16,
+        "19 25 25",
+        3,
+        "s"
+    ),
+    intrinsic!(
+        3001,
+        "has_foreign_data_wrapper_privilege",
+        16,
+        "19 26 25",
+        3,
+        "s"
+    ),
+    intrinsic!(
+        3002,
+        "has_foreign_data_wrapper_privilege",
+        16,
+        "26 25 25",
+        3,
+        "s"
+    ),
+    intrinsic!(
+        3003,
+        "has_foreign_data_wrapper_privilege",
+        16,
+        "26 26 25",
+        3,
+        "s"
+    ),
+    intrinsic!(
+        3004,
+        "has_foreign_data_wrapper_privilege",
+        16,
+        "25 25",
+        2,
+        "s"
+    ),
+    intrinsic!(
+        3005,
+        "has_foreign_data_wrapper_privilege",
+        16,
+        "26 25",
+        2,
+        "s"
+    ),
+    intrinsic!(3006, "has_server_privilege", 16, "19 25 25", 3, "s"),
+    intrinsic!(3007, "has_server_privilege", 16, "19 26 25", 3, "s"),
+    intrinsic!(3008, "has_server_privilege", 16, "26 25 25", 3, "s"),
+    intrinsic!(3009, "has_server_privilege", 16, "26 26 25", 3, "s"),
+    intrinsic!(3010, "has_server_privilege", 16, "25 25", 2, "s"),
+    intrinsic!(3011, "has_server_privilege", 16, "26 25", 2, "s"),
+    intrinsic!(6348, "has_largeobject_privilege", 16, "19 26 25", 3, "s"),
+    intrinsic!(6349, "has_largeobject_privilege", 16, "26 25", 2, "s"),
+    intrinsic!(6350, "has_largeobject_privilege", 16, "26 26 25", 3, "s"),
+    intrinsic!(329, "hash_aclitem", 23, "1033", 1, "i"),
+    intrinsic!(777, "hash_aclitem_extended", 20, "1033 20", 2, "i"),
+    intrinsic!(1031, "aclitemin", 1033, "2275", 1, "s"),
+    intrinsic!(1032, "aclitemout", 2275, "1033", 1, "s"),
+    intrinsic!(1035, "aclinsert", 1034, "1034 1033", 2, "i"),
+    intrinsic!(1036, "aclremove", 1034, "1034 1033", 2, "i"),
+    intrinsic!(1037, "aclcontains", 16, "1034 1033", 2, "i"),
+    intrinsic!(1062, "aclitemeq", 16, "1033 1033", 2, "i"),
+    intrinsic!(1365, "makeaclitem", 1033, "26 26 25 16", 4, "i"),
+    intrinsic!(1689, "aclexplode", 2249, "1034", 1, "s"),
+    intrinsic!(3943, "acldefault", 1034, "18 26", 2, "i"),
+    intrinsic!(6385, "pg_get_acl", 1034, "26 26 23", 3, "s"),
     intrinsic!(377, "cash_cmp", super::types::oid::INT4, "790 790", 2, "i"),
     intrinsic!(
         846,
@@ -3170,6 +3383,8 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 4389
             | 4450
             | 6227
+            | 4189
+            | 4190
             | 4299
             | 4300
             | 6225
@@ -3239,6 +3454,7 @@ fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
             | 2764
             | 2765
             | 2766
+            | 1689
     )
 }
 
@@ -3254,6 +3470,26 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
 
 fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
+        1062 => "aclitem_eq",
+        3000 => "has_foreign_data_wrapper_privilege_name_name",
+        3001 => "has_foreign_data_wrapper_privilege_name_id",
+        3002 => "has_foreign_data_wrapper_privilege_id_name",
+        3003 => "has_foreign_data_wrapper_privilege_id_id",
+        3004 => "has_foreign_data_wrapper_privilege_name",
+        3005 => "has_foreign_data_wrapper_privilege_id",
+        3006 => "has_server_privilege_name_name",
+        3007 => "has_server_privilege_name_id",
+        3008 => "has_server_privilege_id_name",
+        3009 => "has_server_privilege_id_id",
+        3010 => "has_server_privilege_name",
+        3011 => "has_server_privilege_id",
+        3943 => "acldefault_sql",
+        4189 | 4190 => "aggregate_dummy",
+        5023 => "",
+        6103 => "numeric_pg_lsn",
+        6348 => "has_largeobject_privilege_name_id",
+        6349 => "has_largeobject_privilege_id",
+        6350 => "has_largeobject_privilege_id_id",
         89 => "pgsql_version",
         376 => "text_to_array_null",
         394 => "text_to_array",
@@ -3551,6 +3787,8 @@ const PUBLICATION_TABLE_OUTPUT_NAMES: &[&str] = &["pubid", "relid", "attrs", "qu
 const LOGICAL_SLOT_OUTPUT_OIDS: &[i32] = &[19, super::types::oid::PG_LSN];
 const LOGICAL_SLOT_OUTPUT_NAMES: &[&str] = &["slot_name", "lsn"];
 const LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES: &[&str] = &["slot_name", "end_lsn"];
+const ACL_EXPLODE_OUTPUT_OIDS: &[i32] = &[26, 26, 25, 16];
+const ACL_EXPLODE_OUTPUT_NAMES: &[&str] = &["grantor", "grantee", "privilege_type", "is_grantable"];
 
 fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
     match oid {
@@ -3598,6 +3836,7 @@ fn intrinsic_record_outputs(
         3566 => Some((DROPPED_OBJECT_OUTPUT_OIDS, DROPPED_OBJECT_OUTPUT_NAMES)),
         3786 | 4222 | 4223 | 4224 => Some((LOGICAL_SLOT_OUTPUT_OIDS, LOGICAL_SLOT_OUTPUT_NAMES)),
         3878 => Some((LOGICAL_SLOT_OUTPUT_OIDS, LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES)),
+        1689 => Some((ACL_EXPLODE_OUTPUT_OIDS, ACL_EXPLODE_OUTPUT_NAMES)),
         _ => None,
     }
 }
@@ -4526,6 +4765,176 @@ macro_rules! catalog_prefix_operator {
 }
 
 const CATALOG_OPERATORS: &[CatalogOperator] = &[
+    catalog_operator!(
+        966,
+        "+",
+        ColType::Array(super::types::ArrElem::AclItem),
+        ColType::AclItem,
+        ColType::Array(super::types::ArrElem::AclItem),
+        1035,
+        "aclinsert"
+    ),
+    catalog_operator!(
+        967,
+        "-",
+        ColType::Array(super::types::ArrElem::AclItem),
+        ColType::AclItem,
+        ColType::Array(super::types::ArrElem::AclItem),
+        1036,
+        "aclremove"
+    ),
+    catalog_operator!(
+        968,
+        "@>",
+        ColType::Array(super::types::ArrElem::AclItem),
+        ColType::AclItem,
+        ColType::Bool,
+        1037,
+        "aclcontains"
+    ),
+    catalog_comparison_operator!(
+        974,
+        "=",
+        ColType::AclItem,
+        1062,
+        "aclitemeq",
+        974,
+        0,
+        false,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3222,
+        "=",
+        ColType::PgLsn,
+        3233,
+        "pg_lsn_eq",
+        3222,
+        3223,
+        true,
+        true,
+        101,
+        "eqsel",
+        105,
+        "eqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3223,
+        "<>",
+        ColType::PgLsn,
+        3236,
+        "pg_lsn_ne",
+        3223,
+        3222,
+        false,
+        false,
+        102,
+        "neqsel",
+        106,
+        "neqjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3224,
+        "<",
+        ColType::PgLsn,
+        3231,
+        "pg_lsn_lt",
+        3225,
+        3227,
+        false,
+        false,
+        103,
+        "scalarltsel",
+        107,
+        "scalarltjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3225,
+        ">",
+        ColType::PgLsn,
+        3235,
+        "pg_lsn_gt",
+        3224,
+        3226,
+        false,
+        false,
+        104,
+        "scalargtsel",
+        108,
+        "scalargtjoinsel"
+    ),
+    catalog_comparison_operator!(
+        3226,
+        "<=",
+        ColType::PgLsn,
+        3232,
+        "pg_lsn_le",
+        3227,
+        3225,
+        false,
+        false,
+        336,
+        "scalarlesel",
+        386,
+        "scalarlejoinsel"
+    ),
+    catalog_comparison_operator!(
+        3227,
+        ">=",
+        ColType::PgLsn,
+        3234,
+        "pg_lsn_ge",
+        3226,
+        3224,
+        false,
+        false,
+        337,
+        "scalargesel",
+        398,
+        "scalargejoinsel"
+    ),
+    catalog_operator!(
+        3228,
+        "-",
+        ColType::PgLsn,
+        ColType::PgLsn,
+        ColType::Numeric,
+        3237,
+        "pg_lsn_mi"
+    ),
+    catalog_operator_with_commutator!(
+        5025,
+        "+",
+        ColType::PgLsn,
+        ColType::Numeric,
+        ColType::PgLsn,
+        5022,
+        "pg_lsn_pli",
+        5026
+    ),
+    catalog_operator_with_commutator!(
+        5026,
+        "+",
+        ColType::Numeric,
+        ColType::PgLsn,
+        ColType::PgLsn,
+        5023,
+        "numeric_pl_pg_lsn",
+        5025
+    ),
+    catalog_operator!(
+        5027,
+        "-",
+        ColType::PgLsn,
+        ColType::Numeric,
+        ColType::PgLsn,
+        5024,
+        "pg_lsn_mii"
+    ),
     // PostgreSQL 18.6 temporal operators. Keeping the complete connected
     // family here makes direct operator resolution and pg_operator agree.
     catalog_operator_with_commutator!(
@@ -7517,6 +7926,12 @@ const XID8_BTREE_OPERATOR_CLASS_OID: i32 = 10053;
 const XID8_CMP_OID: i32 = 5096;
 const MONEY_BTREE_OPERATOR_FAMILY_OID: i32 = 2099;
 const MONEY_BTREE_OPERATOR_CLASS_OID: i32 = 10047;
+const PG_LSN_BTREE_OPERATOR_FAMILY_OID: i32 = 3253;
+const PG_LSN_BTREE_OPERATOR_CLASS_OID: i32 = 10067;
+const PG_LSN_HASH_OPERATOR_FAMILY_OID: i32 = 3254;
+const PG_LSN_HASH_OPERATOR_CLASS_OID: i32 = 10068;
+const ACLITEM_HASH_OPERATOR_FAMILY_OID: i32 = 2235;
+const ACLITEM_HASH_OPERATOR_CLASS_OID: i32 = 10059;
 const TID_BTREE_OPERATOR_FAMILY_OID: i32 = 2789;
 const TID_BTREE_OPERATOR_CLASS_OID: i32 = 10050;
 const CID_HASH_OPERATOR_FAMILY_OID: i32 = 2226;
@@ -7734,6 +8149,79 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_foreign_data_wrapper"
         ),
     }
+}
+
+/// Returns the ACL column addressed by PostgreSQL's `(classid, objid,
+/// objsubid)` object identity. Catalog synthesis is the single source of truth
+/// for both direct catalog reads and `pg_get_acl`, so the two surfaces cannot
+/// disagree about explicit versus default ACLs.
+pub(crate) fn object_acl_by_address<'a>(
+    storage: &Storage,
+    txid: u32,
+    classid: u32,
+    objid: u32,
+    objsubid: i32,
+    arena: &'a Arena,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let (catalog, id_columns, acl_column): (&str, &[&str], &str) = match classid as i32 {
+        PG_CLASS_OID if objsubid == 0 => ("pg_class", &["oid"], "relacl"),
+        PG_CLASS_OID if objsubid > 0 => ("pg_attribute", &["attrelid", "attnum"], "attacl"),
+        PG_PROC_OID if objsubid == 0 => ("pg_proc", &["oid"], "proacl"),
+        PG_TYPE_OID if objsubid == 0 => ("pg_type", &["oid"], "typacl"),
+        PG_NAMESPACE_OID if objsubid == 0 => ("pg_namespace", &["oid"], "nspacl"),
+        1262 if objsubid == 0 => ("pg_database", &["oid"], "datacl"),
+        1213 if objsubid == 0 => ("pg_tablespace", &["oid"], "spcacl"),
+        PG_LANGUAGE_OID if objsubid == 0 => ("pg_language", &["oid"], "lanacl"),
+        PG_LARGEOBJECT_METADATA_OID if objsubid == 0 => {
+            ("pg_largeobject_metadata", &["oid"], "lomacl")
+        }
+        2328 if objsubid == 0 => ("pg_foreign_data_wrapper", &["oid"], "fdwacl"),
+        1417 if objsubid == 0 => ("pg_foreign_server", &["oid"], "srvacl"),
+        6243 if objsubid == 0 => ("pg_parameter_acl", &["oid"], "paracl"),
+        _ => return Ok(None),
+    };
+    let table = synthesize(storage, Some("pg_catalog"), catalog, txid, arena)?;
+    let column = |name: &str| {
+        table.def.columns()[..table.def.n_columns]
+            .iter()
+            .position(|candidate| candidate.name.as_str() == name)
+    };
+    let Some(acl_index) = column(acl_column) else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "{} is missing its ACL column",
+            catalog
+        ));
+    };
+    let mut identities = [0usize; 2];
+    for (slot, name) in id_columns.iter().enumerate() {
+        identities[slot] = column(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "{} is missing object identity column {}",
+                catalog,
+                name
+            )
+        })?;
+    }
+    let matches_oid = |value: Datum<'_>, wanted: u32| match value {
+        Datum::Oid(value) => value == wanted,
+        Datum::Int4(value) => value as u32 == wanted,
+        Datum::Int8(value) => u32::try_from(value) == Ok(wanted),
+        _ => false,
+    };
+    for row in table.rows {
+        if !matches_oid(row[identities[0]], objid) {
+            continue;
+        }
+        if id_columns.len() == 2
+            && !matches!(row[identities[1]], Datum::Int4(value) if value == objsubid)
+        {
+            continue;
+        }
+        return Ok(Some(row[acl_index]));
+    }
+    Ok(None)
 }
 
 /// Builds the requested catalog relation. `qualifier` is the schema (or
@@ -8426,6 +8914,7 @@ fn acl<'a>(
     let explicit_owner_acl = storage.acl_entries().any(|(slot, entry)| {
         let (grantee, grantor) = storage.acl_identity(slot, txid);
         entry.object == object
+            && storage.acl_entry_visible(slot, txid)
             && grantee == owner as u16
             && grantor == owner as u16
             && entry.object.slot != u16::MAX
@@ -8433,6 +8922,7 @@ fn acl<'a>(
     let has_entries = storage.acl_entries().any(|(slot, entry)| {
         let (grantee, _) = storage.acl_identity(slot, txid);
         entry.object == object
+            && storage.acl_entry_visible(slot, txid)
             && (storage.acl_state(slot, txid).0.0 != 0
                 || (explicit_owner_acl && grantee == owner as u16)
                 || (matches!(
@@ -8516,15 +9006,22 @@ fn acl<'a>(
         owner_options,
         &mut owner_acl,
     );
-    values[0] = Datum::Text(
-        arena
-            .alloc_str(owner_acl.as_str())
-            .map_err(|_| arena_full())?,
-    );
-    let mut count = 1usize;
+    let mut count = 0usize;
+    if !explicit_owner_acl {
+        values[count] = Datum::Text(
+            arena
+                .alloc_str(owner_acl.as_str())
+                .map_err(|_| arena_full())?,
+        );
+        count += 1;
+    }
     for (slot, entry) in storage.acl_entries() {
         let (grantee, grantor) = storage.acl_identity(slot, txid);
-        if entry.object != object || (grantee == owner as u16 && grantor == owner as u16) {
+        if entry.object != object || !storage.acl_entry_visible(slot, txid) {
+            continue;
+        }
+        let owner_entry = grantee == owner as u16 && grantor == owner as u16;
+        if owner_entry && !explicit_owner_acl {
             continue;
         }
         if storage
@@ -8532,14 +9029,14 @@ fn acl<'a>(
             .filter(|(earlier_slot, _)| *earlier_slot < slot)
             .any(|(earlier_slot, earlier)| {
                 earlier.object == object
-                    && storage.acl_identity(earlier_slot, txid) != (owner as u16, owner as u16)
+                    && storage.acl_entry_visible(earlier_slot, txid)
                     && storage.acl_identity(earlier_slot, txid) == (grantee, grantor)
             })
         {
             continue;
         }
         let (privileges, grant_options) = storage.acl_from(object, grantee, grantor, txid);
-        if privileges.0 == 0 {
+        if privileges.0 == 0 && !owner_entry {
             continue;
         }
         let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
@@ -19333,7 +19830,37 @@ fn pg_opfamily<'a>(
             arena,
         )?;
     }
-    let mut count = 19usize;
+    for (index, (oid, method)) in [
+        (PG_LSN_BTREE_OPERATOR_FAMILY_OID, 403),
+        (PG_LSN_HASH_OPERATOR_FAMILY_OID, 405),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[19 + index] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text("pg_lsn_ops", arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+    }
+    rows[21] = row(
+        &[
+            Datum::Int4(2753),
+            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
+            Datum::Int4(405),
+            text("aclitem_ops", arena)?,
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Int4(10),
+        ],
+        arena,
+    )?;
+    let mut count = 22usize;
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -19630,7 +20157,53 @@ fn pg_opclass<'a>(
             arena,
         )?;
     }
-    let mut count = 21usize;
+    for (index, (oid, method, family)) in [
+        (
+            PG_LSN_BTREE_OPERATOR_CLASS_OID,
+            403,
+            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
+        ),
+        (
+            PG_LSN_HASH_OPERATOR_CLASS_OID,
+            405,
+            PG_LSN_HASH_OPERATOR_FAMILY_OID,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows[21 + index] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(oid),
+                Datum::Int4(method),
+                text("pg_lsn_ops", arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(family),
+                Datum::Int4(super::types::oid::PG_LSN),
+                Datum::Bool(true),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+    }
+    rows[23] = row(
+        &[
+            Datum::Int4(2616),
+            Datum::Int4(ACLITEM_HASH_OPERATOR_CLASS_OID),
+            Datum::Int4(405),
+            text("aclitem_ops", arena)?,
+            Datum::Int4(PG_CATALOG_NS_OID),
+            Datum::Int4(10),
+            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::ACLITEM),
+            Datum::Bool(true),
+            Datum::Int4(0),
+        ],
+        arena,
+    )?;
+    let mut count = 24usize;
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -20218,6 +20791,47 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         count += 1;
     }
+    for (oid, family, strategy, operator, method) in [
+        (10250, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 1, 3224, 403),
+        (10251, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 2, 3226, 403),
+        (10252, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 3, 3222, 403),
+        (10253, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 4, 3227, 403),
+        (10254, PG_LSN_BTREE_OPERATOR_FAMILY_OID, 5, 3225, 403),
+        (10296, PG_LSN_HASH_OPERATOR_FAMILY_OID, 1, 3222, 405),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(super::types::oid::PG_LSN),
+                Datum::Int4(super::types::oid::PG_LSN),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(method),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    rows[count] = row(
+        &[
+            Datum::Int4(2602),
+            Datum::Int4(10294),
+            Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
+            Datum::Int4(super::types::oid::ACLITEM),
+            Datum::Int4(super::types::oid::ACLITEM),
+            Datum::Int2(1),
+            Datum::Bpchar("s"),
+            Datum::Int4(974),
+            Datum::Int4(405),
+            Datum::Int4(0),
+        ],
+        arena,
+    )?;
+    count += 1;
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -20668,6 +21282,68 @@ fn pg_amproc<'a>(
                 Datum::Int4(family),
                 Datum::Int4(input),
                 Datum::Int4(input),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, family, number, procedure, name) in [
+        (
+            10118,
+            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
+            1,
+            3251,
+            "pg_lsn_cmp",
+        ),
+        (
+            10119,
+            PG_LSN_BTREE_OPERATOR_FAMILY_OID,
+            4,
+            5051,
+            "btequalimage",
+        ),
+        (
+            10196,
+            PG_LSN_HASH_OPERATOR_FAMILY_OID,
+            1,
+            3252,
+            "pg_lsn_hash",
+        ),
+        (
+            10197,
+            PG_LSN_HASH_OPERATOR_FAMILY_OID,
+            2,
+            3413,
+            "pg_lsn_hash_extended",
+        ),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(super::types::oid::PG_LSN),
+                Datum::Int4(super::types::oid::PG_LSN),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, number, procedure, name) in [
+        (10190, 1, 329, "hash_aclitem"),
+        (10191, 2, 777, "hash_aclitem_extended"),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
+                Datum::Int4(super::types::oid::ACLITEM),
+                Datum::Int4(super::types::oid::ACLITEM),
                 Datum::Int2(number),
                 builtin_regproc(Some((procedure, name))),
             ],
@@ -21398,6 +22074,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                             | 4389
                             | 4450
                             | 6227
+                            | 4189
+                            | 4190
                     ) {
                         "a"
                     } else {
@@ -21891,7 +22569,7 @@ fn pg_aggregate<'a>(
             ("aggminitval", ColType::Text),
         ],
     );
-    let count = 32
+    let count = 34
         + (0..storage.routine_count())
             .filter(|slot| {
                 storage.routine_slot_visible_to(*slot, txid)
@@ -22256,7 +22934,40 @@ fn pg_aggregate<'a>(
             arena,
         )?;
     }
-    let mut index = 32usize;
+    for (offset, (aggregate_oid, transition_oid, sort_operator_oid)) in
+        [(4189, 4187, 3225), (4190, 4188, 3224)]
+            .into_iter()
+            .enumerate()
+    {
+        rows[32 + offset] = row(
+            &[
+                regproc(aggregate_oid)?,
+                Datum::Bpchar("n"),
+                Datum::Int2(0),
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(transition_oid)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                regproc(0)?,
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bpchar("r"),
+                Datum::Bpchar("r"),
+                Datum::Int4(sort_operator_oid),
+                Datum::Int4(super::types::oid::PG_LSN),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    let mut index = 34usize;
     for slot in 0..storage.routine_count() {
         let routine = storage.routine_for(slot, txid);
         if !storage.routine_slot_visible_to(slot, txid) {
@@ -22846,6 +23557,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::PgSnapshot,
         ColType::TxidSnapshot,
         ColType::PgLsn,
+        ColType::AclItem,
         ColType::Money,
         ColType::Tid,
         ColType::Cid,
@@ -22928,6 +23640,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::PgSnapshot
         | ColType::TxidSnapshot
         | ColType::PgLsn
+        | ColType::AclItem
         | ColType::Uuid
         | ColType::Bytea
         | ColType::TsVector
@@ -22972,6 +23685,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Null, // typdefault
                 text(
                     match t {
+                        ColType::PgLsn => "pg_lsn_in",
+                        ColType::AclItem => "aclitemin",
                         ColType::Money => "cash_in",
                         ColType::Tid => "tidin",
                         ColType::Cid => "cidin",
@@ -22981,6 +23696,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )?,
                 text(
                     match t {
+                        ColType::PgLsn => "pg_lsn_out",
+                        ColType::AclItem => "aclitemout",
                         ColType::Money => "cash_out",
                         ColType::Tid => "tidout",
                         ColType::Cid => "cidout",
@@ -23021,16 +23738,6 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             0,
             0,
             "p",
-        ),
-        (
-            super::types::oid::ACLITEM,
-            "aclitem",
-            12,
-            "U",
-            0,
-            super::types::oid::ACLITEM_ARRAY,
-            0,
-            "b",
         ),
         (
             super::types::oid::ANYELEMENT,

@@ -195,6 +195,12 @@ fn privilege_object_name<'a>(
                 catalog.database_name(oid, arena)
             } else if function == "has_tablespace_privilege" {
                 catalog.tablespace_name(oid, arena)
+            } else if function == "has_foreign_data_wrapper_privilege" {
+                catalog.foreign_data_wrapper_name(oid, arena)
+            } else if function == "has_server_privilege" {
+                catalog.foreign_server_name(oid, arena)
+            } else if function == "has_largeobject_privilege" {
+                catalog.large_object_name(oid, arena)
             } else {
                 catalog.relname(oid, arena)
             }
@@ -514,6 +520,9 @@ pub(crate) fn dispatch<'a>(
             | "has_function_privilege"
             | "has_database_privilege"
             | "has_tablespace_privilege"
+            | "has_foreign_data_wrapper_privilege"
+            | "has_server_privilege"
+            | "has_largeobject_privilege"
             | "has_parameter_privilege"
             | "pg_relation_is_publishable"
             | "pg_get_replica_identity_index"
@@ -564,6 +573,7 @@ pub(crate) fn dispatch<'a>(
             | "current_setting"
             | "set_config"
             | "acldefault"
+            | "pg_get_acl"
     ) {
         return None;
     }
@@ -769,6 +779,38 @@ pub(crate) fn dispatch<'a>(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "pg_extension_config_dump() can only be called from an SQL script executed by CREATE EXTENSION"
                 ))
+            }
+            "pg_get_acl" => {
+                arity(3)?;
+                let oid = |value: Datum<'_>| -> Result<Option<u32>, SqlError> {
+                    match value {
+                        Datum::Oid(value) => Ok(Some(value)),
+                        Datum::Int4(value) => Ok(Some(value as u32)),
+                        Datum::RegObject { referenced_oid, .. } => Ok(Some(referenced_oid as u32)),
+                        Datum::Null => Ok(None),
+                        other => Err(type_mismatch("pg_get_acl", &other)),
+                    }
+                };
+                let Some(classid) = oid(eval_full(args[0], arena, params, row, hooks)?)? else {
+                    return Ok(Datum::Null);
+                };
+                let Some(objid) = oid(eval_full(args[1], arena, params, row, hooks)?)? else {
+                    return Ok(Datum::Null);
+                };
+                let objsubid = match eval_full(args[2], arena, params, row, hooks)? {
+                    Datum::Int4(value) => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch("pg_get_acl", &other)),
+                };
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "object ACL catalog access is unavailable"
+                    )
+                })?;
+                Ok(catalog
+                    .object_acl(classid, objid, objsubid, arena)?
+                    .unwrap_or(Datum::Null))
             }
             "acldefault" => {
                 arity(2)?;
@@ -1031,6 +1073,9 @@ pub(crate) fn dispatch<'a>(
             | "has_function_privilege"
             | "has_database_privilege"
             | "has_tablespace_privilege"
+            | "has_foreign_data_wrapper_privilege"
+            | "has_server_privilege"
+            | "has_largeobject_privilege"
             | "has_parameter_privilege" => {
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
@@ -1132,6 +1177,13 @@ pub(crate) fn dispatch<'a>(
                     }
                     "has_tablespace_privilege" => {
                         cat.has_tablespace_privilege(role, object, privilege)?
+                    }
+                    "has_foreign_data_wrapper_privilege" => {
+                        cat.has_foreign_data_wrapper_privilege(role, object, privilege)?
+                    }
+                    "has_server_privilege" => cat.has_server_privilege(role, object, privilege)?,
+                    "has_largeobject_privilege" => {
+                        cat.has_largeobject_privilege(role, object, privilege)?
                     }
                     "has_parameter_privilege" => {
                         cat.has_parameter_privilege(role, object, privilege)?
@@ -1817,6 +1869,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Float8(_) => "double precision",
                     Datum::Char(_) => "\"char\"",
                     Datum::Text(_) => "text",
+                    Datum::AclItem(_) => "aclitem",
                     Datum::Bpchar(_) => "character",
                     Datum::Regtype { .. } => "regtype",
                     Datum::RegObject { type_oid, .. } => match type_oid {

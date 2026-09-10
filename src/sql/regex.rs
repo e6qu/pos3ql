@@ -2070,8 +2070,10 @@ mod tests {
         );
         assert!(regex_search("(?=(a))\\1", "a", false).is_err());
 
-        let mut literal = RegexOptions::default();
-        literal.flavor = super::RegexFlavor::Literal;
+        let literal = RegexOptions {
+            flavor: super::RegexFlavor::Literal,
+            ..RegexOptions::default()
+        };
         assert_eq!(
             find_with_options("a.b", "a.b", 0, literal).unwrap(),
             Some((0, 3))
@@ -2080,12 +2082,16 @@ mod tests {
         assert!(m("***=a+b", "a+b"));
         assert!(m("***:a+b", "aaab"));
         assert!(m("(?i)abc", "ABC"));
-        let mut quoted_expanded = RegexOptions::default();
-        quoted_expanded.flavor = super::RegexFlavor::Literal;
-        quoted_expanded.expanded = true;
+        let quoted_expanded = RegexOptions {
+            flavor: super::RegexFlavor::Literal,
+            expanded: true,
+            ..RegexOptions::default()
+        };
         assert!(find_with_options("a b", "a b", 0, quoted_expanded).is_err());
-        let mut expanded_director = RegexOptions::default();
-        expanded_director.expanded = true;
+        let expanded_director = RegexOptions {
+            expanded: true,
+            ..RegexOptions::default()
+        };
         assert_eq!(
             find_with_options("***=a b", "a b", 0, expanded_director).unwrap(),
             Some((0, 3))
@@ -2094,8 +2100,10 @@ mod tests {
             find_with_options("***=a b", "ab", 0, expanded_director).unwrap(),
             None
         );
-        let mut basic = RegexOptions::default();
-        basic.flavor = super::RegexFlavor::Basic;
+        let basic = RegexOptions {
+            flavor: super::RegexFlavor::Basic,
+            ..RegexOptions::default()
+        };
         assert_eq!(find_with_options("(?i)a", "A", 0, basic).unwrap(), None);
         assert_eq!(
             find_with_options("(?i)a", "(?i)a", 0, basic).unwrap(),
@@ -2106,8 +2114,10 @@ mod tests {
             Some((0, 1))
         );
         assert_eq!(find_with_options("[\\d]", "1", 0, basic).unwrap(), None);
-        let mut extended = RegexOptions::default();
-        extended.flavor = super::RegexFlavor::Extended;
+        let extended = RegexOptions {
+            flavor: super::RegexFlavor::Extended,
+            ..RegexOptions::default()
+        };
         assert_eq!(find_with_options("(?i)a", "A", 0, extended).unwrap(), None);
         assert_eq!(
             find_with_options("\\d", "d", 0, extended).unwrap(),
@@ -2116,16 +2126,20 @@ mod tests {
         assert_eq!(find_with_options("[\\d]", "1", 0, extended).unwrap(), None);
         assert!(find_with_options("\\1", "1", 0, extended).is_err());
 
-        let mut expanded = RegexOptions::default();
-        expanded.expanded = true;
+        let expanded = RegexOptions {
+            expanded: true,
+            ..RegexOptions::default()
+        };
         assert_eq!(
             find_with_options("a # ignored\n b", "ab", 0, expanded).unwrap(),
             Some((0, 2))
         );
 
-        let mut newline = RegexOptions::default();
-        newline.newline_stop = true;
-        newline.newline_anchors = true;
+        let newline = RegexOptions {
+            newline_stop: true,
+            newline_anchors: true,
+            ..RegexOptions::default()
+        };
         assert_eq!(
             find_with_options("^b$", "a\nb", 0, newline).unwrap(),
             Some((2, 3))

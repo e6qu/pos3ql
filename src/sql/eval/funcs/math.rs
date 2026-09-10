@@ -190,10 +190,22 @@ fn random_numeric<'a>(
             "lower bound cannot be NaN"
         ));
     }
+    if min.is_infinite() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "lower bound cannot be infinity"
+        ));
+    }
     if max.is_nan() {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,
             "upper bound cannot be NaN"
+        ));
+    }
+    if max.is_infinite() {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "upper bound cannot be infinity"
         ));
     }
     let rscale = min.dscale.max(max.dscale);
@@ -436,6 +448,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Numeric(n) => Ok(Datum::Numeric(Numeric {
                         sign: match n.sign {
                             numeric::Sign::Neg => numeric::Sign::Pos,
+                            numeric::Sign::NegInf => numeric::Sign::PosInf,
                             other => other,
                         },
                         ..n
@@ -514,9 +527,12 @@ pub(crate) fn dispatch<'a>(
                     Datum::Float4(v) => Ok(Datum::Float8(float_sign(f64::from(v)))),
                     Datum::Float8(v) => Ok(Datum::Float8(float_sign(v))),
                     Datum::Numeric(n) => {
+                        if n.is_nan() {
+                            return Ok(Datum::Numeric(Numeric::NAN));
+                        }
                         let s = if n.is_zero() {
                             "0"
-                        } else if n.sign == numeric::Sign::Neg {
+                        } else if n.is_negative() {
                             "-1"
                         } else {
                             "1"
@@ -535,13 +551,13 @@ pub(crate) fn dispatch<'a>(
                     return Ok(Datum::Null);
                 }
                 if let Datum::Numeric(n) = d {
-                    if name == "sqrt" && n.sign == numeric::Sign::Neg && !n.is_zero() {
+                    if name == "sqrt" && n.is_negative() && !n.is_zero() {
                         return Err(sql_err!(
                             sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
                             "cannot take square root of a negative number"
                         ));
                     }
-                    if name == "ln" && (n.sign == numeric::Sign::Neg || n.is_zero()) {
+                    if name == "ln" && (n.is_negative() || n.is_zero()) {
                         return Err(sql_err!(
                             sqlstate::INVALID_ARGUMENT_FOR_LOG,
                             "cannot take logarithm of a non-positive number"
@@ -828,6 +844,7 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
+                    Datum::Numeric(n) if n.is_special() => Ok(Datum::Null),
                     Datum::Numeric(n) => Ok(Datum::Int4(n.dscale as i32)),
                     Datum::Int4(_) | Datum::Int8(_) => Ok(Datum::Int4(0)),
                     other => Err(type_mismatch(name, &other)),
@@ -837,6 +854,7 @@ pub(crate) fn dispatch<'a>(
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
+                    Datum::Numeric(n) if n.is_special() => Ok(Datum::Null),
                     Datum::Numeric(n) => Ok(Datum::Int4(n.min_scale() as i32)),
                     Datum::Int4(_) | Datum::Int8(_) => Ok(Datum::Int4(0)),
                     other => Err(type_mismatch(name, &other)),

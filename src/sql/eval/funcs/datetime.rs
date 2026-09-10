@@ -17,7 +17,7 @@ use crate::sql::{datetime, guc, to_char};
 use crate::{sql_err, stack_format};
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, cast_to, datum_numeric, eval_full, int_arg,
+    ColumnLookup, EvalHooks, SqlError, arena_full, cast_to, datum_numeric, eval_full, int_arg,
     interval_extract, num_f64, num_factor, overlaps_end_micros, overlaps_micros, sqlstate,
     text_arg, text_view, timestamp_micros, type_mismatch,
 };
@@ -25,6 +25,120 @@ use super::super::{
 /// The session zone's offset (seconds east) at an instant.
 fn session_offset(utc_micros: i64) -> i32 {
     crate::sql::timezone::session().resolve(utc_micros).0
+}
+
+fn timezone_from_datum(value: Datum<'_>) -> Result<crate::sql::timezone::Timezone, SqlError> {
+    match text_view(value) {
+        Datum::Text(name) => guc::parse_timezone(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "time zone \"{}\" not recognized",
+                name
+            )
+        }),
+        Datum::Interval(interval) if interval.months == 0 && interval.days == 0 => {
+            let seconds = i32::try_from(interval.micros / 1_000_000).map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "interval time zone is out of range"
+                )
+            })?;
+            Ok(crate::sql::timezone::Timezone::fixed(seconds, ""))
+        }
+        Datum::Interval(_) => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "interval time zone must not include months or days"
+        )),
+        other => Err(type_mismatch("timezone", &other)),
+    }
+}
+
+fn temporal_support(name: &str) -> bool {
+    datetime::is_comparison_function(name)
+        || matches!(
+            name,
+            "date_cmp"
+                | "date_cmp_timestamp"
+                | "date_cmp_timestamptz"
+                | "time_cmp"
+                | "timetz_cmp"
+                | "timestamp_cmp"
+                | "timestamp_cmp_date"
+                | "timestamp_cmp_timestamptz"
+                | "timestamptz_cmp"
+                | "timestamptz_cmp_date"
+                | "timestamptz_cmp_timestamp"
+                | "interval_cmp"
+                | "date_larger"
+                | "date_smaller"
+                | "time_larger"
+                | "time_smaller"
+                | "timetz_larger"
+                | "timetz_smaller"
+                | "timestamp_larger"
+                | "timestamp_smaller"
+                | "timestamptz_larger"
+                | "timestamptz_smaller"
+                | "interval_larger"
+                | "interval_smaller"
+                | "date_mi"
+                | "date_pli"
+                | "date_mii"
+                | "date_pl_interval"
+                | "date_mi_interval"
+                | "time_mi_time"
+                | "time_pl_interval"
+                | "time_mi_interval"
+                | "timetz_pl_interval"
+                | "timetz_mi_interval"
+                | "timestamp_mi"
+                | "timestamp_pl_interval"
+                | "timestamp_mi_interval"
+                | "timestamptz_mi"
+                | "timestamptz_pl_interval"
+                | "timestamptz_mi_interval"
+                | "interval_um"
+                | "interval_pl"
+                | "interval_mi"
+                | "interval_mul"
+                | "mul_d_interval"
+                | "interval_div"
+                | "datetime_pl"
+                | "timedate_pl"
+                | "datetimetz_pl"
+                | "timetzdate_pl"
+                | "interval_pl_date"
+                | "interval_pl_time"
+                | "interval_pl_timetz"
+                | "interval_pl_timestamp"
+                | "interval_pl_timestamptz"
+                | "integer_pl_date"
+        )
+}
+
+fn temporal_hash_input(name: &str, value: Datum<'_>) -> Result<u32, SqlError> {
+    let int64 = |value| crate::sql::identity::hash_int64_input(value);
+    match (name, value) {
+        ("hashdate" | "hashdateextended", Datum::Date(days)) => Ok(days as u32),
+        (
+            "time_hash"
+            | "time_hash_extended"
+            | "timestamp_hash"
+            | "timestamp_hash_extended"
+            | "timestamptz_hash"
+            | "timestamptz_hash_extended",
+            Datum::Time(micros) | Datum::Timestamp(micros) | Datum::Timestamptz(micros),
+        ) => Ok(int64(micros)),
+        ("interval_hash" | "interval_hash_extended", Datum::Interval(interval)) => {
+            // interval_cmp_value uses a 128-bit 30-day-month span; PostgreSQL
+            // deliberately hashes only its low 64 bits for compatibility.
+            let span = i128::from(interval.micros)
+                + i128::from(interval.days) * 86_400_000_000
+                + i128::from(interval.months) * 30 * 86_400_000_000;
+            Ok(int64(span as i64))
+        }
+        (_, other) => Err(type_mismatch(name, &other)),
+    }
 }
 
 /// Rounds `micros` to an optional fractional-second precision argument, which
@@ -75,6 +189,27 @@ pub(crate) fn dispatch<'a>(
             | "transaction_timestamp"
             | "statement_timestamp"
             | "clock_timestamp"
+            | "timeofday"
+            | "date_add"
+            | "date_subtract"
+            | "date"
+            | "timestamp"
+            | "timestamptz"
+            | "time"
+            | "timetz"
+            | "interval"
+            | "hashdate"
+            | "hashdateextended"
+            | "time_hash"
+            | "time_hash_extended"
+            | "timetz_hash"
+            | "timetz_hash_extended"
+            | "timestamp_hash"
+            | "timestamp_hash_extended"
+            | "timestamptz_hash"
+            | "timestamptz_hash_extended"
+            | "interval_hash"
+            | "interval_hash_extended"
             | "date_bin"
             | "isfinite"
             | "current_date"
@@ -98,7 +233,8 @@ pub(crate) fn dispatch<'a>(
             | "extract"
             | "date_part"
             | "date_trunc"
-    ) {
+    ) && !temporal_support(name)
+    {
         return None;
     }
     let arity = |n: usize| -> Result<(), SqlError> {
@@ -115,6 +251,250 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "hashdate"
+            | "hashdateextended"
+            | "time_hash"
+            | "time_hash_extended"
+            | "timestamp_hash"
+            | "timestamp_hash_extended"
+            | "timestamptz_hash"
+            | "timestamptz_hash_extended"
+            | "interval_hash"
+            | "interval_hash_extended" => {
+                let extended = name.ends_with("extended");
+                arity(if extended { 2 } else { 1 })?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                if value.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let input = temporal_hash_input(name, value)?;
+                if extended {
+                    let seed = int_arg(name, args, 1, arena, params, row, hooks)?
+                        .ok_or_else(|| type_mismatch(name, &Datum::Null))?;
+                    Ok(Datum::Int8(
+                        crate::sql::identity::hash_uint32_extended(input, seed) as i64,
+                    ))
+                } else {
+                    Ok(Datum::Int4(crate::sql::identity::hash_uint32(input) as i32))
+                }
+            }
+            "timetz_hash" | "timetz_hash_extended" => {
+                let extended = name.ends_with("extended");
+                arity(if extended { 2 } else { 1 })?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                let Datum::Timetz(micros, seconds_east) = value else {
+                    if value.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    return Err(type_mismatch(name, &value));
+                };
+                let time_input = crate::sql::identity::hash_int64_input(micros);
+                let zone = (-seconds_east) as u32;
+                if extended {
+                    let seed = int_arg(name, args, 1, arena, params, row, hooks)?
+                        .ok_or_else(|| type_mismatch(name, &Datum::Null))?;
+                    let time = crate::sql::identity::hash_uint32_extended(time_input, seed);
+                    let zone = crate::sql::identity::hash_uint32_extended(zone, seed);
+                    Ok(Datum::Int8((time ^ zone) as i64))
+                } else {
+                    let time = crate::sql::identity::hash_uint32(time_input);
+                    let zone = crate::sql::identity::hash_uint32(zone);
+                    Ok(Datum::Int4((time ^ zone) as i32))
+                }
+            }
+            "date" | "timestamp" | "timestamptz" | "time" | "timetz" | "interval" => {
+                if !matches!(args.len(), 1 | 2) || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}(...) with {} arguments does not exist",
+                        name,
+                        args.len()
+                    ));
+                }
+                let first = eval_full(args[0], arena, params, row, hooks)?;
+                if first.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let target = match name {
+                    "date" => ColType::Date,
+                    "timestamp" => ColType::Timestamp,
+                    "timestamptz" => ColType::Timestamptz,
+                    "time" => ColType::Time,
+                    "timetz" => ColType::Timetz,
+                    "interval" => ColType::Interval,
+                    _ => unreachable!(),
+                };
+                if args.len() == 1 {
+                    return cast_to(first, target, arena);
+                }
+                let second = eval_full(args[1], arena, params, row, hooks)?;
+                if second.is_null() {
+                    return Ok(Datum::Null);
+                }
+                if matches!(
+                    (&first, &second, name),
+                    (Datum::Date(_), Datum::Time(_), "timestamp" | "timestamptz")
+                        | (Datum::Date(_), Datum::Timetz(..), "timestamptz")
+                ) {
+                    let combined = super::super::operators::binary(
+                        crate::sql::ast::BinaryOp::Add,
+                        first,
+                        second,
+                        false,
+                        false,
+                        arena,
+                    )?;
+                    return cast_to(combined, target, arena);
+                }
+                let typmod = match second {
+                    Datum::Int2(value) => i32::from(value),
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
+                    })?,
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                crate::sql::exec::apply_typmod(first, target, typmod, arena)
+            }
+            name if datetime::is_comparison_function(name) => {
+                arity(2)?;
+                let left = eval_full(args[0], arena, params, row, hooks)?;
+                let right = eval_full(args[1], arena, params, row, hooks)?;
+                if left.is_null() || right.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let ordering = super::super::operators::compare_datums(&left, &right)?;
+                let value = if name.contains("_eq") {
+                    ordering.is_eq()
+                } else if name.contains("_ne") {
+                    ordering.is_ne()
+                } else if name.contains("_lt") {
+                    ordering.is_lt()
+                } else if name.contains("_le") {
+                    ordering.is_le()
+                } else if name.contains("_gt") {
+                    ordering.is_gt()
+                } else {
+                    ordering.is_ge()
+                };
+                Ok(Datum::Bool(value))
+            }
+            "date_cmp"
+            | "date_cmp_timestamp"
+            | "date_cmp_timestamptz"
+            | "time_cmp"
+            | "timetz_cmp"
+            | "timestamp_cmp"
+            | "timestamp_cmp_date"
+            | "timestamp_cmp_timestamptz"
+            | "timestamptz_cmp"
+            | "timestamptz_cmp_date"
+            | "timestamptz_cmp_timestamp"
+            | "interval_cmp" => {
+                arity(2)?;
+                let left = eval_full(args[0], arena, params, row, hooks)?;
+                let right = eval_full(args[1], arena, params, row, hooks)?;
+                if left.is_null() || right.is_null() {
+                    return Ok(Datum::Null);
+                }
+                Ok(Datum::Int4(
+                    match super::super::operators::compare_datums(&left, &right)? {
+                        core::cmp::Ordering::Less => -1,
+                        core::cmp::Ordering::Equal => 0,
+                        core::cmp::Ordering::Greater => 1,
+                    },
+                ))
+            }
+            "date_larger"
+            | "date_smaller"
+            | "time_larger"
+            | "time_smaller"
+            | "timetz_larger"
+            | "timetz_smaller"
+            | "timestamp_larger"
+            | "timestamp_smaller"
+            | "timestamptz_larger"
+            | "timestamptz_smaller"
+            | "interval_larger"
+            | "interval_smaller" => {
+                arity(2)?;
+                let left = eval_full(args[0], arena, params, row, hooks)?;
+                let right = eval_full(args[1], arena, params, row, hooks)?;
+                if left.is_null() || right.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let ordering = super::super::operators::compare_datums(&left, &right)?;
+                let take_left = if name.ends_with("larger") {
+                    ordering.is_gt()
+                } else {
+                    ordering.is_lt()
+                };
+                Ok(if take_left { left } else { right })
+            }
+            "interval_um" => {
+                arity(1)?;
+                match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Null => Ok(Datum::Null),
+                    Datum::Interval(interval) => Ok(Datum::Interval(
+                        match datetime::interval_infinity_sign(interval) {
+                            1 => datetime::INTERVAL_NEG_INFINITY,
+                            -1 => datetime::INTERVAL_INFINITY,
+                            _ => Interval {
+                                months: interval.months.checked_neg().ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERVAL_FIELD_OVERFLOW,
+                                        "interval out of range"
+                                    )
+                                })?,
+                                days: interval.days.checked_neg().ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERVAL_FIELD_OVERFLOW,
+                                        "interval out of range"
+                                    )
+                                })?,
+                                micros: interval.micros.checked_neg().ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERVAL_FIELD_OVERFLOW,
+                                        "interval out of range"
+                                    )
+                                })?,
+                            },
+                        },
+                    )),
+                    other => Err(type_mismatch(name, &other)),
+                }
+            }
+            name if temporal_support(name) => {
+                arity(2)?;
+                let left = eval_full(args[0], arena, params, row, hooks)?;
+                let right = eval_full(args[1], arena, params, row, hooks)?;
+                if left.is_null() || right.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let operator = if matches!(name, "interval_mul" | "mul_d_interval") {
+                    crate::sql::ast::BinaryOp::Mul
+                } else if name == "interval_div" {
+                    crate::sql::ast::BinaryOp::Div
+                } else if matches!(
+                    name,
+                    "date_mi"
+                        | "date_mii"
+                        | "date_mi_interval"
+                        | "time_mi_time"
+                        | "time_mi_interval"
+                        | "timetz_mi_interval"
+                        | "timestamp_mi"
+                        | "timestamp_mi_interval"
+                        | "timestamptz_mi"
+                        | "timestamptz_mi_interval"
+                        | "interval_mi"
+                ) {
+                    crate::sql::ast::BinaryOp::Sub
+                } else {
+                    crate::sql::ast::BinaryOp::Add
+                };
+                super::super::operators::binary(operator, left, right, false, false, arena)
+            }
             "now"
             | "current_timestamp"
             | "transaction_timestamp"
@@ -136,6 +516,44 @@ pub(crate) fn dispatch<'a>(
                     Datum::Timestamptz(micros)
                 })
             }
+            "timeofday" => {
+                arity(0)?;
+                let now = datetime::now_micros();
+                let (offset, abbreviation) = crate::sql::timezone::session().resolve(now);
+                let local = now
+                    .checked_add(i64::from(offset) * 1_000_000)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                    })?;
+                let days = local.div_euclid(86_400_000_000);
+                let in_day = local.rem_euclid(86_400_000_000);
+                let (year, month, day) = datetime::civil_from_days(days + datetime::PG_EPOCH_DAYS);
+                let seconds = in_day / 1_000_000;
+                let micros = in_day % 1_000_000;
+                let weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+                let months = [
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                    "Dec",
+                ];
+                let rendered = stack_format!(
+                    64,
+                    "{} {} {:02} {:02}:{:02}:{:02}.{:06} {} {}",
+                    weekdays[datetime::day_of_week(days)],
+                    months[month as usize - 1],
+                    day,
+                    seconds / 3600,
+                    seconds / 60 % 60,
+                    seconds % 60,
+                    micros,
+                    year,
+                    abbreviation.as_str()
+                );
+                Ok(Datum::Text(
+                    arena
+                        .alloc_str(rendered.as_str())
+                        .map_err(|_| arena_full())?,
+                ))
+            }
             // `current_time` carries the session's offset; `localtime` is the
             // same wall clock with the zone dropped.
             "current_time" | "localtime" => {
@@ -149,6 +567,60 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     Datum::Time(in_day)
                 })
+            }
+            "date_add" | "date_subtract" => {
+                if !matches!(args.len(), 2 | 3) || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}(...) with {} arguments does not exist",
+                        name,
+                        args.len()
+                    ));
+                }
+                let source = eval_full(args[0], arena, params, row, hooks)?;
+                let interval = eval_full(args[1], arena, params, row, hooks)?;
+                if source.is_null() || interval.is_null() {
+                    return Ok(Datum::Null);
+                }
+                let Datum::Timestamptz(source) = cast_to(source, ColType::Timestamptz, arena)?
+                else {
+                    unreachable!("timestamptz cast returned another type")
+                };
+                let Datum::Interval(mut interval) = cast_to(interval, ColType::Interval, arena)?
+                else {
+                    unreachable!("interval cast returned another type")
+                };
+                if name == "date_subtract" {
+                    interval = match datetime::interval_infinity_sign(interval) {
+                        1 => datetime::INTERVAL_NEG_INFINITY,
+                        -1 => datetime::INTERVAL_INFINITY,
+                        _ => Interval {
+                            months: interval.months.checked_neg().ok_or_else(|| {
+                                sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range")
+                            })?,
+                            days: interval.days.checked_neg().ok_or_else(|| {
+                                sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range")
+                            })?,
+                            micros: interval.micros.checked_neg().ok_or_else(|| {
+                                sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range")
+                            })?,
+                        },
+                    };
+                }
+                let zone = if args.len() == 3 {
+                    let zone = eval_full(args[2], arena, params, row, hooks)?;
+                    if zone.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    timezone_from_datum(zone)?
+                } else {
+                    crate::sql::timezone::session()
+                };
+                datetime::checked_add_timestamptz_in_zone(source, interval, zone)
+                    .map(Datum::Timestamptz)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                    })
             }
             // `date_bin(stride, source, origin)`: the stride-aligned bucket start at
             // or before `source`, measured from `origin`. Strides with a month or
@@ -181,37 +653,75 @@ pub(crate) fn dispatch<'a>(
                         return Err(type_mismatch("date_bin origin must be a timestamp", &other));
                     }
                 };
+                if matches!(
+                    source_micros,
+                    datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                ) {
+                    return Ok(if tz {
+                        Datum::Timestamptz(source_micros)
+                    } else {
+                        Datum::Timestamp(source_micros)
+                    });
+                }
+                if matches!(
+                    origin_micros,
+                    datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                ) {
+                    return Err(sql_err!(
+                        sqlstate::DATETIME_FIELD_OVERFLOW,
+                        "origin out of range"
+                    ));
+                }
                 if stride.months != 0 {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "timestamps cannot be binned into intervals containing months or years"
                     ));
                 }
-                let stride_micros = (stride.days as i64) * 86_400_000_000 + stride.micros;
+                let stride_micros = i64::from(stride.days)
+                    .checked_mul(86_400_000_000)
+                    .and_then(|days| days.checked_add(stride.micros))
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "interval out of range")
+                    })?;
                 if stride_micros <= 0 {
                     return Err(sql_err!(
                         sqlstate::DATETIME_FIELD_OVERFLOW,
                         "stride must be greater than zero"
                     ));
                 }
-                let delta = source_micros - origin_micros;
+                let delta = i128::from(source_micros) - i128::from(origin_micros);
                 // Floor-division so the bucket start is at or before the source.
-                let binned = origin_micros + delta.div_euclid(stride_micros) * stride_micros;
+                let binned = i128::from(origin_micros)
+                    + delta.div_euclid(i128::from(stride_micros)) * i128::from(stride_micros);
+                let binned = i64::try_from(binned).map_err(|_| {
+                    sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                })?;
                 Ok(if tz {
                     Datum::Timestamptz(binned)
                 } else {
                     Datum::Timestamp(binned)
                 })
             }
-            // `isfinite`: always true — no infinite date/timestamp/interval exists.
+            // `isfinite` recognizes the sentinels for the three temporal
+            // families on which PostgreSQL defines infinity.
             "isfinite" => {
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => Ok(Datum::Null),
-                    Datum::Date(_)
-                    | Datum::Timestamp(_)
-                    | Datum::Timestamptz(_)
-                    | Datum::Interval(_) => Ok(Datum::Bool(true)),
+                    Datum::Date(value) => Ok(Datum::Bool(!matches!(
+                        value,
+                        datetime::DATE_INFINITY | datetime::DATE_NEG_INFINITY
+                    ))),
+                    Datum::Timestamp(value) | Datum::Timestamptz(value) => {
+                        Ok(Datum::Bool(!matches!(
+                            value,
+                            datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                        )))
+                    }
+                    Datum::Interval(value) => {
+                        Ok(Datum::Bool(datetime::interval_infinity_sign(value) == 0))
+                    }
                     other => Err(type_mismatch(
                         "isfinite requires a date/time/interval",
                         &other,
@@ -237,6 +747,17 @@ pub(crate) fn dispatch<'a>(
                     return Err(type_mismatch(name, &f));
                 };
                 match v {
+                    Datum::Timestamp(value) | Datum::Timestamptz(value)
+                        if matches!(
+                            value,
+                            datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                        ) =>
+                    {
+                        return Ok(Datum::Null);
+                    }
+                    Datum::Date(datetime::DATE_INFINITY | datetime::DATE_NEG_INFINITY) => {
+                        return Ok(Datum::Null);
+                    }
                     Datum::Timestamp(value) => {
                         return Ok(Datum::Text(to_char::timestamp(value, fmt, arena)?));
                     }
@@ -325,20 +846,31 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "make_date" | "make_time" | "make_timestamp" | "make_timestamptz" => {
-                let want = if name == "make_timestamp" || name == "make_timestamptz" {
+                let field_count = if name == "make_timestamp" || name == "make_timestamptz" {
                     6
                 } else {
                     3
                 };
-                arity(want)?;
+                if name == "make_timestamptz" {
+                    if !matches!(args.len(), 6 | 7) || star {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function {}(...) with {} arguments does not exist",
+                            name,
+                            args.len()
+                        ));
+                    }
+                } else {
+                    arity(field_count)?;
+                }
                 // The seconds field is a double; every other field is an integer.
                 let sec_idx = if name == "make_date" {
                     usize::MAX
                 } else {
-                    want - 1
+                    field_count - 1
                 };
                 let mut ints = [0i64; 6];
-                for (i, slot) in ints[..want].iter_mut().enumerate() {
+                for (i, slot) in ints[..field_count].iter_mut().enumerate() {
                     if i == sec_idx {
                         continue;
                     }
@@ -362,16 +894,23 @@ pub(crate) fn dispatch<'a>(
                         let local = datetime::make_timestamp(
                             ints[0], ints[1], ints[2], ints[3], ints[4], sec,
                         )?;
-                        Ok(Datum::Timestamptz(
+                        let zone = if args.len() == 7 {
+                            let zone = eval_full(args[6], arena, params, row, hooks)?;
+                            if zone.is_null() {
+                                return Ok(Datum::Null);
+                            }
+                            timezone_from_datum(zone)?
+                        } else {
                             crate::sql::timezone::session()
-                                .resolve_local(local)
-                                .ok_or_else(|| {
-                                    sql_err!(
-                                        sqlstate::DATETIME_FIELD_OVERFLOW,
-                                        "timestamp out of range"
-                                    )
-                                })?,
-                        ))
+                        };
+                        Ok(Datum::Timestamptz(zone.resolve_local(local).ok_or_else(
+                            || {
+                                sql_err!(
+                                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                                    "timestamp out of range"
+                                )
+                            },
+                        )?))
                     }
                     _ => Ok(Datum::Timestamp(datetime::make_timestamp(
                         ints[0], ints[1], ints[2], ints[3], ints[4], sec,
@@ -432,24 +971,36 @@ pub(crate) fn dispatch<'a>(
                 }))
             }
             "timezone" => {
-                // `timezone(zone, ts)` == `ts AT TIME ZONE zone`. A plain timestamp
-                // is read as wall-clock time in `zone` and becomes the timestamptz
-                // instant; a timestamptz instant becomes the wall-clock timestamp in
-                // `zone`. The zone's offset can shift with DST, so it is resolved at
-                // the relevant instant.
-                arity(2)?;
-                let Some(zone_name) = text_arg(name, args, 0, arena, params, row, hooks)? else {
-                    return Ok(Datum::Null);
+                // The two-argument forms implement `AT TIME ZONE`; PostgreSQL
+                // 18's one-argument forms implement `AT LOCAL`. A zone is a
+                // name or a fixed interval with no month/day fields.
+                if !matches!(args.len(), 1 | 2) || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}(...) with {} arguments does not exist",
+                        name,
+                        args.len()
+                    ));
+                }
+                let (zone, value_index) = if args.len() == 1 {
+                    (crate::sql::timezone::session(), 0)
+                } else {
+                    let zone = eval_full(args[0], arena, params, row, hooks)?;
+                    if zone.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    (timezone_from_datum(zone)?, 1)
                 };
-                let zone = guc::parse_timezone(zone_name).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INVALID_PARAMETER_VALUE,
-                        "time zone \"{}\" not recognized",
-                        zone_name
-                    )
-                })?;
-                match text_view(eval_full(args[1], arena, params, row, hooks)?) {
+                match text_view(eval_full(args[value_index], arena, params, row, hooks)?) {
                     Datum::Null => Ok(Datum::Null),
+                    Datum::Timestamptz(utc)
+                        if matches!(
+                            utc,
+                            datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                        ) =>
+                    {
+                        Ok(Datum::Timestamp(utc))
+                    }
                     Datum::Timestamptz(utc) => {
                         let (offset_seconds, _) = zone.resolve(utc);
                         Ok(Datum::Timestamp(
@@ -462,16 +1013,39 @@ pub(crate) fn dispatch<'a>(
                     // resolution of `'2021-07-04 12:00' AT TIME ZONE z`.
                     Datum::Text(s) => {
                         let utc = datetime::parse_timestamp(s, true)?;
+                        if matches!(
+                            utc,
+                            datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                        ) {
+                            return Ok(Datum::Timestamp(utc));
+                        }
                         let (offset_seconds, _) = zone.resolve(utc);
                         Ok(Datum::Timestamp(
                             utc + i64::from(offset_seconds) * 1_000_000,
                         ))
+                    }
+                    Datum::Timestamp(wall_clock)
+                        if matches!(
+                            wall_clock,
+                            datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                        ) =>
+                    {
+                        Ok(Datum::Timestamptz(wall_clock))
                     }
                     Datum::Timestamp(wall_clock) => Ok(Datum::Timestamptz(
                         zone.resolve_local(wall_clock).ok_or_else(|| {
                             sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
                         })?,
                     )),
+                    Datum::Timetz(time, old_offset) => {
+                        let new_offset = zone.resolve(datetime::transaction_micros()).0;
+                        let shifted = time - i64::from(old_offset) * 1_000_000
+                            + i64::from(new_offset) * 1_000_000;
+                        Ok(Datum::Timetz(
+                            shifted.rem_euclid(86_400_000_000),
+                            new_offset,
+                        ))
+                    }
                     other => Err(type_mismatch(name, &other)),
                 }
             }
@@ -519,6 +1093,17 @@ pub(crate) fn dispatch<'a>(
                     let day = 86_400_000_000i64;
                     datetime::now_micros().div_euclid(day) * day
                 };
+                if a == b
+                    && matches!(
+                        a,
+                        datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                    )
+                {
+                    return Err(sql_err!(
+                        sqlstate::INTERVAL_FIELD_OVERFLOW,
+                        "interval out of range"
+                    ));
+                }
                 Ok(Datum::Interval(datetime::age_between(a, b)))
             }
             "justify_hours" | "justify_days" | "justify_interval" => {
@@ -577,11 +1162,60 @@ pub(crate) fn dispatch<'a>(
                 // only the time ones — plus, for timetz, `timezone` — apply.
                 let mut zone_secs: Option<i32> = None;
                 let mut instant_micros: Option<i64> = None;
-                let (days, in_day) = match eval_full(args[1], arena, params, row, hooks)? {
+                let mut time_only = false;
+                let mut date_only = false;
+                let value = eval_full(args[1], arena, params, row, hooks)?;
+                let infinity = match value {
+                    Datum::Date(datetime::DATE_INFINITY)
+                    | Datum::Timestamp(datetime::TIMESTAMP_INFINITY)
+                    | Datum::Timestamptz(datetime::TIMESTAMP_INFINITY) => 1,
+                    Datum::Date(datetime::DATE_NEG_INFINITY)
+                    | Datum::Timestamp(datetime::TIMESTAMP_NEG_INFINITY)
+                    | Datum::Timestamptz(datetime::TIMESTAMP_NEG_INFINITY) => -1,
+                    Datum::Interval(interval) => datetime::interval_infinity_sign(interval),
+                    _ => 0,
+                };
+                if infinity != 0 {
+                    let monotonic = [
+                        "epoch",
+                        "julian",
+                        "year",
+                        "isoyear",
+                        "decade",
+                        "century",
+                        "millennium",
+                    ]
+                    .iter()
+                    .any(|unit| field.eq_ignore_ascii_case(unit));
+                    if !monotonic {
+                        return Ok(Datum::Null);
+                    }
+                    return Ok(if name == "extract" {
+                        Datum::Numeric(if infinity > 0 {
+                            Numeric::POS_INFINITY
+                        } else {
+                            Numeric::NEG_INFINITY
+                        })
+                    } else {
+                        Datum::Float8(if infinity > 0 {
+                            f64::INFINITY
+                        } else {
+                            f64::NEG_INFINITY
+                        })
+                    });
+                }
+                let (days, in_day) = match value {
                     Datum::Null => return Ok(Datum::Null),
-                    Datum::Date(d) => (d as i64, 0i64),
-                    Datum::Time(t) => (0, t),
+                    Datum::Date(d) => {
+                        date_only = true;
+                        (d as i64, 0i64)
+                    }
+                    Datum::Time(t) => {
+                        time_only = true;
+                        (0, t)
+                    }
                     Datum::Timetz(t, zone) => {
+                        time_only = true;
                         zone_secs = Some(zone);
                         (0, t)
                     }
@@ -695,11 +1329,16 @@ pub(crate) fn dispatch<'a>(
                     });
                 }
                 // Fractional fields, scaled to microseconds.
-                let micros_val: i64 = if eq("second") || eq("seconds") {
+                let micros_val: i64 = if eq("second")
+                    || eq("seconds")
+                    || eq("millisecond")
+                    || eq("milliseconds")
+                {
                     s * 1_000_000 + frac
                 } else if eq("epoch") {
                     let value = match instant_micros {
                         Some(instant) => instant,
+                        None if time_only => in_day,
                         None => days
                             .checked_mul(86_400_000_000)
                             .and_then(|date| date.checked_add(in_day))
@@ -710,8 +1349,23 @@ pub(crate) fn dispatch<'a>(
                                 )
                             })?,
                     };
-                    value
-                        .checked_add(PG_EPOCH_SECS * 1_000_000)
+                    if time_only {
+                        value
+                    } else {
+                        value
+                            .checked_add(PG_EPOCH_SECS * 1_000_000)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                                    "timestamp out of range"
+                                )
+                            })?
+                    }
+                } else if eq("julian") && !time_only {
+                    // PostgreSQL epoch 2000-01-01 is Julian day 2451545.
+                    (days + 2_451_545)
+                        .checked_mul(86_400_000_000)
+                        .and_then(|date| date.checked_add(in_day))
                         .ok_or_else(|| {
                             sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
                         })?
@@ -724,30 +1378,180 @@ pub(crate) fn dispatch<'a>(
                     ));
                 };
                 if name == "extract" {
+                    if eq("julian") {
+                        let whole = micros_val.div_euclid(86_400_000_000);
+                        if date_only {
+                            return Ok(Datum::Numeric(Numeric::from_i64(whole, arena)?));
+                        }
+                        let remainder = micros_val.rem_euclid(86_400_000_000);
+                        let fraction = crate::sql::numeric::div(
+                            &Numeric::from_i64(remainder, arena)?,
+                            &Numeric::from_i64(86_400_000_000, arena)?,
+                            arena,
+                        )?;
+                        return Ok(Datum::Numeric(crate::sql::numeric::add(
+                            &Numeric::from_i64(whole, arena)?,
+                            &fraction,
+                            arena,
+                        )?));
+                    }
                     let neg = micros_val < 0;
                     let a = micros_val.unsigned_abs();
+                    let divisor = if eq("millisecond") || eq("milliseconds") {
+                        1_000
+                    } else if eq("julian") {
+                        86_400_000_000
+                    } else {
+                        1_000_000
+                    };
+                    let decimals = if eq("millisecond") || eq("milliseconds") {
+                        3
+                    } else if eq("julian") {
+                        20
+                    } else {
+                        6
+                    };
                     let text = stack_format!(
-                        40,
-                        "{}{}.{:06}",
+                        64,
+                        "{}{}.{:0width$}",
                         if neg { "-" } else { "" },
-                        a / 1_000_000,
-                        a % 1_000_000
+                        a / divisor,
+                        a % divisor,
+                        width = decimals
                     );
                     Ok(Datum::Numeric(Numeric::parse(text.as_str(), arena)?))
                 } else {
-                    Ok(Datum::Float8(micros_val as f64 / 1_000_000.0))
+                    let divisor = if eq("millisecond") || eq("milliseconds") {
+                        1_000.0
+                    } else if eq("julian") {
+                        86_400_000_000.0
+                    } else {
+                        1_000_000.0
+                    };
+                    Ok(Datum::Float8(micros_val as f64 / divisor))
                 }
             }
             "date_trunc" => {
-                arity(2)?;
+                if !matches!(args.len(), 2 | 3) || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}(...) with {} arguments does not exist",
+                        name,
+                        args.len()
+                    ));
+                }
                 let Some(field) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let (is_tz, t) = match eval_full(args[1], arena, params, row, hooks)? {
+                let value = eval_full(args[1], arena, params, row, hooks)?;
+                if let Datum::Interval(interval) = value {
+                    if args.len() != 2 {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function date_trunc(text, interval, text) does not exist"
+                        ));
+                    }
+                    if datetime::interval_infinity_sign(interval) != 0 {
+                        return Ok(Datum::Interval(interval));
+                    }
+                    let eq = |unit: &str| field.eq_ignore_ascii_case(unit);
+                    let mut truncated = interval;
+                    if eq("millennium") || eq("millennia") {
+                        truncated.months = truncated.months / 12_000 * 12_000;
+                        truncated.days = 0;
+                        truncated.micros = 0;
+                    } else if eq("century") || eq("centuries") {
+                        truncated.months = truncated.months / 1_200 * 1_200;
+                        truncated.days = 0;
+                        truncated.micros = 0;
+                    } else if eq("decade") || eq("decades") {
+                        truncated.months = truncated.months / 120 * 120;
+                        truncated.days = 0;
+                        truncated.micros = 0;
+                    } else if eq("year") || eq("years") {
+                        truncated.months = truncated.months / 12 * 12;
+                        truncated.days = 0;
+                        truncated.micros = 0;
+                    } else if eq("quarter") {
+                        truncated.months = truncated.months / 3 * 3;
+                        truncated.days = 0;
+                        truncated.micros = 0;
+                    } else if eq("month") || eq("months") {
+                        truncated.days = 0;
+                        truncated.micros = 0;
+                    } else if eq("day") || eq("days") {
+                        truncated.micros = 0;
+                    } else if eq("hour") || eq("hours") {
+                        truncated.micros = truncated.micros / 3_600_000_000 * 3_600_000_000;
+                    } else if eq("minute") || eq("minutes") {
+                        truncated.micros = truncated.micros / 60_000_000 * 60_000_000;
+                    } else if eq("second") || eq("seconds") {
+                        truncated.micros = truncated.micros / 1_000_000 * 1_000_000;
+                    } else if eq("millisecond") || eq("milliseconds") {
+                        truncated.micros = truncated.micros / 1_000 * 1_000;
+                    } else if eq("microsecond") || eq("microseconds") {
+                    } else {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "unit \"{}\" not supported for type interval",
+                            field
+                        ));
+                    }
+                    return Ok(Datum::Interval(truncated));
+                }
+                let zone = if args.len() == 3 {
+                    let zone = eval_full(args[2], arena, params, row, hooks)?;
+                    if zone.is_null() {
+                        return Ok(Datum::Null);
+                    }
+                    timezone_from_datum(zone)?
+                } else {
+                    crate::sql::timezone::session()
+                };
+                let explicit_zone = args.len() == 3;
+                let (is_tz, t) = match value {
                     Datum::Null => return Ok(Datum::Null),
+                    Datum::Timestamp(t)
+                        if matches!(
+                            t,
+                            datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                        ) =>
+                    {
+                        return Ok(if explicit_zone {
+                            Datum::Timestamptz(t)
+                        } else {
+                            Datum::Timestamp(t)
+                        });
+                    }
+                    Datum::Timestamp(t) if explicit_zone => {
+                        let utc = crate::sql::timezone::session()
+                            .resolve_local(t)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                                    "timestamp out of range"
+                                )
+                            })?;
+                        let offset = i64::from(zone.resolve(utc).0) * 1_000_000;
+                        (
+                            true,
+                            utc.checked_add(offset).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                                    "timestamp out of range"
+                                )
+                            })?,
+                        )
+                    }
                     Datum::Timestamp(t) => (false, t),
                     Datum::Timestamptz(t) => {
-                        let offset = i64::from(session_offset(t)) * 1_000_000;
+                        if matches!(
+                            t,
+                            datetime::TIMESTAMP_INFINITY | datetime::TIMESTAMP_NEG_INFINITY
+                        ) {
+                            return Ok(Datum::Timestamptz(t));
+                        }
+                        let offset = i64::from(zone.resolve(t).0) * 1_000_000;
                         (
                             true,
                             t.checked_add(offset).ok_or_else(|| {
@@ -760,12 +1564,39 @@ pub(crate) fn dispatch<'a>(
                     }
                     // A date promotes to timestamptz here, as PostgreSQL
                     // resolves date_trunc(text, date) through that cast.
-                    Datum::Date(d) => (
-                        true,
-                        i64::from(d).checked_mul(86_400_000_000).ok_or_else(|| {
+                    Datum::Date(datetime::DATE_INFINITY) => {
+                        return Ok(Datum::Timestamptz(datetime::TIMESTAMP_INFINITY));
+                    }
+                    Datum::Date(datetime::DATE_NEG_INFINITY) => {
+                        return Ok(Datum::Timestamptz(datetime::TIMESTAMP_NEG_INFINITY));
+                    }
+                    Datum::Date(d) => {
+                        let local = i64::from(d).checked_mul(86_400_000_000).ok_or_else(|| {
                             sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
-                        })?,
-                    ),
+                        })?;
+                        if explicit_zone {
+                            let utc = crate::sql::timezone::session()
+                                .resolve_local(local)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATETIME_FIELD_OVERFLOW,
+                                        "timestamp out of range"
+                                    )
+                                })?;
+                            let offset = i64::from(zone.resolve(utc).0) * 1_000_000;
+                            (
+                                true,
+                                utc.checked_add(offset).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::DATETIME_FIELD_OVERFLOW,
+                                        "timestamp out of range"
+                                    )
+                                })?,
+                            )
+                        } else {
+                            (true, local)
+                        }
+                    }
                     other => return Err(type_mismatch(name, &other)),
                 };
                 use datetime::{PG_EPOCH_DAYS, civil_from_days, day_of_week, days_from_civil};
@@ -775,54 +1606,75 @@ pub(crate) fn dispatch<'a>(
                 let (h, minute, s) = (seconds / 3600, (seconds / 60) % 60, seconds % 60);
                 let eq = |k: &str| field.eq_ignore_ascii_case(k);
                 // (new day count since epoch, seconds within the day).
-                let (new_days, sod): (i64, i64) = if eq("year") || eq("years") {
-                    (days_from_civil(y, 1, 1) - PG_EPOCH_DAYS, 0)
-                } else if eq("quarter") {
-                    (
-                        days_from_civil(y, ((m - 1) / 3) * 3 + 1, 1) - PG_EPOCH_DAYS,
-                        0,
-                    )
-                } else if eq("month") || eq("months") {
-                    (days_from_civil(y, m, 1) - PG_EPOCH_DAYS, 0)
-                } else if eq("week") {
-                    let dow0 = day_of_week(days) as i64;
-                    let isodow = if dow0 == 0 { 7 } else { dow0 };
-                    (days - (isodow - 1), 0)
-                } else if eq("day") || eq("days") {
-                    (days, 0)
-                } else if eq("hour") || eq("hours") {
-                    (days, h * 3600)
-                } else if eq("minute") || eq("minutes") {
-                    (days, h * 3600 + minute * 60)
-                } else if eq("second") || eq("seconds") {
-                    (days, h * 3600 + minute * 60 + s)
-                } else {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "unit \"{}\" not recognized for date_trunc()",
-                        field
-                    ));
-                };
+                let (new_days, sod, micros_remainder): (i64, i64, i64) =
+                    if eq("millennium") || eq("millennia") {
+                        let first = if y > 0 {
+                            (y - 1) / 1_000 * 1_000 + 1
+                        } else {
+                            y / 1_000 * 1_000
+                        };
+                        (days_from_civil(first, 1, 1) - PG_EPOCH_DAYS, 0, 0)
+                    } else if eq("century") || eq("centuries") {
+                        let first = if y > 0 {
+                            (y - 1) / 100 * 100 + 1
+                        } else {
+                            y / 100 * 100
+                        };
+                        (days_from_civil(first, 1, 1) - PG_EPOCH_DAYS, 0, 0)
+                    } else if eq("decade") || eq("decades") {
+                        let first = y / 10 * 10;
+                        (days_from_civil(first, 1, 1) - PG_EPOCH_DAYS, 0, 0)
+                    } else if eq("year") || eq("years") {
+                        (days_from_civil(y, 1, 1) - PG_EPOCH_DAYS, 0, 0)
+                    } else if eq("quarter") {
+                        (
+                            days_from_civil(y, ((m - 1) / 3) * 3 + 1, 1) - PG_EPOCH_DAYS,
+                            0,
+                            0,
+                        )
+                    } else if eq("month") || eq("months") {
+                        (days_from_civil(y, m, 1) - PG_EPOCH_DAYS, 0, 0)
+                    } else if eq("week") {
+                        let dow0 = day_of_week(days) as i64;
+                        let isodow = if dow0 == 0 { 7 } else { dow0 };
+                        (days - (isodow - 1), 0, 0)
+                    } else if eq("day") || eq("days") {
+                        (days, 0, 0)
+                    } else if eq("hour") || eq("hours") {
+                        (days, h * 3600, 0)
+                    } else if eq("minute") || eq("minutes") {
+                        (days, h * 3600 + minute * 60, 0)
+                    } else if eq("second") || eq("seconds") {
+                        (days, h * 3600 + minute * 60 + s, 0)
+                    } else if eq("millisecond") || eq("milliseconds") {
+                        (
+                            days,
+                            h * 3600 + minute * 60 + s,
+                            in_day % 1_000_000 / 1_000 * 1_000,
+                        )
+                    } else if eq("microsecond") || eq("microseconds") {
+                        (days, h * 3600 + minute * 60 + s, in_day % 1_000_000)
+                    } else {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "unit \"{}\" not recognized for date_trunc()",
+                            field
+                        ));
+                    };
                 let micros = new_days
                     .checked_mul(86_400_000_000)
                     .and_then(|date| {
                         sod.checked_mul(1_000_000)
+                            .and_then(|time| time.checked_add(micros_remainder))
                             .and_then(|time| date.checked_add(time))
                     })
                     .ok_or_else(|| {
                         sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
                     })?;
                 Ok(if is_tz {
-                    Datum::Timestamptz(
-                        crate::sql::timezone::session()
-                            .resolve_local(micros)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::DATETIME_FIELD_OVERFLOW,
-                                    "timestamp out of range"
-                                )
-                            })?,
-                    )
+                    Datum::Timestamptz(zone.resolve_local(micros).ok_or_else(|| {
+                        sql_err!(sqlstate::DATETIME_FIELD_OVERFLOW, "timestamp out of range")
+                    })?)
                 } else {
                     Datum::Timestamp(micros)
                 })

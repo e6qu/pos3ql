@@ -34,6 +34,8 @@ pub const MAX_NDIGITS: usize = 512;
 pub enum Sign {
     Pos,
     Neg,
+    PosInf,
+    NegInf,
     NaN,
 }
 
@@ -85,12 +87,38 @@ impl<'a> Numeric<'a> {
         digits: &[],
     };
 
+    pub const POS_INFINITY: Numeric<'static> = Numeric {
+        sign: Sign::PosInf,
+        weight: 0,
+        dscale: 0,
+        digits: &[],
+    };
+
+    pub const NEG_INFINITY: Numeric<'static> = Numeric {
+        sign: Sign::NegInf,
+        weight: 0,
+        dscale: 0,
+        digits: &[],
+    };
+
     pub fn is_zero(&self) -> bool {
-        self.sign != Sign::NaN && self.digits.is_empty()
+        matches!(self.sign, Sign::Pos | Sign::Neg) && self.digits.is_empty()
     }
 
     pub fn is_nan(&self) -> bool {
         self.sign == Sign::NaN
+    }
+
+    pub fn is_infinite(&self) -> bool {
+        matches!(self.sign, Sign::PosInf | Sign::NegInf)
+    }
+
+    pub fn is_special(&self) -> bool {
+        self.is_nan() || self.is_infinite()
+    }
+
+    pub fn is_negative(&self) -> bool {
+        matches!(self.sign, Sign::Neg | Sign::NegInf)
     }
 
     /// Number of base-10000 digits.
@@ -106,8 +134,12 @@ impl<'a> Numeric<'a> {
         mode: RoundMode,
         arena: &'b Arena,
     ) -> Result<Numeric<'b>, SqlError> {
-        if self.is_nan() {
-            return Ok(Numeric::NAN);
+        if self.is_special() {
+            return Ok(match self.sign {
+                Sign::PosInf => Numeric::POS_INFINITY,
+                Sign::NegInf => Numeric::NEG_INFINITY,
+                _ => Numeric::NAN,
+            });
         }
         const DIG: usize = 2100;
         let text = crate::stack_format!(2100, "{}", self);
@@ -182,6 +214,12 @@ impl<'a> Numeric<'a> {
         let t = s.trim();
         if t.eq_ignore_ascii_case("nan") {
             return Ok(Numeric::NAN);
+        }
+        if t.eq_ignore_ascii_case("infinity") || t.eq_ignore_ascii_case("+infinity") {
+            return Ok(Numeric::POS_INFINITY);
+        }
+        if t.eq_ignore_ascii_case("-infinity") {
+            return Ok(Numeric::NEG_INFINITY);
         }
         let bad = || {
             sql_err!(
@@ -445,6 +483,12 @@ impl<'a> Numeric<'a> {
         if self.is_nan() {
             return f64::NAN;
         }
+        if self.sign == Sign::PosInf {
+            return f64::INFINITY;
+        }
+        if self.sign == Sign::NegInf {
+            return f64::NEG_INFINITY;
+        }
         // PostgreSQL's numeric→float8 goes through the decimal text (strtod),
         // which rounds correctly to the nearest f64; digit-by-digit float
         // accumulation drifts by ULPs and diverges from PostgreSQL's results.
@@ -460,10 +504,11 @@ impl<'a> Numeric<'a> {
 
     /// Rounds to an i64, erroring on overflow (for int casts).
     pub fn to_i64(&self) -> Result<i64, SqlError> {
-        if self.is_nan() {
+        if self.is_special() {
             return Err(sql_err!(
                 sqlstate::NUMERIC_OUT_OF_RANGE,
-                "cannot convert NaN to integer"
+                "cannot convert {} to integer",
+                self
             ));
         }
         // Build integer magnitude from digits above/at weight 0, rounding the
@@ -530,6 +575,12 @@ impl fmt::Display for Numeric<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_nan() {
             return f.write_str("NaN");
+        }
+        if self.sign == Sign::PosInf {
+            return f.write_str("Infinity");
+        }
+        if self.sign == Sign::NegInf {
+            return f.write_str("-Infinity");
         }
         if self.sign == Sign::Neg {
             f.write_str("-")?;
@@ -613,14 +664,17 @@ fn write_digit(f: &mut fmt::Formatter<'_>, d: u8) -> fmt::Result {
     })
 }
 
-/// Sign-and-magnitude comparison (ignores dscale; NaN sorts highest, as in
-/// PostgreSQL).
+/// Sign-and-magnitude comparison (ignores dscale); special values sort in
+/// PostgreSQL order: negative infinity, finite values, positive infinity, NaN.
 pub fn compare(a: &Numeric, b: &Numeric) -> Ordering {
-    match (a.sign, b.sign) {
-        (Sign::NaN, Sign::NaN) => return Ordering::Equal,
-        (Sign::NaN, _) => return Ordering::Greater,
-        (_, Sign::NaN) => return Ordering::Less,
-        _ => {}
+    if a.is_special() || b.is_special() {
+        let rank = |sign| match sign {
+            Sign::NegInf => 0,
+            Sign::Neg | Sign::Pos => 1,
+            Sign::PosInf => 2,
+            Sign::NaN => 3,
+        };
+        return rank(a.sign).cmp(&rank(b.sign));
     }
     if a.is_zero() && b.is_zero() {
         return Ordering::Equal;
@@ -660,10 +714,15 @@ pub fn compare(a: &Numeric, b: &Numeric) -> Ordering {
 /// needs to name the offending side, since `cmp_decimal_str` fails without
 /// saying which of its two arguments was malformed.
 pub(crate) fn valid_decimal(s: &str) -> bool {
-    split_decimal(s).is_some()
+    special_decimal_rank(s).is_some() || split_decimal(s).is_some()
 }
 
 pub fn cmp_decimal_str(a: &str, b: &str) -> Option<Ordering> {
+    let a_special = special_decimal_rank(a);
+    let b_special = special_decimal_rank(b);
+    if a_special.is_some() || b_special.is_some() {
+        return Some(a_special.unwrap_or(1).cmp(&b_special.unwrap_or(1)));
+    }
     let (asign, aint, afrac) = split_decimal(a)?;
     let (bsign, bint, bfrac) = split_decimal(b)?;
     let a_zero = aint.is_empty() && afrac.is_empty();
@@ -681,6 +740,19 @@ pub fn cmp_decimal_str(a: &str, b: &str) -> Option<Ordering> {
         (false, false) => mag,
         (true, true) => mag.reverse(),
     })
+}
+
+fn special_decimal_rank(s: &str) -> Option<u8> {
+    let text = s.trim();
+    if text.eq_ignore_ascii_case("-infinity") {
+        Some(0)
+    } else if text.eq_ignore_ascii_case("infinity") || text.eq_ignore_ascii_case("+infinity") {
+        Some(2)
+    } else if text.eq_ignore_ascii_case("nan") {
+        Some(3)
+    } else {
+        None
+    }
 }
 
 /// Splits a plain decimal into (negative, integer-digits, fraction-digits) with
@@ -754,6 +826,13 @@ pub fn add<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
     if a.is_nan() || b.is_nan() {
         return Ok(Numeric::NAN);
     }
+    if a.is_infinite() || b.is_infinite() {
+        return Ok(match (a.sign, b.sign) {
+            (Sign::PosInf, Sign::NegInf) | (Sign::NegInf, Sign::PosInf) => Numeric::NAN,
+            (Sign::PosInf, _) | (_, Sign::PosInf) => Numeric::POS_INFINITY,
+            _ => Numeric::NEG_INFINITY,
+        });
+    }
     let dscale = a.dscale.max(b.dscale);
     if a.sign == b.sign || a.is_zero() || b.is_zero() {
         // Same sign (or one zero): add magnitudes, keep the nonzero sign.
@@ -787,6 +866,8 @@ pub fn sub<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
         sign: match b.sign {
             Sign::Pos => Sign::Neg,
             Sign::Neg => Sign::Pos,
+            Sign::PosInf => Sign::NegInf,
+            Sign::NegInf => Sign::PosInf,
             Sign::NaN => Sign::NaN,
         },
         ..*b
@@ -868,6 +949,18 @@ pub fn mul<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
     if a.is_nan() || b.is_nan() {
         return Ok(Numeric::NAN);
     }
+    if a.is_infinite() || b.is_infinite() {
+        if a.is_zero() || b.is_zero() {
+            return Ok(Numeric::NAN);
+        }
+        let negative = matches!(a.sign, Sign::Neg | Sign::NegInf)
+            != matches!(b.sign, Sign::Neg | Sign::NegInf);
+        return Ok(if negative {
+            Numeric::NEG_INFINITY
+        } else {
+            Numeric::POS_INFINITY
+        });
+    }
     if a.is_zero() || b.is_zero() {
         return Ok(Numeric {
             sign: Sign::Pos,
@@ -943,6 +1036,20 @@ pub fn div<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
     if b.is_zero() {
         return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
     }
+    if a.is_infinite() && b.is_infinite() {
+        return Ok(Numeric::NAN);
+    }
+    if b.is_infinite() {
+        return Ok(Numeric::ZERO);
+    }
+    if a.is_infinite() {
+        let negative = matches!(a.sign, Sign::NegInf) != matches!(b.sign, Sign::Neg);
+        return Ok(if negative {
+            Numeric::NEG_INFINITY
+        } else {
+            Numeric::POS_INFINITY
+        });
+    }
     let rscale = div_result_scale(a, b);
     div_with_scale(a, b, rscale, true, arena)
 }
@@ -952,6 +1059,12 @@ pub fn div<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>
 pub fn rem<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
     if a.is_nan() || b.is_nan() {
         return Ok(Numeric::NAN);
+    }
+    if a.is_infinite() {
+        return Ok(Numeric::NAN);
+    }
+    if b.is_infinite() {
+        return finish(a.sign, a.weight, a.dscale, a.digits, arena);
     }
     if b.is_zero() {
         return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
@@ -1279,7 +1392,7 @@ impl Numeric<'_> {
     /// adjusted for how many decimal digits the most-significant base-10000
     /// digit actually occupies.
     fn dec_weight(&self) -> i32 {
-        if self.is_zero() || self.is_nan() {
+        if self.is_zero() || self.is_special() {
             return 0;
         }
         let msd = self.digit(0);
@@ -1297,12 +1410,26 @@ impl Numeric<'_> {
 
     /// Whether the value is an exact integer (no fractional part).
     fn is_integer(&self) -> bool {
+        if self.is_infinite() {
+            return true;
+        }
+        if self.is_nan() {
+            return false;
+        }
         if self.is_zero() {
             return true;
         }
         // The least-significant stored base digit sits at weight
         // `weight-(ndigits-1)`; a value is integral when that is >= 0.
         self.weight as i32 - (self.ndigits() as i32 - 1) >= 0
+    }
+
+    fn is_odd_integer(&self) -> bool {
+        if !self.is_integer() || self.is_special() || self.is_zero() {
+            return false;
+        }
+        let lowest_weight = self.weight as i32 - (self.ndigits() as i32 - 1);
+        lowest_weight == 0 && self.digit(self.ndigits() - 1) & 1 != 0
     }
 }
 
@@ -1319,6 +1446,15 @@ fn one<'a>(arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
 pub fn sqrt<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
     if arg.is_nan() {
         return Ok(Numeric::NAN);
+    }
+    if arg.sign == Sign::PosInf {
+        return Ok(Numeric::POS_INFINITY);
+    }
+    if arg.is_negative() && !arg.is_zero() {
+        return Err(sql_err!(
+            sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+            "cannot take square root of a negative number"
+        ));
     }
     // sweight = (weight+1)*DEC_DIGITS/2 - 1; rscale = MIN_SIG_DIGITS - sweight.
     let sweight = (arg.weight as i32 + 1) * DEC_DIGITS as i32 / 2 - 1;
@@ -1406,6 +1542,15 @@ pub fn ln<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> 
     if arg.is_nan() {
         return Ok(Numeric::NAN);
     }
+    if arg.sign == Sign::PosInf {
+        return Ok(Numeric::POS_INFINITY);
+    }
+    if arg.is_negative() || arg.is_zero() {
+        return Err(sql_err!(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of a non-positive number"
+        ));
+    }
     let rscale = ln_rscale(arg);
     ln_var(arg, rscale, arena)?.round_scale(rscale as usize, RoundMode::HalfAwayZero, arena)
 }
@@ -1488,6 +1633,12 @@ pub fn exp<'a>(arg: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError>
     if arg.is_nan() {
         return Ok(Numeric::NAN);
     }
+    if arg.sign == Sign::PosInf {
+        return Ok(Numeric::POS_INFINITY);
+    }
+    if arg.sign == Sign::NegInf {
+        return Ok(Numeric::ZERO);
+    }
     let value = arg.to_f64();
     // rscale = MIN_SIG_DIGITS - trunc(value/ln10) (result decimal weight).
     let rscale = (MIN_SIG_DIGITS - (value / LN10) as i32)
@@ -1558,6 +1709,23 @@ pub fn logb<'a>(
     if base.is_nan() || value.is_nan() {
         return Ok(Numeric::NAN);
     }
+    if base.is_negative() || value.is_negative() || base.is_zero() || value.is_zero() {
+        return Err(sql_err!(
+            sqlstate::INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of a non-positive number"
+        ));
+    }
+    if base.is_infinite() || value.is_infinite() {
+        return Ok(if base.is_infinite() {
+            if value.is_infinite() {
+                Numeric::NAN
+            } else {
+                Numeric::ZERO
+            }
+        } else {
+            Numeric::POS_INFINITY
+        });
+    }
     let rscale = ln_rscale(value);
     let wscale = rscale + 12;
     let lnv = ln_var(value, wscale, arena)?;
@@ -1581,6 +1749,9 @@ pub fn trunc_div<'a>(a: &Numeric, b: &Numeric, arena: &'a Arena) -> Result<Numer
     if b.is_zero() {
         return Err(sql_err!(sqlstate::DIVISION_BY_ZERO, "division by zero"));
     }
+    if a.is_infinite() || b.is_infinite() {
+        return div(a, b, arena);
+    }
     div_with_scale(a, b, 0, false, arena)
 }
 
@@ -1588,7 +1759,7 @@ impl Numeric<'_> {
     /// The minimum display scale that preserves this value (its significant
     /// fractional digit count) — PostgreSQL `min_scale`.
     pub fn min_scale(&self) -> u16 {
-        if self.is_zero() || self.is_nan() {
+        if self.is_zero() || self.is_special() {
             return 0;
         }
         let text = crate::stack_format!(2100, "{}", self);
@@ -1604,12 +1775,34 @@ impl Numeric<'_> {
 /// result-scale selection. Integer exponents are evaluated exactly by repeated
 /// squaring; other exponents use `exp(exp * ln(base))`.
 pub fn pow<'a>(base: &Numeric, exp: &Numeric, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
-    if base.is_nan() || exp.is_nan() {
-        return Ok(Numeric::NAN);
+    if base.is_nan() {
+        return if !exp.is_special() && exp.is_zero() {
+            one(arena)
+        } else {
+            Ok(Numeric::NAN)
+        };
+    }
+    if exp.is_nan() {
+        return if !base.is_special()
+            && compare(base, &Numeric::from_i64(1, arena)?) == Ordering::Equal
+        {
+            one(arena)
+        } else {
+            Ok(Numeric::NAN)
+        };
+    }
+    if base.is_zero() && exp.is_infinite() {
+        if exp.is_negative() {
+            return Err(sql_err!(
+                sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+                "zero raised to a negative power is undefined"
+            ));
+        }
+        return Ok(Numeric::ZERO);
     }
     // Domain rules matching PostgreSQL numeric_power.
     if base.is_zero() {
-        if exp.sign == Sign::Neg {
+        if exp.is_negative() {
             return Err(sql_err!(
                 sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
                 "zero raised to a negative power is undefined"
@@ -1630,11 +1823,56 @@ pub fn pow<'a>(base: &Numeric, exp: &Numeric, arena: &'a Arena) -> Result<Numeri
             digits: &[],
         });
     }
-    if base.sign == Sign::Neg && !exp.is_integer() {
+    if base.is_negative() && !exp.is_integer() {
         return Err(sql_err!(
             sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
             "a negative number raised to a non-integer power yields a complex result"
         ));
+    }
+    if base.is_infinite() || exp.is_infinite() {
+        let one_v = one(arena)?;
+        if !base.is_special() && compare(base, &one_v) == Ordering::Equal {
+            return Ok(one_v);
+        }
+        if exp.is_zero() {
+            return Ok(one_v);
+        }
+        if exp.is_infinite() {
+            if !base.is_special() {
+                let abs_base = Numeric {
+                    sign: Sign::Pos,
+                    ..*base
+                };
+                if compare(&abs_base, &one_v) == Ordering::Equal {
+                    return Ok(one_v);
+                }
+                let magnitude_grows = compare(&abs_base, &one_v) == Ordering::Greater;
+                return Ok(if magnitude_grows == (exp.sign == Sign::PosInf) {
+                    Numeric::POS_INFINITY
+                } else {
+                    Numeric::ZERO
+                });
+            }
+            return Ok(if exp.sign == Sign::PosInf {
+                Numeric::POS_INFINITY
+            } else {
+                Numeric::ZERO
+            });
+        }
+        if base.sign == Sign::PosInf {
+            return Ok(if exp.is_negative() {
+                Numeric::ZERO
+            } else {
+                Numeric::POS_INFINITY
+            });
+        }
+        return Ok(if exp.is_negative() {
+            Numeric::ZERO
+        } else if exp.is_odd_integer() {
+            Numeric::NEG_INFINITY
+        } else {
+            Numeric::POS_INFINITY
+        });
     }
     // Result decimal weight ~ exp * log10(|base|); rscale = MIN_SIG - that.
     // A zero exponent makes the product zero regardless of the base.
@@ -1806,6 +2044,27 @@ mod tests {
         assert_eq!(disp(&p("1e3", &a)), "1000");
         assert_eq!(disp(&p("1.5e2", &a)), "150");
         assert_eq!(disp(&p("15e-1", &a)), "1.5");
+    }
+
+    #[test]
+    fn special_values_follow_postgresql_arithmetic_and_math() {
+        let a = arena();
+        let pinf = p("Infinity", &a);
+        let ninf = p("-Infinity", &a);
+        let zero = p("0", &a);
+        let half = p("0.5", &a);
+        let three = p("3", &a);
+
+        assert_eq!(disp(&div(&pinf, &three, &a).unwrap()), "Infinity");
+        assert!(div(&pinf, &zero, &a).is_err());
+        assert_eq!(disp(&sqrt(&pinf, &a).unwrap()), "Infinity");
+        assert!(sqrt(&ninf, &a).is_err());
+        assert_eq!(disp(&ln(&pinf, &a).unwrap()), "Infinity");
+        assert!(ln(&ninf, &a).is_err());
+        assert_eq!(disp(&exp(&ninf, &a).unwrap()), "0");
+        assert_eq!(disp(&pow(&ninf, &three, &a).unwrap()), "-Infinity");
+        assert_eq!(disp(&pow(&half, &ninf, &a).unwrap()), "Infinity");
+        assert!(pow(&zero, &ninf, &a).is_err());
     }
 
     #[test]

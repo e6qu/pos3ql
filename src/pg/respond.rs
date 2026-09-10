@@ -1559,7 +1559,9 @@ impl<'b> Responder<'b> {
                     let sign_code: i16 = match nm.sign {
                         crate::sql::numeric::Sign::Pos => 0x0000,
                         crate::sql::numeric::Sign::Neg => 0x4000,
-                        crate::sql::numeric::Sign::NaN => -0x4000, // 0xC000
+                        crate::sql::numeric::Sign::PosInf => -0x3000, // 0xD000
+                        crate::sql::numeric::Sign::NegInf => -0x1000, // 0xF000
+                        crate::sql::numeric::Sign::NaN => -0x4000,    // 0xC000
                     };
                     m.i16(sign_code);
                     m.i16(nm.dscale as i16);

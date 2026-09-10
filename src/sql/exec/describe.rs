@@ -9,6 +9,7 @@
 //! here rather than part-way through a scan.
 
 use crate::sql::ast::{Expr, SelectItem};
+use crate::sql::datetime;
 use crate::sql::eval::{ColumnLookup, SqlError, described_expression_collation, sqlstate};
 use crate::sql::types::{ColDesc, ColType, CollationDerivation, Datum, oid};
 use crate::sql_err;
@@ -3042,6 +3043,21 @@ pub fn infer_type_res(
                     if ro == oid::DATE && matches!(operator, Add) && int_like(lo) {
                         return Ok(of(ColType::Date));
                     }
+                    if matches!(operator, Sub) && lo == oid::TIME && ro == oid::TIME {
+                        return Ok(of(ColType::Interval));
+                    }
+                    if matches!(operator, Add)
+                        && ((lo == oid::DATE && ro == oid::TIME)
+                            || (lo == oid::TIME && ro == oid::DATE))
+                    {
+                        return Ok(of(ColType::Timestamp));
+                    }
+                    if matches!(operator, Add)
+                        && ((lo == oid::DATE && ro == oid::TIMETZ)
+                            || (lo == oid::TIMETZ && ro == oid::DATE))
+                    {
+                        return Ok(of(ColType::Timestamptz));
+                    }
                     // Interval arithmetic: date/timestamp ± interval -> the
                     // timestamp type; interval ± interval -> interval.
                     let is_dt = |o: i32| matches!(o, oid::DATE | oid::TIMESTAMP | oid::TIMESTAMPTZ);
@@ -3606,6 +3622,7 @@ pub fn infer_type_res(
                     Some(oid::FLOAT4) if *name == "sum" => of(ColType::Float4),
                     Some(oid::FLOAT4) => of(ColType::Float8),
                     Some(oid::FLOAT8) => of(ColType::Float8),
+                    Some(oid::INTERVAL) => of(ColType::Interval),
                     Some(oid::UNKNOWN) | None => of(ColType::Numeric),
                     Some(other) => return Err(agg_undefined(name, other)),
                 }
@@ -4040,7 +4057,66 @@ pub fn infer_type_res(
             "make_time" => of(ColType::Time),
             "make_timestamp" => of(ColType::Timestamp),
             "make_timestamptz" => of(ColType::Timestamptz),
+            "date" => of(ColType::Date),
+            "timestamp" => of(ColType::Timestamp),
+            "timestamptz" | "date_add" | "date_subtract" => of(ColType::Timestamptz),
+            "time" => of(ColType::Time),
+            "timetz" => of(ColType::Timetz),
+            "interval" => of(ColType::Interval),
             "isfinite" => of(ColType::Bool),
+            name if datetime::is_comparison_function(name) => of(ColType::Bool),
+            "date_cmp"
+            | "date_cmp_timestamp"
+            | "date_cmp_timestamptz"
+            | "time_cmp"
+            | "timetz_cmp"
+            | "timestamp_cmp"
+            | "timestamp_cmp_date"
+            | "timestamp_cmp_timestamptz"
+            | "timestamptz_cmp"
+            | "timestamptz_cmp_date"
+            | "timestamptz_cmp_timestamp"
+            | "interval_cmp"
+            | "hashdate"
+            | "time_hash"
+            | "timetz_hash"
+            | "timestamp_hash"
+            | "timestamptz_hash"
+            | "interval_hash" => of(ColType::Int4),
+            "hashdateextended"
+            | "time_hash_extended"
+            | "timetz_hash_extended"
+            | "timestamp_hash_extended"
+            | "timestamptz_hash_extended"
+            | "interval_hash_extended" => of(ColType::Int8),
+            "date_larger" | "date_smaller" | "date_pli" | "date_mii" | "integer_pl_date" => {
+                of(ColType::Date)
+            }
+            "time_larger" | "time_smaller" | "time_pl_interval" | "time_mi_interval"
+            | "interval_pl_time" => of(ColType::Time),
+            "timetz_larger" | "timetz_smaller" | "timetz_pl_interval" | "timetz_mi_interval"
+            | "interval_pl_timetz" => of(ColType::Timetz),
+            "timestamp_larger"
+            | "timestamp_smaller"
+            | "date_pl_interval"
+            | "date_mi_interval"
+            | "timestamp_pl_interval"
+            | "timestamp_mi_interval"
+            | "interval_pl_date"
+            | "interval_pl_timestamp"
+            | "datetime_pl"
+            | "timedate_pl" => of(ColType::Timestamp),
+            "timestamptz_larger"
+            | "timestamptz_smaller"
+            | "timestamptz_pl_interval"
+            | "timestamptz_mi_interval"
+            | "interval_pl_timestamptz"
+            | "datetimetz_pl"
+            | "timetzdate_pl" => of(ColType::Timestamptz),
+            "interval_larger" | "interval_smaller" | "time_mi_time" | "timestamp_mi"
+            | "timestamptz_mi" | "interval_um" | "interval_pl" | "interval_mi" | "interval_mul"
+            | "mul_d_interval" | "interval_div" => of(ColType::Interval),
+            "date_mi" => of(ColType::Int4),
             // Encoding / hashing / bytea manipulation.
             "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "convert_to"
             | "convert" | "byteain" | "byteasend" | "byteacat" | "bytea_larger"
@@ -4091,15 +4167,17 @@ pub fn infer_type_res(
             "age" | "justify_hours" | "justify_days" | "justify_interval" | "make_interval" => {
                 of(ColType::Interval)
             }
-            // timezone(zone, ts) == ts AT TIME ZONE zone: timestamptz <-> timestamp.
+            // timezone(zone, value) and AT LOCAL preserve timetz, and switch
+            // between timestamp with/without time zone for timestamp inputs.
             "timezone" => {
                 let arg = args
-                    .get(1)
+                    .get(if args.len() == 1 { 0 } else { 1 })
                     .map(|a| infer_type_res(a, columns))
                     .transpose()?
                     .map(|t| t.0);
                 match arg {
                     Some(oid::TIMESTAMPTZ) => of(ColType::Timestamp),
+                    Some(oid::TIMETZ) => of(ColType::Timetz),
                     _ => of(ColType::Timestamptz),
                 }
             }
@@ -4259,10 +4337,10 @@ pub fn infer_type_res(
                     .map(|a| infer_type_res(a, columns))
                     .transpose()?
                     .map(|t| t.0);
-                if a == Some(oid::TIMESTAMPTZ) {
-                    of(ColType::Timestamptz)
-                } else {
-                    of(ColType::Timestamp)
+                match a {
+                    Some(oid::TIMESTAMPTZ) => of(ColType::Timestamptz),
+                    Some(oid::INTERVAL) => of(ColType::Interval),
+                    _ => of(ColType::Timestamp),
                 }
             }
             // The remaining implemented functions (trim family, substr, replace,

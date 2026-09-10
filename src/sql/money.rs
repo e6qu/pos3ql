@@ -137,8 +137,12 @@ pub fn from_integer(value: i64) -> Result<i64, SqlError> {
 }
 
 pub fn from_numeric(value: &Numeric<'_>, arena: &Arena) -> Result<i64, SqlError> {
-    if value.is_nan() {
-        return Err(out_of_range());
+    if value.is_special() {
+        return Err(sql_err!(
+            sqlstate::NUMERIC_OUT_OF_RANGE,
+            "cannot convert {} to bigint",
+            if value.is_nan() { "NaN" } else { "infinity" }
+        ));
     }
     let rounded = value.round_scale(2, RoundMode::HalfAwayZero, arena)?;
     let text = crate::stack_format!(2100, "{rounded}");

@@ -398,7 +398,7 @@ pub(crate) fn log_domain_check(n: &Numeric) -> Result<(), SqlError> {
             "cannot take logarithm of zero"
         ));
     }
-    if n.sign == crate::sql::numeric::Sign::Neg {
+    if n.is_negative() {
         return Err(sql_err!(
             sqlstate::INVALID_ARGUMENT_FOR_LOG,
             "cannot take logarithm of a negative number"

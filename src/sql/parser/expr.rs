@@ -201,6 +201,21 @@ impl<'a> Parser<'a> {
             // (parsed above binary-operator precedence).
             if self.peeked == Tok::Ident("at") {
                 self.advance()?;
+                if self.peeked == Tok::Ident("local") {
+                    self.advance()?;
+                    left = self.arena_expr(Expr::Call {
+                        name: "timezone",
+                        args: self.arena_slice(&[left])?,
+                        argument_names: &[],
+                        variadic: false,
+                        star: false,
+                        distinct: false,
+                        order_by: &[],
+                        over: None,
+                        filter: None,
+                    })?;
+                    continue;
+                }
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
                 let zone = self.expression(8)?;

@@ -55984,6 +55984,241 @@ fn datetime_functions() {
 }
 
 #[test]
+fn postgresql_18_temporal_boundaries() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET TIME ZONE 'America/New_York';
+         SELECT date 'infinity', date '-infinity', isfinite(date 'infinity'),
+                isfinite(timestamp 'infinity'),
+                timestamp '2024-07-15 12:00'::timestamptz,
+                timestamptz '2024-07-15 16:00+00'::timestamp;
+         SELECT timestamp '2024-07-15 12:00' = timestamptz '2024-07-15 16:00+00',
+                date '2024-07-15' = timestamptz '2024-07-15 04:00+00';
+         SELECT timestamp '2024-07-15 12:00' AT LOCAL,
+                timestamptz '2024-07-15 16:00+00' AT LOCAL,
+                timetz '12:00+02' AT LOCAL;
+         SELECT make_timestamptz(2024,7,15,12,0,0,'Europe/Bucharest');
+         SELECT date_add(timestamptz '2024-03-09 12:00-05', interval '1 day'),
+                date_add(timestamptz '2024-03-09 12:00-05', interval '1 day','UTC'),
+                date_subtract(timestamptz '2024-03-11 12:00-04', interval '1 day'),
+                date_add(timestamp '2024-03-09 12:00','1 day'),
+                date_add(date '2024-03-09',interval '1 day'),
+                date_subtract(timestamp '2024-03-11 12:00',interval '1 day','UTC');
+         SELECT date_trunc('hour', timestamptz '2024-07-15 12:34:56-04', 'UTC'),
+                date_trunc('day', timestamp '2024-07-15 12:34:56', 'UTC'),
+                date_trunc('day', date '2024-07-15', 'UTC'),
+                date_trunc('milliseconds', timestamp '2024-01-01 00:00:01.234567'),
+                date_trunc('decade', interval '123 years 7 mons 8 days 09:10:11.654321');
+         SELECT date '2024-01-02' + time '03:04:05',
+                time '03:04:05' + date '2024-01-02',
+                date '2024-01-02' + timetz '03:04:05+02',
+                time '03:04:05' - time '01:02:03';
+         SELECT pg_catalog.timestamp(date '2024-01-02',time '03:04:05'),
+                pg_catalog.timestamptz(date '2024-01-02',time '03:04:05'),
+                pg_catalog.timestamptz(date '2024-01-02',timetz '03:04:05+02'),
+                pg_catalog.interval(time '03:04:05'),
+                pg_catalog.timestamp(timestamp '2024-01-01 00:00:00.555555',3);
+         SELECT hashdate(date '2024-01-02'),hashdateextended(date '2024-01-02',123),
+                time_hash(time '03:04:05'),timetz_hash(timetz '03:04:05+02'),
+                timestamp_hash(timestamp '2024-01-02 03:04:05'),
+                timestamptz_hash(timestamptz '2024-01-02 03:04:05+02'),
+                interval_hash(interval '1 month'),interval_hash(interval '30 days'),
+                hashdate(date 'infinity'),hashdate(date '-infinity'),
+                timestamp_hash(timestamp 'infinity'),timestamp_hash(timestamp '-infinity'),
+                interval_hash(interval 'infinity'),interval_hash(interval '-infinity'),
+                interval_hash_extended(interval 'infinity',123),
+                interval_hash_extended(interval '-infinity',123);
+         SELECT count(*) FROM pg_operator WHERE oprnamespace=11 AND
+                (oprleft IN (1082,1083,1114,1184,1186,1266) OR
+                 oprright IN (1082,1083,1114,1184,1186,1266));
+         SELECT count(*) FROM pg_cast WHERE oid BETWEEN 10158 AND 10170 OR
+                                               oid BETWEEN 10212 AND 10216;
+         SELECT oid,proname,prosrc,proisstrict,provolatile,proparallel,
+                pronargdefaults,proargnames
+           FROM pg_proc WHERE oid IN (1026,1271,3463,3464,6222,6334)
+          ORDER BY oid;
+         SELECT aggfnoid::oid,aggtransfn::oid,aggfinalfn::oid,aggcombinefn::oid,
+                aggsortop,aggtranstype
+           FROM pg_aggregate WHERE aggfnoid IN (2106,2113,2122,2144)
+          ORDER BY aggfnoid;
+         SELECT interval 'infinity',interval '-infinity',isfinite(interval 'infinity'),
+                interval 'infinity'+interval '1 day',interval 'infinity' * -2,
+                interval '1 day' * 'Infinity'::float8,
+                interval '1 day' / 'Infinity'::float8,
+                age(timestamp 'infinity',timestamp '2000-01-01');
+         SELECT date_bin(interval '1 day',timestamp 'infinity',timestamp '2000-01-01'),
+                date_trunc('day',timestamp '-infinity'),
+                to_char(timestamp 'infinity','YYYY') IS NULL;
+         SELECT extract(epoch from time '01:02:03.5'),
+                extract(milliseconds from time '01:02:03.5'),
+                extract(julian from date '2000-01-01'),
+                extract(epoch from interval 'infinity'),
+                date_part('month',date 'infinity') IS NULL;
+         SELECT extract(julian from timestamp '2000-01-01'),
+                extract(julian from timestamp '2000-01-01 12:00'),
+                extract(julian from timestamp '1999-12-31 23:59:59.123456');
+         SELECT numeric 'Infinity'+1,numeric '-Infinity' * -2,
+                numeric 'Infinity'+numeric '-Infinity',numeric '5'%numeric 'Infinity';
+         SELECT abs(numeric '-Infinity'),sign(numeric '-Infinity'),
+                sqrt(numeric 'Infinity'),ln(numeric 'Infinity'),
+                exp(numeric '-Infinity'),scale(numeric 'Infinity') IS NULL,
+                min_scale(numeric 'Infinity') IS NULL,trim_scale(numeric 'Infinity'),
+                power(numeric '-Infinity',3),power(0::numeric,numeric 'Infinity'),
+                power(0.5::numeric,numeric '-Infinity'),div(numeric 'Infinity',2);
+         SELECT to_char(numeric 'Infinity','S999.99'),
+                to_char(numeric '-Infinity','S999.99'),
+                to_char(numeric 'Infinity','9.9EEEE'),
+                numrange(numeric 'Infinity',numeric 'Infinity','[]'),
+                hash_range(numrange(numeric '-Infinity',numeric 'Infinity','[]'));
+         SELECT to_json(numeric 'Infinity'),to_json(numeric '-Infinity'),
+                to_json(numeric 'NaN'),json_build_array(numeric 'Infinity'),
+                to_json('Infinity'::float8);
+         SELECT daterange(date 'infinity',date 'infinity','[]'),
+                daterange(date '-infinity',date '-infinity','[]'),
+                daterange(date '2024-01-01',date 'infinity','[]'),
+                daterange(date '-infinity',date '2024-01-01','(]');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "infinity|-infinity|f|f|2024-07-15 12:00:00-04|2024-07-15 12:00:00",
+            "t|t",
+            "2024-07-15 12:00:00-04|2024-07-15 12:00:00|06:00:00-04",
+            "2024-07-15 05:00:00-04",
+            "2024-03-10 12:00:00-04|2024-03-10 13:00:00-04|2024-03-10 12:00:00-04|2024-03-10 12:00:00-04|2024-03-10 00:00:00-05|2024-03-10 12:00:00-04",
+            "2024-07-15 12:00:00-04|2024-07-14 20:00:00-04|2024-07-14 20:00:00-04|2024-01-01 00:00:01.234|120 years",
+            "2024-01-02 03:04:05|2024-01-02 03:04:05|2024-01-01 20:04:05-05|02:02:02",
+            "2024-01-02 03:04:05|2024-01-02 03:04:05-05|2024-01-01 20:04:05-05|03:04:05|2024-01-01 00:00:00.556",
+            "-555957077|5967375162135414403|-550072194|-1004663756|-1717080021|843851912|1574789525|1574789525|-96758253|-1524351049|-1524351049|-96758253|-523051888|810964538|6152251958620404323|2179321112479743567",
+            "104",
+            "18",
+            "1026|timezone|timestamptz_izone|t|i|s|0|NULL",
+            "1271|overlaps|overlaps_timetz|f|i|s|0|NULL",
+            "3463|make_timestamptz|make_timestamptz_at_timezone|t|s|s|0|{year,month,mday,hour,min,sec,timezone}",
+            "3464|make_interval|make_interval|t|i|s|7|{years,months,weeks,days,hours,mins,secs}",
+            "6222|date_add|timestamptz_pl_interval_at_zone|t|i|s|0|NULL",
+            "6334|timezone|timestamptz_at_local|t|s|s|0|NULL",
+            "2106|1843|1844|3325|0|2281",
+            "2113|1843|6326|3325|0|2281",
+            "2122|1138|0|1138|1097|1082",
+            "2144|1197|0|1197|1332|1186",
+            "infinity|-infinity|f|infinity|-infinity|infinity|00:00:00|infinity",
+            "infinity|-infinity|t",
+            "3723.500000|3500.000|2451545|Infinity|t",
+            "2451545.0000000000000000000000000000|2451545.50000000000000000000|2451544.99998985481481481481",
+            "Infinity|Infinity|NaN|5",
+            "Infinity|-1|Infinity|Infinity|0|t|t|Infinity|-Infinity|0|Infinity|Infinity",
+            "+###.##|-###.##| #.#####|[Infinity,Infinity]|1132062176",
+            "\"Infinity\"|\"-Infinity\"|\"NaN\"|[\"Infinity\"]|\"Infinity\"",
+            "[infinity,infinity]|[-infinity,-infinity]|[2024-01-01,infinity]|(-infinity,2024-01-02)",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    for (query, sqlstate) in [
+        ("SELECT sqrt(numeric '-Infinity')", "2201F"),
+        ("SELECT ln(numeric '-Infinity')", "2201E"),
+        ("SELECT numeric 'Infinity'/0", "22012"),
+        ("SELECT power(0::numeric,numeric '-Infinity')", "2201F"),
+        ("SELECT interval 'infinity' * 0", "22015"),
+        ("SELECT interval 'infinity' / 'Infinity'::float8", "22015"),
+        (
+            "SELECT timestamp 'infinity' + interval '-infinity'",
+            "22008",
+        ),
+        ("SELECT numeric 'Infinity'::numeric(10,2)", "22003"),
+        ("SELECT numeric '-Infinity'::money", "22003"),
+        (
+            "SELECT * FROM generate_series(numeric 'Infinity',numeric 'Infinity',1)",
+            "22023",
+        ),
+        ("SELECT random(numeric '-Infinity',numeric '1')", "22023"),
+        (
+            "SELECT sum(x) OVER (ORDER BY x RANGE BETWEEN numeric '-Infinity' PRECEDING AND CURRENT ROW) FROM (VALUES (1::numeric)) AS v(x)",
+            "22013",
+        ),
+    ] {
+        let error = run_with(&mut engine, &mut budget, query);
+        assert!(
+            String::from_utf8_lossy(&error).contains(sqlstate),
+            "{query}: {}",
+            String::from_utf8_lossy(&error)
+        );
+    }
+}
+
+#[test]
+fn temporal_values_and_expressions_survive_object_cold_recovery() {
+    let mut config = test_config("temporal-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("temporal-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "SET TIME ZONE 'America/New_York';
+         CREATE TABLE durable_temporal (
+           id integer PRIMARY KEY,
+           d date,
+           ts timestamp,
+           tstz timestamptz,
+           t time,
+           tz timetz,
+           iv interval,
+           n numeric,
+           shifted timestamptz GENERATED ALWAYS AS
+             (date_add(tstz, interval '1 day', 'UTC')) STORED
+         );
+         CREATE INDEX durable_temporal_date ON durable_temporal (d);
+         INSERT INTO durable_temporal VALUES
+           (1,'infinity','infinity','infinity','03:04:05','03:04:05+02',
+            'infinity','Infinity',DEFAULT);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let tail = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO durable_temporal VALUES
+           (2,'2024-03-10','2024-03-10 03:30','2024-03-10 03:30-04',
+            '23:59:59','23:59:59-05','30 days','-Infinity',DEFAULT);",
+    );
+    assert!(!String::from_utf8_lossy(&tail).contains("ERROR"));
+    let query = "SET TIME ZONE 'America/New_York';
+                 SELECT id,d,isfinite(d),ts,tstz,t,tz,iv,n,shifted,
+                        d = tstz::date
+                   FROM durable_temporal ORDER BY d,id;
+                 SELECT min(iv),max(iv),sum(iv),avg(iv)
+                   FROM durable_temporal";
+    let before = data_rows(&run_with(&mut engine, &mut budget, query));
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut cold, &mut cold_budget, query)),
+        before
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn set_operations() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE t (a int)");

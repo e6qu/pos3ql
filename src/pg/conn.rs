@@ -4774,15 +4774,30 @@ fn binary_numeric_to_str(
         return Err(wrong);
     }
     let rd = |o: usize| i16::from_be_bytes([bytes[o], bytes[o + 1]]);
-    let ndigits = rd(0) as usize;
+    let ndigits = rd(0) as u16 as usize;
     let weight = rd(2) as i32;
     let sign = rd(4) as u16;
-    let dscale = rd(6).max(0) as usize;
-    if bytes.len() != 8 + ndigits * 2 {
+    let dscale = rd(6) as u16;
+    let special = matches!(sign, 0xC000 | 0xD000 | 0xF000);
+    if bytes.len() != 8 + ndigits * 2
+        || !matches!(sign, 0x0000 | 0x4000 | 0xC000 | 0xD000 | 0xF000)
+        || dscale & !0x3fff != 0
+        || (special && ndigits != 0)
+        || (0..ndigits).any(|index| !(0..10_000).contains(&rd(8 + index * 2)))
+    {
         return Err(wrong);
     }
+    let dscale = dscale as usize;
     if sign == 0xC000 {
         let _ = out.write_str("NaN");
+        return finish_numeric(out, wrong);
+    }
+    if sign == 0xD000 {
+        let _ = out.write_str("Infinity");
+        return finish_numeric(out, wrong);
+    }
+    if sign == 0xF000 {
+        let _ = out.write_str("-Infinity");
         return finish_numeric(out, wrong);
     }
     let digit = |i: i32| -> i16 {
@@ -5473,7 +5488,7 @@ mod tests {
     #[test]
     fn binary_numeric_decoding() {
         // PostgreSQL binary numeric: i16 ndigits, weight, sign, dscale, then
-        // base-10000 digit groups (big-endian). Values verified against PG 18.4.
+        // base-10000 digit groups (big-endian). Values verified against PG 18.6.
         // 2.50 -> ndigits 2, weight 0, sign +, dscale 2, digits [2, 5000].
         assert_eq!(num_str(&[0, 2, 0, 0, 0, 0, 0, 2, 0, 2, 0x13, 0x88]), "2.50");
         // -0.50 -> ndigits 1, weight -1, sign 0x4000, dscale 2, digit [5000].
@@ -5488,6 +5503,17 @@ mod tests {
         );
         // NaN -> sign 0xC000.
         assert_eq!(num_str(&[0, 0, 0, 0, 0xC0, 0, 0, 0]), "NaN");
+        assert_eq!(num_str(&[0, 0, 0, 0, 0xD0, 0, 0, 0]), "Infinity");
+        assert_eq!(num_str(&[0, 0, 0, 0, 0xF0, 0, 0, 0]), "-Infinity");
+
+        for invalid in [
+            &[0, 0, 0, 0, 0x20, 0, 0, 0][..],
+            &[0, 0, 0, 0, 0, 0, 0x40, 0][..],
+            &[0, 1, 0, 0, 0xD0, 0, 0, 0, 0, 1][..],
+        ] {
+            let mut out = crate::util::StackStr::<96>::new();
+            assert!(binary_numeric_to_str(invalid, &mut out).is_err());
+        }
     }
 
     #[test]

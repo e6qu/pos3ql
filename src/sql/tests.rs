@@ -7,6 +7,188 @@
 use super::*;
 
 #[test]
+fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE cursor_values (handle refcursor, handles refcursor[]); \
+         INSERT INTO cursor_values VALUES ('saved', ARRAY['left','right']::refcursor[]); \
+         SELECT handle, handles, pg_typeof(handle), pg_typeof(handles) FROM cursor_values; \
+         COPY (SELECT handle, handles FROM cursor_values) TO STDOUT; \
+         SELECT oid, typname, typlen, typtype, typcategory, typelem, typarray, typinput, typoutput \
+           FROM pg_type WHERE oid IN (1790,2201) ORDER BY oid; \
+         SELECT oid, proname, prorettype, proretset, proallargtypes, proargmodes, proargnames \
+           FROM pg_proc WHERE oid = 2511; \
+         SELECT oid, reltype, relkind, relnatts FROM pg_class WHERE oid = 12077; \
+         SELECT count(*) FROM pg_attribute WHERE attrelid = 12077 AND attnum > 0; \
+         SELECT (SELECT count(*) FROM pg_operator WHERE oprleft IN (1790,2201) OR oprright IN (1790,2201)), \
+                (SELECT count(*) FROM pg_opclass WHERE opcintype IN (1790,2201)), \
+                (SELECT count(*) FROM pg_cast WHERE castsource IN (1790,2201) OR casttarget IN (1790,2201)); \
+         CREATE FUNCTION native_cursor_probe(n integer) RETURNS text LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor := 'native'; first_value text; prior_value text; \
+         BEGIN \
+           OPEN c SCROLL FOR EXECUTE 'SELECT $1::text UNION ALL SELECT ''b''' USING n; \
+           FETCH NEXT FROM c INTO first_value; \
+           MOVE LAST FROM c; \
+           FETCH PRIOR FROM c INTO prior_value; \
+           CLOSE c; \
+           RETURN first_value || ':' || prior_value; \
+         END $$; \
+         CREATE FUNCTION unnamed_cursor_probe() RETURNS text LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor; value text; \
+         BEGIN \
+           OPEN c FOR SELECT 9::text; \
+           FETCH NEXT FROM c INTO value; \
+           CLOSE c; \
+           RETURN value; \
+         END $$; \
+         CREATE FUNCTION static_cursor_probe(n integer) RETURNS text LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor := 'static'; value text; \
+         BEGIN \
+           OPEN c FOR SELECT n::text; \
+           FETCH NEXT FROM c INTO value; \
+           CLOSE c; \
+           RETURN value; \
+         END $$; \
+         CREATE FUNCTION record_cursor_probe() RETURNS text LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor := 'record'; value record; \
+         BEGIN \
+           OPEN c FOR SELECT 4::integer AS number, 'v'::text AS label; \
+           FETCH NEXT FROM c INTO value; \
+           CLOSE c; \
+           RETURN value.number::text || ':' || value.label; \
+         END $$; \
+         SELECT native_cursor_probe(7), unnamed_cursor_probe(), static_cursor_probe(13), record_cursor_probe(); \
+         CREATE FUNCTION returned_cursor_probe() RETURNS refcursor LANGUAGE plpgsql AS $$ \
+         DECLARE c refcursor := 'returned'; \
+         BEGIN OPEN c FOR SELECT 11::integer AS value; RETURN c; END $$; \
+         BEGIN; SELECT returned_cursor_probe(); \
+         SELECT name, statement, is_holdable, is_binary, is_scrollable \
+           FROM pg_cursors WHERE name = 'returned'; \
+         FETCH NEXT FROM returned; CLOSE returned; COMMIT; \
+         BEGIN; \
+         DECLARE visible SCROLL CURSOR FOR SELECT 1; \
+         SELECT name, statement, is_holdable, is_binary, is_scrollable, creation_time IS NOT NULL \
+           FROM pg_cursors; \
+         SELECT count(*) FROM pg_cursor(); \
+         CLOSE visible; COMMIT",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "saved|{left,right}|refcursor|refcursor[]",
+            "1790|refcursor|-1|b|U|0|2201|textin|textout",
+            "2201|_refcursor|-1|b|A|1790|0|array_in|array_out",
+            "2511|pg_cursor|2249|t|{25,25,16,16,16,1184}|{o,o,o,o,o,o}|{name,statement,is_holdable,is_binary,is_scrollable,creation_time}",
+            "12077|12079|v|6",
+            "6",
+            "0|0|0",
+            "7:7|9|13|4:v",
+            "returned",
+            "returned|SELECT 11::integer AS value|f|f|f",
+            "11",
+            "visible|DECLARE visible SCROLL CURSOR FOR SELECT 1|f|f|t|t",
+            "1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+    assert_eq!(copy_data_rows(&output), ["saved\t{left,right}"]);
+    for query in [
+        "SELECT 'a'::refcursor = 'a'::refcursor",
+        "SELECT ARRAY['a']::refcursor[] = ARRAY['a']::refcursor[]",
+        "SELECT 'a'::refcursor IN ('a'::refcursor)",
+        "SELECT 'a'::refcursor = ANY (ARRAY['a']::refcursor[])",
+        "SELECT CASE 'a'::refcursor WHEN 'a'::refcursor THEN 1 END",
+        "SELECT 'a'::refcursor UNION SELECT 'b'::refcursor",
+        "SELECT 'a'::refcursor UNION ALL SELECT 'b'::refcursor ORDER BY 1",
+        "SELECT DISTINCT handle FROM cursor_values",
+        "SELECT handle FROM cursor_values ORDER BY handle",
+    ] {
+        let error =
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, query)).into_owned();
+        assert!(error.contains("42883"), "{query}: {error}");
+    }
+}
+
+#[test]
+fn refcursor_values_survive_checkpoint_wal_and_object_cold_recovery() {
+    let mut config = test_config("refcursor-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("refcursor-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_refcursors (
+             id integer PRIMARY KEY,
+             handle refcursor,
+             handles refcursor[]
+         );
+         INSERT INTO durable_refcursors VALUES
+             (1, 'checkpointed', ARRAY['left','right']::refcursor[]);
+         CREATE VIEW durable_refcursor_view AS
+             SELECT id, handle, handles,
+                    pg_typeof(handle) AS handle_type,
+                    pg_typeof(handles) AS handles_type
+             FROM durable_refcursors",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let tail = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE durable_refcursors
+            SET handle = 'wal-tail', handles = ARRAY['tail']::refcursor[]
+          WHERE id = 1;
+         INSERT INTO durable_refcursors VALUES (2, NULL, NULL)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tail).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tail)
+    );
+    let before = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM durable_refcursor_view ORDER BY id",
+    ));
+    assert_eq!(
+        before,
+        [
+            "1|wal-tail|{tail}|refcursor|refcursor[]",
+            "2|NULL|NULL|refcursor|refcursor[]"
+        ]
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT * FROM durable_refcursor_view ORDER BY id",
+        )),
+        before
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn postgresql_18_regular_expressions_are_complete_and_catalogued() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

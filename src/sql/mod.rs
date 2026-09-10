@@ -1987,6 +1987,13 @@ fn project_replication_values<'a>(
     (projected, count)
 }
 
+fn cursor_result_too_large() -> SqlError {
+    sql_err!(
+        eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "cursor result exceeds cursor_bytes; raise it or narrow the query"
+    )
+}
+
 impl Engine {
     pub(crate) fn subscription_cleanup_runtime(
         &self,
@@ -12930,6 +12937,7 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let prior_origin = txn.enter_ddl_origin();
+        let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
         let result = self.execute_stmt_with_workspace(
             statement,
             arena,
@@ -17015,6 +17023,205 @@ impl Engine {
         Ok(Ok(()))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cursor materialization carries the active statement and session contexts"
+    )]
+    pub(crate) fn materialize_cursor(
+        &mut self,
+        name: &str,
+        statement: &str,
+        sql: &str,
+        scroll: cursor::CursorScroll,
+        hold: bool,
+        binary: bool,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &TxnState,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        let at = cursors.open(name, statement, scroll, hold, binary)?;
+        let out = {
+            let mut parser = match Parser::new(sql, arena) {
+                Ok(parser) => parser,
+                Err(error) => {
+                    cursors.abandon(at);
+                    return Err(SqlError {
+                        sqlstate: SqlState::known(error.sqlstate),
+                        message: stack_format!(192, "{}", error.message.as_str()),
+                    });
+                }
+            };
+            let parsed = match parser.next_stmt() {
+                Ok(Some(statement)) => statement,
+                _ => {
+                    cursors.abandon(at);
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
+                }
+            };
+            let (text, binary) = cursors.result_buffers(at);
+            let mut capture = Responder::for_cursor(text, binary);
+            capture.set_render(guc.render());
+            let sequence_state = sequence::SequenceReplayState::new();
+            let sequence = sequence::ReplaySeqEval::new(
+                sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                &sequence_state,
+            );
+            match &parsed {
+                Stmt::Select(select) => {
+                    let select = match query::expand_ctes_exec(
+                        select,
+                        &self.storage,
+                        txn.txid,
+                        &self.work,
+                        params,
+                        &[],
+                        Some(&sequence),
+                    ) {
+                        Ok(select) => select,
+                        Err(error) => {
+                            cursors.abandon(at);
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = query::validate_locking(select) {
+                        cursors.abandon(at);
+                        return Err(error);
+                    }
+                    if select.from.is_none() {
+                        query::constant_select(
+                            &self.storage,
+                            txn.txid,
+                            select,
+                            &self.work,
+                            params,
+                            Some(&sequence),
+                            &mut capture,
+                        )
+                    } else {
+                        query::select_query(
+                            &self.storage,
+                            txn.txid,
+                            select,
+                            &self.work,
+                            params,
+                            Some(&sequence),
+                            &mut capture,
+                        )
+                    }
+                }
+                Stmt::SetQuery(query) => query::set_query(
+                    &self.storage,
+                    txn.txid,
+                    query,
+                    &self.work,
+                    params,
+                    Some(&sequence),
+                    &mut capture,
+                ),
+                _ => {
+                    cursors.abandon(at);
+                    return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
+                }
+            }
+        };
+        match out {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                cursors.abandon(at);
+                return Err(error);
+            }
+            Err(WireFull) => {
+                cursors.abandon(at);
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "cursor result exceeds cursor_bytes; raise it or narrow the query"
+                ));
+            }
+        }
+        if let Err(error) = cursors.seal(at) {
+            cursors.abandon(at);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cursor materialization carries the active routine and session contexts"
+    )]
+    pub(crate) fn materialize_plpgsql_cursor<'a>(
+        &'a mut self,
+        name: &str,
+        sql: &str,
+        scroll: cursor::CursorScroll,
+        select: &'a ast::Select<'a>,
+        outer: &dyn eval::ColumnLookup<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        txn: &TxnState,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        let at = cursors.open(name, sql, scroll, false, false)?;
+        let result = (|| -> Result<(), SqlError> {
+            let (text, binary) = cursors.result_buffers(at);
+            let mut capture = Responder::for_cursor(text, binary);
+            capture.set_render(guc.render());
+            let mut columns = [types::ColDesc::new("", 0, 0); exec::MAX_PROJ];
+            let count = query::describe_cursor_select(
+                select,
+                &self.storage,
+                txn.txid,
+                outer,
+                arena,
+                &mut columns,
+            )?;
+            capture
+                .row_description(&columns[..count])
+                .map_err(|_| cursor_result_too_large())?;
+            let sequence_state = sequence::SequenceReplayState::new();
+            let sequence = sequence::ReplaySeqEval::new(
+                sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                &sequence_state,
+            );
+            let mut rows = 0u64;
+            query::select_into_rows(
+                &self.storage,
+                txn.txid,
+                select,
+                arena,
+                params,
+                Some(outer),
+                Some(&sequence),
+                &mut |values| {
+                    match query::emit_data_row(&self.storage, txn.txid, arena, &mut capture, values)
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(WireFull) => return Err(cursor_result_too_large()),
+                    }
+                    rows += 1;
+                    Ok(())
+                },
+            )?;
+            capture
+                .command_complete(stack_format!(32, "SELECT {}", rows).as_str())
+                .map_err(|_| cursor_result_too_large())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            cursors.abandon(at);
+            return Err(error);
+        }
+        if let Err(error) = cursors.seal(at) {
+            cursors.abandon(at);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn execute_cursor_statement(
         &mut self,
         statement: &Stmt,
@@ -17034,6 +17241,7 @@ impl Engine {
                 binary,
                 scroll,
                 hold,
+                statement,
                 sql,
             } => {
                 if !txn.is_explicit() {
@@ -17042,116 +17250,9 @@ impl Engine {
                         "DECLARE CURSOR can only be used in transaction blocks"
                     )));
                 }
-                let at = match cursors.open(name, *scroll, *hold, *binary) {
-                    Ok(at) => at,
-                    Err(error) => return Ok(Err(error)),
-                };
-                let out = {
-                    let mut parser = match Parser::new(sql, arena) {
-                        Ok(parser) => parser,
-                        Err(error) => {
-                            cursors.abandon(at);
-                            return Ok(Err(SqlError {
-                                sqlstate: SqlState::known(error.sqlstate),
-                                message: stack_format!(192, "{}", error.message.as_str()),
-                            }));
-                        }
-                    };
-                    let parsed = match parser.next_stmt() {
-                        Ok(Some(statement)) => statement,
-                        _ => {
-                            cursors.abandon(at);
-                            return Ok(Err(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "DECLARE CURSOR requires a SELECT"
-                            )));
-                        }
-                    };
-                    let (text, binary) = cursors.result_buffers(at);
-                    let mut capture = Responder::for_cursor(text, binary);
-                    capture.set_render(guc.render());
-                    let sequence_state = sequence::SequenceReplayState::new();
-                    let sequence = sequence::ReplaySeqEval::new(
-                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                        &sequence_state,
-                    );
-                    match &parsed {
-                        Stmt::Select(select) => {
-                            let select = match query::expand_ctes_exec(
-                                select,
-                                &self.storage,
-                                txn.txid,
-                                &self.work,
-                                params,
-                                &[],
-                                Some(&sequence),
-                            ) {
-                                Ok(select) => select,
-                                Err(error) => {
-                                    cursors.abandon(at);
-                                    return Ok(Err(error));
-                                }
-                            };
-                            if let Err(error) = query::validate_locking(select) {
-                                cursors.abandon(at);
-                                return Ok(Err(error));
-                            }
-                            if select.from.is_none() {
-                                query::constant_select(
-                                    &self.storage,
-                                    txn.txid,
-                                    select,
-                                    &self.work,
-                                    params,
-                                    Some(&sequence),
-                                    &mut capture,
-                                )
-                            } else {
-                                query::select_query(
-                                    &self.storage,
-                                    txn.txid,
-                                    select,
-                                    &self.work,
-                                    params,
-                                    Some(&sequence),
-                                    &mut capture,
-                                )
-                            }
-                        }
-                        Stmt::SetQuery(query) => query::set_query(
-                            &self.storage,
-                            txn.txid,
-                            query,
-                            &self.work,
-                            params,
-                            Some(&sequence),
-                            &mut capture,
-                        ),
-                        _ => {
-                            cursors.abandon(at);
-                            return Ok(Err(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "DECLARE CURSOR requires a SELECT"
-                            )));
-                        }
-                    }
-                };
-                match out {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        cursors.abandon(at);
-                        return Ok(Err(error));
-                    }
-                    Err(WireFull) => {
-                        cursors.abandon(at);
-                        return Ok(Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "cursor result exceeds cursor_bytes; raise it or narrow the query"
-                        )));
-                    }
-                }
-                if let Err(error) = cursors.seal(at) {
-                    cursors.abandon(at);
+                if let Err(error) = self.materialize_cursor(
+                    name, statement, sql, *scroll, *hold, *binary, arena, params, txn, cursors, guc,
+                ) {
                     return Ok(Err(error));
                 }
                 responder.command_complete("DECLARE CURSOR")?;

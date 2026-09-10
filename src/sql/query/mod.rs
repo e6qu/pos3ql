@@ -3929,32 +3929,35 @@ fn check_key_types<'a>(
     scope: &QueryScope<'a>,
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
-    let undefined = |ordering: bool| {
-        Err(sql_err!(
-            sqlstate::UNDEFINED_FUNCTION,
-            "could not identify an {} operator for type json",
-            if ordering { "ordering" } else { "equality" }
-        ))
+    let noncomparable = |e: &Expr<'a>| {
+        infer_scope_type(e, scope)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+            .filter(|ctype| !ctype.has_builtin_equality())
     };
-    let is_json =
-        |e: &Expr<'a>| matches!(infer_scope_type(e, scope), Ok((super::types::oid::JSON, _)));
     let unordered_cid = |e: &Expr<'a>| {
-        matches!(
-            infer_scope_type(e, scope)
-                .ok()
-                .and_then(|(oid, _)| ColType::from_oid(oid)),
-            Some(ColType::Cid | ColType::Array(super::types::ArrElem::Cid))
-        )
+        infer_scope_type(e, scope)
+            .ok()
+            .and_then(|(oid, _)| ColType::from_oid(oid))
+            .is_some_and(|ctype| ctype.has_builtin_equality() && !ctype.has_builtin_ordering())
     };
     for key in statement.group_by.iter().chain(statement.distinct_on) {
-        if is_json(key) {
-            return undefined(false);
+        if let Some(ctype) = noncomparable(key) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "could not identify an equality operator for type {}",
+                ctype.name()
+            ));
         }
     }
     for order in statement.order_by {
         let target = resolve_order_target(order.expression, statement.items, scope, arena)?;
-        if is_json(target) {
-            return undefined(true);
+        if let Some(ctype) = noncomparable(target) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "could not identify an ordering operator for type {}",
+                ctype.name()
+            ));
         }
         if unordered_cid(target) {
             let type_name = if matches!(
@@ -3977,9 +3980,13 @@ fn check_key_types<'a>(
     if statement.distinct {
         for item in statement.items {
             if let SelectItem::Expr { expression, .. } = item
-                && is_json(expression)
+                && let Some(ctype) = noncomparable(expression)
             {
-                return undefined(false);
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an equality operator for type {}",
+                    ctype.name()
+                ));
             }
         }
     }
@@ -4479,6 +4486,50 @@ pub(crate) fn describe_select<'a>(
         }
         None => describe_select_items(sel.items, None, storage, txid, arena, out),
     }
+}
+
+/// Describes a PL/pgSQL cursor query whose FROM-less expressions may name the
+/// routine's typed locals. Table-backed projections retain the ordinary query
+/// scope; their predicates can still reach the same outer local scope during
+/// execution.
+pub(crate) fn describe_cursor_select<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    outer: &dyn ColumnLookup<'a>,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    if select.set_body.is_some() || select.from.is_some() {
+        return describe_select(select, storage, txid, arena, out);
+    }
+    let catalog = storage_catalog(storage, arena, txid);
+    let mut count = 0usize;
+    for item in select.items {
+        let SelectItem::Expr { expression, alias } = item else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "SELECT * with no tables specified is not valid"
+            ));
+        };
+        if count == out.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "select list too wide"
+            ));
+        }
+        let name = alias.unwrap_or(super::exec::derived_name(expression));
+        let ctype = super::exec::typeof_static_coltype(expression, outer, Some(&catalog))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "could not resolve PL/pgSQL cursor result type"
+                )
+            })?;
+        out[count] = ColDesc::of_type(name, ctype);
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn describe_set_tree<'a>(

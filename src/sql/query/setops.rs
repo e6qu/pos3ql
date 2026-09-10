@@ -334,10 +334,45 @@ fn resolve_set_order(
                 "could not determine which collation to use for string comparison"
             ));
         }
+        reject_missing_ordering(columns[index].type_oid)?;
         keys[count] = (index, order.descending, order.nulls_first);
         count += 1;
     }
     Ok(count)
+}
+
+fn missing_equality(ctype: ColType) -> bool {
+    !ctype.has_builtin_equality()
+}
+
+fn reject_missing_ordering(type_oid: i32) -> Result<(), SqlError> {
+    let Some(ctype) = ColType::from_oid(type_oid) else {
+        return Ok(());
+    };
+    if !ctype.has_builtin_ordering() {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "could not identify an ordering operator for type {}",
+            ctype.name()
+        ));
+    }
+    Ok(())
+}
+
+fn set_tree_requires_equality(tree: &SetTree<'_>) -> bool {
+    match tree {
+        SetTree::Select(_) => false,
+        SetTree::Op {
+            operator,
+            all,
+            left,
+            right,
+        } => {
+            !(*operator == SetOp::Union && *all)
+                || set_tree_requires_equality(left)
+                || set_tree_requires_equality(right)
+        }
+    }
 }
 
 fn compare_set_order(
@@ -1349,6 +1384,17 @@ pub(crate) fn describe_set_body<'a>(
     }
     // A column that stayed unknown across every branch (all NULL) is text.
     let target: [ColType; MAX_PROJ] = core::array::from_fn(|c| target[c].unwrap_or(ColType::Text));
+    if set_tree_requires_equality(tree) {
+        for ctype in &target[..n_cols] {
+            if missing_equality(*ctype) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "could not identify an equality operator for type {}",
+                    ctype.name()
+                ));
+            }
+        }
+    }
     for (c, col) in columns[..n_cols].iter_mut().enumerate() {
         col.type_oid = target[c].oid();
         col.typlen = target[c].typlen();
@@ -1736,6 +1782,7 @@ pub(crate) fn sort_set_rows(
                 "could not determine which collation to use for string comparison"
             ));
         }
+        reject_missing_ordering(columns[index].type_oid)?;
         keys[nk] = (index, ob.descending, ob.nulls_first);
         nk += 1;
     }

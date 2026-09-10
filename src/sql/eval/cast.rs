@@ -75,6 +75,10 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::PgDdlCommand => v,
             _ => return Err(cast_unsupported(&v, "pg_ddl_command")),
         },
+        ColType::Refcursor => match v {
+            Datum::Text(_) => v,
+            _ => return Err(cast_unsupported(&v, "refcursor")),
+        },
         ColType::Xid8 => match v {
             Datum::Xid8(_) => v,
             Datum::Text(text) => {

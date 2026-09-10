@@ -14714,7 +14714,29 @@ struct PlpgsqlDynamicSelectInto<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum PlpgsqlCursorQuery<'a> {
+    Static(&'a str),
+    Dynamic(PlpgsqlDynamicQuery<'a>),
+}
+
+#[derive(Clone, Copy)]
+struct PlpgsqlCursorOpen<'a> {
+    variable: SqlName,
+    scroll: super::cursor::CursorScroll,
+    query: PlpgsqlCursorQuery<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct PlpgsqlCursorMotion<'a> {
+    variable: SqlName,
+    motion: super::cursor::FetchMotion,
+    move_only: bool,
+    targets: &'a [SqlName],
+}
+
+#[derive(Clone, Copy)]
 struct BoundPlpgsqlDynamicQuery<'a> {
+    source: &'a str,
     statement: &'a Stmt<'a>,
     arguments: &'a [Datum<'a>],
 }
@@ -14847,6 +14869,9 @@ enum TriggerStatement<'a> {
     SelectInto(TriggerSelectInto<'a>),
     DynamicQuery(PlpgsqlDynamicQuery<'a>),
     DynamicSelectInto(PlpgsqlDynamicSelectInto<'a>),
+    CursorOpen(PlpgsqlCursorOpen<'a>),
+    CursorMotion(PlpgsqlCursorMotion<'a>),
+    CursorClose(SqlName),
     Perform(&'a Select<'a>),
     Assert(TriggerAssert<'a>),
     Raise(TriggerRaise<'a>),
@@ -17104,6 +17129,131 @@ fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> 
     Some(crate::sql::eval::SqlState::known(state))
 }
 
+fn parse_plpgsql_cursor_open<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<PlpgsqlCursorOpen<'a>>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "open") else {
+        return Ok(None);
+    };
+    let body = body.trim();
+    let Some(split) = body.find(char::is_whitespace) else {
+        return Err(unsupported_trigger_body());
+    };
+    let variable = SqlName::parse(body[..split].trim())?;
+    let body = body[split..].trim();
+    let Some(for_at) = trigger_top_level_keyword(body, "for") else {
+        return Err(unsupported_trigger_body());
+    };
+    let options = body[..for_at].trim();
+    let scroll = if options.is_empty() {
+        super::cursor::CursorScroll::Default
+    } else if options.eq_ignore_ascii_case("scroll") {
+        super::cursor::CursorScroll::Scroll
+    } else if options.eq_ignore_ascii_case("no scroll") {
+        super::cursor::CursorScroll::NoScroll
+    } else {
+        return Err(unsupported_trigger_body());
+    };
+    let query = body[for_at + 3..].trim();
+    if query.is_empty() {
+        return Err(unsupported_trigger_body());
+    }
+    let query = if let Some(dynamic) = strip_trigger_keyword(query, "execute") {
+        let dynamic = dynamic.trim();
+        let using_at = trigger_top_level_keyword(dynamic, "using");
+        let command = using_at.map_or(dynamic, |at| &dynamic[..at]);
+        let using = using_at.map(|at| &dynamic[at + 5..]);
+        PlpgsqlCursorQuery::Dynamic(parse_plpgsql_dynamic_query(command, using, arena)?)
+    } else {
+        PlpgsqlCursorQuery::Static(query)
+    };
+    Ok(Some(PlpgsqlCursorOpen {
+        variable,
+        scroll,
+        query,
+    }))
+}
+
+fn parse_plpgsql_cursor_motion<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
+) -> Result<Option<PlpgsqlCursorMotion<'a>>, SqlError> {
+    let (keyword, body, move_only) = if let Some(body) = strip_trigger_keyword(statement, "fetch") {
+        ("FETCH", body.trim(), false)
+    } else if let Some(body) = strip_trigger_keyword(statement, "move") {
+        ("MOVE", body.trim(), true)
+    } else {
+        return Ok(None);
+    };
+    let into_at = trigger_top_level_keyword(body, "into");
+    if move_only && into_at.is_some() {
+        return Err(unsupported_trigger_body());
+    }
+    let motion_and_variable = into_at.map_or(body, |at| body[..at].trim());
+    let Some(variable_text) = motion_and_variable.split_ascii_whitespace().next_back() else {
+        return Err(unsupported_trigger_body());
+    };
+    let variable = SqlName::parse(variable_text)?;
+    let variable_at = motion_and_variable
+        .len()
+        .checked_sub(variable_text.len())
+        .ok_or_else(unsupported_trigger_body)?;
+    let mut motion_source = motion_and_variable[..variable_at].trim_end();
+    for introducer in ["from", "in"] {
+        if motion_source
+            .split_ascii_whitespace()
+            .next_back()
+            .is_some_and(|token| token.eq_ignore_ascii_case(introducer))
+        {
+            motion_source = motion_source[..motion_source.len() - introducer.len()].trim_end();
+            break;
+        }
+    }
+    let mut source = StackStr::<256>::new();
+    use core::fmt::Write as _;
+    let _ = write!(source, "{}", keyword);
+    if !motion_source.is_empty() {
+        let _ = write!(source, " {}", motion_source);
+    }
+    let _ = write!(source, " FROM __plpgsql_cursor__");
+    if source.is_truncated() {
+        return Err(unsupported_trigger_body());
+    }
+    let parsed = super::parser::parse_stored_statement(source.as_str(), arena)?;
+    let Stmt::FetchCursor {
+        motion,
+        move_only: parsed_move,
+        ..
+    } = parsed
+    else {
+        return Err(unsupported_trigger_body());
+    };
+    debug_assert_eq!(*parsed_move, move_only);
+    let targets = match into_at {
+        Some(at) => parse_plpgsql_into_targets(&body[at + 4..], arena)?.0,
+        None if move_only => &[],
+        None => return Err(unsupported_trigger_body()),
+    };
+    Ok(Some(PlpgsqlCursorMotion {
+        variable,
+        motion: *motion,
+        move_only,
+        targets,
+    }))
+}
+
+fn parse_plpgsql_cursor_close(statement: &str) -> Result<Option<SqlName>, SqlError> {
+    let Some(body) = strip_trigger_keyword(statement, "close") else {
+        return Ok(None);
+    };
+    let body = body.trim();
+    if body.is_empty() || body.contains(char::is_whitespace) {
+        return Err(unsupported_trigger_body());
+    }
+    Ok(Some(SqlName::parse(body)?))
+}
+
 fn trigger_raise_default_sqlstate(level: TriggerRaiseLevel) -> crate::sql::eval::SqlState {
     match level {
         TriggerRaiseLevel::Exception => {
@@ -17198,6 +17348,15 @@ fn parse_trigger_statement<'a>(
             ));
         }
         return Ok(TriggerStatement::GetStackedDiagnostics(diagnostics));
+    }
+    if let Some(open) = parse_plpgsql_cursor_open(segment, arena)? {
+        return Ok(TriggerStatement::CursorOpen(open));
+    }
+    if let Some(motion) = parse_plpgsql_cursor_motion(segment, arena)? {
+        return Ok(TriggerStatement::CursorMotion(motion));
+    }
+    if let Some(variable) = parse_plpgsql_cursor_close(segment)? {
+        return Ok(TriggerStatement::CursorClose(variable));
     }
     if let Some(assignment) = parse_trigger_assignment(segment, arena)? {
         return Ok(TriggerStatement::Assign(assignment));
@@ -19640,6 +19799,7 @@ fn bind_plpgsql_dynamic_query<'a>(
         )?;
     }
     Ok(BoundPlpgsqlDynamicQuery {
+        source: command,
         statement: super::parser::parse_stored_statement(command, context.arena)?,
         arguments: &*arguments,
     })
@@ -19703,6 +19863,7 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
         .alloc_str(text)
         .map_err(|_| super::query::arena_full_pub())?;
     Ok(BoundPlpgsqlDynamicQuery {
+        source: text,
         statement: super::parser::parse_stored_statement(text, context.arena)?,
         arguments: &*values,
     })
@@ -20093,6 +20254,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     execute_bound_plpgsql_dynamic_utility(
                         context,
                         BoundPlpgsqlDynamicQuery {
+                            source: "",
                             statement: requalified,
                             arguments: &[],
                         },
@@ -21782,6 +21944,7 @@ fn execute_plpgsql_dynamic_explain(
     let planned = resolve_plpgsql_dynamic_prepared(
         context,
         BoundPlpgsqlDynamicQuery {
+            source: "",
             statement,
             arguments,
         },
@@ -22677,6 +22840,319 @@ fn execute_trigger_block<'a>(
                     };
                 } else {
                     assign_trigger_local(context, locals, local_values, assignment.name, value)?;
+                }
+            }
+            TriggerStatement::CursorOpen(statement) => {
+                let local = trigger_local_index(locals, statement.variable)?;
+                if locals[local].ctype != ColType::Refcursor {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "variable \"{}\" must be of type cursor or refcursor",
+                        statement.variable.as_str()
+                    ));
+                }
+                let generated;
+                let name = match local_values[local] {
+                    Datum::Text(name) => name,
+                    Datum::Null => {
+                        let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "SQL cursors are not available in trigger execution"
+                            ));
+                        };
+                        generated = cursors.unnamed_name()?;
+                        context
+                            .arena
+                            .alloc_str(generated.as_str())
+                            .map_err(|_| super::query::arena_full_pub())?
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "variable \"{}\" must be of type cursor or refcursor",
+                            statement.variable.as_str()
+                        ));
+                    }
+                };
+                let transition = TriggerTransition {
+                    definition,
+                    old,
+                    new: new.as_deref(),
+                };
+                let scope = TriggerLocalScope {
+                    locals,
+                    values: &local_values[..locals.len()],
+                    found: status.found,
+                    invocation,
+                    transition: &transition,
+                };
+                let (source, arguments, static_select) = match statement.query {
+                    PlpgsqlCursorQuery::Static(source) => {
+                        let parsed = super::parser::parse_stored_statement(source, context.arena)?;
+                        match parsed {
+                            Stmt::Select(select) => (source, context.params, Some(select)),
+                            Stmt::SetQuery(_) => (source, context.params, None),
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::SYNTAX_ERROR,
+                                    "OPEN requires a SELECT"
+                                ));
+                            }
+                        }
+                    }
+                    PlpgsqlCursorQuery::Dynamic(query) => {
+                        let bound = resolve_plpgsql_dynamic_prepared(
+                            context,
+                            bind_plpgsql_dynamic_query(context, query, &scope)?,
+                            &scope,
+                        )?;
+                        if !matches!(bound.statement, Stmt::Select(_) | Stmt::SetQuery(_)) {
+                            return Err(sql_err!(sqlstate::SYNTAX_ERROR, "OPEN requires a SELECT"));
+                        }
+                        (bound.source, bound.arguments, None)
+                    }
+                };
+                let PlpgsqlExecHost::Routine {
+                    engine,
+                    guc,
+                    cursors,
+                    ..
+                } = &mut context.host
+                else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "SQL cursors are not available in trigger execution"
+                    ));
+                };
+                if let Some(select) = static_select {
+                    engine.materialize_plpgsql_cursor(
+                        name,
+                        source,
+                        statement.scroll,
+                        select,
+                        &scope,
+                        context.arena,
+                        arguments,
+                        context.txn,
+                        cursors,
+                        guc,
+                    )?;
+                } else {
+                    engine.materialize_cursor(
+                        name,
+                        source,
+                        source,
+                        statement.scroll,
+                        false,
+                        false,
+                        context.arena,
+                        arguments,
+                        context.txn,
+                        cursors,
+                        guc,
+                    )?;
+                }
+                assign_trigger_local(
+                    context,
+                    locals,
+                    local_values,
+                    statement.variable,
+                    Datum::Text(name),
+                )?;
+                status.assign_output_local(local, local_values[local]);
+            }
+            TriggerStatement::CursorMotion(statement) => {
+                let local = trigger_local_index(locals, statement.variable)?;
+                if locals[local].ctype != ColType::Refcursor {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "variable \"{}\" must be of type cursor or refcursor",
+                        statement.variable.as_str()
+                    ));
+                }
+                let Datum::Text(name) = local_values[local] else {
+                    return Err(sql_err!(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "cursor variable \"{}\" is null",
+                        statement.variable.as_str()
+                    ));
+                };
+                let arena = context.arena;
+                let (count, rows) = {
+                    let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "SQL cursors are not available in trigger execution"
+                        ));
+                    };
+                    let count = cursors.fetch(name, statement.motion)?;
+                    let rows = arena
+                        .alloc_slice_copy(cursors.emitted())
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    (count, rows)
+                };
+                if !statement.move_only {
+                    if count > 1 {
+                        return Err(sql_err!(
+                            sqlstate::CARDINALITY_VIOLATION,
+                            "FETCH statement returned more than one row"
+                        ));
+                    }
+                    let target_local = statement
+                        .targets
+                        .first()
+                        .copied()
+                        .map(|target| trigger_local_index(locals, target))
+                        .transpose()?;
+                    let record_target = statement.targets.len() == 1
+                        && target_local.is_some_and(|target| {
+                            matches!(
+                                locals[target].ctype,
+                                ColType::Record | ColType::Composite(_)
+                            )
+                        });
+                    let mut column_names = [None; MAX_COLUMNS];
+                    let mut column_type_oids = [0; MAX_COLUMNS];
+                    let column_count = {
+                        let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
+                            unreachable!("cursor host cannot change during execution")
+                        };
+                        let wire = cursors.wire_parts(name).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_CURSOR,
+                                "cursor \"{}\" does not exist",
+                                name
+                            )
+                        })?;
+                        let mut borrowed_names = [None; MAX_COLUMNS];
+                        let count = super::cursor::description_columns(
+                            wire.description,
+                            &mut borrowed_names,
+                            &mut column_type_oids,
+                        )?;
+                        for (target, source) in column_names[..count]
+                            .iter_mut()
+                            .zip(&borrowed_names[..count])
+                        {
+                            *target = Some(
+                                context
+                                    .arena
+                                    .alloc_str(source.expect("description name initialized"))
+                                    .map_err(|_| super::query::arena_full_pub())?,
+                            );
+                        }
+                        count
+                    };
+                    if !record_target && column_count != statement.targets.len() {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "cursor returned {} columns but FETCH INTO expects {}",
+                            column_count,
+                            statement.targets.len()
+                        ));
+                    }
+                    let mut values = [Datum::Null; MAX_COLUMNS];
+                    let mut decoded = [None; MAX_COLUMNS];
+                    if let Some(row) = rows.first().copied() {
+                        let width = {
+                            let PlpgsqlExecHost::Routine { cursors, .. } = &context.host else {
+                                unreachable!("cursor host cannot change during execution")
+                            };
+                            cursors.emitted_text_row(name, row, &mut decoded)?
+                        };
+                        if width != column_count {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "cursor row has {} columns but its description has {}",
+                                width,
+                                column_count
+                            ));
+                        }
+                        if !record_target {
+                            for (index, field) in decoded[..width].iter().enumerate() {
+                                values[index] = match field {
+                                    Some(text) => Datum::Text(
+                                        arena
+                                            .alloc_str(text)
+                                            .map_err(|_| super::query::arena_full_pub())?,
+                                    ),
+                                    None => Datum::Null,
+                                };
+                            }
+                        }
+                    }
+                    if record_target {
+                        let mut fields = [RecordField {
+                            name: "",
+                            type_oid: 0,
+                            value: Datum::Null,
+                        }; MAX_COLUMNS];
+                        for index in 0..column_count {
+                            let value = match decoded[index] {
+                                Some(text) => Datum::Text(
+                                    arena
+                                        .alloc_str(text)
+                                        .map_err(|_| super::query::arena_full_pub())?,
+                                ),
+                                None => Datum::Null,
+                            };
+                            let value = match catalog_column_type(
+                                context.storage(),
+                                context.txn.txid,
+                                column_type_oids[index],
+                            ) {
+                                Some((ctype, _)) => cast_to(value, ctype, arena)?,
+                                None => value,
+                            };
+                            fields[index] = RecordField {
+                                name: column_names[index]
+                                    .expect("cursor description name initialized"),
+                                type_oid: column_type_oids[index],
+                                value,
+                            };
+                        }
+                        let fields = arena
+                            .alloc_slice_copy(&fields[..column_count])
+                            .map_err(|_| super::query::arena_full_pub())?;
+                        values[0] = Datum::Record(&*fields);
+                    }
+                    for (index, target) in statement.targets.iter().copied().enumerate() {
+                        assign_trigger_local(context, locals, local_values, target, values[index])?;
+                        let assigned = trigger_local_index(locals, target)?;
+                        status.assign_output_local(assigned, local_values[assigned]);
+                    }
+                }
+                status.set_rows(count as u64)?;
+            }
+            TriggerStatement::CursorClose(variable) => {
+                let local = trigger_local_index(locals, variable)?;
+                if locals[local].ctype != ColType::Refcursor {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "variable \"{}\" must be of type cursor or refcursor",
+                        variable.as_str()
+                    ));
+                }
+                let Datum::Text(name) = local_values[local] else {
+                    return Err(sql_err!(
+                        sqlstate::NULL_VALUE_NOT_ALLOWED,
+                        "cursor variable \"{}\" is null",
+                        variable.as_str()
+                    ));
+                };
+                let PlpgsqlExecHost::Routine { cursors, .. } = &mut context.host else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "SQL cursors are not available in trigger execution"
+                    ));
+                };
+                if !cursors.close(name) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_CURSOR,
+                        "cursor \"{}\" does not exist",
+                        name
+                    ));
                 }
             }
             TriggerStatement::LoopControl(control) => {
@@ -51163,7 +51639,7 @@ fn decode_binary_field_with_context<'a>(
             let [byte]: [u8; 1] = bytes.try_into().map_err(|_| bad())?;
             Ok(Datum::Char(byte))
         }
-        ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
+        ColType::Text | ColType::Refcursor | ColType::Varchar | ColType::Bpchar | ColType::Name => {
             core::str::from_utf8(bytes)
                 .map(Datum::Text)
                 .map_err(|_| bad())

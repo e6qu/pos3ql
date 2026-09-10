@@ -27,6 +27,7 @@ use super::{QueryScope, arena_full, describe_scope_items, record_star_width};
 /// Whether `name` is one of the supported set-returning functions.
 pub(crate) fn is_srf_name(name: &str) -> bool {
     is_event_trigger_introspection(name)
+        || name.eq_ignore_ascii_case("pg_cursor")
         || name.eq_ignore_ascii_case("_pg_expandarray")
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
@@ -1269,6 +1270,12 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             crate::sql::event_trigger::with_dropped_objects(|rows| rows.len())
         };
     }
+    if name.eq_ignore_ascii_case("pg_cursor") {
+        require_no_arguments(name, args)?;
+        return crate::sql::cursor::with_active(|pool| {
+            Ok(pool.map_or(0, crate::sql::cursor::CursorPool::len))
+        });
+    }
     let as_i64 = |d: &Datum| -> Option<i64> {
         match d {
             Datum::Int4(v) => Some(*v as i64),
@@ -2464,6 +2471,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_ts_debug = tref.table.eq_ignore_ascii_case("ts_debug");
     let is_ts_stat = tref.table.eq_ignore_ascii_case("ts_stat");
     let is_event_introspection = is_event_trigger_introspection(tref.table);
+    let is_cursor_introspection = tref.table.eq_ignore_ascii_case("pg_cursor");
     let is_logical_slot_record = is_logical_slot_record_function(tref.table);
     let built_in = is_gs
         || is_unnest
@@ -2489,6 +2497,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_ts_debug
         || is_ts_stat
         || is_event_introspection
+        || is_cursor_introspection
         || is_logical_slot_record;
     let routine = if built_in {
         None
@@ -2509,7 +2518,29 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
     let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
-    let n_default = if is_json_to_record {
+    let n_default = if is_cursor_introspection {
+        require_no_arguments(tref.table, tref.func_args.unwrap_or(&[]))?;
+        for (index, (name, ctype)) in [
+            ("name", ColType::Text),
+            ("statement", ColType::Text),
+            ("is_holdable", ColType::Bool),
+            ("is_binary", ColType::Bool),
+            ("is_scrollable", ColType::Bool),
+            ("creation_time", ColType::Timestamptz),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            default_cols[index] = table_function_column(
+                SqlName::parse(name)?,
+                ctype,
+                None,
+                -1,
+                crate::sql::ast::Collation::None,
+            );
+        }
+        6
+    } else if is_json_to_record {
         json_to_record_append_columns(
             tref.func_args.unwrap_or(&[]),
             storage,
@@ -3317,6 +3348,44 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     };
     if is_event_trigger_introspection(tref.table) {
         return event_trigger_rows(tref.table, args, storage, txid, arena);
+    }
+    if tref.table.eq_ignore_ascii_case("pg_cursor") {
+        require_no_arguments(tref.table, args)?;
+        return crate::sql::cursor::with_active(|pool| {
+            let count = pool.map_or(0, crate::sql::cursor::CursorPool::len);
+            const EMPTY: &[u8] = &[];
+            let rows = arena
+                .alloc_slice_with(count, |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            if let Some(pool) = pool {
+                let mut index = 0usize;
+                let mut error = None;
+                pool.visit(|cursor| {
+                    if error.is_some() {
+                        return;
+                    }
+                    let values = [
+                        Datum::Text(cursor.name),
+                        Datum::Text(cursor.statement),
+                        Datum::Bool(cursor.holdable),
+                        Datum::Bool(cursor.binary),
+                        Datum::Bool(cursor.scrollable),
+                        Datum::Timestamptz(cursor.created_at),
+                    ];
+                    match crate::sql::exec::encode_projected_pub(&values, arena) {
+                        Ok(encoded) => {
+                            rows[index] = encoded;
+                            index += 1;
+                        }
+                        Err(found) => error = Some(found),
+                    }
+                });
+                if let Some(error) = error {
+                    return Err(error);
+                }
+            }
+            Ok(&*rows)
+        });
     }
     let eval_argument = |argument| match eval_hooks {
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),

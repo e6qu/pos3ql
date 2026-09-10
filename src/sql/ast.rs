@@ -1145,6 +1145,9 @@ pub enum Stmt<'a> {
         binary: bool,
         scroll: crate::sql::cursor::CursorScroll,
         hold: bool,
+        /// Exact DECLARE command text exposed through the cursor catalogs.
+        statement: &'a str,
+        /// Raw SELECT text parsed and materialized at DECLARE.
         sql: &'a str,
     },
     /// FETCH/MOVE direction [FROM|IN] cursor. MOVE positions without rows.

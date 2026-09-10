@@ -63,6 +63,37 @@ impl PrngState {
     fn next_f64(&mut self) -> f64 {
         ((self.next_u64() >> 12) as f64) * 2_f64.powi(-52)
     }
+
+    /// Select uniformly from the inclusive range.  Mask-and-reject is the
+    /// algorithm PostgreSQL uses; modulo reduction would bias most ranges.
+    fn next_u64_range(&mut self, min: u64, max: u64) -> u64 {
+        if max <= min {
+            return min;
+        }
+        let range = max - min;
+        let shift = range.leading_zeros();
+        loop {
+            let value = self.next_u64() >> shift;
+            if value <= range {
+                return min + value;
+            }
+        }
+    }
+
+    fn next_i64_range(&mut self, min: i64, max: i64) -> i64 {
+        if max <= min {
+            return min;
+        }
+        let offset = self.next_u64_range(0, (max as u64).wrapping_sub(min as u64));
+        (min as u64).wrapping_add(offset) as i64
+    }
+
+    fn next_normal(&mut self) -> f64 {
+        // Box-Muller requires (0, 1], while next_f64() produces [0, 1).
+        let u1 = 1.0 - self.next_f64();
+        let u2 = 1.0 - self.next_f64();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * core::f64::consts::PI * u2).sin()
+    }
 }
 
 std::thread_local! {
@@ -116,6 +147,48 @@ pub(crate) fn active_random() -> Result<f64, SqlError> {
         }
         // SAFETY: EvalScope owns the pointer's dynamic extent.
         unsafe { &*pointer }.random()
+    })
+}
+
+pub(crate) fn active_random_u64_range(min: u64, max: u64) -> Result<u64, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "random is unavailable outside statement execution"
+            ));
+        }
+        // SAFETY: EvalScope owns the pointer's dynamic extent.
+        unsafe { &*pointer }.random_u64_range(min, max)
+    })
+}
+
+pub(crate) fn active_random_i64_range(min: i64, max: i64) -> Result<i64, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "random is unavailable outside statement execution"
+            ));
+        }
+        // SAFETY: EvalScope owns the pointer's dynamic extent.
+        unsafe { &*pointer }.random_i64_range(min, max)
+    })
+}
+
+pub(crate) fn active_random_normal(mean: f64, stddev: f64) -> Result<f64, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "random_normal is unavailable outside statement execution"
+            ));
+        }
+        // SAFETY: EvalScope owns the pointer's dynamic extent.
+        unsafe { &*pointer }.random_normal(mean, stddev)
     })
 }
 
@@ -1079,7 +1152,7 @@ impl GucState {
         Ok(())
     }
 
-    pub(crate) fn random(&self) -> Result<f64, SqlError> {
+    fn initialized_random_state(&self) -> Result<PrngState, SqlError> {
         let mut state = self.random.get();
         if !state.initialized {
             let mut seed = [0_u8; 16];
@@ -1097,7 +1170,33 @@ impl GucState {
                 state.initialized = true;
             }
         }
+        Ok(state)
+    }
+
+    pub(crate) fn random(&self) -> Result<f64, SqlError> {
+        let mut state = self.initialized_random_state()?;
         let value = state.next_f64();
+        self.random.set(state);
+        Ok(value)
+    }
+
+    pub(crate) fn random_u64_range(&self, min: u64, max: u64) -> Result<u64, SqlError> {
+        let mut state = self.initialized_random_state()?;
+        let value = state.next_u64_range(min, max);
+        self.random.set(state);
+        Ok(value)
+    }
+
+    pub(crate) fn random_i64_range(&self, min: i64, max: i64) -> Result<i64, SqlError> {
+        let mut state = self.initialized_random_state()?;
+        let value = state.next_i64_range(min, max);
+        self.random.set(state);
+        Ok(value)
+    }
+
+    pub(crate) fn random_normal(&self, mean: f64, stddev: f64) -> Result<f64, SqlError> {
+        let mut state = self.initialized_random_state()?;
+        let value = stddev * state.next_normal() + mean;
         self.random.set(state);
         Ok(value)
     }

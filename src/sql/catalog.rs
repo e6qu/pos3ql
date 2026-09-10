@@ -891,22 +891,96 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 2,
         volatility: "s",
     },
-    IntrinsicRoutine {
-        oid: 1598,
-        name: "random",
-        result_oid: 701,
-        argument_types: "",
-        argument_count: 0,
-        volatility: "v",
-    },
-    IntrinsicRoutine {
-        oid: 1599,
-        name: "setseed",
-        result_oid: 2278,
-        argument_types: "701",
-        argument_count: 1,
-        volatility: "v",
-    },
+    // PostgreSQL 18 mathematical functions and overload identities.
+    intrinsic!(320, "width_bucket", 23, "701 701 701 23", 4, "i"),
+    intrinsic!(940, "mod", 21, "21 21", 2, "i"),
+    intrinsic!(941, "mod", 23, "23 23", 2, "i"),
+    intrinsic!(947, "mod", 20, "20 20", 2, "i"),
+    intrinsic!(1194, "log10", 701, "701", 1, "i"),
+    intrinsic!(1340, "log", 701, "701", 1, "i"),
+    intrinsic!(1341, "ln", 701, "701", 1, "i"),
+    intrinsic!(1342, "round", 701, "701", 1, "i"),
+    intrinsic!(1343, "trunc", 701, "701", 1, "i"),
+    intrinsic!(1344, "sqrt", 701, "701", 1, "i"),
+    intrinsic!(1345, "cbrt", 701, "701", 1, "i"),
+    intrinsic!(1346, "pow", 701, "701 701", 2, "i"),
+    intrinsic!(1347, "exp", 701, "701", 1, "i"),
+    intrinsic!(1368, "power", 701, "701 701", 2, "i"),
+    intrinsic!(1376, "factorial", 1700, "20", 1, "i"),
+    intrinsic!(1394, "abs", 700, "700", 1, "i"),
+    intrinsic!(1395, "abs", 701, "701", 1, "i"),
+    intrinsic!(1396, "abs", 20, "20", 1, "i"),
+    intrinsic!(1397, "abs", 23, "23", 1, "i"),
+    intrinsic!(1398, "abs", 21, "21", 1, "i"),
+    intrinsic!(1481, "log10", 1700, "1700", 1, "i"),
+    intrinsic!(1598, "random", 701, "", 0, "v"),
+    intrinsic!(1599, "setseed", 2278, "701", 1, "v"),
+    intrinsic!(1600, "asin", 701, "701", 1, "i"),
+    intrinsic!(1601, "acos", 701, "701", 1, "i"),
+    intrinsic!(1602, "atan", 701, "701", 1, "i"),
+    intrinsic!(1603, "atan2", 701, "701 701", 2, "i"),
+    intrinsic!(1604, "sin", 701, "701", 1, "i"),
+    intrinsic!(1605, "cos", 701, "701", 1, "i"),
+    intrinsic!(1606, "tan", 701, "701", 1, "i"),
+    intrinsic!(1607, "cot", 701, "701", 1, "i"),
+    intrinsic!(1608, "degrees", 701, "701", 1, "i"),
+    intrinsic!(1609, "radians", 701, "701", 1, "i"),
+    intrinsic!(1610, "pi", 701, "", 0, "i"),
+    intrinsic!(1705, "abs", 1700, "1700", 1, "i"),
+    intrinsic!(1706, "sign", 1700, "1700", 1, "i"),
+    intrinsic!(1707, "round", 1700, "1700 23", 2, "i"),
+    intrinsic!(1708, "round", 1700, "1700", 1, "i"),
+    intrinsic!(1709, "trunc", 1700, "1700 23", 2, "i"),
+    intrinsic!(1710, "trunc", 1700, "1700", 1, "i"),
+    intrinsic!(1711, "ceil", 1700, "1700", 1, "i"),
+    intrinsic!(1712, "floor", 1700, "1700", 1, "i"),
+    intrinsic!(1728, "mod", 1700, "1700 1700", 2, "i"),
+    intrinsic!(1730, "sqrt", 1700, "1700", 1, "i"),
+    intrinsic!(1732, "exp", 1700, "1700", 1, "i"),
+    intrinsic!(1734, "ln", 1700, "1700", 1, "i"),
+    intrinsic!(1736, "log", 1700, "1700 1700", 2, "i"),
+    intrinsic!(1738, "pow", 1700, "1700 1700", 2, "i"),
+    intrinsic!(1741, "log", 1700, "1700", 1, "i"),
+    intrinsic!(1973, "div", 1700, "1700 1700", 2, "i"),
+    intrinsic!(2167, "ceiling", 1700, "1700", 1, "i"),
+    intrinsic!(2169, "power", 1700, "1700 1700", 2, "i"),
+    intrinsic!(2170, "width_bucket", 23, "1700 1700 1700 23", 4, "i"),
+    intrinsic!(2308, "ceil", 701, "701", 1, "i"),
+    intrinsic!(2309, "floor", 701, "701", 1, "i"),
+    intrinsic!(2310, "sign", 701, "701", 1, "i"),
+    intrinsic!(2320, "ceiling", 701, "701", 1, "i"),
+    intrinsic!(2462, "sinh", 701, "701", 1, "i"),
+    intrinsic!(2463, "cosh", 701, "701", 1, "i"),
+    intrinsic!(2464, "tanh", 701, "701", 1, "i"),
+    intrinsic!(2465, "asinh", 701, "701", 1, "i"),
+    intrinsic!(2466, "acosh", 701, "701", 1, "i"),
+    intrinsic!(2467, "atanh", 701, "701", 1, "i"),
+    intrinsic!(2731, "asind", 701, "701", 1, "i"),
+    intrinsic!(2732, "acosd", 701, "701", 1, "i"),
+    intrinsic!(2733, "atand", 701, "701", 1, "i"),
+    intrinsic!(2734, "atan2d", 701, "701 701", 2, "i"),
+    intrinsic!(2735, "sind", 701, "701", 1, "i"),
+    intrinsic!(2736, "cosd", 701, "701", 1, "i"),
+    intrinsic!(2737, "tand", 701, "701", 1, "i"),
+    intrinsic!(2738, "cotd", 701, "701", 1, "i"),
+    intrinsic!(3218, "width_bucket", 23, "5077 5078", 2, "i"),
+    intrinsic!(3281, "scale", 23, "1700", 1, "i"),
+    intrinsic!(5042, "min_scale", 23, "1700", 1, "i"),
+    intrinsic!(5043, "trim_scale", 1700, "1700", 1, "i"),
+    intrinsic!(5044, "gcd", 23, "23 23", 2, "i"),
+    intrinsic!(5045, "gcd", 20, "20 20", 2, "i"),
+    intrinsic!(5046, "lcm", 23, "23 23", 2, "i"),
+    intrinsic!(5047, "lcm", 20, "20 20", 2, "i"),
+    intrinsic!(5048, "gcd", 1700, "1700 1700", 2, "i"),
+    intrinsic!(5049, "lcm", 1700, "1700 1700", 2, "i"),
+    intrinsic!(6212, "random_normal", 701, "701 701", 2, "v"),
+    intrinsic!(6219, "erf", 701, "701", 1, "i"),
+    intrinsic!(6220, "erfc", 701, "701", 1, "i"),
+    intrinsic!(6339, "random", 23, "23 23", 2, "v"),
+    intrinsic!(6340, "random", 20, "20 20", 2, "v"),
+    intrinsic!(6341, "random", 1700, "1700 1700", 2, "v"),
+    intrinsic!(6383, "gamma", 701, "701", 1, "i"),
+    intrinsic!(6384, "lgamma", 701, "701", 1, "i"),
     intrinsic!(3432, "gen_random_uuid", super::types::oid::UUID, "", 0, "v"),
     intrinsic!(6428, "uuidv4", super::types::oid::UUID, "", 0, "v"),
     intrinsic!(6429, "uuidv7", super::types::oid::UUID, "", 0, "v"),
@@ -2715,8 +2789,98 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
         715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
         | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
         | 4223 | 4224 | 1402 | 1403 | 2078 | 2943 | 3348 | 5059 | 5060 | 3086 | 6119 | 6120 => "u",
-        1181 | 1641 | 3566 | 4568 => "r",
+        1181 | 1598 | 1599 | 1641 | 3566 | 4568 | 6212 | 6339 | 6340 | 6341 => "r",
         _ => "s",
+    }
+}
+
+fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
+    match routine.oid {
+        89 => "pgsql_version",
+        320 => "width_bucket_float8",
+        3281 => "numeric_scale",
+        4112 => "macaddr8_trunc",
+        5042 => "numeric_min_scale",
+        5043 => "numeric_trim_scale",
+        5044 => "int4gcd",
+        5045 => "int8gcd",
+        5046 => "int4lcm",
+        5047 => "int8lcm",
+        5048 => "numeric_gcd",
+        5049 => "numeric_lcm",
+        6212 => "drandom_normal",
+        6219 => "derf",
+        6220 => "derfc",
+        6339 => "int4random",
+        6340 => "int8random",
+        6341 => "numeric_random",
+        6383 => "dgamma",
+        6384 => "dlgamma",
+        6428 => "gen_random_uuid",
+        6430 => "uuidv7_interval",
+        753 => "macaddr_trunc",
+        940 => "int2mod",
+        941 => "int4mod",
+        947 => "int8mod",
+        1194 | 1340 => "dlog10",
+        1341 => "dlog1",
+        1342 => "dround",
+        1343 => "dtrunc",
+        1344 => "dsqrt",
+        1345 => "dcbrt",
+        1346 | 1368 => "dpow",
+        1347 => "dexp",
+        1376 => "numeric_fac",
+        1394 => "float4abs",
+        1395 => "float8abs",
+        1396 => "int8abs",
+        1397 => "int4abs",
+        1398 => "int2abs",
+        1481 | 1708 | 1710 | 1741 => "",
+        1598 => "drandom",
+        1600 => "dasin",
+        1601 => "dacos",
+        1602 => "datan",
+        1603 => "datan2",
+        1604 => "dsin",
+        1605 => "dcos",
+        1606 => "dtan",
+        1607 => "dcot",
+        1610 => "dpi",
+        1705 => "numeric_abs",
+        1706 => "numeric_sign",
+        1707 => "numeric_round",
+        1709 => "numeric_trunc",
+        1711 => "numeric_ceil",
+        1712 => "numeric_floor",
+        1728 => "numeric_mod",
+        1730 => "numeric_sqrt",
+        1732 => "numeric_exp",
+        1734 => "numeric_ln",
+        1736 => "numeric_log",
+        1738 | 2169 => "numeric_power",
+        1973 => "numeric_div_trunc",
+        2167 => "numeric_ceil",
+        2170 => "width_bucket_numeric",
+        2308 | 2320 => "dceil",
+        2309 => "dfloor",
+        2310 => "dsign",
+        2462 => "dsinh",
+        2463 => "dcosh",
+        2464 => "dtanh",
+        2465 => "dasinh",
+        2466 => "dacosh",
+        2467 => "datanh",
+        2731 => "dasind",
+        2732 => "dacosd",
+        2733 => "datand",
+        2734 => "datan2d",
+        2735 => "dsind",
+        2736 => "dcosd",
+        2737 => "dtand",
+        2738 => "dcotd",
+        3218 => "width_bucket_array",
+        _ => routine.name,
     }
 }
 
@@ -8877,6 +9041,39 @@ pub fn function_arguments_text<'a>(
     identity: bool,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+        let mut output = StackStr::<256>::new();
+        use core::fmt::Write;
+        for (index, written) in routine.argument_types.split_ascii_whitespace().enumerate() {
+            if index != 0 {
+                write!(output, ", ").map_err(|_| super::eval::arena_full())?;
+            }
+            if routine.oid == 6212 {
+                write!(output, "{} ", ["mean", "stddev"][index])
+                    .map_err(|_| super::eval::arena_full())?;
+            } else if (6339..=6341).contains(&routine.oid) {
+                write!(output, "{} ", ["min", "max"][index])
+                    .map_err(|_| super::eval::arena_full())?;
+            }
+            let type_oid = written.parse::<i32>().map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "intrinsic routine has an invalid argument OID"
+                )
+            })?;
+            let Some(type_name) = intrinsic_type_name(type_oid) else {
+                return Ok(None);
+            };
+            write!(output, "{type_name}").map_err(|_| super::eval::arena_full())?;
+            if routine.oid == 6212 && !identity {
+                write!(output, " DEFAULT {}", index).map_err(|_| super::eval::arena_full())?;
+            }
+        }
+        return arena
+            .alloc_str(output.as_str())
+            .map(Some)
+            .map_err(|_| super::eval::arena_full());
+    }
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
     };
@@ -8934,6 +9131,11 @@ pub fn function_result_text<'a>(
     oid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
+        return intrinsic_type_name(routine.result_oid)
+            .map(|name| arena.alloc_str(name).map_err(|_| super::eval::arena_full()))
+            .transpose();
+    }
     let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
         return Ok(None);
     };
@@ -9021,6 +9223,25 @@ pub fn function_result_text<'a>(
         .alloc_str(output.as_str())
         .map(Some)
         .map_err(|_| super::eval::arena_full())
+}
+
+fn intrinsic_type_name(oid: i32) -> Option<&'static str> {
+    ColType::from_oid(oid).map(ColType::name).or_else(|| {
+        Some(match oid {
+            super::types::oid::ANYELEMENT => "anyelement",
+            super::types::oid::ANYARRAY => "anyarray",
+            super::types::oid::ANYNONARRAY => "anynonarray",
+            super::types::oid::ANYENUM => "anyenum",
+            super::types::oid::ANYRANGE => "anyrange",
+            super::types::oid::ANYMULTIRANGE => "anymultirange",
+            super::types::oid::ANYCOMPATIBLE => "anycompatible",
+            super::types::oid::ANYCOMPATIBLEARRAY => "anycompatiblearray",
+            super::types::oid::ANYCOMPATIBLENONARRAY => "anycompatiblenonarray",
+            super::types::oid::ANYCOMPATIBLERANGE => "anycompatiblerange",
+            super::types::oid::ANYCOMPATIBLEMULTIRANGE => "anycompatiblemultirange",
+            _ => return None,
+        })
+    })
 }
 
 pub fn collation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
@@ -18687,7 +18908,9 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("prosqlbody", ColType::PgNodeTree),
         ],
     );
-    const MAX_ROWS: usize = 640;
+    // Built-ins plus the startup-bounded user-routine inventory.  Keep this
+    // above the PostgreSQL 18 intrinsic set with the default 32 routine slots.
+    const MAX_ROWS: usize = 768;
     let mut rows: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
     for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
         let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -18767,16 +18990,12 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 } else {
                     Datum::Null
                 },
-                Datum::Int4(12),
-                text(
-                    match routine.oid {
-                        89 => "pgsql_version",
-                        6428 => "gen_random_uuid",
-                        6430 => "uuidv7_interval",
-                        _ => routine.name,
-                    },
-                    arena,
-                )?,
+                Datum::Int4(if matches!(routine.oid, 1481 | 1708 | 1710 | 1741) {
+                    14
+                } else {
+                    12
+                }),
+                text(intrinsic_routine_source(*routine), arena)?,
                 Datum::Null,
                 Datum::Bool(intrinsic_routine_is_strict(*routine)),
                 Datum::Bool(matches!(
@@ -18799,6 +19018,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(match routine.oid {
                     3577 | 3578 => 1,
                     3786 => 3,
+                    6212 => 2,
                     1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => 2,
                     3960 | 3961 => 1,
                     _ => 0,
@@ -18838,6 +19058,17 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         element: super::types::ArrElem::Text,
                         raw: super::array::build(&[Datum::Text("shift")], arena)?,
                     },
+                    (6212, _) => Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(
+                            &[Datum::Text("mean"), Datum::Text("stddev")],
+                            arena,
+                        )?,
+                    },
+                    (6339..=6341, _) => Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(&[Datum::Text("min"), Datum::Text("max")], arena)?,
+                    },
                     (_, Some((_, output_names))) => Datum::Array {
                         element: super::types::ArrElem::Text,
                         raw: super::array::build(
@@ -18854,6 +19085,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         Datum::Text("'{}'::jsonb false")
                     }
                     3960 | 3961 => Datum::Text("false"),
+                    6212 => Datum::Text("0, 1"),
                     _ => Datum::Null,
                 },
                 Datum::Null,

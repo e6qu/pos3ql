@@ -2102,6 +2102,24 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.compare_text(collation, left, right)
     }
 
+    fn uses_full_unicode_case_mapping(
+        &self,
+        collation: super::ast::Collation,
+    ) -> Result<bool, SqlError> {
+        Ok(match collation {
+            super::ast::Collation::PgUnicodeFast => true,
+            super::ast::Collation::Catalog(slot) => {
+                let definition = self
+                    .storage
+                    .collation(usize::from(slot))
+                    .definition_for(self.txid);
+                definition.provider == crate::storage::CollationProvider::Builtin
+                    && definition.locale.as_str() == "PG_UNICODE_FAST"
+            }
+            _ => false,
+        })
+    }
+
     fn convert_encoding<'a>(
         &self,
         source: crate::storage::PgEncoding,

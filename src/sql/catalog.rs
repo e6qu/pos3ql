@@ -2715,6 +2715,83 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(4389, "range_intersect_agg", 4537, "4537", 1, "i"),
     intrinsic!(4450, "range_intersect_agg", 3831, "3831", 1, "i"),
     intrinsic!(6227, "range_agg", 4537, "4537", 1, "i"),
+    // PostgreSQL 18 text, binary-string, and Unicode surface. Keeping every
+    // overload here makes regprocedure resolution and pg_proc introspection
+    // agree with the evaluator instead of exposing only a hand-picked subset.
+    intrinsic!(376, "string_to_array", 1009, "25 25 25", 3, "i"),
+    intrinsic!(394, "string_to_array", 1009, "25 25", 2, "i"),
+    intrinsic!(849, "position", 23, "25 25", 2, "i"),
+    intrinsic!(868, "strpos", 23, "25 25", 2, "i"),
+    intrinsic!(870, "lower", 25, "25", 1, "i"),
+    intrinsic!(871, "upper", 25, "25", 1, "i"),
+    intrinsic!(872, "initcap", 25, "25", 1, "i"),
+    intrinsic!(873, "lpad", 25, "25 23 25", 3, "i"),
+    intrinsic!(874, "rpad", 25, "25 23 25", 3, "i"),
+    intrinsic!(875, "ltrim", 25, "25 25", 2, "i"),
+    intrinsic!(876, "rtrim", 25, "25 25", 2, "i"),
+    intrinsic!(877, "substr", 25, "25 23 23", 3, "i"),
+    intrinsic!(878, "translate", 25, "25 25 25", 3, "i"),
+    intrinsic!(879, "lpad", 25, "25 23", 2, "i"),
+    intrinsic!(880, "rpad", 25, "25 23", 2, "i"),
+    intrinsic!(881, "ltrim", 25, "25", 1, "i"),
+    intrinsic!(882, "rtrim", 25, "25", 1, "i"),
+    intrinsic!(883, "substr", 25, "25 23", 2, "i"),
+    intrinsic!(884, "btrim", 25, "25 25", 2, "i"),
+    intrinsic!(885, "btrim", 25, "25", 1, "i"),
+    intrinsic!(936, "substring", 25, "25 23 23", 3, "i"),
+    intrinsic!(937, "substring", 25, "25 23", 2, "i"),
+    intrinsic!(1268, "parse_ident", 1009, "25 16", 2, "i"),
+    intrinsic!(1282, "quote_ident", 25, "25", 1, "i"),
+    intrinsic!(1283, "quote_literal", 25, "25", 1, "i"),
+    intrinsic!(1285, "quote_literal", 25, "2283", 1, "s"),
+    intrinsic!(1289, "quote_nullable", 25, "25", 1, "i"),
+    intrinsic!(1290, "quote_nullable", 25, "2283", 1, "s"),
+    intrinsic!(1317, "length", 23, "25", 1, "i"),
+    intrinsic!(1318, "length", 23, "1042", 1, "i"),
+    intrinsic!(1367, "character_length", 23, "1042", 1, "i"),
+    intrinsic!(1369, "character_length", 23, "25", 1, "i"),
+    intrinsic!(1372, "char_length", 23, "1042", 1, "i"),
+    intrinsic!(1374, "octet_length", 23, "25", 1, "i"),
+    intrinsic!(1375, "octet_length", 23, "1042", 1, "i"),
+    intrinsic!(1381, "char_length", 23, "25", 1, "i"),
+    intrinsic!(1404, "overlay", 25, "25 25 23 23", 4, "i"),
+    intrinsic!(1405, "overlay", 25, "25 25 23", 3, "i"),
+    intrinsic!(1530, "length", 701, "601", 1, "i"),
+    intrinsic!(1531, "length", 701, "602", 1, "i"),
+    intrinsic!(1620, "ascii", 23, "25", 1, "i"),
+    intrinsic!(1621, "chr", 25, "23", 1, "i"),
+    intrinsic!(1622, "repeat", 25, "25 23", 2, "i"),
+    intrinsic!(1811, "bit_length", 23, "25", 1, "i"),
+    intrinsic!(1845, "to_ascii", 25, "25", 1, "i"),
+    intrinsic!(1846, "to_ascii", 25, "25 23", 2, "i"),
+    intrinsic!(1847, "to_ascii", 25, "25 19", 2, "i"),
+    intrinsic!(2073, "substring", 25, "25 25", 2, "i"),
+    intrinsic!(2074, "substring", 25, "25 25 25", 3, "i"),
+    intrinsic!(2087, "replace", 25, "25 25 25", 3, "i"),
+    intrinsic!(2088, "split_part", 25, "25 25 23", 3, "i"),
+    intrinsic!(2089, "to_hex", 25, "23", 1, "i"),
+    intrinsic!(2090, "to_hex", 25, "20", 1, "i"),
+    intrinsic!(3058, "concat", 25, "2276", 1, "s"),
+    intrinsic!(3059, "concat_ws", 25, "25 2276", 2, "s"),
+    intrinsic!(3060, "left", 25, "25 23", 2, "i"),
+    intrinsic!(3061, "right", 25, "25 23", 2, "i"),
+    intrinsic!(3062, "reverse", 25, "25", 1, "i"),
+    intrinsic!(3539, "format", 25, "25 2276", 2, "s"),
+    intrinsic!(3540, "format", 25, "25", 1, "s"),
+    intrinsic!(3696, "starts_with", 16, "25 25", 2, "i"),
+    intrinsic!(3711, "length", 23, "3614", 1, "i"),
+    intrinsic!(4350, "normalize", 25, "25 25", 2, "i"),
+    intrinsic!(4351, "is_normalized", 16, "25 25", 2, "i"),
+    intrinsic!(4549, "unicode_version", 25, "", 0, "i"),
+    intrinsic!(6105, "unicode_assigned", 16, "25", 1, "i"),
+    intrinsic!(6160, "string_to_table", 25, "25 25", 2, "i"),
+    intrinsic!(6161, "string_to_table", 25, "25 25 25", 3, "i"),
+    intrinsic!(6198, "unistr", 25, "25", 1, "i"),
+    intrinsic!(6330, "to_bin", 25, "23", 1, "i"),
+    intrinsic!(6331, "to_bin", 25, "20", 1, "i"),
+    intrinsic!(6332, "to_oct", 25, "23", 1, "i"),
+    intrinsic!(6333, "to_oct", 25, "20", 1, "i"),
+    intrinsic!(6412, "casefold", 25, "25", 1, "i"),
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -2774,13 +2851,35 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 4300
             | 6225
             | 6226
+            | 376
+            | 394
+            | 1289
+            | 1290
+            | 3058
+            | 3059
+            | 3539
+            | 3540
+            | 6160
+            | 6161
     )
 }
 
 fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
     matches!(
         routine.oid,
-        1293 | 1179 | 2947 | 3205 | 3475 | 3491 | 3961 | 4006 | 5064 | 6119 | 4568 | 3566
+        1293 | 1179
+            | 2947
+            | 3205
+            | 3475
+            | 3491
+            | 3961
+            | 4006
+            | 5064
+            | 6119
+            | 4568
+            | 3566
+            | 6160
+            | 6161
     )
 }
 
@@ -2797,6 +2896,72 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
 fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
         89 => "pgsql_version",
+        376 => "text_to_array_null",
+        394 => "text_to_array",
+        720 | 2010 => "byteaoctetlen",
+        749 => "byteaoverlay",
+        752 => "byteaoverlay_no_len",
+        849 | 868 => "textpos",
+        877 | 936 => "text_substr",
+        879 | 880 | 1810 | 1811 | 1812 | 2074 => "",
+        881 => "ltrim1",
+        882 => "rtrim1",
+        883 | 937 => "text_substr_no_len",
+        885 => "btrim1",
+        1285 => "select pg_catalog.quote_literal($1::pg_catalog.text)",
+        1290 => "select pg_catalog.quote_nullable($1::pg_catalog.text)",
+        1317 | 1369 | 1381 => "textlen",
+        1318 | 1367 | 1372 => "bpcharlen",
+        1374 => "textoctetlen",
+        1375 => "bpcharoctetlen",
+        1404 => "textoverlay",
+        1405 => "textoverlay_no_len",
+        1530 => "lseg_length",
+        1531 => "path_length",
+        1680 => "bitsubstr",
+        1681 => "bitlength",
+        1682 => "bitoctetlength",
+        1698 => "bitposition",
+        1699 => "bitsubstr_no_len",
+        1845 => "to_ascii_default",
+        1846 => "to_ascii_enc",
+        1847 => "to_ascii_encname",
+        2012 => "bytea_substr",
+        2013 => "bytea_substr_no_len",
+        2014 => "byteapos",
+        2015 => "byteatrim",
+        2073 => "textregexsubstr",
+        2087 => "replace_text",
+        2085 => "bytea_substr",
+        2086 => "bytea_substr_no_len",
+        2089 => "to_hex32",
+        2090 => "to_hex64",
+        3030 => "bitoverlay",
+        3031 => "bitoverlay_no_len",
+        3058 => "text_concat",
+        3059 => "text_concat_ws",
+        3060 => "text_left",
+        3061 => "text_right",
+        3062 => "text_reverse",
+        3539 => "text_format",
+        3540 => "text_format_nv",
+        3696 => "text_starts_with",
+        3711 => "tsvector_length",
+        3848 => "range_lower",
+        3849 => "range_upper",
+        4235 => "multirange_lower",
+        4236 => "multirange_upper",
+        4350 => "unicode_normalize_func",
+        4351 => "unicode_is_normalized",
+        6160 => "text_to_table",
+        6161 => "text_to_table_null",
+        6195 => "bytealtrim",
+        6196 => "byteartrim",
+        6330 => "to_bin32",
+        6331 => "to_bin64",
+        6332 => "to_oct32",
+        6333 => "to_oct64",
+        6382 => "bytea_reverse",
         320 => "width_bucket_float8",
         3281 => "numeric_scale",
         4112 => "macaddr8_trunc",
@@ -9054,6 +9219,16 @@ pub fn function_arguments_text<'a>(
             } else if (6339..=6341).contains(&routine.oid) {
                 write!(output, "{} ", ["min", "max"][index])
                     .map_err(|_| super::eval::arena_full())?;
+            } else if routine.oid == 1268 {
+                write!(output, "{} ", ["str", "strict"][index])
+                    .map_err(|_| super::eval::arena_full())?;
+            }
+            if matches!(routine.oid, 3058 | 3059 | 3539)
+                && index + 1 == routine.argument_count as usize
+            {
+                output
+                    .write_str("VARIADIC ")
+                    .map_err(|_| super::eval::arena_full())?;
             }
             let type_oid = written.parse::<i32>().map_err(|_| {
                 sql_err!(
@@ -9067,6 +9242,14 @@ pub fn function_arguments_text<'a>(
             write!(output, "{type_name}").map_err(|_| super::eval::arena_full())?;
             if routine.oid == 6212 && !identity {
                 write!(output, " DEFAULT {}", index).map_err(|_| super::eval::arena_full())?;
+            } else if !identity && routine.oid == 1268 && index == 1 {
+                output
+                    .write_str(" DEFAULT true")
+                    .map_err(|_| super::eval::arena_full())?;
+            } else if !identity && matches!(routine.oid, 4350 | 4351) && index == 1 {
+                output
+                    .write_str(" DEFAULT 'NFC'::text")
+                    .map_err(|_| super::eval::arena_full())?;
             }
         }
         return arena
@@ -9228,6 +9411,7 @@ pub fn function_result_text<'a>(
 fn intrinsic_type_name(oid: i32) -> Option<&'static str> {
     ColType::from_oid(oid).map(ColType::name).or_else(|| {
         Some(match oid {
+            2276 => "\"any\"",
             super::types::oid::ANYELEMENT => "anyelement",
             super::types::oid::ANYARRAY => "anyarray",
             super::types::oid::ANYNONARRAY => "anynonarray",
@@ -18990,11 +19174,26 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 } else {
                     Datum::Null
                 },
-                Datum::Int4(if matches!(routine.oid, 1481 | 1708 | 1710 | 1741) {
-                    14
-                } else {
-                    12
-                }),
+                Datum::Int4(
+                    if matches!(
+                        routine.oid,
+                        879 | 880
+                            | 1285
+                            | 1290
+                            | 1481
+                            | 1708
+                            | 1710
+                            | 1741
+                            | 1810
+                            | 1811
+                            | 1812
+                            | 2074
+                    ) {
+                        14
+                    } else {
+                        12
+                    },
+                ),
                 text(intrinsic_routine_source(*routine), arena)?,
                 Datum::Null,
                 Datum::Bool(intrinsic_routine_is_strict(*routine)),
@@ -19021,10 +19220,12 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     6212 => 2,
                     1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => 2,
                     3960 | 3961 => 1,
+                    1268 | 4350 | 4351 => 1,
                     _ => 0,
                 }),
                 Datum::Int4(match routine.oid {
                     6119 => super::types::oid::TEXT,
+                    3058 | 3059 | 3539 => 2276,
                     4282 => 3904,
                     4285 => 3906,
                     4288 => 3908,
@@ -19069,6 +19270,13 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         element: super::types::ArrElem::Text,
                         raw: super::array::build(&[Datum::Text("min"), Datum::Text("max")], arena)?,
                     },
+                    (1268, _) => Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(
+                            &[Datum::Text("str"), Datum::Text("strict")],
+                            arena,
+                        )?,
+                    },
                     (_, Some((_, output_names))) => Datum::Array {
                         element: super::types::ArrElem::Text,
                         raw: super::array::build(
@@ -19086,6 +19294,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     }
                     3960 | 3961 => Datum::Text("false"),
                     6212 => Datum::Text("0, 1"),
+                    1268 => Datum::Text("true"),
+                    4350 | 4351 => Datum::Text("'NFC'::text"),
                     _ => Datum::Null,
                 },
                 Datum::Null,
@@ -20094,8 +20304,9 @@ fn pg_collation<'a>(
             ("collversion", ColType::Text),
         ],
     );
-    let mut output: [&[Datum]; 4 + crate::storage::MAX_COLLATIONS] =
-        [&[]; 4 + crate::storage::MAX_COLLATIONS];
+    let mut output: [&[Datum];
+        crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS] =
+        [&[]; crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS];
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         let locale = collation.libc_locale();
         output[index] = row(
@@ -20120,18 +20331,20 @@ fn pg_collation<'a>(
                 },
                 match collation {
                     crate::sql::ast::Collation::UcsBasic => text("C", arena)?,
+                    crate::sql::ast::Collation::PgUnicodeFast => text("PG_UNICODE_FAST", arena)?,
                     _ => Datum::Null,
                 },
                 Datum::Null,
                 match collation {
-                    crate::sql::ast::Collation::UcsBasic => text("1", arena)?,
+                    crate::sql::ast::Collation::UcsBasic
+                    | crate::sql::ast::Collation::PgUnicodeFast => text("1", arena)?,
                     _ => Datum::Null,
                 },
             ],
             arena,
         )?;
     }
-    let mut count = 4;
+    let mut count = crate::sql::ast::Collation::BUILTIN.len();
     for (slot, collation) in storage.collations_visible_to(txid) {
         let stored = storage.collation(slot);
         let optional = |value: &str| {
@@ -25851,7 +26064,10 @@ fn info_collations<'a>(
         ],
     );
     let output = arena
-        .alloc_slice_with(4 + crate::storage::MAX_COLLATIONS, |_| &[] as &[Datum])
+        .alloc_slice_with(
+            crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS,
+            |_| &[] as &[Datum],
+        )
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
@@ -25898,7 +26114,10 @@ fn info_collation_character_set_applicability<'a>(
         ],
     );
     let output = arena
-        .alloc_slice_with(4 + crate::storage::MAX_COLLATIONS, |_| &[] as &[Datum])
+        .alloc_slice_with(
+            crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS,
+            |_| &[] as &[Datum],
+        )
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {

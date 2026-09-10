@@ -46,6 +46,25 @@ impl<'a> Parser<'a> {
             if min_prec <= 4 && self.peeked == Tok::Ident("is") {
                 self.advance()?;
                 let negated = self.eat_ident("not")?;
+                let normalization_form = match self.peeked {
+                    Tok::Ident(form @ ("nfc" | "nfd" | "nfkc" | "nfkd")) => {
+                        self.advance()?;
+                        Some(form)
+                    }
+                    _ => None,
+                };
+                if normalization_form.is_some() || self.peeked == Tok::Ident("normalized") {
+                    self.expect_ident("normalized")?;
+                    let form = self.arena_expr(Expr::Str(normalization_form.unwrap_or("nfc")))?;
+                    left = self.plain_call("is_normalized", &[left, form])?;
+                    if negated {
+                        left = self.arena_expr(Expr::Unary {
+                            operator: UnaryOp::Not,
+                            operand: left,
+                        })?;
+                    }
+                    continue;
+                }
                 if self.eat_ident("json")? {
                     let kind = if self.eat_ident("value")? {
                         "value"
@@ -135,9 +154,9 @@ impl<'a> Parser<'a> {
                     left = self.build_distinct_from(left, right, negated)?;
                     continue;
                 }
-                return Err(
-                    self.err_here("expected NULL, TRUE, FALSE, UNKNOWN, or DISTINCT after IS")
-                );
+                return Err(self.err_here(
+                    "expected NULL, TRUE, FALSE, UNKNOWN, DISTINCT, JSON, or NORMALIZED after IS",
+                ));
             }
             // Array subscript `base[index]` or slice `base[lo:hi]` (1-based,
             // either slice bound optional: `[lo:]`, `[:hi]`, `[:]`).
@@ -509,6 +528,8 @@ impl<'a> Parser<'a> {
             Ok(ParsedCollation::Builtin(Collation::Default))
         } else if catalog && name.eq_ignore_ascii_case("ucs_basic") {
             Ok(ParsedCollation::Builtin(Collation::UcsBasic))
+        } else if catalog && name.eq_ignore_ascii_case("pg_unicode_fast") {
+            Ok(ParsedCollation::Builtin(Collation::PgUnicodeFast))
         } else {
             let name = self
                 .arena
@@ -1873,6 +1894,21 @@ impl<'a> Parser<'a> {
 
     pub(super) fn call(&mut self, name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
+        if name.eq_ignore_ascii_case("normalize") {
+            let target = self.expression(0)?;
+            let form = if self.eat_op(",")? {
+                let form = self.any_ident("Unicode normalization form")?;
+                if !matches!(form, "nfc" | "nfd" | "nfkc" | "nfkd") {
+                    return Err(self.err_here("invalid Unicode normalization form"));
+                }
+                form
+            } else {
+                "nfc"
+            };
+            self.expect_op(")")?;
+            let form = self.arena_expr(Expr::Str(form))?;
+            return self.plain_call("normalize", &[target, form]);
+        }
         if name.eq_ignore_ascii_case("json_arrayagg") {
             return self.sql_json_array_aggregate();
         }

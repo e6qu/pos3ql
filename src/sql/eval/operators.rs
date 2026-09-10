@@ -48,7 +48,11 @@ pub(crate) fn compare_text_collated<'a>(
         _ => return compare(operator, l, r, false, false),
     };
     let ordering = match collation {
-        Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => left.cmp(right),
+        Collation::None
+        | Collation::C
+        | Collation::Posix
+        | Collation::UcsBasic
+        | Collation::PgUnicodeFast => left.cmp(right),
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
@@ -514,9 +518,11 @@ pub fn compare_datums_with_catalog(
         _ => return compare_datums(left, right),
     };
     match collation {
-        Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => {
-            Ok(left.cmp(right))
-        }
+        Collation::None
+        | Collation::C
+        | Collation::Posix
+        | Collation::UcsBasic
+        | Collation::PgUnicodeFast => Ok(left.cmp(right)),
         Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(

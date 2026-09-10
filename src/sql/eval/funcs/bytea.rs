@@ -30,6 +30,8 @@ pub(crate) fn dispatch<'a>(
     if !matches!(
         name,
         "to_hex"
+            | "to_bin"
+            | "to_oct"
             | "md5"
             | "sha224"
             | "sha256"
@@ -377,20 +379,30 @@ pub(crate) fn dispatch<'a>(
                     other => Err(type_mismatch(name, &other)),
                 }
             }
-            "to_hex" => {
+            "to_hex" | "to_bin" | "to_oct" => {
                 arity(1)?;
-                let s = match eval_full(args[0], arena, params, row, hooks)? {
+                let (value, width) = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Null => return Ok(Datum::Null),
-                    // to_hex has int4 and int8 forms only; int2 is ambiguous.
+                    // These functions have int4 and int8 forms only; int2 is
+                    // ambiguous between the two implicit promotions.
                     Datum::Int2(_) => {
                         return Err(sql_err!(
                             sqlstate::AMBIGUOUS_FUNCTION,
-                            "function to_hex(smallint) is not unique"
+                            "function {}(smallint) is not unique",
+                            name
                         ));
                     }
-                    Datum::Int4(v) => stack_format!(16, "{:x}", v as u32),
-                    Datum::Int8(v) => stack_format!(16, "{:x}", v as u64),
+                    Datum::Int4(value) => (u64::from(value as u32), 32),
+                    Datum::Int8(value) => (value as u64, 64),
                     other => return Err(type_mismatch(name, &other)),
+                };
+                let s = match (name, width) {
+                    ("to_bin", 32) => stack_format!(64, "{:b}", value as u32),
+                    ("to_oct", 32) => stack_format!(64, "{:o}", value as u32),
+                    ("to_hex", 32) => stack_format!(64, "{:x}", value as u32),
+                    ("to_bin", _) => stack_format!(64, "{:b}", value),
+                    ("to_oct", _) => stack_format!(64, "{:o}", value),
+                    _ => stack_format!(64, "{:x}", value),
                 };
                 Ok(Datum::Text(
                     arena.alloc_str(s.as_str()).map_err(|_| arena_full())?,

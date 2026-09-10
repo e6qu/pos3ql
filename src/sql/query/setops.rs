@@ -1364,12 +1364,18 @@ pub(crate) fn describe_set_body<'a>(
         &mut collation_workspace,
         &mut next_collation_node,
     )?;
-    for (column, collation) in columns[..n_cols]
+    for (index, (column, collation)) in columns[..n_cols]
         .iter_mut()
         .zip(&collation_workspace[collation_root])
+        .enumerate()
     {
-        column.collation = collation.value;
-        column.collation_derivation = collation.derivation;
+        if target[index].is_collatable() && collation.derivation == CollationDerivation::None {
+            column.collation = Collation::Default;
+            column.collation_derivation = CollationDerivation::Implicit;
+        } else {
+            column.collation = collation.value;
+            column.collation_derivation = collation.derivation;
+        }
     }
     Ok(n_cols)
 }

@@ -7,6 +7,129 @@
 use super::*;
 
 #[test]
+fn postgresql_18_unicode_and_text_completion_is_typed_and_catalogued() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT normalize('ä', NFC), normalize('ä', NFD), normalize('①', NFKC), normalize('각', NFD); \
+         SELECT 'ä' IS NFC NORMALIZED, 'ä' IS NFD NORMALIZED, 'ä' IS NOT NFC NORMALIZED; \
+         SELECT unicode_version(), unicode_assigned('ab'), unicode_assigned('͸'); \
+         SELECT unistr('d\\0061t\\+000061'), unistr('\\D83D\\DE00'); \
+         SELECT casefold('Straße İ Σς' COLLATE pg_unicode_fast), casefold('Straße İ Σς' COLLATE \"C\"); \
+         SELECT lower('ÄBCßİΣ' COLLATE \"C\"), upper('äbcßiσ' COLLATE \"C\"), initcap('élan STRAßE' COLLATE \"C\"); \
+         SELECT lower('ÄBCßİΣ' COLLATE pg_unicode_fast), upper('äbcßiσ' COLLATE pg_unicode_fast), initcap('élan STRAßE' COLLATE pg_unicode_fast); \
+         CREATE COLLATION unicode_fast_copy FROM pg_catalog.pg_unicode_fast; \
+         SELECT upper('straße' COLLATE unicode_fast_copy), initcap('ǆungla' COLLATE unicode_fast_copy); \
+         SELECT to_bin(-1::int4), to_bin(-1::int8), to_oct(-1::int4), to_oct(-1::int8), to_hex(-1::int4); \
+         SELECT to_ascii('ÀÉîõü', 'LATIN1'); \
+         SELECT oid, proname, prorettype, proargtypes::text, prosrc FROM pg_proc WHERE oid IN (4350, 4351, 4549, 6105, 6198, 6330, 6333, 6412) ORDER BY oid; \
+         SELECT oid, collname, collprovider, collencoding, colllocale, collversion FROM pg_collation WHERE oid IN (962, 6411) ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "ä|ä|1|각",
+            "f|t|t",
+            "16.0|t|f",
+            "data|😀",
+            "strasse i̇ σσ|straße İ Σς",
+            "ÄbcßİΣ|äBCßIσ|éLan StraßE",
+            "äbcßi̇ς|ÄBCSSIΣ|Élan Straße",
+            "STRASSE|ǅungla",
+            "11111111111111111111111111111111|1111111111111111111111111111111111111111111111111111111111111111|37777777777|1777777777777777777777|ffffffff",
+            "A A ARAuA ",
+            "4350|normalize|25|25 25|unicode_normalize_func",
+            "4351|is_normalized|16|25 25|unicode_is_normalized",
+            "4549|unicode_version|25||unicode_version",
+            "6105|unicode_assigned|16|25|unicode_assigned",
+            "6198|unistr|25|25|unistr",
+            "6330|to_bin|25|23|to_bin32",
+            "6333|to_oct|25|20|to_oct64",
+            "6412|casefold|25|25|casefold",
+            "962|ucs_basic|b|6|C|1",
+            "6411|pg_unicode_fast|b|6|PG_UNICODE_FAST|1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+
+    let unsupported = run_with(&mut engine, &mut budget, "SELECT to_ascii('é')");
+    assert!(
+        String::from_utf8_lossy(&unsupported).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported)
+    );
+}
+
+#[test]
+fn unicode_text_expressions_survive_checkpoint_wal_and_object_cold_recovery() {
+    let mut config = test_config("unicode-text-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("unicode-text-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_unicode_text (
+             id integer PRIMARY KEY,
+             source text CHECK (source IS NFD NORMALIZED),
+             canonical text GENERATED ALWAYS AS (normalize(source, NFC)) STORED,
+             folded text GENERATED ALWAYS AS (casefold(source COLLATE pg_unicode_fast)) STORED
+         );
+         CREATE INDEX durable_unicode_canonical ON durable_unicode_text (canonical);
+         CREATE VIEW durable_unicode_view AS
+           SELECT id, canonical, folded, unicode_assigned(source) AS assigned
+           FROM durable_unicode_text;
+         PREPARE normalize_text(text) AS
+           SELECT normalize($1, NFKC), $1 IS NFC NORMALIZED;
+         EXECUTE normalize_text('①');
+         INSERT INTO durable_unicode_text (id, source) VALUES (1, 'ä')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO durable_unicode_text (id, source) VALUES (2, 'Straße')",
+    );
+    let before = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM durable_unicode_view ORDER BY id; \
+         SELECT id FROM durable_unicode_text WHERE canonical = 'ä'",
+    ));
+    assert_eq!(before, ["1|ä|ä|t", "2|Straße|strasse|t", "1"]);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT * FROM durable_unicode_view ORDER BY id; \
+             SELECT id FROM durable_unicode_text WHERE canonical = 'ä'",
+        )),
+        before
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn foreign_data_catalogs_are_typed_transactional_and_visible() {
     let (mut engine, mut budget) = test_engine();
     let created = run_with(
@@ -21864,16 +21987,14 @@ fn regex_match_operators_and_operator_syntax() {
         )),
         ["foo", "public"]
     );
-    let unsupported = run_with_txn_bytes(
-        &mut e,
-        &mut b,
-        &mut t,
-        "SELECT 'a' COLLATE pg_catalog.pg_unicode_fast",
-    );
-    assert!(
-        String::from_utf8_lossy(&unsupported).contains("42704"),
-        "{}",
-        String::from_utf8_lossy(&unsupported)
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut e,
+            &mut b,
+            &mut t,
+            "SELECT 'a' COLLATE pg_catalog.pg_unicode_fast",
+        )),
+        ["a"]
     );
 }
 
@@ -45132,7 +45253,13 @@ fn psql_catalog_listing_contracts() {
             &mut budget,
             "SELECT collname, collprovider FROM pg_collation ORDER BY collname",
         )),
-        ["C|c", "POSIX|c", "default|d", "ucs_basic|b"]
+        [
+            "C|c",
+            "POSIX|c",
+            "default|d",
+            "pg_unicode_fast|b",
+            "ucs_basic|b"
+        ]
     );
     run_with(
         &mut engine,

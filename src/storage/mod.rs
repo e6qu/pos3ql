@@ -14008,9 +14008,11 @@ impl Storage {
         right: &str,
     ) -> Result<core::cmp::Ordering, SqlError> {
         let behavior = match collation {
-            Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => {
-                CollationBehavior::Bytewise
-            }
+            Collation::None
+            | Collation::C
+            | Collation::Posix
+            | Collation::UcsBasic
+            | Collation::PgUnicodeFast => CollationBehavior::Bytewise,
             Collation::Default => CollationBehavior::Database,
             Collation::Catalog(slot) => self
                 .collations
@@ -14047,7 +14049,18 @@ impl Storage {
         let bytewise =
             |value: &str| value.eq_ignore_ascii_case("C") || value.eq_ignore_ascii_case("POSIX");
         match provider {
-            CollationProvider::Builtin if bytewise(locale) => Ok(CollationBehavior::Bytewise),
+            CollationProvider::Builtin if locale == "C" || locale == "PG_UNICODE_FAST" => {
+                Ok(CollationBehavior::Bytewise)
+            }
+            CollationProvider::Builtin if locale == "C.UTF-8" => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "builtin collation locale \"C.UTF-8\" is not supported"
+            )),
+            CollationProvider::Builtin => Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "invalid locale name \"{}\" for builtin provider",
+                locale
+            )),
             CollationProvider::Libc if bytewise(collate) && bytewise(ctype) => {
                 Ok(CollationBehavior::Bytewise)
             }

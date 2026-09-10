@@ -1,6 +1,7 @@
 //! SQL front end: lexer → parser → execution, and the engine entry point
 //! the wire protocol calls.
 
+pub mod acl;
 pub mod array;
 pub mod ast;
 pub mod catalog;
@@ -24,6 +25,7 @@ pub(crate) mod large_object;
 pub mod lexer;
 pub(crate) mod lock;
 pub(crate) mod logical_replication;
+pub mod lsn;
 pub mod md5;
 pub mod money;
 pub mod net;
@@ -17172,7 +17174,53 @@ impl Engine {
                     } else {
                         requested
                     };
+                    let mut type_oids = [0i32; crate::pg::respond::MAX_RESULT_COLS];
+                    let columns =
+                        match cursor::description_type_oids(wire.description, &mut type_oids) {
+                            Ok(columns) => columns,
+                            Err(error) => return Ok(Err(error)),
+                        };
                     responder.cursor_row_description(wire.description, formats)?;
+                    for (index, oid) in type_oids[..columns].iter().enumerate() {
+                        if !formats.is_binary(index) {
+                            continue;
+                        }
+                        let unavailable =
+                            match exec::binary_output_capability(&self.storage, *oid, txn.txid) {
+                                exec::BinaryOutputCapability::Supported => false,
+                                exec::BinaryOutputCapability::MissingAclItemSend => true,
+                                exec::BinaryOutputCapability::MissingAclItemElementSend => {
+                                    let mut present = false;
+                                    for &row in cursors.emitted() {
+                                        let (offset, len) = wire.binary_spans[row as usize];
+                                        let bytes =
+                                            &wire.binary[offset as usize..(offset + len) as usize];
+                                        match cursor::binary_row_field_is_null(bytes, index) {
+                                            Ok(false) => {
+                                                present = true;
+                                                break;
+                                            }
+                                            Ok(true) => {}
+                                            Err(error) => return Ok(Err(error)),
+                                        }
+                                    }
+                                    present
+                                }
+                                exec::BinaryOutputCapability::Unsupported => {
+                                    return Ok(Err(sql_err!(
+                                        eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                                        "binary output is not supported for type oid {}",
+                                        oid
+                                    )));
+                                }
+                            };
+                        if unavailable {
+                            return Ok(Err(sql_err!(
+                                eval::sqlstate::UNDEFINED_FUNCTION,
+                                "no binary output function available for type aclitem"
+                            )));
+                        }
+                    }
                     for &row in cursors.emitted() {
                         let (text_offset, text_len) = wire.text_spans[row as usize];
                         let (binary_offset, binary_len) = wire.binary_spans[row as usize];

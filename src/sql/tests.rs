@@ -9794,6 +9794,208 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
 }
 
 #[test]
+fn aclitem_and_pg_lsn_are_first_class_postgresql_18_types() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE acl_reader; \
+         CREATE ROLE acl_grantor; \
+         CREATE TABLE acl_surface (id integer, visible text); \
+         GRANT SELECT ON acl_surface TO acl_reader; \
+         GRANT UPDATE (visible) ON acl_surface TO acl_reader; \
+         CREATE TABLE acl_manual_public (id integer); \
+         GRANT SELECT ON acl_manual_public TO PUBLIC; \
+         SELECT relacl::text FROM pg_class WHERE relname = 'acl_manual_public'; \
+         ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC; \
+         CREATE TABLE acl_default_public (id integer); \
+         ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM PUBLIC; \
+         SELECT relacl::text FROM pg_class WHERE relname = 'acl_default_public'; \
+         SELECT 'acl_reader=w*r/acl_grantor'::aclitem::text; \
+         SELECT 'acl_reader=rw*/acl_grantor'::aclitem = \
+                'acl_reader=w*r/acl_grantor'::aclitem; \
+         SELECT ARRAY['acl_reader=rw/acl_grantor'::aclitem] @> \
+                'acl_reader=r/acl_grantor'::aclitem; \
+         SELECT hash_aclitem(makeaclitem(10, 10, 'SELECT', true)), \
+                hash_aclitem_extended(makeaclitem(10, 10, 'SELECT', true), 0), \
+                hash_aclitem_extended(makeaclitem(10, 10, 'SELECT', true), 123); \
+         SELECT makeaclitem('acl_reader'::regrole, 'acl_grantor'::regrole, \
+                            'SELECT', false)::text; \
+         SELECT grantor::regrole::text, grantee::regrole::text, privilege_type, is_grantable \
+           FROM aclexplode(ARRAY['acl_reader=r*/acl_grantor'::aclitem, \
+                                 '=w/acl_grantor'::aclitem]); \
+         SELECT pg_get_acl('pg_class'::regclass, 'acl_surface'::regclass, 0)::text; \
+         SELECT pg_get_acl('pg_class'::regclass, 'acl_surface'::regclass, 2)::text; \
+         SELECT '0/10'::pg_lsn + 1.5::numeric; \
+         SELECT 1.5::numeric + '0/10'::pg_lsn; \
+         SELECT '0/20'::pg_lsn - '0/10'::pg_lsn; \
+         SELECT pg_wal_lsn_diff('0/20'::pg_lsn, '0/10'::pg_lsn); \
+         SELECT min(v), max(v) \
+           FROM (VALUES ('0/20'::pg_lsn), ('0/10'::pg_lsn)) AS s(v); \
+         SELECT count(*) FROM pg_proc \
+          WHERE oid IN (329,777,1031,1032,1035,1036,1037,1062,1365,1689,3943,6385, \
+                        3165,3229,3230,3231,3232,3233,3234,3235,3236,3237,3238,3239, \
+                        3251,3252,3413,4187,4188,4189,4190,5022,5023,5024,6103); \
+         SELECT count(*) FROM pg_operator \
+          WHERE oid IN (966,967,968,974,3222,3223,3224,3225,3226,3227,3228,5025,5026,5027); \
+         SELECT count(*) FROM pg_opclass WHERE oid IN (10059,10067,10068); \
+         SELECT count(*) FROM pg_opfamily WHERE oid IN (2235,3253,3254); \
+         SELECT count(*) FROM pg_amop WHERE oid IN (10250,10251,10252,10253,10254,10294,10296); \
+         SELECT count(*) FROM pg_amproc WHERE oid IN (10118,10119,10190,10191,10196,10197)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "{postgres=arwdDxtm/postgres,=r/postgres}",
+            "{=r/postgres,postgres=arwdDxtm/postgres}",
+            "acl_reader=rw*/acl_grantor",
+            "t",
+            "t",
+            "22|22|2773602834858152604",
+            "acl_reader=r/acl_grantor",
+            "acl_grantor|acl_reader|SELECT|t",
+            "acl_grantor|-|UPDATE|f",
+            "{postgres=arwdDxtm/postgres,acl_reader=r/postgres}",
+            "{acl_reader=w/postgres}",
+            "0/12",
+            "0/12",
+            "16",
+            "16",
+            "0/10|0/20",
+            "35",
+            "14",
+            "3",
+            "3",
+            "7",
+            "6",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT '0/1'::pg_lsn, 'acl_reader=r/acl_grantor'::aclitem, \
+                    ARRAY['acl_reader=r/acl_grantor'::aclitem]",
+        )),
+        [
+            crate::sql::types::oid::PG_LSN,
+            crate::sql::types::oid::ACLITEM,
+            crate::sql::types::oid::ACLITEM_ARRAY,
+        ]
+    );
+    for sql in [
+        "COPY (SELECT 'acl_reader=r/acl_grantor'::aclitem) TO STDOUT (FORMAT binary)",
+        "COPY (SELECT ARRAY['acl_reader=r/acl_grantor'::aclitem]) TO STDOUT (FORMAT binary)",
+    ] {
+        let rejected = run_with(&mut engine, &mut budget, sql);
+        let message = String::from_utf8_lossy(&rejected);
+        assert!(message.contains("42883"), "{sql}: {message}");
+        assert!(
+            message.contains("no binary output function available for type aclitem"),
+            "{sql}: {message}"
+        );
+    }
+    for (sql, tag) in [
+        (
+            "COPY (SELECT NULL::aclitem[]) TO STDOUT (FORMAT binary)",
+            "COPY 1",
+        ),
+        (
+            "COPY (SELECT NULL::aclitem[] WHERE false) TO STDOUT (FORMAT binary)",
+            "COPY 0",
+        ),
+    ] {
+        let accepted = run_with(&mut engine, &mut budget, sql);
+        let message = String::from_utf8_lossy(&accepted);
+        assert!(!message.contains("ERROR"), "{sql}: {message}");
+        assert!(message.contains(tag), "{sql}: {message}");
+    }
+    for sql in [
+        "SELECT 'missing_role=r/acl_grantor'::aclitem",
+        "SELECT ARRAY['acl_reader=r/acl_grantor'::aclitem, NULL] @> \
+                'acl_reader=r/acl_grantor'::aclitem",
+        "SELECT ARRAY['acl_reader=r/acl_grantor'::aclitem] + \
+                'acl_reader=w/acl_grantor'::aclitem",
+        "SELECT 'FFFFFFFF/FFFFFFFF'::pg_lsn + 1",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, sql)).contains("ERROR"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn aclitem_role_identity_survives_renames_and_recovery() {
+    let config = test_config("aclitem-role-identity");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE acl_old_reader;
+         CREATE ROLE acl_old_grantor;
+         CREATE TABLE acl_identity (
+             direct aclitem,
+             members aclitem[],
+             defaulted aclitem DEFAULT 'acl_old_reader=w/acl_old_grantor'::aclitem
+         );
+         INSERT INTO acl_identity (direct, members)
+         VALUES ('acl_old_reader=r*/acl_old_grantor'::aclitem,
+                 ARRAY['acl_old_reader=r/acl_old_grantor'::aclitem]);
+         ALTER ROLE acl_old_reader RENAME TO acl_new_reader;
+         ALTER ROLE acl_old_grantor RENAME TO acl_new_grantor;
+         SELECT direct::text, members::text, defaulted::text,
+                members @> 'acl_new_reader=r/acl_new_grantor'::aclitem
+           FROM acl_identity;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "acl_new_reader=r*/acl_new_grantor|{acl_new_reader=r/acl_new_grantor}|acl_new_reader=w/acl_new_grantor|t"
+        ]
+    );
+    engine.checkpoint().unwrap();
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 28);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT direct::text, members::text, defaulted::text,
+                members @> 'acl_new_reader=r/acl_new_grantor'::aclitem
+           FROM acl_identity",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "acl_new_reader=r*/acl_new_grantor|{acl_new_reader=r/acl_new_grantor}|acl_new_reader=w/acl_new_grantor|t"
+        ]
+    );
+    let dropped = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "DROP ROLE acl_new_reader;
+         DROP ROLE acl_new_grantor;
+         SELECT direct::text ~ '^[0-9]+=r\\*/[0-9]+$',
+                members::text ~ '^\\{[0-9]+=r/[0-9]+\\}$',
+                defaulted::text ~ '^[0-9]+=w/[0-9]+$'
+           FROM acl_identity",
+    );
+    assert!(
+        !String::from_utf8_lossy(&dropped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    assert_eq!(data_rows(&dropped), ["t|t|t"]);
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn object_ownership_and_acl_enforce_and_replay() {
     let config = test_config("object-acl-wal-replay");
     let mut budget = Budget::new(1 << 29);

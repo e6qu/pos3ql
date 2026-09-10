@@ -2581,7 +2581,7 @@ impl Conn {
                 "bind parameter count differs from the statement",
             );
         }
-        if !result_formats.matches_column_count(1) {
+        if !result_formats.matches_column_count(1) || result_formats.any_binary() {
             // A per-column result-format list needs the query's described
             // shape. Probe that same typed boundary before a portal exists,
             // discard its provisional response, and retain only a valid
@@ -2609,8 +2609,22 @@ impl Conn {
                 Err(WireFull) => return Step::Close,
             }
             let columns = match self.send.filled_mut().get(mark..) {
-                Some([wire::MSG_ROW_DESCRIPTION, _, _, _, _, high, low, ..]) => {
-                    usize::from(u16::from_be_bytes([*high, *low]))
+                Some(message @ [wire::MSG_ROW_DESCRIPTION, _, _, _, _, high, low, ..]) => {
+                    let columns = usize::from(u16::from_be_bytes([*high, *low]));
+                    let payload = &message[5..];
+                    let mut at = 2usize;
+                    for _ in 0..columns {
+                        let Some(name_len) = payload[at..].iter().position(|byte| *byte == 0)
+                        else {
+                            return Step::Close;
+                        };
+                        at += name_len + 1;
+                        if at + 18 > payload.len() {
+                            return Step::Close;
+                        }
+                        at += 18;
+                    }
+                    columns
                 }
                 Some([wire::MSG_NO_DATA, _, _, _, _]) => 0,
                 _ => return Step::Close,
@@ -5100,6 +5114,89 @@ mod tests {
         drop(connection);
         drop(engine);
         crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn extended_binary_aclitem_result_is_rejected_at_execute() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pos3ql-binary-aclitem-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 256;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"aclitem\0SELECT makeaclitem(10,10,'SELECT',false)\0");
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"aclitem_portal\0aclitem\0");
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert_eq!(
+            connection.send.readable(),
+            &[wire::MSG_BIND_COMPLETE, 0, 0, 0, 4]
+        );
+        assert!(matches!(connection.phase, Phase::Ready));
+        assert!(connection.portals.iter().any(|portal| portal.active));
+        connection.send.clear();
+
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_DESCRIBE, b"Paclitem_portal\0"));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert_eq!(connection.send.readable()[0], wire::MSG_ROW_DESCRIPTION);
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"aclitem_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        let response = connection.send.readable();
+        assert!(response.windows(7).any(|bytes| bytes == b"C42883\0"));
+        assert!(
+            response
+                .windows(52)
+                .any(|bytes| { bytes == b"no binary output function available for type aclitem" })
+        );
+        assert!(matches!(connection.phase, Phase::SkipToSync));
+        assert!(connection.portals.iter().any(|portal| portal.active));
+
+        drop(connection);
+        drop(engine);
         let _ = std::fs::remove_dir_all(directory);
     }
 

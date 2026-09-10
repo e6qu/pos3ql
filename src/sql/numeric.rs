@@ -504,6 +504,12 @@ impl<'a> Numeric<'a> {
 
     /// Rounds to an i64, erroring on overflow (for int casts).
     pub fn to_i64(&self) -> Result<i64, SqlError> {
+        i64::try_from(self.to_i128()?).map_err(|_| overflow_int())
+    }
+
+    /// Rounds to an `i128`, preserving the wider domain needed by unsigned
+    /// PostgreSQL scalars such as `pg_lsn`.
+    pub fn to_i128(&self) -> Result<i128, SqlError> {
         if self.is_special() {
             return Err(sql_err!(
                 sqlstate::NUMERIC_OUT_OF_RANGE,
@@ -530,7 +536,7 @@ impl<'a> Numeric<'a> {
                 .ok_or_else(overflow_int)?;
         }
         // Account for weight gaps (trailing implicit zero base-digits above 0).
-        let lowest = self.weight as i32 - (self.digits.len() as i32 - 1);
+        let lowest = self.weight as i32 - (self.ndigits() as i32 - 1);
         if lowest > 0 {
             for _ in 0..lowest {
                 acc = acc.checked_mul(NBASE as i128).ok_or_else(overflow_int)?;
@@ -539,7 +545,7 @@ impl<'a> Numeric<'a> {
         if self.sign == Sign::Neg {
             acc = -acc;
         }
-        i64::try_from(acc).map_err(|_| overflow_int())
+        Ok(acc)
     }
 }
 
@@ -2258,6 +2264,8 @@ mod tests {
         assert_eq!(disp(&Numeric::from_i64(0, &a).unwrap()), "0");
         assert_eq!(disp(&Numeric::from_i64(-12345, &a).unwrap()), "-12345");
         assert_eq!(disp(&Numeric::from_i64(1000000, &a).unwrap()), "1000000");
+        assert_eq!(p("100000000", &a).to_i128().unwrap(), 100000000);
+        assert_eq!(p("-100000000", &a).to_i128().unwrap(), -100000000);
         assert_eq!(p("42.7", &a).to_i64().unwrap(), 43);
         assert_eq!(p("42.4", &a).to_i64().unwrap(), 42);
         assert_eq!(p("-42.5", &a).to_i64().unwrap(), -43);

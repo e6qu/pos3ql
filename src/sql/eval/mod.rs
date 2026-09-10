@@ -9,7 +9,7 @@ use crate::util::StackStr;
 
 use super::ast::{BinaryOp, Collation, Expr, UnaryOp};
 use super::numeric::Numeric;
-use super::types::{ArrElem, ColType, Datum};
+use super::types::{ArrElem, ColType, Datum, RecordField};
 
 mod cast;
 pub mod funcs;
@@ -1131,6 +1131,15 @@ pub trait CatalogAccess {
     fn role_oid(&self, _name: &str) -> Option<i32> {
         None
     }
+    fn object_acl<'a>(
+        &self,
+        _classid: u32,
+        _objid: u32,
+        _objsubid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
     /// Resolve a namespace OID to its catalog name.
     fn schema_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
@@ -1251,6 +1260,51 @@ pub trait CatalogAccess {
         _tablespace: &str,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_foreign_data_wrapper_privilege(
+        &self,
+        _role: Option<&str>,
+        _wrapper: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_server_privilege(
+        &self,
+        _role: Option<&str>,
+        _server: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_largeobject_privilege(
+        &self,
+        _role: Option<&str>,
+        _large_object: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn foreign_data_wrapper_name<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    fn foreign_server_name<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    fn large_object_name<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     fn has_parameter_privilege(
@@ -1787,7 +1841,115 @@ fn eval_binary_expression<'a>(
     binary(operator, l, r, left_unknown, right_unknown, arena)
 }
 
+fn materialize_acl_value<'a>(
+    value: Datum<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    fn contains_acl(value: &Datum<'_>) -> bool {
+        match value {
+            Datum::AclItem(_) => true,
+            Datum::Array { element, .. } => *element == ArrElem::AclItem,
+            Datum::Record(fields) | Datum::Composite { fields, .. } => {
+                fields.iter().any(|field| contains_acl(&field.value))
+            }
+            _ => false,
+        }
+    }
+
+    if !contains_acl(&value) {
+        return Ok(value);
+    }
+    let Some(catalog) = hooks.catalog else {
+        return Ok(value);
+    };
+    match value {
+        Datum::AclItem(item) => {
+            crate::sql::acl::materialize(item, catalog, arena).map(Datum::AclItem)
+        }
+        Datum::Array {
+            element: ArrElem::AclItem,
+            raw,
+        } => {
+            let count = super::array::len(raw);
+            let items = arena
+                .alloc_slice_with(count, |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (index, target) in items.iter_mut().enumerate() {
+                *target = match super::array::get(raw, ArrElem::AclItem, index) {
+                    Some(Datum::AclItem(item)) => {
+                        Datum::AclItem(crate::sql::acl::materialize(item, catalog, arena)?)
+                    }
+                    Some(Datum::Text(text)) => {
+                        Datum::AclItem(crate::sql::acl::from_text(text, catalog, arena)?)
+                    }
+                    Some(Datum::Null) => Datum::Null,
+                    _ => unreachable!("aclitem array carries its declared element type"),
+                };
+            }
+            Ok(Datum::Array {
+                element: ArrElem::AclItem,
+                raw: super::array::build_shaped(
+                    items,
+                    super::array::shape(raw).expect("validated array shape"),
+                    arena,
+                )?,
+            })
+        }
+        Datum::Record(fields) => {
+            let materialized = arena
+                .alloc_slice_with(fields.len(), |_| RecordField {
+                    name: "",
+                    type_oid: 0,
+                    value: Datum::Null,
+                })
+                .map_err(|_| arena_full())?;
+            for (target, field) in materialized.iter_mut().zip(fields) {
+                *target = RecordField {
+                    value: materialize_acl_value(field.value, hooks, arena)?,
+                    ..*field
+                };
+            }
+            Ok(Datum::Record(materialized))
+        }
+        Datum::Composite { slot, fields } => {
+            let materialized = arena
+                .alloc_slice_with(fields.len(), |_| RecordField {
+                    name: "",
+                    type_oid: 0,
+                    value: Datum::Null,
+                })
+                .map_err(|_| arena_full())?;
+            for (target, field) in materialized.iter_mut().zip(fields) {
+                *target = RecordField {
+                    value: materialize_acl_value(field.value, hooks, arena)?,
+                    ..*field
+                };
+            }
+            Ok(Datum::Composite {
+                slot,
+                fields: materialized,
+            })
+        }
+        _ => Ok(value),
+    }
+}
+
 pub fn eval_full<'a>(
+    expression: &Expr<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    materialize_acl_value(
+        eval_full_inner(expression, arena, params, row, hooks)?,
+        hooks,
+        arena,
+    )
+}
+
+fn eval_full_inner<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -2094,6 +2256,55 @@ pub fn eval_full<'a>(
                 return Ok(value);
             }
             let v = cast(v, type_name, arena)?;
+            let v = if let Some(target) = ColType::from_sql_name(type_name)
+                && matches!(target, ColType::AclItem | ColType::Array(ArrElem::AclItem))
+                && !v.is_null()
+            {
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "aclitem role catalog access is unavailable"
+                    )
+                })?;
+                match v {
+                    Datum::Text(value) => {
+                        Datum::AclItem(crate::sql::acl::from_text(value, catalog, arena)?)
+                    }
+                    Datum::AclItem(_) => v,
+                    Datum::Array {
+                        element: ArrElem::AclItem,
+                        raw,
+                    } => {
+                        let count = super::array::len(raw);
+                        let items = arena
+                            .alloc_slice_with(count, |_| Datum::Null)
+                            .map_err(|_| arena_full())?;
+                        for (index, item) in items.iter_mut().enumerate() {
+                            *item = match super::array::get(raw, ArrElem::AclItem, index) {
+                                Some(Datum::Text(value)) => Datum::AclItem(
+                                    crate::sql::acl::from_text(value, catalog, arena)?,
+                                ),
+                                Some(item @ Datum::AclItem(_)) => item,
+                                Some(Datum::Null) => Datum::Null,
+                                _ => {
+                                    unreachable!("aclitem array decoder preserves its element type")
+                                }
+                            };
+                        }
+                        Datum::Array {
+                            element: ArrElem::AclItem,
+                            raw: super::array::build_shaped(
+                                items,
+                                super::array::shape(raw).expect("validated array shape"),
+                                arena,
+                            )?,
+                        }
+                    }
+                    _ => unreachable!("aclitem cast returns its declared type"),
+                }
+            } else {
+                v
+            };
             // `::numeric(p,s)` / `::varchar(n)`: enforce the modifier on the
             // cast result exactly as a column of that type would.
             if type_mod != -1
@@ -2641,10 +2852,13 @@ pub fn eval_full<'a>(
                 // `unknown` literals adopt the array's resolved common type;
                 // they must not force a typed range/enum/etc. constructor to
                 // text merely because their runtime carrier is `Datum::Text`.
-                if !is_unknown_literal(e)
-                    && let Some(el) = super::types::ArrElem::from_datum(&v)
-                {
-                    element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
+                if !is_unknown_literal(e) {
+                    let inferred = static_type(e, row)
+                        .and_then(super::types::ArrElem::from_coltype)
+                        .or_else(|| super::types::ArrElem::from_datum(&v));
+                    if let Some(el) = inferred {
+                        element = Some(element.map_or(el, |acc| unify_arr_elem(acc, el)));
+                    }
                 }
                 vals[i] = v;
             }
@@ -3861,6 +4075,16 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
+        && let Some(result) = funcs::acl::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::lsn::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
         && let Some(result) = funcs::string::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
@@ -4581,6 +4805,57 @@ fn call<'a>(
                         name: "value",
                         type_oid: value_oid,
                         value: *value,
+                    },
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(Datum::Record(fields))
+        }
+        "aclexplode" => {
+            arity(1)?;
+            let raw = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Array {
+                    element: ArrElem::AclItem,
+                    raw,
+                } => raw,
+                Datum::Null => return Ok(Datum::Null),
+                other => return Err(type_mismatch("aclexplode", &other)),
+            };
+            let index = hooks.srf_index.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "set-returning function called where not allowed"
+                )
+            })?;
+            let catalog = hooks.catalog.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "aclitem role catalog access is unavailable"
+                )
+            })?;
+            let Some(value) = crate::sql::acl::explode_at(raw, index - 1, catalog, arena)? else {
+                return Ok(Datum::Null);
+            };
+            let fields = arena
+                .alloc_slice_copy(&[
+                    super::types::RecordField {
+                        name: "grantor",
+                        type_oid: super::types::oid::OID,
+                        value: Datum::Oid(value.grantor),
+                    },
+                    super::types::RecordField {
+                        name: "grantee",
+                        type_oid: super::types::oid::OID,
+                        value: Datum::Oid(value.grantee),
+                    },
+                    super::types::RecordField {
+                        name: "privilege_type",
+                        type_oid: super::types::oid::TEXT,
+                        value: Datum::Text(value.privilege),
+                    },
+                    super::types::RecordField {
+                        name: "is_grantable",
+                        type_oid: super::types::oid::BOOL,
+                        value: Datum::Bool(value.grantable),
                     },
                 ])
                 .map_err(|_| arena_full())?;
@@ -6727,6 +7002,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Char(_) => "\"char\"",
         Datum::Numeric(_) => "numeric",
         Datum::Text(_) => "text",
+        Datum::AclItem(_) => "aclitem",
         Datum::Bpchar(_) => "character",
         Datum::Regtype { .. } => "regtype",
         Datum::RegObject { type_oid, .. } => match *type_oid {

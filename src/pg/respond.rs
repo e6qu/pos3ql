@@ -47,6 +47,14 @@ impl ResultFmt {
         self.n
     }
 
+    pub(crate) fn any_binary(&self) -> bool {
+        match self.n {
+            0 => false,
+            1 => self.codes[0],
+            n => self.codes[..usize::from(n)].iter().any(|code| *code),
+        }
+    }
+
     /// Whether column `col` is requested in binary.
     pub(crate) fn is_binary(&self, col: usize) -> bool {
         match self.n {
@@ -85,6 +93,11 @@ pub struct Responder<'b> {
     suppress_row_description: bool,
     /// Per-column result format requested by Bind.
     formats: ResultFmt,
+    /// Type identity from the most recent RowDescription. The executor needs
+    /// this even when extended Execute suppresses that message: a NULL value
+    /// does not itself retain the result column's catalog type.
+    result_type_oids: [i32; MAX_RESULT_COLS],
+    result_columns: usize,
     /// Where a full send buffer drains so large results stream. The socket is
     /// put in blocking mode by the caller for the duration.
     flush: FlushSink<'b>,
@@ -362,6 +375,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Timetz(..) => 12,
         Datum::Interval(_) | Datum::Uuid(_) => 16,
         Datum::Text(text) | Datum::Bpchar(text) => text.len(),
+        Datum::AclItem(_) => unreachable!("aclitem has no binary output function"),
         Datum::Xml(text) => {
             let mut length = 0usize;
             crate::sql::xml::write_output(text, |part| length = length.saturating_add(part.len()));
@@ -433,6 +447,8 @@ impl<'b> Responder<'b> {
             alternate_formats: ResultFmt::ALL_TEXT,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
+            result_type_oids: [0; MAX_RESULT_COLS],
+            result_columns: 0,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
@@ -452,6 +468,8 @@ impl<'b> Responder<'b> {
             alternate_formats: ResultFmt::ALL_TEXT,
             suppress_row_description: true,
             formats,
+            result_type_oids: [0; MAX_RESULT_COLS],
+            result_columns: 0,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
@@ -472,6 +490,8 @@ impl<'b> Responder<'b> {
             alternate_formats: ResultFmt::ALL_BINARY,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
+            result_type_oids: [0; MAX_RESULT_COLS],
+            result_columns: 0,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
@@ -493,6 +513,8 @@ impl<'b> Responder<'b> {
             alternate_formats: ResultFmt::ALL_TEXT,
             suppress_row_description: false,
             formats,
+            result_type_oids: [0; MAX_RESULT_COLS],
+            result_columns: 0,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
@@ -733,6 +755,15 @@ impl<'b> Responder<'b> {
     }
 
     pub fn row_description(&mut self, columns: &[ColDesc]) -> Result<(), WireFull> {
+        self.result_columns = columns.len().min(MAX_RESULT_COLS);
+        for (target, column) in self
+            .result_type_oids
+            .iter_mut()
+            .zip(columns.iter())
+            .take(self.result_columns)
+        {
+            *target = column.type_oid;
+        }
         if self.suppress_row_description || self.discard_query_output {
             return Ok(());
         }
@@ -929,6 +960,10 @@ impl<'b> Responder<'b> {
 
     pub(crate) fn result_formats(&self) -> ResultFmt {
         self.formats
+    }
+
+    pub(crate) fn result_type_oid(&self, index: usize) -> Option<i32> {
+        (index < self.result_columns).then(|| self.result_type_oids[index])
     }
 
     pub(crate) fn alternate_result_formats(&self) -> Option<ResultFmt> {
@@ -1287,6 +1322,9 @@ impl<'b> Responder<'b> {
                 }
                 Datum::PgDdlCommand => {
                     unreachable!("pg_ddl_command output is rejected before encoding")
+                }
+                Datum::AclItem(_) => {
+                    unreachable!("aclitem has no binary output function")
                 }
                 Datum::Bool(b) => {
                     m.i32(1);

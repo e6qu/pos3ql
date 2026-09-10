@@ -9916,6 +9916,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         | Some(OwnedDatum::PgLsn(_))
         | Some(OwnedDatum::Money(_))
         | Some(OwnedDatum::Float8(_)) => 8,
+        Some(OwnedDatum::AclItem { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Snapshot { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
         Some(OwnedDatum::RegObject { len, .. }) => 9 + *len as usize,
@@ -10013,7 +10014,7 @@ pub(crate) fn append_default(buffer: &mut FixedBuf, d: &Option<OwnedDatum>) -> b
 }
 
 /// Largest encoded default: an enum's tag, identity, ordering key, length and
-/// bounded label. Array payloads carry less metadata.
+/// bounded label. Array and ACL payloads carry less metadata.
 pub(crate) const MAX_DEFAULT_ENCODED: usize = 12 + crate::storage::MAX_DEFAULT_TEXT;
 
 /// Stack encoding of a column default; returns the byte count.
@@ -10079,6 +10080,12 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[0] = 33;
             out[1..9].copy_from_slice(&v.to_le_bytes());
             9
+        }
+        Some(OwnedDatum::AclItem { len, bytes }) => {
+            out[0] = 40;
+            out[1] = *len;
+            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + *len as usize
         }
         Some(OwnedDatum::Money(v)) => {
             out[0] = 37;
@@ -10368,6 +10375,16 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = payload.get(*at..*at + 8)?;
             *at += 8;
             Some(OwnedDatum::PgLsn(u64::from_le_bytes(b.try_into().unwrap())))
+        }
+        40 => {
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            crate::sql::acl::from_stored(&bytes[..len]).ok()?;
+            Some(OwnedDatum::AclItem {
+                len: len as u8,
+                bytes,
+            })
         }
         37 => {
             let b = payload.get(*at..*at + 8)?;
@@ -11059,6 +11076,18 @@ mod tests {
                 element: crate::sql::types::ArrElem::Int4,
                 len: 3,
                 bytes: text,
+            }),
+            Some(OwnedDatum::AclItem {
+                len: 19,
+                bytes: {
+                    let mut bytes = [0u8; crate::storage::MAX_DEFAULT_TEXT];
+                    bytes[..4].copy_from_slice(&101u32.to_le_bytes());
+                    bytes[4..8].copy_from_slice(&10u32.to_le_bytes());
+                    bytes[8..10].copy_from_slice(&2u16.to_le_bytes());
+                    bytes[10..12].copy_from_slice(&2u16.to_le_bytes());
+                    bytes[12..19].copy_from_slice(b"r=r*/pg");
+                    bytes
+                },
             }),
             Some(OwnedDatum::Range {
                 kind: crate::sql::types::RangeKind::Int4,

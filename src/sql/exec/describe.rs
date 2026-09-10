@@ -1778,6 +1778,15 @@ fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, C
             _ => None,
         };
     }
+    if name.eq_ignore_ascii_case("aclexplode") {
+        return match index {
+            0 => Some(("grantor", ColType::Oid)),
+            1 => Some(("grantee", ColType::Oid)),
+            2 => Some(("privilege_type", ColType::Text)),
+            3 => Some(("is_grantable", ColType::Bool)),
+            _ => None,
+        };
+    }
     if name.eq_ignore_ascii_case("pg_get_sequence_data") {
         return match index {
             0 => Some(("last_value", ColType::Int8)),
@@ -2988,6 +2997,12 @@ pub fn infer_type_res(
                     }
                 }
                 Add | Sub | Mul | Div | Mod => {
+                    if matches!(operator, Add | Sub)
+                        && lo == oid::ACLITEM_ARRAY
+                        && ro == oid::ACLITEM
+                    {
+                        return Ok((oid::ACLITEM_ARRAY, -1));
+                    }
                     let numeric = |o: i32| {
                         matches!(
                             o,
@@ -3001,6 +3016,16 @@ pub fn infer_type_res(
                     };
                     let int_like =
                         |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::UNKNOWN);
+                    let lsn_offset =
+                        |o: i32| matches!(o, oid::INT2 | oid::INT4 | oid::INT8 | oid::NUMERIC);
+                    if matches!(operator, Sub) && lo == oid::PG_LSN && ro == oid::PG_LSN {
+                        return Ok(of(ColType::Numeric));
+                    }
+                    if matches!(operator, Add | Sub) && lo == oid::PG_LSN && lsn_offset(ro)
+                        || matches!(operator, Add) && lsn_offset(lo) && ro == oid::PG_LSN
+                    {
+                        return Ok(of(ColType::PgLsn));
+                    }
                     if lo == oid::MONEY || ro == oid::MONEY {
                         let result = match (operator, lo, ro) {
                             (Add | Sub, oid::MONEY, oid::MONEY) => Some(ColType::Money),
@@ -3391,6 +3416,9 @@ pub fn infer_type_res(
             | "has_schema_privilege"
             | "has_type_privilege"
             | "has_database_privilege"
+            | "has_foreign_data_wrapper_privilege"
+            | "has_server_privilege"
+            | "has_largeobject_privilege"
             | "has_parameter_privilege"
             | "pg_relation_is_publishable" => of(ColType::Bool),
             "pg_get_replica_identity_index" => of(ColType::Regclass),
@@ -3657,6 +3685,14 @@ pub fn infer_type_res(
                     }
                 }
                 t.unwrap_or_else(|| of(ColType::Int8))
+            }
+            name if crate::sql::eval::funcs::lsn::result_type(name).is_some() => {
+                of(crate::sql::eval::funcs::lsn::result_type(name)
+                    .expect("guarded pg_lsn function"))
+            }
+            name if crate::sql::eval::funcs::acl::result_type(name).is_some() => {
+                of(crate::sql::eval::funcs::acl::result_type(name)
+                    .expect("guarded aclitem function"))
             }
             "cash_in" | "money" | "cash_pl" | "cash_mi" | "cash_mul_int2" | "cash_mul_int4"
             | "cash_mul_int8" | "int2_mul_cash" | "int4_mul_cash" | "int8_mul_cash"
@@ -4049,6 +4085,7 @@ pub fn infer_type_res(
             | "json_each_text"
             | "jsonb_each_text"
             | "pg_options_to_table"
+            | "aclexplode"
             | "pg_get_sequence_data"
             | "pg_get_publication_tables"
             | "_pg_expandarray" => (oid::RECORD, -1),
@@ -4319,7 +4356,7 @@ pub fn infer_type_res(
             | "current_database" | "current_catalog" => of(ColType::Name),
             // current_setting(name [, missing_ok]) returns the value as text.
             "current_setting" | "set_config" => of(ColType::Text),
-            "acldefault" => of(ColType::Array(crate::sql::types::ArrElem::AclItem)),
+            "acldefault" | "pg_get_acl" => of(ColType::Array(crate::sql::types::ArrElem::AclItem)),
             "current_time" => of(ColType::Timetz),
             "localtime" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),

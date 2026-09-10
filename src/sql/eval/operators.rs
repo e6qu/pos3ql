@@ -91,6 +91,62 @@ fn coerce_unknown_array<'a>(
     }
 }
 
+fn acl_contains(left: Datum<'_>, right: Datum<'_>) -> Result<Datum<'static>, SqlError> {
+    if left.is_null() || right.is_null() {
+        return Ok(Datum::Null);
+    }
+    let Datum::Array {
+        element: crate::sql::types::ArrElem::AclItem,
+        raw,
+    } = left
+    else {
+        return Err(type_mismatch("aclcontains", &left));
+    };
+    let right_item = match right {
+        Datum::AclItem(item) => Some(item),
+        Datum::Text(_) => None,
+        _ => return Err(type_mismatch("aclcontains", &right)),
+    };
+    let right_text = match right {
+        Datum::Text(value) => Some(crate::sql::acl::parse(value)?),
+        _ => None,
+    };
+    for index in 0..array::len(raw) {
+        if !matches!(
+            array::get(raw, crate::sql::types::ArrElem::AclItem, index),
+            Some(Datum::Text(_) | Datum::AclItem(_))
+        ) {
+            return Err(sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "ACL arrays must not contain null values"
+            ));
+        }
+    }
+    for index in 0..array::len(raw) {
+        let contains = match (
+            array::get(raw, crate::sql::types::ArrElem::AclItem, index),
+            right_item,
+            right_text,
+        ) {
+            (Some(Datum::AclItem(value)), Some(right), _) => {
+                value.grantee() == right.grantee()
+                    && value.grantor() == right.grantor()
+                    && value.privileges() & right.privileges() == right.privileges()
+                    && value.grant_options() & right.grant_options() == right.grant_options()
+            }
+            (Some(Datum::Text(value)), _, Some(right)) => {
+                crate::sql::acl::parse(value)?.contains(right)
+            }
+            (Some(Datum::Text(_) | Datum::AclItem(_)), _, _) => false,
+            _ => unreachable!("ACL array was validated before containment"),
+        };
+        if contains {
+            return Ok(Datum::Bool(true));
+        }
+    }
+    Ok(Datum::Bool(false))
+}
+
 pub(crate) fn array_set_op<'a>(
     operator: BinaryOp,
     l: Datum<'a>,
@@ -667,6 +723,13 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[4]);
             hasher.write(s.as_bytes());
         }
+        Datum::AclItem(item) => {
+            hasher.write(&[49]);
+            hasher.write(&item.grantee().to_le_bytes());
+            hasher.write(&item.grantor().to_le_bytes());
+            hasher.write(&item.privileges().to_le_bytes());
+            hasher.write(&item.grant_options().to_le_bytes());
+        }
         Datum::Bpchar(s) => {
             hasher.write(&[4]);
             hasher.write(s.trim_end_matches(' ').as_bytes());
@@ -786,6 +849,13 @@ pub(crate) fn compare_datums_as(
         (Datum::Cid(a), Datum::Cid(b)) => a.cmp(b),
         (Datum::Char(a), Datum::Char(b)) => a.cmp(b),
         (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
+        (Datum::AclItem(a), Datum::AclItem(b)) => (
+            a.grantee(),
+            a.grantor(),
+            a.privileges(),
+            a.grant_options(),
+        )
+            .cmp(&(b.grantee(), b.grantor(), b.privileges(), b.grant_options())),
         (Datum::TsVector(a), Datum::TsVector(b)) => {
             crate::sql::full_text::compare_vector(a.as_str(), b.as_str())
         }
@@ -1234,6 +1304,28 @@ pub(crate) fn arithmetic<'a>(
     let l = if l_unknown { coerce_unknown(l, &r)? } else { l };
     let r = if r_unknown { coerce_unknown(r, &l)? } else { r };
     match (operator, l, r) {
+        (BinaryOp::Sub, Datum::PgLsn(left), Datum::PgLsn(right)) => {
+            return crate::sql::lsn::difference(left, right, arena).map(Datum::Numeric);
+        }
+        (BinaryOp::Add | BinaryOp::Sub, Datum::PgLsn(value), offset)
+            if matches!(
+                offset,
+                Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) | Datum::Numeric(_)
+            ) =>
+        {
+            let offset = to_numeric(&offset, arena)?;
+            return crate::sql::lsn::shift(value, &offset, operator == BinaryOp::Sub, arena)
+                .map(Datum::PgLsn);
+        }
+        (BinaryOp::Add, offset, Datum::PgLsn(value))
+            if matches!(
+                offset,
+                Datum::Int2(_) | Datum::Int4(_) | Datum::Int8(_) | Datum::Numeric(_)
+            ) =>
+        {
+            let offset = to_numeric(&offset, arena)?;
+            return crate::sql::lsn::shift(value, &offset, false, arena).map(Datum::PgLsn);
+        }
         (BinaryOp::Add, Datum::Money(left), Datum::Money(right)) => {
             return crate::sql::money::add(left, right).map(Datum::Money);
         }
@@ -2407,6 +2499,25 @@ pub(crate) fn binary<'a>(
             ) => row_compare(operator, a, b),
             _ => compare(operator, l, r, l_unknown, r_unknown),
         },
+        Add | Sub
+            if matches!(
+                l,
+                Datum::Array {
+                    element: crate::sql::types::ArrElem::AclItem,
+                    ..
+                }
+            ) =>
+        {
+            Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{} is no longer supported",
+                if operator == Add {
+                    "aclinsert"
+                } else {
+                    "aclremove"
+                }
+            ))
+        }
         // `jsonb - text`/`text[]`/`integer` deletes a key, keys, or an element.
         Sub if matches!(l, Datum::Json { jsonb: true, .. }) => jsonb_delete(l, r, arena),
         Add | Sub if is_network(&l) || is_network(&r) => network_op(operator, l, r),
@@ -2442,6 +2553,17 @@ pub(crate) fn binary<'a>(
         },
         // `inet && inet` overlap.
         Overlaps if is_network(&l) || is_network(&r) => network_op(operator, l, r),
+        Contains
+            if matches!(
+                l,
+                Datum::Array {
+                    element: crate::sql::types::ArrElem::AclItem,
+                    ..
+                }
+            ) =>
+        {
+            acl_contains(l, r)
+        }
         // Array containment/overlap: `@>` `<@` `&&` over two arrays.
         Contains | ContainedBy | Overlaps
             if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) =>
@@ -2573,6 +2695,37 @@ mod hash_tests {
 
     fn h(d: Datum) -> u64 {
         hash_key(&[d], &[0])
+    }
+
+    #[test]
+    fn pg_lsn_numeric_arithmetic_uses_the_dedicated_operator_family() {
+        let mut budget = crate::mem::Budget::new(4096);
+        let arena = Arena::new(&mut budget, "lsn arithmetic test", 2048).unwrap();
+        let offset = Numeric::parse("1.5", &arena).unwrap();
+        assert_eq!(
+            arithmetic(
+                BinaryOp::Add,
+                Datum::PgLsn(16),
+                Datum::Numeric(offset),
+                false,
+                false,
+                &arena,
+            )
+            .unwrap(),
+            Datum::PgLsn(18)
+        );
+        assert_eq!(
+            arithmetic(
+                BinaryOp::Sub,
+                Datum::PgLsn(16),
+                Datum::Numeric(offset),
+                false,
+                false,
+                &arena,
+            )
+            .unwrap(),
+            Datum::PgLsn(15)
+        );
     }
 
     #[test]

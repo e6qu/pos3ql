@@ -2561,6 +2561,23 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .or_else(|| super::catalog::predefined_role_oid(name))
     }
 
+    fn object_acl<'a>(
+        &self,
+        classid: u32,
+        objid: u32,
+        objsubid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        super::catalog::object_acl_by_address(
+            self.storage,
+            self.txid,
+            classid,
+            objid,
+            objsubid,
+            arena,
+        )
+    }
+
     fn schema_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         let Some(name) = super::catalog::schema_name_by_oid(self.storage, self.txid, oid) else {
             return Ok(None);
@@ -3109,6 +3126,113 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(Some)
     }
 
+    fn has_foreign_data_wrapper_privilege(
+        &self,
+        role: Option<&str>,
+        wrapper: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::ForeignDataWrapper,
+            wrapper,
+            crate::storage::PrivilegeSet::USAGE,
+            privileges,
+        )
+    }
+
+    fn has_server_privilege(
+        &self,
+        role: Option<&str>,
+        server: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::ForeignServer,
+            server,
+            crate::storage::PrivilegeSet::USAGE,
+            privileges,
+        )
+    }
+
+    fn has_largeobject_privilege(
+        &self,
+        role: Option<&str>,
+        large_object: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        object_privilege_query(
+            self.storage,
+            self.txid,
+            role,
+            crate::storage::AccessClass::LargeObject,
+            large_object,
+            crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
+            privileges,
+        )
+    }
+
+    fn foreign_data_wrapper_name<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let Some((_, entry)) = self
+            .storage
+            .foreign_wrappers(self.txid)
+            .find(|(slot, _)| super::catalog::foreign_data_wrapper_oid(*slot) == oid)
+        else {
+            return Ok(None);
+        };
+        arena
+            .alloc_str(entry.definition_for(self.txid).name.as_str())
+            .map(Some)
+            .map_err(|_| arena_full())
+    }
+
+    fn foreign_server_name<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let Some((_, entry)) = self
+            .storage
+            .foreign_servers(self.txid)
+            .find(|(slot, _)| super::catalog::foreign_server_oid(*slot) == oid)
+        else {
+            return Ok(None);
+        };
+        arena
+            .alloc_str(entry.definition_for(self.txid).name.as_str())
+            .map(Some)
+            .map_err(|_| arena_full())
+    }
+
+    fn large_object_name<'a>(
+        &self,
+        oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        let Some(oid) = u32::try_from(oid)
+            .ok()
+            .and_then(crate::storage::LargeObjectOid::parse)
+        else {
+            return Ok(None);
+        };
+        if self.storage.large_object_slot(oid, self.txid).is_none() {
+            return Ok(None);
+        }
+        arena
+            .alloc_str_display(oid.get())
+            .map(Some)
+            .map_err(|_| arena_full())
+    }
+
     fn has_parameter_privilege(
         &self,
         role: Option<&str>,
@@ -3421,6 +3545,32 @@ fn privilege_query(
     Ok(answer)
 }
 
+fn object_privilege_query(
+    storage: &Storage,
+    txid: u32,
+    role: Option<&str>,
+    class: crate::storage::AccessClass,
+    name: &str,
+    all: crate::storage::PrivilegeSet,
+    privileges: &str,
+) -> Result<Option<bool>, SqlError> {
+    let role = match privilege_role(storage, role, txid) {
+        Some(role) => role,
+        None => return Ok(None),
+    };
+    let Some(object) = storage.resolve_access_object(class, "", name, txid) else {
+        return Ok(None);
+    };
+    privilege_query(
+        privileges,
+        crate::storage::PrivilegeSet::NONE,
+        all,
+        |privilege| storage.has_object_privilege(object, role, privilege, txid),
+        |privilege| storage.has_object_grant_option(object, role, privilege, txid),
+    )
+    .map(Some)
+}
+
 fn parameter_privilege_query(
     written: &str,
     has_privilege: impl Fn(crate::sql::ast::ParameterPrivileges) -> bool,
@@ -3511,10 +3661,29 @@ pub(crate) fn emit_data_row(
         if formats.is_binary(index)
             || alternate_formats.is_some_and(|alternate| alternate.is_binary(index))
         {
+            if formats.is_binary(index)
+                && responder.result_type_oid(index).is_some_and(|oid| {
+                    super::exec::binary_output_capability(storage, oid, txid)
+                        == super::exec::BinaryOutputCapability::MissingAclItemSend
+                })
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "no binary output function available for type aclitem"
+                ));
+            }
             *plan = match super::exec::binary_field_plan(&values[index], storage, txid, arena) {
                 Ok(plan) => plan,
                 Err(error) => return sql_fail(error),
             };
+            if formats.is_binary(index)
+                && matches!(*plan, super::exec::BinaryFieldPlan::Unavailable)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "no binary output function available for type aclitem"
+                ));
+            }
         }
     }
     let render = responder.render_context();

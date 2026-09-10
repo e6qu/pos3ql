@@ -51,6 +51,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Macaddr(_) => 6,
             Datum::Macaddr8(_) => 8,
             Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
+            Datum::AclItem(item) => 8 + item.raw().len(),
             Datum::Json { text, .. }
             | Datum::Xml(text)
             | Datum::JsonPath(text)
@@ -191,6 +192,13 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
                 rest[4..4 + s.len()].copy_from_slice(s.as_bytes());
                 take = 4 + s.len();
+            }
+            Datum::AclItem(item) => {
+                let payload = 4 + item.raw().len();
+                rest[..4].copy_from_slice(&(payload as u32).to_le_bytes());
+                rest[4..8].copy_from_slice(b"ACI1");
+                rest[8..8 + item.raw().len()].copy_from_slice(item.raw());
+                take = 8 + item.raw().len();
             }
             Datum::Json { text, .. }
             | Datum::Xml(text)
@@ -370,6 +378,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             Some(7 + u16::from_le_bytes([header[5], header[6]]) as usize * 2)
         }
         ColType::Text
+        | ColType::AclItem
         | ColType::Name
         | ColType::Varchar
         | ColType::Bpchar
@@ -666,6 +675,20 @@ pub(crate) fn decode<'a>(
             ColType::Char => {
                 out[i] = Datum::Char(*bytes.get(at).ok_or_else(corrupt)?);
                 at += 1;
+            }
+            ColType::AclItem => {
+                let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                at += 4;
+                let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
+                at += len;
+                if let Some(payload) = raw.strip_prefix(b"ACI1") {
+                    out[i] = Datum::AclItem(
+                        crate::sql::acl::from_stored(payload).map_err(|_| corrupt())?,
+                    );
+                } else {
+                    out[i] = Datum::Text(core::str::from_utf8(raw).map_err(|_| corrupt())?);
+                }
             }
             ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
@@ -966,6 +989,28 @@ mod tests {
         let mut out = [Datum::Null; 2];
         decode(&buffer, &schema, &mut out).unwrap();
         assert_eq!(out, values);
+    }
+
+    #[test]
+    fn aclitem_round_trip_preserves_role_identity_and_render_cache() {
+        assert!(core::mem::size_of::<Datum<'_>>() <= 32);
+        let mut budget = crate::mem::budget::Budget::new(1024);
+        let arena = crate::mem::arena::Arena::new(&mut budget, "aclitem row", 512).unwrap();
+        let schema = [ColType::AclItem];
+        let values = [Datum::AclItem(
+            crate::sql::acl::with_identity(16_384, 10, "reader=rw*/postgres", &arena).unwrap(),
+        )];
+        let mut buffer = vec![0u8; encoded_len(&values)];
+        encode(&values, &mut buffer);
+        let mut out = [Datum::Null; 1];
+        decode(&buffer, &schema, &mut out).unwrap();
+        assert_eq!(out, values);
+
+        let privilege_offset = 2 + 1 + 4 + 4 + 4 + 4;
+        let mut corrupted = buffer.clone();
+        corrupted[privilege_offset] ^= 1;
+        let mut corrupt_out = [Datum::Null; 1];
+        assert!(decode(&corrupted, &schema, &mut corrupt_out).is_err());
     }
 
     #[test]

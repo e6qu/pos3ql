@@ -65,6 +65,14 @@ and collation catalogs, generated/check expressions, indexes, stored views,
 prepared statements, WAL, checkpoints, and object-cold recovery share the same
 startup-bounded representation.
 
+PostgreSQL 18 regular expressions include BRE, ERE, literal, and ARE modes,
+the complete flag and `regexp_*` overload surface, named arguments, captures
+and backreferences, lookaround and word constraints, character classes and
+escapes, and the native text/name operators. Exact procedure and operator
+catalogs, generated/check expressions, expression indexes, views, prepared
+statements, WAL, checkpoints, and object-cold recovery share one bounded
+matcher whose complexity exhaustion is an explicit error.
+
 PostgreSQL 18 network addresses include `inet`, `cidr`, `macaddr`, and
 `macaddr8` parsing, formatting, inspection, containment, arithmetic, bitwise
 operations, hashes, and `inet` extrema. Exact procedure, operator, cast,

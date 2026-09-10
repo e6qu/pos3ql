@@ -22,7 +22,7 @@ pub(crate) fn similar_to_posix(
     escape: Option<char>,
 ) -> Result<(), SqlError> {
     use core::fmt::Write as _;
-    let _ = buffer.write_char('^');
+    let _ = buffer.write_str("^(?:");
     let mut chars = pattern.chars();
     let mut in_bracket = false;
     while let Some(c) = chars.next() {
@@ -62,7 +62,7 @@ pub(crate) fn similar_to_posix(
             }
         }
     }
-    let _ = buffer.write_char('$');
+    let _ = buffer.write_str(")$");
     if buffer.is_truncated() {
         return Err(sql_err!(
             sqlstate::STRING_DATA_LENGTH_MISMATCH,
@@ -340,16 +340,14 @@ pub(crate) fn sql_regex_substring<'a>(
     }
 }
 
-/// Splits `src` on every match of `pattern` into an arena slice of text pieces,
-/// for callers outside this module (`regexp_split_to_table` in the FROM clause).
-pub fn regex_split_pub<'a>(
+pub fn regex_split_pub_with_options<'a>(
     src: &'a str,
     pattern: &str,
-    case_insensitive: bool,
+    options: crate::sql::regex::RegexOptions,
     arena: &'a Arena,
 ) -> Result<&'a [Datum<'a>], SqlError> {
     let mut pieces = [Datum::Null; 1024];
-    let n = regex_split(src, pattern, case_insensitive, &mut pieces)?;
+    let n = regex_split_with_options(src, pattern, options, &mut pieces)?;
     Ok(&*arena
         .alloc_slice_copy(&pieces[..n])
         .map_err(|_| arena_full())?)
@@ -357,10 +355,10 @@ pub fn regex_split_pub<'a>(
 
 /// Splits `src` on every match of `pattern`, writing the pieces into `out` and
 /// returning the count. An empty pattern splits into individual characters.
-pub(crate) fn regex_split<'a>(
+pub(crate) fn regex_split_with_options<'a>(
     src: &'a str,
     pattern: &str,
-    case_insensitive: bool,
+    options: crate::sql::regex::RegexOptions,
     out: &mut [Datum<'a>],
 ) -> Result<usize, SqlError> {
     let mut n = 0usize;
@@ -383,46 +381,51 @@ pub(crate) fn regex_split<'a>(
     }
     let mut last = 0usize;
     let mut pos = 0usize;
+    let mut previous_match_end = None;
     while pos <= src.len() {
-        let Some((start, end)) = crate::sql::regex::find(pattern, src, pos, case_insensitive)?
+        let Some((start, end)) = crate::sql::regex::find_with_options(pattern, src, pos, options)?
         else {
             break;
         };
         if end == start {
-            // A zero-width match: advance one character so the scan progresses.
-            let step = src[pos..].chars().next().map_or(1, char::len_utf8);
-            if pos + step > src.len() {
-                break;
+            // PostgreSQL ignores a zero-width separator at either edge or
+            // immediately after the previous match, but an isolated interior
+            // zero-width match still splits the string.
+            if start != 0 && start != src.len() && previous_match_end != Some(start) {
+                push(&src[last..start], &mut n)?;
+                last = start;
             }
-            pos += step;
+            previous_match_end = Some(end);
+            let Some(next) = crate::sql::regex::next_match_from(src, start, end) else {
+                break;
+            };
+            pos = next;
             continue;
         }
         push(&src[last..start], &mut n)?;
         last = end;
+        previous_match_end = Some(end);
         pos = end;
     }
     push(&src[last..], &mut n)?;
     Ok(n)
 }
 
-/// Parses PostgreSQL regex flags into `(global, case_insensitive)`; an unknown
-/// flag is a loud error.
-pub fn regexp_flags(flags: &str) -> Result<(bool, bool), SqlError> {
+/// Parsed PostgreSQL regex flags: global result selection is kept separate
+/// from the compile behavior used by every matcher entry point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegexpFlags {
+    pub global: bool,
+    pub options: crate::sql::regex::RegexOptions,
+}
+
+pub fn regexp_options(flags: &str) -> Result<RegexpFlags, SqlError> {
     let mut global = false;
-    let mut case_insensitive = false;
+    let mut options = crate::sql::regex::RegexOptions::default();
     for f in flags.chars() {
-        match f {
-            'g' => global = true,
-            'i' => case_insensitive = true,
-            'c' => case_insensitive = false,
-            _ => {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "invalid regular expression option: \"{}\"",
-                    f
-                ));
-            }
+        if options.apply_flag(f)? {
+            global = true;
         }
     }
-    Ok((global, case_insensitive))
+    Ok(RegexpFlags { global, options })
 }

@@ -280,20 +280,60 @@ pub(crate) fn format_append_literal<'a>(
     Ok(())
 }
 
-/// Byte offset of the 0-based character index `n` in `s` (clamped to the end).
-pub(crate) fn char_index_to_byte(s: &str, n: usize) -> usize {
-    s.char_indices().nth(n).map_or(s.len(), |(b, _)| b)
-}
-
 /// 1-based character position of byte offset `b` in `s`.
 pub(crate) fn byte_to_char_1based(s: &str, b: usize) -> i32 {
     s[..b].chars().count() as i32 + 1
 }
 
+/// Reorders a call whose selected built-in overload has no default arguments.
+/// PostgreSQL permits positional arguments followed by named arguments; the
+/// evaluator's built-ins consume their arguments in declaration order.
+pub(crate) fn reorder_required_arguments<'a>(
+    name: &str,
+    args: &[&'a Expr<'a>],
+    argument_names: &[Option<&str>],
+    parameters: &[&str],
+    ordered: &mut [&'a Expr<'a>],
+) -> Result<(), SqlError> {
+    if args.len() != parameters.len()
+        || ordered.len() != args.len()
+        || !argument_names.is_empty() && argument_names.len() != args.len()
+    {
+        return Err(arity_err(name, args.len()));
+    }
+    if argument_names.is_empty() || argument_names.iter().all(Option::is_none) {
+        ordered.copy_from_slice(args);
+        return Ok(());
+    }
+    let mut occupied = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    let mut next_positional = 0usize;
+    for (call_index, argument) in args.iter().enumerate() {
+        let destination = if let Some(written) = argument_names[call_index] {
+            parameters
+                .iter()
+                .position(|parameter| *parameter == written)
+                .ok_or_else(|| arity_err(name, args.len()))?
+        } else {
+            let destination = next_positional;
+            next_positional += 1;
+            destination
+        };
+        if destination >= args.len() || occupied[destination] {
+            return Err(arity_err(name, args.len()));
+        }
+        ordered[destination] = argument;
+        occupied[destination] = true;
+    }
+    if occupied[..args.len()].iter().any(|present| !present) {
+        return Err(arity_err(name, args.len()));
+    }
+    Ok(())
+}
+
 /// Expands a `regexp_replace` replacement string into `out`: `\&` is the whole
 /// match, `\\` a literal backslash, `\` + other the literal character.
-/// Capture-group backreferences (`\1`..`\9`) are rejected loudly — this engine
-/// does not track capture positions.
+/// Capture-group backreferences (`\1`..`\9`) use the spans supplied by the
+/// matcher; a nonparticipating or out-of-range group contributes no bytes.
 pub(crate) fn expand_replacement(
     out: &mut StackStr<8192>,
     rep: &str,

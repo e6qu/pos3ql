@@ -3790,12 +3790,15 @@ pub fn infer_type_res(
             | "is_normalized"
             | "unicode_assigned" => of(ColType::Bool),
             "regexp_substr" => of(ColType::Text),
-            "regexp_like" => of(ColType::Bool),
-            "regexp_split_to_array" | "string_to_array" => {
+            "regexp_like" | "nameregexeq" | "nameregexne" | "nameicregexeq" | "nameicregexne"
+            | "textregexeq" | "textregexne" | "texticregexeq" | "texticregexne" => {
+                of(ColType::Bool)
+            }
+            "regexp_match" | "regexp_split_to_array" | "string_to_array" => {
                 of(ColType::Array(crate::sql::types::ArrElem::Text))
             }
-            "format" | "regexp_replace" | "normalize" | "unicode_version" | "unistr"
-            | "casefold" | "to_ascii" => of(ColType::Text),
+            "format" | "regexp_replace" | "similar_to_escape" | "normalize" | "unicode_version"
+            | "unistr" | "casefold" | "to_ascii" => of(ColType::Text),
             "overlay" | "substr" | "substring" | "reverse" | "btrim" | "ltrim" | "rtrim" => {
                 match args
                     .first()

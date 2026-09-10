@@ -2792,6 +2792,71 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6332, "to_oct", 25, "23", 1, "i"),
     intrinsic!(6333, "to_oct", 25, "20", 1, "i"),
     intrinsic!(6412, "casefold", 25, "25", 1, "i"),
+    // PostgreSQL 18 regular-expression operators, functions, SRFs, and
+    // planner support identities share the same bounded matcher.
+    intrinsic!(79, "nameregexeq", 16, "19 25", 2, "i"),
+    intrinsic!(1024, "texticregexeq_support", 2281, "2281", 1, "i"),
+    intrinsic!(1238, "texticregexeq", 16, "25 25", 2, "i"),
+    intrinsic!(1239, "texticregexne", 16, "25 25", 2, "i"),
+    intrinsic!(1240, "nameicregexeq", 16, "19 25", 2, "i"),
+    intrinsic!(1241, "nameicregexne", 16, "19 25", 2, "i"),
+    intrinsic!(1252, "nameregexne", 16, "19 25", 2, "i"),
+    intrinsic!(1254, "textregexeq", 16, "25 25", 2, "i"),
+    intrinsic!(1256, "textregexne", 16, "25 25", 2, "i"),
+    intrinsic!(1364, "textregexeq_support", 2281, "2281", 1, "i"),
+    intrinsic!(1818, "regexeqsel", 701, "2281 26 2281 23", 4, "s"),
+    intrinsic!(1820, "icregexeqsel", 701, "2281 26 2281 23", 4, "s"),
+    intrinsic!(1821, "regexnesel", 701, "2281 26 2281 23", 4, "s"),
+    intrinsic!(1823, "icregexnesel", 701, "2281 26 2281 23", 4, "s"),
+    intrinsic!(1824, "regexeqjoinsel", 701, "2281 26 2281 21 2281", 5, "s"),
+    intrinsic!(
+        1826,
+        "icregexeqjoinsel",
+        701,
+        "2281 26 2281 21 2281",
+        5,
+        "s"
+    ),
+    intrinsic!(1827, "regexnejoinsel", 701, "2281 26 2281 21 2281", 5, "s"),
+    intrinsic!(
+        1829,
+        "icregexnejoinsel",
+        701,
+        "2281 26 2281 21 2281",
+        5,
+        "s"
+    ),
+    intrinsic!(1986, "similar_to_escape", 25, "25 25", 2, "i"),
+    intrinsic!(1987, "similar_to_escape", 25, "25", 1, "i"),
+    intrinsic!(2284, "regexp_replace", 25, "25 25 25", 3, "i"),
+    intrinsic!(2285, "regexp_replace", 25, "25 25 25 25", 4, "i"),
+    intrinsic!(2763, "regexp_matches", 1009, "25 25", 2, "i"),
+    intrinsic!(2764, "regexp_matches", 1009, "25 25 25", 3, "i"),
+    intrinsic!(2765, "regexp_split_to_table", 25, "25 25", 2, "i"),
+    intrinsic!(2766, "regexp_split_to_table", 25, "25 25 25", 3, "i"),
+    intrinsic!(2767, "regexp_split_to_array", 1009, "25 25", 2, "i"),
+    intrinsic!(2768, "regexp_split_to_array", 1009, "25 25 25", 3, "i"),
+    intrinsic!(3396, "regexp_match", 1009, "25 25", 2, "i"),
+    intrinsic!(3397, "regexp_match", 1009, "25 25 25", 3, "i"),
+    intrinsic!(6251, "regexp_replace", 25, "25 25 25 23 23 25", 6, "i"),
+    intrinsic!(6252, "regexp_replace", 25, "25 25 25 23 23", 5, "i"),
+    intrinsic!(6253, "regexp_replace", 25, "25 25 25 23", 4, "i"),
+    intrinsic!(6254, "regexp_count", 23, "25 25", 2, "i"),
+    intrinsic!(6255, "regexp_count", 23, "25 25 23", 3, "i"),
+    intrinsic!(6256, "regexp_count", 23, "25 25 23 25", 4, "i"),
+    intrinsic!(6257, "regexp_instr", 23, "25 25", 2, "i"),
+    intrinsic!(6258, "regexp_instr", 23, "25 25 23", 3, "i"),
+    intrinsic!(6259, "regexp_instr", 23, "25 25 23 23", 4, "i"),
+    intrinsic!(6260, "regexp_instr", 23, "25 25 23 23 23", 5, "i"),
+    intrinsic!(6261, "regexp_instr", 23, "25 25 23 23 23 25", 6, "i"),
+    intrinsic!(6262, "regexp_instr", 23, "25 25 23 23 23 25 23", 7, "i"),
+    intrinsic!(6263, "regexp_like", 16, "25 25", 2, "i"),
+    intrinsic!(6264, "regexp_like", 16, "25 25 25", 3, "i"),
+    intrinsic!(6265, "regexp_substr", 25, "25 25", 2, "i"),
+    intrinsic!(6266, "regexp_substr", 25, "25 25 23", 3, "i"),
+    intrinsic!(6267, "regexp_substr", 25, "25 25 23 23", 4, "i"),
+    intrinsic!(6268, "regexp_substr", 25, "25 25 23 23 25", 5, "i"),
+    intrinsic!(6269, "regexp_substr", 25, "25 25 23 23 25 23", 6, "i"),
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
@@ -2880,6 +2945,10 @@ fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
             | 3566
             | 6160
             | 6161
+            | 2763
+            | 2764
+            | 2765
+            | 2766
     )
 }
 
@@ -2931,6 +3000,37 @@ fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
         2014 => "byteapos",
         2015 => "byteatrim",
         2073 => "textregexsubstr",
+        1986 => "similar_to_escape_2",
+        1987 => "similar_to_escape_1",
+        2284 => "textregexreplace_noopt",
+        2285 => "textregexreplace",
+        2763 => "regexp_matches_no_flags",
+        2764 => "regexp_matches",
+        2765 => "regexp_split_to_table_no_flags",
+        2766 => "regexp_split_to_table",
+        2767 => "regexp_split_to_array_no_flags",
+        2768 => "regexp_split_to_array",
+        3396 => "regexp_match_no_flags",
+        3397 => "regexp_match",
+        6251 => "textregexreplace_extended",
+        6252 => "textregexreplace_extended_no_flags",
+        6253 => "textregexreplace_extended_no_n",
+        6254 => "regexp_count_no_start",
+        6255 => "regexp_count_no_flags",
+        6256 => "regexp_count",
+        6257 => "regexp_instr_no_start",
+        6258 => "regexp_instr_no_n",
+        6259 => "regexp_instr_no_endoption",
+        6260 => "regexp_instr_no_flags",
+        6261 => "regexp_instr_no_subexpr",
+        6262 => "regexp_instr",
+        6263 => "regexp_like_no_flags",
+        6264 => "regexp_like",
+        6265 => "regexp_substr_no_start",
+        6266 => "regexp_substr_no_n",
+        6267 => "regexp_substr_no_flags",
+        6268 => "regexp_substr_no_subexpr",
+        6269 => "regexp_substr",
         2087 => "replace_text",
         2085 => "bytea_substr",
         2086 => "bytea_substr_no_len",
@@ -3081,6 +3181,35 @@ const PUBLICATION_TABLE_OUTPUT_NAMES: &[&str] = &["pubid", "relid", "attrs", "qu
 const LOGICAL_SLOT_OUTPUT_OIDS: &[i32] = &[19, super::types::oid::PG_LSN];
 const LOGICAL_SLOT_OUTPUT_NAMES: &[&str] = &["slot_name", "lsn"];
 const LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES: &[&str] = &["slot_name", "end_lsn"];
+
+fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
+    match oid {
+        2284 => Some(&["string", "pattern", "replacement"]),
+        2285 => Some(&["string", "pattern", "replacement", "flags"]),
+        2763 | 2765 | 2767 | 3396 | 6254 | 6257 | 6263 | 6265 => Some(&["string", "pattern"]),
+        2764 | 2766 | 2768 | 3397 | 6264 => Some(&["string", "pattern", "flags"]),
+        6251 => Some(&["string", "pattern", "replacement", "start", "N", "flags"]),
+        6252 => Some(&["string", "pattern", "replacement", "start", "N"]),
+        6253 => Some(&["string", "pattern", "replacement", "start"]),
+        6255 | 6258 | 6266 => Some(&["string", "pattern", "start"]),
+        6256 => Some(&["string", "pattern", "start", "flags"]),
+        6259 | 6267 => Some(&["string", "pattern", "start", "N"]),
+        6260 => Some(&["string", "pattern", "start", "N", "endoption"]),
+        6261 => Some(&["string", "pattern", "start", "N", "endoption", "flags"]),
+        6262 => Some(&[
+            "string",
+            "pattern",
+            "start",
+            "N",
+            "endoption",
+            "flags",
+            "subexpr",
+        ]),
+        6268 => Some(&["string", "pattern", "start", "N", "flags"]),
+        6269 => Some(&["string", "pattern", "start", "N", "flags", "subexpr"]),
+        _ => None,
+    }
+}
 
 fn intrinsic_record_outputs(
     routine: IntrinsicRoutine,
@@ -3999,6 +4128,126 @@ macro_rules! catalog_prefix_operator {
 }
 
 const CATALOG_OPERATORS: &[CatalogOperator] = &[
+    CatalogOperator {
+        oid: 639,
+        name: "~",
+        left: Some(ColType::Name),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 79,
+        procedure_name: "nameregexeq",
+        commutator: 0,
+        negator: 640,
+        merges: false,
+        hashes: false,
+        restriction: Some((1818, "regexeqsel")),
+        join: Some((1824, "regexeqjoinsel")),
+    },
+    CatalogOperator {
+        oid: 640,
+        name: "!~",
+        left: Some(ColType::Name),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 1252,
+        procedure_name: "nameregexne",
+        commutator: 0,
+        negator: 639,
+        merges: false,
+        hashes: false,
+        restriction: Some((1821, "regexnesel")),
+        join: Some((1827, "regexnejoinsel")),
+    },
+    CatalogOperator {
+        oid: 641,
+        name: "~",
+        left: Some(ColType::Text),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 1254,
+        procedure_name: "textregexeq",
+        commutator: 0,
+        negator: 642,
+        merges: false,
+        hashes: false,
+        restriction: Some((1818, "regexeqsel")),
+        join: Some((1824, "regexeqjoinsel")),
+    },
+    CatalogOperator {
+        oid: 642,
+        name: "!~",
+        left: Some(ColType::Text),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 1256,
+        procedure_name: "textregexne",
+        commutator: 0,
+        negator: 641,
+        merges: false,
+        hashes: false,
+        restriction: Some((1821, "regexnesel")),
+        join: Some((1827, "regexnejoinsel")),
+    },
+    CatalogOperator {
+        oid: 1226,
+        name: "~*",
+        left: Some(ColType::Name),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 1240,
+        procedure_name: "nameicregexeq",
+        commutator: 0,
+        negator: 1227,
+        merges: false,
+        hashes: false,
+        restriction: Some((1820, "icregexeqsel")),
+        join: Some((1826, "icregexeqjoinsel")),
+    },
+    CatalogOperator {
+        oid: 1227,
+        name: "!~*",
+        left: Some(ColType::Name),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 1241,
+        procedure_name: "nameicregexne",
+        commutator: 0,
+        negator: 1226,
+        merges: false,
+        hashes: false,
+        restriction: Some((1823, "icregexnesel")),
+        join: Some((1829, "icregexnejoinsel")),
+    },
+    CatalogOperator {
+        oid: 1228,
+        name: "~*",
+        left: Some(ColType::Text),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 1238,
+        procedure_name: "texticregexeq",
+        commutator: 0,
+        negator: 1229,
+        merges: false,
+        hashes: false,
+        restriction: Some((1820, "icregexeqsel")),
+        join: Some((1826, "icregexeqjoinsel")),
+    },
+    CatalogOperator {
+        oid: 1229,
+        name: "!~*",
+        left: Some(ColType::Text),
+        right: Some(ColType::Text),
+        result: ColType::Bool,
+        procedure_oid: 1239,
+        procedure_name: "texticregexne",
+        commutator: 0,
+        negator: 1228,
+        merges: false,
+        hashes: false,
+        restriction: Some((1823, "icregexnesel")),
+        join: Some((1829, "icregexnejoinsel")),
+    },
     catalog_comparison_operator!(
         1955,
         "=",
@@ -19092,10 +19341,15 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("prosqlbody", ColType::PgNodeTree),
         ],
     );
-    // Built-ins plus the startup-bounded user-routine inventory.  Keep this
-    // above the PostgreSQL 18 intrinsic set with the default 32 routine slots.
-    const MAX_ROWS: usize = 768;
-    let mut rows: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    // The routine inventory is fixed at startup, so size the synthesized row
+    // index from that same bound instead of coupling it to the built-in count.
+    let row_capacity = INTRINSIC_ROUTINES
+        .len()
+        .checked_add(storage.routine_count())
+        .ok_or_else(|| catalog_capacity_exceeded("pg_proc"))?;
+    let rows = arena
+        .alloc_slice_with(row_capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
         let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut argument_count = 0usize;
@@ -19121,6 +19375,12 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         let mut all_types = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
         let mut modes = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
         let mut names = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+        let intrinsic_names = intrinsic_routine_argument_names(routine.oid);
+        if let Some(argument_names) = intrinsic_names {
+            for (index, name) in argument_names.iter().enumerate() {
+                names[index] = Datum::Text(name);
+            }
+        }
         let record_input_count = usize::from(routine.oid == 6119);
         if routine.oid == 6119 {
             all_types[0] = Datum::Oid(1009);
@@ -19204,15 +19464,30 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Null,
                 Datum::Float8(if routine.oid == 6120 { 10.0 } else { 1.0 }),
                 Datum::Float8(match routine.oid {
+                    2763 => 1.0,
+                    2764 => 10.0,
+                    2765 | 2766 => 1000.0,
                     2947 | 5064 => 50.0,
                     6119 => 1000.0,
                     _ => 0.0,
                 }),
                 Datum::Null,
-                Datum::RegObject {
-                    type_oid: super::types::oid::REGPROC,
-                    referenced_oid: 0,
-                    name: "-",
+                match routine.oid {
+                    79 | 1254 => Datum::RegObject {
+                        type_oid: super::types::oid::REGPROC,
+                        referenced_oid: 1364,
+                        name: "textregexeq_support",
+                    },
+                    1238 | 1240 => Datum::RegObject {
+                        type_oid: super::types::oid::REGPROC,
+                        referenced_oid: 1024,
+                        name: "texticregexeq_support",
+                    },
+                    _ => Datum::RegObject {
+                        type_oid: super::types::oid::REGPROC,
+                        referenced_oid: 0,
+                        name: "-",
+                    },
                 },
                 Datum::Int4(match routine.oid {
                     3577 | 3578 => 1,
@@ -19274,6 +19549,13 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         element: super::types::ArrElem::Text,
                         raw: super::array::build(
                             &[Datum::Text("str"), Datum::Text("strict")],
+                            arena,
+                        )?,
+                    },
+                    (_, _) if intrinsic_names.is_some() => Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(
+                            &names[..intrinsic_names.expect("checked").len()],
                             arena,
                         )?,
                     },

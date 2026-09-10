@@ -2608,13 +2608,12 @@ impl Conn {
                 }
                 Err(WireFull) => return Step::Close,
             }
-            let (columns, unsupported_binary) = match self.send.filled_mut().get(mark..) {
+            let columns = match self.send.filled_mut().get(mark..) {
                 Some(message @ [wire::MSG_ROW_DESCRIPTION, _, _, _, _, high, low, ..]) => {
                     let columns = usize::from(u16::from_be_bytes([*high, *low]));
                     let payload = &message[5..];
                     let mut at = 2usize;
-                    let mut unsupported = false;
-                    for column in 0..columns {
+                    for _ in 0..columns {
                         let Some(name_len) = payload[at..].iter().position(|byte| *byte == 0)
                         else {
                             return Step::Close;
@@ -2623,21 +2622,11 @@ impl Conn {
                         if at + 18 > payload.len() {
                             return Step::Close;
                         }
-                        at += 6;
-                        let type_oid = i32::from_be_bytes(
-                            payload[at..at + 4].try_into().expect("four checked bytes"),
-                        );
-                        unsupported |= result_formats.is_binary(column)
-                            && matches!(
-                                type_oid,
-                                crate::sql::types::oid::ACLITEM
-                                    | crate::sql::types::oid::ACLITEM_ARRAY
-                            );
-                        at += 12;
+                        at += 18;
                     }
-                    (columns, unsupported)
+                    columns
                 }
-                Some([wire::MSG_NO_DATA, _, _, _, _]) => (0, false),
+                Some([wire::MSG_NO_DATA, _, _, _, _]) => 0,
                 _ => return Step::Close,
             };
             self.send.truncate_to(mark);
@@ -2652,14 +2641,6 @@ impl Conn {
                         result_formats.count(),
                     )
                     .as_str(),
-                );
-            }
-            if unsupported_binary {
-                return ext_err(
-                    &mut self.send,
-                    &mut self.phase,
-                    crate::sql::eval::sqlstate::UNDEFINED_FUNCTION,
-                    "no binary output function available for type aclitem",
                 );
             }
         }
@@ -5137,7 +5118,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_binary_aclitem_result_is_rejected_at_bind() {
+    fn extended_binary_aclitem_result_is_rejected_at_execute() {
         use core::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -5156,7 +5137,7 @@ mod tests {
         connection.phase = Phase::Ready;
 
         let mut parse = Vec::new();
-        parse.extend_from_slice(b"aclitem\0SELECT '10=r/10'::aclitem\0");
+        parse.extend_from_slice(b"aclitem\0SELECT makeaclitem(10,10,'SELECT',false)\0");
         parse.extend_from_slice(&0i16.to_be_bytes());
         connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
         assert!(matches!(
@@ -5176,6 +5157,34 @@ mod tests {
             connection.process_message(&mut engine),
             Step::Continue
         ));
+        assert_eq!(
+            connection.send.readable(),
+            &[wire::MSG_BIND_COMPLETE, 0, 0, 0, 4]
+        );
+        assert!(matches!(connection.phase, Phase::Ready));
+        assert!(connection.portals.iter().any(|portal| portal.active));
+        connection.send.clear();
+
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_DESCRIBE, b"Paclitem_portal\0"));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert_eq!(connection.send.readable()[0], wire::MSG_ROW_DESCRIPTION);
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"aclitem_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
         let response = connection.send.readable();
         assert!(response.windows(7).any(|bytes| bytes == b"C42883\0"));
         assert!(
@@ -5184,7 +5193,7 @@ mod tests {
                 .any(|bytes| { bytes == b"no binary output function available for type aclitem" })
         );
         assert!(matches!(connection.phase, Phase::SkipToSync));
-        assert!(!connection.portals.iter().any(|portal| portal.active));
+        assert!(connection.portals.iter().any(|portal| portal.active));
 
         drop(connection);
         drop(engine);

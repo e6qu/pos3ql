@@ -187,6 +187,89 @@ fn decode_text_row<'a>(row: &'a [u8], fields: &mut [Option<&'a str>]) -> Result<
     Ok(count)
 }
 
+/// Extracts type OIDs from one captured RowDescription. FETCH uses this at
+/// execution time so an unavailable binary send function is reported after
+/// Bind and Describe, matching PostgreSQL's extended-protocol boundary.
+pub(crate) fn description_type_oids(
+    description: &[u8],
+    output: &mut [i32],
+) -> Result<usize, SqlError> {
+    let corrupt = || {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor row description is malformed"
+        )
+    };
+    if description.len() < 7 || description[0] != b'T' {
+        return Err(corrupt());
+    }
+    let declared = u32::from_be_bytes(description[1..5].try_into().unwrap()) as usize;
+    if declared + 1 != description.len() {
+        return Err(corrupt());
+    }
+    let count = u16::from_be_bytes(description[5..7].try_into().unwrap()) as usize;
+    if count > output.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "cursor row description has more than {} columns",
+            output.len()
+        ));
+    }
+    let mut at = 7usize;
+    for oid in output.iter_mut().take(count) {
+        let name_len = description
+            .get(at..)
+            .and_then(|bytes| bytes.iter().position(|byte| *byte == 0))
+            .ok_or_else(corrupt)?;
+        at += name_len + 1;
+        let fields = description.get(at..at + 18).ok_or_else(corrupt)?;
+        *oid = i32::from_be_bytes(fields[6..10].try_into().unwrap());
+        at += 18;
+    }
+    if at != description.len() {
+        return Err(corrupt());
+    }
+    Ok(count)
+}
+
+/// Reports whether one field in a captured binary DataRow is NULL. Cursor
+/// capture writes a zero-length placeholder for non-NULL values whose send
+/// function is unavailable, so FETCH can fail only when PostgreSQL would
+/// actually invoke an array element send function.
+pub(crate) fn binary_row_field_is_null(row: &[u8], target: usize) -> Result<bool, SqlError> {
+    let corrupt = || sql_err!(sqlstate::INTERNAL_ERROR, "cursor binary row is malformed");
+    if row.len() < 7 || row[0] != b'D' {
+        return Err(corrupt());
+    }
+    let declared = u32::from_be_bytes(row[1..5].try_into().unwrap()) as usize;
+    if declared + 1 != row.len() {
+        return Err(corrupt());
+    }
+    let count = u16::from_be_bytes(row[5..7].try_into().unwrap()) as usize;
+    if target >= count {
+        return Err(corrupt());
+    }
+    let mut at = 7usize;
+    for index in 0..count {
+        let length =
+            i32::from_be_bytes(row.get(at..at + 4).ok_or_else(corrupt)?.try_into().unwrap());
+        at += 4;
+        if length < -1 {
+            return Err(corrupt());
+        }
+        if index == target {
+            return Ok(length == -1);
+        }
+        if length >= 0 {
+            at = at
+                .checked_add(length as usize)
+                .filter(|end| *end <= row.len())
+                .ok_or_else(corrupt)?;
+        }
+    }
+    Err(corrupt())
+}
+
 impl CursorPool {
     pub fn budget_bytes(config: &Config) -> usize {
         config.max_cursors

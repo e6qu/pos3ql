@@ -9897,6 +9897,21 @@ fn aclitem_and_pg_lsn_are_first_class_postgresql_18_types() {
             "{sql}: {message}"
         );
     }
+    for (sql, tag) in [
+        (
+            "COPY (SELECT NULL::aclitem[]) TO STDOUT (FORMAT binary)",
+            "COPY 1",
+        ),
+        (
+            "COPY (SELECT NULL::aclitem[] WHERE false) TO STDOUT (FORMAT binary)",
+            "COPY 0",
+        ),
+    ] {
+        let accepted = run_with(&mut engine, &mut budget, sql);
+        let message = String::from_utf8_lossy(&accepted);
+        assert!(!message.contains("ERROR"), "{sql}: {message}");
+        assert!(message.contains(tag), "{sql}: {message}");
+    }
     for sql in [
         "SELECT 'missing_role=r/acl_grantor'::aclitem",
         "SELECT ARRAY['acl_reader=r/acl_grantor'::aclitem, NULL] @> \

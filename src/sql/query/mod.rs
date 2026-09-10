@@ -3661,10 +3661,29 @@ pub(crate) fn emit_data_row(
         if formats.is_binary(index)
             || alternate_formats.is_some_and(|alternate| alternate.is_binary(index))
         {
+            if formats.is_binary(index)
+                && responder.result_type_oid(index).is_some_and(|oid| {
+                    super::exec::binary_output_capability(storage, oid, txid)
+                        == super::exec::BinaryOutputCapability::MissingAclItemSend
+                })
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "no binary output function available for type aclitem"
+                ));
+            }
             *plan = match super::exec::binary_field_plan(&values[index], storage, txid, arena) {
                 Ok(plan) => plan,
                 Err(error) => return sql_fail(error),
             };
+            if formats.is_binary(index)
+                && matches!(*plan, super::exec::BinaryFieldPlan::Unavailable)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "no binary output function available for type aclitem"
+                ));
+            }
         }
     }
     let render = responder.render_context();

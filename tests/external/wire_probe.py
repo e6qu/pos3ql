@@ -328,15 +328,79 @@ def test_aclitem_array_wire_identity():
     )
     description = next((payload for kind, payload in messages if kind == b"T"), None)
     row = next((payload for kind, payload in messages if kind == b"D"), None)
-    expected = binary_array(1033, [b"wire_acl_reader=r/postgres"])
+    error = next((payload for kind, payload in messages if kind == b"E"), None)
     check(
-        "aclitem wire: Describe and binary array preserve PostgreSQL type identity",
+        "aclitem wire: Describe precedes the missing element send-function error",
         description is not None
         and row_description_type_oids(description) == [1034]
         and row_description_formats(description) == [1]
-        and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
+        and row is None
+        and error is not None
+        and b"C42883" in error
+        and b"Mno binary output function available for type aclitem" in error,
         messages,
     )
+
+    empty = extended_binary_result(
+        s, "SELECT makeaclitem(10, 10, 'SELECT', false) WHERE false"
+    )
+    check(
+        "aclitem wire: a zero-row scalar result never initializes its send function",
+        any(kind == b"T" for kind, _ in empty)
+        and any(kind == b"C" and payload == b"SELECT 0\x00" for kind, payload in empty)
+        and not any(kind == b"E" for kind, _ in empty),
+        empty,
+    )
+    null_scalar = extended_binary_result(s, "SELECT NULL::aclitem")
+    check(
+        "aclitem wire: a NULL scalar row still requires the missing type send function",
+        any(kind == b"T" for kind, _ in null_scalar)
+        and not any(kind == b"D" for kind, _ in null_scalar)
+        and any(
+            kind == b"E"
+            and b"C42883" in payload
+            and b"Mno binary output function available for type aclitem" in payload
+            for kind, payload in null_scalar
+        ),
+        null_scalar,
+    )
+    null_array = extended_binary_result(s, "SELECT NULL::aclitem[]")
+    check(
+        "aclitem wire: a NULL array does not invoke the missing element send function",
+        any(kind == b"T" for kind, _ in null_array)
+        and any(
+            kind == b"D" and payload == b"\x00\x01\xff\xff\xff\xff"
+            for kind, payload in null_array
+        )
+        and not any(kind == b"E" for kind, _ in null_array),
+        null_array,
+    )
+
+    declared = simple_query(
+        s,
+        "BEGIN; DECLARE wire_acl_cursor CURSOR FOR "
+        "SELECT attacl FROM pg_attribute "
+        "WHERE attrelid = 'wire_acl_target'::regclass AND attname = 'visible'",
+    )
+    check(
+        "aclitem cursor: text-and-binary capture does not reject DECLARE",
+        not any(kind == b"E" for kind, _ in declared),
+        declared,
+    )
+    fetched = extended_binary_result(s, "FETCH ALL FROM wire_acl_cursor")
+    description = next((payload for kind, payload in fetched if kind == b"T"), None)
+    error = next((payload for kind, payload in fetched if kind == b"E"), None)
+    check(
+        "aclitem cursor: binary FETCH rejects at execution after Describe",
+        description is not None
+        and row_description_type_oids(description) == [1034]
+        and row_description_formats(description) == [1]
+        and error is not None
+        and b"C42883" in error,
+        fetched,
+    )
+    simple_query(s, "ROLLBACK")
+    simple_query(s, "DROP TABLE wire_acl_target; DROP ROLE wire_acl_reader")
     s.close()
 
 

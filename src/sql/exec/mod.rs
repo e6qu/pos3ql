@@ -50944,27 +50944,42 @@ pub(crate) fn decode_binary_input<'a>(
     })
 }
 
-/// Whether a catalog-resolved result type has a PostgreSQL binary send form.
-/// This uses the same typed OID boundary as Bind, so query COPY cannot reject
-/// domains and user arrays merely because their identity is not a built-in
-/// [`ColType`].
-pub(crate) fn binary_output_type_supported(storage: &Storage, oid: i32, txid: u32) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BinaryOutputCapability {
+    Supported,
+    /// The result type itself has no send function, so PostgreSQL fails while
+    /// initializing binary output even when the result contains no rows.
+    MissingAclItemSend,
+    /// `array_send` exists, but fails only for a non-NULL array because its
+    /// aclitem element type has no send function.
+    MissingAclItemElementSend,
+    Unsupported,
+}
+
+/// Resolves binary output capability at the catalog OID boundary. Keeping the
+/// two aclitem failure modes distinct preserves PostgreSQL's execution timing.
+pub(crate) fn binary_output_capability(
+    storage: &Storage,
+    oid: i32,
+    txid: u32,
+) -> BinaryOutputCapability {
     match resolve_parameter_input_type(storage, oid, txid) {
-        Ok(ParameterInputType::Builtin(
-            ColType::AclItem | ColType::Array(crate::sql::types::ArrElem::AclItem),
-        ))
+        Ok(ParameterInputType::Builtin(ColType::AclItem))
         | Ok(ParameterInputType::Domain {
             base: ColType::AclItem,
             ..
-        })
-        | Ok(ParameterInputType::DomainArray(crate::sql::types::ArrElem::AclItem)) => false,
+        }) => BinaryOutputCapability::MissingAclItemSend,
+        Ok(ParameterInputType::Builtin(ColType::Array(crate::sql::types::ArrElem::AclItem)))
+        | Ok(ParameterInputType::DomainArray(crate::sql::types::ArrElem::AclItem)) => {
+            BinaryOutputCapability::MissingAclItemElementSend
+        }
         Ok(ParameterInputType::DomainArray(element))
             if element.to_coltype() == ColType::AclItem =>
         {
-            false
+            BinaryOutputCapability::MissingAclItemElementSend
         }
-        Ok(_) => true,
-        Err(_) => false,
+        Ok(_) => BinaryOutputCapability::Supported,
+        Err(_) => BinaryOutputCapability::Unsupported,
     }
 }
 
@@ -51702,6 +51717,12 @@ fn emit_copy_out_row<'a>(
                 )?;
             }
             *plan = binary_field_plan(&values[target], storage, txid, arena)?;
+            if matches!(*plan, BinaryFieldPlan::Unavailable) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "no binary output function available for type aclitem"
+                ));
+            }
         }
         responder
             .copy_binary_row(setup.n_targets, &|message| {
@@ -51779,6 +51800,30 @@ pub fn copy_out(
         .transpose()?
         .flatten();
     let fmt = &setup.fmt;
+    if fmt.binary {
+        for &target in &setup.targets[..setup.n_targets] {
+            let oid = storage
+                .declared_column_type(&def.columns()[target], txid)?
+                .catalog_oid();
+            match binary_output_capability(storage, oid, txid) {
+                BinaryOutputCapability::Supported
+                | BinaryOutputCapability::MissingAclItemElementSend => {}
+                BinaryOutputCapability::MissingAclItemSend => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "no binary output function available for type aclitem"
+                    ));
+                }
+                BinaryOutputCapability::Unsupported => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "COPY BINARY cannot send a column of type oid {}",
+                        oid
+                    ));
+                }
+            }
+        }
+    }
     responder
         .copy_out_response(setup.n_targets, fmt.binary)
         .map_err(wire_to_sql)?;
@@ -52023,21 +52068,22 @@ pub fn copy_out_query(
     let fmt = copy_fmt_for_columns(&names[..n], options)?;
     if fmt.binary {
         for c in &columns[..n] {
-            if !binary_output_type_supported(storage, c.type_oid, txid) {
-                if matches!(
-                    c.type_oid,
-                    crate::sql::types::oid::ACLITEM | crate::sql::types::oid::ACLITEM_ARRAY
-                ) {
+            match binary_output_capability(storage, c.type_oid, txid) {
+                BinaryOutputCapability::Supported
+                | BinaryOutputCapability::MissingAclItemElementSend => {}
+                BinaryOutputCapability::MissingAclItemSend => {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
                         "no binary output function available for type aclitem"
                     ));
                 }
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "COPY BINARY cannot send a column of type oid {}",
-                    c.type_oid
-                ));
+                BinaryOutputCapability::Unsupported => {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "COPY BINARY cannot send a column of type oid {}",
+                        c.type_oid
+                    ));
+                }
             }
         }
     }
@@ -52081,6 +52127,12 @@ pub fn copy_out_query(
             let mut plans = [BinaryFieldPlan::Direct; MAX_COLUMNS];
             for (i, plan) in plans.iter_mut().enumerate().take(n) {
                 *plan = binary_field_plan(&vals[i], storage, txid, arena)?;
+                if matches!(*plan, BinaryFieldPlan::Unavailable) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "no binary output function available for type aclitem"
+                    ));
+                }
             }
             responder
                 .copy_binary_row(n, &|m| {
@@ -52145,6 +52197,9 @@ type RangeBinaryParts<'a> = (u8, Option<Datum<'a>>, Option<Datum<'a>>);
 #[derive(Clone, Copy)]
 pub(crate) enum BinaryFieldPlan<'a> {
     Direct,
+    /// Cursor capture prepares both formats. This placeholder is never sent:
+    /// binary FETCH detects the unavailable send function from its type OID.
+    Unavailable,
     Composite(Datum<'a>),
     Range(u8, Option<Datum<'a>>, Option<Datum<'a>>),
     Multirange(&'a [RangeBinaryParts<'a>]),
@@ -52164,6 +52219,12 @@ pub(crate) fn encode_binary_field_plan(
 ) {
     match plan {
         BinaryFieldPlan::Direct => Responder::encode_value_binary(m, value),
+        BinaryFieldPlan::Unavailable => {
+            // Cursor capture needs a non-NULL marker so FETCH can distinguish
+            // an unavailable value from a genuine SQL NULL without retaining
+            // another per-row bitmap.
+            m.i32(0);
+        }
         BinaryFieldPlan::Composite(value) => Responder::encode_value_binary(m, &value),
         BinaryFieldPlan::Range(flags, lower, upper) => {
             m.field(|m| encode_range_binary(m, flags, lower, upper));
@@ -52200,6 +52261,11 @@ pub(crate) fn binary_field_plan<'a>(
     arena: &'a Arena,
 ) -> Result<BinaryFieldPlan<'a>, SqlError> {
     match v {
+        Datum::AclItem(_)
+        | Datum::Array {
+            element: crate::sql::types::ArrElem::AclItem,
+            ..
+        } => Ok(BinaryFieldPlan::Unavailable),
         Datum::CompositeText {
             slot,
             physical_fields,

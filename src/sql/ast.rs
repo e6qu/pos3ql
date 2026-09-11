@@ -5509,6 +5509,18 @@ fn is_volatile_function(name: &str) -> bool {
         "pg_xact_status",
         "pg_is_in_recovery",
         "pg_reload_conf",
+        "pg_blocking_pids",
+        "pg_advisory_lock",
+        "pg_advisory_lock_shared",
+        "pg_try_advisory_lock",
+        "pg_try_advisory_lock_shared",
+        "pg_advisory_unlock",
+        "pg_advisory_unlock_shared",
+        "pg_advisory_unlock_all",
+        "pg_advisory_xact_lock",
+        "pg_advisory_xact_lock_shared",
+        "pg_try_advisory_xact_lock",
+        "pg_try_advisory_xact_lock_shared",
         "set_config",
     ];
     NAMES

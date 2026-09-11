@@ -50,6 +50,10 @@ pub struct Config {
     /// Cluster-wide PostgreSQL two-phase transaction slots. Zero disables
     /// PREPARE TRANSACTION, matching PostgreSQL's startup-only setting.
     pub max_prepared_transactions: usize,
+    /// Advisory-lock entries available to each live or prepared transaction.
+    /// The shared registry is reserved at startup from this PostgreSQL-shaped
+    /// limit; exhaustion is reported instead of allocating while serving.
+    pub max_locks_per_transaction: usize,
     /// Bound-parameter bytes per portal.
     pub portal_bytes: usize,
     /// Buffered result bytes per portal (Execute max_rows paging).
@@ -210,6 +214,7 @@ impl Config {
             portal_result_bytes: 64 * KIB,
             txn_rows: 8192,
             max_prepared_transactions: 0,
+            max_locks_per_transaction: 64,
             memtable_bytes: 64 * MIB,
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
@@ -411,6 +416,10 @@ impl Config {
                 }
                 "max_prepared_transactions" => {
                     config.max_prepared_transactions =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_locks_per_transaction" => {
+                    config.max_locks_per_transaction =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "memtable_bytes" => {
@@ -661,6 +670,12 @@ impl Config {
                 "max_rules must be greater than zero".to_string(),
             ));
         }
+        if config.max_locks_per_transaction == 0 {
+            return Err(ConfigError::at(
+                0,
+                "max_locks_per_transaction must be greater than zero".to_string(),
+            ));
+        }
         if config.max_large_objects == 0
             || config.large_object_pages == 0
             || config.max_large_object_descriptors == 0
@@ -859,6 +874,7 @@ mod tests {
 listen_addr = 0.0.0.0:5432
 max_connections = 128
 max_prepared_transactions = 11
+max_locks_per_transaction = 96
 max_replication_slots = 12
 max_subscriptions = 7
 max_rules = 19
@@ -870,6 +886,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.listen_addr, "0.0.0.0:5432");
         assert_eq!(c.max_connections, 128);
         assert_eq!(c.max_prepared_transactions, 11);
+        assert_eq!(c.max_locks_per_transaction, 96);
         assert_eq!(c.max_replication_slots, 12);
         assert_eq!(c.max_subscriptions, 7);
         assert_eq!(c.max_rules, 19);
@@ -889,6 +906,16 @@ sql_arena_bytes = 4096
                 .unwrap()
                 .temporary_spill_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn advisory_lock_capacity_must_be_nonzero() {
+        let error = Config::parse("max_locks_per_transaction = 0\n").unwrap_err();
+        assert_eq!(error.line, 0);
+        assert_eq!(
+            error.message,
+            "max_locks_per_transaction must be greater than zero"
         );
     }
 

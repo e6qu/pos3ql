@@ -5845,6 +5845,60 @@ def test_catalog_object_addresses_over_raw_wire():
     s.close()
 
 
+def test_advisory_locks_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    key = (1 << 40) + 73
+    parse = frontend_message(
+        b"P",
+        b"\x00SELECT pg_backend_pid(), pg_try_advisory_lock($1), "
+        b"pg_blocking_pids(pg_backend_pid())\x00" + struct.pack("!hi", 1, 20),
+    )
+    bind = frontend_message(
+        b"B",
+        b"\x00\x00"
+        + struct.pack("!hhh", 1, 1, 1)
+        + struct.pack("!i", 8)
+        + struct.pack("!q", key)
+        + struct.pack("!h", 0),
+    )
+    s.sendall(
+        parse
+        + bind
+        + frontend_message(b"D", b"P\x00")
+        + frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+        + frontend_message(b"S")
+    )
+    acquired = []
+    while True:
+        item = read_message(s)
+        acquired.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in acquired if kind == b"T"), None)
+    values = text_row_fields(next(payload for kind, payload in acquired if kind == b"D"))
+    held = simple_query(
+        s,
+        "SELECT classid,objid,objsubid,mode,granted,pid=pg_backend_pid() "
+        "FROM pg_locks WHERE locktype='advisory'",
+    )
+    released = simple_query(s, f"SELECT pg_advisory_unlock({key})")
+    check(
+        "advisory locks: raw binary Bind, Describe, catalogs, and release agree",
+        not any(kind == b"E" for messages in (acquired, held, released) for kind, _ in messages)
+        and description is not None
+        and row_description_type_oids(description) == [23, 16, 1007]
+        and int(values[0]) > 0
+        and values[1:] == ["t", "{}"]
+        and text_row_fields(next(payload for kind, payload in held if kind == b"D"))
+        == ["256", "73", "1", "ExclusiveLock", "t", "t"]
+        and first_text_row(released) == "t",
+        acquired + held + released,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     selected = os.environ.get("POS3QL_WIRE_PROBE")

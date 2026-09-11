@@ -777,6 +777,50 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    fn current_backend_pid(&self) -> Result<i32, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "backend identity access is unavailable"
+        ))
+    }
+    fn blocking_backend_pids(&self, _backend_pid: i32, _output: &mut [i32]) -> usize {
+        0
+    }
+    fn blocking_backend_pid_count(&self, _backend_pid: i32) -> usize {
+        0
+    }
+    fn acquire_advisory_lock(
+        &self,
+        _class_id: u32,
+        _object_id: u32,
+        _object_sub_id: i16,
+        _shared: bool,
+        _transaction_scope: bool,
+        _try_only: bool,
+    ) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "advisory locks are unavailable"
+        ))
+    }
+    fn unlock_advisory_lock(
+        &self,
+        _class_id: u32,
+        _object_id: u32,
+        _object_sub_id: i16,
+        _shared: bool,
+    ) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "advisory locks are unavailable"
+        ))
+    }
+    fn unlock_all_advisory_locks(&self) -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "advisory locks are unavailable"
+        ))
+    }
     /// Returns this session's top-level transaction identity. `assign` mirrors
     /// PostgreSQL's distinction between assigning an identity and merely
     /// observing one that was already assigned.

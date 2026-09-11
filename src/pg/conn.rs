@@ -799,9 +799,17 @@ impl Conn {
             return After::Continue;
         }
         self.parked = false;
-        let after = match self.process_message(engine) {
-            Step::Close => After::Close,
-            Step::Continue | Step::NeedMoreData | Step::Parked => After::Continue,
+        let after = loop {
+            match self.process_message(engine) {
+                Step::Close => break After::Close,
+                Step::NeedMoreData | Step::Parked => break After::Continue,
+                Step::Continue
+                    if self.terminate_after_flush || self.replication_completion_pending =>
+                {
+                    break After::Continue;
+                }
+                Step::Continue => {}
+            }
         };
         match self.flush() {
             Ok(()) => after,

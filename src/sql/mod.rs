@@ -241,6 +241,7 @@ pub struct Engine {
     next_txid: u32,
     max_connections: u32,
     max_prepared_transactions: usize,
+    max_locks_per_transaction: usize,
     prepared_transactions: two_phase::PreparedTransactions,
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
@@ -2191,6 +2192,10 @@ impl Engine {
     /// The worker uses the ordinary engine transaction and durability path;
     /// replication cannot create a second, weaker write path.
     pub fn begin_subscription_apply(&mut self, txn: &mut TxnState, guc: &GucState) {
+        // Apply workers have transaction identities but no frontend/backend
+        // process identity. Do not inherit whichever client the single-threaded
+        // engine happened to dispatch most recently.
+        self.storage.set_current_connection_id(0);
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         txn.replication_apply = true;
         txn.begin_command();
@@ -3011,6 +3016,7 @@ impl Engine {
             next_txid: recovered_transaction_id,
             max_connections: config.max_connections,
             max_prepared_transactions: config.max_prepared_transactions,
+            max_locks_per_transaction: config.max_locks_per_transaction,
             prepared_transactions,
             notify: notify::NotifyState::new(
                 budget,
@@ -4496,6 +4502,7 @@ impl Engine {
             self.storage.release_serializable(txn.txid);
             self.storage.release_table_locks(txn.txid);
             self.storage.release_row_locks(txn.txid);
+            self.storage.release_advisory_transaction_locks(txn.txid);
         }
         for event_index in 0..txn.truncates().len() {
             let event = txn.truncates()[event_index];
@@ -6193,6 +6200,7 @@ impl Engine {
             self.prepared_transactions.release(slot);
             return Err(error);
         }
+        self.storage.prepare_transaction_locks(txn.txid);
         let prepared_lsn = self.storage.lsn();
         let first_lsn = self
             .prepared_transactions
@@ -6286,6 +6294,7 @@ impl Engine {
             self.storage.release_serializable(txn.txid);
             self.storage.release_table_locks(txn.txid);
             self.storage.release_row_locks(txn.txid);
+            self.storage.release_advisory_transaction_locks(txn.txid);
             self.promote_transaction_state(txn, resolution_lsn, None)
         } else {
             self.rollback_transaction_state(txn, false);
@@ -6755,6 +6764,7 @@ impl Engine {
         self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
         self.storage.release_row_locks(txn.txid);
+        self.storage.release_advisory_transaction_locks(txn.txid);
         // Reverse-replay every write to its prior image (newest first), so a
         // row written multiple times unwinds to its pre-transaction state.
         for &(table, rowid, prior) in txn.touched().iter().rev() {
@@ -7866,6 +7876,7 @@ impl Engine {
     pub fn drop_connection(&mut self, conn_id: i32) {
         self.notify.drop_conn(conn_id);
         self.invalidate_replication_snapshot(conn_id);
+        self.storage.release_connection_advisory_locks(conn_id);
         self.storage.drop_connection_temporary_relations(conn_id);
         if let Some(spiller) = self.temporary_spiller.as_mut() {
             spiller.cleanup(&self.storage);
@@ -8284,17 +8295,20 @@ impl Engine {
             let output_mark = responder.buffer.mark();
             let statement_mark =
                 txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-            let outcome = self.execute_stmt(
-                statement,
-                arena,
-                NO_PARAMS,
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                routine_transaction_context,
-                responder,
-            )?;
+            let outcome = match self.storage.begin_advisory_statement() {
+                Ok(()) => self.execute_stmt(
+                    statement,
+                    arena,
+                    NO_PARAMS,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine_transaction_context,
+                    responder,
+                )?,
+                Err(error) => Err(error),
+            };
             let outcome = outcome
                 .and_then(|()| {
                     exec::constraints::validate_deferred_constraints(
@@ -8319,6 +8333,7 @@ impl Engine {
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
                     if txn.owns_statement_mark(statement_mark) {
+                        self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
                         if !lock_timeout_expired {
                             return Ok(ExecutionStatus::Blocked {
@@ -8446,27 +8461,32 @@ impl Engine {
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         emit_parse_warnings(&mut parser, responder)?;
         let output_mark = responder.buffer.mark();
-        let outcome = match self.execute_stmt(
-            &statement,
-            arena,
-            params,
-            txn,
-            sqlprep,
-            cursors,
-            guc,
-            routine_transaction_context,
-            responder,
-        ) {
-            Ok(outcome) => outcome,
-            Err(WireFull) => {
-                if txn.is_explicit() {
-                    txn.failed = true;
-                } else {
-                    self.rollback_txn(txn, guc);
+        let outcome = match self.storage.begin_advisory_statement() {
+            Ok(()) => {
+                match self.execute_stmt(
+                    &statement,
+                    arena,
+                    params,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    routine_transaction_context,
+                    responder,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(WireFull) => {
+                        if txn.is_explicit() {
+                            txn.failed = true;
+                        } else {
+                            self.rollback_txn(txn, guc);
+                        }
+                        responder.replace_with_overflow_error(output_mark)?;
+                        return Ok(ExtendedExecutionStatus::Complete(false));
+                    }
                 }
-                responder.replace_with_overflow_error(output_mark)?;
-                return Ok(ExtendedExecutionStatus::Complete(false));
             }
+            Err(error) => Err(error),
         }
         .and_then(|()| {
             exec::constraints::validate_deferred_constraints(&self.storage, txn, true, arena)
@@ -8498,6 +8518,7 @@ impl Engine {
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
                     if txn.owns_statement_mark(statement_mark) {
+                        self.storage.preserve_advisory_statement();
                         self.rollback_waiting_statement(txn, statement_mark);
                         if !lock_timeout_expired {
                             return Ok(ExtendedExecutionStatus::Blocked {
@@ -17458,6 +17479,9 @@ impl Engine {
         if name.eq_ignore_ascii_case("max_prepared_transactions") {
             return Some(stack_format!(256, "{}", self.max_prepared_transactions));
         }
+        if name.eq_ignore_ascii_case("max_locks_per_transaction") {
+            return Some(stack_format!(256, "{}", self.max_locks_per_transaction));
+        }
         fixed_setting(name).map(crate::util::StackStr::from_str)
     }
 
@@ -17514,6 +17538,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "lc_monetary",
     "lock_timeout",
     "max_connections",
+    "max_locks_per_transaction",
     "max_prepared_transactions",
     "row_security",
     "search_path",

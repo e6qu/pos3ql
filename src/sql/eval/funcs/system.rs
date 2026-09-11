@@ -98,6 +98,50 @@ impl ObjectOid {
     }
 }
 
+fn advisory_key<'a>(
+    name: &str,
+    args: &[&Expr<'a>],
+    arena: &'a crate::mem::arena::Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<crate::sql::lock::AdvisoryKey>, SqlError> {
+    let integer = |value: Datum<'_>| -> Result<Option<i64>, SqlError> {
+        match value {
+            Datum::Null => Ok(None),
+            Datum::Int2(value) => Ok(Some(i64::from(value))),
+            Datum::Int4(value) => Ok(Some(i64::from(value))),
+            Datum::Int8(value) => Ok(Some(value)),
+            other => Err(type_mismatch(name, &other)),
+        }
+    };
+    match args {
+        [argument] => integer(eval_full(argument, arena, params, row, hooks)?)
+            .map(|value| value.map(crate::sql::lock::AdvisoryKey::from_bigint)),
+        [class_id, object_id] => {
+            let Some(class_id) = integer(eval_full(class_id, arena, params, row, hooks)?)? else {
+                return Ok(None);
+            };
+            let Some(object_id) = integer(eval_full(object_id, arena, params, row, hooks)?)? else {
+                return Ok(None);
+            };
+            let class_id = i32::try_from(class_id)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range"))?;
+            let object_id = i32::try_from(object_id)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range"))?;
+            Ok(Some(crate::sql::lock::AdvisoryKey::from_ints(
+                class_id, object_id,
+            )))
+        }
+        _ => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {}(...) with {} arguments does not exist",
+            name,
+            args.len()
+        )),
+    }
+}
+
 /// PostgreSQL's closed one-byte object-class protocol for `acldefault`.
 #[derive(Clone, Copy)]
 enum AclDefaultObject {
@@ -730,6 +774,19 @@ pub(crate) fn dispatch<'a>(
     if !matches!(
         name,
         "version"
+            | "pg_backend_pid"
+            | "pg_blocking_pids"
+            | "pg_advisory_lock"
+            | "pg_advisory_lock_shared"
+            | "pg_try_advisory_lock"
+            | "pg_try_advisory_lock_shared"
+            | "pg_advisory_unlock"
+            | "pg_advisory_unlock_shared"
+            | "pg_advisory_unlock_all"
+            | "pg_advisory_xact_lock"
+            | "pg_advisory_xact_lock_shared"
+            | "pg_try_advisory_xact_lock"
+            | "pg_try_advisory_xact_lock_shared"
             | "pg_is_in_recovery"
             | "pg_reload_conf"
             | "pg_event_trigger_table_rewrite_oid"
@@ -853,6 +910,126 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "pg_backend_pid" => {
+                arity(0)?;
+                Ok(Datum::Int4(
+                    hooks
+                        .catalog
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "backend identity access is unavailable"
+                            )
+                        })?
+                        .current_backend_pid()?,
+                ))
+            }
+            "pg_blocking_pids" => {
+                arity(1)?;
+                let backend_pid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int2(value) => i32::from(value),
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "backend lock visibility is unavailable"
+                    )
+                })?;
+                let count = catalog.blocking_backend_pid_count(backend_pid);
+                if count > array::MAX_ELEMENTS {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "blocking backend list exceeds {} entries",
+                        array::MAX_ELEMENTS
+                    ));
+                }
+                let pids = arena
+                    .alloc_slice_with(count, |_| 0_i32)
+                    .map_err(|_| arena_full())?;
+                let written = catalog.blocking_backend_pids(backend_pid, pids);
+                let values = arena
+                    .alloc_slice_with(written, |index| Datum::Int4(pids[index]))
+                    .map_err(|_| arena_full())?;
+                Ok(Datum::Array {
+                    element: ArrElem::Int4,
+                    raw: array::build(values, arena)?,
+                })
+            }
+            "pg_advisory_lock"
+            | "pg_advisory_lock_shared"
+            | "pg_try_advisory_lock"
+            | "pg_try_advisory_lock_shared"
+            | "pg_advisory_xact_lock"
+            | "pg_advisory_xact_lock_shared"
+            | "pg_try_advisory_xact_lock"
+            | "pg_try_advisory_xact_lock_shared" => {
+                let Some(key) = advisory_key(name, args, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let shared = name.ends_with("_shared");
+                let transaction_scope = name.contains("_xact_");
+                let try_only = name.starts_with("pg_try_");
+                let acquired = hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "advisory locks are unavailable"
+                        )
+                    })?
+                    .acquire_advisory_lock(
+                        key.class_id,
+                        key.object_id,
+                        key.object_sub_id,
+                        shared,
+                        transaction_scope,
+                        try_only,
+                    )?;
+                if try_only {
+                    Ok(Datum::Bool(acquired))
+                } else {
+                    Ok(Datum::Null)
+                }
+            }
+            "pg_advisory_unlock" | "pg_advisory_unlock_shared" => {
+                let Some(key) = advisory_key(name, args, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let unlocked = hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "advisory locks are unavailable"
+                        )
+                    })?
+                    .unlock_advisory_lock(
+                        key.class_id,
+                        key.object_id,
+                        key.object_sub_id,
+                        name.ends_with("_shared"),
+                    )?;
+                Ok(Datum::Bool(unlocked))
+            }
+            "pg_advisory_unlock_all" => {
+                arity(0)?;
+                hooks
+                    .catalog
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "advisory locks are unavailable"
+                        )
+                    })?
+                    .unlock_all_advisory_locks()?;
+                Ok(Datum::Null)
+            }
             "pg_current_xact_id"
             | "pg_current_xact_id_if_assigned"
             | "txid_current"

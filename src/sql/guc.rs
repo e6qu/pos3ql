@@ -2683,6 +2683,7 @@ fn is_read_only(name: &str) -> bool {
         "data_directory_mode",
         "in_hot_standby",
         "max_connections",
+        "max_locks_per_transaction",
         "max_prepared_transactions",
     ];
     READ_ONLY.iter().any(|r| name.eq_ignore_ascii_case(r))

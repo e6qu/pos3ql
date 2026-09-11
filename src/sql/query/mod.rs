@@ -1624,6 +1624,84 @@ impl StorageCatalog<'_, '_, '_, '_> {
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn current_backend_pid(&self) -> Result<i32, SqlError> {
+        let pid = self.storage.current_connection_id();
+        if pid <= 0 {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "backend identity access is unavailable"
+            ));
+        }
+        Ok(pid)
+    }
+
+    fn blocking_backend_pids(&self, backend_pid: i32, output: &mut [i32]) -> usize {
+        self.storage.blocking_backend_pids(backend_pid, output)
+    }
+
+    fn blocking_backend_pid_count(&self, backend_pid: i32) -> usize {
+        self.storage.blocking_backend_pid_count(backend_pid)
+    }
+
+    fn acquire_advisory_lock(
+        &self,
+        class_id: u32,
+        object_id: u32,
+        object_sub_id: i16,
+        shared: bool,
+        transaction_scope: bool,
+        try_only: bool,
+    ) -> Result<bool, SqlError> {
+        let decision = self.storage.acquire_advisory_lock(
+            self.txid,
+            crate::sql::lock::AdvisoryKey {
+                class_id,
+                object_id,
+                object_sub_id,
+            },
+            if shared {
+                crate::sql::lock::AdvisoryMode::Shared
+            } else {
+                crate::sql::lock::AdvisoryMode::Exclusive
+            },
+            transaction_scope,
+            try_only,
+        )?;
+        match decision {
+            crate::sql::lock::AdvisoryDecision::Acquired => Ok(true),
+            crate::sql::lock::AdvisoryDecision::Unavailable => Ok(false),
+            crate::sql::lock::AdvisoryDecision::Waiting => Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for an advisory lock"
+            )),
+        }
+    }
+
+    fn unlock_advisory_lock(
+        &self,
+        class_id: u32,
+        object_id: u32,
+        object_sub_id: i16,
+        shared: bool,
+    ) -> Result<bool, SqlError> {
+        self.storage.unlock_advisory_session(
+            crate::sql::lock::AdvisoryKey {
+                class_id,
+                object_id,
+                object_sub_id,
+            },
+            if shared {
+                crate::sql::lock::AdvisoryMode::Shared
+            } else {
+                crate::sql::lock::AdvisoryMode::Exclusive
+            },
+        )
+    }
+
+    fn unlock_all_advisory_locks(&self) -> Result<(), SqlError> {
+        self.storage.unlock_all_advisory_session()
+    }
+
     fn current_transaction_id(&self, assign: bool) -> Result<Option<u64>, SqlError> {
         Ok(if assign {
             Some(self.storage.assign_transaction_identity(self.txid))

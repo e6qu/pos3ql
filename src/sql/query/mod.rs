@@ -1489,56 +1489,41 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 "data-modifying SQL functions require a resumable query executor"
             ));
         }
-        let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        for (slot, argument) in arguments.iter().enumerate() {
-            let encoded =
-                crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
-            parameters[slot] =
-                crate::sql::exec::decode_projected_col_record(encoded, 0, self.routine_workspace)?;
+        let track = matches!(
+            super::guc::active_track_functions(),
+            super::guc::TrackFunctions::All
+        );
+        let timed = super::statistics::begin_function_timing(track);
+        if track
+            && let Err(error) = self
+                .storage
+                .ensure_function_statistics(crate::storage::routine_oid(&routine))
+        {
+            let _ = super::statistics::finish_function_timing(timed);
+            return Err(error);
         }
-        for step in function_program.preceding {
-            let RoutinePrelude::Statement(statement) = step else {
-                let RoutinePrelude::Forbidden(statement) = step else {
-                    unreachable!("routine prelude has two variants");
-                };
-                return Err(routine_forbidden_statement_error(statement));
-            };
-            let query = match statement {
-                Stmt::Select(query) => RoutineQuery::Select(query),
-                Stmt::SetQuery(query) => RoutineQuery::Set(query),
-                _ => unreachable!("mutable routine prelude was rejected above"),
-            };
-            execute_bound_routine_query(
-                &query,
-                self.storage,
-                slot,
-                routine,
-                self.txid,
-                self.routine_workspace,
-                &parameters[..arguments.len()],
-                true,
-                &mut |_| Ok(()),
-            )?;
-        }
-        let mut result = None;
-        let result_query = match function_program.result {
-            RoutineFunctionResult::Query(result_query) => result_query,
-            RoutineFunctionResult::DataModification(_) => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "data-modifying SQL function results require a resumable query executor"
-                ));
+        let output = (|| -> Result<Option<Datum<'a>>, SqlError> {
+            let mut parameters = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for (slot, argument) in arguments.iter().enumerate() {
+                let encoded =
+                    crate::sql::exec::encode_projected_pub(&[*argument], self.routine_workspace)?;
+                parameters[slot] = crate::sql::exec::decode_projected_col_record(
+                    encoded,
+                    0,
+                    self.routine_workspace,
+                )?;
             }
-            RoutineFunctionResult::Void(statement) => {
+            for step in function_program.preceding {
+                let RoutinePrelude::Statement(statement) = step else {
+                    let RoutinePrelude::Forbidden(statement) = step else {
+                        unreachable!("routine prelude has two variants");
+                    };
+                    return Err(routine_forbidden_statement_error(statement));
+                };
                 let query = match statement {
                     Stmt::Select(query) => RoutineQuery::Select(query),
                     Stmt::SetQuery(query) => RoutineQuery::Set(query),
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "data-modifying SQL functions require a resumable query executor"
-                        ));
-                    }
+                    _ => unreachable!("mutable routine prelude was rejected above"),
                 };
                 execute_bound_routine_query(
                     &query,
@@ -1551,75 +1536,120 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     true,
                     &mut |_| Ok(()),
                 )?;
-                return Ok(Some(Datum::Text("")));
             }
-            RoutineFunctionResult::Forbidden(statement) => {
-                return Err(routine_forbidden_statement_error(statement));
-            }
-        };
-        execute_bound_routine_query(
-            result_query,
-            self.storage,
-            slot,
-            routine,
-            self.txid,
-            self.routine_workspace,
-            &parameters[..arguments.len()],
-            true,
-            &mut |values| {
-                let expected = record_columns.map_or(1, <[_]>::len);
-                if values.len() != expected {
+            let mut result = None;
+            let result_query = match function_program.result {
+                RoutineFunctionResult::Query(result_query) => result_query,
+                RoutineFunctionResult::DataModification(_) => {
                     return Err(sql_err!(
-                        sqlstate::SYNTAX_ERROR,
-                        "SQL function query returns {} columns but {} were declared",
-                        values.len(),
-                        expected
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "data-modifying SQL function results require a resumable query executor"
                     ));
                 }
-                if result.is_some() {
-                    return Ok(());
+                RoutineFunctionResult::Void(statement) => {
+                    let query = match statement {
+                        Stmt::Select(query) => RoutineQuery::Select(query),
+                        Stmt::SetQuery(query) => RoutineQuery::Set(query),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "data-modifying SQL functions require a resumable query executor"
+                            ));
+                        }
+                    };
+                    execute_bound_routine_query(
+                        &query,
+                        self.storage,
+                        slot,
+                        routine,
+                        self.txid,
+                        self.routine_workspace,
+                        &parameters[..arguments.len()],
+                        true,
+                        &mut |_| Ok(()),
+                    )?;
+                    return Ok(Some(Datum::Text("")));
                 }
-                let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
-                result = Some(if let Some(columns) = record_columns {
-                    let fields = arena
-                        .alloc_slice_with(columns.len(), |_| super::types::RecordField {
-                            name: "",
-                            type_oid: super::types::oid::UNKNOWN,
-                            value: Datum::Null,
-                        })
-                        .map_err(|_| arena_full())?;
-                    for (index, (field, column)) in fields.iter_mut().zip(columns).enumerate() {
-                        field.name = arena
-                            .alloc_str(column.name.as_str())
-                            .map_err(|_| arena_full())?;
-                        field.type_oid = self
-                            .storage
-                            .routine_type_oid(column.ctype, column.user_type, self.txid)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "routine result type identity is unavailable"
-                                )
-                            })?;
-                        field.value =
-                            crate::sql::exec::decode_projected_col_record(encoded, index, arena)?;
+                RoutineFunctionResult::Forbidden(statement) => {
+                    return Err(routine_forbidden_statement_error(statement));
+                }
+            };
+            execute_bound_routine_query(
+                result_query,
+                self.storage,
+                slot,
+                routine,
+                self.txid,
+                self.routine_workspace,
+                &parameters[..arguments.len()],
+                true,
+                &mut |values| {
+                    let expected = record_columns.map_or(1, <[_]>::len);
+                    if values.len() != expected {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "SQL function query returns {} columns but {} were declared",
+                            values.len(),
+                            expected
+                        ));
                     }
-                    Datum::Record(fields)
-                } else {
-                    crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?
-                });
-                Ok(())
-            },
-        )?;
-        let result = result.unwrap_or(Datum::Null);
-        let Some(result_contract) = result_contract else {
-            return Ok(Some(result));
-        };
-        if result_contract.polymorphic_type().is_some() {
-            Ok(Some(result))
-        } else {
-            super::eval::cast_to(result, result_type, arena).map(Some)
+                    if result.is_some() {
+                        return Ok(());
+                    }
+                    let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
+                    result = Some(if let Some(columns) = record_columns {
+                        let fields = arena
+                            .alloc_slice_with(columns.len(), |_| super::types::RecordField {
+                                name: "",
+                                type_oid: super::types::oid::UNKNOWN,
+                                value: Datum::Null,
+                            })
+                            .map_err(|_| arena_full())?;
+                        for (index, (field, column)) in fields.iter_mut().zip(columns).enumerate() {
+                            field.name = arena
+                                .alloc_str(column.name.as_str())
+                                .map_err(|_| arena_full())?;
+                            field.type_oid = self
+                                .storage
+                                .routine_type_oid(column.ctype, column.user_type, self.txid)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "routine result type identity is unavailable"
+                                    )
+                                })?;
+                            field.value = crate::sql::exec::decode_projected_col_record(
+                                encoded, index, arena,
+                            )?;
+                        }
+                        Datum::Record(fields)
+                    } else {
+                        crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?
+                    });
+                    Ok(())
+                },
+            )?;
+            let result = result.unwrap_or(Datum::Null);
+            let Some(result_contract) = result_contract else {
+                return Ok(Some(result));
+            };
+            if result_contract.polymorphic_type().is_some() {
+                Ok(Some(result))
+            } else {
+                super::eval::cast_to(result, result_type, arena).map(Some)
+            }
+        })();
+        if let Some((total, own)) = super::statistics::finish_function_timing(timed)
+            && output.is_ok()
+        {
+            self.storage.record_function_call(
+                self.txid,
+                crate::storage::routine_oid(&routine),
+                total,
+                own,
+            )?;
         }
+        output
     }
 }
 

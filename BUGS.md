@@ -22,6 +22,14 @@ insert dead-tuple, top-level and nested-savepoint TRUNCATE counter, built-in
 initial-privilege, NULL-encoded `void`, omitted database-level index-tuple
 return, and NULL-predicate phantom-scan defects are fixed in the same change.
 
+The review additionally covers PostgreSQL 18 cumulative and transaction-local
+user-function timing, `track_functions`, statistics reset controls, and the
+remaining `pg_statio_*`, SLRU, WAL receiver, recovery-prefetch, GSSAPI,
+archiver, background-writer, checkpointer, I/O, WAL, and command-progress
+catalogs. The discovered foreign/partitioned-parent statistics leakage, failed
+function-call accounting, nullable shared-reset behavior, and fixed
+`pg_attribute` row ceiling are fixed in the same change.
+
 Record only a genuinely intractable or externally blocked defect here. A row must include a stable ID, a reproducer, and the reason it cannot be fixed now. Fixable work belongs in the same change that finds it; fixed-bug history belongs in git history and pull requests.
 
 | ID | Status | Found | Description | Repro | Blocker |

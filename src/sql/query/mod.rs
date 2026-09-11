@@ -1551,7 +1551,7 @@ impl StorageCatalog<'_, '_, '_, '_> {
                     true,
                     &mut |_| Ok(()),
                 )?;
-                return Ok(Some(Datum::Null));
+                return Ok(Some(Datum::Text("")));
             }
             RoutineFunctionResult::Forbidden(statement) => {
                 return Err(routine_forbidden_statement_error(statement));

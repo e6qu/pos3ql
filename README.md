@@ -66,6 +66,17 @@ cancellation share transaction rollback and extended-protocol synchronization.
 queue, and `pg_stat_database_conflicts` reports the exact zero-conflict state of
 a server that never enters PostgreSQL hot standby.
 
+Startup-budgeted cumulative statistics back PostgreSQL 18's all/system/user
+table, transaction-local table, index, and database views. Query, DML, COPY,
+MERGE, maintenance, transaction, deadlock, and session choke points update the
+same counters; commit, abort, nested savepoint release/rollback, transactional
+TRUNCATE, relation/index reuse, ANALYZE, VACUUM, and reset functions retain
+PostgreSQL's distinct semantics.
+Heap-page, HOT-update, autovacuum, parallel-worker, and standby-conflict fields
+remain exact zero states because those PostgreSQL subsystems do not exist in
+the object-native engine. Statistics control functions return PostgreSQL's
+non-null zero-length `void` value over text and extended protocol paths.
+
 PostgreSQL `money` is an exact signed-cent type with C/en_US monetary text,
 scalar and array binary wire formats, casts, comparisons, arithmetic, support
 functions, aggregates, btree indexes and catalogs. Values retain that identity

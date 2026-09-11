@@ -224,14 +224,14 @@ fn execute_slot_control<'a>(
             };
             engine.reset_subscription_statistics(oid, txn.txid);
         }
-        return Ok(Datum::Null);
+        return Ok(Datum::Text(""));
     }
     engine.require_replication_privilege(txn.txid)?;
     if oid_value == 3780 {
         let name =
             crate::storage::ReplicationSlotName::parse(text_argument(arguments[0], function)?)?;
         engine.drop_replication_slot(name)?;
-        return Ok(Datum::Null);
+        return Ok(Datum::Text(""));
     }
     if oid_value == 3878 {
         let written_name = text_argument(arguments[0], function)?;

@@ -40,6 +40,7 @@ pub mod ryu;
 pub mod sequence;
 pub mod sha512;
 pub mod snapshot;
+pub(crate) mod statistics;
 pub mod timezone;
 pub mod to_char;
 pub(crate) mod two_phase;
@@ -5915,6 +5916,7 @@ impl Engine {
             guc.commit_transaction();
         }
         self.storage.clear_temporary_transaction(txn.txid);
+        self.storage.finish_cumulative_transaction(txn.txid, true);
         self.storage.finish_transaction_identity(txn.txid, true);
         txn.clear();
         notify_result.and(index_result).and(temporary_result)
@@ -6788,6 +6790,8 @@ impl Engine {
         self.wal.discard_stage(txn.txid);
         self.storage.clear_temporary_transaction(txn.txid);
         self.storage
+            .finish_cumulative_transaction(txn.txid, committed);
+        self.storage
             .finish_transaction_identity(txn.txid, committed);
         txn.clear();
     }
@@ -6887,6 +6891,10 @@ impl Engine {
                     .rollback_extended_statistics_data(statistics as usize, txn.txid),
             }
         }
+        self.storage
+            .finish_cumulative_subtransactions(txn.txid, index as u8 + 2, false);
+        self.storage
+            .set_cumulative_transaction_nest_level(txn.txid, index as u8 + 2);
         txn.rewind_touched(sp.touched_mark);
         txn.rewind_truncates(sp.truncate_mark);
         txn.rewind_ddl(sp.ddl_mark);
@@ -7111,8 +7119,14 @@ impl Engine {
                         .relation_visible_to_current_session(slot, txn.txid)
                 {
                     txn.record_statistics(slot as u32)?;
-                    total_rows = total_rows
-                        .saturating_add(self.storage.analyze_table(slot, txn.txid, &[])?.rows);
+                    let started = datetime::now_micros();
+                    let statistics = self.storage.analyze_table(slot, txn.txid, &[])?;
+                    self.storage.record_relation_analyze(
+                        slot,
+                        statistics.rows,
+                        datetime::now_micros().saturating_sub(started).max(0) as u64,
+                    );
+                    total_rows = total_rows.saturating_add(statistics.rows);
                     exec::analyze_extended_statistics(
                         &mut self.storage,
                         txn,
@@ -7149,11 +7163,17 @@ impl Engine {
                     selected_count += 1;
                 }
                 txn.record_statistics(slot as u32)?;
-                total_rows = total_rows.saturating_add(
+                let started = datetime::now_micros();
+                let statistics =
                     self.storage
-                        .analyze_table(slot, txn.txid, &selected[..selected_count])?
-                        .rows,
+                        .analyze_table(slot, txn.txid, &selected[..selected_count]);
+                let statistics = statistics?;
+                self.storage.record_relation_analyze(
+                    slot,
+                    statistics.rows,
+                    datetime::now_micros().saturating_sub(started).max(0) as u64,
                 );
+                total_rows = total_rows.saturating_add(statistics.rows);
                 exec::analyze_extended_statistics(
                     &mut self.storage,
                     txn,
@@ -7164,6 +7184,38 @@ impl Engine {
             }
         }
         Ok(total_rows)
+    }
+
+    fn record_vacuum_targets(
+        &self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txid: u32,
+        elapsed_micros: u64,
+    ) -> Result<(), SqlError> {
+        if targets.is_empty() {
+            for slot in 0..self.storage.table_count() {
+                if self.storage.table_slot_visible_to(slot, txid)
+                    && self.storage.relation_visible_to_current_session(slot, txid)
+                {
+                    self.storage.record_relation_vacuum(slot, elapsed_micros);
+                }
+            }
+            return Ok(());
+        }
+        for target in targets {
+            let root = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
+            for slot in 0..self.storage.table_count() {
+                if self.storage.table_slot_visible_to(slot, txid)
+                    && self.storage.relation_visible_to_current_session(slot, txid)
+                    && (slot == root
+                        || (target.inheritance == ast::RelationInheritance::Descendants
+                            && self.storage.relation_descends_from(slot, root, txid)))
+                {
+                    self.storage.record_relation_vacuum(slot, elapsed_micros);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn execute_checkpoint_statement(
@@ -7186,6 +7238,7 @@ impl Engine {
         txn: &mut TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let started = datetime::now_micros();
         let mode = if options.full {
             ast::TableLockMode::AccessExclusive
         } else {
@@ -7205,6 +7258,13 @@ impl Engine {
         if self.ckpt.is_some()
             && let Err(error) = self.checkpoint()
         {
+            return Ok(Err(error));
+        }
+        if let Err(error) = self.record_vacuum_targets(
+            targets,
+            txn.txid,
+            datetime::now_micros().saturating_sub(started).max(0) as u64,
+        ) {
             return Ok(Err(error));
         }
         responder.command_complete("VACUUM")?;
@@ -8420,6 +8480,9 @@ impl Engine {
                         );
                     }
                 }
+                if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.storage.record_deadlock();
+                }
                 if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.abort_explicit_txn(txn, guc);
                 } else if txn.is_explicit() {
@@ -8496,6 +8559,9 @@ impl Engine {
                 return Ok(ExtendedExecutionStatus::Complete(true));
             }
             Err(e) => {
+                if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.storage.record_deadlock();
+                }
                 if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.abort_explicit_txn(txn, guc);
                 } else if txn.is_explicit() {
@@ -8614,6 +8680,9 @@ impl Engine {
                             "a non-atomic routine cannot suspend after transaction control"
                         );
                     }
+                }
+                if e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.storage.record_deadlock();
                 }
                 if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.abort_explicit_txn(txn, guc);
@@ -11226,10 +11295,16 @@ impl Engine {
                 };
             }
             let logical_replication_intrinsic = logical_replication::is_intrinsic(oid);
-            if !logical_replication_intrinsic && large_object::is_mutating(oid) {
+            let statistics_intrinsic = statistics::is_intrinsic(oid);
+            if !logical_replication_intrinsic
+                && !statistics_intrinsic
+                && large_object::is_mutating(oid)
+            {
                 self.storage.assign_transaction_identity(txn.txid);
             }
-            let value = match if logical_replication_intrinsic {
+            let value = match if statistics_intrinsic {
+                statistics::execute(oid, &arguments[..pending.argument_count], self, txn)
+            } else if logical_replication_intrinsic {
                 logical_replication::execute(
                     oid,
                     &arguments[..pending.argument_count],
@@ -15450,6 +15525,11 @@ impl Engine {
                     txn.release_savepoints_from(index);
                     return Ok(Err(error));
                 }
+                let index = txn
+                    .savepoint_index(name)
+                    .expect("savepoint was retained after remote mirroring");
+                self.storage
+                    .set_cumulative_transaction_nest_level(txn.txid, index as u8 + 2);
                 guc.savepoint();
                 responder.command_complete("SAVEPOINT")?;
                 Ok(Ok(()))
@@ -15468,6 +15548,13 @@ impl Engine {
                         {
                             return Ok(Err(error));
                         }
+                        self.storage.finish_cumulative_subtransactions(
+                            txn.txid,
+                            index as u8 + 2,
+                            true,
+                        );
+                        self.storage
+                            .set_cumulative_transaction_nest_level(txn.txid, index as u8 + 1);
                         txn.release_savepoints_from(index);
                         guc.release_savepoints_from(index);
                         responder.command_complete("RELEASE")?;
@@ -18128,7 +18215,7 @@ fn replay_transaction_batches(
                             let (location, bytes) = storage.heap.append(row.len())?;
                             bytes.copy_from_slice(row);
                             storage.observe_rowid(rowid);
-                            let prior = storage.write_pending(
+                            let prior = storage.write_pending_untracked(
                                 table_slot,
                                 rowid,
                                 transaction_id,
@@ -18153,7 +18240,7 @@ fn replay_transaction_batches(
                             else {
                                 continue;
                             };
-                            let prior = storage.write_pending(
+                            let prior = storage.write_pending_untracked(
                                 table_slot,
                                 rowid,
                                 transaction_id,

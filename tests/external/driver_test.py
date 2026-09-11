@@ -966,6 +966,88 @@ else:
     raise AssertionError("terminated backend remained usable")
 activity.close()
 
+# Cumulative statistics retain PostgreSQL's result types and transaction-local
+# accounting across separate extended-protocol messages.  An aborted write
+# contributes attempt counters without changing the live-row estimate.
+cur.execute("DROP TABLE IF EXISTS drv_cumulative_statistics")
+cur.execute(
+    "CREATE TABLE drv_cumulative_statistics(id integer PRIMARY KEY, value integer)"
+)
+cur.execute(
+    "CREATE INDEX drv_cumulative_statistics_value_idx "
+    "ON drv_cumulative_statistics(value)"
+)
+cur.execute("INSERT INTO drv_cumulative_statistics VALUES (1,10),(2,20),(3,30)")
+cur.execute("SELECT pg_stat_reset()")
+assert cur.fetchone() == ("",)
+cur.execute("SELECT pg_stat_clear_snapshot() IS NULL, pg_stat_force_next_flush()::text")
+assert cur.fetchone() == (False, "")
+cur.execute("BEGIN")
+cur.execute("SELECT value FROM drv_cumulative_statistics WHERE id=%s", (2,))
+assert cur.fetchone() == (20,)
+cur.execute("UPDATE drv_cumulative_statistics SET value=%s WHERE id=%s", (21, 2))
+cur.execute("DELETE FROM drv_cumulative_statistics WHERE id=%s", (3,))
+cur.execute("INSERT INTO drv_cumulative_statistics VALUES (%s,%s)", (4, 40))
+cur.execute(
+    "SELECT seq_scan+idx_scan>0, seq_tup_read+idx_tup_fetch>0, "
+    "n_tup_ins,n_tup_upd,n_tup_del FROM pg_stat_xact_user_tables "
+    "WHERE relname='drv_cumulative_statistics'"
+)
+xact_statistics = cur.fetchone()
+assert xact_statistics[:2] == (True, True), xact_statistics
+assert xact_statistics[2:] == (1, 1, 1), xact_statistics
+cur.execute("ROLLBACK")
+# A literal equality gives the planner an indexable key while the preceding
+# parameterized statements prove their transaction counters over Bind.
+cur.execute("SELECT value FROM drv_cumulative_statistics WHERE id=1")
+assert cur.fetchone() == (10,)
+cur.execute(
+    "SELECT relid,schemaname,seq_scan,last_seq_scan,total_analyze_time,"
+    "n_tup_ins,n_tup_upd,n_tup_del,n_live_tup,n_dead_tup,n_mod_since_analyze "
+    "FROM pg_stat_user_tables WHERE relname='drv_cumulative_statistics'"
+)
+assert [column.type_code for column in cur.description] == [
+    26, 19, 20, 1184, 701, 20, 20, 20, 20, 20, 20,
+]
+relation_statistics = cur.fetchone()
+assert relation_statistics[1] == "public", relation_statistics
+assert relation_statistics[5:] == (1, 1, 1, 0, 2, 0), relation_statistics
+cur.execute(
+    "SELECT idx_scan>0,idx_tup_read>0,idx_tup_fetch>0,last_idx_scan IS NOT NULL "
+    "FROM pg_stat_user_indexes "
+    "WHERE indexrelname='drv_cumulative_statistics_pkey'"
+)
+index_statistics = cur.fetchone()
+assert index_statistics == (True, True, True, True), index_statistics
+cur.execute("ANALYZE drv_cumulative_statistics")
+cur.execute("VACUUM drv_cumulative_statistics")
+cur.execute(
+    "SELECT n_live_tup,n_dead_tup,n_mod_since_analyze,n_ins_since_vacuum,"
+    "analyze_count>0,vacuum_count>0,last_analyze IS NOT NULL,last_vacuum IS NOT NULL "
+    "FROM pg_stat_user_tables WHERE relname='drv_cumulative_statistics'"
+)
+assert cur.fetchone() == (3, 0, 0, 0, True, True, True, True)
+cur.execute(
+    "SELECT pg_stat_reset_single_table_counters(%s::regclass)",
+    ("drv_cumulative_statistics",),
+)
+assert cur.fetchone() == ("",)
+cur.execute(
+    "SELECT n_tup_ins,n_tup_upd,n_tup_del,seq_scan,idx_scan>0 "
+    "FROM pg_stat_user_tables WHERE relname='drv_cumulative_statistics'"
+)
+assert cur.fetchone() == (0, 0, 0, 0, True)
+cur.execute(
+    "SELECT pg_typeof(datid)::text,pg_typeof(numbackends)::text,"
+    "pg_typeof(xact_commit)::text,numbackends>0,xact_commit>0,xact_rollback>0,"
+    "tup_inserted>0,tup_updated>0,tup_deleted>0,stats_reset IS NOT NULL "
+    "FROM pg_stat_database WHERE datname=current_database()"
+)
+assert cur.fetchone() == (
+    "oid", "integer", "bigint", True, True, True, True, True, True, True,
+)
+print("cumulative statistics extended-protocol boundaries ok")
+
 cur.execute("SELECT count(*) FROM pg_stat_database_conflicts WHERE datname=current_database()")
 assert cur.fetchone() == (1,)
 print("backend activity/control boundaries ok", admin_pid)

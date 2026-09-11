@@ -10710,6 +10710,171 @@ pub(crate) enum BackendSignal {
     Terminate(i32),
 }
 
+/// Executor counters behind PostgreSQL's cumulative table-statistics views.
+/// They are deliberately not durable: like PostgreSQL's collector state,
+/// they describe this server lifetime rather than the authoritative rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RelationCumulativeStatistics {
+    pub(crate) seq_scan: u64,
+    pub(crate) last_seq_scan: Option<i64>,
+    pub(crate) seq_tup_read: u64,
+    pub(crate) idx_scan: u64,
+    pub(crate) last_idx_scan: Option<i64>,
+    pub(crate) idx_tup_fetch: u64,
+    pub(crate) n_tup_ins: u64,
+    pub(crate) n_tup_upd: u64,
+    pub(crate) n_tup_del: u64,
+    pub(crate) n_live_tup: u64,
+    pub(crate) n_dead_tup: u64,
+    pub(crate) n_mod_since_analyze: u64,
+    pub(crate) n_ins_since_vacuum: u64,
+    pub(crate) last_vacuum: Option<i64>,
+    pub(crate) last_analyze: Option<i64>,
+    pub(crate) vacuum_count: u64,
+    pub(crate) analyze_count: u64,
+    pub(crate) total_vacuum_time_micros: u64,
+    pub(crate) total_analyze_time_micros: u64,
+}
+
+impl RelationCumulativeStatistics {
+    const EMPTY: Self = Self {
+        seq_scan: 0,
+        last_seq_scan: None,
+        seq_tup_read: 0,
+        idx_scan: 0,
+        last_idx_scan: None,
+        idx_tup_fetch: 0,
+        n_tup_ins: 0,
+        n_tup_upd: 0,
+        n_tup_del: 0,
+        n_live_tup: 0,
+        n_dead_tup: 0,
+        n_mod_since_analyze: 0,
+        n_ins_since_vacuum: 0,
+        last_vacuum: None,
+        last_analyze: None,
+        vacuum_count: 0,
+        analyze_count: 0,
+        total_vacuum_time_micros: 0,
+        total_analyze_time_micros: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RelationTransactionStatistics {
+    txid: u32,
+    table: u32,
+    nest_level: u8,
+    pub(crate) seq_scan: u64,
+    last_seq_scan: Option<i64>,
+    pub(crate) seq_tup_read: u64,
+    pub(crate) idx_scan: u64,
+    last_idx_scan: Option<i64>,
+    idx_tup_read: u64,
+    pub(crate) idx_tup_fetch: u64,
+    pub(crate) n_tup_ins: u64,
+    pub(crate) n_tup_upd: u64,
+    pub(crate) n_tup_del: u64,
+    truncated: bool,
+    pre_truncate_n_tup_ins: u64,
+    pre_truncate_n_tup_upd: u64,
+    pre_truncate_n_tup_del: u64,
+}
+
+impl RelationTransactionStatistics {
+    const fn new(txid: u32, table: usize, nest_level: u8) -> Self {
+        Self {
+            txid,
+            table: table as u32,
+            nest_level,
+            seq_scan: 0,
+            last_seq_scan: None,
+            seq_tup_read: 0,
+            idx_scan: 0,
+            last_idx_scan: None,
+            idx_tup_read: 0,
+            idx_tup_fetch: 0,
+            n_tup_ins: 0,
+            n_tup_upd: 0,
+            n_tup_del: 0,
+            truncated: false,
+            pre_truncate_n_tup_ins: 0,
+            pre_truncate_n_tup_upd: 0,
+            pre_truncate_n_tup_del: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IndexCumulativeStatistics {
+    pub(crate) oid: i32,
+    database: DatabaseOid,
+    pub(crate) idx_scan: u64,
+    pub(crate) last_idx_scan: Option<i64>,
+    pub(crate) idx_tup_read: u64,
+    pub(crate) idx_tup_fetch: u64,
+}
+
+impl IndexCumulativeStatistics {
+    const EMPTY: Self = Self {
+        oid: 0,
+        database: DatabaseOid::POSTGRES,
+        idx_scan: 0,
+        last_idx_scan: None,
+        idx_tup_read: 0,
+        idx_tup_fetch: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DatabaseCumulativeStatistics {
+    pub(crate) oid: DatabaseOid,
+    pub(crate) xact_commit: u64,
+    pub(crate) xact_rollback: u64,
+    pub(crate) tup_returned: u64,
+    pub(crate) tup_fetched: u64,
+    pub(crate) tup_inserted: u64,
+    pub(crate) tup_updated: u64,
+    pub(crate) tup_deleted: u64,
+    pub(crate) deadlocks: u64,
+    pub(crate) session_time_micros: u64,
+    pub(crate) active_time_micros: u64,
+    pub(crate) idle_in_transaction_time_micros: u64,
+    pub(crate) sessions: u64,
+    pub(crate) sessions_abandoned: u64,
+    pub(crate) sessions_fatal: u64,
+    pub(crate) sessions_killed: u64,
+    pub(crate) stats_reset: Option<i64>,
+}
+
+impl DatabaseCumulativeStatistics {
+    const fn empty(oid: DatabaseOid) -> Self {
+        Self {
+            oid,
+            xact_commit: 0,
+            xact_rollback: 0,
+            tup_returned: 0,
+            tup_fetched: 0,
+            tup_inserted: 0,
+            tup_updated: 0,
+            tup_deleted: 0,
+            deadlocks: 0,
+            session_time_micros: 0,
+            active_time_micros: 0,
+            idle_in_transaction_time_micros: 0,
+            sessions: 0,
+            sessions_abandoned: 0,
+            sessions_fatal: 0,
+            sessions_killed: 0,
+            stats_reset: None,
+        }
+    }
+
+    pub(crate) const fn empty_for_catalog() -> Self {
+        Self::empty(DatabaseOid::POSTGRES)
+    }
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -10757,6 +10922,11 @@ pub struct Storage {
     current_connection_id: Cell<i32>,
     backends: std::cell::RefCell<FixedVec<BackendActivity>>,
     backend_signals: std::cell::RefCell<FixedVec<BackendSignal>>,
+    relation_cumulative_statistics: std::cell::RefCell<FixedVec<RelationCumulativeStatistics>>,
+    relation_transaction_statistics: std::cell::RefCell<FixedVec<RelationTransactionStatistics>>,
+    cumulative_transaction_nesting: std::cell::RefCell<FixedVec<(u32, u8)>>,
+    index_cumulative_statistics: std::cell::RefCell<FixedVec<IndexCumulativeStatistics>>,
+    database_cumulative_statistics: std::cell::RefCell<FixedVec<DatabaseCumulativeStatistics>>,
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
     temporary_transactions: std::cell::RefCell<FixedVec<u32>>,
@@ -11595,6 +11765,566 @@ fn rename_table_sql_identity(
 }
 
 impl Storage {
+    fn cumulative_transaction_nest_level(&self, txid: u32) -> u8 {
+        self.cumulative_transaction_nesting
+            .borrow()
+            .iter()
+            .find(|(candidate, _)| *candidate == txid)
+            .map_or(1, |(_, nest_level)| *nest_level)
+    }
+
+    pub(crate) fn set_cumulative_transaction_nest_level(&self, txid: u32, nest_level: u8) {
+        if txid == 0 {
+            return;
+        }
+        let mut nesting = self.cumulative_transaction_nesting.borrow_mut();
+        if let Some(entry) = nesting.iter_mut().find(|(candidate, _)| *candidate == txid) {
+            entry.1 = nest_level;
+        } else {
+            nesting
+                .push((txid, nest_level))
+                .expect("cumulative nesting is sized to transaction capacity");
+        }
+    }
+
+    fn with_relation_transaction_statistics(
+        &self,
+        txid: u32,
+        table: usize,
+        update: impl FnOnce(&mut RelationTransactionStatistics),
+    ) -> Result<(), SqlError> {
+        if txid == 0 || table == self.large_object_page_table as usize {
+            return Ok(());
+        }
+        let nest_level = self.cumulative_transaction_nest_level(txid);
+        let mut statistics = self.relation_transaction_statistics.borrow_mut();
+        let position = if let Some(position) = statistics.iter().position(|entry| {
+            entry.txid == txid && entry.table as usize == table && entry.nest_level == nest_level
+        }) {
+            position
+        } else {
+            statistics
+                .push(RelationTransactionStatistics::new(txid, table, nest_level))
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "transaction relation-statistics capacity exhausted"
+                    )
+                })?;
+            statistics.len() - 1
+        };
+        update(&mut statistics[position]);
+        Ok(())
+    }
+
+    pub(crate) fn record_relation_scan(
+        &self,
+        txid: u32,
+        table: usize,
+        index_oid: Option<i32>,
+        index_entries: usize,
+    ) -> Result<(), SqlError> {
+        let now = crate::sql::datetime::now_micros();
+        self.with_relation_transaction_statistics(txid, table, |statistics| {
+            if index_oid.is_some() {
+                statistics.idx_scan = statistics.idx_scan.saturating_add(1);
+                statistics.last_idx_scan = Some(now);
+                statistics.idx_tup_read =
+                    statistics.idx_tup_read.saturating_add(index_entries as u64);
+            } else {
+                statistics.seq_scan = statistics.seq_scan.saturating_add(1);
+                statistics.last_seq_scan = Some(now);
+            }
+        })?;
+        if let Some(oid) = index_oid {
+            let mut indexes = self.index_cumulative_statistics.borrow_mut();
+            let position = if let Some(position) = indexes.iter().position(|entry| entry.oid == oid)
+            {
+                position
+            } else {
+                indexes
+                    .push(IndexCumulativeStatistics {
+                        oid,
+                        database: self.tables[table].database,
+                        ..IndexCumulativeStatistics::EMPTY
+                    })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "index statistics capacity exhausted"
+                        )
+                    })?;
+                indexes.len() - 1
+            };
+            let statistics = &mut indexes[position];
+            statistics.idx_scan = statistics.idx_scan.saturating_add(1);
+            statistics.last_idx_scan = Some(now);
+            statistics.idx_tup_read = statistics.idx_tup_read.saturating_add(index_entries as u64);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_relation_tuple_read(
+        &self,
+        txid: u32,
+        table: usize,
+        index_oid: Option<i32>,
+    ) -> Result<(), SqlError> {
+        self.with_relation_transaction_statistics(txid, table, |statistics| {
+            if index_oid.is_some() {
+                statistics.idx_tup_fetch = statistics.idx_tup_fetch.saturating_add(1);
+            } else {
+                statistics.seq_tup_read = statistics.seq_tup_read.saturating_add(1);
+            }
+        })?;
+        if let Some(oid) = index_oid
+            && let Some(statistics) = self
+                .index_cumulative_statistics
+                .borrow_mut()
+                .iter_mut()
+                .find(|statistics| statistics.oid == oid)
+        {
+            statistics.idx_tup_fetch = statistics.idx_tup_fetch.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn record_relation_write(
+        &self,
+        txid: u32,
+        table: usize,
+        existed: bool,
+        exists: bool,
+    ) -> Result<(), SqlError> {
+        if existed == exists && !exists {
+            return Ok(());
+        }
+        self.with_relation_transaction_statistics(txid, table, |statistics| {
+            match (existed, exists) {
+                (false, true) => statistics.n_tup_ins = statistics.n_tup_ins.saturating_add(1),
+                (true, true) => statistics.n_tup_upd = statistics.n_tup_upd.saturating_add(1),
+                (true, false) => statistics.n_tup_del = statistics.n_tup_del.saturating_add(1),
+                (false, false) => {}
+            }
+        })
+    }
+
+    pub(crate) fn record_relation_transaction_truncate(
+        &self,
+        txid: u32,
+        table: usize,
+    ) -> Result<(), SqlError> {
+        self.with_relation_transaction_statistics(txid, table, |statistics| {
+            if !statistics.truncated {
+                statistics.pre_truncate_n_tup_ins = statistics.n_tup_ins;
+                statistics.pre_truncate_n_tup_upd = statistics.n_tup_upd;
+                statistics.pre_truncate_n_tup_del = statistics.n_tup_del;
+                statistics.truncated = true;
+            }
+            statistics.n_tup_ins = 0;
+            statistics.n_tup_upd = 0;
+            statistics.n_tup_del = 0;
+        })
+    }
+
+    pub(crate) fn finish_cumulative_subtransactions(
+        &self,
+        txid: u32,
+        minimum_nest_level: u8,
+        committed: bool,
+    ) {
+        let maximum_nest_level = self
+            .relation_transaction_statistics
+            .borrow()
+            .iter()
+            .filter(|statistics| statistics.txid == txid)
+            .map(|statistics| statistics.nest_level)
+            .max()
+            .unwrap_or(0);
+        if maximum_nest_level < minimum_nest_level {
+            return;
+        }
+        let mut transactions = self.relation_transaction_statistics.borrow_mut();
+        let mut relations = self.relation_cumulative_statistics.borrow_mut();
+        let mut databases = self.database_cumulative_statistics.borrow_mut();
+        for nest_level in (minimum_nest_level..=maximum_nest_level).rev() {
+            while let Some(position) = transactions.iter().position(|statistics| {
+                statistics.txid == txid && statistics.nest_level == nest_level
+            }) {
+                let mut transaction = transactions.swap_remove(position);
+                let table = transaction.table as usize;
+                if table >= relations.len() || table >= self.tables.len() {
+                    continue;
+                }
+                let relation = &mut relations[table];
+                relation.seq_scan = relation.seq_scan.saturating_add(transaction.seq_scan);
+                relation.last_seq_scan = match (relation.last_seq_scan, transaction.last_seq_scan) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (None, right) => right,
+                    (left, None) => left,
+                };
+                relation.seq_tup_read = relation
+                    .seq_tup_read
+                    .saturating_add(transaction.seq_tup_read);
+                relation.idx_scan = relation.idx_scan.saturating_add(transaction.idx_scan);
+                relation.last_idx_scan = match (relation.last_idx_scan, transaction.last_idx_scan) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (None, right) => right,
+                    (left, None) => left,
+                };
+                relation.idx_tup_fetch = relation
+                    .idx_tup_fetch
+                    .saturating_add(transaction.idx_tup_fetch);
+                if let Some(database_slot) = self
+                    .databases
+                    .iter()
+                    .position(|database| database.oid == self.tables[table].database)
+                {
+                    let database = &mut databases[database_slot];
+                    database.tup_returned = database
+                        .tup_returned
+                        .saturating_add(transaction.seq_tup_read)
+                        .saturating_add(transaction.idx_tup_read);
+                    database.tup_fetched = database
+                        .tup_fetched
+                        .saturating_add(transaction.idx_tup_fetch);
+                }
+                transaction.seq_scan = 0;
+                transaction.last_seq_scan = None;
+                transaction.seq_tup_read = 0;
+                transaction.idx_scan = 0;
+                transaction.last_idx_scan = None;
+                transaction.idx_tup_read = 0;
+                transaction.idx_tup_fetch = 0;
+                if committed {
+                    let parent_nest_level = nest_level - 1;
+                    let parent_position = if let Some(position) =
+                        transactions.iter().position(|parent| {
+                            parent.txid == txid
+                                && parent.table == transaction.table
+                                && parent.nest_level == parent_nest_level
+                        }) {
+                        position
+                    } else {
+                        transactions
+                            .push(RelationTransactionStatistics::new(
+                                txid,
+                                table,
+                                parent_nest_level,
+                            ))
+                            .expect("removing a subtransaction leaves room for its parent");
+                        transactions.len() - 1
+                    };
+                    let parent = &mut transactions[parent_position];
+                    if transaction.truncated {
+                        if !parent.truncated {
+                            parent.pre_truncate_n_tup_ins = parent.n_tup_ins;
+                            parent.pre_truncate_n_tup_upd = parent.n_tup_upd;
+                            parent.pre_truncate_n_tup_del = parent.n_tup_del;
+                            parent.truncated = true;
+                        }
+                        parent.n_tup_ins = transaction.n_tup_ins;
+                        parent.n_tup_upd = transaction.n_tup_upd;
+                        parent.n_tup_del = transaction.n_tup_del;
+                    } else {
+                        parent.n_tup_ins = parent.n_tup_ins.saturating_add(transaction.n_tup_ins);
+                        parent.n_tup_upd = parent.n_tup_upd.saturating_add(transaction.n_tup_upd);
+                        parent.n_tup_del = parent.n_tup_del.saturating_add(transaction.n_tup_del);
+                    }
+                } else {
+                    let (n_tup_ins, n_tup_upd, n_tup_del) = if transaction.truncated {
+                        (
+                            transaction.pre_truncate_n_tup_ins,
+                            transaction.pre_truncate_n_tup_upd,
+                            transaction.pre_truncate_n_tup_del,
+                        )
+                    } else {
+                        (
+                            transaction.n_tup_ins,
+                            transaction.n_tup_upd,
+                            transaction.n_tup_del,
+                        )
+                    };
+                    relation.n_tup_ins = relation.n_tup_ins.saturating_add(n_tup_ins);
+                    relation.n_tup_upd = relation.n_tup_upd.saturating_add(n_tup_upd);
+                    relation.n_tup_del = relation.n_tup_del.saturating_add(n_tup_del);
+                    relation.n_dead_tup = relation
+                        .n_dead_tup
+                        .saturating_add(n_tup_ins)
+                        .saturating_add(n_tup_upd);
+                    relation.n_ins_since_vacuum =
+                        relation.n_ins_since_vacuum.saturating_add(n_tup_ins);
+                    if let Some(database_slot) = self
+                        .databases
+                        .iter()
+                        .position(|database| database.oid == self.tables[table].database)
+                    {
+                        let database = &mut databases[database_slot];
+                        database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
+                        database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
+                        database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn finish_cumulative_transaction(&self, txid: u32, committed: bool) {
+        if txid == 0 {
+            return;
+        }
+        self.finish_cumulative_subtransactions(txid, 2, committed);
+        let mut transactions = self.relation_transaction_statistics.borrow_mut();
+        let mut relations = self.relation_cumulative_statistics.borrow_mut();
+        let mut databases = self.database_cumulative_statistics.borrow_mut();
+        let mut position = 0usize;
+        while position < transactions.len() {
+            if transactions[position].txid != txid {
+                position += 1;
+                continue;
+            }
+            let transaction = transactions.swap_remove(position);
+            let table = transaction.table as usize;
+            if table >= relations.len() || table >= self.tables.len() {
+                continue;
+            }
+            let (n_tup_ins, n_tup_upd, n_tup_del) = if !committed && transaction.truncated {
+                (
+                    transaction.pre_truncate_n_tup_ins,
+                    transaction.pre_truncate_n_tup_upd,
+                    transaction.pre_truncate_n_tup_del,
+                )
+            } else {
+                (
+                    transaction.n_tup_ins,
+                    transaction.n_tup_upd,
+                    transaction.n_tup_del,
+                )
+            };
+            let relation = &mut relations[table];
+            relation.seq_scan = relation.seq_scan.saturating_add(transaction.seq_scan);
+            relation.last_seq_scan = match (relation.last_seq_scan, transaction.last_seq_scan) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (None, right) => right,
+                (left, None) => left,
+            };
+            relation.seq_tup_read = relation
+                .seq_tup_read
+                .saturating_add(transaction.seq_tup_read);
+            relation.idx_scan = relation.idx_scan.saturating_add(transaction.idx_scan);
+            relation.last_idx_scan = match (relation.last_idx_scan, transaction.last_idx_scan) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (None, right) => right,
+                (left, None) => left,
+            };
+            relation.idx_tup_fetch = relation
+                .idx_tup_fetch
+                .saturating_add(transaction.idx_tup_fetch);
+            relation.n_tup_ins = relation.n_tup_ins.saturating_add(n_tup_ins);
+            relation.n_tup_upd = relation.n_tup_upd.saturating_add(n_tup_upd);
+            relation.n_tup_del = relation.n_tup_del.saturating_add(n_tup_del);
+            if committed && transaction.truncated {
+                relation.n_live_tup = 0;
+                relation.n_dead_tup = 0;
+                relation.n_ins_since_vacuum = 0;
+            }
+            relation.n_dead_tup = relation.n_dead_tup.saturating_add(if committed {
+                n_tup_upd.saturating_add(n_tup_del)
+            } else {
+                n_tup_ins.saturating_add(n_tup_upd)
+            });
+            relation.n_ins_since_vacuum = relation.n_ins_since_vacuum.saturating_add(n_tup_ins);
+            if committed {
+                relation.n_live_tup = relation
+                    .n_live_tup
+                    .saturating_add(n_tup_ins)
+                    .saturating_sub(n_tup_del);
+                relation.n_mod_since_analyze = relation
+                    .n_mod_since_analyze
+                    .saturating_add(n_tup_ins)
+                    .saturating_add(n_tup_upd)
+                    .saturating_add(n_tup_del);
+            }
+            if let Some(database_slot) = self
+                .databases
+                .iter()
+                .position(|database| database.oid == self.tables[table].database)
+            {
+                let database = &mut databases[database_slot];
+                database.tup_returned = database
+                    .tup_returned
+                    .saturating_add(transaction.seq_tup_read)
+                    .saturating_add(transaction.idx_tup_read);
+                database.tup_fetched = database
+                    .tup_fetched
+                    .saturating_add(transaction.idx_tup_fetch);
+                database.tup_inserted = database.tup_inserted.saturating_add(n_tup_ins);
+                database.tup_updated = database.tup_updated.saturating_add(n_tup_upd);
+                database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
+            }
+        }
+        if let Some(database_slot) = self.database_slot_by_oid(self.current_database, 0) {
+            let database = &mut databases[database_slot];
+            if committed {
+                database.xact_commit = database.xact_commit.saturating_add(1);
+            } else {
+                database.xact_rollback = database.xact_rollback.saturating_add(1);
+            }
+        }
+        let mut nesting = self.cumulative_transaction_nesting.borrow_mut();
+        if let Some(position) = nesting.iter().position(|(candidate, _)| *candidate == txid) {
+            nesting.swap_remove(position);
+        }
+    }
+
+    pub(crate) fn relation_cumulative_statistics(
+        &self,
+        table: usize,
+    ) -> RelationCumulativeStatistics {
+        self.relation_cumulative_statistics.borrow()[table]
+    }
+
+    pub(crate) fn relation_transaction_statistics(
+        &self,
+        txid: u32,
+        table: usize,
+    ) -> RelationTransactionStatistics {
+        let mut total = RelationTransactionStatistics::new(txid, table, 1);
+        for statistics in self
+            .relation_transaction_statistics
+            .borrow()
+            .iter()
+            .filter(|entry| entry.txid == txid && entry.table as usize == table)
+        {
+            total.seq_scan = total.seq_scan.saturating_add(statistics.seq_scan);
+            total.last_seq_scan = match (total.last_seq_scan, statistics.last_seq_scan) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (None, right) => right,
+                (left, None) => left,
+            };
+            total.seq_tup_read = total.seq_tup_read.saturating_add(statistics.seq_tup_read);
+            total.idx_scan = total.idx_scan.saturating_add(statistics.idx_scan);
+            total.last_idx_scan = match (total.last_idx_scan, statistics.last_idx_scan) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (None, right) => right,
+                (left, None) => left,
+            };
+            total.idx_tup_read = total.idx_tup_read.saturating_add(statistics.idx_tup_read);
+            total.idx_tup_fetch = total.idx_tup_fetch.saturating_add(statistics.idx_tup_fetch);
+            total.n_tup_ins = total.n_tup_ins.saturating_add(statistics.n_tup_ins);
+            total.n_tup_upd = total.n_tup_upd.saturating_add(statistics.n_tup_upd);
+            total.n_tup_del = total.n_tup_del.saturating_add(statistics.n_tup_del);
+        }
+        total
+    }
+
+    pub(crate) fn index_cumulative_statistics(&self, oid: i32) -> IndexCumulativeStatistics {
+        self.index_cumulative_statistics
+            .borrow()
+            .iter()
+            .find(|statistics| statistics.oid == oid)
+            .copied()
+            .unwrap_or(IndexCumulativeStatistics {
+                oid,
+                ..IndexCumulativeStatistics::EMPTY
+            })
+    }
+
+    pub(crate) fn database_cumulative_statistics(
+        &self,
+        slot: usize,
+    ) -> DatabaseCumulativeStatistics {
+        let statistics = self.database_cumulative_statistics.borrow()[slot];
+        if statistics.oid == self.databases[slot].oid {
+            statistics
+        } else {
+            DatabaseCumulativeStatistics::empty(self.databases[slot].oid)
+        }
+    }
+
+    pub(crate) fn reset_current_database_statistics(&self) {
+        let now = crate::sql::datetime::now_micros();
+        if let Some(slot) = self.database_slot_by_oid(self.current_database, 0) {
+            let mut reset = DatabaseCumulativeStatistics::empty(self.current_database);
+            reset.stats_reset = Some(now);
+            self.database_cumulative_statistics.borrow_mut()[slot] = reset;
+        }
+        for (slot, table) in self.tables.iter().enumerate() {
+            if table.database == self.current_database {
+                self.relation_cumulative_statistics.borrow_mut()[slot] =
+                    RelationCumulativeStatistics::EMPTY;
+            }
+        }
+        let mut indexes = self.index_cumulative_statistics.borrow_mut();
+        let mut position = 0usize;
+        while position < indexes.len() {
+            if indexes[position].database == self.current_database {
+                indexes.swap_remove(position);
+            } else {
+                position += 1;
+            }
+        }
+    }
+
+    pub(crate) fn reset_relation_statistics(&self, table: usize) {
+        if table < self.relation_cumulative_statistics.borrow().len() {
+            self.relation_cumulative_statistics.borrow_mut()[table] =
+                RelationCumulativeStatistics::EMPTY;
+        }
+    }
+
+    pub(crate) fn reset_index_statistics(&self, oid: i32) {
+        let mut statistics = self.index_cumulative_statistics.borrow_mut();
+        if let Some(position) = statistics.iter().position(|entry| entry.oid == oid) {
+            statistics.swap_remove(position);
+        }
+    }
+
+    fn reset_implicit_index_statistics(&self, table: usize) {
+        let first = crate::sql::catalog::index_oid(table, 0);
+        let end = crate::sql::catalog::index_oid(table, 64);
+        let mut statistics = self.index_cumulative_statistics.borrow_mut();
+        let mut position = 0usize;
+        while position < statistics.len() {
+            if (first..end).contains(&statistics[position].oid) {
+                statistics.swap_remove(position);
+            } else {
+                position += 1;
+            }
+        }
+    }
+
+    pub(crate) fn record_relation_analyze(&self, table: usize, rows: u64, elapsed_micros: u64) {
+        let mut statistics = self.relation_cumulative_statistics.borrow_mut();
+        let relation = &mut statistics[table];
+        relation.n_live_tup = rows;
+        relation.n_mod_since_analyze = 0;
+        relation.last_analyze = Some(crate::sql::datetime::now_micros());
+        relation.analyze_count = relation.analyze_count.saturating_add(1);
+        relation.total_analyze_time_micros = relation
+            .total_analyze_time_micros
+            .saturating_add(elapsed_micros);
+    }
+
+    pub(crate) fn record_relation_vacuum(&self, table: usize, elapsed_micros: u64) {
+        let mut statistics = self.relation_cumulative_statistics.borrow_mut();
+        let relation = &mut statistics[table];
+        relation.n_dead_tup = 0;
+        relation.n_ins_since_vacuum = 0;
+        relation.last_vacuum = Some(crate::sql::datetime::now_micros());
+        relation.vacuum_count = relation.vacuum_count.saturating_add(1);
+        relation.total_vacuum_time_micros = relation
+            .total_vacuum_time_micros
+            .saturating_add(elapsed_micros);
+    }
+
+    pub(crate) fn record_deadlock(&self) {
+        if let Some(slot) = self.database_slot_by_oid(self.current_database, 0) {
+            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            statistics.deadlocks = statistics.deadlocks.saturating_add(1);
+        }
+    }
+
     pub(crate) fn set_current_connection_id(&self, connection_id: i32) {
         self.current_connection_id.set(connection_id);
     }
@@ -11655,6 +12385,10 @@ impl Storage {
             )
         })?;
         drop(backends);
+        if let Some(slot) = self.database_slot_by_oid(database, 0) {
+            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            statistics.sessions = statistics.sessions.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -11667,12 +12401,23 @@ impl Storage {
         backend_xid: Option<u32>,
     ) {
         let now = crate::sql::datetime::statement_micros();
+        let mut idle = None;
         if let Some(activity) = self
             .backends
             .borrow_mut()
             .iter_mut()
             .find(|activity| activity.pid == pid)
         {
+            if matches!(
+                activity.state,
+                BackendActivityState::IdleInTransaction
+                    | BackendActivityState::IdleInTransactionAborted
+            ) {
+                idle = Some((
+                    activity.database,
+                    now.saturating_sub(activity.state_change).max(0) as u64,
+                ));
+            }
             activity.application_name = StackStr::from_str(application_name);
             activity.query = StackStr::from_str(query);
             activity.query_start = Some(now);
@@ -11682,6 +12427,14 @@ impl Storage {
             activity.state_change = now;
             activity.wait_event_type = None;
             activity.wait_event = None;
+        }
+        if let Some((database, elapsed)) = idle
+            && let Some(slot) = self.database_slot_by_oid(database, 0)
+        {
+            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            statistics.idle_in_transaction_time_micros = statistics
+                .idle_in_transaction_time_micros
+                .saturating_add(elapsed);
         }
     }
 
@@ -11734,12 +12487,16 @@ impl Storage {
         backend_xid: Option<u32>,
     ) {
         let now = crate::sql::datetime::now_micros();
+        let mut active = None;
         if let Some(activity) = self
             .backends
             .borrow_mut()
             .iter_mut()
             .find(|activity| activity.pid == pid)
         {
+            active = activity
+                .query_start
+                .map(|started| (activity.database, now.saturating_sub(started).max(0) as u64));
             activity.state = if transaction_failed {
                 BackendActivityState::IdleInTransactionAborted
             } else if transaction_active {
@@ -11755,12 +12512,35 @@ impl Storage {
                 activity.xact_start = None;
             }
         }
+        if let Some((database, elapsed)) = active
+            && let Some(slot) = self.database_slot_by_oid(database, 0)
+        {
+            let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+            statistics.active_time_micros = statistics.active_time_micros.saturating_add(elapsed);
+        }
     }
 
     pub(crate) fn unregister_backend(&self, pid: i32) {
         let mut backends = self.backends.borrow_mut();
         if let Some(index) = backends.iter().position(|activity| activity.pid == pid) {
-            backends.swap_remove(index);
+            let activity = backends.swap_remove(index);
+            drop(backends);
+            if let Some(slot) = self.database_slot_by_oid(activity.database, 0) {
+                let now = crate::sql::datetime::now_micros();
+                let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+                statistics.session_time_micros = statistics
+                    .session_time_micros
+                    .saturating_add(now.saturating_sub(activity.backend_start).max(0) as u64);
+                if matches!(
+                    activity.state,
+                    BackendActivityState::IdleInTransaction
+                        | BackendActivityState::IdleInTransactionAborted
+                ) {
+                    statistics.idle_in_transaction_time_micros = statistics
+                        .idle_in_transaction_time_micros
+                        .saturating_add(now.saturating_sub(activity.state_change).max(0) as u64);
+                }
+            }
         }
     }
 
@@ -11818,6 +12598,10 @@ impl Storage {
                     "too many pending backend signals"
                 )
             })?;
+            if terminate && let Some(slot) = self.database_slot_by_oid(target.database, 0) {
+                let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
+                statistics.sessions_killed = statistics.sessions_killed.saturating_add(1);
+            }
         }
         Ok(true)
     }
@@ -13006,6 +13790,16 @@ impl Storage {
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<BackendActivity>()
             + config.max_connections as usize * size_of::<BackendSignal>()
+            + table_slot_capacity(config) * size_of::<RelationCumulativeStatistics>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
+                * table_slot_capacity(config)
+                * size_of::<RelationTransactionStatistics>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
+                * size_of::<(u32, u8)>()
+            + (table_slot_capacity(config) * (MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS)
+                + config.max_value_indexes)
+                * size_of::<IndexCumulativeStatistics>()
+            + MAX_DATABASES * size_of::<DatabaseCumulativeStatistics>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<(u32, u64)>()
             + (config.max_connections as usize + config.max_prepared_transactions)
@@ -13758,6 +14552,36 @@ impl Storage {
             "backend_signals",
             config.max_connections as usize,
         )?);
+        let mut relation_cumulative_statistics =
+            FixedVec::new(budget, "relation_cumulative_statistics", table_capacity)?;
+        for _ in 0..table_capacity {
+            relation_cumulative_statistics
+                .push(RelationCumulativeStatistics::EMPTY)
+                .expect("sized to the table catalog");
+        }
+        let relation_transaction_statistics = FixedVec::new(
+            budget,
+            "relation_transaction_statistics",
+            transaction_capacity * table_capacity,
+        )?;
+        let cumulative_transaction_nesting = FixedVec::new(
+            budget,
+            "cumulative_transaction_nesting",
+            transaction_capacity,
+        )?;
+        let index_cumulative_statistics = FixedVec::new(
+            budget,
+            "index_cumulative_statistics",
+            table_capacity * (MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS)
+                + config.max_value_indexes,
+        )?;
+        let mut database_cumulative_statistics =
+            FixedVec::new(budget, "database_cumulative_statistics", MAX_DATABASES)?;
+        for database in databases.iter() {
+            database_cumulative_statistics
+                .push(DatabaseCumulativeStatistics::empty(database.oid))
+                .expect("sized to the database catalog");
+        }
         let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
             "table_locks",
@@ -13825,6 +14649,13 @@ impl Storage {
             current_connection_id: Cell::new(0),
             backends,
             backend_signals,
+            relation_cumulative_statistics: std::cell::RefCell::new(relation_cumulative_statistics),
+            relation_transaction_statistics: std::cell::RefCell::new(
+                relation_transaction_statistics,
+            ),
+            cumulative_transaction_nesting: std::cell::RefCell::new(cumulative_transaction_nesting),
+            index_cumulative_statistics: std::cell::RefCell::new(index_cumulative_statistics),
+            database_cumulative_statistics: std::cell::RefCell::new(database_cumulative_statistics),
             temporary_transactions,
             tablespaces,
             schemas,
@@ -14750,6 +15581,8 @@ impl Storage {
             },
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.database_cumulative_statistics.borrow_mut()[slot] =
+            DatabaseCumulativeStatistics::empty(oid);
         if let Err(error) = self.clone_database_catalog(template, oid, txid) {
             self.clear_database_catalog(oid);
             self.databases[slot].ddl_state = CatalogDdlState::Absent;
@@ -14785,6 +15618,8 @@ impl Storage {
             },
             ddl_state: CatalogDdlState::Present,
         };
+        self.database_cumulative_statistics.borrow_mut()[slot] =
+            DatabaseCumulativeStatistics::empty(oid);
         Ok(slot)
     }
 
@@ -23949,6 +24784,31 @@ impl Storage {
         cid: u32,
         loc: Option<RowLoc>,
     ) -> Result<Option<Option<RowLoc>>, SqlError> {
+        self.write_pending_inner(table_index, rowid, txid, cid, loc, true)
+    }
+
+    /// Row rewrites and WAL reconstruction use the same MVCC transition but
+    /// are not executor INSERT/UPDATE/DELETE operations.
+    pub(crate) fn write_pending_untracked(
+        &mut self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        loc: Option<RowLoc>,
+    ) -> Result<Option<Option<RowLoc>>, SqlError> {
+        self.write_pending_inner(table_index, rowid, txid, cid, loc, false)
+    }
+
+    fn write_pending_inner(
+        &mut self,
+        table_index: usize,
+        rowid: u64,
+        txid: u32,
+        cid: u32,
+        loc: Option<RowLoc>,
+        track_statistics: bool,
+    ) -> Result<Option<Option<RowLoc>>, SqlError> {
         if let Some(owner) = self.tables[table_index]
             .pending_def_txid
             .filter(|owner| *owner != txid)
@@ -23971,6 +24831,12 @@ impl Storage {
                 "statement is waiting for a concurrent row update"
             ));
         }
+        let existed = match self.tables[table_index].rows.get(&rowid) {
+            Some(state) => state.visible_to(txid).is_some(),
+            None => self
+                .spill_probe_at(table_index, rowid, u64::MAX)?
+                .is_some_and(|version| version.len.is_some()),
+        };
         let table = &mut self.tables[table_index];
         if let Some(state) = table.rows.get_mut(&rowid) {
             if let Some(last) = state.pending.last_mut()
@@ -23978,6 +24844,9 @@ impl Storage {
             {
                 let prior = Some(last.loc);
                 last.loc = loc;
+                if track_statistics {
+                    self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+                }
                 return Ok(prior);
             }
             state.history.prune(oldest_snapshot);
@@ -23993,6 +24862,9 @@ impl Storage {
                 ));
             }
             state.pending.push(PendingChange { txid, cid, loc })?;
+            if track_statistics {
+                self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+            }
             return Ok(None);
         }
         // An absent entry no longer means an absent row: the spill list may
@@ -24040,6 +24912,9 @@ impl Storage {
                 },
             )
             .expect("capacity checked above");
+        if track_statistics {
+            self.record_relation_write(txid, table_index, existed, loc.is_some())?;
+        }
         Ok(None)
     }
 
@@ -25206,6 +26081,9 @@ impl Storage {
         let ownership = self.initial_ownership(pending.map_or(0, |pending| pending.txid));
         self.catalog_seq += 1;
         let stamp = self.catalog_seq;
+        self.relation_cumulative_statistics.borrow_mut()[slot] =
+            RelationCumulativeStatistics::EMPTY;
+        self.reset_implicit_index_statistics(slot);
         let table = &mut self.tables[slot];
         table.database = self.current_database;
         table.def = def;
@@ -25553,6 +26431,8 @@ impl Storage {
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
         self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
+        self.reset_relation_statistics(index);
+        self.reset_implicit_index_statistics(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
         self.tables[index].live = false;
@@ -34621,13 +35501,15 @@ impl Storage {
     /// Promotes this transaction's pending index drops on a table (cascaded
     /// from its DROP TABLE) into the committed catalog.
     pub fn commit_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
-        for x in self.indexes.iter_mut() {
-            if x.database == self.current_database
-                && x.schema.as_str() == schema
-                && x.table.as_str() == table
-                && x.ddl_state == (CatalogDdlState::PendingDrop { txid })
+        for slot in 0..self.indexes.len() {
+            if self.indexes[slot].database == self.current_database
+                && self.indexes[slot].schema.as_str() == schema
+                && self.indexes[slot].table.as_str() == table
+                && self.indexes[slot].ddl_state == (CatalogDdlState::PendingDrop { txid })
             {
-                x.ddl_state = x.ddl_state.commit_drop();
+                let oid = crate::sql::catalog::explicit_index_oid(&self.indexes[slot]);
+                self.reset_index_statistics(oid);
+                self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_drop();
             }
         }
     }
@@ -34689,6 +35571,7 @@ impl Storage {
     /// Promotes an uncommitted DROP INDEX into the committed catalog.
     pub fn commit_index_drop(&mut self, slot: usize) {
         let (schema, name) = (self.indexes[slot].schema, self.indexes[slot].name);
+        self.reset_index_statistics(crate::sql::catalog::explicit_index_oid(&self.indexes[slot]));
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.indexes[slot].ddl_state = self.indexes[slot].ddl_state.commit_drop();
         self.clear_extension_dependencies_for_object(AccessObject {

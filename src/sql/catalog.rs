@@ -1084,6 +1084,36 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         1,
         "i"
     ),
+    intrinsic!(2026, "pg_backend_pid", 23, "", 0, "s"),
+    intrinsic!(2561, "pg_blocking_pids", 1007, "23", 1, "v"),
+    intrinsic!(2880, "pg_advisory_lock", 2278, "20", 1, "v"),
+    intrinsic!(2881, "pg_advisory_lock_shared", 2278, "20", 1, "v"),
+    intrinsic!(2882, "pg_try_advisory_lock", 16, "20", 1, "v"),
+    intrinsic!(2883, "pg_try_advisory_lock_shared", 16, "20", 1, "v"),
+    intrinsic!(2884, "pg_advisory_unlock", 16, "20", 1, "v"),
+    intrinsic!(2885, "pg_advisory_unlock_shared", 16, "20", 1, "v"),
+    intrinsic!(2886, "pg_advisory_lock", 2278, "23 23", 2, "v"),
+    intrinsic!(2887, "pg_advisory_lock_shared", 2278, "23 23", 2, "v"),
+    intrinsic!(2888, "pg_try_advisory_lock", 16, "23 23", 2, "v"),
+    intrinsic!(2889, "pg_try_advisory_lock_shared", 16, "23 23", 2, "v"),
+    intrinsic!(2890, "pg_advisory_unlock", 16, "23 23", 2, "v"),
+    intrinsic!(2891, "pg_advisory_unlock_shared", 16, "23 23", 2, "v"),
+    intrinsic!(2892, "pg_advisory_unlock_all", 2278, "", 0, "v"),
+    intrinsic!(3089, "pg_advisory_xact_lock", 2278, "20", 1, "v"),
+    intrinsic!(3090, "pg_advisory_xact_lock_shared", 2278, "20", 1, "v"),
+    intrinsic!(3091, "pg_try_advisory_xact_lock", 16, "20", 1, "v"),
+    intrinsic!(3092, "pg_try_advisory_xact_lock_shared", 16, "20", 1, "v"),
+    intrinsic!(3093, "pg_advisory_xact_lock", 2278, "23 23", 2, "v"),
+    intrinsic!(3094, "pg_advisory_xact_lock_shared", 2278, "23 23", 2, "v"),
+    intrinsic!(3095, "pg_try_advisory_xact_lock", 16, "23 23", 2, "v"),
+    intrinsic!(
+        3096,
+        "pg_try_advisory_xact_lock_shared",
+        16,
+        "23 23",
+        2,
+        "v"
+    ),
     IntrinsicRoutine {
         oid: 2077,
         name: "current_setting",
@@ -3602,13 +3632,49 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
         715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
         | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
         | 4223 | 4224 | 1402 | 1403 | 2078 | 2943 | 3348 | 5059 | 5060 | 3086 | 6119 | 6120 => "u",
-        1181 | 1598 | 1599 | 1641 | 2511 | 3566 | 4568 | 6212 | 6339 | 6340 | 6341 => "r",
+        1181
+        | 1598
+        | 1599
+        | 1641
+        | 2026
+        | 2511
+        | 2880..=2892
+        | 3089..=3096
+        | 3566
+        | 4568
+        | 6212
+        | 6339
+        | 6340
+        | 6341 => "r",
         _ => "s",
     }
 }
 
 fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
+        2026 => "pg_backend_pid",
+        2561 => "pg_blocking_pids",
+        2880 => "pg_advisory_lock_int8",
+        2881 => "pg_advisory_lock_shared_int8",
+        2882 => "pg_try_advisory_lock_int8",
+        2883 => "pg_try_advisory_lock_shared_int8",
+        2884 => "pg_advisory_unlock_int8",
+        2885 => "pg_advisory_unlock_shared_int8",
+        2886 => "pg_advisory_lock_int4",
+        2887 => "pg_advisory_lock_shared_int4",
+        2888 => "pg_try_advisory_lock_int4",
+        2889 => "pg_try_advisory_lock_shared_int4",
+        2890 => "pg_advisory_unlock_int4",
+        2891 => "pg_advisory_unlock_shared_int4",
+        2892 => "pg_advisory_unlock_all",
+        3089 => "pg_advisory_xact_lock_int8",
+        3090 => "pg_advisory_xact_lock_shared_int8",
+        3091 => "pg_try_advisory_xact_lock_int8",
+        3092 => "pg_try_advisory_xact_lock_shared_int8",
+        3093 => "pg_advisory_xact_lock_int4",
+        3094 => "pg_advisory_xact_lock_shared_int4",
+        3095 => "pg_try_advisory_xact_lock_int4",
+        3096 => "pg_try_advisory_xact_lock_shared_int4",
         1062 => "aclitem_eq",
         3000 => "has_foreign_data_wrapper_privilege_name_name",
         3001 => "has_foreign_data_wrapper_privilege_name_id",
@@ -8187,6 +8253,7 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_stat_subscription", 12248),
     ("pg_stat_subscription_stats", 12347),
     ("pg_transform", 3576),
+    ("pg_locks", 12073),
     ("pg_cursors", 12077),
 ];
 
@@ -8332,6 +8399,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_transform"
                 | "pg_tablespace"
                 | "pg_foreign_data_wrapper"
+                | "pg_locks"
                 | "pg_cursors"
         ),
     }
@@ -8427,6 +8495,7 @@ pub fn synthesize<'a>(
         (false, "pg_collation") => pg_collation(storage, txid, arena),
         (false, "pg_conversion") => pg_conversion(storage, txid, arena),
         (false, "pg_type") => pg_type(storage, txid, arena),
+        (false, "pg_locks") => pg_locks(storage, arena),
         (false, "pg_cursors") => pg_cursors(arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
@@ -15975,9 +16044,29 @@ const PG_CURSORS_COLUMNS: &[(&str, ColType)] = &[
     ("creation_time", ColType::Timestamptz),
 ];
 
+const PG_LOCKS_COLUMNS: &[(&str, ColType)] = &[
+    ("locktype", ColType::Text),
+    ("database", ColType::Oid),
+    ("relation", ColType::Oid),
+    ("page", ColType::Int4),
+    ("tuple", ColType::Int2),
+    ("virtualxid", ColType::Text),
+    ("transactionid", ColType::Xid),
+    ("classid", ColType::Oid),
+    ("objid", ColType::Oid),
+    ("objsubid", ColType::Int2),
+    ("virtualtransaction", ColType::Text),
+    ("pid", ColType::Int4),
+    ("mode", ColType::Text),
+    ("granted", ColType::Bool),
+    ("fastpath", ColType::Bool),
+    ("waitstart", ColType::Timestamptz),
+];
+
 type MonitoringRelation = (i32, i32, &'static str, &'static [(&'static str, ColType)]);
 
 const MONITORING_RELATIONS: &[MonitoringRelation] = &[
+    (12073, 12075, "pg_locks", PG_LOCKS_COLUMNS),
     (12077, 12079, "pg_cursors", PG_CURSORS_COLUMNS),
     (
         12231,
@@ -16011,13 +16100,14 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
     ),
 ];
 
-const MONITORING_ATTRIBUTE_COUNT: usize = 80;
+const MONITORING_ATTRIBUTE_COUNT: usize = 96;
 
 const fn monitoring_type_oid(ctype: ColType) -> i32 {
     match ctype {
         ColType::Bool => 16,
         ColType::Int8 => 20,
         ColType::Int4 => 23,
+        ColType::Int2 => 21,
         ColType::Text => 25,
         ColType::Oid => 26,
         ColType::Xid => 28,
@@ -16033,6 +16123,7 @@ const fn monitoring_type_oid(ctype: ColType) -> i32 {
 const fn monitoring_type_len(ctype: ColType) -> i32 {
     match ctype {
         ColType::Bool => 1,
+        ColType::Int2 => 2,
         ColType::Int4 | ColType::Oid | ColType::Xid => 4,
         ColType::Int8 | ColType::Timestamptz | ColType::PgLsn => 8,
         ColType::Interval => 16,
@@ -16045,6 +16136,7 @@ const fn monitoring_type_len(ctype: ColType) -> i32 {
 const fn monitoring_type_alignment(ctype: ColType) -> &'static str {
     match ctype {
         ColType::Bool | ColType::Name => "c",
+        ColType::Int2 => "s",
         ColType::Int8 | ColType::Timestamptz | ColType::Interval | ColType::PgLsn => "d",
         ColType::Int4 | ColType::Text | ColType::Oid | ColType::Xid | ColType::Inet => "i",
         _ => panic!("monitoring relation has an unsupported catalog type"),
@@ -24312,6 +24404,132 @@ fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     finish(def, &out[..n], arena)
 }
 
+fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_locks", PG_LOCKS_COLUMNS);
+    let advisory_capacity = storage.advisory_lock_view_count();
+    let advisory: &mut [Option<crate::sql::lock::AdvisoryLockView>] = arena
+        .alloc_slice_with(advisory_capacity, |_| None)
+        .map_err(|_| arena_full())?;
+    let mut advisory_count = 0usize;
+    storage.visit_advisory_locks(|candidate| {
+        let duplicate = advisory[..advisory_count].iter().flatten().any(|existing| {
+            existing.key == candidate.key
+                && existing.wait_owner == candidate.wait_owner
+                && existing.mode == candidate.mode
+                && existing.granted == candidate.granted
+        });
+        if !duplicate {
+            advisory[advisory_count] = Some(candidate);
+            advisory_count += 1;
+        }
+    });
+    let row_capacity = advisory_count
+        .checked_add(storage.table_lock_view_count())
+        .ok_or_else(|| catalog_capacity_exceeded("pg_locks"))?;
+    let rows = arena
+        .alloc_slice_with(row_capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let database_oid = u32::try_from(storage.current_database_oid().get()).map_err(|_| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "current database has an invalid OID"
+        )
+    })?;
+    let virtual_transaction = |owner: crate::sql::lock::WaitOwner| {
+        crate::sql::lock::wait_owner_pid(owner).map(|pid| stack_format!(64, "{}/1", pid))
+    };
+    let mut count = 0usize;
+    for lock in advisory[..advisory_count].iter().flatten() {
+        let virtual_transaction = virtual_transaction(lock.wait_owner);
+        rows[count] = row(
+            &[
+                text("advisory", arena)?,
+                Datum::Oid(database_oid),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Oid(lock.key.class_id),
+                Datum::Oid(lock.key.object_id),
+                Datum::Int2(lock.key.object_sub_id),
+                match virtual_transaction.as_ref() {
+                    Some(value) => text(value.as_str(), arena)?,
+                    None => Datum::Null,
+                },
+                crate::sql::lock::wait_owner_pid(lock.wait_owner)
+                    .map(Datum::Int4)
+                    .unwrap_or(Datum::Null),
+                text(lock.mode.name(), arena)?,
+                Datum::Bool(lock.granted),
+                Datum::Bool(false),
+                lock.wait_start
+                    .map(Datum::Timestamptz)
+                    .unwrap_or(Datum::Null),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    let mut table_error = None;
+    storage.visit_table_locks(|_, owner, table_slot, mode| {
+        if table_error.is_some() {
+            return;
+        }
+        let mode = match mode {
+            crate::sql::ast::TableLockMode::AccessShare => "AccessShareLock",
+            crate::sql::ast::TableLockMode::RowShare => "RowShareLock",
+            crate::sql::ast::TableLockMode::RowExclusive => "RowExclusiveLock",
+            crate::sql::ast::TableLockMode::ShareUpdateExclusive => "ShareUpdateExclusiveLock",
+            crate::sql::ast::TableLockMode::Share => "ShareLock",
+            crate::sql::ast::TableLockMode::ShareRowExclusive => "ShareRowExclusiveLock",
+            crate::sql::ast::TableLockMode::Exclusive => "ExclusiveLock",
+            crate::sql::ast::TableLockMode::AccessExclusive => "AccessExclusiveLock",
+        };
+        let virtual_transaction = virtual_transaction(owner);
+        let values = [
+            Datum::Text("relation"),
+            Datum::Oid(database_oid),
+            Datum::Oid(user_table_oid(table_slot) as u32),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+            match virtual_transaction.as_ref() {
+                Some(value) => match arena.alloc_str(value.as_str()) {
+                    Ok(value) => Datum::Text(value),
+                    Err(_) => {
+                        table_error = Some(arena_full());
+                        return;
+                    }
+                },
+                None => Datum::Null,
+            },
+            crate::sql::lock::wait_owner_pid(owner)
+                .map(Datum::Int4)
+                .unwrap_or(Datum::Null),
+            Datum::Text(mode),
+            Datum::Bool(true),
+            Datum::Bool(false),
+            Datum::Null,
+        ];
+        match row(&values, arena) {
+            Ok(encoded) => {
+                rows[count] = encoded;
+                count += 1;
+            }
+            Err(error) => table_error = Some(error),
+        }
+    });
+    if let Some(error) = table_error {
+        return Err(error);
+    }
+    finish(definition, &rows[..count], arena)
+}
+
 fn pg_cursors<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of("pg_cursors", PG_CURSORS_COLUMNS);
     crate::sql::cursor::with_active(|pool| {
@@ -26110,6 +26328,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "lc_monetary" => "C.UTF-8",
             "is_superuser" => "on",
             "max_connections" => "100",
+            "max_locks_per_transaction" => "64",
             "max_prepared_transactions" => "0",
             "search_path" => "\"$user\", public",
             "server_version" => crate::pg::REPORTED_SERVER_VERSION,
@@ -26145,6 +26364,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "data_directory_mode"
                 | "extra_float_digits"
                 | "max_connections"
+                | "max_locks_per_transaction"
                 | "max_prepared_transactions"
         ) {
             "integer"
@@ -26161,7 +26381,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "server_version_num"
         ) {
             "internal"
-        } else if matches!(name, "max_connections" | "max_prepared_transactions") {
+        } else if matches!(
+            name,
+            "max_connections" | "max_locks_per_transaction" | "max_prepared_transactions"
+        ) {
             "postmaster"
         } else {
             "user"

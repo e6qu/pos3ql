@@ -47,6 +47,15 @@ historical `txid` aliases, snapshot set-returning functions, current-ID and
 status functions, arrays, indexing, text/binary protocol values, and durable
 ordinary and prepared-transaction status across object-cold recovery.
 
+PostgreSQL advisory locking includes the complete session and transaction
+function families for 64-bit and two-integer keys, shared and exclusive modes,
+blocking and try acquisition, reentrant session holds, savepoints, disconnect,
+and prepared-transaction recovery. Advisory, row, and relation waits share one
+deadlock graph. `pg_backend_pid()`, `pg_blocking_pids()`, and `pg_locks` expose
+live granted and waiting locks with PostgreSQL 18 catalog and wire types. The
+startup-only `max_locks_per_transaction` setting sizes the fixed lock pool;
+exhaustion fails explicitly.
+
 PostgreSQL `money` is an exact signed-cent type with C/en_US monetary text,
 scalar and array binary wire formats, casts, comparisons, arithmetic, support
 functions, aggregates, btree indexes and catalogs. Values retain that identity

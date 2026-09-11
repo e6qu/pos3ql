@@ -15446,10 +15446,45 @@ fn run_txn(engine: &mut Engine, budget: &mut Budget, txn: &mut TxnState, sql_tex
     String::from_utf8_lossy(&run_txn_bytes(engine, budget, txn, sql_text)).to_string()
 }
 
+fn test_connection_id(txn: &TxnState) -> i32 {
+    // Tests model independent protocol sessions with independent TxnState
+    // values. Give each one a stable live-backend identity so the shared
+    // wait graph cannot mistake two test sessions for a self-deadlock.
+    (((txn as *const TxnState as usize) >> 4) & 0x3fff_ffff) as i32 + 1
+}
+
 fn run_txn_bytes(
     engine: &mut Engine,
     budget: &mut Budget,
     txn: &mut TxnState,
+    sql_text: &str,
+) -> Vec<u8> {
+    let connection_id = test_connection_id(txn);
+    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let mut pool = test_pool(budget);
+    let mut guc = GucState::new();
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple(
+            sql_text,
+            &arena,
+            txn,
+            &mut pool,
+            &mut test_cursors(budget),
+            &mut guc,
+            &mut responder,
+            connection_id,
+        )
+        .unwrap();
+    buffer.readable().to_vec()
+}
+
+fn run_txn_conn(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    txn: &mut TxnState,
+    connection_id: i32,
     sql_text: &str,
 ) -> Vec<u8> {
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
@@ -15466,10 +15501,287 @@ fn run_txn_bytes(
             &mut test_cursors(budget),
             &mut guc,
             &mut responder,
-            1,
+            connection_id,
         )
         .unwrap();
     buffer.readable().to_vec()
+}
+
+#[test]
+fn advisory_locks_cover_session_transaction_wait_and_catalog_boundaries() {
+    let (mut engine, mut budget) = test_engine();
+    let mut first = TxnState::new(&mut budget, 256).unwrap();
+    let mut second = TxnState::new(&mut budget, 256).unwrap();
+    {
+        let mut run = |txn: &mut TxnState, connection_id: i32, sql: &str| {
+            run_txn_conn(&mut engine, &mut budget, txn, connection_id, sql)
+        };
+
+        let backend = run(&mut first, 11, "SELECT pg_backend_pid()");
+        assert_eq!(data_rows(&backend), ["11"]);
+
+        let acquired = run(
+            &mut first,
+            11,
+            "SELECT pg_advisory_lock(4294967298), pg_advisory_lock(4294967298)",
+        );
+        assert!(!String::from_utf8_lossy(&acquired).contains("ERROR"));
+        let held = run(
+            &mut first,
+            11,
+            "SELECT locktype,database IS NOT NULL,classid,objid,objsubid,mode,granted,fastpath,pid=pg_backend_pid() FROM pg_locks WHERE locktype='advisory'",
+        );
+        assert_eq!(data_rows(&held), ["advisory|t|1|2|1|ExclusiveLock|t|f|t"]);
+
+        let unavailable = run(&mut second, 22, "SELECT pg_try_advisory_lock(4294967298)");
+        assert_eq!(data_rows(&unavailable), ["f"]);
+        let waiting = run(&mut second, 22, "SELECT pg_advisory_lock(4294967298)");
+        assert!(
+            data_rows(&waiting).is_empty(),
+            "blocked statement has no result row: {}",
+            String::from_utf8_lossy(&waiting)
+        );
+        let blockers = run(&mut first, 11, "SELECT pg_blocking_pids(22)");
+        assert_eq!(data_rows(&blockers), ["{11}"]);
+        let wait_row = run(
+            &mut first,
+            11,
+            "SELECT mode,granted,waitstart IS NOT NULL,pid FROM pg_locks WHERE locktype='advisory' ORDER BY granted DESC,pid",
+        );
+        assert_eq!(
+            data_rows(&wait_row),
+            ["ExclusiveLock|t|f|11", "ExclusiveLock|f|t|22"]
+        );
+
+        assert_eq!(
+            data_rows(&run(
+                &mut first,
+                11,
+                "SELECT pg_advisory_unlock(4294967298), pg_advisory_unlock(4294967298)"
+            )),
+            ["t|t"]
+        );
+        let resumed = run(&mut second, 22, "SELECT pg_advisory_lock(4294967298)");
+        assert!(!resumed.is_empty());
+        assert_eq!(
+            data_rows(&run(
+                &mut second,
+                22,
+                "SELECT pg_advisory_unlock(4294967298)"
+            )),
+            ["t"]
+        );
+
+        run(&mut first, 11, "SELECT pg_advisory_lock(1001)");
+        run(
+            &mut second,
+            22,
+            "SELECT pg_advisory_lock(2001), pg_advisory_lock(1001)",
+        );
+        run(&mut first, 11, "SELECT pg_advisory_unlock(1001)");
+        run(
+            &mut second,
+            22,
+            "SELECT pg_advisory_lock(2001), pg_advisory_lock(1001)",
+        );
+        assert_eq!(
+            data_rows(&run(
+                &mut second,
+                22,
+                "SELECT pg_advisory_unlock(2001), pg_advisory_unlock(2001), pg_advisory_unlock(1001)"
+            )),
+            ["t|f|t"],
+            "a resumed statement must not repeat session-lock acquisitions"
+        );
+
+        run(&mut first, 11, "SELECT pg_advisory_lock(1002)");
+        run(
+            &mut second,
+            22,
+            "SELECT pg_advisory_lock(2002), pg_advisory_lock(2002)",
+        );
+        run(
+            &mut second,
+            22,
+            "SELECT pg_advisory_unlock(2002), pg_advisory_lock(1002)",
+        );
+        run(&mut first, 11, "SELECT pg_advisory_unlock(1002)");
+        run(
+            &mut second,
+            22,
+            "SELECT pg_advisory_unlock(2002), pg_advisory_lock(1002)",
+        );
+        assert_eq!(
+            data_rows(&run(
+                &mut second,
+                22,
+                "SELECT pg_advisory_unlock(2002), pg_advisory_unlock(2002), pg_advisory_unlock(1002)"
+            )),
+            ["t|f|t"],
+            "a resumed statement must replay the original unlock result"
+        );
+
+        run(
+            &mut first,
+            11,
+            "BEGIN; SELECT pg_advisory_xact_lock_shared(-1,2); SAVEPOINT s; SELECT pg_advisory_xact_lock(7); ROLLBACK TO s",
+        );
+        let transactional = run(
+            &mut first,
+            11,
+            "SELECT classid,objid,objsubid,mode FROM pg_locks WHERE locktype='advisory' ORDER BY objsubid",
+        );
+        assert_eq!(data_rows(&transactional), ["4294967295|2|2|ShareLock"]);
+        assert_eq!(
+            data_rows(&run(
+                &mut second,
+                22,
+                "SELECT pg_try_advisory_xact_lock_shared(-1,2)"
+            )),
+            ["t"]
+        );
+        run(&mut first, 11, "COMMIT");
+        run(&mut second, 22, "COMMIT");
+        let released = run(
+            &mut first,
+            11,
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory'",
+        );
+        assert_eq!(data_rows(&released), ["0"]);
+
+        run(&mut first, 11, "SELECT pg_advisory_lock(91)");
+    }
+    engine.drop_connection(11);
+    let reacquired = run_txn_conn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        22,
+        "SELECT pg_try_advisory_lock(91)",
+    );
+    assert_eq!(data_rows(&reacquired), ["t"]);
+    run_txn_conn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        22,
+        "SELECT pg_advisory_unlock_all()",
+    );
+
+    let relation_lock = run_txn_conn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        22,
+        "CREATE TABLE advisory_lock_relation(id integer); BEGIN; \
+         LOCK TABLE advisory_lock_relation IN SHARE MODE; \
+         SELECT locktype,relation='advisory_lock_relation'::regclass,mode,granted, \
+                pid=pg_backend_pid() FROM pg_locks WHERE locktype='relation'; ROLLBACK",
+    );
+    assert_eq!(data_rows(&relation_lock), ["relation|t|ShareLock|t|t"]);
+
+    let procedures = run_txn_conn(
+        &mut engine,
+        &mut budget,
+        &mut second,
+        22,
+        "SELECT oid,proname,prorettype,proargtypes::text,provolatile,proparallel,proisstrict,prosrc FROM pg_proc WHERE oid IN (2026,2561,2880,2892,3096) ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&procedures),
+        [
+            "2026|pg_backend_pid|23||s|r|t|pg_backend_pid",
+            "2561|pg_blocking_pids|1007|23|v|s|t|pg_blocking_pids",
+            "2880|pg_advisory_lock|2278|20|v|r|t|pg_advisory_lock_int8",
+            "2892|pg_advisory_unlock_all|2278||v|r|t|pg_advisory_unlock_all",
+            "3096|pg_try_advisory_xact_lock_shared|16|23 23|v|r|t|pg_try_advisory_xact_lock_shared_int4",
+        ]
+    );
+}
+
+#[test]
+fn prepared_advisory_locks_survive_object_cold_recovery() {
+    let mut config = test_config("prepared-advisory-lock-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.max_prepared_transactions = 1;
+    config.object_store_namespace = format!("prepared-advisory-lock-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let prepared = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; SELECT pg_advisory_xact_lock(-7,19); PREPARE TRANSACTION 'advisory_cold'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let held = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT classid,objid,objsubid,mode,granted,pid IS NULL FROM pg_locks WHERE locktype='advisory'; \
+         SELECT pg_try_advisory_xact_lock(-7,19)",
+    );
+    assert_eq!(
+        data_rows(&held),
+        ["4294967289|19|2|ExclusiveLock|t|t", "f"],
+        "{}",
+        String::from_utf8_lossy(&held)
+    );
+    let commit = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'advisory_cold'",
+    );
+    assert!(!String::from_utf8_lossy(&commit).contains("ERROR"));
+    let resolved = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT pg_try_advisory_xact_lock(-7,19)",
+    );
+    assert_eq!(
+        data_rows(&resolved),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&resolved)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn advisory_lock_pool_exhaustion_is_a_named_error() {
+    let mut config = test_config("advisory-lock-capacity");
+    config.max_connections = 1;
+    config.max_prepared_transactions = 0;
+    config.max_locks_per_transaction = 1;
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_advisory_lock(1); SELECT pg_advisory_lock(2)",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("53200"), "{text}");
+    assert!(
+        text.contains("out of shared memory for advisory locks (1 entries)"),
+        "{text}"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -25128,6 +25440,7 @@ fn run_session_transaction(
     guc: &mut GucState,
     sql_text: &str,
 ) -> Vec<u8> {
+    let connection_id = test_connection_id(transaction);
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
     let mut pool = test_pool(budget);
@@ -25141,7 +25454,7 @@ fn run_session_transaction(
             &mut test_cursors(budget),
             guc,
             &mut responder,
-            1,
+            connection_id,
         )
         .unwrap();
     buffer.readable().to_vec()
@@ -25153,6 +25466,7 @@ fn run_with_txn_bytes(
     txn: &mut TxnState,
     sql_text: &str,
 ) -> Vec<u8> {
+    let connection_id = test_connection_id(txn);
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
     let mut pool = test_pool(budget);
@@ -25167,7 +25481,7 @@ fn run_with_txn_bytes(
             &mut test_cursors(budget),
             &mut guc,
             &mut responder,
-            1,
+            connection_id,
         )
         .unwrap();
     buffer.readable().to_vec()

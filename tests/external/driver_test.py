@@ -2,6 +2,8 @@
 # psycopg uses the extended query protocol (Parse/Bind/Describe/Execute)
 # for parameterized queries.
 import datetime
+import threading
+import time
 import uuid
 
 import psycopg
@@ -802,6 +804,67 @@ assert cur.description[0].type_code == 25
 assert cur.fetchone() == ("drv_object_api.items_id_seq",)
 cur.execute("DROP SCHEMA drv_object_api CASCADE")
 print("catalog object address extended protocol ok")
+
+# Advisory locks cross extended Bind/Describe/Execute, park a competing backend
+# without blocking the reactor, and expose the same wait through pg_locks and
+# pg_blocking_pids. Session teardown releases any remaining holds.
+advisory_key = (1 << 40) + 37
+cur.execute("SELECT pg_backend_pid(), pg_try_advisory_lock(%s)", (advisory_key,))
+holder_pid, acquired = cur.fetchone()
+assert acquired is True
+assert [column.type_code for column in cur.description] == [23, 16]
+
+waiter = psycopg.connect(
+    host="127.0.0.1", port=5433, user="postgres", dbname="postgres",
+    sslmode="disable", autocommit=True,
+)
+waiter_cur = waiter.cursor()
+waiter_cur.execute("SELECT pg_backend_pid()")
+waiter_pid = waiter_cur.fetchone()[0]
+waiter_acquired = threading.Event()
+waiter_started = threading.Event()
+waiter_error = []
+
+def wait_for_advisory_lock():
+    try:
+        waiter_started.set()
+        waiter_cur.execute("SELECT pg_advisory_lock(%s)", (advisory_key,))
+        waiter_cur.fetchone()
+        waiter_acquired.set()
+    except Exception as error:  # surfaced by the assertion below
+        waiter_error.append(error)
+
+waiter_thread = threading.Thread(target=wait_for_advisory_lock, daemon=True)
+waiter_thread.start()
+assert waiter_started.wait(timeout=1)
+blocking = []
+for _ in range(500):
+    cur.execute("SELECT pg_blocking_pids(%s)", (waiter_pid,))
+    blocking = cur.fetchone()[0]
+    if blocking or waiter_error or waiter_acquired.is_set():
+        break
+    time.sleep(0.01)
+if blocking != [holder_pid]:
+    cur.execute(
+        "SELECT granted,pid,classid,objid,objsubid FROM pg_locks "
+        "WHERE locktype='advisory' ORDER BY granted DESC,pid"
+    )
+    observed_locks = cur.fetchall()
+    cur.execute("SELECT pg_advisory_unlock(%s)", (advisory_key,))
+    waiter_thread.join(timeout=5)
+    raise AssertionError((blocking, waiter_error, waiter_acquired.is_set(), observed_locks))
+cur.execute(
+    "SELECT granted,waitstart IS NOT NULL,pid FROM pg_locks "
+    "WHERE locktype='advisory' ORDER BY granted DESC,pid"
+)
+assert cur.fetchall() == [(True, False, holder_pid), (False, True, waiter_pid)]
+cur.execute("SELECT pg_advisory_unlock(%s)", (advisory_key,))
+assert cur.fetchone() == (True,)
+waiter_thread.join(timeout=5)
+assert not waiter_thread.is_alive() and not waiter_error and waiter_acquired.is_set(), waiter_error
+waiter_cur.execute("SELECT pg_advisory_unlock_all()")
+waiter.close()
+print("advisory lock extended/concurrent/catalog boundaries ok")
 
 conn.close()
 observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")

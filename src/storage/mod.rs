@@ -10589,6 +10589,7 @@ pub enum ResolvedRelation {
 #[derive(Clone, Copy)]
 struct TableLock {
     owner: u32,
+    wait_owner: crate::sql::lock::WaitOwner,
     table: u32,
     /// Acquisition sequence for each table-lock mode. PostgreSQL permits a
     /// transaction to hold multiple incomparable modes on one relation.
@@ -10646,6 +10647,7 @@ struct ForeignStatementContext {
 #[derive(Clone, Copy)]
 struct ActiveTransactionIdentity {
     transaction_id: u32,
+    connection_id: Option<i32>,
     assigned: bool,
 }
 
@@ -10755,6 +10757,9 @@ pub struct Storage {
     /// PostgreSQL row locks and their wait-for graph. The registry is sized at
     /// startup from the per-transaction row bound and connection count.
     row_locks: std::cell::RefCell<crate::sql::lock::LockManager>,
+    /// Session- and transaction-owned advisory locks share the global wait
+    /// graph with relation and row locks.
+    advisory_locks: std::cell::RefCell<crate::sql::lock::AdvisoryLockManager>,
     /// Shared acquisition clock for table and row locks. It lets a savepoint
     /// restore both registries to one exact transaction boundary.
     lock_sequence: Cell<u64>,
@@ -11537,6 +11542,10 @@ fn rename_table_sql_identity(
 impl Storage {
     pub(crate) fn set_current_connection_id(&self, connection_id: i32) {
         self.current_connection_id.set(connection_id);
+    }
+
+    pub(crate) fn current_connection_id(&self) -> i32 {
+        self.current_connection_id.get()
     }
 
     fn mark_temporary_transaction(&self, txid: u32) {
@@ -12669,6 +12678,11 @@ impl Storage {
                     * config.txn_rows,
                 config.max_connections as usize,
             )
+            + crate::sql::lock::AdvisoryLockManager::budget_bytes(
+                (config.max_connections as usize + config.max_prepared_transactions)
+                    * config.max_locks_per_transaction,
+                config.max_connections as usize,
+            )
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * table_slot_capacity(config)
                 * size_of::<(u32, u32, u64, bool)>()
@@ -13404,6 +13418,11 @@ impl Storage {
             transaction_capacity * config.txn_rows,
             config.max_connections as usize,
         )?);
+        let advisory_locks = std::cell::RefCell::new(crate::sql::lock::AdvisoryLockManager::new(
+            budget,
+            transaction_capacity * config.max_locks_per_transaction,
+            config.max_connections as usize,
+        )?);
         let serializable_snapshots = std::cell::RefCell::new(FixedVec::new(
             budget,
             "serializable_snapshots",
@@ -13485,6 +13504,7 @@ impl Storage {
             latest_transaction_id: Cell::new(0),
             table_locks,
             row_locks,
+            advisory_locks,
             lock_sequence: Cell::new(0),
             serializable_snapshots,
             next_rowid: 1,
@@ -18673,7 +18693,7 @@ impl Storage {
                 .filter(|pending| pending.txid != txid)
                 .map(|pending| pending.txid)
         }) {
-            self.row_locks.borrow_mut().wait_for(txid, owner)?;
+            self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on role \"{}\"",
@@ -18715,7 +18735,7 @@ impl Storage {
         if let Some(pending) = self.roles[slot].pending
             && pending.txid != txid
         {
-            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on role \"{}\"",
@@ -18752,7 +18772,7 @@ impl Storage {
         if let Some(pending) = self.roles[slot].pending
             && pending.txid != txid
         {
-            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on role \"{}\"",
@@ -18781,7 +18801,7 @@ impl Storage {
         if let Some(pending) = self.roles[slot].pending
             && pending.txid != txid
         {
-            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on role \"{}\"",
@@ -18977,7 +18997,7 @@ impl Storage {
         if let Some(pending) = self.role_memberships[slot].pending
             && pending.txid != txid
         {
-            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent role membership DDL"
@@ -19122,7 +19142,7 @@ impl Storage {
         if let Some(pending) = self.role_settings[slot].pending
             && pending.txid != txid
         {
-            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent role setting DDL"
@@ -19241,7 +19261,7 @@ impl Storage {
         if let Some(pending) = self.system_settings[slot].pending
             && pending.txid != txid
         {
-            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            self.wait_for_transaction(txid, pending.txid)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent system setting DDL"
@@ -19903,7 +19923,7 @@ impl Storage {
                 .then_some(schema.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
-            self.row_locks.borrow_mut().wait_for(txid, owner)?;
+            self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on schema \"{}\"",
@@ -23581,7 +23601,7 @@ impl Storage {
             .pending_def_txid
             .filter(|owner| *owner != txid)
         {
-            self.row_locks.borrow_mut().wait_for(txid, owner)?;
+            self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for a concurrent table definition change"
@@ -23593,7 +23613,7 @@ impl Storage {
             .get(&rowid)
             .and_then(|state| state.locked_by_other(txid));
         if let Some(owner) = conflicting_owner {
-            self.row_locks.borrow_mut().wait_for(txid, owner)?;
+            self.wait_for_transaction(txid, owner)?;
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for a concurrent row update"
@@ -24631,7 +24651,7 @@ impl Storage {
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
         if let Some(other) = self.tables[index].ddl_locked_by_other(txid) {
-            self.row_locks.borrow_mut().wait_for(txid, other)?;
+            self.wait_for_transaction(txid, other)?;
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on \"{}\"",
@@ -25095,7 +25115,7 @@ impl Storage {
         if let Some(other) =
             self.ddl_name_locked_by_other(def.schema.as_str(), def.name.as_str(), txid)
         {
-            self.row_locks.borrow_mut().wait_for(txid, other)?;
+            self.wait_for_transaction(txid, other)?;
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on \"{}\"",
@@ -35201,9 +35221,57 @@ impl Storage {
         active
             .push(ActiveTransactionIdentity {
                 transaction_id,
+                connection_id: (self.current_connection_id.get() > 0)
+                    .then_some(self.current_connection_id.get()),
                 assigned: false,
             })
             .expect("transaction identity registry matches configured capacity");
+    }
+
+    fn transaction_wait_owner(&self, transaction_id: u32) -> crate::sql::lock::WaitOwner {
+        self.transaction_identities
+            .borrow()
+            .iter()
+            .find(|identity| identity.transaction_id == transaction_id)
+            .and_then(|identity| identity.connection_id)
+            .map(crate::sql::lock::connection_wait_owner)
+            .unwrap_or_else(|| crate::sql::lock::prepared_wait_owner(transaction_id))
+    }
+
+    pub(crate) fn prepare_transaction_locks(&self, transaction_id: u32) {
+        let prepared_owner = crate::sql::lock::prepared_wait_owner(transaction_id);
+        let prior_owner = {
+            let mut identities = self.transaction_identities.borrow_mut();
+            let Some(identity) = identities
+                .iter_mut()
+                .find(|identity| identity.transaction_id == transaction_id)
+            else {
+                return;
+            };
+            let prior = identity
+                .connection_id
+                .map(crate::sql::lock::connection_wait_owner)
+                .unwrap_or(prepared_owner);
+            identity.connection_id = None;
+            prior
+        };
+        if prior_owner == prepared_owner {
+            return;
+        }
+        for lock in self
+            .table_locks
+            .borrow_mut()
+            .iter_mut()
+            .filter(|lock| lock.owner == transaction_id)
+        {
+            lock.wait_owner = prepared_owner;
+        }
+        self.row_locks
+            .borrow_mut()
+            .rebind_wait_owner(prior_owner, prepared_owner);
+        self.advisory_locks
+            .borrow_mut()
+            .rebind_transaction_wait_owner(transaction_id, prior_owner, prepared_owner);
     }
 
     pub(crate) fn latest_transaction_identity(&self) -> u64 {
@@ -35406,7 +35474,9 @@ impl Storage {
         self.active_snapshots.swap_remove(index);
         // Schema waits can be blocked by a historical snapshot even when the
         // reader holds no row lock. Wake the shared wait graph when it ends.
-        self.row_locks.borrow_mut().resource_released(txid);
+        self.row_locks
+            .borrow_mut()
+            .resource_released(self.transaction_wait_owner(txid));
         let oldest = self.oldest_snapshot();
         for table in self.tables.iter_mut() {
             for (_, state) in table.rows.iter_mut() {
@@ -35424,6 +35494,149 @@ impl Storage {
 
     pub fn has_active_snapshots(&self) -> bool {
         !self.active_snapshots.is_empty()
+    }
+
+    pub(crate) fn acquire_advisory_lock(
+        &self,
+        transaction_id: u32,
+        key: crate::sql::lock::AdvisoryKey,
+        mode: crate::sql::lock::AdvisoryMode,
+        transaction_scope: bool,
+        try_only: bool,
+    ) -> Result<crate::sql::lock::AdvisoryDecision, SqlError> {
+        let connection_id = self.current_connection_id.get();
+        if connection_id <= 0 {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "advisory locks require a live connection"
+            ));
+        }
+        let wait_owner = crate::sql::lock::connection_wait_owner(connection_id);
+        let owner = if transaction_scope {
+            crate::sql::lock::AdvisoryOwner::Transaction(transaction_id)
+        } else {
+            crate::sql::lock::AdvisoryOwner::Session(connection_id)
+        };
+        let sequence = self.next_lock_sequence();
+        self.advisory_locks.borrow_mut().acquire(
+            key,
+            owner,
+            wait_owner,
+            mode,
+            try_only,
+            sequence,
+            &mut self.row_locks.borrow_mut(),
+        )
+    }
+
+    pub(crate) fn begin_advisory_statement(&self) -> Result<(), SqlError> {
+        self.advisory_locks
+            .borrow_mut()
+            .begin_statement(self.current_connection_id.get())
+    }
+
+    pub(crate) fn preserve_advisory_statement(&self) {
+        self.advisory_locks
+            .borrow_mut()
+            .preserve_statement(self.current_connection_id.get());
+    }
+
+    pub(crate) fn unlock_advisory_session(
+        &self,
+        key: crate::sql::lock::AdvisoryKey,
+        mode: crate::sql::lock::AdvisoryMode,
+    ) -> Result<bool, SqlError> {
+        self.advisory_locks.borrow_mut().unlock_session(
+            self.current_connection_id.get(),
+            key,
+            mode,
+            &mut self.row_locks.borrow_mut(),
+        )
+    }
+
+    pub(crate) fn unlock_all_advisory_session(&self) -> Result<(), SqlError> {
+        self.advisory_locks.borrow_mut().unlock_all_session(
+            self.current_connection_id.get(),
+            &mut self.row_locks.borrow_mut(),
+        )
+    }
+
+    pub(crate) fn release_advisory_transaction_locks(&self, transaction_id: u32) {
+        let wait_owner = self.transaction_wait_owner(transaction_id);
+        self.advisory_locks.borrow_mut().release_transaction(
+            transaction_id,
+            wait_owner,
+            &mut self.row_locks.borrow_mut(),
+        );
+    }
+
+    pub(crate) fn release_connection_advisory_locks(&self, connection_id: i32) {
+        let mut advisory_locks = self.advisory_locks.borrow_mut();
+        advisory_locks.drop_connection(connection_id);
+        advisory_locks
+            .unlock_all_session(connection_id, &mut self.row_locks.borrow_mut())
+            .expect("connection cleanup does not enter statement replay");
+    }
+
+    pub(crate) fn blocking_backend_pids(&self, backend_pid: i32, output: &mut [i32]) -> usize {
+        let advisory = self.advisory_locks.borrow();
+        if advisory.blocker_pid_count(backend_pid) != 0 {
+            advisory.blocker_pids(backend_pid, output)
+        } else {
+            self.row_locks.borrow().blocker_pids(backend_pid, output)
+        }
+    }
+
+    pub(crate) fn blocking_backend_pid_count(&self, backend_pid: i32) -> usize {
+        let advisory_count = self.advisory_locks.borrow().blocker_pid_count(backend_pid);
+        if advisory_count != 0 {
+            advisory_count
+        } else {
+            self.row_locks.borrow().blocker_pid_count(backend_pid)
+        }
+    }
+
+    pub(crate) fn visit_advisory_locks(
+        &self,
+        visit: impl FnMut(crate::sql::lock::AdvisoryLockView),
+    ) {
+        self.advisory_locks.borrow().visit(visit);
+    }
+
+    pub(crate) fn advisory_lock_view_count(&self) -> usize {
+        self.advisory_locks.borrow().view_count()
+    }
+
+    pub(crate) fn visit_table_locks(
+        &self,
+        mut visit: impl FnMut(u32, crate::sql::lock::WaitOwner, usize, crate::sql::ast::TableLockMode),
+    ) {
+        for lock in self.table_locks.borrow().iter() {
+            for (mode, acquired_at) in lock.modes.iter().enumerate() {
+                if *acquired_at == 0 {
+                    continue;
+                }
+                let mode = match mode {
+                    0 => crate::sql::ast::TableLockMode::AccessShare,
+                    1 => crate::sql::ast::TableLockMode::RowShare,
+                    2 => crate::sql::ast::TableLockMode::RowExclusive,
+                    3 => crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+                    4 => crate::sql::ast::TableLockMode::Share,
+                    5 => crate::sql::ast::TableLockMode::ShareRowExclusive,
+                    6 => crate::sql::ast::TableLockMode::Exclusive,
+                    _ => crate::sql::ast::TableLockMode::AccessExclusive,
+                };
+                visit(lock.owner, lock.wait_owner, lock.table as usize, mode);
+            }
+        }
+    }
+
+    pub(crate) fn table_lock_view_count(&self) -> usize {
+        self.table_locks
+            .borrow()
+            .iter()
+            .map(|lock| lock.modes.iter().filter(|sequence| **sequence != 0).count())
+            .sum()
     }
 
     pub fn lock_table(
@@ -35523,6 +35736,7 @@ impl Storage {
         }
 
         let mut table_locks = self.table_locks.borrow_mut();
+        let wait_owner = self.transaction_wait_owner(txid);
         let requested = mode_bit(mode);
         let own_index = table_locks
             .iter()
@@ -35544,7 +35758,9 @@ impl Storage {
                     "could not obtain lock on relation"
                 ));
             }
-            self.row_locks.borrow_mut().wait_for(txid, blocker.owner)?;
+            self.row_locks
+                .borrow_mut()
+                .wait_for(wait_owner, blocker.wait_owner)?;
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for a relation lock"
@@ -35560,6 +35776,7 @@ impl Storage {
         table_locks
             .push(TableLock {
                 owner: txid,
+                wait_owner,
                 table: table as u32,
                 modes,
             })
@@ -35651,7 +35868,31 @@ impl Storage {
                     table.def.schema.as_str(),
                     table.def.name.as_str(),
                 )
-            })
+            })?;
+        let mut advisory_result = Ok(());
+        self.advisory_locks
+            .borrow()
+            .visit_transaction(txid, |key, advisory_mode| {
+                if advisory_result.is_err() {
+                    return;
+                }
+                let mode = match (key.object_sub_id, advisory_mode) {
+                    (1, crate::sql::lock::AdvisoryMode::Shared) => 0,
+                    (1, crate::sql::lock::AdvisoryMode::Exclusive) => 1,
+                    (2, crate::sql::lock::AdvisoryMode::Shared) => 2,
+                    (2, crate::sql::lock::AdvisoryMode::Exclusive) => 3,
+                    _ => {
+                        advisory_result = Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "advisory lock has an invalid key namespace"
+                        ));
+                        return;
+                    }
+                };
+                let packed = u64::from(key.class_id) << 32 | u64::from(key.object_id);
+                advisory_result = append_lock(output, 2, mode, packed, "", "");
+            });
+        advisory_result
     }
 
     pub(crate) fn restore_transaction_locks(
@@ -35698,16 +35939,16 @@ impl Storage {
             })?)
             .map_err(|_| sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is not UTF-8"))?;
             at += table_len;
-            let slot = self.find_visible(schema, table, 0).ok_or_else(|| {
-                sql_err!(
-                    sqlstate::DATA_EXCEPTION,
-                    "prepared lock WAL targets missing relation \"{}.{}\"",
-                    schema,
-                    table
-                )
-            })?;
             match kind {
                 0 => {
+                    let slot = self.find_visible(schema, table, 0).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "prepared lock WAL targets missing relation \"{}.{}\"",
+                            schema,
+                            table
+                        )
+                    })?;
                     let table_mode = match mode {
                         0 => crate::sql::ast::TableLockMode::AccessShare,
                         1 => crate::sql::ast::TableLockMode::RowShare,
@@ -35727,6 +35968,14 @@ impl Storage {
                     self.lock_table(txid, slot, table_mode, false)?;
                 }
                 1 => {
+                    let slot = self.find_visible(schema, table, 0).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "prepared lock WAL targets missing relation \"{}.{}\"",
+                            schema,
+                            table
+                        )
+                    })?;
                     let strength = match mode {
                         0 => crate::sql::ast::LockStrength::Update,
                         1 => crate::sql::ast::LockStrength::NoKeyUpdate,
@@ -35753,6 +36002,39 @@ impl Storage {
                         ));
                     }
                 }
+                2 => {
+                    let advisory_mode = match mode {
+                        0 | 2 => crate::sql::lock::AdvisoryMode::Shared,
+                        1 | 3 => crate::sql::lock::AdvisoryMode::Exclusive,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "prepared lock WAL has an invalid advisory-lock mode"
+                            ));
+                        }
+                    };
+                    let key = crate::sql::lock::AdvisoryKey {
+                        class_id: (rowid >> 32) as u32,
+                        object_id: rowid as u32,
+                        object_sub_id: if mode < 2 { 1 } else { 2 },
+                    };
+                    let wait_owner = crate::sql::lock::prepared_wait_owner(txid);
+                    let decision = self.advisory_locks.borrow_mut().acquire(
+                        key,
+                        crate::sql::lock::AdvisoryOwner::Transaction(txid),
+                        wait_owner,
+                        advisory_mode,
+                        false,
+                        self.next_lock_sequence(),
+                        &mut self.row_locks.borrow_mut(),
+                    )?;
+                    if decision != crate::sql::lock::AdvisoryDecision::Acquired {
+                        return Err(sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "recovered prepared advisory locks conflict"
+                        ));
+                    }
+                }
                 _ => {
                     return Err(sql_err!(
                         sqlstate::DATA_EXCEPTION,
@@ -35765,6 +36047,7 @@ impl Storage {
     }
 
     pub(crate) fn rollback_locks_to(&self, txid: u32, mark: u64) {
+        let wait_owner = self.transaction_wait_owner(txid);
         let mut table_locks = self.table_locks.borrow_mut();
         let mut table_changed = false;
         let mut index = 0usize;
@@ -35787,13 +36070,17 @@ impl Storage {
         }
         drop(table_locks);
         let mut row_locks = self.row_locks.borrow_mut();
-        row_locks.rollback_to(txid, mark);
+        row_locks.rollback_to(txid, wait_owner, mark);
+        self.advisory_locks
+            .borrow_mut()
+            .rollback_to(txid, wait_owner, mark, &mut row_locks);
         if table_changed {
-            row_locks.resource_released(txid);
+            row_locks.resource_released(wait_owner);
         }
     }
 
     pub fn release_table_locks(&self, txid: u32) {
+        let wait_owner = self.transaction_wait_owner(txid);
         let mut table_locks = self.table_locks.borrow_mut();
         let mut changed = false;
         let mut index = 0usize;
@@ -35807,7 +36094,7 @@ impl Storage {
         }
         drop(table_locks);
         if changed {
-            self.row_locks.borrow_mut().resource_released(txid);
+            self.row_locks.borrow_mut().resource_released(wait_owner);
         }
     }
 
@@ -35820,13 +36107,15 @@ impl Storage {
         wait: crate::sql::ast::LockWait,
     ) -> Result<crate::sql::lock::LockDecision, SqlError> {
         let sequence = self.next_lock_sequence();
+        let wait_owner = self.transaction_wait_owner(txid);
         self.row_locks
             .borrow_mut()
-            .acquire(table, rowid, txid, strength, wait, sequence)
+            .acquire(table, rowid, txid, wait_owner, strength, wait, sequence)
     }
 
     pub(crate) fn release_row_locks(&self, txid: u32) {
-        self.row_locks.borrow_mut().release(txid);
+        let wait_owner = self.transaction_wait_owner(txid);
+        self.row_locks.borrow_mut().release(txid, wait_owner);
     }
 
     pub(crate) fn lock_generation(&self) -> u64 {
@@ -35901,7 +36190,10 @@ impl Storage {
     }
 
     pub(crate) fn wait_for_transaction(&self, waiter: u32, blocker: u32) -> Result<(), SqlError> {
-        self.row_locks.borrow_mut().wait_for(waiter, blocker)
+        self.row_locks.borrow_mut().wait_for(
+            self.transaction_wait_owner(waiter),
+            self.transaction_wait_owner(blocker),
+        )
     }
 
     fn catalog_ddl_wait_error(&self, waiter: u32, blocker: u32, name: &str) -> SqlError {

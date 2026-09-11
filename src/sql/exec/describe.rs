@@ -3554,6 +3554,19 @@ pub fn infer_type_res(
             "pg_snapshot_xip" => of(ColType::Xid8),
             "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => of(ColType::Bool),
             "pg_xact_status" | "txid_status" => of(ColType::Text),
+            "pg_backend_pid" => of(ColType::Int4),
+            "pg_blocking_pids" => of(ColType::Array(crate::sql::types::ArrElem::Int4)),
+            "pg_try_advisory_lock"
+            | "pg_try_advisory_lock_shared"
+            | "pg_advisory_unlock"
+            | "pg_advisory_unlock_shared"
+            | "pg_try_advisory_xact_lock"
+            | "pg_try_advisory_xact_lock_shared" => of(ColType::Bool),
+            "pg_advisory_lock"
+            | "pg_advisory_lock_shared"
+            | "pg_advisory_unlock_all"
+            | "pg_advisory_xact_lock"
+            | "pg_advisory_xact_lock_shared" => of(ColType::Void),
             "gen_random_uuid"
             | "uuidv4"
             | "uuidv7"

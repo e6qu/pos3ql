@@ -28,6 +28,7 @@ use super::{QueryScope, arena_full, describe_scope_items, record_star_width};
 pub(crate) fn is_srf_name(name: &str) -> bool {
     is_event_trigger_introspection(name)
         || name.eq_ignore_ascii_case("pg_cursor")
+        || name.eq_ignore_ascii_case("pg_listening_channels")
         || name.eq_ignore_ascii_case("_pg_expandarray")
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
@@ -1282,6 +1283,12 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             Ok(pool.map_or(0, crate::sql::cursor::CursorPool::len))
         });
     }
+    if name.eq_ignore_ascii_case("pg_listening_channels") {
+        require_no_arguments(name, args)?;
+        return Ok(hooks
+            .catalog
+            .map_or(0, crate::sql::eval::CatalogAccess::listening_channel_count));
+    }
     let as_i64 = |d: &Datum| -> Option<i64> {
         match d {
             Datum::Int4(v) => Some(*v as i64),
@@ -2478,6 +2485,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_ts_stat = tref.table.eq_ignore_ascii_case("ts_stat");
     let is_event_introspection = is_event_trigger_introspection(tref.table);
     let is_cursor_introspection = tref.table.eq_ignore_ascii_case("pg_cursor");
+    let is_listening_channels = tref.table.eq_ignore_ascii_case("pg_listening_channels");
     let is_logical_slot_record = is_logical_slot_record_function(tref.table);
     let is_object_address_record = is_object_address_record_function(tref.table);
     let built_in = is_gs
@@ -2505,6 +2513,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_ts_stat
         || is_event_introspection
         || is_cursor_introspection
+        || is_listening_channels
         || is_logical_slot_record
         || is_object_address_record;
     let routine = if built_in {
@@ -2573,6 +2582,16 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             );
         }
         6
+    } else if is_listening_channels {
+        require_no_arguments(tref.table, tref.func_args.unwrap_or(&[]))?;
+        default_cols[0] = table_function_column(
+            SqlName::parse("pg_listening_channels")?,
+            ColType::Text,
+            None,
+            -1,
+            crate::sql::ast::Collation::Default,
+        );
+        1
     } else if is_json_to_record {
         json_to_record_append_columns(
             tref.func_args.unwrap_or(&[]),
@@ -3381,6 +3400,28 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     };
     if is_event_trigger_introspection(tref.table) {
         return event_trigger_rows(tref.table, args, storage, txid, arena);
+    }
+    if tref.table.eq_ignore_ascii_case("pg_listening_channels") {
+        require_no_arguments(tref.table, args)?;
+        let pid = storage.current_connection_id();
+        let count = storage.listening_channel_count(pid);
+        const EMPTY: &[u8] = &[];
+        let rows = arena
+            .alloc_slice_with(count, |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (index, output) in rows.iter_mut().enumerate() {
+            let channel = storage.listening_channel_at(pid, index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "listening-channel registry changed during scan"
+                )
+            })?;
+            let channel = arena
+                .alloc_str(channel.as_str())
+                .map_err(|_| arena_full())?;
+            *output = crate::sql::exec::encode_projected_pub(&[Datum::Text(channel)], arena)?;
+        }
+        return Ok(rows);
     }
     if tref.table.eq_ignore_ascii_case("pg_cursor") {
         require_no_arguments(tref.table, args)?;

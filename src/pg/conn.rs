@@ -353,6 +353,7 @@ pub struct Conn {
     /// Negotiated protocol minor version (major is always 3).
     minor: u16,
     id: i32,
+    backend_start: i64,
     /// A simple-query message parked on a row lock remains at the front of
     /// `recv`; completed statements in that message are not replayed.
     parked: bool,
@@ -455,6 +456,7 @@ impl Conn {
             phase: Phase::Startup,
             minor: 0,
             id: 0,
+            backend_start: 0,
             parked: false,
             parked_generation: 0,
             parked_for_io: false,
@@ -506,6 +508,7 @@ impl Conn {
         self.phase = Phase::Startup;
         self.minor = 0;
         self.id = id;
+        self.backend_start = crate::sql::datetime::now_micros();
         self.parked = false;
         self.parked_generation = 0;
         self.parked_for_io = false;
@@ -578,22 +581,64 @@ impl Conn {
         self.cancel_request.take()
     }
 
-    pub(crate) fn cancel_parked(&mut self) -> bool {
+    pub(crate) fn cancel_parked(&mut self, engine: &mut Engine) -> bool {
         if !self.parked {
             return false;
         }
         let extended = self.recv.readable().first() != Some(&wire::FMSG_QUERY);
-        self.recv.clear();
+        // The parked Query/Execute remains at the front of `recv`. Consume
+        // only that message: an extended client commonly pipelines Sync
+        // behind Execute, and dropping it would leave the client waiting for
+        // ReadyForQuery forever after the cancellation ErrorResponse.
+        let message_bytes = self
+            .recv
+            .readable()
+            .get(1..5)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .and_then(|bytes| usize::try_from(i32::from_be_bytes(bytes)).ok())
+            .and_then(|length| length.checked_add(1))
+            .filter(|length| *length <= self.recv.len())
+            .unwrap_or(self.recv.len());
+        self.recv.consume(message_bytes);
         self.finish_lock_wait();
-        if extended {
+        engine.cancel_backend_wait(self.id);
+        if self.txn.is_explicit() {
+            self.txn.failed = true;
+        } else {
+            engine.rollback_txn(&mut self.txn, &self.guc);
+        }
+        engine.finish_backend_statement(&self.txn, self.id);
+        let mut synchronized = false;
+        while extended && self.recv.len() >= 5 {
+            let bytes = self.recv.readable();
+            let Some(length) = bytes
+                .get(1..5)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(i32::from_be_bytes)
+                .and_then(|length| usize::try_from(length).ok())
+                .and_then(|length| length.checked_add(1))
+                .filter(|length| *length <= bytes.len())
+            else {
+                break;
+            };
+            let sync = bytes[0] == wire::FMSG_SYNC;
+            self.recv.consume(length);
+            if sync {
+                synchronized = true;
+                break;
+            }
+        }
+        if extended && !synchronized {
             self.phase = Phase::SkipToSync;
+        } else if synchronized {
+            self.phase = Phase::Ready;
         }
         let mut responder = Responder::new(&mut self.send);
         let sent = responder.error(
             sqlstate::QUERY_CANCELED,
             "canceling statement due to user request",
         );
-        let sent = if extended {
+        let sent = if extended && !synchronized {
             sent
         } else {
             sent.and_then(|()| responder.ready_for_query(self.txn.status_byte()))
@@ -1227,16 +1272,20 @@ impl Conn {
             .guc
             .get_owned("timezone")
             .unwrap_or_else(|| StackStr::from_str("UTC"));
-        let mut responder = Responder::new(&mut self.send);
         self.arena.reset();
-        if let Err(error) = engine.execute_login_event_triggers(
-            &mut self.txn,
-            &mut self.sqlprep,
-            &mut self.cursors,
-            &mut self.guc,
-            &self.arena,
-            &mut responder,
-        ) {
+        let login_trigger_result = {
+            let mut responder = Responder::new(&mut self.send);
+            engine.execute_login_event_triggers(
+                &mut self.txn,
+                &mut self.sqlprep,
+                &mut self.cursors,
+                &mut self.guc,
+                &self.arena,
+                &mut responder,
+            )
+        };
+        if let Err(error) = login_trigger_result {
+            let mut responder = Responder::new(&mut self.send);
             let _ = responder.error(error.sqlstate, error.message.as_str());
             if let Some(role) = self.authenticated_role.take() {
                 engine.release_role_connection(role);
@@ -1246,6 +1295,59 @@ impl Conn {
             }
             return Step::Close;
         }
+        let (client_addr, client_port) = self
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.peer_addr().ok())
+            .map(|address| {
+                let (family, bytes) = match address.ip() {
+                    std::net::IpAddr::V4(value) => {
+                        let mut bytes = [0u8; 16];
+                        bytes[..4].copy_from_slice(&value.octets());
+                        (4, bytes)
+                    }
+                    std::net::IpAddr::V6(value) => (6, value.octets()),
+                };
+                (
+                    crate::sql::net::NetAddr::new(
+                        family,
+                        if family == 4 { 32 } else { 128 },
+                        bytes,
+                    ),
+                    i32::from(address.port()),
+                )
+            })
+            .unwrap_or((None, -1));
+        let (ssl_version, ssl_cipher, ssl_bits) = self
+            .tls
+            .as_ref()
+            .map(crate::pg::tls::ServerSession::negotiated_parameters)
+            .unwrap_or((None, None, None));
+        let application_name = self.guc.get_owned("application_name").unwrap_or_default();
+        if let Err(error) = engine.register_backend(
+            id,
+            database.oid,
+            self.authenticated_role.expect("role was reserved"),
+            application_name.as_str(),
+            client_addr,
+            client_port,
+            self.backend_start,
+            self.tls.is_some(),
+            ssl_version,
+            ssl_cipher,
+            ssl_bits,
+        ) {
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(error.sqlstate, error.message.as_str());
+            if let Some(role) = self.authenticated_role.take() {
+                engine.release_role_connection(role);
+            }
+            if let Some(database) = self.authenticated_database.take() {
+                engine.release_database_connection(database);
+            }
+            return Step::Close;
+        }
+        let mut responder = Responder::new(&mut self.send);
         let mut write_all = || -> Result<(), WireFull> {
             responder.auth_ok()?;
             for (k, v) in [
@@ -1724,6 +1826,7 @@ impl Conn {
                 engine.copy_abort(&mut self.txn, &self.guc);
                 self.copy = None;
                 self.copy_buf.clear();
+                engine.finish_backend_statement(&self.txn, self.id);
                 let mut responder = Responder::new(&mut self.send);
                 let sent = responder.error(sqlstate::QUERY_CANCELED, detail.as_str());
                 if extended {
@@ -2255,6 +2358,7 @@ impl Conn {
             }
         };
         let failed = outcome.is_err();
+        engine.finish_backend_statement(&self.txn, self.id);
         let mut responder = Responder::new(&mut self.send);
         let sent = match outcome {
             Ok(count) => {
@@ -3004,9 +3108,13 @@ impl Conn {
             match result {
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(true)) => {
                     self.finish_lock_wait();
+                    if pending_copy.is_none() {
+                        engine.finish_backend_statement(&self.txn, self.id);
+                    }
                 }
                 Ok(crate::sql::ExtendedExecutionStatus::Complete(false)) => {
                     self.finish_lock_wait();
+                    engine.finish_backend_statement(&self.txn, self.id);
                     if pending_copy.is_some() {
                         engine.copy_abort(&mut self.txn, &self.guc);
                     }
@@ -3030,6 +3138,7 @@ impl Conn {
                     }
                     let generation = engine.lock_generation();
                     self.park(io_wait, generation);
+                    engine.park_backend_statement(self.id, io_wait);
                     return Step::Parked;
                 }
                 Err(WireFull) => {
@@ -3260,6 +3369,7 @@ impl Conn {
                     self.recv.consume(total);
                     return Step::Continue;
                 }
+                engine.finish_backend_statement(&self.txn, self.id);
                 let mut responder = Responder::new(&mut self.send);
                 match responder.ready_for_query(status) {
                     Ok(()) => Step::Continue,
@@ -3275,6 +3385,7 @@ impl Conn {
                 self.resume_statement = completed_statements;
                 let generation = engine.lock_generation();
                 self.park(io_wait, generation);
+                engine.park_backend_statement(self.id, io_wait);
                 self.arena.reset();
                 return Step::Parked;
             }
@@ -5676,14 +5787,21 @@ mod tests {
 
     #[test]
     fn canceling_a_parked_statement_emits_query_canceled() {
-        let config = Config::default_dev();
-        let mut budget = Budget::new(64 << 20);
+        let mut config = Config::default_dev();
+        config.max_tables = 8;
+        config.table_rows = 256;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine budget");
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
-        connection.recv.append(b"Q\0\0\0\x05");
+        connection.recv.append(b"E\0\0\0\x04S\0\0\0\x04");
+        connection.txn.mode = crate::sql::txn::TxnMode::Explicit;
+        connection.txn.txid = 1;
         connection.park(false, 0);
-        assert!(connection.cancel_parked());
+        assert!(connection.cancel_parked(&mut engine));
         assert!(!connection.parked);
         assert!(connection.recv.is_empty());
+        assert!(connection.txn.failed);
+        assert_eq!(connection.phase, Phase::Ready);
         assert!(
             connection
                 .send
@@ -5691,6 +5809,12 @@ mod tests {
                 .windows(5)
                 .any(|bytes| bytes == b"57014"),
             "cancellation must be reported as SQLSTATE 57014"
+        );
+        assert!(
+            connection
+                .send
+                .readable()
+                .contains(&wire::MSG_READY_FOR_QUERY)
         );
     }
 

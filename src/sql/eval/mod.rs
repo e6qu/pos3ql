@@ -789,6 +789,18 @@ pub trait CatalogAccess {
     fn blocking_backend_pid_count(&self, _backend_pid: i32) -> usize {
         0
     }
+    fn signal_backend(&self, _backend_pid: i32, _terminate: bool) -> Result<bool, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "backend signaling is unavailable"
+        ))
+    }
+    fn listening_channel_count(&self) -> usize {
+        0
+    }
+    fn listening_channel_at(&self, _index: usize) -> Option<crate::sql::notify::Channel> {
+        None
+    }
     fn acquire_advisory_lock(
         &self,
         _class_id: u32,

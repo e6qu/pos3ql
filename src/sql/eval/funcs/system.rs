@@ -776,6 +776,10 @@ pub(crate) fn dispatch<'a>(
         "version"
             | "pg_backend_pid"
             | "pg_blocking_pids"
+            | "pg_cancel_backend"
+            | "pg_terminate_backend"
+            | "pg_listening_channels"
+            | "pg_notification_queue_usage"
             | "pg_advisory_lock"
             | "pg_advisory_lock_shared"
             | "pg_try_advisory_lock"
@@ -960,6 +964,77 @@ pub(crate) fn dispatch<'a>(
                     element: ArrElem::Int4,
                     raw: array::build(values, arena)?,
                 })
+            }
+            "pg_cancel_backend" | "pg_terminate_backend" => {
+                let terminate = name.eq_ignore_ascii_case("pg_terminate_backend");
+                if args.is_empty() || args.len() > if terminate { 2 } else { 1 } || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}(...) with {} arguments does not exist",
+                        name,
+                        if star { 1 } else { args.len() }
+                    ));
+                }
+                let pid = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int2(value) => i32::from(value),
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "integer out of range")
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                if args.len() == 2 {
+                    let timeout = match eval_full(args[1], arena, params, row, hooks)? {
+                        Datum::Int2(value) => i64::from(value),
+                        Datum::Int4(value) => i64::from(value),
+                        Datum::Int8(value) => value,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => return Err(type_mismatch(name, &other)),
+                    };
+                    if timeout < 0 {
+                        return Err(sql_err!(
+                            sqlstate::NUMERIC_OUT_OF_RANGE,
+                            "timeout must not be negative"
+                        ));
+                    }
+                    if timeout != 0 {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "waiting for backend termination is not supported; use a zero timeout"
+                        ));
+                    }
+                }
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "backend signaling is unavailable"
+                    )
+                })?;
+                Ok(Datum::Bool(catalog.signal_backend(pid, terminate)?))
+            }
+            "pg_listening_channels" => {
+                arity(0)?;
+                let Some(index) = hooks.srf_index.and_then(|index| index.checked_sub(1)) else {
+                    return Ok(Datum::Null);
+                };
+                let channel = hooks
+                    .catalog
+                    .and_then(|catalog| catalog.listening_channel_at(index));
+                match channel {
+                    Some(channel) => Ok(Datum::Text(
+                        arena
+                            .alloc_str(channel.as_str())
+                            .map_err(|_| crate::sql::eval::arena_full())?,
+                    )),
+                    None => Ok(Datum::Null),
+                }
+            }
+            "pg_notification_queue_usage" => {
+                arity(0)?;
+                // Notifications are delivered after every reactor dispatch;
+                // no committed queue is observable from a SQL statement.
+                Ok(Datum::Float8(0.0))
             }
             "pg_advisory_lock"
             | "pg_advisory_lock_shared"

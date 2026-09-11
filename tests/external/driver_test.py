@@ -866,6 +866,110 @@ waiter_cur.execute("SELECT pg_advisory_unlock_all()")
 waiter.close()
 print("advisory lock extended/concurrent/catalog boundaries ok")
 
+# Backend activity and control use the same live registry as lock waits.  A
+# canceled extended-protocol statement aborts its transaction, while a
+# terminated idle backend receives PostgreSQL's administrator-shutdown fatal.
+admin_pid = cur.execute("SELECT pg_backend_pid()").fetchone()[0]
+activity = psycopg.connect(
+    host="127.0.0.1", port=5433, user="postgres", dbname="postgres",
+    application_name="pos3ql-activity-probe", sslmode="disable", autocommit=True,
+)
+activity_cur = activity.cursor()
+activity_pid = activity_cur.execute("SELECT pg_backend_pid()").fetchone()[0]
+cur.execute(
+    "SELECT datname,usesysid,usename,application_name,client_addr::text,"
+    "client_port>0,backend_start IS NOT NULL,state,backend_type "
+    "FROM pg_stat_activity WHERE pid=%s",
+    (activity_pid,),
+)
+activity_row = cur.fetchone()
+assert activity_row == (
+    "postgres", 10, "postgres", "pos3ql-activity-probe", "127.0.0.1",
+    True, True, "idle", "client backend",
+), activity_row
+cur.execute("SELECT ssl,version,cipher,bits FROM pg_stat_ssl WHERE pid=%s", (activity_pid,))
+assert cur.fetchone() == (False, None, None, None)
+cur.execute(
+    "SELECT count(*)=22 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid "
+    "WHERE c.relname='pg_stat_activity' AND a.attnum>0 AND NOT a.attisdropped"
+)
+assert cur.fetchone() == (True,)
+cur.execute("CREATE ROLE driver_activity_limited")
+cur.execute("GRANT driver_activity_limited TO postgres")
+cur.execute("SET ROLE driver_activity_limited")
+cur.execute(
+    "SELECT query LIKE 'SELECT query LIKE%%' FROM pg_stat_activity "
+    "WHERE pid=pg_backend_pid()"
+)
+assert cur.fetchone() == (True,)
+cur.execute("RESET ROLE")
+cur.execute("DROP ROLE driver_activity_limited")
+
+activity_cur.execute("LISTEN driver_activity_channel")
+activity_cur.execute("SELECT * FROM pg_listening_channels()")
+assert activity_cur.fetchall() == [("driver_activity_channel",)]
+activity_cur.execute("UNLISTEN *")
+activity_cur.execute("SELECT * FROM pg_listening_channels()")
+assert activity_cur.fetchall() == []
+activity_cur.execute("SELECT pg_notification_queue_usage()")
+assert activity_cur.fetchone() == (0.0,)
+
+cancel_key = advisory_key + 1
+cur.execute("SELECT pg_advisory_lock(%s)", (cancel_key,))
+cancel_errors = []
+cancel_started = threading.Event()
+
+def wait_for_canceled_lock():
+    try:
+        cancel_started.set()
+        activity_cur.execute("SELECT pg_advisory_lock(%s)", (cancel_key,))
+    except Exception as error:
+        cancel_errors.append(error)
+
+cancel_thread = threading.Thread(target=wait_for_canceled_lock, daemon=True)
+cancel_thread.start()
+assert cancel_started.wait(timeout=1)
+for _ in range(500):
+    cur.execute(
+        "SELECT state,wait_event_type,wait_event,query LIKE 'SELECT pg_advisory_lock%%' "
+        "FROM pg_stat_activity WHERE pid=%s",
+        (activity_pid,),
+    )
+    waiting_activity = cur.fetchone()
+    if waiting_activity and waiting_activity[1] == "Lock":
+        break
+    time.sleep(0.01)
+assert waiting_activity == ("active", "Lock", "advisory", True), waiting_activity
+cur.execute("SELECT pg_cancel_backend(%s)", (activity_pid,))
+assert cur.fetchone() == (True,)
+cancel_thread.join(timeout=5)
+assert not cancel_thread.is_alive()
+assert len(cancel_errors) == 1 and isinstance(cancel_errors[0], psycopg.errors.QueryCanceled)
+cur.execute("SELECT pg_blocking_pids(%s)", (activity_pid,))
+assert cur.fetchone() == ([],)
+activity_cur.execute("SELECT 1")
+assert activity_cur.fetchone() == (1,)
+cur.execute("SELECT pg_advisory_unlock(%s)", (cancel_key,))
+assert cur.fetchone() == (True,)
+
+cur.execute("SELECT pg_cancel_backend(%s),pg_terminate_backend(%s)", (2_147_483_647, 2_147_483_647))
+assert cur.fetchone() == (False, False)
+cur.execute("SELECT pg_terminate_backend(%s)", (activity_pid,))
+assert cur.fetchone() == (True,)
+for _ in range(100):
+    try:
+        activity_cur.execute("SELECT 1")
+    except psycopg.errors.AdminShutdown:
+        break
+    time.sleep(0.01)
+else:
+    raise AssertionError("terminated backend remained usable")
+activity.close()
+
+cur.execute("SELECT count(*) FROM pg_stat_database_conflicts WHERE datname=current_database()")
+assert cur.fetchone() == (1,)
+print("backend activity/control boundaries ok", admin_pid)
+
 conn.close()
 observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")
 assert observer_cur.fetchone() == (0,)

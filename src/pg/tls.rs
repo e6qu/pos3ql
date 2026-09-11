@@ -99,6 +99,52 @@ impl ServerSession {
         self.inner.as_ref().expect("live tls session").wants_write()
     }
 
+    /// PostgreSQL-shaped negotiated parameters for `pg_stat_ssl`.  The names
+    /// are protocol constants, so returning static strings does not allocate.
+    pub(crate) fn negotiated_parameters(
+        &self,
+    ) -> (Option<&'static str>, Option<&'static str>, Option<i32>) {
+        use rustls::{CipherSuite, ProtocolVersion};
+        let session = self.inner.as_ref().expect("live tls session");
+        let version = match session.protocol_version() {
+            Some(ProtocolVersion::TLSv1_2) => Some("TLSv1.2"),
+            Some(ProtocolVersion::TLSv1_3) => Some("TLSv1.3"),
+            _ => None,
+        };
+        let cipher = session.negotiated_cipher_suite().map(|suite| suite.suite());
+        let (cipher, bits) = match cipher {
+            Some(CipherSuite::TLS13_AES_256_GCM_SHA384) => {
+                (Some("TLS_AES_256_GCM_SHA384"), Some(256))
+            }
+            Some(CipherSuite::TLS13_AES_128_GCM_SHA256) => {
+                (Some("TLS_AES_128_GCM_SHA256"), Some(128))
+            }
+            Some(CipherSuite::TLS13_CHACHA20_POLY1305_SHA256) => {
+                (Some("TLS_CHACHA20_POLY1305_SHA256"), Some(256))
+            }
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384) => {
+                (Some("ECDHE-ECDSA-AES256-GCM-SHA384"), Some(256))
+            }
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384) => {
+                (Some("ECDHE-RSA-AES256-GCM-SHA384"), Some(256))
+            }
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256) => {
+                (Some("ECDHE-ECDSA-AES128-GCM-SHA256"), Some(128))
+            }
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256) => {
+                (Some("ECDHE-RSA-AES128-GCM-SHA256"), Some(128))
+            }
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256) => {
+                (Some("ECDHE-ECDSA-CHACHA20-POLY1305"), Some(256))
+            }
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256) => {
+                (Some("ECDHE-RSA-CHACHA20-POLY1305"), Some(256))
+            }
+            _ => (None, None),
+        };
+        (version, cipher, bits)
+    }
+
     /// Reads ciphertext off the socket and returns decrypted plaintext into
     /// `dst`. Mirrors `TcpStream::read` semantics for the caller: `Ok(0)` means
     /// the peer closed, `WouldBlock` means no plaintext is ready yet (e.g. still

@@ -56,6 +56,16 @@ live granted and waiting locks with PostgreSQL 18 catalog and wire types. The
 startup-only `max_locks_per_transaction` setting sizes the fixed lock pool;
 exhaustion fails explicitly.
 
+A startup-bounded backend registry drives `pg_stat_activity` and `pg_stat_ssl`,
+including live query, transaction, lock-wait, client, application, and
+negotiated TLS state. `pg_cancel_backend()` and zero-timeout
+`pg_terminate_backend()` signal that same registry; protocol and SQL
+cancellation share transaction rollback and extended-protocol synchronization.
+`pg_listening_channels()` exposes committed session registrations,
+`pg_notification_queue_usage()` reflects the reactor's immediately drained
+queue, and `pg_stat_database_conflicts` reports the exact zero-conflict state of
+a server that never enters PostgreSQL hot standby.
+
 PostgreSQL `money` is an exact signed-cent type with C/en_US monetary text,
 scalar and array binary wire formats, casts, comparisons, arithmetic, support
 functions, aggregates, btree indexes and catalogs. Values retain that identity

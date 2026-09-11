@@ -1643,6 +1643,21 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.blocking_backend_pid_count(backend_pid)
     }
 
+    fn signal_backend(&self, backend_pid: i32, terminate: bool) -> Result<bool, SqlError> {
+        self.storage
+            .request_backend_signal(backend_pid, terminate, self.txid)
+    }
+
+    fn listening_channel_count(&self) -> usize {
+        self.storage
+            .listening_channel_count(self.storage.current_connection_id())
+    }
+
+    fn listening_channel_at(&self, index: usize) -> Option<crate::sql::notify::Channel> {
+        self.storage
+            .listening_channel_at(self.storage.current_connection_id(), index)
+    }
+
     fn acquire_advisory_lock(
         &self,
         class_id: u32,

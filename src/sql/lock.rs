@@ -536,6 +536,24 @@ impl AdvisoryLockManager {
         }
     }
 
+    /// Abandons a parked executor attempt without releasing session locks that
+    /// earlier expressions in the statement successfully acquired.
+    pub(crate) fn cancel_statement(&mut self, connection_id: i32, wait_graph: &mut LockManager) {
+        let wait_owner = connection_wait_owner(connection_id);
+        self.clear_wait(wait_owner);
+        wait_graph.clear_wait(wait_owner);
+        self.clear_replay_actions(connection_id);
+        if let Some(state) = self
+            .replay_states
+            .iter_mut()
+            .find(|state| state.connection_id == connection_id)
+        {
+            state.preserved = false;
+            state.cursor = 0;
+            state.replay_count = 0;
+        }
+    }
+
     pub(crate) fn drop_connection(&mut self, connection_id: i32) {
         self.clear_replay_actions(connection_id);
         if let Some(index) = self

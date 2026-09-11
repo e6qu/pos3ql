@@ -1086,6 +1086,10 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     ),
     intrinsic!(2026, "pg_backend_pid", 23, "", 0, "s"),
     intrinsic!(2561, "pg_blocking_pids", 1007, "23", 1, "v"),
+    intrinsic!(2171, "pg_cancel_backend", 16, "23", 1, "v"),
+    intrinsic!(2096, "pg_terminate_backend", 16, "23 20", 2, "v"),
+    intrinsic!(3035, "pg_listening_channels", 25, "", 0, "s"),
+    intrinsic!(3296, "pg_notification_queue_usage", 701, "", 0, "v"),
     intrinsic!(2880, "pg_advisory_lock", 2278, "20", 1, "v"),
     intrinsic!(2881, "pg_advisory_lock_shared", 2278, "20", 1, "v"),
     intrinsic!(2882, "pg_try_advisory_lock", 16, "20", 1, "v"),
@@ -3624,6 +3628,7 @@ fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
             | 2766
             | 1689
             | 2511
+            | 3035
     )
 }
 
@@ -3637,6 +3642,8 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
         | 1599
         | 1641
         | 2026
+        | 3035
+        | 3296
         | 2511
         | 2880..=2892
         | 3089..=3096
@@ -3654,6 +3661,8 @@ fn intrinsic_routine_source(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
         2026 => "pg_backend_pid",
         2561 => "pg_blocking_pids",
+        2171 => "pg_cancel_backend",
+        2096 => "pg_terminate_backend",
         2880 => "pg_advisory_lock_int8",
         2881 => "pg_advisory_lock_shared_int8",
         2882 => "pg_try_advisory_lock_int8",
@@ -4012,6 +4021,8 @@ const OBJECT_ADDRESS_OUTPUT_NAMES: &[&str] = &["classid", "objid", "objsubid"];
 
 fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
     match oid {
+        2096 => Some(&["pid", "timeout"]),
+        2171 => Some(&["pid"]),
         6119 => Some(&["pubname"]),
         3382 | 3839 => Some(&["classid", "objid", "objsubid"]),
         3954 => Some(&["type", "object_names", "object_args"]),
@@ -8252,6 +8263,9 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_subscription", 6107),
     ("pg_stat_subscription", 12248),
     ("pg_stat_subscription_stats", 12347),
+    ("pg_stat_activity", 12226),
+    ("pg_stat_ssl", 12253),
+    ("pg_stat_database_conflicts", 12275),
     ("pg_transform", 3576),
     ("pg_locks", 12073),
     ("pg_cursors", 12077),
@@ -8401,6 +8415,9 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_foreign_data_wrapper"
                 | "pg_locks"
                 | "pg_cursors"
+                | "pg_stat_activity"
+                | "pg_stat_ssl"
+                | "pg_stat_database_conflicts"
         ),
     }
 }
@@ -8497,6 +8514,9 @@ pub fn synthesize<'a>(
         (false, "pg_type") => pg_type(storage, txid, arena),
         (false, "pg_locks") => pg_locks(storage, arena),
         (false, "pg_cursors") => pg_cursors(arena),
+        (false, "pg_stat_activity") => pg_stat_activity(storage, txid, arena),
+        (false, "pg_stat_ssl") => pg_stat_ssl(storage, arena),
+        (false, "pg_stat_database_conflicts") => pg_stat_database_conflicts(storage, txid, arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
@@ -12478,6 +12498,13 @@ pub fn function_arguments_text<'a>(
             if routine.oid == 6212 {
                 write!(output, "{} ", ["mean", "stddev"][index])
                     .map_err(|_| super::eval::arena_full())?;
+            } else if routine.oid == 2096 {
+                write!(output, "{} ", ["pid", "timeout"][index])
+                    .map_err(|_| super::eval::arena_full())?;
+            } else if routine.oid == 2171 {
+                output
+                    .write_str("pid ")
+                    .map_err(|_| super::eval::arena_full())?;
             } else if (6339..=6341).contains(&routine.oid) {
                 write!(output, "{} ", ["min", "max"][index])
                     .map_err(|_| super::eval::arena_full())?;
@@ -12504,6 +12531,10 @@ pub fn function_arguments_text<'a>(
             write!(output, "{type_name}").map_err(|_| super::eval::arena_full())?;
             if routine.oid == 6212 && !identity {
                 write!(output, " DEFAULT {}", index).map_err(|_| super::eval::arena_full())?;
+            } else if routine.oid == 2096 && !identity && index == 1 {
+                output
+                    .write_str(" DEFAULT 0")
+                    .map_err(|_| super::eval::arena_full())?;
             } else if !identity && routine.oid == 1268 && index == 1 {
                 output
                     .write_str(" DEFAULT true")
@@ -16063,11 +16094,59 @@ const PG_LOCKS_COLUMNS: &[(&str, ColType)] = &[
     ("waitstart", ColType::Timestamptz),
 ];
 
+const PG_STAT_ACTIVITY_COLUMNS: &[(&str, ColType)] = &[
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("pid", ColType::Int4),
+    ("leader_pid", ColType::Int4),
+    ("usesysid", ColType::Oid),
+    ("usename", ColType::Name),
+    ("application_name", ColType::Text),
+    ("client_addr", ColType::Inet),
+    ("client_hostname", ColType::Text),
+    ("client_port", ColType::Int4),
+    ("backend_start", ColType::Timestamptz),
+    ("xact_start", ColType::Timestamptz),
+    ("query_start", ColType::Timestamptz),
+    ("state_change", ColType::Timestamptz),
+    ("wait_event_type", ColType::Text),
+    ("wait_event", ColType::Text),
+    ("state", ColType::Text),
+    ("backend_xid", ColType::Xid),
+    ("backend_xmin", ColType::Xid),
+    ("query_id", ColType::Int8),
+    ("query", ColType::Text),
+    ("backend_type", ColType::Text),
+];
+
+const PG_STAT_SSL_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("ssl", ColType::Bool),
+    ("version", ColType::Text),
+    ("cipher", ColType::Text),
+    ("bits", ColType::Int4),
+    ("client_dn", ColType::Text),
+    ("client_serial", ColType::Numeric),
+    ("issuer_dn", ColType::Text),
+];
+
+const PG_STAT_DATABASE_CONFLICTS_COLUMNS: &[(&str, ColType)] = &[
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("confl_tablespace", ColType::Int8),
+    ("confl_lock", ColType::Int8),
+    ("confl_snapshot", ColType::Int8),
+    ("confl_bufferpin", ColType::Int8),
+    ("confl_deadlock", ColType::Int8),
+    ("confl_active_logicalslot", ColType::Int8),
+];
+
 type MonitoringRelation = (i32, i32, &'static str, &'static [(&'static str, ColType)]);
 
 const MONITORING_RELATIONS: &[MonitoringRelation] = &[
     (12073, 12075, "pg_locks", PG_LOCKS_COLUMNS),
     (12077, 12079, "pg_cursors", PG_CURSORS_COLUMNS),
+    (12226, 12228, "pg_stat_activity", PG_STAT_ACTIVITY_COLUMNS),
     (
         12231,
         12233,
@@ -16079,6 +16158,13 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
         12250,
         "pg_stat_subscription",
         PG_STAT_SUBSCRIPTION_COLUMNS,
+    ),
+    (12253, 12255, "pg_stat_ssl", PG_STAT_SSL_COLUMNS),
+    (
+        12275,
+        12277,
+        "pg_stat_database_conflicts",
+        PG_STAT_DATABASE_CONFLICTS_COLUMNS,
     ),
     (
         12261,
@@ -16100,7 +16186,7 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
     ),
 ];
 
-const MONITORING_ATTRIBUTE_COUNT: usize = 96;
+const MONITORING_ATTRIBUTE_COUNT: usize = 134;
 
 const fn monitoring_type_oid(ctype: ColType) -> i32 {
     match ctype {
@@ -16116,6 +16202,7 @@ const fn monitoring_type_oid(ctype: ColType) -> i32 {
         ColType::Timestamptz => 1184,
         ColType::Interval => 1186,
         ColType::PgLsn => 3220,
+        ColType::Numeric => 1700,
         _ => panic!("monitoring relation has an unsupported catalog type"),
     }
 }
@@ -16128,7 +16215,7 @@ const fn monitoring_type_len(ctype: ColType) -> i32 {
         ColType::Int8 | ColType::Timestamptz | ColType::PgLsn => 8,
         ColType::Interval => 16,
         ColType::Name => 64,
-        ColType::Text | ColType::Inet => -1,
+        ColType::Text | ColType::Inet | ColType::Numeric => -1,
         _ => panic!("monitoring relation has an unsupported catalog type"),
     }
 }
@@ -16138,7 +16225,12 @@ const fn monitoring_type_alignment(ctype: ColType) -> &'static str {
         ColType::Bool | ColType::Name => "c",
         ColType::Int2 => "s",
         ColType::Int8 | ColType::Timestamptz | ColType::Interval | ColType::PgLsn => "d",
-        ColType::Int4 | ColType::Text | ColType::Oid | ColType::Xid | ColType::Inet => "i",
+        ColType::Int4
+        | ColType::Text
+        | ColType::Oid
+        | ColType::Xid
+        | ColType::Inet
+        | ColType::Numeric => "i",
         _ => panic!("monitoring relation has an unsupported catalog type"),
     }
 }
@@ -23042,6 +23134,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                 },
                 Datum::Int4(match routine.oid {
+                    2096 => 1,
                     3577 | 3578 => 1,
                     3786 => 3,
                     6212 => 2,
@@ -23122,6 +23215,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     (_, None) => Datum::Null,
                 },
                 match routine.oid {
+                    2096 => Datum::Text("0"),
                     3577 | 3578 => Datum::Text("false"),
                     3786 => Datum::Text("false false false"),
                     1177 | 1179 | 1180 | 2023 | 2030 | 4005 | 4006 | 4007 | 4008 | 4009 => {
@@ -24526,6 +24620,153 @@ fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, S
     });
     if let Some(error) = table_error {
         return Err(error);
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_activity<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_stat_activity", PG_STAT_ACTIVITY_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let current_name = crate::sql::eval::funcs::system::current_user_owned();
+    let current_role = storage.find_role_visible(current_name.as_str(), txid);
+    let see_all = current_role.is_some_and(|role| storage.role(role).attributes_to(txid).superuser);
+    let mut count = 0usize;
+    let mut found_error = None;
+    storage.visit_backends(|activity| {
+        if found_error.is_some() {
+            return;
+        }
+        let database_name = storage
+            .database_slot_by_oid(activity.database, txid)
+            .map(|slot| storage.database_definition(slot, txid).name);
+        let role_name = storage.role_name(usize::from(activity.role), txid);
+        let visible = activity.pid == storage.current_connection_id()
+            || see_all
+            || current_role == Some(usize::from(activity.role));
+        let query = if visible {
+            activity.query.as_str()
+        } else {
+            "<insufficient privilege>"
+        };
+        let encoded = (|| -> Result<&[Datum], SqlError> {
+            let values = [
+                Datum::Oid(activity.database.get() as u32),
+                match database_name {
+                    Some(name) => text(name.as_str(), arena)?,
+                    None => Datum::Null,
+                },
+                Datum::Int4(activity.pid),
+                Datum::Null,
+                Datum::Oid(Storage::role_oid(usize::from(activity.role)) as u32),
+                text(role_name.as_str(), arena)?,
+                text(activity.application_name.as_str(), arena)?,
+                activity.client_addr.map_or(Datum::Null, Datum::Inet),
+                Datum::Null,
+                Datum::Int4(activity.client_port),
+                Datum::Timestamptz(activity.backend_start),
+                activity.xact_start.map_or(Datum::Null, Datum::Timestamptz),
+                activity.query_start.map_or(Datum::Null, Datum::Timestamptz),
+                Datum::Timestamptz(activity.state_change),
+                activity.wait_event_type.map_or(Datum::Null, Datum::Text),
+                activity.wait_event.map_or(Datum::Null, Datum::Text),
+                Datum::Text(activity.state.as_str()),
+                activity
+                    .backend_xid
+                    .map_or(Datum::Null, |xid| Datum::Int4(xid as i32)),
+                Datum::Null,
+                Datum::Null,
+                text(query, arena)?,
+                Datum::Text("client backend"),
+            ];
+            row(&values, arena)
+        })();
+        match encoded {
+            Ok(encoded) => {
+                rows[count] = encoded;
+                count += 1;
+            }
+            Err(error) => found_error = Some(error),
+        }
+    });
+    if let Some(error) = found_error {
+        return Err(error);
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_ssl<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_stat_ssl", PG_STAT_SSL_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    let mut found_error = None;
+    storage.visit_backends(|activity| {
+        if found_error.is_some() {
+            return;
+        }
+        let values = [
+            Datum::Int4(activity.pid),
+            Datum::Bool(activity.ssl),
+            activity.ssl_version.map_or(Datum::Null, Datum::Text),
+            activity.ssl_cipher.map_or(Datum::Null, Datum::Text),
+            activity.ssl_bits.map_or(Datum::Null, Datum::Int4),
+            Datum::Null,
+            Datum::Null,
+            Datum::Null,
+        ];
+        match row(&values, arena) {
+            Ok(encoded) => {
+                rows[count] = encoded;
+                count += 1;
+            }
+            Err(error) => found_error = Some(error),
+        }
+    });
+    if let Some(error) = found_error {
+        return Err(error);
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_database_conflicts<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_stat_database_conflicts",
+        PG_STAT_DATABASE_CONFLICTS_COLUMNS,
+    );
+    let rows = arena
+        .alloc_slice_with(crate::storage::MAX_DATABASES, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for slot in 0..crate::storage::MAX_DATABASES {
+        let database = storage.database(slot);
+        if !database.visible_to(txid) {
+            continue;
+        }
+        rows[count] = row(
+            &[
+                Datum::Oid(database.oid.get() as u32),
+                text(database.definition_for(txid).name.as_str(), arena)?,
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+            ],
+            arena,
+        )?;
+        count += 1;
     }
     finish(definition, &rows[..count], arena)
 }

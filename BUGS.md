@@ -30,6 +30,19 @@ catalogs. The discovered foreign/partitioned-parent statistics leakage, failed
 function-call accounting, nullable shared-reset behavior, and fixed
 `pg_attribute` row ceiling are fixed in the same change.
 
+The review additionally covers PostgreSQL 18 system-relation identity and
+attribute metadata, prepared-statement descriptors, compatibility role views,
+replication origins, wait events, extended-statistics views, and installed
+time-zone catalogs. The discovered catalog OID/width drift, duplicate
+large-object rows, catalog pseudo-type persistence-code collision, incorrect
+`typbyval` inference, non-TZif metadata ingestion, truncated-MCV base-frequency
+calculation, allocating MCV tie sort, and replication-origin commit-LSN replay
+defects are fixed in the same change. Expanding the catalog exposed an undersized
+default SQL arena that rejected ordinary pgJDBC and pgx introspection; the
+startup-fixed default now covers that complete working set. Exact MCV base
+frequencies and subscription origin positions are covered through WAL,
+checkpoint, and cold recovery.
+
 Record only a genuinely intractable or externally blocked defect here. A row must include a stable ID, a reproducer, and the reason it cannot be fixed now. Fixable work belongs in the same change that finds it; fixed-bug history belongs in git history and pull requests.
 
 | ID | Status | Found | Description | Repro | Blocker |

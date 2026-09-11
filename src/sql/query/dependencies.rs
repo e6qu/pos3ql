@@ -1359,7 +1359,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         }
         match entry {
             super::scope::ResolvedColumn::Table(table, column) => {
-                Some(scope.defs[table]?.columns()[column].type_mod)
+                Some(scope.defs[table]?.columns[column].type_mod)
             }
             _ => None,
         }
@@ -1993,7 +1993,7 @@ fn record_relation_column_references<'a>(
                     source.columns[column] = table
                         .col_alias
                         .and_then(|aliases| aliases.get(column).copied())
-                        .unwrap_or(definition.columns()[column].name.as_str());
+                        .unwrap_or(definition.columns[column].name.as_str());
                 }
             }
             ResolvedRelation::View(slot) => {

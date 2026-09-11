@@ -2038,6 +2038,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
     match ct {
         ColType::Void | ColType::Internal => Datum::Null,
         ColType::PgDdlCommand => Datum::PgDdlCommand,
+        ColType::AnyArray => Datum::Null,
         // An empty record: enough for coerce_unknown to leave values alone.
         ColType::Record => Datum::Record(&[]),
         // A named composite is not an anonymous record: even an empty
@@ -2251,7 +2252,7 @@ impl crate::sql::exec::ColTypeResolver for ScopeAndOuterCols<'_, '_, '_, '_> {
         }
         match entry {
             crate::sql::query::scope::ResolvedColumn::Table(table, column) => {
-                Some(self.scope.defs[table]?.columns()[column].type_mod)
+                Some(self.scope.defs[table]?.columns[column].type_mod)
             }
             crate::sql::query::scope::ResolvedColumn::Merged(_) => None,
         }

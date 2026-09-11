@@ -28,9 +28,9 @@ pub struct Config {
     /// Per-connection arena for parsing/planning one statement; reset after
     /// every statement. Sized to hold the working set of real driver
     /// introspection queries: pgJDBC/ORM `DatabaseMetaData` calls join eight
-    /// or more `pg_catalog` relations at once, and each relation's `TableDef`
-    /// (a fixed 64-column array) is copied into this arena while the query is
-    /// planned, so a single such query legitimately draws several hundred KiB.
+    /// or more complete PostgreSQL 18 `pg_catalog` relations at once. Catalog
+    /// rows and their fixed-width `TableDef` values are statement-owned, so a
+    /// single such query legitimately draws several MiB.
     pub sql_arena_bytes: usize,
     /// Shared execution arena for materializing a single query's rows
     /// (ORDER BY / DISTINCT / GROUP BY buffers). Single-threaded execution
@@ -205,7 +205,7 @@ impl Config {
             password: String::new(),
             conn_recv_buffer_bytes: 64 * KIB,
             conn_send_buffer_bytes: 64 * KIB,
-            sql_arena_bytes: MIB,
+            sql_arena_bytes: 4 * MIB,
             work_arena_bytes: 64 * MIB,
             max_prepared: 64,
             prepared_bytes: 8 * KIB,

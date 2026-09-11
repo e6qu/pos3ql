@@ -839,18 +839,18 @@ fn indexed_candidates<'a>(
     }
     let target_type = scope.defs[0]
         .expect("physical table has definition")
-        .columns()[column]
+        .columns[column]
         .ctype;
     let target_collation = scope.defs[0]
         .expect("physical table has definition")
-        .columns()[column]
+        .columns[column]
         .collation;
     let statistics = storage.table_statistics(slot, txid);
     let expected_rows = if statistics.valid && statistics.columns[column].valid {
         let distinct = crate::storage::column_distinct_estimate(
             &scope.defs[0]
                 .expect("physical table has definition")
-                .columns()[column],
+                .columns[column],
             statistics.columns[column],
             statistics.rows,
             false,
@@ -1022,13 +1022,13 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
         match self.scope.find_column(qualifier, name).ok() {
             Some(ResolvedColumn::Table(table, column)) => self.scope.defs[table]
-                .and_then(|definition| definition.columns().get(column))
+                .and_then(|definition| definition.columns.get(column))
                 .map(|column| column.collation)
                 .unwrap_or(crate::sql::ast::Collation::None),
             Some(ResolvedColumn::Merged(merged)) => self.scope.merged[merged].parts
                 [..self.scope.merged[merged].n_parts]
                 .first()
-                .and_then(|&(table, column)| self.scope.defs[table]?.columns().get(column))
+                .and_then(|&(table, column)| self.scope.defs[table]?.columns.get(column))
                 .map(|column| column.collation)
                 .unwrap_or(crate::sql::ast::Collation::None),
             None => crate::sql::ast::Collation::None,
@@ -1046,8 +1046,9 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
         match self.scope.find_column(qualifier, name).ok()? {
-            ResolvedColumn::Table(t, c) => self.scope.defs[t]
-                .and_then(|def| def.columns().get(c).and_then(|col| col.user_type)),
+            ResolvedColumn::Table(t, c) => {
+                self.scope.defs[t].and_then(|def| def.columns.get(c).and_then(|col| col.user_type))
+            }
             // A USING/NATURAL-merged column carries no single domain identity.
             ResolvedColumn::Merged(_) => None,
         }
@@ -1816,10 +1817,10 @@ fn hash_join_keys<'a>(
         } else {
             continue;
         };
-        let pt = scope.defs[probe_t].expect("resolved").columns()[probe_col].ctype;
-        let bt = scope.defs[build_t].expect("resolved").columns()[build_col].ctype;
-        let probe_collation = scope.defs[probe_t].expect("resolved").columns()[probe_col].collation;
-        let build_collation = scope.defs[build_t].expect("resolved").columns()[build_col].collation;
+        let pt = scope.defs[probe_t].expect("resolved").columns[probe_col].ctype;
+        let bt = scope.defs[build_t].expect("resolved").columns[build_col].ctype;
+        let probe_collation = scope.defs[probe_t].expect("resolved").columns[probe_col].collation;
+        let build_collation = scope.defs[build_t].expect("resolved").columns[build_col].collation;
         if probe_collation != build_collation {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::COLLATION_MISMATCH,
@@ -1928,7 +1929,7 @@ pub(crate) fn select_hash_join_plan<'a>(
     let mut key_collations = [Collation::None; 8];
     for (index, &(probe_column, _)) in keys.iter().take(key_count).enumerate() {
         key_collations[index] =
-            scope.defs[probe_table].expect("resolved").columns()[probe_column].collation;
+            scope.defs[probe_table].expect("resolved").columns[probe_column].collation;
     }
     Ok(Some(HashJoinPlan {
         probe_table,

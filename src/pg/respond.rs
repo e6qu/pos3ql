@@ -151,6 +151,7 @@ fn write_wire_text(value: &Datum, out: &mut dyn FnMut(&[u8])) {
         }
     }
     match value {
+        Datum::Char(0) => {}
         Datum::Char(byte) => out(&[*byte]),
         Datum::Xml(text) => crate::sql::xml::write_output(text, |part| out(part.as_bytes())),
         Datum::Array { element, raw } => write_wire_array(*element, raw, out),
@@ -309,7 +310,7 @@ fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usiz
     match value {
         Datum::Null => 0,
         Datum::PgDdlCommand => unreachable!("pg_ddl_command output is rejected before encoding"),
-        Datum::Char(_) => 1,
+        Datum::Char(byte) => usize::from(*byte != 0),
         Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => wire_text_len(value),
         Datum::Xml(_) => wire_text_len(value),
         Datum::Text(text)
@@ -1078,8 +1079,10 @@ impl<'b> Responder<'b> {
                     m.bytes(s.as_bytes());
                 }
                 Datum::Char(byte) => {
-                    m.i32(1);
-                    m.u8(*byte);
+                    m.i32(i32::from(*byte != 0));
+                    if *byte != 0 {
+                        m.u8(*byte);
+                    }
                 }
                 Datum::Xml(_) => {
                     m.field(|m| {
@@ -1223,6 +1226,7 @@ impl<'b> Responder<'b> {
                     "cannot display a value of type pg_ddl_command"
                 ));
             }
+            Datum::Char(0) => &[],
             Datum::Char(byte) => arena.alloc_slice_copy(&[*byte]).map_err(|_| full())?,
             Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
                 let len = wire_text_len(v);
@@ -2116,6 +2120,24 @@ mod tests {
         Responder::encode_value_binary(&mut binary, &Datum::Char(0xff));
         binary.finish().unwrap();
         assert_eq!(buffer.readable(), &[b'd', 0, 0, 0, 9, 0, 0, 0, 1, 0xff]);
+
+        // PostgreSQL's charout() treats the zero sentinel as an empty C
+        // string, while charsend() still transmits its one-byte representation.
+        buffer.clear();
+        let mut text = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_text(
+            &mut text,
+            &Datum::Char(0),
+            crate::sql::guc::RenderContext::default(),
+        );
+        text.finish().unwrap();
+        assert_eq!(buffer.readable(), &[b'd', 0, 0, 0, 8, 0, 0, 0, 0]);
+
+        buffer.clear();
+        let mut binary = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(&mut binary, &Datum::Char(0));
+        binary.finish().unwrap();
+        assert_eq!(buffer.readable(), &[b'd', 0, 0, 0, 9, 0, 0, 0, 1, 0]);
     }
 
     #[test]

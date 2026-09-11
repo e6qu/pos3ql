@@ -5,6 +5,7 @@ pub mod acl;
 pub mod array;
 pub mod ast;
 pub mod catalog;
+mod catalog_metadata;
 pub mod copy;
 pub mod cursor;
 pub mod datetime;
@@ -5266,6 +5267,18 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        let subscription_advance_count = txn.subscription_advances().len() as u64;
+        let (staged_record_count, _) = self.wal.stage_stats(txn.txid);
+        // finish_stage assigns every already-staged record, every advance,
+        // and the COMMIT boundary after the current provisional LSN. A fresh
+        // stage also acquires its implicit database-scope record.
+        let subscription_origin_lsn = self
+            .storage
+            .lsn()
+            .checked_add(staged_record_count.max(1))
+            .and_then(|lsn| lsn.checked_add(subscription_advance_count.saturating_mul(2)))
+            .and_then(|lsn| lsn.checked_add(1))
+            .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted"))?;
         for advance in txn.subscription_advances() {
             let lsn = self.storage.lsn() + 1;
             if let Err(error) = self.wal.stage(
@@ -5276,6 +5289,7 @@ impl Engine {
                     created_at: advance.stream().created_at(),
                     definition_generation: advance.stream().definition_generation(),
                     confirmed_lsn: advance.confirmed_lsn(),
+                    local_lsn: subscription_origin_lsn,
                 },
             ) {
                 self.rollback_txn(txn, guc);
@@ -5332,6 +5346,12 @@ impl Engine {
                 return Err(error);
             }
         };
+        if subscription_advance_count != 0 {
+            debug_assert_eq!(
+                subscription_origin_lsn, commit_lsn,
+                "subscription origin WAL must name its transaction commit LSN"
+            );
+        }
         self.storage.set_lsn(commit_lsn);
         // Publication accepted every staged absolute sequence position.
         // Clear retry markers only now: a staging or journal-capacity error
@@ -5873,7 +5893,7 @@ impl Engine {
             }
         }
         for &advance in txn.subscription_advances() {
-            self.storage.apply_subscription_advance(advance);
+            self.storage.apply_subscription_advance(advance, commit_lsn);
         }
         let mut index_result = Ok(());
         for &(table, rewrote_rows) in &altered_tables[..altered_count] {
@@ -7707,12 +7727,15 @@ impl Engine {
         Ok(Ok(()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn execute_prepare_statement(
         &mut self,
         name: &str,
         sql: &str,
         param_types: &[&str],
         sqlprep: &mut SqlPreparedPool,
+        arena: &Arena,
+        txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let mut types = [ColType::Bool; parser::MAX_LIST];
@@ -7725,7 +7748,83 @@ impl Engine {
             };
             types[index] = ctype;
         }
-        match sqlprep.store(name, sql, &types[..param_types.len()]) {
+        let mut parser = match Parser::new(sql, arena) {
+            Ok(parser) => parser,
+            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+        };
+        let statement = match parser.next_stmt() {
+            Ok(Some(statement)) => statement,
+            Ok(None) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "prepared statement has no query"
+                )));
+            }
+            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+        };
+        match parser.next_stmt() {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "prepared statement must contain exactly one statement"
+                )));
+            }
+            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+        }
+        let statement = match arena.alloc(statement) {
+            Ok(statement) => &*statement,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement too large for SQL arena"
+                )));
+            }
+        };
+        let mut result_columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let described = match statement {
+            Stmt::Select(select) => query::expand_ctes(select, &self.storage, txn.txid, arena)
+                .and_then(|select| {
+                    query::describe_select(
+                        select,
+                        &self.storage,
+                        txn.txid,
+                        arena,
+                        &mut result_columns,
+                    )
+                }),
+            Stmt::SetQuery(query) => query::describe_set_query(
+                &self.storage,
+                txn.txid,
+                query,
+                &mut result_columns,
+                arena,
+            ),
+            Stmt::With { statement, .. } => {
+                self.describe_data_modification_columns(statement, arena, txn, &mut result_columns)
+            }
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+                self.describe_data_modification_columns(statement, arena, txn, &mut result_columns)
+            }
+            _ => Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "utility statements cannot be prepared"
+            )),
+        };
+        let result_count = match described {
+            Ok(count) => count,
+            Err(error) => return Ok(Err(error)),
+        };
+        let mut result_types = [0i32; MAX_PROJ];
+        for (target, column) in result_types.iter_mut().zip(&result_columns[..result_count]) {
+            *target = column.type_oid;
+        }
+        match sqlprep.store(
+            name,
+            sql,
+            &types[..param_types.len()],
+            &result_types[..result_count],
+        ) {
             Ok(()) => {
                 responder.command_complete("PREPARE")?;
                 Ok(Ok(()))
@@ -9368,53 +9467,41 @@ impl Engine {
         }
     }
 
-    fn describe_data_modification(
-        &self,
-        statement: &Stmt,
-        arena: &Arena,
+    fn describe_data_modification_columns<'a>(
+        &'a self,
+        statement: &'a Stmt<'a>,
+        arena: &'a Arena,
         txn: &TxnState,
-        responder: &mut Responder,
-    ) -> Result<bool, WireFull> {
+        columns: &mut [ColDesc<'a>],
+    ) -> Result<usize, SqlError> {
         if let Stmt::Merge(merge) = statement {
             if merge.returning.is_empty() {
-                responder.no_data()?;
-                return Ok(true);
+                return Ok(0);
             }
-            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-            return match exec::describe_merge_returning(
-                &self.storage,
-                txn.txid,
-                merge,
-                arena,
-                &mut columns,
-            ) {
-                Ok(count) => {
-                    responder.row_description(&columns[..count])?;
-                    Ok(true)
-                }
-                Err(error) => {
-                    responder.error(error.sqlstate, error.message.as_str())?;
-                    Ok(false)
-                }
-            };
+            return exec::describe_merge_returning(&self.storage, txn.txid, merge, arena, columns);
         }
         let (target, returning, target_alias) = match statement {
-            Stmt::Insert(insert) => (insert.table, insert.returning, None),
-            Stmt::Update(update) => (update.table, update.returning, update.alias),
-            Stmt::Delete(delete) => (delete.table, delete.returning, delete.alias),
-            _ => {
-                responder.no_data()?;
-                return Ok(true);
+            Stmt::Insert(insert) => {
+                let insert = *insert;
+                (insert.table, insert.returning, None)
             }
+            Stmt::Update(update) => {
+                let update = *update;
+                (update.table, update.returning, update.alias)
+            }
+            Stmt::Delete(delete) => {
+                let delete = *delete;
+                (delete.table, delete.returning, delete.alias)
+            }
+            _ => return Ok(0),
         };
         if returning.is_empty() {
-            responder.no_data()?;
-            return Ok(true);
+            return Ok(0);
         }
         let (target, returning, target_alias) =
             match query::resolve_view_for_dml(&self.storage, target, txn.txid, arena) {
                 Ok(Some(view)) => {
-                    let rewritten = match query::rewrite_view_dml(
+                    let rewritten = query::rewrite_view_dml(
                         statement,
                         target.name,
                         view.base.name,
@@ -9424,13 +9511,7 @@ impl Engine {
                         &self.storage,
                         txn.txid,
                         arena,
-                    ) {
-                        Ok(rewritten) => rewritten,
-                        Err(error) => {
-                            responder.error(error.sqlstate, error.message.as_str())?;
-                            return Ok(false);
-                        }
-                    };
+                    )?;
                     let (returning, target_alias) = match rewritten {
                         Stmt::Insert(insert) => (insert.returning, None),
                         Stmt::Update(update) => (update.returning, update.alias),
@@ -9440,30 +9521,35 @@ impl Engine {
                     (view.base, returning, target_alias)
                 }
                 Ok(None) => (target, returning, target_alias),
-                Err(error) => {
-                    responder.error(error.sqlstate, error.message.as_str())?;
-                    return Ok(false);
-                }
+                Err(error) => return Err(error),
             };
-        let table_index = match exec::resolve_dml_table(&self.storage, &target, txn.txid) {
-            Ok(table_index) => table_index,
-            Err(error) => {
-                responder.error(error.sqlstate, error.message.as_str())?;
-                return Ok(false);
-            }
-        };
-        let definition = *self.storage.table_def(table_index, txn.txid);
-        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match exec::describe_returning_items(
+        let table_index = exec::resolve_dml_table(&self.storage, &target, txn.txid)?;
+        let definition = self.storage.table_def(table_index, txn.txid);
+        exec::describe_returning_items(
             returning,
-            Some(&definition),
+            Some(definition),
             target_alias,
             Some(&self.storage),
             txn.txid,
-            &mut columns,
-        ) {
+            columns,
+        )
+    }
+
+    fn describe_data_modification<'a>(
+        &'a self,
+        statement: &'a Stmt<'a>,
+        arena: &'a Arena,
+        txn: &TxnState,
+        responder: &mut Responder,
+    ) -> Result<bool, WireFull> {
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        match self.describe_data_modification_columns(statement, arena, txn, &mut columns) {
             Ok(count) => {
-                responder.row_description(&columns[..count])?;
+                if count == 0 {
+                    responder.no_data()?;
+                } else {
+                    responder.row_description(&columns[..count])?;
+                }
                 Ok(true)
             }
             Err(error) => {
@@ -9503,7 +9589,17 @@ impl Engine {
                 return Ok(false);
             }
         };
-        match &statement {
+        let statement = match arena.alloc(statement) {
+            Ok(statement) => &*statement,
+            Err(_) => {
+                responder.error(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement too large for SQL arena",
+                )?;
+                return Ok(false);
+            }
+        };
+        match statement {
             Stmt::Explain { .. } => {
                 responder.row_description(&[ColDesc::new("QUERY PLAN", types::oid::TEXT, -1)])?;
                 Ok(true)
@@ -9512,7 +9608,7 @@ impl Engine {
                 self.describe_data_modification(statement, arena, txn, responder)
             }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                self.describe_data_modification(&statement, arena, txn, responder)
+                self.describe_data_modification(statement, arena, txn, responder)
             }
             Stmt::Select(s) => {
                 // Describe the CTE-expanded query so derived columns resolve.
@@ -13146,6 +13242,7 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         let prior_origin = txn.enter_ddl_origin();
         let _active_cursors = cursor::enter_active(cursors as *mut _ as *const _);
+        let _active_prepared = prep::enter_active(sqlprep as *mut _ as *const _);
         let result = self.execute_stmt_with_workspace(
             statement,
             arena,
@@ -15784,7 +15881,15 @@ impl Engine {
                 name,
                 sql,
                 param_types,
-            } => self.execute_prepare_statement(name, sql, param_types, sqlprep, responder),
+            } => self.execute_prepare_statement(
+                name,
+                sql,
+                param_types,
+                sqlprep,
+                arena,
+                txn,
+                responder,
+            ),
             Stmt::ExecutePrepared { name, args } => {
                 let Some(text) = sqlprep.get(name) else {
                     return Ok(Err(SqlError {
@@ -15858,17 +15963,20 @@ impl Engine {
                     }
                 };
                 match inner.next_stmt() {
-                    Ok(Some(statement)) => self.execute_stmt(
-                        &statement,
-                        arena,
-                        &inner_params[..args.len()],
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        exec::PlpgsqlTransactionContext::Atomic,
-                        responder,
-                    ),
+                    Ok(Some(statement)) => {
+                        sqlprep.record_custom_plan(name);
+                        self.execute_stmt(
+                            &statement,
+                            arena,
+                            &inner_params[..args.len()],
+                            txn,
+                            sqlprep,
+                            cursors,
+                            guc,
+                            exec::PlpgsqlTransactionContext::Atomic,
+                            responder,
+                        )
+                    }
                     Ok(None) => Ok(Ok(())),
                     Err(e) => Ok(Err(SqlError {
                         sqlstate: SqlState::known(sqlstate::SYNTAX_ERROR),
@@ -19493,6 +19601,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             created_at,
             definition_generation,
             confirmed_lsn,
+            local_lsn,
         } => {
             let (slot, _) = storage.subscription(name, 0).ok_or_else(|| {
                 sql_err!(
@@ -19514,7 +19623,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     )
                 })?;
             if let Some(advance) = storage.subscription_advance(stream, confirmed_lsn, 0)? {
-                storage.apply_subscription_advance(advance);
+                storage.apply_subscription_advance(
+                    advance,
+                    if local_lsn == 0 { lsn } else { local_lsn },
+                );
             }
         }
         WalOp::SetSubscriptionEnabled { name, enabled } => {

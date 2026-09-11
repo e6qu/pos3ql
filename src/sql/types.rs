@@ -336,6 +336,9 @@ pub enum ColType {
     /// Opaque event-trigger command state. It is observable only for nullness;
     /// PostgreSQL rejects attempts to display or store it.
     PgDdlCommand,
+    /// Polymorphic `anyarray`, used only for null-bearing catalog columns.
+    /// Concrete values must resolve to an actual array type before execution.
+    AnyArray,
     Bool,
     /// `smallint`/`int2`. A real i16 datum with PostgreSQL's OID 21 and
     /// two-byte binary wire representation.
@@ -577,8 +580,9 @@ impl BtreeOperatorClass {
             TsVector => Self::TsVector,
             Uuid => Self::Uuid,
             Bit { varying: true } => Self::Varbit,
-            Void | Internal | PgDdlCommand | Int2Vector | OidVector | PgNodeTree | PgNdistinct
-            | PgDependencies | PgMcvList | PgStatisticArray | Json | Xml | Jsonpath => {
+            Void | Internal | PgDdlCommand | AnyArray | Int2Vector | OidVector | PgNodeTree
+            | PgNdistinct | PgDependencies | PgMcvList | PgStatisticArray | Json | Xml
+            | Jsonpath => {
                 return None;
             }
         })
@@ -802,7 +806,7 @@ impl ColType {
     pub const fn is_pseudo(self) -> bool {
         matches!(
             self,
-            Self::Void | Self::Internal | Self::PgDdlCommand | Self::Record
+            Self::Void | Self::Internal | Self::PgDdlCommand | Self::AnyArray | Self::Record
         )
     }
 
@@ -819,6 +823,47 @@ impl ColType {
                 | Self::Regconfig
                 | Self::Regdictionary
                 | Self::Regcollation
+        )
+    }
+
+    /// PostgreSQL's `typbyval` storage contract on the 64-bit targets this
+    /// server supports. Keep this property with the type rather than
+    /// reconstructing it from `typlen`: fixed-width values such as `tid`,
+    /// `uuid`, `interval`, and `timetz` are nevertheless passed by reference.
+    pub const fn is_pass_by_value(self) -> bool {
+        matches!(
+            self,
+            Self::Void
+                | Self::Internal
+                | Self::Bool
+                | Self::Char
+                | Self::Int2
+                | Self::Int4
+                | Self::Oid
+                | Self::Xid
+                | Self::Xid8
+                | Self::Cid
+                | Self::Regtype
+                | Self::Regproc
+                | Self::Regprocedure
+                | Self::Regoper
+                | Self::Regoperator
+                | Self::Regclass
+                | Self::Regnamespace
+                | Self::Regrole
+                | Self::Regconfig
+                | Self::Regdictionary
+                | Self::Regcollation
+                | Self::Int8
+                | Self::Float4
+                | Self::Float8
+                | Self::Date
+                | Self::Timestamp
+                | Self::Timestamptz
+                | Self::Time
+                | Self::PgLsn
+                | Self::Money
+                | Self::Enum(_)
         )
     }
 
@@ -841,6 +886,7 @@ impl ColType {
             "void" => Self::Void,
             "internal" => Self::Internal,
             "pg_ddl_command" => Self::PgDdlCommand,
+            "anyarray" => Self::AnyArray,
             "int2vector" => Self::Int2Vector,
             "oidvector" => Self::OidVector,
             "bool" | "boolean" => Self::Bool,
@@ -907,6 +953,7 @@ impl ColType {
             Self::Void => oid::VOID,
             Self::Internal => oid::INTERNAL,
             Self::PgDdlCommand => oid::PG_DDL_COMMAND,
+            Self::AnyArray => oid::ANYARRAY,
             Self::Bool => oid::BOOL,
             Self::Int2 => oid::INT2,
             Self::Int2Vector => oid::INT2VECTOR,
@@ -986,6 +1033,7 @@ impl ColType {
             oid::VOID => Some(Self::Void),
             oid::INTERNAL => Some(Self::Internal),
             oid::PG_DDL_COMMAND => Some(Self::PgDdlCommand),
+            oid::ANYARRAY => Some(Self::AnyArray),
             oid::BOOL => Some(Self::Bool),
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
@@ -1114,6 +1162,7 @@ impl ColType {
         match self {
             Self::Void | Self::Internal => 4,
             Self::PgDdlCommand => 8,
+            Self::AnyArray => -1,
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
             Self::Tid => 6,
@@ -1223,6 +1272,7 @@ impl ColType {
             Self::Void => "void",
             Self::Internal => "internal",
             Self::PgDdlCommand => "pg_ddl_command",
+            Self::AnyArray => "anyarray",
             Self::Bool => "bool",
             Self::Int2 => "int2",
             Self::Int2Vector => "int2vector",
@@ -1310,6 +1360,7 @@ impl ColType {
             Self::Void => "void",
             Self::Internal => "internal",
             Self::PgDdlCommand => "pg_ddl_command",
+            Self::AnyArray => "anyarray",
             Self::Bool => "boolean",
             Self::Int2 => "smallint",
             Self::Int2Vector => "int2vector",
@@ -1391,6 +1442,9 @@ impl ColType {
             Self::Void => 57,
             Self::Internal => 73,
             Self::PgDdlCommand => 75,
+            // Catalog pseudo-types are transient and share Record's loud,
+            // deliberately undecodable persistence sentinel.
+            Self::AnyArray => 46,
             Self::Char => 74,
             Self::Bool => 1,
             Self::Int4 => 2,
@@ -3339,6 +3393,7 @@ impl fmt::Display for Datum<'_> {
             // Direct protocol and COPY output bypass `Display` so an
             // arbitrary byte remains arbitrary there. `Display` is used only
             // by SQL text construction, which must stay valid UTF-8.
+            Datum::Char(0) => Ok(()),
             Datum::Char(value) => f.write_char(char::from(*value)),
             // The output function emits the padding — psql shows `hi   `.
             Datum::Text(s)

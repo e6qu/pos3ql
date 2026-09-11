@@ -132,6 +132,13 @@ impl PosixZone {
         }
     }
 
+    pub(crate) fn resolve_info(&self, utc: i64) -> (i32, StackStr<8>, bool) {
+        match self.dst {
+            Some(dst) if self.in_dst(utc, dst) => (self.dst_off, self.dst_abbrev, true),
+            _ => (self.std_off, self.std_abbrev, false),
+        }
+    }
+
     fn in_dst(&self, utc: i64, d: Dst) -> bool {
         // Determine the local year from the standard-time projection.
         let local = utc + self.std_off as i64 * 1_000_000;

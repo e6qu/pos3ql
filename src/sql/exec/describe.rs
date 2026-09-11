@@ -495,22 +495,8 @@ impl ColTypeResolver for CatalogCols<'_> {
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        if let Some((field, type_oid, ctype)) =
-            crate::sql::catalog::intrinsic_record_field(name, arguments, index)
-        {
-            return Some((
-                crate::util::StackStr::from_str(field),
-                StaticTypeMeta {
-                    type_oid,
-                    ctype,
-                    type_mod: -1,
-                    collation: if ctype.is_collatable() {
-                        crate::sql::ast::Collation::Default
-                    } else {
-                        crate::sql::ast::Collation::None
-                    },
-                },
-            ));
+        if let Some(field) = intrinsic_record_field_meta(name, arguments, index) {
+            return Some(field);
         }
         let slot = if argument_names.is_empty() {
             if variadic {
@@ -1140,6 +1126,28 @@ impl StaticTypeMeta {
             collation: crate::sql::ast::Collation::None,
         }
     }
+}
+
+pub(crate) fn intrinsic_record_field_meta(
+    name: &str,
+    arguments: &[i32],
+    index: usize,
+) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+    let (field, type_oid, ctype) =
+        crate::sql::catalog::intrinsic_record_field(name, arguments, index)?;
+    Some((
+        crate::util::StackStr::from_str(field),
+        StaticTypeMeta {
+            type_oid,
+            ctype,
+            type_mod: -1,
+            collation: if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        },
+    ))
 }
 
 /// Resolves a column reference's type during static analysis. Returns an

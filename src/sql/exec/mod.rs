@@ -434,7 +434,7 @@ pub use describe::{
 };
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
-    infer_type_catalog, routine_result_metadata, unify_numeric_tower,
+    infer_type_catalog, intrinsic_record_field_meta, routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 

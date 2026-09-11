@@ -3822,9 +3822,21 @@ impl StoredQueryDependencies {
         }
     }
 
-    pub fn rename(&mut self, class: DependencyClass, slot: usize, schema: SqlName, name: SqlName) {
+    pub fn rename(
+        &mut self,
+        class: DependencyClass,
+        slot: usize,
+        old_identity: Option<(SqlName, SqlName)>,
+        schema: SqlName,
+        name: SqlName,
+    ) {
         for entry in &mut self.entries[..self.len as usize] {
-            if entry.class == class && entry.slot as usize == slot {
+            let serialized_match = entry.slot == u16::MAX
+                && old_identity.is_some_and(|(old_schema, old_name)| {
+                    entry.schema == old_schema && entry.name == old_name
+                });
+            if entry.class == class && (entry.slot as usize == slot || serialized_match) {
+                entry.slot = slot as u16;
                 entry.schema = schema;
                 entry.name = name;
             }
@@ -12359,7 +12371,18 @@ impl Storage {
                         None
                     }
                 },
-                DependencyClass::Collation => self.collation_slot(schema, name, txid),
+                DependencyClass::Collation => {
+                    self.collation_slot(schema, name, txid).or_else(|| {
+                        let slot = usize::from(dependency.slot);
+                        self.collations
+                            .get(slot)
+                            .is_some_and(|collation| {
+                                collation.database == self.current_database
+                                    && collation.visible_to(txid)
+                            })
+                            .then_some(slot)
+                    })
+                }
                 DependencyClass::TextSearchConfiguration => self.text_search_slot(
                     crate::sql::ast::TextSearchObjectKind::Configuration,
                     schema,
@@ -12375,13 +12398,19 @@ impl Storage {
                     name
                 )
             })?;
+            let (schema, name) = if dependency.class == DependencyClass::Collation {
+                let definition = self.collations[slot].definition_for(txid);
+                (definition.schema, definition.name)
+            } else {
+                (dependency.schema, dependency.name)
+            };
             rebound.push(StoredQueryDependency {
                 class: dependency.class,
                 slot: slot as u16,
                 identity: dependency.identity,
                 referenced_columns: dependency.referenced_columns,
-                schema: dependency.schema,
-                name: dependency.name,
+                schema,
+                name,
                 referenced_schema: dependency.referenced_schema,
                 referenced_name: dependency.referenced_name,
             })?;
@@ -12437,26 +12466,36 @@ impl Storage {
         &mut self,
         class: DependencyClass,
         slot: usize,
+        old_identity: Option<(SqlName, SqlName)>,
         schema: SqlName,
         name: SqlName,
     ) {
         for rule_slot in 0..self.rules.len() {
             if self.rules[rule_slot].ddl_state != CatalogDdlState::Absent {
-                self.rules[rule_slot]
-                    .definition
-                    .dependencies
-                    .rename(class, slot, schema, name);
+                self.rules[rule_slot].definition.dependencies.rename(
+                    class,
+                    slot,
+                    old_identity,
+                    schema,
+                    name,
+                );
                 if let Some(pending) = &mut self.rules[rule_slot].pending {
                     pending
                         .definition
                         .dependencies
-                        .rename(class, slot, schema, name);
+                        .rename(class, slot, old_identity, schema, name);
                 }
             }
         }
         for matview_slot in 0..self.matviews.len() {
             if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
-                self.matview_dependencies[matview_slot].rename(class, slot, schema, name);
+                self.matview_dependencies[matview_slot].rename(
+                    class,
+                    slot,
+                    old_identity,
+                    schema,
+                    name,
+                );
             }
         }
         for policy in self.policies.iter_mut() {
@@ -12464,23 +12503,31 @@ impl Storage {
                 policy
                     .definition
                     .dependencies
-                    .rename(class, slot, schema, name);
+                    .rename(class, slot, old_identity, schema, name);
                 if let Some(pending) = &mut policy.pending_definition {
                     pending
                         .definition
                         .dependencies
-                        .rename(class, slot, schema, name);
+                        .rename(class, slot, old_identity, schema, name);
                 }
             }
         }
         for routine_slot in 0..self.routines.len() {
             if self.routines[routine_slot].ddl_state != CatalogDdlState::Absent {
-                self.routine_dependencies[routine_slot].rename(class, slot, schema, name);
+                self.routine_dependencies[routine_slot].rename(
+                    class,
+                    slot,
+                    old_identity,
+                    schema,
+                    name,
+                );
             }
         }
         for pending in self.pending_routine_dependencies.iter_mut() {
             if pending.used {
-                pending.dependencies.rename(class, slot, schema, name);
+                pending
+                    .dependencies
+                    .rename(class, slot, old_identity, schema, name);
             }
         }
     }
@@ -24810,7 +24857,7 @@ impl Storage {
         table.tombstones_overflow = false;
         let schema = table.def.schema;
         let name = table.def.name;
-        self.rename_stored_query_dependency(DependencyClass::Table, slot, schema, name);
+        self.rename_stored_query_dependency(DependencyClass::Table, slot, None, schema, name);
         Ok(slot)
     }
 
@@ -27312,6 +27359,7 @@ impl Storage {
                 self.rename_stored_query_dependency(
                     DependencyClass::Sequence,
                     slot,
+                    None,
                     new_schema,
                     new_name,
                 );
@@ -28622,7 +28670,7 @@ impl Storage {
             }
         }
         self.move_routine_type_references(old_schema, old_name, schema, name, |_| true);
-        self.rename_stored_query_dependency(DependencyClass::Domain, slot, schema, name);
+        self.rename_stored_query_dependency(DependencyClass::Domain, slot, None, schema, name);
     }
 
     pub fn drop_domain(
@@ -29099,7 +29147,13 @@ impl Storage {
         self.move_routine_type_references(old_schema, old_name, new_schema, new_name, |ctype| {
             matches!(ctype, ColType::Enum(candidate) | ColType::Array(ArrElem::Enum(candidate)) if candidate as usize == slot)
         });
-        self.rename_stored_query_dependency(DependencyClass::Enum, slot, new_schema, new_name);
+        self.rename_stored_query_dependency(
+            DependencyClass::Enum,
+            slot,
+            None,
+            new_schema,
+            new_name,
+        );
     }
 
     pub fn drop_enum(
@@ -29519,7 +29573,13 @@ impl Storage {
         self.move_routine_type_references(old_schema, old_name, new_schema, new_name, |ctype| {
             matches!(ctype, ColType::Composite(candidate) | ColType::Array(ArrElem::Composite(candidate)) if candidate as usize == slot)
         });
-        self.rename_stored_query_dependency(DependencyClass::Composite, slot, new_schema, new_name);
+        self.rename_stored_query_dependency(
+            DependencyClass::Composite,
+            slot,
+            None,
+            new_schema,
+            new_name,
+        );
     }
 
     fn move_routine_type_references(
@@ -32060,7 +32120,7 @@ impl Storage {
             }
         };
         if let Some((schema, name)) = changed {
-            self.rename_stored_query_dependency(DependencyClass::Routine, slot, schema, name);
+            self.rename_stored_query_dependency(DependencyClass::Routine, slot, None, schema, name);
         }
     }
 
@@ -34917,7 +34977,7 @@ impl Storage {
                 comment.pending_identity = None;
             }
         }
-        self.rename_stored_query_dependency(DependencyClass::Table, index, new_schema, name);
+        self.rename_stored_query_dependency(DependencyClass::Table, index, None, new_schema, name);
     }
 
     /// Removes one foreign key from a table's definition by constraint name
@@ -35036,7 +35096,13 @@ impl Storage {
         }
         self.tables[index].def = def;
         self.tables[index].mark_dirty();
-        self.rename_stored_query_dependency(DependencyClass::Table, index, def.schema, def.name);
+        self.rename_stored_query_dependency(
+            DependencyClass::Table,
+            index,
+            None,
+            def.schema,
+            def.name,
+        );
     }
 
     pub fn next_rowid(&mut self) -> u64 {
@@ -36625,6 +36691,7 @@ impl Storage {
             self.rename_stored_query_dependency(
                 DependencyClass::TextSearchConfiguration,
                 slot,
+                None,
                 definition.schema(),
                 definition.name(),
             );
@@ -36720,6 +36787,7 @@ impl Storage {
                 self.rename_stored_query_dependency(
                     DependencyClass::TextSearchConfiguration,
                     slot,
+                    None,
                     definition.schema(),
                     definition.name(),
                 );
@@ -36847,7 +36915,13 @@ impl Storage {
             self.collations[slot].pending = None;
         }
         if let Some((schema, name)) = changed {
-            self.rename_stored_query_dependency(DependencyClass::Collation, slot, schema, name);
+            self.rename_stored_query_dependency(
+                DependencyClass::Collation,
+                slot,
+                None,
+                schema,
+                name,
+            );
             self.commit_object_comment_identity(
                 CommentClass::Collation,
                 old.schema,
@@ -36995,7 +37069,7 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
-        if self.collations[slot].ddl_state != CatalogDdlState::Absent {
+        let old_identity = if self.collations[slot].ddl_state != CatalogDdlState::Absent {
             let old = self.collations[slot].definition;
             self.replay_object_comment_identity(
                 CommentClass::Collation,
@@ -37004,13 +37078,21 @@ impl Storage {
                 definition.schema,
                 definition.name,
             );
-            self.rename_stored_query_dependency(
-                DependencyClass::Collation,
-                slot,
-                definition.schema,
-                definition.name,
-            );
-        }
+            Some((old.schema, old.name))
+        } else {
+            None
+        };
+        // Checkpoint dependencies deliberately deserialize with an unbound
+        // slot. Match their old durable name during replay, then bind the slot
+        // and new identity together so rename-after-checkpoint survives cold
+        // recovery. A genuine create has no old identity and remains a no-op.
+        self.rename_stored_query_dependency(
+            DependencyClass::Collation,
+            slot,
+            old_identity,
+            definition.schema,
+            definition.name,
+        );
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.collations[slot] = CollationDef {
             database: self.current_database,
@@ -38203,7 +38285,13 @@ impl Storage {
             self.operators[slot].pending = None;
         }
         if let Some((schema, name)) = changed {
-            self.rename_stored_query_dependency(DependencyClass::Operator, slot, schema, name);
+            self.rename_stored_query_dependency(
+                DependencyClass::Operator,
+                slot,
+                None,
+                schema,
+                name,
+            );
         }
     }
 

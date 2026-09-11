@@ -722,6 +722,42 @@ assert cur.fetchone() == (
 cur.execute("DROP SUBSCRIPTION drv_uri_subscription")
 print("subscription URI conninfo extended protocol ok")
 
+# Catalog references cross Parse/Bind/Describe/Execute with their PostgreSQL
+# type identities intact, including the PostgreSQL 18 regcollation pair.
+cur.execute(
+    "CREATE COLLATION public.drv_catalog_collation "
+    "(PROVIDER = libc, LOCALE = 'C')"
+)
+cur.execute(
+    "SELECT to_regcollation(%s), ARRAY[to_regcollation(%s)], "
+    "to_regtype(%s), to_regtypemod(%s)",
+    (
+        "public.drv_catalog_collation",
+        "public.drv_catalog_collation",
+        "varchar(12)",
+        "numeric(10,3)",
+    ),
+)
+assert [column.type_code for column in cur.description] == [4191, 4192, 2206, 23]
+assert cur.fetchone() == (
+    "drv_catalog_collation",
+    ["drv_catalog_collation"],
+    "character varying",
+    655367,
+)
+bcur = conn.cursor(binary=True)
+bcur.execute(
+    "SELECT to_regcollation(%s), ARRAY[to_regcollation(%s)]",
+    ("public.drv_catalog_collation", "public.drv_catalog_collation"),
+)
+assert [column.type_code for column in bcur.description] == [4191, 4192]
+binary_scalar, binary_array = bcur.fetchone()
+assert isinstance(binary_scalar, bytes) and len(binary_scalar) == 4, binary_scalar
+assert binary_array == [binary_scalar], binary_array
+bcur.close()
+cur.execute("DROP COLLATION public.drv_catalog_collation")
+print("catalog reference extended/binary protocol ok")
+
 conn.close()
 observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")
 assert observer_cur.fetchone() == (0,)

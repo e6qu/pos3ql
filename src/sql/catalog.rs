@@ -732,9 +732,81 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 3476,
+        name: "to_regoperator",
+        result_oid: 2204,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3479,
+        name: "to_regprocedure",
+        result_oid: 2202,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3492,
+        name: "to_regoper",
+        result_oid: 2203,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3493,
+        name: "to_regtype",
+        result_oid: 2206,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3494,
+        name: "to_regproc",
+        result_oid: 24,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 3495,
         name: "to_regclass",
         result_oid: 2205,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 4086,
+        name: "to_regnamespace",
+        result_oid: 4089,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 4093,
+        name: "to_regrole",
+        result_oid: 4096,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 4195,
+        name: "to_regcollation",
+        result_oid: 4191,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 6317,
+        name: "to_regtypemod",
+        result_oid: 23,
         argument_types: "25",
         argument_count: 1,
         volatility: "s",
@@ -9533,6 +9605,10 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
             .unwrap_or(0),
         _ => storage
             .find_schema(schema)
+            .or_else(|| {
+                (0..storage.schema_count())
+                    .find(|slot| storage.schema_def(*slot).name.as_str() == schema)
+            })
             .map(namespace_oid_for_slot)
             .unwrap_or(0),
     }
@@ -9601,7 +9677,7 @@ pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Opti
             .or_else(|| {
                 storage
                     .visible_schemas(txid)
-                    .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
+                    .find(|(slot, _)| namespace_oid_for_slot(*slot) == oid)
                     .map(|(_, schema)| schema.name.as_str())
             }),
     }
@@ -9634,6 +9710,54 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
             .find_schema_visible(name, txid)
             .map(namespace_oid_for_slot),
     }
+}
+
+pub(crate) fn schema_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
+    for name in ["public", "pg_catalog", "pg_toast", "pg_temp"] {
+        if identifier_spelling_matches(written, name) {
+            return schema_oid_by_name(storage, txid, name);
+        }
+    }
+    if let Some(name) = (0..storage.table_count())
+        .find_map(|slot| {
+            let table = storage.table_def(slot, txid);
+            (storage.table_slot_visible_to(slot, txid)
+                && table.persistence == crate::storage::RelationPersistence::Temporary
+                && identifier_spelling_matches(written, table.schema.as_str()))
+            .then_some(table.schema)
+        })
+        .or_else(|| {
+            (0..storage.sequence_count()).find_map(|slot| {
+                let sequence = storage.sequence_for(slot, txid);
+                (storage.sequence_slot_visible_to(slot, txid)
+                    && sequence.persistence == crate::storage::RelationPersistence::Temporary
+                    && identifier_spelling_matches(written, sequence.schema.as_str()))
+                .then_some(sequence.schema)
+            })
+        })
+    {
+        return schema_oid_by_name(storage, txid, name.as_str());
+    }
+    storage.visible_schemas(txid).find_map(|(slot, schema)| {
+        identifier_spelling_matches(written, schema.name.as_str())
+            .then_some(namespace_oid_for_slot(slot))
+    })
+}
+
+pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
+    if let Some(oid) = PREDEFINED_ROLES.iter().find_map(|(_, name)| {
+        identifier_spelling_matches(written, name)
+            .then(|| predefined_role_oid(name))
+            .flatten()
+    }) {
+        return Some(oid);
+    }
+    (0..storage.role_count()).find_map(|slot| {
+        let oid = Storage::role_oid(slot);
+        let visible = storage.role_slot_by_oid(oid, txid)?;
+        identifier_spelling_matches(written, storage.role_name(visible, txid).as_str())
+            .then_some(oid)
+    })
 }
 
 /// Index relations get OIDs from a separate range so they never collide with
@@ -10615,7 +10739,7 @@ fn identifier_spelling_matches(written: &str, name: &str) -> bool {
     }
 }
 
-fn split_qualified_routine_name(written: &str) -> Option<(Option<&str>, &str)> {
+pub(crate) fn split_qualified_name(written: &str) -> Option<(Option<&str>, &str)> {
     let written = written.trim();
     let bytes = written.as_bytes();
     let mut quoted = false;
@@ -10650,7 +10774,7 @@ fn split_qualified_routine_name(written: &str) -> Option<(Option<&str>, &str)> {
 }
 
 fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
-    let Some((written_schema, written_name)) = split_qualified_routine_name(written) else {
+    let Some((written_schema, written_name)) = split_qualified_name(written) else {
         return false;
     };
     identifier_spelling_matches(written_name, name)
@@ -11154,7 +11278,7 @@ pub(crate) fn operator_oid_by_name(
     } else {
         (written.trim(), None)
     };
-    let Some((written_schema, written_name)) = split_qualified_routine_name(name) else {
+    let Some((written_schema, written_name)) = split_qualified_name(name) else {
         return Ok(None);
     };
     let ambiguous = || {
@@ -12027,6 +12151,80 @@ pub fn collation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool 
             .any(|(slot, _)| crate::sql::ast::Collation::Catalog(slot as u8).oid() == oid)
 }
 
+pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
+    let (written_schema, written_name) = split_qualified_name(written)?;
+    let builtin = || {
+        crate::sql::ast::Collation::BUILTIN
+            .into_iter()
+            .find(|collation| identifier_spelling_matches(written_name, collation.name()))
+            .map(crate::sql::ast::Collation::oid)
+    };
+    let user = |schema: &str| {
+        storage
+            .collations_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.schema.as_str() == schema
+                    && identifier_spelling_matches(written_name, definition.name.as_str()))
+                .then_some(crate::sql::ast::Collation::Catalog(slot as u8).oid())
+            })
+    };
+    if let Some(schema) = written_schema {
+        if identifier_spelling_matches(schema, "pg_catalog") {
+            return builtin();
+        }
+        let schema = (0..storage.schema_count()).find_map(|slot| {
+            let definition = storage.schema_def(slot);
+            (definition.visible_to(txid)
+                && identifier_spelling_matches(schema, definition.name.as_str()))
+            .then_some(definition.name)
+        })?;
+        return user(schema.as_str());
+    }
+    for entry in storage.path().entries() {
+        let found = match entry {
+            crate::storage::PathEntry::Catalog => builtin(),
+            crate::storage::PathEntry::Schema(slot) => {
+                user(storage.schema_def(usize::from(*slot)).name.as_str())
+            }
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+pub(crate) fn collation_name_by_oid<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use core::fmt::Write;
+    let mut rendered = StackStr::<256>::new();
+    if let Some(collation) = crate::sql::ast::Collation::BUILTIN
+        .into_iter()
+        .find(|collation| collation.oid() == oid)
+    {
+        write_identifier(&mut rendered, collation.name());
+        return alloc_rendered(&rendered, "collation name is too long", arena).map(Some);
+    }
+    let Some((slot, definition)) = storage
+        .collations_visible_to(txid)
+        .find(|(slot, _)| crate::sql::ast::Collation::Catalog(*slot as u8).oid() == oid)
+    else {
+        return Ok(None);
+    };
+    let visible_unqualified = storage.resolve_collation(None, definition.name.as_str(), txid)
+        == Some(crate::sql::ast::Collation::Catalog(slot as u8));
+    if !visible_unqualified {
+        write_identifier(&mut rendered, definition.schema.as_str());
+        let _ = rendered.write_char('.');
+    }
+    write_identifier(&mut rendered, definition.name.as_str());
+    alloc_rendered(&rendered, "collation name is too long", arena).map(Some)
+}
+
 pub fn relation_oid_is_publishable(storage: &Storage, txid: u32, oid: i32) -> bool {
     (0..storage.table_count()).any(|slot| {
         storage.table_slot_visible_to(slot, txid)
@@ -12641,6 +12839,7 @@ pub fn builtin_type_identity(name: &str, allow_aliases: bool) -> Option<(&'stati
         "regrole" => Some(("regrole", oid::REGROLE)),
         "regconfig" => Some(("regconfig", oid::REGCONFIG)),
         "regdictionary" => Some(("regdictionary", oid::REGDICTIONARY)),
+        "regcollation" => Some(("regcollation", oid::REGCOLLATION)),
         "fdw_handler" => Some(("fdw_handler", oid::FDW_HANDLER)),
         _ => None,
     };
@@ -19541,6 +19740,62 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             "a",
             "f",
         ),
+        (
+            10081,
+            super::types::oid::OID,
+            super::types::oid::REGCOLLATION,
+            0,
+            "i",
+            "b",
+        ),
+        (
+            10082,
+            super::types::oid::REGCOLLATION,
+            super::types::oid::OID,
+            0,
+            "i",
+            "b",
+        ),
+        (
+            10083,
+            super::types::oid::INT8,
+            super::types::oid::REGCOLLATION,
+            1287,
+            "i",
+            "f",
+        ),
+        (
+            10084,
+            super::types::oid::INT2,
+            super::types::oid::REGCOLLATION,
+            313,
+            "i",
+            "f",
+        ),
+        (
+            10085,
+            super::types::oid::INT4,
+            super::types::oid::REGCOLLATION,
+            0,
+            "i",
+            "b",
+        ),
+        (
+            10086,
+            super::types::oid::REGCOLLATION,
+            super::types::oid::INT8,
+            1288,
+            "a",
+            "f",
+        ),
+        (
+            10087,
+            super::types::oid::REGCOLLATION,
+            super::types::oid::INT4,
+            0,
+            "a",
+            "b",
+        ),
     ];
     for (index, (oid, source, target, function, context, method)) in builtin.into_iter().enumerate()
     {
@@ -23654,6 +23909,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Regrole,
         ColType::Regconfig,
         ColType::Regdictionary,
+        ColType::Regcollation,
         ColType::Int8,
         ColType::Float4,
         ColType::Float8,
@@ -23714,7 +23970,18 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::Float4
         | ColType::Float8
         | ColType::Numeric
-        | ColType::Money => "N",
+        | ColType::Money
+        | ColType::Regtype
+        | ColType::Regproc
+        | ColType::Regprocedure
+        | ColType::Regoper
+        | ColType::Regoperator
+        | ColType::Regclass
+        | ColType::Regnamespace
+        | ColType::Regrole
+        | ColType::Regconfig
+        | ColType::Regdictionary
+        | ColType::Regcollation => "N",
         ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
         ColType::Interval => "T",
         ColType::Xid
@@ -23771,6 +24038,17 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text(
                     match t {
                         ColType::Refcursor => "textin",
+                        ColType::Regtype => "regtypein",
+                        ColType::Regproc => "regprocin",
+                        ColType::Regprocedure => "regprocedurein",
+                        ColType::Regoper => "regoperin",
+                        ColType::Regoperator => "regoperatorin",
+                        ColType::Regclass => "regclassin",
+                        ColType::Regnamespace => "regnamespacein",
+                        ColType::Regrole => "regrolein",
+                        ColType::Regconfig => "regconfigin",
+                        ColType::Regdictionary => "regdictionaryin",
+                        ColType::Regcollation => "regcollationin",
                         ColType::PgLsn => "pg_lsn_in",
                         ColType::AclItem => "aclitemin",
                         ColType::Money => "cash_in",
@@ -23783,6 +24061,17 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text(
                     match t {
                         ColType::Refcursor => "textout",
+                        ColType::Regtype => "regtypeout",
+                        ColType::Regproc => "regprocout",
+                        ColType::Regprocedure => "regprocedureout",
+                        ColType::Regoper => "regoperout",
+                        ColType::Regoperator => "regoperatorout",
+                        ColType::Regclass => "regclassout",
+                        ColType::Regnamespace => "regnamespaceout",
+                        ColType::Regrole => "regroleout",
+                        ColType::Regconfig => "regconfigout",
+                        ColType::Regdictionary => "regdictionaryout",
+                        ColType::Regcollation => "regcollationout",
                         ColType::PgLsn => "pg_lsn_out",
                         ColType::AclItem => "aclitemout",
                         ColType::Money => "cash_out",

@@ -2077,7 +2077,8 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         | ColType::Regnamespace
         | ColType::Regrole
         | ColType::Regconfig
-        | ColType::Regdictionary => Datum::RegObject {
+        | ColType::Regdictionary
+        | ColType::Regcollation => Datum::RegObject {
             type_oid: ct.oid(),
             referenced_oid: 0,
             name: "-",

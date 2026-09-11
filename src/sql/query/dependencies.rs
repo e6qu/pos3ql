@@ -2260,6 +2260,15 @@ fn collect_expression<'a>(
     if let Expr::Cast { type_name, .. } = expression {
         collect_type(type_name, storage, txid, path, dependencies)?;
     }
+    if let Expr::Cast {
+        operand,
+        type_name: "regcollation",
+        ..
+    } = expression
+        && let Some(name) = regclass_literal(operand)
+    {
+        collect_regcollation(name, storage, txid, dependencies)?;
+    }
     if let Expr::Collate {
         collation: crate::sql::ast::ParsedCollation::Named(name),
         ..
@@ -2574,6 +2583,42 @@ fn regclass_literal<'a>(expression: &'a Expr<'a>) -> Option<&'a str> {
         Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => regclass_literal(operand),
         _ => None,
     }
+}
+
+fn collect_regcollation(
+    written: &str,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let oid = match written.trim().parse::<i32>() {
+        Ok(oid) => oid,
+        Err(_) => match crate::sql::catalog::collation_oid_by_name(storage, txid, written) {
+            Some(oid) => oid,
+            None => return Ok(()),
+        },
+    };
+    let Some((slot, definition)) = storage
+        .collations_visible_to(txid)
+        .find(|(slot, _)| crate::sql::ast::Collation::Catalog(*slot as u8).oid() == oid)
+    else {
+        return Ok(());
+    };
+    let Some((referenced_schema, referenced_name)) =
+        crate::sql::catalog::split_qualified_name(written)
+    else {
+        return Ok(());
+    };
+    dependencies.push(StoredQueryDependency {
+        class: DependencyClass::Collation,
+        slot: slot as u16,
+        identity: StoredDependencyIdentity::Name,
+        referenced_columns: 0,
+        schema: definition.schema,
+        name: definition.name,
+        referenced_schema: SqlName::parse(referenced_schema.unwrap_or(""))?,
+        referenced_name: SqlName::parse(referenced_name)?,
+    })
 }
 
 fn text_search_config_literal<'a>(name: &str, args: &'a [&Expr<'a>]) -> Option<&'a str> {

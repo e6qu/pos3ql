@@ -140,6 +140,7 @@ pub mod oid {
     pub const REGROLE: i32 = 4096;
     pub const REGCONFIG: i32 = 3734;
     pub const REGDICTIONARY: i32 = 3769;
+    pub const REGCOLLATION: i32 = 4191;
     pub const REGPROC_ARRAY: i32 = 1008;
     pub const REGPROCEDURE_ARRAY: i32 = 2207;
     pub const REGOPER_ARRAY: i32 = 2208;
@@ -150,6 +151,7 @@ pub mod oid {
     pub const REGROLE_ARRAY: i32 = 4097;
     pub const REGCONFIG_ARRAY: i32 = 3735;
     pub const REGDICTIONARY_ARRAY: i32 = 3770;
+    pub const REGCOLLATION_ARRAY: i32 = 4192;
     /// Base OIDs for user-defined domains, enums, composites, and the array types PostgreSQL
     /// creates alongside each of them. Slots are catalog-local identities; the
     /// bands are deliberately disjoint from relation/composite OIDs.
@@ -390,6 +392,7 @@ pub enum ColType {
     Regrole,
     Regconfig,
     Regdictionary,
+    Regcollation,
     Int8,
     /// `real`/`float4`. Its own [`Datum::Float4`] (f32); reports OID 700 and
     /// typlen 4. On disk it keeps the historical 8-byte float8 layout
@@ -555,7 +558,7 @@ impl BtreeOperatorClass {
             Name => Self::Name,
             Numeric => Self::Numeric,
             Oid | Xid | Regtype | Regproc | Regprocedure | Regoper | Regoperator | Regclass
-            | Regnamespace | Regrole | Regconfig | Regdictionary => Self::Oid,
+            | Regnamespace | Regrole | Regconfig | Regdictionary | Regcollation => Self::Oid,
             Xid8 => Self::Xid8,
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
@@ -814,6 +817,7 @@ impl ColType {
                 | Self::Regrole
                 | Self::Regconfig
                 | Self::Regdictionary
+                | Self::Regcollation
         )
     }
 
@@ -857,6 +861,7 @@ impl ColType {
             "regrole" => Self::Regrole,
             "regconfig" => Self::Regconfig,
             "regdictionary" => Self::Regdictionary,
+            "regcollation" => Self::Regcollation,
             "name" => Self::Name,
             "oid" => Self::Oid,
             "xid" => Self::Xid,
@@ -931,6 +936,7 @@ impl ColType {
             Self::Regrole => oid::REGROLE,
             Self::Regconfig => oid::REGCONFIG,
             Self::Regdictionary => oid::REGDICTIONARY,
+            Self::Regcollation => oid::REGCOLLATION,
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT4,
             Self::Float8 => oid::FLOAT8,
@@ -1008,6 +1014,7 @@ impl ColType {
             oid::REGROLE => Some(Self::Regrole),
             oid::REGCONFIG => Some(Self::Regconfig),
             oid::REGDICTIONARY => Some(Self::Regdictionary),
+            oid::REGCOLLATION => Some(Self::Regcollation),
             oid::REGTYPE => Some(Self::Regtype),
             oid::INT8 => Some(Self::Int8),
             oid::FLOAT4 => Some(Self::Float4),
@@ -1130,6 +1137,7 @@ impl ColType {
             | Self::Regrole
             | Self::Regconfig
             | Self::Regdictionary
+            | Self::Regcollation
             | Self::Date
             | Self::Float4 => 4,
             Self::Int8
@@ -1202,7 +1210,8 @@ impl ColType {
             | Self::Regnamespace
             | Self::Regrole
             | Self::Regconfig
-            | Self::Regdictionary => self,
+            | Self::Regdictionary
+            | Self::Regcollation => self,
             other => other,
         }
     }
@@ -1243,6 +1252,7 @@ impl ColType {
             Self::Regrole => "regrole",
             Self::Regconfig => "regconfig",
             Self::Regdictionary => "regdictionary",
+            Self::Regcollation => "regcollation",
             Self::Int8 => "int8",
             Self::Float4 => "float4",
             Self::Float8 => "float8",
@@ -1329,6 +1339,7 @@ impl ColType {
             Self::Regrole => "regrole",
             Self::Regconfig => "regconfig",
             Self::Regdictionary => "regdictionary",
+            Self::Regcollation => "regcollation",
             Self::Int8 => "bigint",
             Self::Float4 => "real",
             Self::Float8 => "double precision",
@@ -1402,6 +1413,7 @@ impl ColType {
             Self::Regrole => 65,
             Self::Regconfig => 28,
             Self::Regdictionary => 29,
+            Self::Regcollation => 247,
             Self::Int8 => 3,
             Self::Float8 => 4,
             Self::Text => 5,
@@ -1495,6 +1507,7 @@ impl ColType {
             65 => Self::Regrole,
             28 => Self::Regconfig,
             29 => Self::Regdictionary,
+            247 => Self::Regcollation,
             3 => Self::Int8,
             4 => Self::Float8,
             5 => Self::Text,
@@ -1621,6 +1634,7 @@ pub enum ArrElem {
     Regrole,
     Regconfig,
     Regdictionary,
+    Regcollation,
     /// Anonymous records are legal in transient arrays such as recursive CTE
     /// search paths, but remain invalid as stored table-column types.
     Record,
@@ -1656,7 +1670,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 72] = [
+    pub const BUILTIN: [Self; 73] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1717,6 +1731,7 @@ impl ArrElem {
         Self::Regrole,
         Self::Regconfig,
         Self::Regdictionary,
+        Self::Regcollation,
         Self::Range(RangeKind::Int4),
         Self::Range(RangeKind::Int8),
         Self::Range(RangeKind::Num),
@@ -1754,6 +1769,7 @@ impl ArrElem {
                 | Self::Regrole
                 | Self::Regconfig
                 | Self::Regdictionary
+                | Self::Regcollation
         )
     }
 
@@ -1822,6 +1838,7 @@ impl ArrElem {
             ArrElem::Regrole => "_regrole",
             ArrElem::Regconfig => "_regconfig",
             ArrElem::Regdictionary => "_regdictionary",
+            ArrElem::Regcollation => "_regcollation",
             ArrElem::Record => "_record",
             ArrElem::Range(kind) => match kind {
                 RangeKind::Int4 => "_int4range",
@@ -1912,6 +1929,7 @@ impl ArrElem {
             ArrElem::Regrole => "regrole[]",
             ArrElem::Regconfig => "regconfig[]",
             ArrElem::Regdictionary => "regdictionary[]",
+            ArrElem::Regcollation => "regcollation[]",
             ArrElem::Record => "record[]",
             ArrElem::Range(kind) => match kind {
                 RangeKind::Int4 => "int4range[]",
@@ -1997,6 +2015,7 @@ impl ArrElem {
                 oid::REGROLE => ArrElem::Regrole,
                 oid::REGCONFIG => ArrElem::Regconfig,
                 oid::REGDICTIONARY => ArrElem::Regdictionary,
+                oid::REGCOLLATION => ArrElem::Regcollation,
                 _ => return None,
             },
             Datum::Record(_) => ArrElem::Record,
@@ -2048,6 +2067,7 @@ impl ArrElem {
             ColType::Regrole => return Some(ArrElem::Regrole),
             ColType::Regconfig => return Some(ArrElem::Regconfig),
             ColType::Regdictionary => return Some(ArrElem::Regdictionary),
+            ColType::Regcollation => return Some(ArrElem::Regcollation),
             ColType::Record => return Some(ArrElem::Record),
             ColType::Range(kind) => return Some(ArrElem::Range(kind)),
             ColType::Multirange(kind) => return Some(ArrElem::Multirange(kind)),
@@ -2142,6 +2162,7 @@ impl ArrElem {
             ArrElem::Regrole => ColType::Regrole,
             ArrElem::Regconfig => ColType::Regconfig,
             ArrElem::Regdictionary => ColType::Regdictionary,
+            ArrElem::Regcollation => ColType::Regcollation,
             ArrElem::Record => ColType::Record,
             ArrElem::Range(kind) => ColType::Range(kind),
             ArrElem::Multirange(kind) => ColType::Multirange(kind),
@@ -2220,6 +2241,7 @@ impl ArrElem {
             ArrElem::Regrole => oid::REGROLE_ARRAY,
             ArrElem::Regconfig => oid::REGCONFIG_ARRAY,
             ArrElem::Regdictionary => oid::REGDICTIONARY_ARRAY,
+            ArrElem::Regcollation => oid::REGCOLLATION_ARRAY,
             ArrElem::Record => oid::RECORD_ARRAY,
             ArrElem::Range(kind) => kind.array_oid(),
             ArrElem::Multirange(kind) => kind.multirange_array_oid(),
@@ -2303,6 +2325,7 @@ impl ArrElem {
             ArrElem::Regrole => 50,
             ArrElem::Regconfig => 66,
             ArrElem::Regdictionary => 67,
+            ArrElem::Regcollation => 168,
             ArrElem::Record => 128,
             ArrElem::Range(kind) => 51 + kind.code(),
             ArrElem::Multirange(kind) => 57 + kind.code(),
@@ -2374,6 +2397,7 @@ impl ArrElem {
             50 => ArrElem::Regrole,
             66 => ArrElem::Regconfig,
             67 => ArrElem::Regdictionary,
+            168 => ArrElem::Regcollation,
             128 => ArrElem::Record,
             51..=56 => ArrElem::Range(RangeKind::from_code(c - 51)?),
             57..=62 => ArrElem::Multirange(RangeKind::from_code(c - 57)?),
@@ -3879,6 +3903,7 @@ mod tests {
             ColType::Regrole,
             ColType::Regconfig,
             ColType::Regdictionary,
+            ColType::Regcollation,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,
@@ -3979,6 +4004,7 @@ mod code_roundtrip_tests {
             ColType::Regrole,
             ColType::Regconfig,
             ColType::Regdictionary,
+            ColType::Regcollation,
             ColType::Int8,
             ColType::Float4,
             ColType::Float8,

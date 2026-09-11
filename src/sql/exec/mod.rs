@@ -11645,9 +11645,11 @@ pub fn drop_schema(
     };
     let write_rel = |out: &mut crate::util::StackStr<192>, schema: &SqlName, name: &SqlName| {
         if in_path(storage, schema.as_str()) {
-            let _ = write!(out, "{}", name.as_str());
+            write_identifier(out, name.as_str());
         } else {
-            let _ = write!(out, "{}.{}", schema.as_str(), name.as_str());
+            write_identifier(out, schema.as_str());
+            let _ = out.write_char('.');
+            write_identifier(out, name.as_str());
         }
     };
     let describe =
@@ -51608,7 +51610,8 @@ fn decode_binary_field_with_context<'a>(
         | ColType::Regnamespace
         | ColType::Regrole
         | ColType::Regconfig
-        | ColType::Regdictionary) => {
+        | ColType::Regdictionary
+        | ColType::Regcollation) => {
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             let referenced_oid = i32::from_be_bytes(bytes);
             match context {

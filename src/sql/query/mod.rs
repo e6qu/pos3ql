@@ -1659,6 +1659,14 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.resolve_collation(schema, name, self.txid)
     }
 
+    fn collation_oid(&self, name: &str) -> Option<i32> {
+        super::catalog::collation_oid_by_name(self.storage, self.txid, name)
+    }
+
+    fn collation_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::collation_name_by_oid(self.storage, self.txid, oid, arena)
+    }
+
     fn resolve_text_search_configuration(&self, schema: Option<&str>, name: &str) -> Option<i32> {
         let slot = self.storage.text_search_slot_on_path(
             super::ast::TextSearchObjectKind::Configuration,
@@ -2561,6 +2569,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .or_else(|| super::catalog::predefined_role_oid(name))
     }
 
+    fn written_role_oid(&self, name: &str) -> Option<i32> {
+        super::catalog::role_oid_by_written(self.storage, self.txid, name)
+    }
+
     fn object_acl<'a>(
         &self,
         classid: u32,
@@ -2587,6 +2599,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
 
     fn schema_oid(&self, name: &str) -> Option<i32> {
         super::catalog::schema_oid_by_name(self.storage, self.txid, name)
+    }
+
+    fn written_schema_oid(&self, name: &str) -> Option<i32> {
+        super::catalog::schema_oid_by_written(self.storage, self.txid, name)
     }
 
     fn routine_name<'a>(

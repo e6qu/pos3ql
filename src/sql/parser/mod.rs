@@ -555,6 +555,7 @@ impl<'a> Parser<'a> {
     /// DECLARE name [BINARY] [INSENSITIVE|ASENSITIVE] [[NO] SCROLL] CURSOR
     /// [{WITH|WITHOUT} HOLD] FOR select ("declare" not yet consumed).
     fn declare_cursor(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let statement_start = self.peek_at;
         self.advance()?; // declare
         let name = self.col_ident("cursor name")?;
         let mut binary = false;
@@ -589,11 +590,13 @@ impl<'a> Parser<'a> {
         let _ = self.query_select()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
+        let statement = self.text[statement_start..end].trim();
         Ok(Stmt::DeclareCursor {
             name,
             binary,
             scroll,
             hold,
+            statement,
             sql,
         })
     }

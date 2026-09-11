@@ -378,6 +378,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             Some(7 + u16::from_le_bytes([header[5], header[6]]) as usize * 2)
         }
         ColType::Text
+        | ColType::Refcursor
         | ColType::AclItem
         | ColType::Name
         | ColType::Varchar
@@ -690,7 +691,11 @@ pub(crate) fn decode<'a>(
                     out[i] = Datum::Text(core::str::from_utf8(raw).map_err(|_| corrupt())?);
                 }
             }
-            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
+            ColType::Text
+            | ColType::Refcursor
+            | ColType::Varchar
+            | ColType::Bpchar
+            | ColType::Name => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
                 at += 4;

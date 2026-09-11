@@ -2116,6 +2116,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Uuid => Datum::Uuid([0; 16]),
         ColType::Char
         | ColType::Text
+        | ColType::Refcursor
         | ColType::Varchar
         | ColType::Bpchar
         | ColType::Name

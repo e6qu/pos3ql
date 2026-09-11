@@ -652,6 +652,14 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 2511,
+        name: "pg_cursor",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 3566,
         name: "pg_event_trigger_dropped_objects",
         result_oid: super::types::oid::RECORD,
@@ -3455,6 +3463,7 @@ fn intrinsic_routine_is_set_returning(routine: IntrinsicRoutine) -> bool {
             | 2765
             | 2766
             | 1689
+            | 2511
     )
 }
 
@@ -3463,7 +3472,7 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
         715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
         | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
         | 4223 | 4224 | 1402 | 1403 | 2078 | 2943 | 3348 | 5059 | 5060 | 3086 | 6119 | 6120 => "u",
-        1181 | 1598 | 1599 | 1641 | 3566 | 4568 | 6212 | 6339 | 6340 | 6341 => "r",
+        1181 | 1598 | 1599 | 1641 | 2511 | 3566 | 4568 | 6212 | 6339 | 6340 | 6341 => "r",
         _ => "s",
     }
 }
@@ -3789,6 +3798,15 @@ const LOGICAL_SLOT_OUTPUT_NAMES: &[&str] = &["slot_name", "lsn"];
 const LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES: &[&str] = &["slot_name", "end_lsn"];
 const ACL_EXPLODE_OUTPUT_OIDS: &[i32] = &[26, 26, 25, 16];
 const ACL_EXPLODE_OUTPUT_NAMES: &[&str] = &["grantor", "grantee", "privilege_type", "is_grantable"];
+const CURSOR_OUTPUT_OIDS: &[i32] = &[25, 25, 16, 16, 16, 1184];
+const CURSOR_OUTPUT_NAMES: &[&str] = &[
+    "name",
+    "statement",
+    "is_holdable",
+    "is_binary",
+    "is_scrollable",
+    "creation_time",
+];
 
 fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
     match oid {
@@ -3837,6 +3855,7 @@ fn intrinsic_record_outputs(
         3786 | 4222 | 4223 | 4224 => Some((LOGICAL_SLOT_OUTPUT_OIDS, LOGICAL_SLOT_OUTPUT_NAMES)),
         3878 => Some((LOGICAL_SLOT_OUTPUT_OIDS, LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES)),
         1689 => Some((ACL_EXPLODE_OUTPUT_OIDS, ACL_EXPLODE_OUTPUT_NAMES)),
+        2511 => Some((CURSOR_OUTPUT_OIDS, CURSOR_OUTPUT_NAMES)),
         _ => None,
     }
 }
@@ -8003,6 +8022,7 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_stat_subscription", 12248),
     ("pg_stat_subscription_stats", 12347),
     ("pg_transform", 3576),
+    ("pg_cursors", 12077),
 ];
 
 fn catalog_relation_oid(name: &str) -> Option<i32> {
@@ -8147,6 +8167,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_transform"
                 | "pg_tablespace"
                 | "pg_foreign_data_wrapper"
+                | "pg_cursors"
         ),
     }
 }
@@ -8241,6 +8262,7 @@ pub fn synthesize<'a>(
         (false, "pg_collation") => pg_collation(storage, txid, arena),
         (false, "pg_conversion") => pg_conversion(storage, txid, arena),
         (false, "pg_type") => pg_type(storage, txid, arena),
+        (false, "pg_cursors") => pg_cursors(arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
@@ -15197,9 +15219,19 @@ const PG_STAT_SUBSCRIPTION_STATS_COLUMNS: &[(&str, ColType)] = &[
     ("stats_reset", ColType::Timestamptz),
 ];
 
-type LogicalMonitoringRelation = (i32, i32, &'static str, &'static [(&'static str, ColType)]);
+const PG_CURSORS_COLUMNS: &[(&str, ColType)] = &[
+    ("name", ColType::Text),
+    ("statement", ColType::Text),
+    ("is_holdable", ColType::Bool),
+    ("is_binary", ColType::Bool),
+    ("is_scrollable", ColType::Bool),
+    ("creation_time", ColType::Timestamptz),
+];
 
-const LOGICAL_MONITORING_RELATIONS: &[LogicalMonitoringRelation] = &[
+type MonitoringRelation = (i32, i32, &'static str, &'static [(&'static str, ColType)]);
+
+const MONITORING_RELATIONS: &[MonitoringRelation] = &[
+    (12077, 12079, "pg_cursors", PG_CURSORS_COLUMNS),
     (
         12231,
         12233,
@@ -15232,9 +15264,9 @@ const LOGICAL_MONITORING_RELATIONS: &[LogicalMonitoringRelation] = &[
     ),
 ];
 
-const LOGICAL_MONITORING_ATTRIBUTE_COUNT: usize = 74;
+const MONITORING_ATTRIBUTE_COUNT: usize = 80;
 
-const fn logical_monitoring_type_oid(ctype: ColType) -> i32 {
+const fn monitoring_type_oid(ctype: ColType) -> i32 {
     match ctype {
         ColType::Bool => 16,
         ColType::Int8 => 20,
@@ -15251,7 +15283,7 @@ const fn logical_monitoring_type_oid(ctype: ColType) -> i32 {
     }
 }
 
-const fn logical_monitoring_type_len(ctype: ColType) -> i32 {
+const fn monitoring_type_len(ctype: ColType) -> i32 {
     match ctype {
         ColType::Bool => 1,
         ColType::Int4 | ColType::Oid | ColType::Xid => 4,
@@ -15263,7 +15295,7 @@ const fn logical_monitoring_type_len(ctype: ColType) -> i32 {
     }
 }
 
-const fn logical_monitoring_type_alignment(ctype: ColType) -> &'static str {
+const fn monitoring_type_alignment(ctype: ColType) -> &'static str {
     match ctype {
         ColType::Bool | ColType::Name => "c",
         ColType::Int8 | ColType::Timestamptz | ColType::Interval | ColType::PgLsn => "d",
@@ -15272,13 +15304,12 @@ const fn logical_monitoring_type_alignment(ctype: ColType) -> &'static str {
     }
 }
 
-const fn logical_monitoring_attribute_rows()
--> [[Datum<'static>; 23]; LOGICAL_MONITORING_ATTRIBUTE_COUNT] {
-    let mut rows = [[Datum::Null; 23]; LOGICAL_MONITORING_ATTRIBUTE_COUNT];
+const fn monitoring_attribute_rows() -> [[Datum<'static>; 23]; MONITORING_ATTRIBUTE_COUNT] {
+    let mut rows = [[Datum::Null; 23]; MONITORING_ATTRIBUTE_COUNT];
     let mut row_index = 0;
     let mut relation_index = 0;
-    while relation_index < LOGICAL_MONITORING_RELATIONS.len() {
-        let (relation_oid, _, _, columns) = LOGICAL_MONITORING_RELATIONS[relation_index];
+    while relation_index < MONITORING_RELATIONS.len() {
+        let (relation_oid, _, _, columns) = MONITORING_RELATIONS[relation_index];
         let mut attribute = 0;
         while attribute < columns.len() {
             let (name, ctype) = columns[attribute];
@@ -15286,16 +15317,16 @@ const fn logical_monitoring_attribute_rows()
             rows[row_index] = [
                 Datum::Int4(relation_oid),
                 Datum::Text(name),
-                Datum::Int4(logical_monitoring_type_oid(ctype)),
+                Datum::Int4(monitoring_type_oid(ctype)),
                 Datum::Int4(number),
                 Datum::Bool(false),
-                Datum::Int4(logical_monitoring_type_len(ctype)),
+                Datum::Int4(monitoring_type_len(ctype)),
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Int4(if ctype.is_collatable() { 100 } else { 0 }),
                 Datum::Text(""),
                 Datum::Text(""),
-                Datum::Text(if logical_monitoring_type_len(ctype) < 0 {
+                Datum::Text(if monitoring_type_len(ctype) < 0 {
                     "x"
                 } else {
                     "p"
@@ -15304,7 +15335,7 @@ const fn logical_monitoring_attribute_rows()
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Int4(number),
-                Datum::Text(logical_monitoring_type_alignment(ctype)),
+                Datum::Text(monitoring_type_alignment(ctype)),
                 Datum::Bool(true),
                 Datum::Null,
                 Datum::Null,
@@ -15317,12 +15348,12 @@ const fn logical_monitoring_attribute_rows()
         }
         relation_index += 1;
     }
-    assert!(row_index == LOGICAL_MONITORING_ATTRIBUTE_COUNT);
+    assert!(row_index == MONITORING_ATTRIBUTE_COUNT);
     rows
 }
 
-static LOGICAL_MONITORING_ATTRIBUTE_ROWS: [[Datum<'static>; 23];
-    LOGICAL_MONITORING_ATTRIBUTE_COUNT] = logical_monitoring_attribute_rows();
+static MONITORING_ATTRIBUTE_ROWS: [[Datum<'static>; 23]; MONITORING_ATTRIBUTE_COUNT] =
+    monitoring_attribute_rows();
 
 fn pg_replication_slots<'a>(
     storage: &Storage,
@@ -15907,7 +15938,7 @@ fn pg_class<'a>(
     let foreign_keys = collect_fkeys(storage, txid, arena)?;
     let mut out: [&[Datum]; 512] = [&[]; 512];
     let mut n = 0;
-    for &(relation_oid, row_type_oid, name, columns) in LOGICAL_MONITORING_RELATIONS {
+    for &(relation_oid, row_type_oid, name, columns) in MONITORING_RELATIONS {
         out[n] = row(
             &[
                 Datum::Int4(relation_oid),
@@ -18614,7 +18645,7 @@ fn pg_attribute<'a>(
     );
     let mut out: [&[Datum]; 1024] = [&[]; 1024];
     let mut n = 0;
-    for attributes in &LOGICAL_MONITORING_ATTRIBUTE_ROWS {
+    for attributes in &MONITORING_ATTRIBUTE_ROWS {
         out[n] = attributes;
         n += 1;
     }
@@ -23510,6 +23541,58 @@ fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     finish(def, &out[..n], arena)
 }
 
+fn pg_cursors<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_cursors", PG_CURSORS_COLUMNS);
+    crate::sql::cursor::with_active(|pool| {
+        let count = pool.map_or(0, crate::sql::cursor::CursorPool::len);
+        let rows = arena
+            .alloc_slice_with(count, |_| &[] as &[Datum])
+            .map_err(|_| arena_full())?;
+        if let Some(pool) = pool {
+            let mut index = 0usize;
+            let mut error = None;
+            pool.visit(|cursor| {
+                if error.is_some() {
+                    return;
+                }
+                let name = match arena.alloc_str(cursor.name) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        error = Some(arena_full());
+                        return;
+                    }
+                };
+                let statement = match arena.alloc_str(cursor.statement) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        error = Some(arena_full());
+                        return;
+                    }
+                };
+                let values = [
+                    Datum::Text(name),
+                    Datum::Text(statement),
+                    Datum::Bool(cursor.holdable),
+                    Datum::Bool(cursor.binary),
+                    Datum::Bool(cursor.scrollable),
+                    Datum::Timestamptz(cursor.created_at),
+                ];
+                match row(&values, arena) {
+                    Ok(encoded) => {
+                        rows[index] = encoded;
+                        index += 1;
+                    }
+                    Err(found) => error = Some(found),
+                }
+            });
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
+        finish(definition, rows, arena)
+    })
+}
+
 fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let def = def_of(
         "pg_type",
@@ -23575,6 +23658,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Float4,
         ColType::Float8,
         ColType::Text,
+        ColType::Refcursor,
         ColType::Name,
         ColType::Varchar,
         ColType::Bpchar,
@@ -23641,6 +23725,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::TxidSnapshot
         | ColType::PgLsn
         | ColType::AclItem
+        | ColType::Refcursor
         | ColType::Uuid
         | ColType::Bytea
         | ColType::TsVector
@@ -23685,6 +23770,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Null, // typdefault
                 text(
                     match t {
+                        ColType::Refcursor => "textin",
                         ColType::PgLsn => "pg_lsn_in",
                         ColType::AclItem => "aclitemin",
                         ColType::Money => "cash_in",
@@ -23696,6 +23782,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 )?,
                 text(
                     match t {
+                        ColType::Refcursor => "textout",
                         ColType::PgLsn => "pg_lsn_out",
                         ColType::AclItem => "aclitemout",
                         ColType::Money => "cash_out",

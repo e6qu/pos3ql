@@ -2543,7 +2543,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     // `json` has no equality operator in PostgreSQL — two documents that differ
     // only in whitespace or key order are the same value but not the same text,
     // so it declines to say. `jsonb`, which is canonicalized, does compare.
-    if matches!(a, Json) || matches!(b, Json) {
+    if !a.has_builtin_equality() || !b.has_builtin_equality() {
         return false;
     }
     if a == b {
@@ -3195,12 +3195,52 @@ pub fn infer_type_res(
             }
         }
         Expr::IsNull { .. } => of(ColType::Bool),
-        Expr::InList { .. } | Expr::Between { .. } | Expr::Like { .. } | Expr::Match { .. } => {
+        Expr::InList { operand, list, .. } => {
+            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+            for item in *list {
+                let right = coltype_of_oid(infer_type_res(item, columns)?.0);
+                if let (Some(left), Some(right)) = (left, right)
+                    && !comparable(left, right)
+                {
+                    return Err(operator_undefined(left, "=", right));
+                }
+            }
             of(ColType::Bool)
         }
-        Expr::Case {
-            whens, otherwise, ..
+        Expr::Between {
+            operand, low, high, ..
         } => {
+            let value = coltype_of_oid(infer_type_res(operand, columns)?.0);
+            for bound in [*low, *high] {
+                let bound = coltype_of_oid(infer_type_res(bound, columns)?.0);
+                if let (Some(value), Some(bound)) = (value, bound)
+                    && (!comparable(value, bound)
+                        || !value.has_builtin_ordering()
+                        || !bound.has_builtin_ordering())
+                {
+                    return Err(operator_undefined(value, ">=", bound));
+                }
+            }
+            of(ColType::Bool)
+        }
+        Expr::Like { .. } | Expr::Match { .. } => of(ColType::Bool),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+                for (when, _) in *whens {
+                    let right = coltype_of_oid(infer_type_res(when, columns)?.0);
+                    if let (Some(left), Some(right)) = (left, right)
+                        && !comparable(left, right)
+                    {
+                        return Err(operator_undefined(left, "=", right));
+                    }
+                }
+            }
             let mut acc: Option<ColType> = None;
             let mut consider = |e: &Expr| -> Result<(), SqlError> {
                 let (o, _) = infer_type_res(e, columns)?;
@@ -3234,7 +3274,41 @@ pub fn infer_type_res(
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } | Expr::Exists(_) => {
             of(ColType::Bool)
         }
-        Expr::AnyAll { .. } => of(ColType::Bool),
+        Expr::AnyAll {
+            operand,
+            operator,
+            array,
+            ..
+        } => {
+            let left = coltype_of_oid(infer_type_res(operand, columns)?.0);
+            let right = coltype_of_oid(infer_type_res(array, columns)?.0).and_then(|ctype| {
+                if let ColType::Array(element) = ctype {
+                    Some(element.to_coltype())
+                } else {
+                    None
+                }
+            });
+            if let (Some(left), Some(right)) = (left, right) {
+                use crate::sql::ast::BinaryOp::{Eq, Gt, GtEq, Lt, LtEq, NotEq};
+                let invalid = match operator {
+                    Eq | NotEq => !comparable(left, right),
+                    Lt | LtEq | Gt | GtEq => {
+                        !comparable(left, right)
+                            || !left.has_builtin_ordering()
+                            || !right.has_builtin_ordering()
+                    }
+                    _ => false,
+                };
+                if invalid {
+                    return Err(operator_undefined(
+                        left,
+                        operator.operator_name().unwrap_or("?"),
+                        right,
+                    ));
+                }
+            }
+            of(ColType::Bool)
+        }
         Expr::Array(items) => {
             // An unknown-typed element (a bare string literal) makes the array
             // text[], as PostgreSQL coerces it; only a concrete element type

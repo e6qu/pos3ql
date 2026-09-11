@@ -56,6 +56,8 @@ pub mod oid {
     pub const PG_LSN_ARRAY: i32 = 3221;
     pub const OID_ARRAY: i32 = 1028;
     pub const TEXT: i32 = 25;
+    pub const REFCURSOR: i32 = 1790;
+    pub const REFCURSOR_ARRAY: i32 = 2201;
     pub const ACLITEM: i32 = 1033;
     pub const ACLITEM_ARRAY: i32 = 1034;
     pub const NAME: i32 = 19;
@@ -399,6 +401,9 @@ pub enum ColType {
     /// at expression, catalog, and wire boundaries.
     Char,
     Text,
+    /// PostgreSQL cursor-handle type. Values use text storage while retaining
+    /// a distinct catalog and wire identity.
+    Refcursor,
     /// `name`: PostgreSQL's identifier type (OID 19, typlen 64). Text storage;
     /// input truncates to 63 bytes.
     Name,
@@ -559,7 +564,7 @@ impl BtreeOperatorClass {
             Money => Self::Money,
             Tid => Self::Tid,
             Cid => return None,
-            Char | Geometry(_) | PgSnapshot | TxidSnapshot => return None,
+            Char | Refcursor | Geometry(_) | PgSnapshot | TxidSnapshot => return None,
             Time => Self::Time,
             Timestamp => Self::Timestamp,
             Timestamptz => Self::Timestamptz,
@@ -763,6 +768,24 @@ const ARRAY_CODE_BASE: u8 = 80;
 const RANGE_KINDS: u8 = 6;
 
 impl ColType {
+    /// Whether PostgreSQL exposes a built-in equality operator for this value
+    /// shape. Array equality exists only when its element type has equality.
+    pub const fn has_builtin_equality(self) -> bool {
+        !matches!(
+            self,
+            Self::Json
+                | Self::Refcursor
+                | Self::Array(ArrElem::Json)
+                | Self::Array(ArrElem::Refcursor)
+        )
+    }
+
+    /// Whether PostgreSQL exposes the ordering operators needed by SQL sort
+    /// keys. Command IDs have equality but deliberately have no ordering.
+    pub const fn has_builtin_ordering(self) -> bool {
+        self.has_builtin_equality() && !matches!(self, Self::Cid | Self::Array(ArrElem::Cid))
+    }
+
     /// Whether values of this type carry a PostgreSQL collation.
     ///
     /// Keeping this on the type prevents each catalog, DDL, and recovery path
@@ -823,6 +846,7 @@ impl ColType {
             "float4" | "real" => Self::Float4,
             "\"char\"" => Self::Char,
             "text" => Self::Text,
+            "refcursor" => Self::Refcursor,
             "regtype" => Self::Regtype,
             "regproc" => Self::Regproc,
             "regprocedure" => Self::Regprocedure,
@@ -912,6 +936,7 @@ impl ColType {
             Self::Float8 => oid::FLOAT8,
             Self::Char => oid::CHAR,
             Self::Text => oid::TEXT,
+            Self::Refcursor => oid::REFCURSOR,
             Self::Name => oid::NAME,
             Self::Varchar => oid::VARCHAR,
             Self::Bpchar => oid::BPCHAR,
@@ -989,6 +1014,7 @@ impl ColType {
             oid::FLOAT8 => Some(Self::Float8),
             oid::CHAR => Some(Self::Char),
             oid::TEXT => Some(Self::Text),
+            oid::REFCURSOR => Some(Self::Refcursor),
             oid::NAME => Some(Self::Name),
             oid::VARCHAR => Some(Self::Varchar),
             oid::BPCHAR => Some(Self::Bpchar),
@@ -1123,6 +1149,7 @@ impl ColType {
             Self::Geometry(_) => -1,
             Self::Name => 64,
             Self::Text
+            | Self::Refcursor
             | Self::Varchar
             | Self::Bpchar
             | Self::Bytea
@@ -1153,6 +1180,7 @@ impl ColType {
             Self::Varchar
             | Self::Bpchar
             | Self::Name
+            | Self::Refcursor
             | Self::PgNodeTree
             | Self::PgNdistinct
             | Self::PgDependencies
@@ -1220,6 +1248,7 @@ impl ColType {
             Self::Float8 => "float8",
             Self::Char => "char",
             Self::Text => "text",
+            Self::Refcursor => "refcursor",
             Self::Name => "name",
             Self::Varchar => "varchar",
             Self::Bpchar => "bpchar",
@@ -1305,6 +1334,7 @@ impl ColType {
             Self::Float8 => "double precision",
             Self::Char => "\"char\"",
             Self::Text => "text",
+            Self::Refcursor => "refcursor",
             Self::Name => "name",
             Self::Varchar => "character varying",
             Self::Bpchar => "character",
@@ -1375,6 +1405,7 @@ impl ColType {
             Self::Int8 => 3,
             Self::Float8 => 4,
             Self::Text => 5,
+            Self::Refcursor => 245,
             Self::Date => 6,
             Self::Timestamp => 7,
             Self::Timestamptz => 8,
@@ -1467,6 +1498,7 @@ impl ColType {
             3 => Self::Int8,
             4 => Self::Float8,
             5 => Self::Text,
+            245 => Self::Refcursor,
             6 => Self::Date,
             7 => Self::Timestamp,
             8 => Self::Timestamptz,
@@ -1545,6 +1577,7 @@ pub enum ArrElem {
     Int8,
     Float8,
     Text,
+    Refcursor,
     /// `aclitem[]` uses text-shaped values with PostgreSQL's distinct catalog
     /// and wire identity. An individual aclitem is not a general stored type.
     AclItem,
@@ -1623,7 +1656,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 71] = [
+    pub const BUILTIN: [Self; 72] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1641,6 +1674,7 @@ impl ArrElem {
         Self::Float4,
         Self::Float8,
         Self::Text,
+        Self::Refcursor,
         Self::AclItem,
         Self::Name,
         Self::Varchar,
@@ -1741,6 +1775,7 @@ impl ArrElem {
             ArrElem::Int8 => "_int8",
             ArrElem::Float8 => "_float8",
             ArrElem::Text => "_text",
+            ArrElem::Refcursor => "_refcursor",
             ArrElem::AclItem => "_aclitem",
             ArrElem::Numeric => "_numeric",
             ArrElem::Date => "_date",
@@ -1830,6 +1865,7 @@ impl ArrElem {
             ArrElem::Int8 => "bigint[]",
             ArrElem::Float8 => "double precision[]",
             ArrElem::Text => "text[]",
+            ArrElem::Refcursor => "refcursor[]",
             ArrElem::AclItem => "aclitem[]",
             ArrElem::Numeric => "numeric[]",
             ArrElem::Date => "date[]",
@@ -1983,6 +2019,7 @@ impl ArrElem {
             ColType::Varchar => return Some(ArrElem::Varchar),
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
+            ColType::Refcursor => return Some(ArrElem::Refcursor),
             ColType::Oid => return Some(ArrElem::Oid),
             ColType::Xid => return Some(ArrElem::Xid),
             ColType::Tid => return Some(ArrElem::Tid),
@@ -2066,6 +2103,7 @@ impl ArrElem {
             ArrElem::Int8 => ColType::Int8,
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
+            ArrElem::Refcursor => ColType::Refcursor,
             ArrElem::AclItem => ColType::AclItem,
             ArrElem::Numeric => ColType::Numeric,
             ArrElem::Date => ColType::Date,
@@ -2143,6 +2181,7 @@ impl ArrElem {
             ArrElem::Int8 => 1016,
             ArrElem::Float8 => 1022,
             ArrElem::Text => 1009,
+            ArrElem::Refcursor => oid::REFCURSOR_ARRAY,
             ArrElem::AclItem => oid::ACLITEM_ARRAY,
             ArrElem::Numeric => 1231,
             ArrElem::Date => 1182,
@@ -2219,6 +2258,7 @@ impl ArrElem {
             ArrElem::Int8 => 2,
             ArrElem::Float8 => 3,
             ArrElem::Text => 4,
+            ArrElem::Refcursor => 166,
             ArrElem::AclItem => 125,
             ArrElem::Numeric => 5,
             ArrElem::Date => 6,
@@ -2289,6 +2329,7 @@ impl ArrElem {
             2 => ArrElem::Int8,
             3 => ArrElem::Float8,
             4 => ArrElem::Text,
+            166 => ArrElem::Refcursor,
             125 => ArrElem::AclItem,
             5 => ArrElem::Numeric,
             6 => ArrElem::Date,

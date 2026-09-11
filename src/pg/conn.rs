@@ -5201,6 +5201,131 @@ mod tests {
     }
 
     #[test]
+    fn extended_binary_refcursor_bind_and_result_preserve_type_identity() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pos3ql-binary-refcursor-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 256;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"refcursor_binary\0SELECT $1::refcursor, $2::refcursor[]\0");
+        parse.extend_from_slice(&2i16.to_be_bytes());
+        parse.extend_from_slice(&crate::sql::types::oid::REFCURSOR.to_be_bytes());
+        parse.extend_from_slice(&crate::sql::types::oid::REFCURSOR_ARRAY.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut array = Vec::new();
+        array.extend_from_slice(&1i32.to_be_bytes());
+        array.extend_from_slice(&0i32.to_be_bytes());
+        array.extend_from_slice(&crate::sql::types::oid::REFCURSOR.to_be_bytes());
+        array.extend_from_slice(&2i32.to_be_bytes());
+        array.extend_from_slice(&1i32.to_be_bytes());
+        for value in [b"left".as_slice(), b"right".as_slice()] {
+            array.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            array.extend_from_slice(value);
+        }
+        let scalar = b"wire_cursor";
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"refcursor_portal\0refcursor_binary\0");
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&2i16.to_be_bytes());
+        bind.extend_from_slice(&(scalar.len() as i32).to_be_bytes());
+        bind.extend_from_slice(scalar);
+        bind.extend_from_slice(&(array.len() as i32).to_be_bytes());
+        bind.extend_from_slice(&array);
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_DESCRIBE, b"Prefcursor_portal\0"));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        let description = connection.send.readable();
+        assert_eq!(description[0], wire::MSG_ROW_DESCRIPTION);
+        assert_eq!(i16::from_be_bytes([description[5], description[6]]), 2);
+        let mut offset = 7usize;
+        for expected_oid in [
+            crate::sql::types::oid::REFCURSOR,
+            crate::sql::types::oid::REFCURSOR_ARRAY,
+        ] {
+            offset += description[offset..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap()
+                + 1;
+            offset += 6;
+            assert_eq!(
+                i32::from_be_bytes(description[offset..offset + 4].try_into().unwrap()),
+                expected_oid
+            );
+            offset += 12;
+        }
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"refcursor_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+
+        let mut expected = Vec::new();
+        expected.push(wire::MSG_DATA_ROW);
+        expected.extend_from_slice(
+            &(4i32 + 2 + 4 + scalar.len() as i32 + 4 + array.len() as i32).to_be_bytes(),
+        );
+        expected.extend_from_slice(&2i16.to_be_bytes());
+        expected.extend_from_slice(&(scalar.len() as i32).to_be_bytes());
+        expected.extend_from_slice(scalar);
+        expected.extend_from_slice(&(array.len() as i32).to_be_bytes());
+        expected.extend_from_slice(&array);
+        assert!(
+            connection
+                .send
+                .readable()
+                .windows(expected.len())
+                .any(|frame| frame == expected),
+            "{:?}",
+            connection.send.readable()
+        );
+
+        drop(connection);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn extended_binary_array_bind_and_result_preserve_declared_subscripts() {
         use core::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);

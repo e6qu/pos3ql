@@ -11,6 +11,9 @@ use crate::mem::buffer::FixedBuf;
 use crate::pg::respond::ResultFmt;
 use crate::sql_err;
 use crate::storage::SqlName;
+use crate::util::StackStr;
+
+use core::cell::Cell;
 
 use super::eval::{SqlError, sqlstate};
 
@@ -46,11 +49,57 @@ pub struct CursorPool {
     slots: Vec<CursorSlot>,
     /// Row indexes selected by the last [`Self::fetch`], in emission order.
     emit: Vec<u32>,
+    next_unnamed: u64,
+}
+
+const CURSOR_STATEMENT_BYTES: usize = 4096;
+
+thread_local! {
+    static ACTIVE_CURSORS: Cell<*const CursorPool> = const { Cell::new(core::ptr::null()) };
+}
+
+pub(crate) struct ActiveCursorGuard(*const CursorPool);
+
+impl Drop for ActiveCursorGuard {
+    fn drop(&mut self) {
+        ACTIVE_CURSORS.with(|active| active.set(self.0));
+    }
+}
+
+/// Makes the current connection's startup-bounded cursor pool visible to the
+/// `pg_cursor()` catalog SRF while a statement executes. Nested routine
+/// statements restore the outer pool on return.
+pub(crate) fn enter_active(pool: *const CursorPool) -> ActiveCursorGuard {
+    let prior = ACTIVE_CURSORS.with(|active| active.replace(pool));
+    ActiveCursorGuard(prior)
+}
+
+pub(crate) fn with_active<R>(f: impl FnOnce(Option<&CursorPool>) -> R) -> R {
+    ACTIVE_CURSORS.with(|active| {
+        let pool = active.get();
+        // SAFETY: `enter_active` is guarded by synchronous statement execution;
+        // its guard restores the pointer before the connection-owned pool can
+        // be dropped. Catalog evaluation never mutates the pool while this
+        // shared reference is live.
+        f((!pool.is_null()).then(|| unsafe { &*pool }))
+    })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CursorInfo<'a> {
+    pub name: &'a str,
+    pub statement: &'a str,
+    pub holdable: bool,
+    pub binary: bool,
+    pub scrollable: bool,
+    pub created_at: i64,
 }
 
 struct CursorSlot {
     active: bool,
     name: SqlName,
+    statement: StackStr<CURSOR_STATEMENT_BYTES>,
+    created_at: i64,
     scroll: CursorScroll,
     hold: bool,
     binary: bool,
@@ -194,6 +243,17 @@ pub(crate) fn description_type_oids(
     description: &[u8],
     output: &mut [i32],
 ) -> Result<usize, SqlError> {
+    let mut names = [None; crate::pg::respond::MAX_RESULT_COLS];
+    description_columns(description, &mut names, output)
+}
+
+/// Extracts names and type OIDs from one captured RowDescription for typed
+/// PL/pgSQL record assignment at the cursor-pool boundary.
+pub(crate) fn description_columns<'a>(
+    description: &'a [u8],
+    names: &mut [Option<&'a str>],
+    type_oids: &mut [i32],
+) -> Result<usize, SqlError> {
     let corrupt = || {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
@@ -208,22 +268,24 @@ pub(crate) fn description_type_oids(
         return Err(corrupt());
     }
     let count = u16::from_be_bytes(description[5..7].try_into().unwrap()) as usize;
-    if count > output.len() {
+    if count > names.len() || count > type_oids.len() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "cursor row description has more than {} columns",
-            output.len()
+            names.len().min(type_oids.len())
         ));
     }
     let mut at = 7usize;
-    for oid in output.iter_mut().take(count) {
+    for index in 0..count {
         let name_len = description
             .get(at..)
             .and_then(|bytes| bytes.iter().position(|byte| *byte == 0))
             .ok_or_else(corrupt)?;
+        names[index] =
+            Some(core::str::from_utf8(&description[at..at + name_len]).map_err(|_| corrupt())?);
         at += name_len + 1;
         let fields = description.get(at..at + 18).ok_or_else(corrupt)?;
-        *oid = i32::from_be_bytes(fields[6..10].try_into().unwrap());
+        type_oids[index] = i32::from_be_bytes(fields[6..10].try_into().unwrap());
         at += 18;
     }
     if at != description.len() {
@@ -275,6 +337,7 @@ impl CursorPool {
         config.max_cursors
             * (config.cursor_bytes * 2
                 + 2048
+                + CURSOR_STATEMENT_BYTES
                 + MAX_CURSOR_ROWS * 2 * core::mem::size_of::<(u32, u32)>())
     }
 
@@ -284,6 +347,8 @@ impl CursorPool {
             slots.push(CursorSlot {
                 active: false,
                 name: SqlName::parse("").expect("empty fits"),
+                statement: StackStr::new(),
+                created_at: 0,
                 scroll: CursorScroll::Default,
                 hold: false,
                 binary: false,
@@ -300,6 +365,7 @@ impl CursorPool {
         Ok(Self {
             slots,
             emit: Vec::with_capacity(MAX_CURSOR_ROWS),
+            next_unnamed: 1,
         })
     }
 
@@ -310,6 +376,7 @@ impl CursorPool {
             s.active = false;
         }
         self.emit.clear();
+        self.next_unnamed = 1;
     }
 
     fn find(&self, name: &str) -> Option<usize> {
@@ -323,6 +390,7 @@ impl CursorPool {
     pub fn open(
         &mut self,
         name: &str,
+        statement: &str,
         scroll: CursorScroll,
         hold: bool,
         binary: bool,
@@ -343,6 +411,15 @@ impl CursorPool {
         };
         let slot = &mut self.slots[at];
         slot.name = SqlName::parse(name)?;
+        slot.statement = StackStr::from_str(statement);
+        if slot.statement.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "cursor statement exceeds {} bytes",
+                CURSOR_STATEMENT_BYTES
+            ));
+        }
+        slot.created_at = crate::sql::datetime::now_micros();
         slot.scroll = scroll;
         slot.hold = hold;
         slot.binary = binary;
@@ -397,6 +474,46 @@ impl CursorPool {
 
     pub fn exists(&self, name: &str) -> bool {
         self.find(name).is_some()
+    }
+
+    pub(crate) fn visit(&self, mut emit: impl FnMut(CursorInfo<'_>)) {
+        for slot in &self.slots {
+            if !slot.active {
+                continue;
+            }
+            emit(CursorInfo {
+                name: slot.name.as_str(),
+                statement: slot.statement.as_str(),
+                holdable: slot.hold,
+                binary: slot.binary,
+                scrollable: slot.scroll == CursorScroll::Scroll,
+                created_at: slot.created_at,
+            });
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.active).count()
+    }
+
+    pub(crate) fn unnamed_name(&mut self) -> Result<StackStr<128>, SqlError> {
+        for _ in 0..=self.slots.len() {
+            let name = crate::stack_format!(128, "<unnamed portal {}>", self.next_unnamed);
+            self.next_unnamed = self.next_unnamed.checked_add(1).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "cursor name sequence exhausted"
+                )
+            })?;
+            if !self.exists(name.as_str()) {
+                return Ok(name);
+            }
+        }
+        Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many open cursors (limit {})",
+            self.slots.len()
+        ))
     }
 
     /// The declaration-time RowDescription of a live SQL cursor. PostgreSQL

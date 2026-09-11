@@ -235,6 +235,17 @@ pub(crate) fn active_planner_settings() -> PlannerSettings {
     })
 }
 
+pub(crate) fn active_track_functions() -> TrackFunctions {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return TrackFunctions::None;
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        unsafe { &*pointer }.track_functions()
+    })
+}
+
 pub fn set_active_config(
     name: &str,
     value: Option<&str>,
@@ -584,6 +595,24 @@ struct GucValues {
     default_transaction_read_only: bool,
     default_transaction_deferrable: bool,
     password_encryption: PasswordEncryption,
+    track_functions: TrackFunctions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrackFunctions {
+    None,
+    Pl,
+    All,
+}
+
+impl TrackFunctions {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Pl => "pl",
+            Self::All => "all",
+        }
+    }
 }
 
 /// Planner inputs reported by `EXPLAIN (SETTINGS)`.  This is deliberately a
@@ -661,6 +690,7 @@ impl GucValues {
             default_transaction_read_only: false,
             default_transaction_deferrable: false,
             password_encryption: PasswordEncryption::ScramSha256,
+            track_functions: TrackFunctions::None,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -702,7 +732,8 @@ const GUC_EVENT_TRIGGERS: u32 = 1 << 23;
 const GUC_DEFAULT_TEXT_SEARCH_CONFIG: u32 = 1 << 24;
 const GUC_PASSWORD_ENCRYPTION: u32 = 1 << 25;
 const GUC_LC_MONETARY: u32 = 1 << 26;
-const GUC_ALL: u32 = (1 << 27) - 1;
+const GUC_TRACK_FUNCTIONS: u32 = 1 << 27;
+const GUC_ALL: u32 = (1 << 28) - 1;
 
 fn guc_bit(name: &str) -> u32 {
     if name.eq_ignore_ascii_case("datestyle") {
@@ -759,6 +790,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_EVENT_TRIGGERS
     } else if name.eq_ignore_ascii_case("password_encryption") {
         GUC_PASSWORD_ENCRYPTION
+    } else if name.eq_ignore_ascii_case("track_functions") {
+        GUC_TRACK_FUNCTIONS
     } else {
         0
     }
@@ -769,7 +802,7 @@ pub(crate) fn knows_parameter(name: &str) -> bool {
 }
 
 pub(crate) fn requires_set_privilege(name: &str) -> bool {
-    name.eq_ignore_ascii_case("event_triggers")
+    name.eq_ignore_ascii_case("event_triggers") || name.eq_ignore_ascii_case("track_functions")
 }
 
 fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
@@ -814,6 +847,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
         default_transaction_deferrable
     );
     copy!(GUC_PASSWORD_ENCRYPTION, password_encryption);
+    copy!(GUC_TRACK_FUNCTIONS, track_functions);
 }
 
 fn finish_setting_change(
@@ -962,6 +996,7 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(default_transaction_read_only);
     changed!(default_transaction_deferrable);
     changed!(password_encryption);
+    changed!(track_functions);
 }
 
 impl Default for GucState {
@@ -1067,6 +1102,8 @@ impl GucState {
                 PasswordEncryption::ScramSha256 => "scram-sha-256",
                 PasswordEncryption::Md5 => "md5",
             }))
+        } else if name.eq_ignore_ascii_case("track_functions") {
+            Some(StackStr::from_str(values.track_functions.as_str()))
         } else {
             None
         }
@@ -1268,6 +1305,10 @@ impl GucState {
 
     pub(crate) fn event_triggers(&self) -> bool {
         self.store.borrow().current.event_triggers
+    }
+
+    pub(crate) fn track_functions(&self) -> TrackFunctions {
+        self.store.borrow().current.track_functions
     }
 
     pub(crate) fn transaction_defaults(&self) -> (TransactionIsolation, bool, bool) {
@@ -1863,6 +1904,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.default_transaction_deferrable = defaults.default_transaction_deferrable;
     } else if name.eq_ignore_ascii_case("password_encryption") {
         values.password_encryption = defaults.password_encryption;
+    } else if name.eq_ignore_ascii_case("track_functions") {
+        values.track_functions = defaults.track_functions;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -2209,6 +2252,18 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         };
         return Ok(());
     }
+    if name.eq_ignore_ascii_case("track_functions") {
+        values.track_functions = if is_default || v.eq_ignore_ascii_case("none") {
+            TrackFunctions::None
+        } else if v.eq_ignore_ascii_case("pl") {
+            TrackFunctions::Pl
+        } else if v.eq_ignore_ascii_case("all") {
+            TrackFunctions::All
+        } else {
+            return Err(unsupported_value("track_functions", v));
+        };
+        return Ok(());
+    }
     // Read-only parameters cannot be assigned.
     if is_read_only(name) {
         return Err(sql_err!(
@@ -2317,6 +2372,8 @@ impl GucState {
                 PasswordEncryption::ScramSha256 => "scram-sha-256",
                 PasswordEncryption::Md5 => "md5",
             }))
+        } else if name.eq_ignore_ascii_case("track_functions") {
+            Some(StackStr::from_str(values.track_functions.as_str()))
         } else if name.eq_ignore_ascii_case("seed") {
             Some(StackStr::from_str("unavailable"))
         } else {

@@ -10736,6 +10736,50 @@ pub(crate) struct RelationCumulativeStatistics {
     pub(crate) total_analyze_time_micros: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FunctionCumulativeStatistics {
+    database: DatabaseOid,
+    pub(crate) oid: i32,
+    pub(crate) calls: u64,
+    pub(crate) total_time_micros: u64,
+    pub(crate) self_time_micros: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FunctionTransactionStatistics {
+    txid: u32,
+    oid: i32,
+    calls: u64,
+    total_time_micros: u64,
+    self_time_micros: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SharedStatisticsResetTimes {
+    pub(crate) archiver: i64,
+    pub(crate) background_writer: i64,
+    pub(crate) checkpointer: i64,
+    pub(crate) io: i64,
+    pub(crate) recovery_prefetch: i64,
+    pub(crate) wal: i64,
+    pub(crate) slru: [i64; 8],
+}
+
+impl SharedStatisticsResetTimes {
+    fn new() -> Self {
+        let now = crate::sql::datetime::now_micros();
+        Self {
+            archiver: now,
+            background_writer: now,
+            checkpointer: now,
+            io: now,
+            recovery_prefetch: now,
+            wal: now,
+            slru: [now; 8],
+        }
+    }
+}
+
 impl RelationCumulativeStatistics {
     const EMPTY: Self = Self {
         seq_scan: 0,
@@ -10927,6 +10971,9 @@ pub struct Storage {
     cumulative_transaction_nesting: std::cell::RefCell<FixedVec<(u32, u8)>>,
     index_cumulative_statistics: std::cell::RefCell<FixedVec<IndexCumulativeStatistics>>,
     database_cumulative_statistics: std::cell::RefCell<FixedVec<DatabaseCumulativeStatistics>>,
+    function_cumulative_statistics: std::cell::RefCell<FixedVec<FunctionCumulativeStatistics>>,
+    function_transaction_statistics: std::cell::RefCell<FixedVec<FunctionTransactionStatistics>>,
+    shared_statistics_reset_times: Cell<SharedStatisticsResetTimes>,
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
     temporary_transactions: std::cell::RefCell<FixedVec<u32>>,
@@ -12175,6 +12222,171 @@ impl Storage {
         if let Some(position) = nesting.iter().position(|(candidate, _)| *candidate == txid) {
             nesting.swap_remove(position);
         }
+        let mut functions = self.function_transaction_statistics.borrow_mut();
+        while let Some(position) = functions.iter().position(|entry| entry.txid == txid) {
+            functions.swap_remove(position);
+        }
+    }
+
+    pub(crate) fn record_function_call(
+        &self,
+        txid: u32,
+        oid: i32,
+        total_time_micros: u64,
+        self_time_micros: u64,
+    ) -> Result<(), SqlError> {
+        self.ensure_function_statistics(oid)?;
+        let mut cumulative = self.function_cumulative_statistics.borrow_mut();
+        let slot = cumulative
+            .iter()
+            .position(|entry| entry.database == self.current_database && entry.oid == oid)
+            .expect("function statistics were reserved before recording");
+        let entry = &mut cumulative[slot];
+        entry.calls = entry.calls.saturating_add(1);
+        entry.total_time_micros = entry.total_time_micros.saturating_add(total_time_micros);
+        entry.self_time_micros = entry.self_time_micros.saturating_add(self_time_micros);
+        drop(cumulative);
+
+        if txid == 0 {
+            return Ok(());
+        }
+        let mut transaction = self.function_transaction_statistics.borrow_mut();
+        let slot = if let Some(slot) = transaction
+            .iter()
+            .position(|entry| entry.txid == txid && entry.oid == oid)
+        {
+            slot
+        } else {
+            transaction
+                .push(FunctionTransactionStatistics {
+                    txid,
+                    oid,
+                    calls: 0,
+                    total_time_micros: 0,
+                    self_time_micros: 0,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "transaction function statistics capacity exhausted"
+                    )
+                })?;
+            transaction.len() - 1
+        };
+        let entry = &mut transaction[slot];
+        entry.calls = entry.calls.saturating_add(1);
+        entry.total_time_micros = entry.total_time_micros.saturating_add(total_time_micros);
+        entry.self_time_micros = entry.self_time_micros.saturating_add(self_time_micros);
+        Ok(())
+    }
+
+    pub(crate) fn ensure_function_statistics(&self, oid: i32) -> Result<(), SqlError> {
+        let mut cumulative = self.function_cumulative_statistics.borrow_mut();
+        if cumulative
+            .iter()
+            .any(|entry| entry.database == self.current_database && entry.oid == oid)
+        {
+            return Ok(());
+        }
+        cumulative
+            .push(FunctionCumulativeStatistics {
+                database: self.current_database,
+                oid,
+                calls: 0,
+                total_time_micros: 0,
+                self_time_micros: 0,
+            })
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "function statistics capacity exhausted"
+                )
+            })
+    }
+
+    pub(crate) fn function_cumulative_statistics(
+        &self,
+        oid: i32,
+    ) -> Option<FunctionCumulativeStatistics> {
+        self.function_cumulative_statistics
+            .borrow()
+            .iter()
+            .find(|entry| entry.database == self.current_database && entry.oid == oid)
+            .copied()
+    }
+
+    pub(crate) fn function_transaction_statistics(
+        &self,
+        txid: u32,
+        oid: i32,
+    ) -> Option<FunctionCumulativeStatistics> {
+        self.function_transaction_statistics
+            .borrow()
+            .iter()
+            .find(|entry| entry.txid == txid && entry.oid == oid)
+            .map(|entry| FunctionCumulativeStatistics {
+                database: self.current_database,
+                oid,
+                calls: entry.calls,
+                total_time_micros: entry.total_time_micros,
+                self_time_micros: entry.self_time_micros,
+            })
+    }
+
+    pub(crate) fn reset_function_statistics(&self, oid: i32) {
+        let mut statistics = self.function_cumulative_statistics.borrow_mut();
+        if let Some(position) = statistics
+            .iter()
+            .position(|entry| entry.database == self.current_database && entry.oid == oid)
+        {
+            statistics.swap_remove(position);
+        }
+    }
+
+    pub(crate) fn shared_statistics_reset_times(&self) -> SharedStatisticsResetTimes {
+        self.shared_statistics_reset_times.get()
+    }
+
+    pub(crate) fn reset_shared_statistics(&self, target: &str) -> bool {
+        let now = crate::sql::datetime::now_micros();
+        let mut reset = self.shared_statistics_reset_times.get();
+        match target {
+            "archiver" => reset.archiver = now,
+            "bgwriter" => reset.background_writer = now,
+            "checkpointer" => reset.checkpointer = now,
+            "io" => reset.io = now,
+            "recovery_prefetch" => reset.recovery_prefetch = now,
+            "slru" => reset.slru = [now; 8],
+            "wal" => reset.wal = now,
+            _ => return false,
+        }
+        self.shared_statistics_reset_times.set(reset);
+        true
+    }
+
+    pub(crate) fn reset_slru_statistics(&self, target: Option<&str>) -> bool {
+        const NAMES: [&str; 8] = [
+            "commit_timestamp",
+            "multixact_member",
+            "multixact_offset",
+            "notify",
+            "other",
+            "serializable",
+            "subtransaction",
+            "transaction",
+        ];
+        let now = crate::sql::datetime::now_micros();
+        let mut reset = self.shared_statistics_reset_times.get();
+        if let Some(target) = target {
+            let Some(index) = NAMES.iter().position(|name| *name == target) else {
+                return false;
+            };
+            reset.slru[index] = now;
+        } else {
+            reset.slru = [now; 8];
+        }
+        self.shared_statistics_reset_times.set(reset);
+        true
     }
 
     pub(crate) fn relation_cumulative_statistics(
@@ -12260,6 +12472,15 @@ impl Storage {
         while position < indexes.len() {
             if indexes[position].database == self.current_database {
                 indexes.swap_remove(position);
+            } else {
+                position += 1;
+            }
+        }
+        let mut functions = self.function_cumulative_statistics.borrow_mut();
+        let mut position = 0usize;
+        while position < functions.len() {
+            if functions[position].database == self.current_database {
+                functions.swap_remove(position);
             } else {
                 position += 1;
             }
@@ -14582,6 +14803,13 @@ impl Storage {
                 .push(DatabaseCumulativeStatistics::empty(database.oid))
                 .expect("sized to the database catalog");
         }
+        let function_cumulative_statistics =
+            FixedVec::new(budget, "function_cumulative_statistics", config.max_tables)?;
+        let function_transaction_statistics = FixedVec::new(
+            budget,
+            "function_transaction_statistics",
+            transaction_capacity * config.max_tables,
+        )?;
         let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
             "table_locks",
@@ -14656,6 +14884,11 @@ impl Storage {
             cumulative_transaction_nesting: std::cell::RefCell::new(cumulative_transaction_nesting),
             index_cumulative_statistics: std::cell::RefCell::new(index_cumulative_statistics),
             database_cumulative_statistics: std::cell::RefCell::new(database_cumulative_statistics),
+            function_cumulative_statistics: std::cell::RefCell::new(function_cumulative_statistics),
+            function_transaction_statistics: std::cell::RefCell::new(
+                function_transaction_statistics,
+            ),
+            shared_statistics_reset_times: Cell::new(SharedStatisticsResetTimes::new()),
             temporary_transactions,
             tablespaces,
             schemas,
@@ -33782,7 +34015,9 @@ impl Storage {
     }
 
     pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
-        let oid = routine_oid(&self.routines[slot]) as u32;
+        let routine_oid = routine_oid(&self.routines[slot]);
+        let oid = routine_oid as u32;
+        self.reset_function_statistics(routine_oid);
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_drop();
         let object = Self::routine_access_object(slot);
         self.clear_object_acl_entries(object);

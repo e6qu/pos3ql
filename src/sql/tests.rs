@@ -10194,6 +10194,192 @@ fn cumulative_statistics_cover_tables_indexes_transactions_resets_and_catalogs()
 }
 
 #[test]
+fn postgresql_18_monitoring_views_cover_io_shared_progress_and_catalog_shapes() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE monitor_parent(id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE monitor_child PARTITION OF monitor_parent FOR VALUES FROM (0) TO (10); \
+         CREATE INDEX monitor_child_idx ON monitor_child(id); \
+         CREATE SEQUENCE monitor_sequence; \
+         SELECT relname, heap_blks_read, heap_blks_hit, idx_blks_read, idx_blks_hit, \
+                toast_blks_read IS NULL, tidx_blks_read IS NULL \
+           FROM pg_statio_user_tables WHERE relname LIKE 'monitor_%' ORDER BY relname; \
+         SELECT indexrelname, idx_blks_read, idx_blks_hit \
+           FROM pg_statio_user_indexes WHERE indexrelname = 'monitor_child_idx'; \
+         SELECT relname, blks_read, blks_hit FROM pg_statio_user_sequences \
+          WHERE relname = 'monitor_sequence'; \
+         SELECT count(*), bool_and(stats_reset IS NOT NULL) FROM pg_stat_slru; \
+         SELECT count(*) FROM pg_stat_wal_receiver; \
+         SELECT prefetch, hit, wal_distance, block_distance, io_depth, stats_reset IS NOT NULL \
+           FROM pg_stat_recovery_prefetch; \
+         SELECT count(*) FROM pg_stat_gssapi; \
+         SELECT archived_count, last_archived_wal IS NULL, failed_count, stats_reset IS NOT NULL \
+           FROM pg_stat_archiver; \
+         SELECT buffers_clean, maxwritten_clean, buffers_alloc, stats_reset IS NOT NULL \
+           FROM pg_stat_bgwriter; \
+         SELECT num_timed, num_requested, num_done, write_time, sync_time, \
+                buffers_written, slru_written, stats_reset IS NOT NULL \
+           FROM pg_stat_checkpointer; \
+         SELECT wal_records, wal_fpi, wal_bytes, wal_buffers_full, stats_reset IS NOT NULL \
+           FROM pg_stat_wal; \
+         SELECT count(*), bool_and(stats_reset IS NOT NULL) FROM pg_stat_io; \
+         SELECT object, context, reads IS NULL, writebacks IS NULL, extends IS NULL, \
+                hits IS NULL, reuses IS NULL, fsyncs IS NULL \
+           FROM pg_stat_io ORDER BY object, context; \
+         SELECT (SELECT count(*) FROM pg_stat_progress_analyze) + \
+                (SELECT count(*) FROM pg_stat_progress_vacuum) + \
+                (SELECT count(*) FROM pg_stat_progress_cluster) + \
+                (SELECT count(*) FROM pg_stat_progress_create_index) + \
+                (SELECT count(*) FROM pg_stat_progress_basebackup) + \
+                (SELECT count(*) FROM pg_stat_progress_copy); \
+         SELECT pg_stat_reset_shared('archiver'), pg_stat_reset_shared('bgwriter'), \
+                pg_stat_reset_shared('checkpointer'), pg_stat_reset_shared('io'), \
+                pg_stat_reset_shared('recovery_prefetch'), pg_stat_reset_shared('slru'), \
+                pg_stat_reset_shared('wal'), pg_stat_reset_slru(NULL); \
+         SELECT count(*) FROM pg_class WHERE oid IN \
+           (12174,12179,12183,12200,12205,12209,12213,12218,12222,12236,12240,12244, \
+            12257,12279,12284,12289,12293,12297,12301,12305,12309,12314,12319,12324, \
+            12329,12333); \
+         SELECT count(*) FROM pg_attribute WHERE attrelid IN \
+           (12174,12179,12183,12200,12205,12209,12213,12218,12222,12236,12240,12244, \
+            12257,12279,12284,12289,12293,12297,12301,12305,12309,12314,12319,12324, \
+            12329,12333) AND attnum > 0 AND NOT attisdropped",
+    );
+    let rendered = String::from_utf8_lossy(&output);
+    assert!(!rendered.contains("ERROR"), "{rendered}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "monitor_child|0|0|0|0|t|t",
+            "monitor_child_idx|0|0",
+            "monitor_sequence|0|0",
+            "8|t",
+            "0",
+            "0|0|0|0|0|t",
+            "0",
+            "0|t|0|t",
+            "0|0|0|t",
+            "0|0|0|0|0|0|0|t",
+            "0|0|0|0|t",
+            "8|t",
+            "relation|bulkread|f|f|t|f|f|t",
+            "relation|bulkwrite|f|f|f|f|f|t",
+            "relation|init|f|f|f|f|t|f",
+            "relation|normal|f|f|f|f|t|f",
+            "relation|vacuum|f|f|f|f|f|t",
+            "temp relation|normal|f|t|f|f|t|t",
+            "wal|init|t|t|t|t|t|f",
+            "wal|normal|f|t|t|t|t|f",
+            "0",
+            "|||||||",
+            "26",
+            "240",
+        ],
+        "{rendered}"
+    );
+}
+
+#[test]
+fn user_function_statistics_track_nested_calls_transactions_and_resets() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "SHOW track_functions; \
+         SELECT setting, boot_val, reset_val, context, vartype, enumvals::text \
+           FROM pg_settings WHERE name = 'track_functions'; \
+         SET track_functions = 'all'; \
+         CREATE FUNCTION monitored_inner(value integer) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT $1 + 1'; \
+         CREATE FUNCTION monitored_outer(value integer) RETURNS integer LANGUAGE plpgsql \
+           AS 'BEGIN RETURN monitored_inner(value); END'; \
+         BEGIN; \
+         SELECT monitored_outer(40); \
+         SELECT funcname, calls, total_time >= 0, self_time >= 0, total_time >= self_time \
+           FROM pg_stat_xact_user_functions WHERE funcname LIKE 'monitored_%' ORDER BY funcname; \
+         COMMIT; \
+         SELECT funcname, calls, total_time >= 0, self_time >= 0, total_time >= self_time \
+           FROM pg_stat_user_functions WHERE funcname LIKE 'monitored_%' ORDER BY funcname; \
+         SELECT pg_stat_reset_single_function_counters(oid) \
+           FROM pg_proc WHERE proname = 'monitored_inner'; \
+         SELECT funcname FROM pg_stat_user_functions WHERE funcname LIKE 'monitored_%' \
+          ORDER BY funcname; \
+         SELECT pg_stat_reset(); \
+         SELECT count(*) FROM pg_stat_user_functions WHERE funcname LIKE 'monitored_%'; \
+         SET track_functions = 'pl'; \
+         SELECT monitored_outer(1); \
+         SELECT funcname, calls FROM pg_stat_user_functions \
+          WHERE funcname LIKE 'monitored_%' ORDER BY funcname; \
+         SELECT oid, pronargs, prorettype, provolatile, proparallel, proisstrict, proacl IS NULL \
+           FROM pg_proc WHERE oid IN (2307,3775,3777,6387) ORDER BY oid; \
+         SELECT count(*) FROM pg_init_privs WHERE objoid IN (2307,3775,3777,6387)",
+    );
+    let rendered = String::from_utf8_lossy(&setup);
+    assert!(!rendered.contains("ERROR"), "{rendered}");
+    assert_eq!(
+        data_rows(&setup),
+        [
+            "none",
+            "none|none|none|superuser|enum|{none,pl,all}",
+            "41",
+            "monitored_inner|1|t|t|t",
+            "monitored_outer|1|t|t|t",
+            "monitored_inner|1|t|t|t",
+            "monitored_outer|1|t|t|t",
+            "",
+            "monitored_outer",
+            "",
+            "0",
+            "2",
+            "monitored_outer|1",
+            "2307|1|2278|v|s|f|f",
+            "3775|1|2278|v|s|f|f",
+            "3777|1|2278|v|s|t|f",
+            "6387|1|2278|v|s|t|f",
+            "4",
+        ],
+        "{rendered}"
+    );
+
+    let failure_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "SET track_functions = 'all'; \
+         CREATE FUNCTION monitored_failure() RETURNS integer LANGUAGE plpgsql \
+           AS 'BEGIN RETURN 1 / 0; END'",
+    );
+    assert!(!String::from_utf8_lossy(&failure_setup).contains("ERROR"));
+    let failing = run_with(
+        &mut engine,
+        &mut budget,
+        "SET track_functions = 'all'; SELECT monitored_failure()",
+    );
+    assert!(String::from_utf8_lossy(&failing).contains("22012"));
+    let failed_statistics = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT funcname, calls FROM pg_stat_user_functions \
+          WHERE funcname = 'monitored_failure'",
+    );
+    assert_eq!(data_rows(&failed_statistics), ["monitored_failure|0"]);
+
+    let denied_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE function_statistics_reader",
+    );
+    assert!(!String::from_utf8_lossy(&denied_setup).contains("ERROR"));
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE function_statistics_reader; SET track_functions = 'all'",
+    );
+    assert!(String::from_utf8_lossy(&denied).contains("42501"));
+}
+
+#[test]
 fn cumulative_database_statistics_count_index_entries_as_returned_tuples() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

@@ -335,10 +335,42 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     ),
     intrinsic!(2274, "pg_stat_reset", super::types::oid::VOID, "", 0, "v"),
     intrinsic!(
+        2307,
+        "pg_stat_reset_slru",
+        super::types::oid::VOID,
+        "25",
+        1,
+        "v"
+    ),
+    intrinsic!(
+        3775,
+        "pg_stat_reset_shared",
+        super::types::oid::VOID,
+        "25",
+        1,
+        "v"
+    ),
+    intrinsic!(
         3776,
         "pg_stat_reset_single_table_counters",
         super::types::oid::VOID,
         "26",
+        1,
+        "v"
+    ),
+    intrinsic!(
+        3777,
+        "pg_stat_reset_single_function_counters",
+        super::types::oid::VOID,
+        "26",
+        1,
+        "v"
+    ),
+    intrinsic!(
+        6387,
+        "pg_stat_reset_backend_stats",
+        super::types::oid::VOID,
+        "23",
         1,
         "v"
     ),
@@ -3534,6 +3566,8 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 2137
             | 2230
             | 2274
+            | 2307
+            | 3775
             | 2900
             | 2901
             | 3205
@@ -4051,6 +4085,7 @@ const OBJECT_ADDRESS_OUTPUT_NAMES: &[&str] = &["classid", "objid", "objsubid"];
 
 fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
     match oid {
+        2307 | 3775 => Some(&["target"]),
         2096 => Some(&["pid", "timeout"]),
         2171 => Some(&["pid"]),
         6119 => Some(&["pubname"]),
@@ -8301,11 +8336,37 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_stat_xact_sys_tables", 12161),
     ("pg_stat_user_tables", 12165),
     ("pg_stat_xact_user_tables", 12170),
+    ("pg_statio_all_tables", 12174),
+    ("pg_statio_sys_tables", 12179),
+    ("pg_statio_user_tables", 12183),
     ("pg_stat_all_indexes", 12187),
     ("pg_stat_sys_indexes", 12192),
     ("pg_stat_user_indexes", 12196),
+    ("pg_statio_all_indexes", 12200),
+    ("pg_statio_sys_indexes", 12205),
+    ("pg_statio_user_indexes", 12209),
+    ("pg_statio_all_sequences", 12213),
+    ("pg_statio_sys_sequences", 12218),
+    ("pg_statio_user_sequences", 12222),
+    ("pg_stat_slru", 12236),
+    ("pg_stat_wal_receiver", 12240),
+    ("pg_stat_recovery_prefetch", 12244),
+    ("pg_stat_gssapi", 12257),
     ("pg_stat_database", 12270),
     ("pg_stat_database_conflicts", 12275),
+    ("pg_stat_user_functions", 12279),
+    ("pg_stat_xact_user_functions", 12284),
+    ("pg_stat_archiver", 12289),
+    ("pg_stat_bgwriter", 12293),
+    ("pg_stat_checkpointer", 12297),
+    ("pg_stat_io", 12301),
+    ("pg_stat_wal", 12305),
+    ("pg_stat_progress_analyze", 12309),
+    ("pg_stat_progress_vacuum", 12314),
+    ("pg_stat_progress_cluster", 12319),
+    ("pg_stat_progress_create_index", 12324),
+    ("pg_stat_progress_basebackup", 12329),
+    ("pg_stat_progress_copy", 12333),
     ("pg_transform", 3576),
     ("pg_locks", 12073),
     ("pg_cursors", 12077),
@@ -8463,11 +8524,37 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_stat_xact_sys_tables"
                 | "pg_stat_user_tables"
                 | "pg_stat_xact_user_tables"
+                | "pg_statio_all_tables"
+                | "pg_statio_sys_tables"
+                | "pg_statio_user_tables"
                 | "pg_stat_all_indexes"
                 | "pg_stat_sys_indexes"
                 | "pg_stat_user_indexes"
+                | "pg_statio_all_indexes"
+                | "pg_statio_sys_indexes"
+                | "pg_statio_user_indexes"
+                | "pg_statio_all_sequences"
+                | "pg_statio_sys_sequences"
+                | "pg_statio_user_sequences"
+                | "pg_stat_slru"
+                | "pg_stat_wal_receiver"
+                | "pg_stat_recovery_prefetch"
+                | "pg_stat_gssapi"
                 | "pg_stat_database"
                 | "pg_stat_database_conflicts"
+                | "pg_stat_user_functions"
+                | "pg_stat_xact_user_functions"
+                | "pg_stat_archiver"
+                | "pg_stat_bgwriter"
+                | "pg_stat_checkpointer"
+                | "pg_stat_io"
+                | "pg_stat_wal"
+                | "pg_stat_progress_analyze"
+                | "pg_stat_progress_vacuum"
+                | "pg_stat_progress_cluster"
+                | "pg_stat_progress_create_index"
+                | "pg_stat_progress_basebackup"
+                | "pg_stat_progress_copy"
         ),
     }
 }
@@ -8614,6 +8701,27 @@ pub fn synthesize<'a>(
             StatisticsScope::User,
             true,
         ),
+        (false, "pg_statio_all_tables") => pg_statio_tables(
+            storage,
+            txid,
+            arena,
+            "pg_statio_all_tables",
+            StatisticsScope::All,
+        ),
+        (false, "pg_statio_sys_tables") => pg_statio_tables(
+            storage,
+            txid,
+            arena,
+            "pg_statio_sys_tables",
+            StatisticsScope::System,
+        ),
+        (false, "pg_statio_user_tables") => pg_statio_tables(
+            storage,
+            txid,
+            arena,
+            "pg_statio_user_tables",
+            StatisticsScope::User,
+        ),
         (false, "pg_stat_all_indexes") => pg_stat_indexes(
             storage,
             txid,
@@ -8635,8 +8743,93 @@ pub fn synthesize<'a>(
             "pg_stat_user_indexes",
             StatisticsScope::User,
         ),
+        (false, "pg_statio_all_indexes") => pg_statio_indexes(
+            storage,
+            txid,
+            arena,
+            "pg_statio_all_indexes",
+            StatisticsScope::All,
+        ),
+        (false, "pg_statio_sys_indexes") => pg_statio_indexes(
+            storage,
+            txid,
+            arena,
+            "pg_statio_sys_indexes",
+            StatisticsScope::System,
+        ),
+        (false, "pg_statio_user_indexes") => pg_statio_indexes(
+            storage,
+            txid,
+            arena,
+            "pg_statio_user_indexes",
+            StatisticsScope::User,
+        ),
+        (false, "pg_statio_all_sequences") => pg_statio_sequences(
+            storage,
+            txid,
+            arena,
+            "pg_statio_all_sequences",
+            StatisticsScope::All,
+        ),
+        (false, "pg_statio_sys_sequences") => pg_statio_sequences(
+            storage,
+            txid,
+            arena,
+            "pg_statio_sys_sequences",
+            StatisticsScope::System,
+        ),
+        (false, "pg_statio_user_sequences") => pg_statio_sequences(
+            storage,
+            txid,
+            arena,
+            "pg_statio_user_sequences",
+            StatisticsScope::User,
+        ),
+        (false, "pg_stat_slru") => pg_stat_slru(storage, arena),
+        (false, "pg_stat_wal_receiver") => {
+            empty_monitoring_view("pg_stat_wal_receiver", PG_STAT_WAL_RECEIVER_COLUMNS, arena)
+        }
+        (false, "pg_stat_recovery_prefetch") => pg_stat_recovery_prefetch(storage, arena),
+        (false, "pg_stat_gssapi") => pg_stat_gssapi(storage, arena),
         (false, "pg_stat_database") => pg_stat_database(storage, txid, arena),
         (false, "pg_stat_database_conflicts") => pg_stat_database_conflicts(storage, txid, arena),
+        (false, "pg_stat_user_functions") => pg_stat_functions(storage, txid, arena, false),
+        (false, "pg_stat_xact_user_functions") => pg_stat_functions(storage, txid, arena, true),
+        (false, "pg_stat_archiver") => pg_stat_archiver(storage, arena),
+        (false, "pg_stat_bgwriter") => pg_stat_bgwriter(storage, arena),
+        (false, "pg_stat_checkpointer") => pg_stat_checkpointer(storage, arena),
+        (false, "pg_stat_io") => pg_stat_io(storage, arena),
+        (false, "pg_stat_wal") => pg_stat_wal(storage, arena),
+        (false, "pg_stat_progress_analyze") => empty_monitoring_view(
+            "pg_stat_progress_analyze",
+            PG_STAT_PROGRESS_ANALYZE_COLUMNS,
+            arena,
+        ),
+        (false, "pg_stat_progress_vacuum") => empty_monitoring_view(
+            "pg_stat_progress_vacuum",
+            PG_STAT_PROGRESS_VACUUM_COLUMNS,
+            arena,
+        ),
+        (false, "pg_stat_progress_cluster") => empty_monitoring_view(
+            "pg_stat_progress_cluster",
+            PG_STAT_PROGRESS_CLUSTER_COLUMNS,
+            arena,
+        ),
+        (false, "pg_stat_progress_create_index") => empty_monitoring_view(
+            "pg_stat_progress_create_index",
+            PG_STAT_PROGRESS_CREATE_INDEX_COLUMNS,
+            arena,
+        ),
+        (false, "pg_stat_progress_basebackup") => empty_monitoring_view(
+            "pg_stat_progress_basebackup",
+            PG_STAT_PROGRESS_BASEBACKUP_COLUMNS,
+            arena,
+        ),
+        (false, "pg_stat_progress_copy") => empty_monitoring_view(
+            "pg_stat_progress_copy",
+            PG_STAT_PROGRESS_COPY_COLUMNS,
+            arena,
+        ),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
@@ -9490,9 +9683,12 @@ fn pg_init_privs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ],
     );
     let rows = arena
-        .alloc_slice_with(5, |_| &[] as &[Datum])
+        .alloc_slice_with(9, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (row_index, function_oid) in [764, 765, 767, 2274, 3776].into_iter().enumerate() {
+    for (row_index, function_oid) in [764, 765, 767, 2274, 2307, 3775, 3776, 3777, 6387]
+        .into_iter()
+        .enumerate()
+    {
         rows[row_index] = row(
             &[
                 Datum::Int4(function_oid),
@@ -16314,6 +16510,246 @@ const PG_STAT_INDEXES_COLUMNS: &[(&str, ColType)] = &[
     ("idx_tup_fetch", ColType::Int8),
 ];
 
+const PG_STATIO_TABLES_COLUMNS: &[(&str, ColType)] = &[
+    ("relid", ColType::Oid),
+    ("schemaname", ColType::Name),
+    ("relname", ColType::Name),
+    ("heap_blks_read", ColType::Int8),
+    ("heap_blks_hit", ColType::Int8),
+    ("idx_blks_read", ColType::Int8),
+    ("idx_blks_hit", ColType::Int8),
+    ("toast_blks_read", ColType::Int8),
+    ("toast_blks_hit", ColType::Int8),
+    ("tidx_blks_read", ColType::Int8),
+    ("tidx_blks_hit", ColType::Int8),
+];
+
+const PG_STATIO_INDEXES_COLUMNS: &[(&str, ColType)] = &[
+    ("relid", ColType::Oid),
+    ("indexrelid", ColType::Oid),
+    ("schemaname", ColType::Name),
+    ("relname", ColType::Name),
+    ("indexrelname", ColType::Name),
+    ("idx_blks_read", ColType::Int8),
+    ("idx_blks_hit", ColType::Int8),
+];
+
+const PG_STATIO_SEQUENCES_COLUMNS: &[(&str, ColType)] = &[
+    ("relid", ColType::Oid),
+    ("schemaname", ColType::Name),
+    ("relname", ColType::Name),
+    ("blks_read", ColType::Int8),
+    ("blks_hit", ColType::Int8),
+];
+
+const PG_STAT_SLRU_COLUMNS: &[(&str, ColType)] = &[
+    ("name", ColType::Text),
+    ("blks_zeroed", ColType::Int8),
+    ("blks_hit", ColType::Int8),
+    ("blks_read", ColType::Int8),
+    ("blks_written", ColType::Int8),
+    ("blks_exists", ColType::Int8),
+    ("flushes", ColType::Int8),
+    ("truncates", ColType::Int8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+const PG_STAT_WAL_RECEIVER_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("status", ColType::Text),
+    ("receive_start_lsn", ColType::PgLsn),
+    ("receive_start_tli", ColType::Int4),
+    ("written_lsn", ColType::PgLsn),
+    ("flushed_lsn", ColType::PgLsn),
+    ("received_tli", ColType::Int4),
+    ("last_msg_send_time", ColType::Timestamptz),
+    ("last_msg_receipt_time", ColType::Timestamptz),
+    ("latest_end_lsn", ColType::PgLsn),
+    ("latest_end_time", ColType::Timestamptz),
+    ("slot_name", ColType::Text),
+    ("sender_host", ColType::Text),
+    ("sender_port", ColType::Int4),
+    ("conninfo", ColType::Text),
+];
+
+const PG_STAT_RECOVERY_PREFETCH_COLUMNS: &[(&str, ColType)] = &[
+    ("stats_reset", ColType::Timestamptz),
+    ("prefetch", ColType::Int8),
+    ("hit", ColType::Int8),
+    ("skip_init", ColType::Int8),
+    ("skip_new", ColType::Int8),
+    ("skip_fpw", ColType::Int8),
+    ("skip_rep", ColType::Int8),
+    ("wal_distance", ColType::Int4),
+    ("block_distance", ColType::Int4),
+    ("io_depth", ColType::Int4),
+];
+
+const PG_STAT_GSSAPI_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("gss_authenticated", ColType::Bool),
+    ("principal", ColType::Text),
+    ("encrypted", ColType::Bool),
+    ("credentials_delegated", ColType::Bool),
+];
+
+const PG_STAT_FUNCTIONS_COLUMNS: &[(&str, ColType)] = &[
+    ("funcid", ColType::Oid),
+    ("schemaname", ColType::Name),
+    ("funcname", ColType::Name),
+    ("calls", ColType::Int8),
+    ("total_time", ColType::Float8),
+    ("self_time", ColType::Float8),
+];
+
+const PG_STAT_ARCHIVER_COLUMNS: &[(&str, ColType)] = &[
+    ("archived_count", ColType::Int8),
+    ("last_archived_wal", ColType::Text),
+    ("last_archived_time", ColType::Timestamptz),
+    ("failed_count", ColType::Int8),
+    ("last_failed_wal", ColType::Text),
+    ("last_failed_time", ColType::Timestamptz),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+const PG_STAT_BGWRITER_COLUMNS: &[(&str, ColType)] = &[
+    ("buffers_clean", ColType::Int8),
+    ("maxwritten_clean", ColType::Int8),
+    ("buffers_alloc", ColType::Int8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+const PG_STAT_CHECKPOINTER_COLUMNS: &[(&str, ColType)] = &[
+    ("num_timed", ColType::Int8),
+    ("num_requested", ColType::Int8),
+    ("num_done", ColType::Int8),
+    ("restartpoints_timed", ColType::Int8),
+    ("restartpoints_req", ColType::Int8),
+    ("restartpoints_done", ColType::Int8),
+    ("write_time", ColType::Float8),
+    ("sync_time", ColType::Float8),
+    ("buffers_written", ColType::Int8),
+    ("slru_written", ColType::Int8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+const PG_STAT_IO_COLUMNS: &[(&str, ColType)] = &[
+    ("backend_type", ColType::Text),
+    ("object", ColType::Text),
+    ("context", ColType::Text),
+    ("reads", ColType::Int8),
+    ("read_bytes", ColType::Numeric),
+    ("read_time", ColType::Float8),
+    ("writes", ColType::Int8),
+    ("write_bytes", ColType::Numeric),
+    ("write_time", ColType::Float8),
+    ("writebacks", ColType::Int8),
+    ("writeback_time", ColType::Float8),
+    ("extends", ColType::Int8),
+    ("extend_bytes", ColType::Numeric),
+    ("extend_time", ColType::Float8),
+    ("hits", ColType::Int8),
+    ("evictions", ColType::Int8),
+    ("reuses", ColType::Int8),
+    ("fsyncs", ColType::Int8),
+    ("fsync_time", ColType::Float8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+const PG_STAT_WAL_COLUMNS: &[(&str, ColType)] = &[
+    ("wal_records", ColType::Int8),
+    ("wal_fpi", ColType::Int8),
+    ("wal_bytes", ColType::Numeric),
+    ("wal_buffers_full", ColType::Int8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
+const PG_STAT_PROGRESS_ANALYZE_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("relid", ColType::Oid),
+    ("phase", ColType::Text),
+    ("sample_blks_total", ColType::Int8),
+    ("sample_blks_scanned", ColType::Int8),
+    ("ext_stats_total", ColType::Int8),
+    ("ext_stats_computed", ColType::Int8),
+    ("child_tables_total", ColType::Int8),
+    ("child_tables_done", ColType::Int8),
+    ("current_child_table_relid", ColType::Oid),
+    ("delay_time", ColType::Float8),
+];
+const PG_STAT_PROGRESS_VACUUM_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("relid", ColType::Oid),
+    ("phase", ColType::Text),
+    ("heap_blks_total", ColType::Int8),
+    ("heap_blks_scanned", ColType::Int8),
+    ("heap_blks_vacuumed", ColType::Int8),
+    ("index_vacuum_count", ColType::Int8),
+    ("max_dead_tuple_bytes", ColType::Int8),
+    ("dead_tuple_bytes", ColType::Int8),
+    ("num_dead_item_ids", ColType::Int8),
+    ("indexes_total", ColType::Int8),
+    ("indexes_processed", ColType::Int8),
+    ("delay_time", ColType::Float8),
+];
+const PG_STAT_PROGRESS_CLUSTER_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("relid", ColType::Oid),
+    ("command", ColType::Text),
+    ("phase", ColType::Text),
+    ("cluster_index_relid", ColType::Oid),
+    ("heap_tuples_scanned", ColType::Int8),
+    ("heap_tuples_written", ColType::Int8),
+    ("heap_blks_total", ColType::Int8),
+    ("heap_blks_scanned", ColType::Int8),
+    ("index_rebuild_count", ColType::Int8),
+];
+const PG_STAT_PROGRESS_CREATE_INDEX_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("relid", ColType::Oid),
+    ("index_relid", ColType::Oid),
+    ("command", ColType::Text),
+    ("phase", ColType::Text),
+    ("lockers_total", ColType::Int8),
+    ("lockers_done", ColType::Int8),
+    ("current_locker_pid", ColType::Int8),
+    ("blocks_total", ColType::Int8),
+    ("blocks_done", ColType::Int8),
+    ("tuples_total", ColType::Int8),
+    ("tuples_done", ColType::Int8),
+    ("partitions_total", ColType::Int8),
+    ("partitions_done", ColType::Int8),
+];
+const PG_STAT_PROGRESS_BASEBACKUP_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("phase", ColType::Text),
+    ("backup_total", ColType::Int8),
+    ("backup_streamed", ColType::Int8),
+    ("tablespaces_total", ColType::Int8),
+    ("tablespaces_streamed", ColType::Int8),
+];
+const PG_STAT_PROGRESS_COPY_COLUMNS: &[(&str, ColType)] = &[
+    ("pid", ColType::Int4),
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("relid", ColType::Oid),
+    ("command", ColType::Text),
+    ("type", ColType::Text),
+    ("bytes_processed", ColType::Int8),
+    ("bytes_total", ColType::Int8),
+    ("tuples_processed", ColType::Int8),
+    ("tuples_excluded", ColType::Int8),
+    ("tuples_skipped", ColType::Int8),
+];
+
 const PG_STAT_DATABASE_COLUMNS: &[(&str, ColType)] = &[
     ("datid", ColType::Oid),
     ("datname", ColType::Name),
@@ -16418,6 +16854,24 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
         "pg_stat_xact_user_tables",
         PG_STAT_XACT_TABLES_COLUMNS,
     ),
+    (
+        12174,
+        12176,
+        "pg_statio_all_tables",
+        PG_STATIO_TABLES_COLUMNS,
+    ),
+    (
+        12179,
+        12181,
+        "pg_statio_sys_tables",
+        PG_STATIO_TABLES_COLUMNS,
+    ),
+    (
+        12183,
+        12185,
+        "pg_statio_user_tables",
+        PG_STATIO_TABLES_COLUMNS,
+    ),
     (12187, 12189, "pg_stat_all_indexes", PG_STAT_INDEXES_COLUMNS),
     (12192, 12194, "pg_stat_sys_indexes", PG_STAT_INDEXES_COLUMNS),
     (
@@ -16425,6 +16879,42 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
         12198,
         "pg_stat_user_indexes",
         PG_STAT_INDEXES_COLUMNS,
+    ),
+    (
+        12200,
+        12202,
+        "pg_statio_all_indexes",
+        PG_STATIO_INDEXES_COLUMNS,
+    ),
+    (
+        12205,
+        12207,
+        "pg_statio_sys_indexes",
+        PG_STATIO_INDEXES_COLUMNS,
+    ),
+    (
+        12209,
+        12211,
+        "pg_statio_user_indexes",
+        PG_STATIO_INDEXES_COLUMNS,
+    ),
+    (
+        12213,
+        12215,
+        "pg_statio_all_sequences",
+        PG_STATIO_SEQUENCES_COLUMNS,
+    ),
+    (
+        12218,
+        12220,
+        "pg_statio_sys_sequences",
+        PG_STATIO_SEQUENCES_COLUMNS,
+    ),
+    (
+        12222,
+        12224,
+        "pg_statio_user_sequences",
+        PG_STATIO_SEQUENCES_COLUMNS,
     ),
     (12073, 12075, "pg_locks", PG_LOCKS_COLUMNS),
     (12077, 12079, "pg_cursors", PG_CURSORS_COLUMNS),
@@ -16435,6 +16925,19 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
         "pg_stat_replication",
         PG_STAT_REPLICATION_COLUMNS,
     ),
+    (12236, 12238, "pg_stat_slru", PG_STAT_SLRU_COLUMNS),
+    (
+        12240,
+        12242,
+        "pg_stat_wal_receiver",
+        PG_STAT_WAL_RECEIVER_COLUMNS,
+    ),
+    (
+        12244,
+        12246,
+        "pg_stat_recovery_prefetch",
+        PG_STAT_RECOVERY_PREFETCH_COLUMNS,
+    ),
     (
         12248,
         12250,
@@ -16442,12 +16945,71 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
         PG_STAT_SUBSCRIPTION_COLUMNS,
     ),
     (12253, 12255, "pg_stat_ssl", PG_STAT_SSL_COLUMNS),
+    (12257, 12259, "pg_stat_gssapi", PG_STAT_GSSAPI_COLUMNS),
     (12270, 12272, "pg_stat_database", PG_STAT_DATABASE_COLUMNS),
     (
         12275,
         12277,
         "pg_stat_database_conflicts",
         PG_STAT_DATABASE_CONFLICTS_COLUMNS,
+    ),
+    (
+        12279,
+        12281,
+        "pg_stat_user_functions",
+        PG_STAT_FUNCTIONS_COLUMNS,
+    ),
+    (
+        12284,
+        12286,
+        "pg_stat_xact_user_functions",
+        PG_STAT_FUNCTIONS_COLUMNS,
+    ),
+    (12289, 12291, "pg_stat_archiver", PG_STAT_ARCHIVER_COLUMNS),
+    (12293, 12295, "pg_stat_bgwriter", PG_STAT_BGWRITER_COLUMNS),
+    (
+        12297,
+        12299,
+        "pg_stat_checkpointer",
+        PG_STAT_CHECKPOINTER_COLUMNS,
+    ),
+    (12301, 12303, "pg_stat_io", PG_STAT_IO_COLUMNS),
+    (12305, 12307, "pg_stat_wal", PG_STAT_WAL_COLUMNS),
+    (
+        12309,
+        12311,
+        "pg_stat_progress_analyze",
+        PG_STAT_PROGRESS_ANALYZE_COLUMNS,
+    ),
+    (
+        12314,
+        12316,
+        "pg_stat_progress_vacuum",
+        PG_STAT_PROGRESS_VACUUM_COLUMNS,
+    ),
+    (
+        12319,
+        12321,
+        "pg_stat_progress_cluster",
+        PG_STAT_PROGRESS_CLUSTER_COLUMNS,
+    ),
+    (
+        12324,
+        12326,
+        "pg_stat_progress_create_index",
+        PG_STAT_PROGRESS_CREATE_INDEX_COLUMNS,
+    ),
+    (
+        12329,
+        12331,
+        "pg_stat_progress_basebackup",
+        PG_STAT_PROGRESS_BASEBACKUP_COLUMNS,
+    ),
+    (
+        12333,
+        12335,
+        "pg_stat_progress_copy",
+        PG_STAT_PROGRESS_COPY_COLUMNS,
     ),
     (
         12261,
@@ -16469,7 +17031,17 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
     ),
 ];
 
-const MONITORING_ATTRIBUTE_COUNT: usize = 317;
+const fn monitoring_attribute_count() -> usize {
+    let mut total = 0usize;
+    let mut index = 0usize;
+    while index < MONITORING_RELATIONS.len() {
+        total += MONITORING_RELATIONS[index].3.len();
+        index += 1;
+    }
+    total
+}
+
+const MONITORING_ATTRIBUTE_COUNT: usize = monitoring_attribute_count();
 
 const fn monitoring_type_oid(ctype: ColType) -> i32 {
     match ctype {
@@ -19862,7 +20434,40 @@ fn pg_attribute<'a>(
             ("attacl", ColType::Array(super::types::ArrElem::AclItem)),
         ],
     );
-    let mut out: [&[Datum]; 1024] = [&[]; 1024];
+    let indexes = collect_indexes(storage, txid, arena)?;
+    let composite_attributes = storage
+        .composites_with_slots_visible_to(txid)
+        .map(|(_, composite)| composite.fields().len())
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
+    let table_attributes = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .map(|slot| {
+            let table = storage.table_def(slot, txid);
+            table.columns().len() + if table.has_toast { 5 } else { 0 }
+        })
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
+    let index_attributes = indexes
+        .iter()
+        .map(|index| index.n_cols + index.n_include_cols)
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
+    let view_attributes = storage
+        .views_visible_to(txid)
+        .map(|(_, view)| view.columns_for(txid).len())
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
+    let capacity = MONITORING_ATTRIBUTE_COUNT
+        .checked_add(table_attributes)
+        .and_then(|count| count.checked_add(composite_attributes))
+        .and_then(|count| count.checked_add(index_attributes))
+        .and_then(|count| count.checked_add(view_attributes))
+        .and_then(|count| count.checked_add(9))
+        .ok_or_else(|| catalog_capacity_exceeded("pg_attribute"))?;
+    let out = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for attributes in &MONITORING_ATTRIBUTE_ROWS {
         out[n] = attributes;
@@ -20097,7 +20702,6 @@ fn pg_attribute<'a>(
             n += 1;
         }
     }
-    let indexes = collect_indexes(storage, txid, arena)?;
     for info in indexes {
         let table = storage.table_def(info.table_slot, txid);
         for attribute in 0..info.n_cols + info.n_include_cols {
@@ -23361,7 +23965,10 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
                 Datum::Bool(false),
-                if matches!(routine.oid, 764 | 765 | 767 | 2274 | 3776) {
+                if matches!(
+                    routine.oid,
+                    764 | 765 | 767 | 2274 | 2307 | 3775 | 3776 | 3777 | 6387
+                ) {
                     builtin_acl(&["postgres=X/postgres"], arena)?
                 } else {
                     Datum::Null
@@ -25073,7 +25680,10 @@ fn pg_stat_tables<'a>(
             continue;
         }
         let table = storage.table_def(table_slot, txid);
-        if !statistics_schema_in_scope(table.schema.as_str(), scope) {
+        if table.kind != crate::storage::TableKind::Local
+            || table.partition.is_partitioned()
+            || !statistics_schema_in_scope(table.schema.as_str(), scope)
+        {
             continue;
         }
         let identity = [
@@ -25181,7 +25791,10 @@ fn pg_stat_indexes<'a>(
     let mut count = 0usize;
     for index in indexes {
         let table = storage.table_def(index.table_slot, txid);
-        if !statistics_schema_in_scope(table.schema.as_str(), scope) {
+        if table.kind != crate::storage::TableKind::Local
+            || table.partition.is_partitioned()
+            || !statistics_schema_in_scope(table.schema.as_str(), scope)
+        {
             continue;
         }
         let statistics = storage.index_cumulative_statistics(index.oid);
@@ -25204,6 +25817,466 @@ fn pg_stat_indexes<'a>(
         count += 1;
     }
     finish(definition, &rows[..count], arena)
+}
+
+fn empty_monitoring_view<'a>(
+    name: &'static str,
+    columns: &'static [(&'static str, ColType)],
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    finish(def_of(name, columns), &[], arena)
+}
+
+fn pg_statio_tables<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    name: &'static str,
+    scope: StatisticsScope,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(name, PG_STATIO_TABLES_COLUMNS);
+    let indexes = collect_indexes(storage, txid, arena)?;
+    let rows = arena
+        .alloc_slice_with(storage.table_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        if table.kind != crate::storage::TableKind::Local
+            || table.partition.is_partitioned()
+            || !statistics_schema_in_scope(table.schema.as_str(), scope)
+        {
+            continue;
+        }
+        let has_indexes = indexes.iter().any(|index| index.table_slot == slot);
+        rows[count] = row(
+            &[
+                Datum::Oid(user_table_oid(slot) as u32),
+                text(table.schema.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
+                Datum::Int8(0),
+                Datum::Int8(0),
+                if has_indexes {
+                    Datum::Int8(0)
+                } else {
+                    Datum::Null
+                },
+                if has_indexes {
+                    Datum::Int8(0)
+                } else {
+                    Datum::Null
+                },
+                if table.has_toast {
+                    Datum::Int8(0)
+                } else {
+                    Datum::Null
+                },
+                if table.has_toast {
+                    Datum::Int8(0)
+                } else {
+                    Datum::Null
+                },
+                if table.has_toast {
+                    Datum::Int8(0)
+                } else {
+                    Datum::Null
+                },
+                if table.has_toast {
+                    Datum::Int8(0)
+                } else {
+                    Datum::Null
+                },
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_statio_indexes<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    name: &'static str,
+    scope: StatisticsScope,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(name, PG_STATIO_INDEXES_COLUMNS);
+    let indexes = collect_indexes(storage, txid, arena)?;
+    let rows = arena
+        .alloc_slice_with(indexes.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for index in indexes {
+        let table = storage.table_def(index.table_slot, txid);
+        if table.kind != crate::storage::TableKind::Local
+            || table.partition.is_partitioned()
+            || !statistics_schema_in_scope(table.schema.as_str(), scope)
+        {
+            continue;
+        }
+        rows[count] = row(
+            &[
+                Datum::Oid(index.table_oid as u32),
+                Datum::Oid(index.oid as u32),
+                text(table.schema.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
+                text(index.name.as_str(), arena)?,
+                Datum::Int8(0),
+                Datum::Int8(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_statio_sequences<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    name: &'static str,
+    scope: StatisticsScope,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(name, PG_STATIO_SEQUENCES_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(storage.sequence_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for slot in 0..storage.sequence_count() {
+        if !storage.sequence_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let sequence = storage.sequence_for(slot, txid);
+        if !statistics_schema_in_scope(sequence.schema.as_str(), scope) {
+            continue;
+        }
+        rows[count] = row(
+            &[
+                Datum::Oid(sequence_oid(slot) as u32),
+                text(sequence.schema.as_str(), arena)?,
+                text(sequence.name.as_str(), arena)?,
+                Datum::Int8(0),
+                Datum::Int8(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_slru<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    const NAMES: [&str; 8] = [
+        "commit_timestamp",
+        "multixact_member",
+        "multixact_offset",
+        "notify",
+        "other",
+        "serializable",
+        "subtransaction",
+        "transaction",
+    ];
+    let definition = def_of("pg_stat_slru", PG_STAT_SLRU_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(NAMES.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let reset = storage.shared_statistics_reset_times();
+    for (index, name) in NAMES.iter().enumerate() {
+        rows[index] = row(
+            &[
+                Datum::Text(name),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Timestamptz(reset.slru[index]),
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_stat_recovery_prefetch<'a>(
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let reset = storage.shared_statistics_reset_times();
+    let encoded = row(
+        &[
+            Datum::Timestamptz(reset.recovery_prefetch),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int4(0),
+            Datum::Int4(0),
+            Datum::Int4(0),
+        ],
+        arena,
+    )?;
+    finish(
+        def_of(
+            "pg_stat_recovery_prefetch",
+            PG_STAT_RECOVERY_PREFETCH_COLUMNS,
+        ),
+        &[encoded],
+        arena,
+    )
+}
+
+fn pg_stat_gssapi<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_stat_gssapi", PG_STAT_GSSAPI_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    let mut error = None;
+    storage.visit_backends(|activity| {
+        if error.is_some() {
+            return;
+        }
+        match row(
+            &[
+                Datum::Int4(activity.pid),
+                Datum::Bool(false),
+                Datum::Null,
+                Datum::Bool(false),
+                Datum::Bool(false),
+            ],
+            arena,
+        ) {
+            Ok(encoded) => {
+                rows[count] = encoded;
+                count += 1;
+            }
+            Err(found) => error = Some(found),
+        }
+    });
+    if let Some(error) = error {
+        return Err(error);
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_functions<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    transaction_local: bool,
+) -> Result<SynthTable<'a>, SqlError> {
+    let name = if transaction_local {
+        "pg_stat_xact_user_functions"
+    } else {
+        "pg_stat_user_functions"
+    };
+    let definition = def_of(name, PG_STAT_FUNCTIONS_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(storage.routine_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for slot in 0..storage.routine_count() {
+        if !storage.routine_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let routine = storage.routine_for(slot, txid);
+        if routine.language == crate::storage::RoutineLanguage::Internal {
+            continue;
+        }
+        let oid = crate::storage::routine_oid(&routine);
+        let statistics = if transaction_local {
+            storage.function_transaction_statistics(txid, oid)
+        } else {
+            storage.function_cumulative_statistics(oid)
+        };
+        let Some(statistics) = statistics else {
+            continue;
+        };
+        rows[count] = row(
+            &[
+                Datum::Oid(oid as u32),
+                text(routine.schema.as_str(), arena)?,
+                text(routine.name.as_str(), arena)?,
+                statistics_count(statistics.calls),
+                Datum::Float8(statistics.total_time_micros as f64 / 1_000.0),
+                Datum::Float8(statistics.self_time_micros as f64 / 1_000.0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_archiver<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let reset = storage.shared_statistics_reset_times();
+    let encoded = row(
+        &[
+            Datum::Int8(0),
+            Datum::Null,
+            Datum::Null,
+            Datum::Int8(0),
+            Datum::Null,
+            Datum::Null,
+            Datum::Timestamptz(reset.archiver),
+        ],
+        arena,
+    )?;
+    finish(
+        def_of("pg_stat_archiver", PG_STAT_ARCHIVER_COLUMNS),
+        &[encoded],
+        arena,
+    )
+}
+
+fn pg_stat_bgwriter<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let reset = storage.shared_statistics_reset_times();
+    let encoded = row(
+        &[
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Timestamptz(reset.background_writer),
+        ],
+        arena,
+    )?;
+    finish(
+        def_of("pg_stat_bgwriter", PG_STAT_BGWRITER_COLUMNS),
+        &[encoded],
+        arena,
+    )
+}
+
+fn pg_stat_checkpointer<'a>(
+    storage: &Storage,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let reset = storage.shared_statistics_reset_times();
+    let encoded = row(
+        &[
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Float8(0.0),
+            Datum::Float8(0.0),
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Timestamptz(reset.checkpointer),
+        ],
+        arena,
+    )?;
+    finish(
+        def_of("pg_stat_checkpointer", PG_STAT_CHECKPOINTER_COLUMNS),
+        &[encoded],
+        arena,
+    )
+}
+
+fn pg_stat_io<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_stat_io", PG_STAT_IO_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(8, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let reset = storage.shared_statistics_reset_times().io;
+    let zero_numeric = Datum::Numeric(crate::sql::numeric::Numeric::ZERO);
+    let specs = [
+        ("relation", "bulkread", true, false, true, false),
+        ("relation", "bulkwrite", true, true, true, false),
+        ("relation", "init", true, true, false, true),
+        ("relation", "normal", true, true, false, true),
+        ("relation", "vacuum", true, true, true, false),
+        ("temp relation", "normal", false, true, false, false),
+        ("wal", "init", false, false, false, true),
+        ("wal", "normal", false, false, false, true),
+    ];
+    for (index, (object, context, writeback, extends, reuse, fsync)) in
+        specs.into_iter().enumerate()
+    {
+        let wal_init = object == "wal" && context == "init";
+        let wal = object == "wal";
+        rows[index] = row(
+            &[
+                Datum::Text("client backend"),
+                Datum::Text(object),
+                Datum::Text(context),
+                if wal_init {
+                    Datum::Null
+                } else {
+                    Datum::Int8(0)
+                },
+                if wal_init { Datum::Null } else { zero_numeric },
+                if wal_init {
+                    Datum::Null
+                } else {
+                    Datum::Float8(0.0)
+                },
+                Datum::Int8(0),
+                zero_numeric,
+                Datum::Float8(0.0),
+                if writeback {
+                    Datum::Int8(0)
+                } else {
+                    Datum::Null
+                },
+                if writeback {
+                    Datum::Float8(0.0)
+                } else {
+                    Datum::Null
+                },
+                if extends { Datum::Int8(0) } else { Datum::Null },
+                if extends { zero_numeric } else { Datum::Null },
+                if extends {
+                    Datum::Float8(0.0)
+                } else {
+                    Datum::Null
+                },
+                if wal { Datum::Null } else { Datum::Int8(0) },
+                if wal { Datum::Null } else { Datum::Int8(0) },
+                if reuse { Datum::Int8(0) } else { Datum::Null },
+                if fsync { Datum::Int8(0) } else { Datum::Null },
+                if fsync {
+                    Datum::Float8(0.0)
+                } else {
+                    Datum::Null
+                },
+                Datum::Timestamptz(reset),
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_stat_wal<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let reset = storage.shared_statistics_reset_times();
+    let encoded = row(
+        &[
+            Datum::Int8(0),
+            Datum::Int8(0),
+            Datum::Numeric(crate::sql::numeric::Numeric::ZERO),
+            Datum::Int8(0),
+            Datum::Timestamptz(reset.wal),
+        ],
+        arena,
+    )?;
+    finish(
+        def_of("pg_stat_wal", PG_STAT_WAL_COLUMNS),
+        &[encoded],
+        arena,
+    )
 }
 
 fn pg_stat_database<'a>(
@@ -27124,6 +28197,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "server_version" => crate::pg::REPORTED_SERVER_VERSION,
             "server_version_num" => crate::pg::REPORTED_SERVER_VERSION_NUM,
             "synchronize_seqscans" => "on",
+            "track_functions" => "none",
             "TimeZone" => "UTC",
             "transaction_isolation" => "read committed",
             "transaction_deferrable" | "transaction_read_only" => "off",
@@ -27146,7 +28220,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "bool"
         } else if matches!(
             name,
-            "DateStyle" | "IntervalStyle" | "bytea_output" | "xmloption"
+            "DateStyle" | "IntervalStyle" | "bytea_output" | "track_functions" | "xmloption"
         ) {
             "enum"
         } else if matches!(
@@ -27176,6 +28250,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "max_connections" | "max_locks_per_transaction" | "max_prepared_transactions"
         ) {
             "postmaster"
+        } else if name == "track_functions" {
+            "superuser"
         } else {
             "user"
         };
@@ -27218,6 +28294,19 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         let (reset_value, source) = crate::sql::eval::funcs::system::session_setting_metadata(name)
             .unwrap_or((value, "default"));
         let (boot, vartype, context, unit) = metadata(name);
+        let enum_values = if name == "track_functions" {
+            let values = [
+                text("none", arena)?,
+                text("pl", arena)?,
+                text("all", arena)?,
+            ];
+            Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(&values, arena)?,
+            }
+        } else {
+            Datum::Null
+        };
         output[count] = row(
             &[
                 text(name, arena)?,
@@ -27227,7 +28316,14 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 } else {
                     text(unit, arena)?
                 },
-                text("Client Connection Defaults", arena)?,
+                text(
+                    if name == "track_functions" {
+                        "Statistics / Monitoring"
+                    } else {
+                        "Client Connection Defaults"
+                    },
+                    arena,
+                )?,
                 text("", arena)?,
                 Datum::Null,
                 text(context, arena)?,
@@ -27235,7 +28331,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 text(source, arena)?,
                 Datum::Null,
                 Datum::Null,
-                Datum::Null,
+                enum_values,
                 text(boot, arena)?,
                 text(reset_value.as_str(), arena)?,
                 Datum::Null,

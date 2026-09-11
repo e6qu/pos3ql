@@ -11326,23 +11326,58 @@ impl Engine {
             };
             return Ok(invocations.complete(value));
         }
-        if self
-            .storage
-            .routine_for(pending.slot, txn.txid)
-            .kind
-            .is_set_returning()
+        let routine = self.storage.routine_for(pending.slot, txn.txid);
+        let track = match guc.track_functions() {
+            guc::TrackFunctions::None => false,
+            guc::TrackFunctions::Pl => routine.language == crate::storage::RoutineLanguage::PlPgSql,
+            guc::TrackFunctions::All => true,
+        };
+        let timed = statistics::begin_function_timing(track);
+        if track
+            && let Err(error) = self
+                .storage
+                .ensure_function_statistics(crate::storage::routine_oid(&routine))
         {
-            let rows = match self.execute_pending_table_routine(
+            let _ = statistics::finish_function_timing(timed);
+            return Ok(Err(error));
+        }
+        if routine.kind.is_set_returning() {
+            let executed = self.execute_pending_table_routine(
                 pending, arena, txn, sqlprep, cursors, guc, responder,
-            )? {
+            );
+            let succeeded = matches!(&executed, Ok(Ok(_)));
+            if let Some((total, own)) = statistics::finish_function_timing(timed)
+                && succeeded
+                && let Err(error) = self.storage.record_function_call(
+                    txn.txid,
+                    crate::storage::routine_oid(&routine),
+                    total,
+                    own,
+                )
+            {
+                return Ok(Err(error));
+            }
+            let rows = match executed? {
                 Ok(rows) => rows,
                 Err(error) => return Ok(Err(error)),
             };
             return Ok(invocations.complete_rows(rows));
         }
-        let value = match self
-            .execute_pending_scalar_routine(pending, arena, txn, sqlprep, cursors, guc, responder)?
+        let executed = self
+            .execute_pending_scalar_routine(pending, arena, txn, sqlprep, cursors, guc, responder);
+        let succeeded = matches!(&executed, Ok(Ok(_)));
+        if let Some((total, own)) = statistics::finish_function_timing(timed)
+            && succeeded
+            && let Err(error) = self.storage.record_function_call(
+                txn.txid,
+                crate::storage::routine_oid(&routine),
+                total,
+                own,
+            )
         {
+            return Ok(Err(error));
+        }
+        let value = match executed? {
             Ok(value) => value,
             Err(error) => return Ok(Err(error)),
         };
@@ -17717,6 +17752,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "transaction_isolation",
     "transaction_read_only",
     "transaction_timeout",
+    "track_functions",
     "xmloption",
 ];
 

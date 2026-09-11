@@ -1069,7 +1069,7 @@ pub(crate) fn dispatch<'a>(
                 if try_only {
                     Ok(Datum::Bool(acquired))
                 } else {
-                    Ok(Datum::Null)
+                    Ok(Datum::Text(""))
                 }
             }
             "pg_advisory_unlock" | "pg_advisory_unlock_shared" => {
@@ -1103,7 +1103,7 @@ pub(crate) fn dispatch<'a>(
                         )
                     })?
                     .unlock_all_advisory_locks()?;
-                Ok(Datum::Null)
+                Ok(Datum::Text(""))
             }
             "pg_current_xact_id"
             | "pg_current_xact_id_if_assigned"
@@ -2530,6 +2530,7 @@ pub(crate) fn dispatch<'a>(
                             |ct| {
                                 ct.storage().oid() == v.type_oid()
                                     || matches!((ct, v), (ColType::Xid, Datum::Oid(_)))
+                                    || matches!((ct, v), (ColType::Void, Datum::Text("")))
                             },
                         );
                     if consistent {

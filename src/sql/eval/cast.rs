@@ -69,7 +69,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         other => other,
     };
     let out = match target {
-        ColType::Void => return Ok(Datum::Null),
+        ColType::Void => return Ok(Datum::Text("")),
         ColType::Internal => return Err(cast_unsupported(&v, "internal")),
         ColType::PgDdlCommand => match v {
             Datum::PgDdlCommand => v,

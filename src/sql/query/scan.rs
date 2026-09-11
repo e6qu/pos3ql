@@ -484,6 +484,9 @@ mod tests {
 /// placement.
 struct IndexedCandidates<'a> {
     table: usize,
+    index_oid: i32,
+    scan_executed: bool,
+    index_entries: usize,
     rowids: &'a [u64],
 }
 
@@ -859,7 +862,22 @@ fn indexed_candidates<'a>(
     if storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid) {
         return Ok(None);
     }
+    let Some(index_oid) = crate::sql::catalog::value_index_oid(storage, txid, slot, column) else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "value-index probe has no catalog index identity"
+        ));
+    };
     let raw = eval_full(constant, arena, params, &NoColumns, hooks)?;
+    if raw.is_null() {
+        return Ok(Some(IndexedCandidates {
+            table: 0,
+            index_oid,
+            scan_executed: false,
+            index_entries: 0,
+            rowids: &[],
+        }));
+    }
     let raw_type = ColType::from_oid(raw.type_oid());
     let integer =
         |column_type: ColType| matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8);
@@ -874,12 +892,6 @@ fn indexed_candidates<'a>(
         return Ok(None);
     }
     let value = cast_to(raw, target_type, arena)?;
-    if value.is_null() {
-        return Ok(Some(IndexedCandidates {
-            table: 0,
-            rowids: &[],
-        }));
-    }
     let key_matches = |key: &[u8]| -> Result<bool, SqlError> {
         let mut decoded = [Datum::Null];
         rowenc::decode(key, &[target_type], &mut decoded)?;
@@ -942,6 +954,9 @@ fn indexed_candidates<'a>(
     }
     Ok(Some(IndexedCandidates {
         table: 0,
+        index_oid,
+        scan_executed: true,
+        index_entries: count,
         rowids: &rowids[..unique],
     }))
 }
@@ -2498,6 +2513,7 @@ fn scan_source_mode<'a>(
             } else if let Some(demand) = pax_demand.selected_mask(build_t)
                 && storage.spill_rows_are_unshadowed(build_slot)
             {
+                storage.record_relation_scan(txid, build_slot, None, 0)?;
                 storage.for_each_spilled_row_batch(
                     build_slot,
                     arena,
@@ -2505,6 +2521,7 @@ fn scan_source_mode<'a>(
                     Some(demand),
                     &mut |rows| {
                         for spilled in rows {
+                            storage.record_relation_tuple_read(txid, build_slot, None)?;
                             let crate::storage::SpilledRowRepresentation::Values(values) =
                                 spilled.representation
                             else {
@@ -2519,11 +2536,13 @@ fn scan_source_mode<'a>(
                     },
                 )?;
             } else {
+                storage.record_relation_scan(txid, build_slot, None, 0)?;
                 storage.for_each_row_state(build_slot, &mut |rowid, state| {
                     let Some(home) = storage.visible_row_home(build_slot, rowid, state, txid)?
                     else {
                         return Ok(ControlFlow::Continue(()));
                     };
+                    storage.record_relation_tuple_read(txid, build_slot, None)?;
                     let bytes = storage.row_bytes(build_slot, rowid, home, arena)?;
                     let mut buffer = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, build_schema, &mut buffer)?;
@@ -2572,6 +2591,7 @@ fn scan_source_mode<'a>(
             if let Some(demand) = pax_demand.selected_mask(probe_t)
                 && storage.spill_rows_are_unshadowed(probe_slot)
             {
+                storage.record_relation_scan(txid, probe_slot, None, 0)?;
                 let mut stopped = false;
                 storage.for_each_spilled_row_batch(
                     probe_slot,
@@ -2581,6 +2601,7 @@ fn scan_source_mode<'a>(
                     &mut |rows| {
                         for spilled in rows {
                             check_timeout()?;
+                            storage.record_relation_tuple_read(txid, probe_slot, None)?;
                             let crate::storage::SpilledRowRepresentation::Values(values) =
                                 spilled.representation
                             else {
@@ -2720,6 +2741,7 @@ fn scan_source_mode<'a>(
             }
             // Collect and sort the probe table's visible rows to match the
             // nested loop's output order.
+            storage.record_relation_scan(txid, probe_slot, None, 0)?;
             let probe_count = storage.visible_row_count(probe_slot, txid)?;
             let probe_ordered = arena
                 .alloc_slice_with(probe_count.max(1), |_| {
@@ -2742,6 +2764,7 @@ fn scan_source_mode<'a>(
                 crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
             });
             for &(rowid, home) in &probe_ordered[..probe_fill] {
+                storage.record_relation_tuple_read(txid, probe_slot, None)?;
                 let keep = recycled(arena, recycle_rows, None, || -> Result<bool, SqlError> {
                     check_timeout()?;
                     let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
@@ -3156,6 +3179,7 @@ fn scan_source_mode<'a>(
                     &mut |rows| {
                         for spilled in rows {
                             check_timeout()?;
+                            storage.record_relation_tuple_read(txid, $slot, None)?;
                             let this = $index;
                             $index += 1;
                             let keep_scanning =
@@ -3317,12 +3341,14 @@ fn scan_source_mode<'a>(
                 let mut index = 0usize;
                 let mut aborted = false;
                 for &leaf in &leaves[..n_leaves] {
+                    storage.record_relation_scan(txid, leaf, None, 0)?;
                     storage.for_each_row_state(leaf, &mut |rowid, state| {
                         use core::ops::ControlFlow;
                         check_timeout()?;
                         let Some(home) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                             return Ok(ControlFlow::Continue(()));
                         };
+                        storage.record_relation_tuple_read(txid, leaf, None)?;
                         let this = index;
                         index += 1;
                         let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
@@ -3360,9 +3386,16 @@ fn scan_source_mode<'a>(
                 }
                 return Ok(true);
             }
-            let candidates = indexed
-                .filter(|access| access.table == order[depth])
-                .map(|access| access.rowids);
+            let access = indexed.filter(|access| access.table == order[depth]);
+            let candidates = access.map(|access| access.rowids);
+            if access.is_none_or(|access| access.scan_executed) {
+                storage.record_relation_scan(
+                    txid,
+                    slot,
+                    access.map(|access| access.index_oid),
+                    access.map_or(0, |access| access.index_entries),
+                )?;
+            }
             // A cold, overlay-free table is already being merged in SST data
             // blocks. Carry the selected entry bytes out of that cursor rather
             // than point-reading every row a second time. Any resident overlay
@@ -3418,6 +3451,11 @@ fn scan_source_mode<'a>(
             });
             for (this, &(rowid, home)) in ordered[..fill].iter().enumerate() {
                 check_timeout()?;
+                storage.record_relation_tuple_read(
+                    txid,
+                    slot,
+                    access.map(|access| access.index_oid),
+                )?;
                 let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                     let bytes = storage.row_bytes(scope.slots[order[depth]], rowid, home, arena)?;
                     visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
@@ -3428,6 +3466,7 @@ fn scan_source_mode<'a>(
             }
         } else {
             let slot = scope.slots[order[depth]];
+            storage.record_relation_scan(txid, slot, None, 0)?;
             let mut index = 0usize;
             let mut aborted = false;
             if storage.spill_rows_are_unshadowed(slot) {
@@ -3439,6 +3478,7 @@ fn scan_source_mode<'a>(
                     let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
                         return Ok(ControlFlow::Continue(()));
                     };
+                    storage.record_relation_tuple_read(txid, slot, None)?;
                     let this = index;
                     index += 1;
                     let keep_scanning = recycled(arena, recycle_rows, retain_match, || {

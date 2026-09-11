@@ -255,7 +255,7 @@ pub(crate) fn execute<'a>(
             let oid = oid_required(arguments[0])?;
             require(storage, txn, oid, PrivilegeSet::UPDATE)?;
             write_at(storage, txn, oid, offset, bytea(arguments[2])?)?;
-            Ok(Datum::Null)
+            Ok(Datum::Text(""))
         }
         764 | 767 => import(function_oid, arguments, storage, txn, arena),
         765 => export(arguments, storage, txn, arena),

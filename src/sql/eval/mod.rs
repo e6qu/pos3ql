@@ -4149,6 +4149,12 @@ fn call<'a>(
     };
     if argument_names.is_empty()
         && let Some(result) =
+            super::statistics::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) =
             super::logical_replication::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;

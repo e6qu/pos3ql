@@ -1433,7 +1433,7 @@ fn plpgsql_scalar_functions_are_typed_transactional_and_durable() {
     );
     assert_eq!(
         data_rows(&setup),
-        ["42|0", "5|-1", "42|82", "42", "0", "NULL"],
+        ["42|0", "5|-1", "42|82", "42", "0", ""],
         "{}",
         String::from_utf8_lossy(&setup)
     );
@@ -1542,7 +1542,7 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
             "15",
             "42",
             "42",
-            "NULL",
+            "",
             "89",
         ],
         "{}",
@@ -1897,15 +1897,15 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
     assert_eq!(
         data_rows(&created),
         [
-            "NULL",
-            "NULL",
-            "NULL",
-            "NULL",
+            "",
+            "",
+            "",
+            "",
             "11",
             "11",
             "1",
             "t",
-            "NULL",
+            "",
             "9|nine",
             "9|nine",
             "dynamic catalog table",
@@ -2134,7 +2134,7 @@ fn plpgsql_dynamic_administration_uses_static_catalog_boundaries() {
          SELECT count(*) FROM pg_am WHERE amname = 'dynamic_catalog_heap'; \
          SELECT count(*) FROM pg_class WHERE relname = 'dynamic_catalog_rows'",
     );
-    assert_eq!(data_rows(&dropped), ["NULL", "0", "0"], "{dropped:?}");
+    assert_eq!(data_rows(&dropped), ["", "0", "0"], "{dropped:?}");
     let cleanup = run_with(
         &mut cold,
         &mut cold_budget,
@@ -2327,7 +2327,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     );
     assert_eq!(
         data_rows(&observed),
-        ["NULL", "dynamic-session", "2", "3", "42", "2", "NULL", "5"],
+        ["", "dynamic-session", "2", "3", "42", "2", "", "5"],
         "{}",
         String::from_utf8_lossy(&observed)
     );
@@ -2965,7 +2965,7 @@ fn large_objects_are_sparse_transactional_and_match_postgresql_functions() {
         data_rows(&output),
         [
             "90001",
-            "NULL",
+            "",
             "4100|000000007879",
             "0",
             "7000|0",
@@ -6143,7 +6143,7 @@ fn plpgsql_dynamic_utilities_share_static_ddl_event_boundaries() {
     );
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
-    assert_eq!(data_rows(&output), ["NULL", "ddl_command_end|CREATE TABLE"]);
+    assert_eq!(data_rows(&output), ["", "ddl_command_end|CREATE TABLE"]);
 }
 
 #[test]
@@ -9998,14 +9998,14 @@ fn logical_replication_monitoring_views_have_postgresql_types_and_live_state() {
         [
             "monitored|oid|xid|pg_lsn|t",
             "monitored|0|0|0|0|bigint|t",
-            "NULL",
+            "",
             "0|0|t",
             "monitored_sub|0|0|0|t",
-            "NULL",
+            "",
             "0|0|t",
             "0",
             "0",
-            "NULL",
+            "",
         ],
         "{rendered}"
     );
@@ -10040,6 +10040,416 @@ fn logical_replication_monitoring_views_have_postgresql_types_and_live_state() {
             AND attribute.attnum > 0 AND NOT attribute.attisdropped",
     );
     assert_eq!(data_rows(&introspection), ["5", "74", "74"]);
+}
+
+#[test]
+fn cumulative_statistics_cover_tables_indexes_transactions_resets_and_catalogs() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE stat_counts(id integer PRIMARY KEY, value integer); \
+         CREATE INDEX stat_counts_value_idx ON stat_counts(value)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO stat_counts VALUES (1, 10), (2, 20), (3, 30)",
+    );
+    assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+    let reset = run_with(&mut engine, &mut budget, "SELECT pg_stat_reset()");
+    assert_eq!(data_rows(&reset), [""]);
+    let void_boundary = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_clear_snapshot() IS NULL, \
+                pg_stat_force_next_flush()::text = '', \
+                pg_typeof(pg_stat_reset_single_table_counters(0::oid))",
+    );
+    assert_eq!(data_rows(&void_boundary), ["f|t|void"]);
+
+    let transaction = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT value FROM stat_counts WHERE id = 2; \
+         UPDATE stat_counts SET value = 21 WHERE id = 2; \
+         DELETE FROM stat_counts WHERE id = 3; \
+         INSERT INTO stat_counts VALUES (4, 40); \
+         SELECT seq_scan, seq_tup_read, idx_scan, idx_tup_fetch, \
+                n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd, n_tup_newpage_upd \
+           FROM pg_stat_xact_user_tables WHERE relname = 'stat_counts'; \
+         ROLLBACK",
+    );
+    let transaction_rows = data_rows(&transaction);
+    assert_eq!(transaction_rows[0], "20");
+    let counters: Vec<u64> = transaction_rows[1]
+        .split('|')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert!(counters[0] >= 2, "{transaction_rows:?}");
+    assert!(counters[1] >= 6, "{transaction_rows:?}");
+    assert!(counters[2] >= 1, "{transaction_rows:?}");
+    assert!(counters[3] >= 1, "{transaction_rows:?}");
+    assert_eq!(&counters[4..], &[1, 1, 1, 0, 0]);
+
+    let cumulative = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup, \
+                n_mod_since_analyze, n_ins_since_vacuum, idx_scan > 0, \
+                last_idx_scan IS NOT NULL \
+           FROM pg_stat_user_tables WHERE relname = 'stat_counts'; \
+         SELECT indexrelname, idx_scan > 0, idx_tup_read > 0, \
+                idx_tup_fetch > 0, last_idx_scan IS NOT NULL \
+           FROM pg_stat_user_indexes WHERE indexrelname = 'stat_counts_pkey'; \
+         SELECT count(*) FROM pg_stat_sys_tables WHERE relname = 'stat_counts'; \
+         SELECT count(*) FROM pg_stat_all_tables WHERE relname = 'stat_counts'",
+    );
+    assert_eq!(
+        data_rows(&cumulative),
+        ["1|1|1|0|2|0|1|t|t", "stat_counts_pkey|t|t|t|t", "0", "1",],
+        "{}",
+        String::from_utf8_lossy(&cumulative)
+    );
+
+    let maintained = run_with(
+        &mut engine,
+        &mut budget,
+        "ANALYZE stat_counts; \
+         SELECT n_live_tup, n_mod_since_analyze, analyze_count, \
+                last_analyze IS NOT NULL, total_analyze_time >= 0 \
+           FROM pg_stat_user_tables WHERE relname = 'stat_counts'",
+    );
+    assert_eq!(data_rows(&maintained), ["3|0|1|t|t"]);
+    let vacuumed = run_with(&mut engine, &mut budget, "VACUUM stat_counts");
+    assert!(!String::from_utf8_lossy(&vacuumed).contains("ERROR"));
+    let vacuum_stats = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT n_dead_tup, n_ins_since_vacuum, vacuum_count, \
+                last_vacuum IS NOT NULL, total_vacuum_time >= 0 \
+           FROM pg_stat_user_tables WHERE relname = 'stat_counts'",
+    );
+    assert_eq!(data_rows(&vacuum_stats), ["0|0|1|t|t"]);
+
+    let relation_reset = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters('stat_counts'::regclass); \
+         SELECT n_tup_ins, n_tup_upd, n_tup_del, seq_scan, idx_scan > 0 \
+           FROM pg_stat_user_tables WHERE relname = 'stat_counts'; \
+         SELECT pg_stat_reset_single_table_counters('stat_counts_pkey'::regclass); \
+         SELECT idx_scan FROM pg_stat_user_indexes \
+          WHERE indexrelname = 'stat_counts_pkey'",
+    );
+    assert_eq!(data_rows(&relation_reset), ["", "0|0|0|0|t", "", "0"]);
+
+    let database = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_typeof(datid), pg_typeof(numbackends), pg_typeof(xact_commit), \
+                xact_commit > 0, xact_rollback > 0, tup_inserted > 0, \
+                tup_updated > 0, tup_deleted > 0, stats_reset IS NOT NULL \
+           FROM pg_stat_database WHERE datname = current_database(); \
+         SELECT count(*) FROM pg_stat_database WHERE datid = 0 AND datname IS NULL",
+    );
+    assert_eq!(
+        data_rows(&database),
+        ["oid|integer|bigint|t|t|t|t|t|t", "1"]
+    );
+
+    let introspection = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_class \
+          WHERE oid IN (12146,12151,12156,12161,12165,12170,12187,12192,12196,12270); \
+         SELECT count(*) FROM pg_attribute \
+          WHERE attrelid IN (12146,12151,12156,12161,12165,12170,12187,12192,12196,12270) \
+            AND attnum > 0 AND NOT attisdropped; \
+         SELECT oid, pronargs, prorettype, provolatile, proparallel, proisstrict, proacl IS NULL \
+           FROM pg_proc WHERE oid IN (2137,2230,2274,3776) ORDER BY oid",
+    );
+    assert_eq!(
+        data_rows(&introspection),
+        [
+            "10",
+            "183",
+            "2137|0|2278|v|r|f|t",
+            "2230|0|2278|v|r|f|t",
+            "2274|0|2278|v|s|f|f",
+            "3776|1|2278|v|s|t|f",
+        ]
+    );
+
+    let denied_setup = run_with(&mut engine, &mut budget, "CREATE ROLE statistics_reader");
+    assert!(!String::from_utf8_lossy(&denied_setup).contains("ERROR"));
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE statistics_reader; SELECT pg_stat_reset()",
+    );
+    assert!(String::from_utf8_lossy(&denied).contains("42501"));
+}
+
+#[test]
+fn cumulative_database_statistics_count_index_entries_as_returned_tuples() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE database_index_counts(id integer PRIMARY KEY); \
+         INSERT INTO database_index_counts VALUES (1), (2), (3); \
+         SELECT pg_stat_reset()",
+    );
+    assert_eq!(data_rows(&setup), [""]);
+    let scan = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id FROM database_index_counts WHERE id = 2",
+    );
+    assert_eq!(data_rows(&scan), ["2"]);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tup_returned, tup_fetched FROM pg_stat_database \
+          WHERE datname = current_database()",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let reset = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters('database_index_counts'::regclass); \
+         SELECT pg_stat_reset_single_table_counters('database_index_counts_pkey'::regclass)",
+    );
+    assert_eq!(data_rows(&reset), ["", ""]);
+    let no_scan = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id FROM database_index_counts WHERE id = NULL",
+    );
+    assert!(data_rows(&no_scan).is_empty());
+    let counters = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT seq_scan, idx_scan FROM pg_stat_user_tables \
+          WHERE relname = 'database_index_counts'; \
+         SELECT idx_scan FROM pg_stat_user_indexes \
+          WHERE indexrelname = 'database_index_counts_pkey'",
+    );
+    assert_eq!(data_rows(&counters), ["0|0", "0"]);
+}
+
+#[test]
+fn cumulative_statistics_match_transactional_truncate_and_abort_accounting() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE truncate_counts(id integer PRIMARY KEY); \
+         INSERT INTO truncate_counts VALUES (1), (2)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let reset = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters('truncate_counts'::regclass)",
+    );
+    assert_eq!(data_rows(&reset), [""]);
+    let transaction = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         INSERT INTO truncate_counts VALUES (3); \
+         TRUNCATE truncate_counts; \
+         INSERT INTO truncate_counts VALUES (4); \
+         COMMIT",
+    );
+    assert!(!String::from_utf8_lossy(&transaction).contains("ERROR"));
+    let committed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM truncate_counts; \
+         SELECT n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup, \
+                n_mod_since_analyze, n_ins_since_vacuum \
+           FROM pg_stat_user_tables WHERE relname = 'truncate_counts'",
+    );
+    assert_eq!(
+        data_rows(&committed),
+        ["1", "1|0|0|1|0|1|1"],
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+
+    let reset = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters('truncate_counts'::regclass)",
+    );
+    assert_eq!(data_rows(&reset), [""]);
+    let transaction = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         INSERT INTO truncate_counts VALUES (5); \
+         TRUNCATE truncate_counts; \
+         INSERT INTO truncate_counts VALUES (6), (7); \
+         ROLLBACK",
+    );
+    assert!(!String::from_utf8_lossy(&transaction).contains("ERROR"));
+    let aborted = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM truncate_counts; \
+         SELECT n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup, \
+                n_mod_since_analyze, n_ins_since_vacuum \
+           FROM pg_stat_user_tables WHERE relname = 'truncate_counts'",
+    );
+    assert_eq!(
+        data_rows(&aborted),
+        ["1", "1|0|0|0|1|0|1"],
+        "{}",
+        String::from_utf8_lossy(&aborted)
+    );
+
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE savepoint_truncate_counts(id integer PRIMARY KEY); \
+         INSERT INTO savepoint_truncate_counts VALUES (1)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let reset = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters( \
+           'savepoint_truncate_counts'::regclass)",
+    );
+    assert_eq!(data_rows(&reset), [""]);
+    let nested = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         INSERT INTO savepoint_truncate_counts VALUES (2); \
+         SAVEPOINT outer_statistics; \
+         TRUNCATE savepoint_truncate_counts; \
+         INSERT INTO savepoint_truncate_counts VALUES (3); \
+         SAVEPOINT inner_statistics; \
+         TRUNCATE savepoint_truncate_counts; \
+         INSERT INTO savepoint_truncate_counts VALUES (4); \
+         ROLLBACK TO inner_statistics; \
+         INSERT INTO savepoint_truncate_counts VALUES (5); \
+         ROLLBACK TO outer_statistics; \
+         INSERT INTO savepoint_truncate_counts VALUES (6); \
+         COMMIT",
+    );
+    assert!(!String::from_utf8_lossy(&nested).contains("ERROR"));
+    let nested_statistics = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id) FROM savepoint_truncate_counts; \
+         SELECT n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup, \
+                n_mod_since_analyze, n_ins_since_vacuum \
+           FROM pg_stat_user_tables \
+          WHERE relname = 'savepoint_truncate_counts'",
+    );
+    assert_eq!(
+        data_rows(&nested_statistics),
+        ["{1,2,6}", "3|0|0|2|1|2|3"],
+        "{}",
+        String::from_utf8_lossy(&nested_statistics)
+    );
+
+    let reset = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters( \
+           'savepoint_truncate_counts'::regclass)",
+    );
+    assert_eq!(data_rows(&reset), [""]);
+    let released = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         INSERT INTO savepoint_truncate_counts VALUES (7); \
+         SAVEPOINT released_statistics; \
+         TRUNCATE savepoint_truncate_counts; \
+         INSERT INTO savepoint_truncate_counts VALUES (8); \
+         RELEASE released_statistics; \
+         INSERT INTO savepoint_truncate_counts VALUES (9); \
+         COMMIT",
+    );
+    assert!(!String::from_utf8_lossy(&released).contains("ERROR"));
+    let released_statistics = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id) FROM savepoint_truncate_counts; \
+         SELECT n_tup_ins, n_live_tup, n_dead_tup, n_mod_since_analyze, \
+                n_ins_since_vacuum \
+           FROM pg_stat_user_tables \
+          WHERE relname = 'savepoint_truncate_counts'",
+    );
+    assert_eq!(
+        data_rows(&released_statistics),
+        ["{8,9}", "2|2|0|2|2"],
+        "{}",
+        String::from_utf8_lossy(&released_statistics)
+    );
+}
+
+#[test]
+fn cumulative_statistics_include_copy_and_merge_physical_scans() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE scan_counts(id integer PRIMARY KEY, value integer); \
+         INSERT INTO scan_counts VALUES (1, 10), (2, 20)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters('scan_counts'::regclass)",
+    );
+    let copied = run_with(&mut engine, &mut budget, "COPY scan_counts TO STDOUT");
+    assert!(!String::from_utf8_lossy(&copied).contains("ERROR"));
+    let copy_statistics = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT seq_scan, seq_tup_read FROM pg_stat_user_tables \
+          WHERE relname = 'scan_counts'",
+    );
+    assert_eq!(data_rows(&copy_statistics), ["1|2"]);
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_stat_reset_single_table_counters('scan_counts'::regclass)",
+    );
+    let merged = run_with(
+        &mut engine,
+        &mut budget,
+        "MERGE INTO scan_counts AS target \
+         USING (VALUES (1, 11), (3, 30)) AS source(id, value) \
+            ON target.id = source.id \
+          WHEN MATCHED THEN UPDATE SET value = source.value \
+          WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value)",
+    );
+    assert!(!String::from_utf8_lossy(&merged).contains("ERROR"));
+    let merge_statistics = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT seq_scan, seq_tup_read, n_tup_ins, n_tup_upd \
+           FROM pg_stat_user_tables WHERE relname = 'scan_counts'",
+    );
+    assert_eq!(data_rows(&merge_statistics), ["1|2|1|1"]);
 }
 
 #[test]

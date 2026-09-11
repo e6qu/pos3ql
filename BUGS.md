@@ -14,6 +14,14 @@ binding, user-type visibility, cascading statistics-drop ownership, cascade
 notice, and small-integer extended-protocol coercion defects are fixed in the
 same change.
 
+The review additionally covers PostgreSQL 18 cumulative database, table,
+transaction-local table, and index statistics across query, DML, COPY, MERGE,
+maintenance, commit, abort, transactional TRUNCATE, relation reuse, reset,
+catalog, text-wire, and extended-protocol boundaries. The discovered aborted
+insert dead-tuple, top-level and nested-savepoint TRUNCATE counter, built-in
+initial-privilege, NULL-encoded `void`, omitted database-level index-tuple
+return, and NULL-predicate phantom-scan defects are fixed in the same change.
+
 Record only a genuinely intractable or externally blocked defect here. A row must include a stable ID, a reproducer, and the reason it cannot be fixed now. Fixable work belongs in the same change that finds it; fixed-bug history belongs in git history and pull requests.
 
 | ID | Status | Found | Description | Repro | Blocker |

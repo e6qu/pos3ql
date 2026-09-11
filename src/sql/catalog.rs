@@ -317,6 +317,31 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "v",
     },
+    intrinsic!(
+        2137,
+        "pg_stat_force_next_flush",
+        super::types::oid::VOID,
+        "",
+        0,
+        "v"
+    ),
+    intrinsic!(
+        2230,
+        "pg_stat_clear_snapshot",
+        super::types::oid::VOID,
+        "",
+        0,
+        "v"
+    ),
+    intrinsic!(2274, "pg_stat_reset", super::types::oid::VOID, "", 0, "v"),
+    intrinsic!(
+        3776,
+        "pg_stat_reset_single_table_counters",
+        super::types::oid::VOID,
+        "26",
+        1,
+        "v"
+    ),
     IntrinsicRoutine {
         oid: 540_000,
         name: "postgres_fdw_handler",
@@ -3506,6 +3531,9 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
     !matches!(
         routine.oid,
         1081 | 2078
+            | 2137
+            | 2230
+            | 2274
             | 2900
             | 2901
             | 3205
@@ -3638,6 +3666,8 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
         | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 3577 | 3578 | 3780 | 3786 | 3878 | 4222
         | 4223 | 4224 | 1402 | 1403 | 2078 | 2943 | 3348 | 5059 | 5060 | 3086 | 6119 | 6120 => "u",
         1181
+        | 2137
+        | 2230
         | 1598
         | 1599
         | 1641
@@ -8265,6 +8295,16 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_stat_subscription_stats", 12347),
     ("pg_stat_activity", 12226),
     ("pg_stat_ssl", 12253),
+    ("pg_stat_all_tables", 12146),
+    ("pg_stat_xact_all_tables", 12151),
+    ("pg_stat_sys_tables", 12156),
+    ("pg_stat_xact_sys_tables", 12161),
+    ("pg_stat_user_tables", 12165),
+    ("pg_stat_xact_user_tables", 12170),
+    ("pg_stat_all_indexes", 12187),
+    ("pg_stat_sys_indexes", 12192),
+    ("pg_stat_user_indexes", 12196),
+    ("pg_stat_database", 12270),
     ("pg_stat_database_conflicts", 12275),
     ("pg_transform", 3576),
     ("pg_locks", 12073),
@@ -8417,6 +8457,16 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_cursors"
                 | "pg_stat_activity"
                 | "pg_stat_ssl"
+                | "pg_stat_all_tables"
+                | "pg_stat_xact_all_tables"
+                | "pg_stat_sys_tables"
+                | "pg_stat_xact_sys_tables"
+                | "pg_stat_user_tables"
+                | "pg_stat_xact_user_tables"
+                | "pg_stat_all_indexes"
+                | "pg_stat_sys_indexes"
+                | "pg_stat_user_indexes"
+                | "pg_stat_database"
                 | "pg_stat_database_conflicts"
         ),
     }
@@ -8516,6 +8566,76 @@ pub fn synthesize<'a>(
         (false, "pg_cursors") => pg_cursors(arena),
         (false, "pg_stat_activity") => pg_stat_activity(storage, txid, arena),
         (false, "pg_stat_ssl") => pg_stat_ssl(storage, arena),
+        (false, "pg_stat_all_tables") => pg_stat_tables(
+            storage,
+            txid,
+            arena,
+            "pg_stat_all_tables",
+            StatisticsScope::All,
+            false,
+        ),
+        (false, "pg_stat_xact_all_tables") => pg_stat_tables(
+            storage,
+            txid,
+            arena,
+            "pg_stat_xact_all_tables",
+            StatisticsScope::All,
+            true,
+        ),
+        (false, "pg_stat_sys_tables") => pg_stat_tables(
+            storage,
+            txid,
+            arena,
+            "pg_stat_sys_tables",
+            StatisticsScope::System,
+            false,
+        ),
+        (false, "pg_stat_xact_sys_tables") => pg_stat_tables(
+            storage,
+            txid,
+            arena,
+            "pg_stat_xact_sys_tables",
+            StatisticsScope::System,
+            true,
+        ),
+        (false, "pg_stat_user_tables") => pg_stat_tables(
+            storage,
+            txid,
+            arena,
+            "pg_stat_user_tables",
+            StatisticsScope::User,
+            false,
+        ),
+        (false, "pg_stat_xact_user_tables") => pg_stat_tables(
+            storage,
+            txid,
+            arena,
+            "pg_stat_xact_user_tables",
+            StatisticsScope::User,
+            true,
+        ),
+        (false, "pg_stat_all_indexes") => pg_stat_indexes(
+            storage,
+            txid,
+            arena,
+            "pg_stat_all_indexes",
+            StatisticsScope::All,
+        ),
+        (false, "pg_stat_sys_indexes") => pg_stat_indexes(
+            storage,
+            txid,
+            arena,
+            "pg_stat_sys_indexes",
+            StatisticsScope::System,
+        ),
+        (false, "pg_stat_user_indexes") => pg_stat_indexes(
+            storage,
+            txid,
+            arena,
+            "pg_stat_user_indexes",
+            StatisticsScope::User,
+        ),
+        (false, "pg_stat_database") => pg_stat_database(storage, txid, arena),
         (false, "pg_stat_database_conflicts") => pg_stat_database_conflicts(storage, txid, arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
@@ -9370,9 +9490,9 @@ fn pg_init_privs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ],
     );
     let rows = arena
-        .alloc_slice_with(3, |_| &[] as &[Datum])
+        .alloc_slice_with(5, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (row_index, function_oid) in [764, 765, 767].into_iter().enumerate() {
+    for (row_index, function_oid) in [764, 765, 767, 2274, 3776].into_iter().enumerate() {
         rows[row_index] = row(
             &[
                 Datum::Int4(function_oid),
@@ -10497,6 +10617,46 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
             info.explicit_definition = Some(index.mutable_for(txid));
             visit(info);
         }
+    }
+}
+
+/// Resolves the catalog identity of the single-column value index selected by
+/// the storage probe path. Duplicate indexes must not all receive credit for
+/// one physical scan.
+pub(crate) fn value_index_oid(
+    storage: &Storage,
+    txid: u32,
+    table_slot: usize,
+    column: usize,
+) -> Option<i32> {
+    let mut found = None;
+    visit_indexes(storage, txid, |index| {
+        if found.is_none()
+            && index.table_slot == table_slot
+            && index.n_cols == 1
+            && index.columns[0] as usize == column
+            && !index.expression_keys[0]
+            && index.predicate.is_none()
+        {
+            found = Some(index.oid);
+        }
+    });
+    found
+}
+
+pub(crate) fn reset_relation_statistics_by_oid(storage: &Storage, txid: u32, oid: i32) {
+    if let Some(table) = (0..storage.table_count())
+        .find(|slot| storage.table_slot_visible_to(*slot, txid) && user_table_oid(*slot) == oid)
+    {
+        storage.reset_relation_statistics(table);
+        return;
+    }
+    let mut is_index = false;
+    visit_indexes(storage, txid, |index| {
+        is_index |= index.oid == oid;
+    });
+    if is_index {
+        storage.reset_index_statistics(oid);
     }
 }
 
@@ -16094,6 +16254,99 @@ const PG_LOCKS_COLUMNS: &[(&str, ColType)] = &[
     ("waitstart", ColType::Timestamptz),
 ];
 
+const PG_STAT_TABLES_COLUMNS: &[(&str, ColType)] = &[
+    ("relid", ColType::Oid),
+    ("schemaname", ColType::Name),
+    ("relname", ColType::Name),
+    ("seq_scan", ColType::Int8),
+    ("last_seq_scan", ColType::Timestamptz),
+    ("seq_tup_read", ColType::Int8),
+    ("idx_scan", ColType::Int8),
+    ("last_idx_scan", ColType::Timestamptz),
+    ("idx_tup_fetch", ColType::Int8),
+    ("n_tup_ins", ColType::Int8),
+    ("n_tup_upd", ColType::Int8),
+    ("n_tup_del", ColType::Int8),
+    ("n_tup_hot_upd", ColType::Int8),
+    ("n_tup_newpage_upd", ColType::Int8),
+    ("n_live_tup", ColType::Int8),
+    ("n_dead_tup", ColType::Int8),
+    ("n_mod_since_analyze", ColType::Int8),
+    ("n_ins_since_vacuum", ColType::Int8),
+    ("last_vacuum", ColType::Timestamptz),
+    ("last_autovacuum", ColType::Timestamptz),
+    ("last_analyze", ColType::Timestamptz),
+    ("last_autoanalyze", ColType::Timestamptz),
+    ("vacuum_count", ColType::Int8),
+    ("autovacuum_count", ColType::Int8),
+    ("analyze_count", ColType::Int8),
+    ("autoanalyze_count", ColType::Int8),
+    ("total_vacuum_time", ColType::Float8),
+    ("total_autovacuum_time", ColType::Float8),
+    ("total_analyze_time", ColType::Float8),
+    ("total_autoanalyze_time", ColType::Float8),
+];
+
+const PG_STAT_XACT_TABLES_COLUMNS: &[(&str, ColType)] = &[
+    ("relid", ColType::Oid),
+    ("schemaname", ColType::Name),
+    ("relname", ColType::Name),
+    ("seq_scan", ColType::Int8),
+    ("seq_tup_read", ColType::Int8),
+    ("idx_scan", ColType::Int8),
+    ("idx_tup_fetch", ColType::Int8),
+    ("n_tup_ins", ColType::Int8),
+    ("n_tup_upd", ColType::Int8),
+    ("n_tup_del", ColType::Int8),
+    ("n_tup_hot_upd", ColType::Int8),
+    ("n_tup_newpage_upd", ColType::Int8),
+];
+
+const PG_STAT_INDEXES_COLUMNS: &[(&str, ColType)] = &[
+    ("relid", ColType::Oid),
+    ("indexrelid", ColType::Oid),
+    ("schemaname", ColType::Name),
+    ("relname", ColType::Name),
+    ("indexrelname", ColType::Name),
+    ("idx_scan", ColType::Int8),
+    ("last_idx_scan", ColType::Timestamptz),
+    ("idx_tup_read", ColType::Int8),
+    ("idx_tup_fetch", ColType::Int8),
+];
+
+const PG_STAT_DATABASE_COLUMNS: &[(&str, ColType)] = &[
+    ("datid", ColType::Oid),
+    ("datname", ColType::Name),
+    ("numbackends", ColType::Int4),
+    ("xact_commit", ColType::Int8),
+    ("xact_rollback", ColType::Int8),
+    ("blks_read", ColType::Int8),
+    ("blks_hit", ColType::Int8),
+    ("tup_returned", ColType::Int8),
+    ("tup_fetched", ColType::Int8),
+    ("tup_inserted", ColType::Int8),
+    ("tup_updated", ColType::Int8),
+    ("tup_deleted", ColType::Int8),
+    ("conflicts", ColType::Int8),
+    ("temp_files", ColType::Int8),
+    ("temp_bytes", ColType::Int8),
+    ("deadlocks", ColType::Int8),
+    ("checksum_failures", ColType::Int8),
+    ("checksum_last_failure", ColType::Timestamptz),
+    ("blk_read_time", ColType::Float8),
+    ("blk_write_time", ColType::Float8),
+    ("session_time", ColType::Float8),
+    ("active_time", ColType::Float8),
+    ("idle_in_transaction_time", ColType::Float8),
+    ("sessions", ColType::Int8),
+    ("sessions_abandoned", ColType::Int8),
+    ("sessions_fatal", ColType::Int8),
+    ("sessions_killed", ColType::Int8),
+    ("parallel_workers_to_launch", ColType::Int8),
+    ("parallel_workers_launched", ColType::Int8),
+    ("stats_reset", ColType::Timestamptz),
+];
+
 const PG_STAT_ACTIVITY_COLUMNS: &[(&str, ColType)] = &[
     ("datid", ColType::Oid),
     ("datname", ColType::Name),
@@ -16144,6 +16397,35 @@ const PG_STAT_DATABASE_CONFLICTS_COLUMNS: &[(&str, ColType)] = &[
 type MonitoringRelation = (i32, i32, &'static str, &'static [(&'static str, ColType)]);
 
 const MONITORING_RELATIONS: &[MonitoringRelation] = &[
+    (12146, 12148, "pg_stat_all_tables", PG_STAT_TABLES_COLUMNS),
+    (
+        12151,
+        12153,
+        "pg_stat_xact_all_tables",
+        PG_STAT_XACT_TABLES_COLUMNS,
+    ),
+    (12156, 12158, "pg_stat_sys_tables", PG_STAT_TABLES_COLUMNS),
+    (
+        12161,
+        12163,
+        "pg_stat_xact_sys_tables",
+        PG_STAT_XACT_TABLES_COLUMNS,
+    ),
+    (12165, 12167, "pg_stat_user_tables", PG_STAT_TABLES_COLUMNS),
+    (
+        12170,
+        12172,
+        "pg_stat_xact_user_tables",
+        PG_STAT_XACT_TABLES_COLUMNS,
+    ),
+    (12187, 12189, "pg_stat_all_indexes", PG_STAT_INDEXES_COLUMNS),
+    (12192, 12194, "pg_stat_sys_indexes", PG_STAT_INDEXES_COLUMNS),
+    (
+        12196,
+        12198,
+        "pg_stat_user_indexes",
+        PG_STAT_INDEXES_COLUMNS,
+    ),
     (12073, 12075, "pg_locks", PG_LOCKS_COLUMNS),
     (12077, 12079, "pg_cursors", PG_CURSORS_COLUMNS),
     (12226, 12228, "pg_stat_activity", PG_STAT_ACTIVITY_COLUMNS),
@@ -16160,6 +16442,7 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
         PG_STAT_SUBSCRIPTION_COLUMNS,
     ),
     (12253, 12255, "pg_stat_ssl", PG_STAT_SSL_COLUMNS),
+    (12270, 12272, "pg_stat_database", PG_STAT_DATABASE_COLUMNS),
     (
         12275,
         12277,
@@ -16186,12 +16469,13 @@ const MONITORING_RELATIONS: &[MonitoringRelation] = &[
     ),
 ];
 
-const MONITORING_ATTRIBUTE_COUNT: usize = 134;
+const MONITORING_ATTRIBUTE_COUNT: usize = 317;
 
 const fn monitoring_type_oid(ctype: ColType) -> i32 {
     match ctype {
         ColType::Bool => 16,
         ColType::Int8 => 20,
+        ColType::Float8 => 701,
         ColType::Int4 => 23,
         ColType::Int2 => 21,
         ColType::Text => 25,
@@ -16212,7 +16496,7 @@ const fn monitoring_type_len(ctype: ColType) -> i32 {
         ColType::Bool => 1,
         ColType::Int2 => 2,
         ColType::Int4 | ColType::Oid | ColType::Xid => 4,
-        ColType::Int8 | ColType::Timestamptz | ColType::PgLsn => 8,
+        ColType::Int8 | ColType::Float8 | ColType::Timestamptz | ColType::PgLsn => 8,
         ColType::Interval => 16,
         ColType::Name => 64,
         ColType::Text | ColType::Inet | ColType::Numeric => -1,
@@ -16224,7 +16508,11 @@ const fn monitoring_type_alignment(ctype: ColType) -> &'static str {
     match ctype {
         ColType::Bool | ColType::Name => "c",
         ColType::Int2 => "s",
-        ColType::Int8 | ColType::Timestamptz | ColType::Interval | ColType::PgLsn => "d",
+        ColType::Int8
+        | ColType::Float8
+        | ColType::Timestamptz
+        | ColType::Interval
+        | ColType::PgLsn => "d",
         ColType::Int4
         | ColType::Text
         | ColType::Oid
@@ -23073,7 +23361,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
                 Datum::Bool(false),
-                if matches!(routine.oid, 764 | 765 | 767) {
+                if matches!(routine.oid, 764 | 765 | 767 | 2274 | 3776) {
                     builtin_acl(&["postgres=X/postgres"], arena)?
                 } else {
                     Datum::Null
@@ -24731,6 +25019,267 @@ fn pg_stat_ssl<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
     });
     if let Some(error) = found_error {
         return Err(error);
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+#[derive(Clone, Copy)]
+enum StatisticsScope {
+    All,
+    System,
+    User,
+}
+
+fn statistics_schema_in_scope(schema: &str, scope: StatisticsScope) -> bool {
+    let system =
+        matches!(schema, "pg_catalog" | "information_schema") || schema.starts_with("pg_toast");
+    match scope {
+        StatisticsScope::All => true,
+        StatisticsScope::System => system,
+        StatisticsScope::User => !system,
+    }
+}
+
+fn statistics_count(value: u64) -> Datum<'static> {
+    Datum::Int8(value.min(i64::MAX as u64) as i64)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pg_stat_tables<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    name: &'static str,
+    scope: StatisticsScope,
+    transaction_local: bool,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        name,
+        if transaction_local {
+            PG_STAT_XACT_TABLES_COLUMNS
+        } else {
+            PG_STAT_TABLES_COLUMNS
+        },
+    );
+    let indexes = (!transaction_local)
+        .then(|| collect_indexes(storage, txid, arena))
+        .transpose()?;
+    let rows = arena
+        .alloc_slice_with(storage.table_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for table_slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table_slot, txid) {
+            continue;
+        }
+        let table = storage.table_def(table_slot, txid);
+        if !statistics_schema_in_scope(table.schema.as_str(), scope) {
+            continue;
+        }
+        let identity = [
+            Datum::Oid(user_table_oid(table_slot) as u32),
+            text(table.schema.as_str(), arena)?,
+            text(table.name.as_str(), arena)?,
+        ];
+        rows[count] = if transaction_local {
+            let statistics = storage.relation_transaction_statistics(txid, table_slot);
+            row(
+                &[
+                    identity[0],
+                    identity[1],
+                    identity[2],
+                    statistics_count(statistics.seq_scan),
+                    statistics_count(statistics.seq_tup_read),
+                    statistics_count(statistics.idx_scan),
+                    statistics_count(statistics.idx_tup_fetch),
+                    statistics_count(statistics.n_tup_ins),
+                    statistics_count(statistics.n_tup_upd),
+                    statistics_count(statistics.n_tup_del),
+                    Datum::Int8(0),
+                    Datum::Int8(0),
+                ],
+                arena,
+            )?
+        } else {
+            let statistics = storage.relation_cumulative_statistics(table_slot);
+            let mut idx_scan = 0u64;
+            let mut idx_tup_fetch = 0u64;
+            let mut last_idx_scan: Option<i64> = None;
+            for index in indexes
+                .expect("cumulative table statistics collected indexes")
+                .iter()
+                .filter(|index| index.table_slot == table_slot)
+            {
+                let index_statistics = storage.index_cumulative_statistics(index.oid);
+                idx_scan = idx_scan.saturating_add(index_statistics.idx_scan);
+                idx_tup_fetch = idx_tup_fetch.saturating_add(index_statistics.idx_tup_fetch);
+                last_idx_scan = match (last_idx_scan, index_statistics.last_idx_scan) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (None, right) => right,
+                    (left, None) => left,
+                };
+            }
+            row(
+                &[
+                    identity[0],
+                    identity[1],
+                    identity[2],
+                    statistics_count(statistics.seq_scan),
+                    statistics
+                        .last_seq_scan
+                        .map_or(Datum::Null, Datum::Timestamptz),
+                    statistics_count(statistics.seq_tup_read),
+                    statistics_count(idx_scan),
+                    last_idx_scan.map_or(Datum::Null, Datum::Timestamptz),
+                    statistics_count(idx_tup_fetch),
+                    statistics_count(statistics.n_tup_ins),
+                    statistics_count(statistics.n_tup_upd),
+                    statistics_count(statistics.n_tup_del),
+                    Datum::Int8(0),
+                    Datum::Int8(0),
+                    statistics_count(statistics.n_live_tup),
+                    statistics_count(statistics.n_dead_tup),
+                    statistics_count(statistics.n_mod_since_analyze),
+                    statistics_count(statistics.n_ins_since_vacuum),
+                    statistics
+                        .last_vacuum
+                        .map_or(Datum::Null, Datum::Timestamptz),
+                    Datum::Null,
+                    statistics
+                        .last_analyze
+                        .map_or(Datum::Null, Datum::Timestamptz),
+                    Datum::Null,
+                    statistics_count(statistics.vacuum_count),
+                    Datum::Int8(0),
+                    statistics_count(statistics.analyze_count),
+                    Datum::Int8(0),
+                    Datum::Float8(statistics.total_vacuum_time_micros as f64 / 1_000.0),
+                    Datum::Float8(0.0),
+                    Datum::Float8(statistics.total_analyze_time_micros as f64 / 1_000.0),
+                    Datum::Float8(0.0),
+                ],
+                arena,
+            )?
+        };
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_indexes<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    name: &'static str,
+    scope: StatisticsScope,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(name, PG_STAT_INDEXES_COLUMNS);
+    let indexes = collect_indexes(storage, txid, arena)?;
+    let rows = arena
+        .alloc_slice_with(indexes.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for index in indexes {
+        let table = storage.table_def(index.table_slot, txid);
+        if !statistics_schema_in_scope(table.schema.as_str(), scope) {
+            continue;
+        }
+        let statistics = storage.index_cumulative_statistics(index.oid);
+        rows[count] = row(
+            &[
+                Datum::Oid(index.table_oid as u32),
+                Datum::Oid(index.oid as u32),
+                text(table.schema.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
+                text(index.name.as_str(), arena)?,
+                statistics_count(statistics.idx_scan),
+                statistics
+                    .last_idx_scan
+                    .map_or(Datum::Null, Datum::Timestamptz),
+                statistics_count(statistics.idx_tup_read),
+                statistics_count(statistics.idx_tup_fetch),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_stat_database<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of("pg_stat_database", PG_STAT_DATABASE_COLUMNS);
+    let rows = arena
+        .alloc_slice_with(crate::storage::MAX_DATABASES + 1, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    let mut append = |datid: Datum<'a>,
+                      datname: Datum<'a>,
+                      numbackends: i32,
+                      statistics: crate::storage::DatabaseCumulativeStatistics|
+     -> Result<(), SqlError> {
+        rows[count] = row(
+            &[
+                datid,
+                datname,
+                Datum::Int4(numbackends),
+                statistics_count(statistics.xact_commit),
+                statistics_count(statistics.xact_rollback),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                statistics_count(statistics.tup_returned),
+                statistics_count(statistics.tup_fetched),
+                statistics_count(statistics.tup_inserted),
+                statistics_count(statistics.tup_updated),
+                statistics_count(statistics.tup_deleted),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                statistics_count(statistics.deadlocks),
+                Datum::Int8(0),
+                Datum::Null,
+                Datum::Float8(0.0),
+                Datum::Float8(0.0),
+                Datum::Float8(statistics.session_time_micros as f64 / 1_000.0),
+                Datum::Float8(statistics.active_time_micros as f64 / 1_000.0),
+                Datum::Float8(statistics.idle_in_transaction_time_micros as f64 / 1_000.0),
+                statistics_count(statistics.sessions),
+                statistics_count(statistics.sessions_abandoned),
+                statistics_count(statistics.sessions_fatal),
+                statistics_count(statistics.sessions_killed),
+                Datum::Int8(0),
+                Datum::Int8(0),
+                statistics
+                    .stats_reset
+                    .map_or(Datum::Null, Datum::Timestamptz),
+            ],
+            arena,
+        )?;
+        count += 1;
+        Ok(())
+    };
+    append(
+        Datum::Oid(0),
+        Datum::Null,
+        0,
+        crate::storage::DatabaseCumulativeStatistics::empty_for_catalog(),
+    )?;
+    for (slot, database) in storage.databases_visible_to(txid) {
+        let mut backends = 0i32;
+        storage.visit_backends(|activity| {
+            if activity.database == database.oid {
+                backends = backends.saturating_add(1);
+            }
+        });
+        append(
+            Datum::Oid(database.oid.get() as u32),
+            text(database.definition_for(txid).name.as_str(), arena)?,
+            backends,
+            storage.database_cumulative_statistics(slot),
+        )?;
     }
     finish(definition, &rows[..count], arena)
 }

@@ -18753,11 +18753,11 @@ pub(crate) fn execute_plpgsql_function<'a>(
         None,
     )? {
         Some(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Ok(value),
-        None if program_kind == PlpgsqlProgramKind::VoidFunction => Ok(Datum::Null),
+        None if program_kind == PlpgsqlProgramKind::VoidFunction => Ok(Datum::Text("")),
         Some(TriggerFlow::Return(TriggerReturnValue::Void))
             if program_kind == PlpgsqlProgramKind::VoidFunction =>
         {
-            Ok(Datum::Null)
+            Ok(Datum::Text(""))
         }
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void))
             if program_kind == PlpgsqlProgramKind::OutputFunction =>
@@ -51253,8 +51253,13 @@ pub fn apply_replication_truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                let prior =
-                    storage.write_pending(table, rowid, txn.txid, txn.command_id(), None)?;
+                let prior = storage.write_pending_untracked(
+                    table,
+                    rowid,
+                    txn.txid,
+                    txn.command_id(),
+                    None,
+                )?;
                 if let Err(error) = txn.touch(table as u32, rowid, prior) {
                     storage.restore_pending(table, rowid, txn.txid, prior);
                     return Err(error);
@@ -51308,7 +51313,11 @@ pub fn apply_replication_truncate(
         table_count: tables.len(),
         cascade,
         restart_identity,
-    })
+    })?;
+    for &table in tables {
+        storage.record_relation_transaction_truncate(txn.txid, table)?;
+    }
+    Ok(())
 }
 
 /// Decodes one COPY-binary field into a datum of `ctype`, per PostgreSQL's
@@ -52423,6 +52432,7 @@ pub fn copy_out(
     let n_leaves = storage.relation_leaf_slots(setup.table_index, txid, leaves)?;
     let mut visible = 0usize;
     for &leaf in &leaves[..n_leaves] {
+        storage.record_relation_scan(txid, leaf, None, 0)?;
         storage.for_each_row_state(leaf, &mut |rowid, state| {
             if storage
                 .visible_row_home(leaf, rowid, state, txid)?
@@ -52460,6 +52470,7 @@ pub fn copy_out(
     tokens.sort_unstable_by_key(|(_, rowid, _)| *rowid);
     let mut count = 0u64;
     for &(leaf, rowid, home) in tokens.iter() {
+        storage.record_relation_tuple_read(txid, leaf, None)?;
         let emitted = storage.with_row_bytes(leaf, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             let physical = storage.table_def(leaf, txid);
@@ -54351,10 +54362,14 @@ pub fn merge<'a>(
             };
         let mut k = 0usize;
         for &leaf in leaves {
+            if let Err(error) = storage.record_relation_scan(txn.txid, leaf, None, 0) {
+                return sql_fail(error);
+            }
             if let Err(e) = storage.for_each_row_state(leaf, &mut |rowid, state| {
                 if let Some(home) = storage.visible_row_home(leaf, rowid, state, txn.txid)?
                     && k < ids.len()
                 {
+                    storage.record_relation_tuple_read(txn.txid, leaf, None)?;
                     ids[k] = rowid;
                     tables[k] = leaf;
                     hms[k] = home;
@@ -59631,7 +59646,13 @@ pub fn truncate(
                 break;
             }
             for &rowid in &rowids[..count] {
-                match storage.write_pending(table_index, rowid, txn.txid, txn.command_id(), None) {
+                match storage.write_pending_untracked(
+                    table_index,
+                    rowid,
+                    txn.txid,
+                    txn.command_id(),
+                    None,
+                ) {
                     Ok(prior) => {
                         if let Err(e) = txn.touch(table_index as u32, rowid, prior) {
                             storage.restore_pending(table_index, rowid, txn.txid, prior);
@@ -59716,6 +59737,11 @@ pub fn truncate(
         restart_identity,
     }) {
         return sql_fail(error);
+    }
+    for &table_index in &list[..n] {
+        if let Err(error) = storage.record_relation_transaction_truncate(txn.txid, table_index) {
+            return sql_fail(error);
+        }
     }
     responder.command_complete("TRUNCATE TABLE")?;
     sql_ok()
@@ -64972,7 +64998,7 @@ fn alter_table_inner(
         let RowHome::Heap(new_loc) = new_home else {
             unreachable!("the rewrite pass re-homes every row to the heap");
         };
-        match storage.write_pending(
+        match storage.write_pending_untracked(
             table_index,
             rowid,
             txn.txid,
@@ -65705,11 +65731,13 @@ fn collect_matches<'a>(
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
+        storage.record_relation_scan(txid, leaf, None, 0)?;
         storage.for_each_row_state(leaf, &mut |rowid, state| {
             use core::ops::ControlFlow;
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(ControlFlow::Continue(()));
             };
+            storage.record_relation_tuple_read(txid, leaf, None)?;
             if row_matches(
                 storage,
                 leaf,
@@ -65825,11 +65853,13 @@ fn collect_join_matches<'a>(
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
+        storage.record_relation_scan(txid, leaf, None, 0)?;
         storage.for_each_row_state(leaf, &mut |rowid, state| {
             use core::ops::ControlFlow;
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(ControlFlow::Continue(()));
             };
+            storage.record_relation_tuple_read(txid, leaf, None)?;
             // Consume-in-place, as in row_matches: the joined-row probe reads
             // this row's values only while it runs.
             let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
@@ -65960,11 +65990,13 @@ fn collect_join_matches_with_transition<'a>(
     }
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
+        storage.record_relation_scan(txid, leaf, None, 0)?;
         storage.for_each_row_state(leaf, &mut |rowid, state| {
             use core::ops::ControlFlow;
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
                 return Ok(ControlFlow::Continue(()));
             };
+            storage.record_relation_tuple_read(txid, leaf, None)?;
             let found = storage.with_row_bytes(leaf, rowid, loc, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, schema, &mut values)?;

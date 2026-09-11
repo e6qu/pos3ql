@@ -2807,6 +2807,11 @@ pub fn infer_type_res(
         return Ok((result.type_oid, result.ctype.typlen()));
     }
     if let Expr::Call { name, args, .. } = expression
+        && let Some(result) = crate::sql::statistics::result_type(name, args.len())
+    {
+        return Ok(result);
+    }
+    if let Expr::Call { name, args, .. } = expression
         && let Some(result) = crate::sql::logical_replication::result_type(name, args.len())
     {
         return Ok(result);

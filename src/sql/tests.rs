@@ -7,6 +7,227 @@
 use super::*;
 
 #[test]
+fn postgresql_object_introspection_and_serial_sequences_are_transactional() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA object_api; \
+         CREATE TABLE object_api.items(id serial, value text); \
+         CREATE FUNCTION object_api.bump(value integer) RETURNS integer \
+           LANGUAGE SQL IMMUTABLE AS $$ SELECT value + 1 $$; \
+         SELECT (pg_identify_object('pg_class'::regclass, c.oid, 0)).* \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'object_api' AND c.relname = 'items'; \
+         SELECT * FROM pg_identify_object( \
+           'pg_class'::regclass, 'object_api.items'::regclass, 0); \
+         SELECT (pg_identify_object_as_address('pg_class'::regclass, c.oid, 2)).* \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'object_api' AND c.relname = 'items'; \
+         SELECT pg_describe_object('pg_class'::regclass, c.oid, 2) \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'object_api' AND c.relname = 'items'; \
+         SELECT (pg_get_object_address('table column', \
+                    ARRAY['object_api','items','value'], ARRAY[]::text[])).classid \
+                    = 'pg_class'::regclass, \
+                (pg_get_object_address('table column', \
+                    ARRAY['object_api','items','value'], ARRAY[]::text[])).objid = c.oid, \
+                (pg_get_object_address('table column', \
+                    ARRAY['object_api','items','value'], ARRAY[]::text[])).objsubid = 2 \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'object_api' AND c.relname = 'items'; \
+         SELECT (pg_get_object_address('function', ARRAY['object_api','bump'], \
+                    ARRAY['integer'])).objid = p.oid \
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'object_api' AND p.proname = 'bump'; \
+         SELECT pg_get_serial_sequence('object_api.items', 'id'), \
+                pg_get_serial_sequence('object_api.items', 'value'); \
+         SELECT (pg_identify_object(1255::smallint, 1665::smallint, 0::smallint)).type; \
+         SELECT oid, proname, prorettype, proargtypes::text, proallargtypes, \
+                proargmodes, proargnames, provolatile, proparallel, proisstrict \
+           FROM pg_proc \
+          WHERE oid IN (1665,2082,2083,2093,3382,3403,3537,3757,3758,3829,3839,3954) \
+          ORDER BY oid",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "table|object_api|items|object_api.items",
+            "table|object_api|items|object_api.items",
+            "table column|{object_api,items,value}|{}",
+            "column value of table object_api.items",
+            "t|t|t",
+            "t",
+            "object_api.items_id_seq|NULL",
+            "function",
+            "1665|pg_get_serial_sequence|25|25 25|NULL|NULL|NULL|s|s|t",
+            "2082|pg_operator_is_visible|16|26|NULL|NULL|NULL|s|s|t",
+            "2083|pg_opclass_is_visible|16|26|NULL|NULL|NULL|s|s|t",
+            "2093|pg_conversion_is_visible|16|26|NULL|NULL|NULL|s|s|t",
+            "3382|pg_identify_object_as_address|2249|26 26 23|{26,26,23,25,1009,1009}|{i,i,i,o,o,o}|{classid,objid,objsubid,type,object_names,object_args}|s|s|t",
+            "3403|pg_statistics_obj_is_visible|16|26|NULL|NULL|NULL|s|s|t",
+            "3537|pg_describe_object|25|26 26 23|NULL|NULL|NULL|s|s|t",
+            "3757|pg_ts_dict_is_visible|16|26|NULL|NULL|NULL|s|s|t",
+            "3758|pg_ts_config_is_visible|16|26|NULL|NULL|NULL|s|s|t",
+            "3829|pg_opfamily_is_visible|16|26|NULL|NULL|NULL|s|s|t",
+            "3839|pg_identify_object|2249|26 26 23|{26,26,23,25,25,25,25}|{i,i,i,o,o,o,o}|{classid,objid,objsubid,type,schema,name,identity}|s|s|t",
+            "3954|pg_get_object_address|2249|25 1009 1009|{25,1009,1009,26,26,23}|{i,i,i,o,o,o}|{type,object_names,object_args,classid,objid,objsubid}|s|s|t",
+        ]
+    );
+
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER TABLE object_api.items RENAME TO products; \
+         ALTER TABLE object_api.products RENAME COLUMN id TO product_id; \
+         SELECT pg_get_serial_sequence('object_api.products', 'product_id'); \
+         SELECT (pg_identify_object('pg_class'::regclass, c.oid, 0)).* \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'object_api' AND c.relname = 'products'; \
+         ROLLBACK; \
+         SELECT pg_get_serial_sequence('object_api.items', 'id')",
+    );
+    let text = String::from_utf8_lossy(&renamed);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&renamed),
+        [
+            "object_api.items_id_seq",
+            "table|object_api|products|object_api.products",
+            "object_api.items_id_seq",
+        ]
+    );
+
+    let missing = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (pg_identify_object('pg_class'::regclass, 999999, 0)).*; \
+         SELECT (pg_identify_object_as_address('pg_proc'::regclass, 999999, 0)).type, \
+                (pg_identify_object_as_address('pg_proc'::regclass, 999999, 0)).object_names, \
+                (pg_identify_object_as_address('pg_proc'::regclass, 999999, 0)).object_args; \
+         SELECT pg_describe_object('pg_class'::regclass, 999999, 0)",
+    );
+    assert_eq!(
+        data_rows(&missing),
+        ["relation|NULL|NULL|NULL", "routine|NULL|NULL", "NULL"],
+        "{}",
+        String::from_utf8_lossy(&missing)
+    );
+    for (query, state) in [
+        ("SELECT pg_identify_object(999999, 1, 0)", "XX000"),
+        (
+            "SELECT pg_get_object_address('bogus', ARRAY['x'], ARRAY[]::text[])",
+            "22023",
+        ),
+        (
+            "SELECT pg_get_object_address('table', ARRAY['object_api','missing'], ARRAY[]::text[])",
+            "42P01",
+        ),
+        (
+            "SELECT pg_get_object_address('table', ARRAY['object_api',NULL], ARRAY[]::text[])",
+            "22023",
+        ),
+    ] {
+        let error = run_with(&mut engine, &mut budget, query);
+        assert!(
+            String::from_utf8_lossy(&error).contains(state),
+            "{query}: {}",
+            String::from_utf8_lossy(&error)
+        );
+    }
+}
+
+#[test]
+fn postgresql_catalog_visibility_distinguishes_hidden_and_missing_objects() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA visible_first; CREATE SCHEMA visible_second; \
+         CREATE TABLE visible_first.same(a integer, b integer); \
+         CREATE TABLE visible_second.same(a integer, b integer); \
+         CREATE TYPE visible_first.same_type AS ENUM ('a'); \
+         CREATE TYPE visible_second.same_type AS ENUM ('b'); \
+         CREATE FUNCTION visible_first.same_fn(integer) RETURNS integer \
+           LANGUAGE SQL IMMUTABLE AS $$ SELECT $1 $$; \
+         CREATE FUNCTION visible_second.same_fn(integer) RETURNS integer \
+           LANGUAGE SQL IMMUTABLE AS $$ SELECT $1 $$; \
+         CREATE COLLATION visible_first.same_collation (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE COLLATION visible_second.same_collation (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE STATISTICS visible_first.same_stats ON a, b FROM visible_first.same; \
+         CREATE STATISTICS visible_second.same_stats ON a, b FROM visible_second.same; \
+         CREATE TEXT SEARCH CONFIGURATION visible_first.same_config (COPY = simple); \
+         CREATE TEXT SEARCH CONFIGURATION visible_second.same_config (COPY = simple); \
+         CREATE OPERATOR FAMILY visible_first.same_family USING btree; \
+         CREATE OPERATOR FAMILY visible_second.same_family USING btree; \
+         SET search_path = visible_first, visible_second, pg_catalog; \
+         SELECT n.nspname, pg_table_is_visible(c.oid) \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE c.relname = 'same' ORDER BY n.nspname; \
+         SELECT n.nspname, pg_type_is_visible(t.oid) \
+           FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+          WHERE t.typname = 'same_type' ORDER BY n.nspname; \
+         SELECT n.nspname, pg_function_is_visible(p.oid) \
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE p.proname = 'same_fn' ORDER BY n.nspname; \
+         SELECT n.nspname, pg_collation_is_visible(c.oid) \
+           FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace \
+          WHERE c.collname = 'same_collation' ORDER BY n.nspname; \
+         SELECT n.nspname, pg_statistics_obj_is_visible(s.oid) \
+           FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace \
+          WHERE s.stxname = 'same_stats' ORDER BY n.nspname; \
+         SELECT n.nspname, pg_ts_config_is_visible(c.oid) \
+           FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace \
+          WHERE c.cfgname = 'same_config' ORDER BY n.nspname; \
+         SELECT n.nspname, pg_opfamily_is_visible(f.oid) \
+           FROM pg_opfamily f JOIN pg_namespace n ON n.oid = f.opfnamespace \
+          WHERE f.opfname = 'same_family' ORDER BY n.nspname; \
+         SELECT pg_table_is_visible(999999) IS NULL, \
+                pg_type_is_visible(999999) IS NULL, \
+                pg_function_is_visible(999999) IS NULL, \
+                pg_collation_is_visible(999999) IS NULL, \
+                pg_statistics_obj_is_visible(999999) IS NULL, \
+                pg_ts_config_is_visible(999999) IS NULL, \
+                pg_opfamily_is_visible(999999) IS NULL",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "visible_first|t",
+            "visible_second|f",
+            "visible_first|t",
+            "visible_second|f",
+            "visible_first|t",
+            "visible_second|f",
+            "visible_first|t",
+            "visible_second|f",
+            "visible_first|t",
+            "visible_second|f",
+            "visible_first|t",
+            "visible_second|f",
+            "visible_first|t",
+            "visible_second|f",
+            "t|t|t|t|t|t|t",
+        ]
+    );
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET search_path; DROP SCHEMA visible_first CASCADE; DROP SCHEMA visible_second CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&dropped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+}
+
+#[test]
 fn postgresql_18_catalog_reference_family_is_typed_and_catalogued() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -33344,6 +33565,7 @@ fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
                  id bigint DEFAULT nextval('schema_rename_source.ticket'), \
                  state schema_rename_source.mood\
              ); \
+             CREATE TABLE schema_rename_source.serial_items(id serial, value text); \
              CREATE VIEW schema_rename_source.item_view AS \
                  SELECT id, state FROM schema_rename_source.items; \
              COMMENT ON SCHEMA schema_rename_source IS 'renamed namespace'; \
@@ -33418,7 +33640,11 @@ fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
         "INSERT INTO schema_rename_target.items(state) VALUES ('calm') RETURNING id; \
          SELECT id, state FROM schema_rename_target.item_view ORDER BY id; \
          SELECT 'storm'::schema_rename_target.mood; \
-         SELECT obj_description('schema_rename_target.ticket'::regclass)",
+         SELECT obj_description('schema_rename_target.ticket'::regclass); \
+         SELECT pg_get_serial_sequence('schema_rename_target.serial_items', 'id'); \
+         SELECT pg_describe_object('pg_class'::regclass, c.oid, 2) \
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'schema_rename_target' AND c.relname = 'serial_items'",
     );
     assert_eq!(
         data_rows(&recovered),
@@ -33428,7 +33654,9 @@ fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
             "3|storm",
             "4|calm",
             "storm",
-            "renamed sequence"
+            "renamed sequence",
+            "schema_rename_target.serial_items_id_seq",
+            "column value of table schema_rename_target.serial_items"
         ],
         "{}",
         String::from_utf8_lossy(&recovered)

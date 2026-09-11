@@ -31,6 +31,7 @@ impl CatalogOid {
     fn parse(value: Datum<'_>) -> Result<Option<Self>, SqlError> {
         match value {
             Datum::Null => Ok(None),
+            Datum::Int2(oid) => Ok(Some(Self(i32::from(oid)))),
             Datum::Int4(oid) => Ok(Some(Self(oid))),
             Datum::Oid(oid) => i32::try_from(oid)
                 .map(Self)
@@ -474,6 +475,246 @@ fn current_user_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> 
     arena.alloc_str(user.as_str()).map_err(|_| arena_full())
 }
 
+fn object_address_parts<'a, const N: usize>(
+    parts: &[crate::util::StackStr<N>],
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::sql::event_trigger::MAX_ADDRESS_PARTS];
+    for (value, part) in values.iter_mut().zip(parts) {
+        *value = Datum::Text(part.as_str());
+    }
+    Ok(Datum::Array {
+        element: ArrElem::Text,
+        raw: array::build(&values[..parts.len()], arena)?,
+    })
+}
+
+fn text_array_parts<'a>(
+    value: Datum<'a>,
+) -> Result<
+    Option<(
+        [&'a str; crate::sql::event_trigger::MAX_ADDRESS_PARTS],
+        usize,
+    )>,
+    SqlError,
+> {
+    let Datum::Array {
+        element: ArrElem::Text,
+        raw,
+    } = value
+    else {
+        return if value.is_null() {
+            Ok(None)
+        } else {
+            Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "object address components must be text arrays"
+            ))
+        };
+    };
+    let shape = array::shape(raw).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INVALID_BINARY_REPRESENTATION,
+            "invalid array representation"
+        )
+    })?;
+    if shape.dimension_count() > 1 {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "object address components must be one-dimensional arrays"
+        ));
+    }
+    let count = array::len(raw);
+    if count > crate::sql::event_trigger::MAX_ADDRESS_PARTS {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "object address has too many components"
+        ));
+    }
+    let mut parts = [""; crate::sql::event_trigger::MAX_ADDRESS_PARTS];
+    for (index, part) in parts[..count].iter_mut().enumerate() {
+        *part = match array::get(raw, ArrElem::Text, index) {
+            Some(Datum::Text(value)) => value,
+            Some(Datum::Null) => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "name or argument lists may not contain nulls"
+                ));
+            }
+            Some(_) => unreachable!("text arrays decode text elements"),
+            None => unreachable!("array length bounds each element"),
+        };
+    }
+    Ok(Some((parts, count)))
+}
+
+fn object_address_record<'a>(
+    class_id: i32,
+    object_id: i32,
+    sub_id: i32,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let fields = arena
+        .alloc_slice_copy(&[
+            crate::sql::types::RecordField {
+                name: "classid",
+                type_oid: crate::sql::types::oid::OID,
+                value: Datum::Oid(class_id as u32),
+            },
+            crate::sql::types::RecordField {
+                name: "objid",
+                type_oid: crate::sql::types::oid::OID,
+                value: Datum::Oid(object_id as u32),
+            },
+            crate::sql::types::RecordField {
+                name: "objsubid",
+                type_oid: crate::sql::types::oid::INT4,
+                value: Datum::Int4(sub_id),
+            },
+        ])
+        .map_err(|_| arena_full())?;
+    Ok(Datum::Record(fields))
+}
+
+fn identify_object_record<'a>(
+    object: crate::sql::event_trigger::EventObject,
+    address: bool,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let object_type = arena
+        .alloc_str(object.object_type.as_str())
+        .map_err(|_| arena_full())?;
+    let object_name = object
+        .object_name
+        .as_ref()
+        .map(|name| name.as_str())
+        .or_else(|| {
+            (object.object_type.as_str().ends_with(" column") && object.address_name_count == 3)
+                .then(|| object.address_names[1].as_str())
+        });
+    let fields = if address {
+        arena
+            .alloc_slice_copy(&[
+                crate::sql::types::RecordField {
+                    name: "type",
+                    type_oid: crate::sql::types::oid::TEXT,
+                    value: Datum::Text(object_type),
+                },
+                crate::sql::types::RecordField {
+                    name: "object_names",
+                    type_oid: crate::sql::types::oid::TEXT_ARRAY,
+                    value: if object.identity.is_empty() {
+                        Datum::Null
+                    } else {
+                        object_address_parts(
+                            &object.address_names[..object.address_name_count],
+                            arena,
+                        )?
+                    },
+                },
+                crate::sql::types::RecordField {
+                    name: "object_args",
+                    type_oid: crate::sql::types::oid::TEXT_ARRAY,
+                    value: if object.identity.is_empty() {
+                        Datum::Null
+                    } else {
+                        object_address_parts(
+                            &object.address_args[..object.address_arg_count],
+                            arena,
+                        )?
+                    },
+                },
+            ])
+            .map_err(|_| arena_full())?
+    } else {
+        arena
+            .alloc_slice_copy(&[
+                crate::sql::types::RecordField {
+                    name: "type",
+                    type_oid: crate::sql::types::oid::TEXT,
+                    value: Datum::Text(object_type),
+                },
+                crate::sql::types::RecordField {
+                    name: "schema",
+                    type_oid: crate::sql::types::oid::TEXT,
+                    value: match object.schema_name.as_ref() {
+                        Some(value) => {
+                            Datum::Text(arena.alloc_str(value.as_str()).map_err(|_| arena_full())?)
+                        }
+                        None => Datum::Null,
+                    },
+                },
+                crate::sql::types::RecordField {
+                    name: "name",
+                    type_oid: crate::sql::types::oid::TEXT,
+                    value: match object_name {
+                        Some(value) => {
+                            Datum::Text(arena.alloc_str(value).map_err(|_| arena_full())?)
+                        }
+                        None => Datum::Null,
+                    },
+                },
+                crate::sql::types::RecordField {
+                    name: "identity",
+                    type_oid: crate::sql::types::oid::TEXT,
+                    value: if object.identity.is_empty() {
+                        Datum::Null
+                    } else {
+                        Datum::Text(
+                            arena
+                                .alloc_str(object.identity.as_str())
+                                .map_err(|_| arena_full())?,
+                        )
+                    },
+                },
+            ])
+            .map_err(|_| arena_full())?
+    };
+    Ok(Datum::Record(fields))
+}
+
+fn describe_catalog_object(
+    object: crate::sql::event_trigger::EventObject,
+    arena: &crate::mem::arena::Arena,
+) -> Result<&str, SqlError> {
+    let description = if object.object_type.as_str() == "domain constraint" {
+        stack_format!(1024, "constraint {}", object.address_args[0].as_str())
+    } else if object.object_type.as_str().ends_with(" column") && object.address_name_count == 3 {
+        let column = crate::sql::types::acl_identifier(object.address_names[2].as_str());
+        let schema = crate::sql::types::acl_identifier(object.address_names[0].as_str());
+        let relation = crate::sql::types::acl_identifier(object.address_names[1].as_str());
+        let relation_kind = object
+            .object_type
+            .as_str()
+            .strip_suffix(" column")
+            .unwrap_or("table");
+        stack_format!(
+            1024,
+            "column {} of {} {}.{}",
+            column.as_str(),
+            relation_kind,
+            schema.as_str(),
+            relation.as_str()
+        )
+    } else {
+        stack_format!(
+            1024,
+            "{} {}",
+            object.object_type.as_str(),
+            object.identity.as_str()
+        )
+    };
+    if description.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "catalog object description exceeds static capacity"
+        ));
+    }
+    arena
+        .alloc_str(description.as_str())
+        .map_err(|_| arena_full())
+}
+
 /// Handles the system/introspection family. Returns `None` if `name` is not one
 /// of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -510,6 +751,18 @@ pub(crate) fn dispatch<'a>(
             | "pg_type_is_visible"
             | "pg_function_is_visible"
             | "pg_collation_is_visible"
+            | "pg_operator_is_visible"
+            | "pg_opclass_is_visible"
+            | "pg_opfamily_is_visible"
+            | "pg_conversion_is_visible"
+            | "pg_statistics_obj_is_visible"
+            | "pg_ts_dict_is_visible"
+            | "pg_ts_config_is_visible"
+            | "pg_identify_object"
+            | "pg_identify_object_as_address"
+            | "pg_get_object_address"
+            | "pg_describe_object"
+            | "pg_get_serial_sequence"
             | "has_table_privilege"
             | "has_column_privilege"
             | "has_any_column_privilege"
@@ -1205,6 +1458,13 @@ pub(crate) fn dispatch<'a>(
             | "pg_type_is_visible"
             | "pg_function_is_visible"
             | "pg_collation_is_visible"
+            | "pg_operator_is_visible"
+            | "pg_opclass_is_visible"
+            | "pg_opfamily_is_visible"
+            | "pg_conversion_is_visible"
+            | "pg_statistics_obj_is_visible"
+            | "pg_ts_dict_is_visible"
+            | "pg_ts_config_is_visible"
             | "pg_relation_is_publishable" => {
                 arity(1)?;
                 let Some(cat) = hooks.catalog else {
@@ -1219,11 +1479,129 @@ pub(crate) fn dispatch<'a>(
                     "pg_type_is_visible" => cat.type_is_visible(oid.0),
                     "pg_function_is_visible" => cat.function_is_visible(oid.0),
                     "pg_collation_is_visible" => cat.collation_is_visible(oid.0),
+                    "pg_operator_is_visible" => cat.operator_is_visible(oid.0),
+                    "pg_opclass_is_visible" => cat.operator_class_is_visible(oid.0),
+                    "pg_opfamily_is_visible" => cat.operator_family_is_visible(oid.0),
+                    "pg_conversion_is_visible" => cat.conversion_is_visible(oid.0),
+                    "pg_statistics_obj_is_visible" => cat.statistics_object_is_visible(oid.0),
+                    "pg_ts_dict_is_visible" => cat.text_search_dictionary_is_visible(oid.0),
+                    "pg_ts_config_is_visible" => cat.text_search_configuration_is_visible(oid.0),
                     "pg_relation_is_publishable" => cat.relation_is_publishable(oid.0),
                     _ => unreachable!(),
                 }
                 .map(Datum::Bool)
                 .unwrap_or(Datum::Null))
+            }
+            "pg_identify_object" | "pg_identify_object_as_address" | "pg_describe_object" => {
+                arity(3)?;
+                let Some(catalog) = hooks.catalog else {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "catalog object introspection is unavailable"
+                    ));
+                };
+                let class_id =
+                    match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                        Some(oid) => oid.0,
+                        None => return Ok(Datum::Null),
+                    };
+                let object_id =
+                    match CatalogOid::parse(eval_full(args[1], arena, params, row, hooks)?)? {
+                        Some(oid) => oid.0,
+                        None => return Ok(Datum::Null),
+                    };
+                let sub_id = match eval_full(args[2], arena, params, row, hooks)? {
+                    Datum::Int2(value) => i32::from(value),
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(
+                            sqlstate::NUMERIC_OUT_OF_RANGE,
+                            "object sub-ID is out of range"
+                        )
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "object sub-ID must be an integer"
+                        ));
+                    }
+                };
+                let object = catalog.catalog_object(class_id, object_id, sub_id)?;
+                if name == "pg_describe_object" {
+                    if object.identity.is_empty() {
+                        Ok(Datum::Null)
+                    } else {
+                        Ok(Datum::Text(describe_catalog_object(object, arena)?))
+                    }
+                } else {
+                    identify_object_record(object, name == "pg_identify_object_as_address", arena)
+                }
+            }
+            "pg_get_object_address" => {
+                arity(3)?;
+                let object_type = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(value) => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "object type must be text"
+                        ));
+                    }
+                };
+                let Some((names, name_count)) =
+                    text_array_parts(eval_full(args[1], arena, params, row, hooks)?)?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let Some((arguments, argument_count)) =
+                    text_array_parts(eval_full(args[2], arena, params, row, hooks)?)?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "catalog object address resolution is unavailable"
+                    )
+                })?;
+                let (class_id, object_id, sub_id) = catalog.catalog_object_address(
+                    object_type,
+                    &names[..name_count],
+                    &arguments[..argument_count],
+                )?;
+                object_address_record(class_id, object_id, sub_id, arena)
+            }
+            "pg_get_serial_sequence" => {
+                arity(2)?;
+                let table = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(value) => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "pg_get_serial_sequence() requires a table name"
+                        ));
+                    }
+                };
+                let column = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Text(value) => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "pg_get_serial_sequence() requires a column name"
+                        ));
+                    }
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                Ok(catalog
+                    .serial_sequence_name(table, column, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             "pg_my_temp_schema" => {
                 arity(0)?;

@@ -6,6 +6,14 @@ The review also covers the complete bounded PostgreSQL 18 BRE, ERE, literal,
 and ARE function/operator/catalog surface and PostgreSQL's upstream regular-
 expression regression cases across SQL, stored expressions, and recovery.
 
+The review additionally covers PostgreSQL 18 object identification,
+descriptions, reversible addresses, catalog visibility predicates, and
+serial-sequence discovery across transaction-local DDL, wire metadata, driver
+adaptation, and object-cold recovery. The discovered successive-ALTER sequence
+binding, user-type visibility, cascading statistics-drop ownership, cascade
+notice, and small-integer extended-protocol coercion defects are fixed in the
+same change.
+
 Record only a genuinely intractable or externally blocked defect here. A row must include a stable ID, a reproducer, and the reason it cannot be fixed now. Fixable work belongs in the same change that finds it; fixed-bug history belongs in git history and pull requests.
 
 | ID | Status | Found | Description | Repro | Blocker |

@@ -56,6 +56,7 @@ pub mod oid {
     pub const PG_LSN_ARRAY: i32 = 3221;
     pub const OID_ARRAY: i32 = 1028;
     pub const TEXT: i32 = 25;
+    pub const TEXT_ARRAY: i32 = 1009;
     pub const REFCURSOR: i32 = 1790;
     pub const REFCURSOR_ARRAY: i32 = 2201;
     pub const ACLITEM: i32 = 1033;

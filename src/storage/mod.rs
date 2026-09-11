@@ -27107,15 +27107,53 @@ impl Storage {
         column: &str,
         txid: u32,
     ) -> Option<usize> {
-        self.sequences.iter().position(|sequence| {
+        let direct = self.sequences.iter().position(|sequence| {
             sequence.database == self.current_database
                 && sequence.visible_to(txid)
                 && matches!(
-                    sequence.generator_for,
+                    sequence.definition_for(txid).generator_for,
                     Some(owner)
                         if owner.table_schema.as_str() == table_schema
                             && owner.table.as_str() == table
                             && owner.column.as_str() == column
+                )
+        });
+        if direct.is_some() {
+            return direct;
+        }
+
+        // Sequence dependencies are stored against the committed table
+        // identity and rebound when its staged definition commits. Translate
+        // the transaction-visible name back through the composed column map so
+        // successive ALTER TABLE statements can still use serial defaults.
+        let table_slot = (0..self.tables.len()).find(|slot| {
+            self.table_slot_visible_to(*slot, txid)
+                && self.table_def(*slot, txid).schema.as_str() == table_schema
+                && self.table_def(*slot, txid).name.as_str() == table
+        })?;
+        let pending = self
+            .pending_table_def(table_slot)
+            .filter(|pending| pending.txid == txid)?;
+        let committed = self.tables[table_slot].def;
+        let committed_column = pending
+            .column_mapping
+            .iter()
+            .enumerate()
+            .take(committed.n_columns)
+            .find_map(|(index, mapped)| {
+                mapped
+                    .is_some_and(|mapped| mapped.as_str() == column)
+                    .then_some(committed.columns()[index].name)
+            })?;
+        self.sequences.iter().position(|sequence| {
+            sequence.database == self.current_database
+                && sequence.visible_to(txid)
+                && matches!(
+                    sequence.definition_for(txid).generator_for,
+                    Some(owner)
+                        if owner.table_schema == committed.schema
+                            && owner.table == committed.name
+                            && owner.column == committed_column
                 )
         })
     }
@@ -33639,21 +33677,31 @@ impl Storage {
     }
 
     pub(crate) fn commit_extended_statistics_drop(&mut self, slot: usize) {
+        assert!(matches!(
+            self.extended_statistics[slot].ddl_state,
+            CatalogDdlState::PendingDrop { .. }
+        ));
+        self.retire_extended_statistics(slot);
+    }
+
+    fn retire_extended_statistics(&mut self, slot: usize) {
         self.drop_comments_by_subid(CommentClass::Statistics, slot as u32);
         self.clear_pending_extended_statistics_data(slot);
         self.extended_statistics[slot].data = ExtendedStatisticsData::EMPTY;
         self.extended_statistics[slot].pending_definition = None;
         self.extended_statistics[slot].pending_keys = None;
-        self.extended_statistics[slot].ddl_state =
-            self.extended_statistics[slot].ddl_state.commit_drop();
+        self.extended_statistics[slot].ddl_state = CatalogDdlState::Absent;
     }
 
     fn commit_extended_statistics_for_table(&mut self, table: usize) {
         for slot in 0..self.extended_statistics.len() {
-            if self.extended_statistics[slot].ddl_state != CatalogDdlState::Absent
+            // A PendingDrop has its own DdlUndo entry and must be promoted by
+            // that entry. This path owns only unstaged internal dependents,
+            // such as statistics swept up by direct journal replay.
+            if self.extended_statistics[slot].ddl_state == CatalogDdlState::Present
                 && usize::from(self.extended_statistics[slot].table) == table
             {
-                self.commit_extended_statistics_drop(slot);
+                self.retire_extended_statistics(slot);
             }
         }
     }

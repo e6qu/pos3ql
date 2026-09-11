@@ -5799,6 +5799,52 @@ def test_view_output_columns_over_raw_wire():
     s.close()
 
 
+def test_catalog_object_addresses_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE SCHEMA wire_object_api; "
+        "CREATE TABLE wire_object_api.items(id serial, value text)",
+    )
+    identify = simple_query(
+        s,
+        "SELECT (pg_identify_object('pg_class'::regclass, c.oid, 2)).* "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'wire_object_api' AND c.relname = 'items'",
+    )
+    identify_description = next(
+        (payload for kind, payload in identify if kind == b"T"), None
+    )
+    reverse = simple_query(
+        s,
+        "SELECT (pg_get_object_address('table column', "
+        "ARRAY['wire_object_api','items','value'], ARRAY[]::text[])).classid, "
+        "(pg_get_object_address('table column', "
+        "ARRAY['wire_object_api','items','value'], ARRAY[]::text[])).objsubid, "
+        "pg_get_serial_sequence('wire_object_api.items', 'id')",
+    )
+    reverse_description = next(
+        (payload for kind, payload in reverse if kind == b"T"), None
+    )
+    cleanup = simple_query(s, "DROP SCHEMA wire_object_api CASCADE")
+    check(
+        "catalog object addresses: raw wire exposes stable record metadata and round trips",
+        not any(kind == b"E" for messages in (setup, identify, reverse, cleanup) for kind, _ in messages)
+        and identify_description is not None
+        and row_description_type_oids(identify_description) == [25, 25, 25, 25]
+        and [text_row_fields(payload) for kind, payload in identify if kind == b"D"]
+        == [["table column", "wire_object_api", "items", "wire_object_api.items.value"]]
+        and reverse_description is not None
+        and row_description_type_oids(reverse_description) == [26, 23, 25]
+        and [text_row_fields(payload) for kind, payload in reverse if kind == b"D"]
+        == [["1259", "2", "wire_object_api.items_id_seq"]],
+        identify + reverse,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     selected = os.environ.get("POS3QL_WIRE_PROBE")

@@ -2471,17 +2471,86 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn relation_is_visible(&self, oid: i32) -> Option<bool> {
-        super::catalog::relation_oid_is_visible(self.storage, self.txid, oid).then_some(true)
+        super::catalog::relation_oid_visibility(self.storage, self.txid, oid)
     }
 
     fn type_is_visible(&self, oid: i32) -> Option<bool> {
-        super::catalog::type_oid_is_visible(self.storage, self.txid, oid).then_some(true)
+        super::catalog::type_oid_visibility(self.storage, self.txid, oid)
     }
 
     fn function_is_visible(&self, oid: i32) -> Option<bool> {
-        (super::catalog::function_oid_is_visible(oid)
-            || self.storage.routine_slot_by_oid(oid, self.txid).is_some())
-        .then_some(true)
+        super::catalog::function_oid_visibility(self.storage, self.txid, oid)
+    }
+
+    fn operator_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::operator_oid_visibility(self.storage, self.txid, oid)
+    }
+
+    fn operator_class_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::operator_class_oid_visibility(self.storage, self.txid, oid)
+    }
+
+    fn operator_family_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::operator_family_oid_visibility(self.storage, self.txid, oid)
+    }
+
+    fn conversion_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::conversion_oid_visibility(self.storage, self.txid, oid)
+    }
+
+    fn statistics_object_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::statistics_oid_visibility(self.storage, self.txid, oid)
+    }
+
+    fn text_search_dictionary_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::text_search_oid_visibility(
+            self.storage,
+            self.txid,
+            oid,
+            super::ast::TextSearchObjectKind::Dictionary,
+        )
+    }
+
+    fn text_search_configuration_is_visible(&self, oid: i32) -> Option<bool> {
+        super::catalog::text_search_oid_visibility(
+            self.storage,
+            self.txid,
+            oid,
+            super::ast::TextSearchObjectKind::Configuration,
+        )
+    }
+
+    fn catalog_object(
+        &self,
+        class_id: i32,
+        object_id: i32,
+        sub_id: i32,
+    ) -> Result<super::event_trigger::EventObject, SqlError> {
+        super::event_trigger::catalog_object(self.storage, self.txid, class_id, object_id, sub_id)
+    }
+
+    fn catalog_object_address(
+        &self,
+        object_type: &str,
+        names: &[&str],
+        arguments: &[&str],
+    ) -> Result<(i32, i32, i32), SqlError> {
+        super::event_trigger::catalog_object_address(
+            self.storage,
+            self.txid,
+            object_type,
+            names,
+            arguments,
+        )
+    }
+
+    fn serial_sequence_name<'a>(
+        &self,
+        table: &str,
+        column: &str,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::serial_sequence_name(self.storage, self.txid, table, column, arena)
     }
 
     fn function_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
@@ -2506,7 +2575,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn collation_is_visible(&self, oid: i32) -> Option<bool> {
-        super::catalog::collation_oid_is_visible(self.storage, self.txid, oid).then_some(true)
+        super::catalog::collation_oid_visibility(self.storage, self.txid, oid)
     }
 
     fn relation_is_publishable(&self, oid: i32) -> Option<bool> {
@@ -8628,6 +8697,23 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
+        if let Some((field, type_oid, ctype)) =
+            super::catalog::intrinsic_record_field(name, arguments, index)
+        {
+            return Some((
+                crate::util::StackStr::from_str(field),
+                super::exec::StaticTypeMeta {
+                    type_oid,
+                    ctype,
+                    type_mod: -1,
+                    collation: if ctype.is_collatable() {
+                        super::ast::Collation::Default
+                    } else {
+                        super::ast::Collation::None
+                    },
+                },
+            ));
+        }
         let slot = if argument_names.is_empty() {
             if variadic {
                 self.storage

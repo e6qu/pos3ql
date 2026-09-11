@@ -57,6 +57,12 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || is_json_each_name(name)
 }
 
+fn is_object_address_record_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("pg_identify_object")
+        || name.eq_ignore_ascii_case("pg_identify_object_as_address")
+        || name.eq_ignore_ascii_case("pg_get_object_address")
+}
+
 fn regex_srf_name(name: &str) -> Option<&str> {
     match name.split_once('.') {
         Some((schema, routine))
@@ -2473,6 +2479,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_event_introspection = is_event_trigger_introspection(tref.table);
     let is_cursor_introspection = tref.table.eq_ignore_ascii_case("pg_cursor");
     let is_logical_slot_record = is_logical_slot_record_function(tref.table);
+    let is_object_address_record = is_object_address_record_function(tref.table);
     let built_in = is_gs
         || is_unnest
         || is_re
@@ -2498,7 +2505,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_ts_stat
         || is_event_introspection
         || is_cursor_introspection
-        || is_logical_slot_record;
+        || is_logical_slot_record
+        || is_object_address_record;
     let routine = if built_in {
         None
     } else {
@@ -2518,7 +2526,32 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
     let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
-    let n_default = if is_cursor_introspection {
+    let n_default = if is_object_address_record {
+        let arguments = tref.func_args.unwrap_or(&[]);
+        if arguments.len() != 3 {
+            return Err(srf_signature_error(tref.table));
+        }
+        let mut count = 0usize;
+        while let Some((field, _, ctype)) = crate::sql::catalog::intrinsic_record_field(
+            tref.table,
+            &[crate::sql::types::oid::UNKNOWN; 3],
+            count,
+        ) {
+            default_cols[count] = table_function_column(
+                SqlName::parse(field)?,
+                ctype,
+                None,
+                -1,
+                if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            );
+            count += 1;
+        }
+        count
+    } else if is_cursor_introspection {
         require_no_arguments(tref.table, tref.func_args.unwrap_or(&[]))?;
         for (index, (name, ctype)) in [
             ("name", ColType::Text),
@@ -3391,6 +3424,48 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
         None => crate::sql::eval::eval(argument, arena, params, columns),
     };
+    if is_object_address_record_function(tref.table) {
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+        };
+        let value = crate::sql::eval::funcs::system::dispatch(
+            tref.table, args, false, arena, params, columns, &hooks,
+        )
+        .ok_or_else(|| srf_signature_error(tref.table))??;
+        let field_count = if tref.table.eq_ignore_ascii_case("pg_identify_object") {
+            4
+        } else {
+            3
+        };
+        let mut values = [Datum::Null; 4];
+        match value {
+            Datum::Record(fields) => {
+                if fields.len() != field_count {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "catalog object function returned an invalid record"
+                    ));
+                }
+                for (output, field) in values.iter_mut().zip(fields) {
+                    *output = field.value;
+                }
+            }
+            Datum::Null => {}
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "catalog object function returned a non-record value"
+                ));
+            }
+        }
+        let encoded = crate::sql::exec::encode_projected_pub(&values[..field_count], arena)?;
+        return arena
+            .alloc_slice_with(1, |_| encoded)
+            .map(|rows| &*rows)
+            .map_err(|_| arena_full());
+    }
     if tref.table.eq_ignore_ascii_case("pg_snapshot_xip")
         || tref.table.eq_ignore_ascii_case("txid_snapshot_xip")
     {

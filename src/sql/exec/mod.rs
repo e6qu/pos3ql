@@ -434,7 +434,7 @@ pub use describe::{
 };
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
-    infer_type_catalog, routine_result_metadata, unify_numeric_tower,
+    infer_type_catalog, intrinsic_record_field_meta, routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 
@@ -11766,11 +11766,39 @@ pub fn drop_schema(
                 write_rel(out, &def.schema, &def.name);
             }
         };
-    if n_objects > 0 && !cascade {
+    let independently_reported = |object: &SchemaObject| match object {
+        // PostgreSQL reports the owning table and suppresses its internal
+        // statistics dependents. A statistics object on a surviving table is
+        // still reported independently.
+        SchemaObject::Statistics(statistics) => {
+            let table = usize::from(storage.extended_statistics(*statistics).table);
+            !objects[..n_objects].iter().flatten().any(|candidate| {
+                matches!(
+                    candidate,
+                    SchemaObject::Table(selected) if *selected == table
+                ) || matches!(
+                    candidate,
+                    SchemaObject::Matview { table: selected, .. } if *selected == table
+                )
+            })
+        }
+        _ => true,
+    };
+    let reported_object_count = objects[..n_objects]
+        .iter()
+        .flatten()
+        .filter(|object| independently_reported(object))
+        .count();
+    if reported_object_count > 0 && !cascade {
         let first = slots[0];
         let mut detail =
             crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
-        for (i, o) in objects[..n_objects].iter().flatten().enumerate() {
+        for (i, o) in objects[..n_objects]
+            .iter()
+            .flatten()
+            .filter(|object| independently_reported(object))
+            .enumerate()
+        {
             let mut line = crate::util::StackStr::<192>::new();
             describe(storage, o, &mut line);
             let schema = match o {
@@ -11928,17 +11956,27 @@ pub fn drop_schema(
             storage.schema_def(first).name.as_str()
         ));
     }
-    if n_objects == 1 {
+    if reported_object_count == 1 {
         let mut line = crate::util::StackStr::<192>::new();
-        describe(storage, objects[0].as_ref().expect("counted"), &mut line);
+        let object = objects[..n_objects]
+            .iter()
+            .flatten()
+            .find(|object| independently_reported(object))
+            .expect("one independently reported object");
+        describe(storage, object, &mut line);
         responder.notice(
             crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
             stack_format!(224, "drop cascades to {}", line.as_str()).as_str(),
         )?;
-    } else if n_objects > 1 {
+    } else if reported_object_count > 1 {
         let mut detail =
             crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
-        for (i, o) in objects[..n_objects].iter().flatten().enumerate() {
+        for (i, o) in objects[..n_objects]
+            .iter()
+            .flatten()
+            .filter(|object| independently_reported(object))
+            .enumerate()
+        {
             let mut line = crate::util::StackStr::<192>::new();
             describe(storage, o, &mut line);
             let _ = write!(
@@ -11951,7 +11989,12 @@ pub fn drop_schema(
         crate::sql::eval::stash_diagnostic(detail, None);
         responder.notice(
             crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
-            stack_format!(128, "drop cascades to {} other objects", n_objects).as_str(),
+            stack_format!(
+                128,
+                "drop cascades to {} other objects",
+                reported_object_count
+            )
+            .as_str(),
         )?;
     }
     let owned_sequence_undo = objects[..n_objects]
@@ -12379,6 +12422,12 @@ pub fn drop_schema(
                 }
             }
             SchemaObject::Statistics(statistics) => {
+                if !storage
+                    .extended_statistics(*statistics)
+                    .visible_to(txn.txid)
+                {
+                    continue;
+                }
                 let definition = storage
                     .extended_statistics(*statistics)
                     .definition_for(txn.txid);

@@ -23,6 +23,12 @@ With object storage enabled, the server groups transactions received in one read
 
 The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, full transaction IDs and snapshots, views, materialized views, indexes, sequences, domains, enums, PostgreSQL large objects, full-text search, SQL functions (scalar, `SETOF`, and `TABLE`, including mutable and nested calls), CTEs, joins, windows, COPY, PostgreSQL 18 SQL/JSON and SQL/XML, PostgreSQL 18-interoperable logical-replication publishing and bounded subscription bootstrap/apply, and PostgreSQL catalog introspection used by common clients and dump/restore tools.
 
+Catalog object introspection includes PostgreSQL 18 object identification,
+descriptions, reversible address records, search-path visibility predicates,
+and serial-sequence discovery. These read transaction-visible DDL and retain
+their exact OUT-column metadata through scalar, table-function, raw-wire, and
+driver boundaries.
+
 SQL/JSON includes first-class `jsonpath`/`jsonpath[]`, strict and lax path execution, path operators and functions, SQL-standard query and construction functions, `JSON_TABLE`, record conversion, SQL/JSON aggregates, and JSONB read/write subscripting. These types and expressions cross text/binary wire, COPY, stored-query, PL/pgSQL, WAL, checkpoint, and object-cold recovery boundaries. [SQL/JSON compatibility and limits](docs/sql-json.md).
 
 SQL/XML includes first-class `xml`/`xml[]`, constructors and predicates,

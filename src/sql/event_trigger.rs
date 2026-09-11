@@ -157,7 +157,7 @@ pub(crate) fn capture_before<'a>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EventObject {
+pub struct EventObject {
     pub class_id: i32,
     pub object_id: i32,
     pub sub_id: i32,
@@ -1564,7 +1564,7 @@ fn primary_object(
 ) -> Result<EventObject, SqlError> {
     Ok(match reference {
         ObjectRef::Table(slot) => {
-            let table = &storage.table(slot).def;
+            let table = storage.table_def(slot, txid);
             base_object(
                 catalog::PG_CLASS_OID,
                 catalog::user_table_oid(slot),
@@ -1577,13 +1577,15 @@ fn primary_object(
         }
         ObjectRef::View(slot) => {
             let view = storage.view(slot);
+            let schema = view.schema_for(txid);
+            let name = view.name_for(txid);
             base_object(
                 catalog::PG_CLASS_OID,
                 catalog::view_oid(slot),
                 "view",
-                Some(view.schema.as_str()),
-                Some(view.name.as_str()),
-                qualified(view.schema.as_str(), view.name.as_str())?,
+                Some(schema.as_str()),
+                Some(name.as_str()),
+                qualified(schema.as_str(), name.as_str())?,
                 false,
             )
         }
@@ -2013,6 +2015,822 @@ fn primary_object(
             )
         }
     })
+}
+
+fn catalog_lookup_failed(class_id: i32, object_id: i32) -> SqlError {
+    sql_err!(
+        sqlstate::UNDEFINED_OBJECT,
+        "cache lookup failed for object {} of catalog {}",
+        object_id,
+        class_id
+    )
+}
+
+fn address_candidate(
+    storage: &Storage,
+    txid: u32,
+    reference: EventObjectRef,
+    object_type: &str,
+    names: &[&str],
+    arguments: &[&str],
+) -> Result<Option<(i32, i32, i32)>, SqlError> {
+    let object = reference.materialize(storage, txid)?;
+    let matches = object.object_type.as_str() == object_type
+        && object.address_name_count == names.len()
+        && object.address_arg_count == arguments.len()
+        && object.address_names[..object.address_name_count]
+            .iter()
+            .zip(names)
+            .all(|(stored, requested)| stored.as_str() == *requested)
+        && object.address_args[..object.address_arg_count]
+            .iter()
+            .zip(arguments)
+            .all(|(stored, requested)| stored.as_str() == *requested);
+    Ok(matches.then_some((object.class_id, object.object_id, object.sub_id)))
+}
+
+/// Resolve the unquoted address components emitted by
+/// `pg_identify_object_as_address`. Candidate objects are materialized through
+/// the event-trigger graph before comparison, making the two APIs exact
+/// inverses without a second identity formatter.
+pub(crate) fn catalog_object_address(
+    storage: &Storage,
+    txid: u32,
+    object_type: &str,
+    names: &[&str],
+    arguments: &[&str],
+) -> Result<(i32, i32, i32), SqlError> {
+    if !matches!(
+        object_type,
+        "table"
+            | "table column"
+            | "view"
+            | "view column"
+            | "materialized view"
+            | "materialized view column"
+            | "sequence"
+            | "index"
+            | "composite type"
+            | "type"
+            | "domain constraint"
+            | "table constraint"
+            | "function"
+            | "procedure"
+            | "aggregate"
+            | "schema"
+            | "operator"
+            | "operator family"
+            | "operator class"
+            | "collation"
+            | "conversion"
+            | "statistics object"
+            | "text search parser"
+            | "text search template"
+            | "text search dictionary"
+            | "text search configuration"
+            | "event trigger"
+            | "trigger"
+            | "rule"
+            | "cast"
+            | "policy"
+            | "publication"
+            | "subscription"
+            | "extension"
+            | "large object"
+            | "role"
+            | "access method"
+            | "language"
+    ) {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "unrecognized object type \"{}\"",
+            object_type
+        ));
+    }
+    macro_rules! consider {
+        ($reference:expr) => {
+            if let Some(address) =
+                address_candidate(storage, txid, $reference, object_type, names, arguments)?
+            {
+                return Ok(address);
+            }
+        };
+    }
+
+    for slot in 0..storage.schema_count() {
+        if storage.schema_def(slot).visible_to(txid) {
+            consider!(EventObjectRef::Primary(ObjectRef::Schema(slot)));
+        }
+    }
+    for (oid, name) in [(11, "pg_catalog"), (99, "pg_toast")] {
+        let object = base_object(
+            catalog::PG_NAMESPACE_OID,
+            oid,
+            "schema",
+            None,
+            Some(name),
+            StackStr::from_str(name),
+            false,
+        );
+        if object.object_type.as_str() == object_type && names == [name] && arguments.is_empty() {
+            return Ok((object.class_id, object.object_id, object.sub_id));
+        }
+    }
+
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let relation = relation_object_ref(storage, txid, catalog::user_table_oid(slot))
+            .expect("visible tables have relation objects");
+        consider!(relation);
+        let table = storage.table_def(slot, txid);
+        for (column, definition) in table.columns().iter().enumerate() {
+            consider!(EventObjectRef::RelationColumn {
+                relation: match relation {
+                    EventObjectRef::Primary(reference) => reference,
+                    _ => unreachable!("relation object is primary"),
+                },
+                attnum: (column + 1) as u16,
+                name: definition.name,
+            });
+        }
+        consider!(EventObjectRef::TableRowType(slot as u16));
+        consider!(EventObjectRef::TableArrayType(slot as u16));
+        if names.len() == 3
+            && names[0] == table.schema.as_str()
+            && names[1] == table.name.as_str()
+            && arguments.is_empty()
+            && let Some(oid) = catalog::table_constraint_oid(storage, txid, slot, names[2])
+        {
+            consider!(EventObjectRef::TableConstraint {
+                table: slot as u16,
+                oid,
+                name: StackStr::from_str(names[2]),
+            });
+        }
+    }
+    for slot in 0..storage.view_count() {
+        if !storage.view_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let relation = ObjectRef::View(slot);
+        consider!(EventObjectRef::Primary(relation));
+        let view = storage.view(slot);
+        for (column, definition) in view.columns.names().iter().enumerate() {
+            consider!(EventObjectRef::RelationColumn {
+                relation,
+                attnum: (column + 1) as u16,
+                name: *definition,
+            });
+        }
+        consider!(EventObjectRef::ViewRowType(slot as u16));
+        consider!(EventObjectRef::ViewArrayType(slot as u16));
+    }
+    for slot in 0..storage.sequence_count() {
+        if storage.sequence_slot_visible_to(slot, txid) {
+            consider!(EventObjectRef::Primary(ObjectRef::Sequence(slot)));
+        }
+    }
+    for slot in 0..storage.index_count() {
+        if storage.index_visible_to(slot, txid).is_some() {
+            consider!(EventObjectRef::Primary(ObjectRef::Index(slot)));
+        }
+    }
+    for slot in 0..storage.domain_count() {
+        if !storage.domain_slot_visible_to(slot, txid) {
+            continue;
+        }
+        consider!(EventObjectRef::Primary(ObjectRef::Domain(slot)));
+        consider!(EventObjectRef::DomainArray(slot as u16));
+        for constraint in 0..storage.domain_for(slot, txid).checks().len() {
+            consider!(EventObjectRef::DomainConstraint {
+                domain: slot as u16,
+                constraint: constraint as u16,
+            });
+        }
+    }
+    for slot in 0..storage.enum_count() {
+        if storage.enum_slot_visible_to(slot, txid) {
+            consider!(EventObjectRef::Primary(ObjectRef::Enum(slot)));
+            consider!(EventObjectRef::EnumArray(slot as u16));
+        }
+    }
+    for (slot, _) in storage.composites_with_slots_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Composite(slot)));
+        consider!(EventObjectRef::CompositeRelation(slot as u16));
+        consider!(EventObjectRef::CompositeArray(slot as u16));
+    }
+    for slot in 0..storage.routine_count() {
+        if storage.routine_slot_visible_to(slot, txid) {
+            consider!(EventObjectRef::Primary(ObjectRef::Routine(slot)));
+        }
+    }
+    for (slot, _) in storage.operators_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Operator(slot)));
+    }
+    for (slot, _) in storage.operator_families_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::OperatorFamily(slot)));
+    }
+    for (slot, _) in storage.operator_classes_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::OperatorClass(slot)));
+    }
+    for (slot, _) in storage.collations_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Collation(slot)));
+    }
+    for (slot, _) in storage.conversions_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Conversion(slot)));
+    }
+    for (slot, _) in storage.text_search_objects_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::TextSearch(slot)));
+    }
+    for slot in 0..storage.extended_statistics_count() {
+        if storage.extended_statistics(slot).visible_to(txid) {
+            consider!(EventObjectRef::Primary(ObjectRef::Statistics(slot)));
+        }
+    }
+    for (slot, _) in storage.event_triggers_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::EventTrigger(slot)));
+    }
+    for (slot, _) in storage.triggers_with_slots_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Trigger(slot)));
+    }
+    for (slot, _) in storage.rules_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Rule(slot)));
+    }
+    for (slot, _) in storage.casts_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Cast(slot)));
+    }
+    for (slot, _) in storage.policies_with_slots_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Policy(slot)));
+    }
+    for (slot, _) in storage.publications_with_slots_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Publication(slot)));
+    }
+    for (slot, _) in storage.subscriptions_with_slots_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Subscription(slot)));
+    }
+    for (slot, _) in storage.extensions_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::Extension(slot)));
+    }
+    for (slot, _) in storage.large_objects_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::LargeObject(slot)));
+    }
+    for slot in 0..storage.role_count() {
+        if storage.role(slot).visible_to(txid) {
+            consider!(EventObjectRef::Primary(ObjectRef::Role(slot)));
+        }
+    }
+    for (_, method) in storage.access_methods_visible_to(txid) {
+        consider!(EventObjectRef::Primary(ObjectRef::AccessMethod(
+            method.oid().get()
+        )));
+    }
+    if names.len() == 1 && arguments.is_empty() {
+        if let Some(oid) = catalog::access_method_oid(names[0]) {
+            consider!(EventObjectRef::Primary(ObjectRef::AccessMethod(oid)));
+        }
+        if let Some(oid) = catalog::procedural_language_oid(names[0]) {
+            consider!(EventObjectRef::Primary(ObjectRef::ProceduralLanguage(oid)));
+        }
+    }
+
+    if matches!(object_type, "function" | "procedure" | "aggregate") && names.len() == 2 {
+        let mut identity = qualified(names[0], names[1])?;
+        identity.write_char('(').map_err(|_| graph_full())?;
+        for (index, argument) in arguments.iter().enumerate() {
+            if index != 0 {
+                identity.write_str(", ").map_err(|_| graph_full())?;
+            }
+            identity.write_str(argument).map_err(|_| graph_full())?;
+        }
+        identity.write_char(')').map_err(|_| graph_full())?;
+        if let Some(oid) = catalog::routine_oid_by_name(storage, txid, identity.as_str(), true)?
+            && let Some(object) = builtin_routine_object(oid)?
+            && object.object_type.as_str() == object_type
+        {
+            return Ok((object.class_id, object.object_id, object.sub_id));
+        }
+    }
+
+    if matches!(
+        object_type,
+        "table"
+            | "table column"
+            | "view"
+            | "view column"
+            | "materialized view"
+            | "materialized view column"
+            | "sequence"
+            | "index"
+            | "composite type"
+    ) {
+        let mut identity = EventIdentity::new();
+        for (index, name) in names.iter().take(2).enumerate() {
+            if index != 0 {
+                identity.write_char('.').map_err(|_| graph_full())?;
+            }
+            identity.write_str(name).map_err(|_| graph_full())?;
+        }
+        Err(sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            identity.as_str()
+        ))
+    } else {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "object address for type \"{}\" does not exist",
+            object_type
+        ))
+    }
+}
+
+fn relation_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObjectRef> {
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid) && catalog::user_table_oid(slot) == object_id {
+            return Some(EventObjectRef::Primary(
+                storage
+                    .matview_slot_for_table(slot, txid)
+                    .map_or(ObjectRef::Table(slot), ObjectRef::MaterializedView),
+            ));
+        }
+    }
+    for slot in 0..storage.view_count() {
+        if storage.view_slot_visible_to(slot, txid) && catalog::view_oid(slot) == object_id {
+            return Some(EventObjectRef::Primary(ObjectRef::View(slot)));
+        }
+    }
+    for slot in 0..storage.sequence_count() {
+        if storage.sequence_slot_visible_to(slot, txid) && catalog::sequence_oid(slot) == object_id
+        {
+            return Some(EventObjectRef::Primary(ObjectRef::Sequence(slot)));
+        }
+    }
+    for (slot, _) in storage.composites_with_slots_visible_to(txid) {
+        if catalog::named_composite_relation_oid(slot) == object_id {
+            return Some(EventObjectRef::CompositeRelation(slot as u16));
+        }
+    }
+    if let Some((schema, name)) = catalog::index_identity_by_oid(storage, txid, object_id) {
+        return Some(EventObjectRef::DetachedIndex {
+            oid: object_id,
+            schema,
+            name,
+        });
+    }
+    None
+}
+
+fn relation_column_ref(
+    storage: &Storage,
+    txid: u32,
+    relation: EventObjectRef,
+    attnum: i32,
+) -> Option<EventObjectRef> {
+    let index = usize::try_from(attnum.checked_sub(1)?).ok()?;
+    let (reference, name) = match relation {
+        EventObjectRef::Primary(reference @ ObjectRef::Table(slot)) => (
+            reference,
+            storage.table_def(slot, txid).columns().get(index)?.name,
+        ),
+        EventObjectRef::Primary(reference @ ObjectRef::MaterializedView(slot)) => {
+            let table = storage.matview_table(slot);
+            (
+                reference,
+                storage.table_def(table, txid).columns().get(index)?.name,
+            )
+        }
+        EventObjectRef::Primary(reference @ ObjectRef::View(slot)) => (
+            reference,
+            *storage.view(slot).columns_for(txid).names().get(index)?,
+        ),
+        _ => return None,
+    };
+    Some(EventObjectRef::RelationColumn {
+        relation: reference,
+        attnum: u16::try_from(attnum).ok()?,
+        name,
+    })
+}
+
+fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<EventObjectRef> {
+    use crate::sql::types::oid;
+    let slot_in = |first: i32, count: usize| {
+        (first..first + count as i32)
+            .contains(&object_id)
+            .then_some((object_id - first) as usize)
+    };
+    if let Some(slot) = slot_in(oid::FIRST_DOMAIN, crate::storage::MAX_DOMAINS)
+        && storage.domain_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::Primary(ObjectRef::Domain(slot)));
+    }
+    if let Some(slot) = slot_in(oid::FIRST_DOMAIN_ARRAY, crate::storage::MAX_DOMAINS)
+        && storage.domain_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::DomainArray(slot as u16));
+    }
+    if let Some(slot) = slot_in(oid::FIRST_ENUM, crate::storage::MAX_ENUMS)
+        && storage.enum_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::Primary(ObjectRef::Enum(slot)));
+    }
+    if let Some(slot) = slot_in(oid::FIRST_ENUM_ARRAY, crate::storage::MAX_ENUMS)
+        && storage.enum_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::EnumArray(slot as u16));
+    }
+    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE, crate::storage::MAX_COMPOSITES)
+        && storage.composite_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::Primary(ObjectRef::Composite(slot)));
+    }
+    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE_ARRAY, crate::storage::MAX_COMPOSITES)
+        && storage.composite_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::CompositeArray(slot as u16));
+    }
+    if let Some(slot) = slot_in(
+        catalog::FIRST_TABLE_COMPOSITE_TYPE_OID,
+        storage.table_count(),
+    ) && storage.table_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::TableRowType(slot as u16));
+    }
+    if let Some(slot) = slot_in(
+        catalog::FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID,
+        storage.table_count(),
+    ) && storage.table_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::TableArrayType(slot as u16));
+    }
+    if let Some(slot) = slot_in(catalog::FIRST_VIEW_COMPOSITE_TYPE_OID, storage.view_count())
+        && storage.view_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::ViewRowType(slot as u16));
+    }
+    if let Some(slot) = slot_in(
+        catalog::FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID,
+        storage.view_count(),
+    ) && storage.view_slot_visible_to(slot, txid)
+    {
+        return Some(EventObjectRef::ViewArrayType(slot as u16));
+    }
+    let column_type = crate::sql::types::ColType::from_oid(object_id)?;
+    let name = match column_type {
+        crate::sql::types::ColType::Array(element) => element.catalog_name(),
+        scalar => scalar.catalog_name(),
+    };
+    Some(EventObjectRef::NamedType {
+        oid: object_id,
+        schema: crate::storage::SqlName::parse("pg_catalog").ok()?,
+        name: crate::storage::SqlName::parse(name).ok()?,
+    })
+}
+
+fn builtin_routine_object(object_id: i32) -> Result<Option<EventObject>, SqlError> {
+    let Some((name, arguments, object_type)) = catalog::intrinsic_routine_event_identity(object_id)
+    else {
+        return Ok(None);
+    };
+    let mut identity = qualified("pg_catalog", name)?;
+    identity.write_char('(').map_err(|_| graph_full())?;
+    let mut object = base_object(
+        catalog::PG_PROC_OID,
+        object_id,
+        object_type,
+        Some("pg_catalog"),
+        None,
+        StackStr::new(),
+        false,
+    );
+    object.address_names[0] = StackStr::from_str("pg_catalog");
+    object.address_names[1] = StackStr::from_str(name);
+    object.address_name_count = 2;
+    for (index, raw) in arguments.split_ascii_whitespace().enumerate() {
+        if index != 0 {
+            identity.write_char(',').map_err(|_| graph_full())?;
+        }
+        let oid = raw.parse::<i32>().map_err(|_| graph_full())?;
+        let name = catalog::intrinsic_type_name(oid).ok_or_else(graph_full)?;
+        let qualified_name = crate::stack_format!(512, "pg_catalog.{name}");
+        identity
+            .write_str(qualified_name.as_str())
+            .map_err(|_| graph_full())?;
+        object.address_args[index] = qualified_name;
+        object.address_arg_count += 1;
+    }
+    identity.write_char(')').map_err(|_| graph_full())?;
+    object.identity = identity;
+    Ok(Some(object))
+}
+
+/// Resolve a PostgreSQL catalog address through the same typed object graph
+/// used by event triggers. DDL callbacks and SQL introspection therefore
+/// cannot disagree after a rename or while observing transaction-local DDL.
+fn existing_catalog_object(
+    storage: &Storage,
+    txid: u32,
+    class_id: i32,
+    object_id: i32,
+    sub_id: i32,
+) -> Result<EventObject, SqlError> {
+    let reference = match class_id {
+        catalog::PG_CLASS_OID => {
+            let relation = relation_object_ref(storage, txid, object_id)
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?;
+            if sub_id == 0 {
+                relation
+            } else {
+                return relation_column_ref(storage, txid, relation, sub_id)
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?
+                    .materialize(storage, txid);
+            }
+        }
+        catalog::PG_TYPE_OID => type_object_ref(storage, txid, object_id)
+            .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        catalog::PG_PROC_OID => {
+            if let Some(slot) = storage.routine_slot_by_oid(object_id, txid) {
+                EventObjectRef::Primary(ObjectRef::Routine(slot))
+            } else {
+                return builtin_routine_object(object_id)?
+                    .ok_or_else(|| catalog_lookup_failed(class_id, object_id));
+            }
+        }
+        catalog::PG_NAMESPACE_OID => {
+            if let Some(slot) = (0..storage.schema_count()).find(|slot| {
+                storage.schema_def(*slot).visible_to(txid)
+                    && catalog::namespace_oid_for_slot(*slot) == object_id
+            }) {
+                EventObjectRef::Primary(ObjectRef::Schema(slot))
+            } else {
+                let name = match object_id {
+                    11 => "pg_catalog",
+                    99 => "pg_toast",
+                    _ => return Err(catalog_lookup_failed(class_id, object_id)),
+                };
+                return Ok(base_object(
+                    catalog::PG_NAMESPACE_OID,
+                    object_id,
+                    "schema",
+                    None,
+                    Some(name),
+                    StackStr::from_str(name),
+                    false,
+                ));
+            }
+        }
+        catalog::PG_CONSTRAINT_OID => {
+            if let Some((table, name)) =
+                catalog::table_constraint_identity_by_oid(storage, txid, object_id)
+            {
+                EventObjectRef::TableConstraint {
+                    table: table as u16,
+                    oid: object_id,
+                    name,
+                }
+            } else if let Some((domain, constraint)) =
+                (0..storage.domain_count()).find_map(|domain| {
+                    if !storage.domain_slot_visible_to(domain, txid) {
+                        return None;
+                    }
+                    storage
+                        .domain_for(domain, txid)
+                        .checks()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(constraint, _)| {
+                            (catalog::FIRST_DOMAIN_CHECK_OID
+                                + domain as i32 * crate::storage::MAX_DOMAIN_CHECKS as i32
+                                + constraint as i32
+                                == object_id)
+                                .then_some((domain, constraint))
+                        })
+                })
+            {
+                EventObjectRef::DomainConstraint {
+                    domain: domain as u16,
+                    constraint: constraint as u16,
+                }
+            } else {
+                return Err(catalog_lookup_failed(class_id, object_id));
+            }
+        }
+        catalog::PG_OPERATOR_OID => EventObjectRef::Primary(ObjectRef::Operator(
+            storage
+                .operator_slot_by_oid(object_id, txid)
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_OPFAMILY_OID => EventObjectRef::Primary(ObjectRef::OperatorFamily(
+            storage
+                .operator_family_slot_by_oid(object_id, txid)
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_OPCLASS_OID => EventObjectRef::Primary(ObjectRef::OperatorClass(
+            storage
+                .operator_class_slot_by_oid(
+                    crate::storage::OperatorClassOid::parse(object_id)
+                        .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+                    txid,
+                )
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_COLLATION_OID => EventObjectRef::Primary(ObjectRef::Collation(
+            storage
+                .collations_visible_to(txid)
+                .find_map(|(slot, _)| {
+                    (storage.collation(slot).oid(slot) == object_id).then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_CONVERSION_OID => EventObjectRef::Primary(ObjectRef::Conversion(
+            storage
+                .conversions_visible_to(txid)
+                .find_map(|(slot, _)| {
+                    (storage.conversion(slot).oid(slot) == object_id).then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_STATISTIC_EXT_OID => EventObjectRef::Primary(ObjectRef::Statistics(
+            storage
+                .extended_statistics_visible(txid)
+                .find_map(|(slot, _)| {
+                    (catalog::extended_statistics_oid(slot) == object_id).then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_TS_PARSER_OID
+        | catalog::PG_TS_TEMPLATE_OID
+        | catalog::PG_TS_DICT_OID
+        | catalog::PG_TS_CONFIG_OID => EventObjectRef::Primary(ObjectRef::TextSearch(
+            storage
+                .text_search_objects_visible_to(txid)
+                .find_map(|(slot, object)| {
+                    (object.oid() == object_id
+                        && match object.kind() {
+                            crate::sql::ast::TextSearchObjectKind::Parser => {
+                                class_id == catalog::PG_TS_PARSER_OID
+                            }
+                            crate::sql::ast::TextSearchObjectKind::Template => {
+                                class_id == catalog::PG_TS_TEMPLATE_OID
+                            }
+                            crate::sql::ast::TextSearchObjectKind::Dictionary => {
+                                class_id == catalog::PG_TS_DICT_OID
+                            }
+                            crate::sql::ast::TextSearchObjectKind::Configuration => {
+                                class_id == catalog::PG_TS_CONFIG_OID
+                            }
+                        })
+                    .then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        3466 => EventObjectRef::Primary(ObjectRef::EventTrigger(
+            storage
+                .event_triggers_visible_to(txid)
+                .find_map(|(slot, _)| {
+                    (storage.event_trigger(slot).oid() == object_id).then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_TRIGGER_OID => EventObjectRef::Primary(ObjectRef::Trigger(
+            storage
+                .triggers_with_slots_visible_to(txid)
+                .find_map(|(slot, trigger)| {
+                    (crate::storage::trigger_oid(&trigger) == object_id).then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_REWRITE_OID => EventObjectRef::Primary(ObjectRef::Rule(
+            storage
+                .rules_visible_to(txid)
+                .find_map(|(slot, rule)| (rule.oid() == object_id).then_some(slot))
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_CAST_OID => EventObjectRef::Primary(ObjectRef::Cast(
+            storage
+                .casts_visible_to(txid)
+                .find_map(|(slot, cast)| (cast.oid() == object_id).then_some(slot))
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_POLICY_OID => EventObjectRef::Primary(ObjectRef::Policy(
+            storage
+                .policies_with_slots_visible_to(txid)
+                .find_map(|(slot, policy)| {
+                    (crate::storage::policy_oid(policy) == object_id).then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_PUBLICATION_OID => EventObjectRef::Primary(ObjectRef::Publication(
+            storage
+                .publications_with_slots_visible_to(txid)
+                .find_map(|(slot, _)| (catalog::publication_oid(slot) == object_id).then_some(slot))
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_SUBSCRIPTION_OID => EventObjectRef::Primary(ObjectRef::Subscription(
+            storage
+                .subscriptions_with_slots_visible_to(txid)
+                .find_map(|(slot, subscription)| {
+                    (catalog::subscription_oid(subscription) == object_id).then_some(slot)
+                })
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_EXTENSION_OID => EventObjectRef::Primary(ObjectRef::Extension(
+            storage
+                .extensions_visible_to(txid)
+                .find_map(|(slot, _)| (catalog::extension_oid(slot) == object_id).then_some(slot))
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_LARGEOBJECT_OID => EventObjectRef::Primary(ObjectRef::LargeObject(
+            storage
+                .large_objects_visible_to(txid)
+                .find_map(|(slot, object)| (object.oid.get() as i32 == object_id).then_some(slot))
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        1260 => EventObjectRef::Primary(ObjectRef::Role(
+            storage
+                .role_slot_by_oid(object_id, txid)
+                .ok_or_else(|| catalog_lookup_failed(class_id, object_id))?,
+        )),
+        catalog::PG_AM_OID => {
+            if catalog::access_method_name(object_id).is_none()
+                && storage.access_method_name_by_oid(object_id).is_none()
+            {
+                return Err(catalog_lookup_failed(class_id, object_id));
+            }
+            EventObjectRef::Primary(ObjectRef::AccessMethod(object_id))
+        }
+        catalog::PG_LANGUAGE_OID => {
+            if catalog::procedural_language_name(object_id).is_none() {
+                return Err(catalog_lookup_failed(class_id, object_id));
+            }
+            EventObjectRef::Primary(ObjectRef::ProceduralLanguage(object_id))
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "unsupported object class: {}",
+                class_id
+            ));
+        }
+    };
+    if sub_id != 0 {
+        return Err(catalog_lookup_failed(class_id, object_id));
+    }
+    reference.materialize(storage, txid)
+}
+
+pub(crate) fn catalog_object(
+    storage: &Storage,
+    txid: u32,
+    class_id: i32,
+    object_id: i32,
+    sub_id: i32,
+) -> Result<EventObject, SqlError> {
+    match existing_catalog_object(storage, txid, class_id, object_id, sub_id) {
+        Ok(object) => Ok(object),
+        Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => {
+            let object_type = match class_id {
+                catalog::PG_CLASS_OID => "relation",
+                catalog::PG_PROC_OID => "routine",
+                catalog::PG_TYPE_OID => "type",
+                catalog::PG_NAMESPACE_OID => "schema",
+                catalog::PG_CONSTRAINT_OID => "constraint",
+                catalog::PG_OPERATOR_OID => "operator",
+                catalog::PG_OPFAMILY_OID => "operator family",
+                catalog::PG_OPCLASS_OID => "operator class",
+                catalog::PG_COLLATION_OID => "collation",
+                catalog::PG_CONVERSION_OID => "conversion",
+                catalog::PG_STATISTIC_EXT_OID => "statistics object",
+                catalog::PG_TS_PARSER_OID => "text search parser",
+                catalog::PG_TS_TEMPLATE_OID => "text search template",
+                catalog::PG_TS_DICT_OID => "text search dictionary",
+                catalog::PG_TS_CONFIG_OID => "text search configuration",
+                3466 => "event trigger",
+                catalog::PG_TRIGGER_OID => "trigger",
+                catalog::PG_REWRITE_OID => "rule",
+                catalog::PG_CAST_OID => "cast",
+                catalog::PG_POLICY_OID => "policy",
+                catalog::PG_PUBLICATION_OID => "publication",
+                catalog::PG_SUBSCRIPTION_OID => "subscription",
+                catalog::PG_EXTENSION_OID => "extension",
+                catalog::PG_LARGEOBJECT_OID => "large object",
+                1260 => "role",
+                catalog::PG_AM_OID => "access method",
+                catalog::PG_LANGUAGE_OID => "language",
+                _ => return Err(error),
+            };
+            Ok(EventObject {
+                class_id,
+                object_id,
+                sub_id,
+                object_type: StackStr::from_str(object_type),
+                ..EventObject::EMPTY
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn explicit_table_drop(statement: &Stmt<'_>, object: &EventObject) -> bool {

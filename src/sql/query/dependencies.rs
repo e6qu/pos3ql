@@ -1248,6 +1248,23 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        if let Some((field, type_oid, ctype)) =
+            crate::sql::catalog::intrinsic_record_field(name, arguments, index)
+        {
+            return Some((
+                crate::util::StackStr::from_str(field),
+                StaticTypeMeta {
+                    type_oid,
+                    ctype,
+                    type_mod: -1,
+                    collation: if ctype.is_collatable() {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        crate::sql::ast::Collation::None
+                    },
+                },
+            ));
+        }
         let slot = if argument_names.is_empty() {
             if variadic {
                 self.storage

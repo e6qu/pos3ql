@@ -1053,6 +1053,57 @@ pub trait CatalogAccess {
     fn type_is_visible(&self, oid: i32) -> Option<bool>;
     /// Whether this OID names a function visible to the current query.
     fn function_is_visible(&self, oid: i32) -> Option<bool>;
+    fn operator_is_visible(&self, _oid: i32) -> Option<bool> {
+        None
+    }
+    fn operator_class_is_visible(&self, _oid: i32) -> Option<bool> {
+        None
+    }
+    fn operator_family_is_visible(&self, _oid: i32) -> Option<bool> {
+        None
+    }
+    fn conversion_is_visible(&self, _oid: i32) -> Option<bool> {
+        None
+    }
+    fn statistics_object_is_visible(&self, _oid: i32) -> Option<bool> {
+        None
+    }
+    fn text_search_dictionary_is_visible(&self, _oid: i32) -> Option<bool> {
+        None
+    }
+    fn text_search_configuration_is_visible(&self, _oid: i32) -> Option<bool> {
+        None
+    }
+    fn catalog_object(
+        &self,
+        _class_id: i32,
+        _object_id: i32,
+        _sub_id: i32,
+    ) -> Result<crate::sql::event_trigger::EventObject, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "catalog object introspection is unavailable"
+        ))
+    }
+    fn catalog_object_address(
+        &self,
+        _object_type: &str,
+        _names: &[&str],
+        _arguments: &[&str],
+    ) -> Result<(i32, i32, i32), SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "catalog object address resolution is unavailable"
+        ))
+    }
+    fn serial_sequence_name<'a>(
+        &self,
+        _table: &str,
+        _column: &str,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     /// The canonical SQL definition for a function OID, if this catalog owns it.
     fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)

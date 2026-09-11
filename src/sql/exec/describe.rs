@@ -495,6 +495,23 @@ impl ColTypeResolver for CatalogCols<'_> {
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        if let Some((field, type_oid, ctype)) =
+            crate::sql::catalog::intrinsic_record_field(name, arguments, index)
+        {
+            return Some((
+                crate::util::StackStr::from_str(field),
+                StaticTypeMeta {
+                    type_oid,
+                    ctype,
+                    type_mod: -1,
+                    collation: if ctype.is_collatable() {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        crate::sql::ast::Collation::None
+                    },
+                },
+            ));
+        }
         let slot = if argument_names.is_empty() {
             if variadic {
                 self.storage
@@ -641,6 +658,25 @@ fn describe_record_star<'q>(
         Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
             let mut index = 0;
             while let Some((field, ctype)) = builtin_record_srf_field(name, index) {
+                push(ColDesc::of_type(field, ctype))?;
+                index += 1;
+            }
+            Ok(())
+        }
+        Expr::Call { name, args, .. }
+            if args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
+                && crate::sql::catalog::intrinsic_record_field(
+                    name,
+                    &[oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS][..args.len()],
+                    0,
+                )
+                .is_some() =>
+        {
+            let unknown = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut index = 0;
+            while let Some((field, _, ctype)) =
+                crate::sql::catalog::intrinsic_record_field(name, &unknown[..args.len()], index)
+            {
                 push(ColDesc::of_type(field, ctype))?;
                 index += 1;
             }
@@ -1146,13 +1182,27 @@ pub trait ColTypeResolver {
 
     fn routine_record_field(
         &self,
-        _name: &str,
+        name: &str,
         _argument_names: &[Option<&str>],
         _variadic: bool,
-        _arguments: &[i32],
-        _index: usize,
+        arguments: &[i32],
+        index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        None
+        let (field, type_oid, ctype) =
+            crate::sql::catalog::intrinsic_record_field(name, arguments, index)?;
+        Some((
+            crate::util::StackStr::from_str(field),
+            StaticTypeMeta {
+                type_oid,
+                ctype,
+                type_mod: -1,
+                collation: if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            },
+        ))
     }
 
     /// Whether an unqualified `name` names a FROM item (so a bare reference to
@@ -1902,6 +1952,37 @@ fn record_shape_metadata_dyn(
             let mut count = 0;
             while let Some((field, ctype)) = builtin_record_srf_field(name, count) {
                 visit(field, StaticTypeMeta::of(ctype));
+                count += 1;
+            }
+            Some(count)
+        }
+        Expr::Call { name, args, .. }
+            if args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
+                && crate::sql::catalog::intrinsic_record_field(
+                    name,
+                    &[oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS][..args.len()],
+                    0,
+                )
+                .is_some() =>
+        {
+            let unknown = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut count = 0usize;
+            while let Some((field, type_oid, ctype)) =
+                crate::sql::catalog::intrinsic_record_field(name, &unknown[..args.len()], count)
+            {
+                visit(
+                    field,
+                    StaticTypeMeta {
+                        type_oid,
+                        ctype,
+                        type_mod: -1,
+                        collation: if ctype.is_collatable() {
+                            crate::sql::ast::Collation::Default
+                        } else {
+                            crate::sql::ast::Collation::None
+                        },
+                    },
+                );
                 count += 1;
             }
             Some(count)

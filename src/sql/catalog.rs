@@ -6,6 +6,8 @@
 //! pipeline as a synthetic table, so WHERE / projection / ORDER BY / LIMIT
 //! and joins all work against them.
 
+use core::fmt::Write as _;
+
 use crate::mem::arena::Arena;
 use crate::storage::{
     ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, OwnedDatum, PartitionBound,
@@ -731,6 +733,7 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 2,
         volatility: "s",
     },
+    intrinsic!(1665, "pg_get_serial_sequence", 25, "25 25", 2, "s"),
     IntrinsicRoutine {
         oid: 3476,
         name: "to_regoperator",
@@ -1113,6 +1116,24 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "s",
     },
+    intrinsic!(2082, "pg_operator_is_visible", 16, "26", 1, "s"),
+    intrinsic!(2083, "pg_opclass_is_visible", 16, "26", 1, "s"),
+    intrinsic!(2093, "pg_conversion_is_visible", 16, "26", 1, "s"),
+    intrinsic!(
+        3382,
+        "pg_identify_object_as_address",
+        2249,
+        "26 26 23",
+        3,
+        "s"
+    ),
+    intrinsic!(3403, "pg_statistics_obj_is_visible", 16, "26", 1, "s"),
+    intrinsic!(3537, "pg_describe_object", 25, "26 26 23", 3, "s"),
+    intrinsic!(3757, "pg_ts_dict_is_visible", 16, "26", 1, "s"),
+    intrinsic!(3758, "pg_ts_config_is_visible", 16, "26", 1, "s"),
+    intrinsic!(3829, "pg_opfamily_is_visible", 16, "26", 1, "s"),
+    intrinsic!(3839, "pg_identify_object", 2249, "26 26 23", 3, "s"),
+    intrinsic!(3954, "pg_get_object_address", 2249, "25 1009 1009", 3, "s"),
     IntrinsicRoutine {
         oid: 2080,
         name: "pg_type_is_visible",
@@ -3410,6 +3431,43 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     intrinsic!(6426, "timestamptz_hash_extended", 20, "1184 20", 2, "i"),
 ];
 
+fn intrinsic_routine_kind(routine: IntrinsicRoutine) -> &'static str {
+    if matches!(
+        routine.oid,
+        2901 | 2112
+            | 2125
+            | 2141
+            | 2106
+            | 2113
+            | 2122
+            | 2123
+            | 2124
+            | 2126
+            | 2127
+            | 2128
+            | 2138
+            | 2139
+            | 2140
+            | 2142
+            | 2143
+            | 2144
+            | 2797
+            | 2798
+            | 3564
+            | 3565
+            | 4301
+            | 4389
+            | 4450
+            | 6227
+            | 4189
+            | 4190
+    ) {
+        "a"
+    } else {
+        "f"
+    }
+}
+
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
     !matches!(
         routine.oid,
@@ -3879,9 +3937,18 @@ const CURSOR_OUTPUT_NAMES: &[&str] = &[
     "is_scrollable",
     "creation_time",
 ];
+const IDENTIFY_OBJECT_OUTPUT_OIDS: &[i32] = &[25, 25, 25, 25];
+const IDENTIFY_OBJECT_OUTPUT_NAMES: &[&str] = &["type", "schema", "name", "identity"];
+const IDENTIFY_ADDRESS_OUTPUT_OIDS: &[i32] = &[25, 1009, 1009];
+const IDENTIFY_ADDRESS_OUTPUT_NAMES: &[&str] = &["type", "object_names", "object_args"];
+const OBJECT_ADDRESS_OUTPUT_OIDS: &[i32] = &[26, 26, 23];
+const OBJECT_ADDRESS_OUTPUT_NAMES: &[&str] = &["classid", "objid", "objsubid"];
 
 fn intrinsic_routine_argument_names(oid: i32) -> Option<&'static [&'static str]> {
     match oid {
+        6119 => Some(&["pubname"]),
+        3382 | 3839 => Some(&["classid", "objid", "objsubid"]),
+        3954 => Some(&["type", "object_names", "object_args"]),
         2284 => Some(&["string", "pattern", "replacement"]),
         2285 => Some(&["string", "pattern", "replacement", "flags"]),
         2763 | 2765 | 2767 | 3396 | 6254 | 6257 | 6263 | 6265 => Some(&["string", "pattern"]),
@@ -3928,8 +3995,34 @@ fn intrinsic_record_outputs(
         3878 => Some((LOGICAL_SLOT_OUTPUT_OIDS, LOGICAL_SLOT_ADVANCE_OUTPUT_NAMES)),
         1689 => Some((ACL_EXPLODE_OUTPUT_OIDS, ACL_EXPLODE_OUTPUT_NAMES)),
         2511 => Some((CURSOR_OUTPUT_OIDS, CURSOR_OUTPUT_NAMES)),
+        3382 => Some((IDENTIFY_ADDRESS_OUTPUT_OIDS, IDENTIFY_ADDRESS_OUTPUT_NAMES)),
+        3839 => Some((IDENTIFY_OBJECT_OUTPUT_OIDS, IDENTIFY_OBJECT_OUTPUT_NAMES)),
+        3954 => Some((OBJECT_ADDRESS_OUTPUT_OIDS, OBJECT_ADDRESS_OUTPUT_NAMES)),
         _ => None,
     }
+}
+
+/// Static OUT-column metadata for a built-in record routine. Keeping this
+/// next to the intrinsic inventory makes scalar row expansion, FROM calls,
+/// and `pg_proc` report one authoritative shape.
+pub(crate) fn intrinsic_record_field(
+    written_name: &str,
+    argument_oids: &[i32],
+    index: usize,
+) -> Option<(&'static str, i32, ColType)> {
+    let name = written_name
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(written_name);
+    let routine = INTRINSIC_ROUTINES.iter().find(|routine| {
+        routine.name == name && routine.argument_count as usize == argument_oids.len()
+    })?;
+    let (output_oids, output_names) = intrinsic_record_outputs(*routine)?;
+    let type_oid = *output_oids.get(index)?;
+    Some((
+        *output_names.get(index)?,
+        type_oid,
+        ColType::from_oid(type_oid)?,
+    ))
 }
 
 /// PostgreSQL 18.4 operator OIDs for the evaluator's scalar integer core.
@@ -10450,6 +10543,26 @@ fn has_index_oid(storage: &Storage, txid: u32, oid: i32) -> bool {
     found
 }
 
+/// Current schema/name identity of an index relation. This uses the same
+/// synthesized-index walk as `pg_class`, so implicit constraint indexes and
+/// explicit indexes cannot disagree at object-introspection boundaries.
+pub(crate) fn index_identity_by_oid(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<(crate::storage::SqlName, StackStr<128>)> {
+    let mut found = None;
+    visit_indexes(storage, txid, |index| {
+        if index.oid == oid {
+            found = Some((
+                storage.table_def(index.table_slot, txid).schema,
+                StackStr::from_str(index.name.as_str()),
+            ));
+        }
+    });
+    found
+}
+
 fn stack_str_64(s: &str) -> StackStr<64> {
     let mut out = StackStr::<64>::new();
     let _ = core::fmt::Write::write_str(&mut out, s);
@@ -10604,6 +10717,88 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
         .map(view_oid)
 }
 
+fn table_slot_by_written_name(storage: &Storage, txid: u32, written: &str) -> Option<usize> {
+    let (written_schema, written_table) = split_qualified_name(written)?;
+    let in_schema = |schema: &str| {
+        (0..storage.table_count()).find(|slot| {
+            storage.table_slot_visible_to(*slot, txid)
+                && storage.table_def(*slot, txid).schema.as_str() == schema
+                && identifier_spelling_matches(
+                    written_table,
+                    storage.table_def(*slot, txid).name.as_str(),
+                )
+        })
+    };
+    if let Some(written_schema) = written_schema {
+        let schema = (0..storage.schema_count()).find_map(|slot| {
+            let definition = storage.schema_def(slot);
+            (definition.visible_to(txid)
+                && identifier_spelling_matches(written_schema, definition.name.as_str()))
+            .then_some(definition.name)
+        })?;
+        return in_schema(schema.as_str());
+    }
+    if let Ok(schema) = storage.temporary_schema()
+        && let Some(slot) = in_schema(schema.as_str())
+    {
+        return Some(slot);
+    }
+    for entry in storage.path().entries() {
+        if let crate::storage::PathEntry::Schema(schema) = entry
+            && let Some(slot) = in_schema(storage.schema_def(*schema as usize).name.as_str())
+        {
+            return Some(slot);
+        }
+    }
+    None
+}
+
+pub(crate) fn serial_sequence_name<'a>(
+    storage: &Storage,
+    txid: u32,
+    table: &str,
+    column: &str,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let table_slot = table_slot_by_written_name(storage, txid, table).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            table
+        )
+    })?;
+    let table_definition = storage.table_def(table_slot, txid);
+    let column = table_definition
+        .columns()
+        .iter()
+        .find(|candidate| identifier_spelling_matches(column, candidate.name.as_str()))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" of relation \"{}\" does not exist",
+                column,
+                table_definition.name.as_str()
+            )
+        })?;
+    let Some(sequence_slot) = storage.generated_sequence_slot(
+        table_definition.schema.as_str(),
+        table_definition.name.as_str(),
+        column.name.as_str(),
+        txid,
+    ) else {
+        return Ok(None);
+    };
+    let sequence = storage.sequence_for(sequence_slot, txid);
+    let mut rendered = StackStr::<270>::new();
+    write_identifier(&mut rendered, sequence.schema.as_str());
+    let _ = rendered.write_char('.');
+    write_identifier(&mut rendered, sequence.name.as_str());
+    arena
+        .alloc_str(rendered.as_str())
+        .map(Some)
+        .map_err(|_| arena_full())
+}
+
 /// Catalog identity checks used by PostgreSQL's visibility helpers.  The
 /// synthesized catalogs and executable SQL built-ins deliberately have
 /// separate namespaces, so an OID is accepted only by the predicate that
@@ -10621,6 +10816,41 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
         || storage
             .composites_with_slots_visible_to(txid)
             .any(|(slot, _)| named_composite_relation_oid(slot) == oid)
+}
+
+pub(crate) fn relation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
+    if catalog_relation_oid_by_oid(oid) {
+        return Some(true);
+    }
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid) && table_oid(storage, slot) == oid {
+            let table = storage.table_def(slot, txid);
+            return Some(reloid_of_name(storage, txid, table.name.as_str()) == Some(oid));
+        }
+    }
+    if let Some((_, name)) = index_identity_by_oid(storage, txid, oid) {
+        return Some(index_oid_by_name(storage, txid, None, name.as_str()) == Some(oid));
+    }
+    for slot in 0..storage.sequence_count() {
+        if storage.sequence_slot_visible_to(slot, txid) && sequence_oid(slot) == oid {
+            let sequence = storage.sequence_for(slot, txid);
+            return Some(reloid_of_name(storage, txid, sequence.name.as_str()) == Some(oid));
+        }
+    }
+    for slot in 0..storage.view_count() {
+        if storage.view_slot_visible_to(slot, txid) && view_oid(slot) == oid {
+            return Some(
+                reloid_of_name(storage, txid, storage.view(slot).name_for(txid).as_str())
+                    == Some(oid),
+            );
+        }
+    }
+    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
+        if named_composite_relation_oid(slot) == oid {
+            return Some(reloid_of_name(storage, txid, composite.name.as_str()) == Some(oid));
+        }
+    }
+    None
 }
 
 fn catalog_relation_oid_by_oid(oid: i32) -> bool {
@@ -10670,6 +10900,87 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
     )
 }
 
+pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
+    if (oid < super::types::oid::FIRST_DOMAIN && intrinsic_type_name(oid).is_some())
+        || matches!(
+            oid,
+            26 | 2249 | 2202 | 2203 | 2204 | 2205 | 2206 | 3115 | 4096 | 4097
+        )
+    {
+        return Some(true);
+    }
+    use super::types::oid as type_oid;
+    for slot in 0..storage.domain_count() {
+        if !storage.domain_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let domain = storage.domain_for(slot, txid);
+        for (candidate, suffix) in [
+            (type_oid::domain_oid(slot as u16), ""),
+            (type_oid::domain_array_oid(slot as u16), "[]"),
+        ] {
+            if candidate == oid {
+                let written = stack_format!(160, "{}{}", domain.name.as_str(), suffix);
+                return Some(user_type_oid(storage, txid, written.as_str()) == Some(oid));
+            }
+        }
+    }
+    for slot in 0..storage.enum_count() {
+        if !storage.enum_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let enumeration = storage.enum_for(slot, txid);
+        for (candidate, suffix) in [
+            (type_oid::enum_oid(slot as u16), ""),
+            (type_oid::enum_array_oid(slot as u16), "[]"),
+        ] {
+            if candidate == oid {
+                let written = stack_format!(160, "{}{}", enumeration.name.as_str(), suffix);
+                return Some(user_type_oid(storage, txid, written.as_str()) == Some(oid));
+            }
+        }
+    }
+    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
+        for (candidate, suffix) in [
+            (type_oid::composite_oid(slot as u16), ""),
+            (type_oid::composite_array_oid(slot as u16), "[]"),
+        ] {
+            if candidate == oid {
+                let written = stack_format!(160, "{}{}", composite.name.as_str(), suffix);
+                return Some(user_type_oid(storage, txid, written.as_str()) == Some(oid));
+            }
+        }
+    }
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        if oid == FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32
+            || oid == FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+        {
+            return Some(
+                reloid_of_name(storage, txid, table.name.as_str())
+                    == Some(table_oid(storage, slot)),
+            );
+        }
+    }
+    for slot in 0..storage.view_count() {
+        if !storage.view_slot_visible_to(slot, txid) {
+            continue;
+        }
+        if oid == FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32
+            || oid == FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+        {
+            return Some(
+                reloid_of_name(storage, txid, storage.view(slot).name_for(txid).as_str())
+                    == Some(view_oid(slot)),
+            );
+        }
+    }
+    None
+}
+
 /// Resolves the exact OID for a visible user-defined type spelling, including
 /// the automatically-created array type.  Call sites that dispatch routines
 /// use this instead of reducing a domain to its storage representation.
@@ -10703,6 +11014,174 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
 
 pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
+}
+
+pub(crate) fn function_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
+    if function_oid_is_visible(oid) {
+        return Some(true);
+    }
+    let slot = storage.routine_slot_by_oid(oid, txid)?;
+    let routine = storage.routine_for(slot, txid);
+    let mut arguments = [super::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+    for (index, argument) in routine.arguments().iter().enumerate() {
+        arguments[index] = storage.routine_type_oid(argument.ctype, argument.user_type, txid)?;
+    }
+    let visible = storage.routine_slot_for_function_call_oids(
+        routine.name_for(txid).as_str(),
+        &arguments[..routine.argument_count],
+        txid,
+    ) == Some(slot);
+    Some(visible)
+}
+
+pub(crate) fn operator_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
+    if CATALOG_OPERATORS.iter().any(|operator| operator.oid == oid)
+        || POLYMORPHIC_RANGE_OPERATORS
+            .iter()
+            .any(|operator| operator.oid == oid)
+    {
+        return Some(true);
+    }
+    let slot = storage.operator_slot_by_oid(oid, txid)?;
+    let definition = storage.operator_for(slot, txid);
+    let left = definition
+        .signature
+        .left
+        .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
+    let right = definition
+        .signature
+        .right
+        .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
+    Some(
+        storage
+            .operator_slot_for_oids(None, definition.name.as_str(), left, right, txid)
+            .ok()
+            .flatten()
+            == Some(slot),
+    )
+}
+
+pub(crate) fn operator_class_oid_visibility(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<bool> {
+    let builtin = matches!(
+        oid,
+        XID8_BTREE_OPERATOR_CLASS_OID
+            | MONEY_BTREE_OPERATOR_CLASS_OID
+            | TID_BTREE_OPERATOR_CLASS_OID
+            | CID_HASH_OPERATOR_CLASS_OID
+            | TID_HASH_OPERATOR_CLASS_OID
+            | BIT_BTREE_OPERATOR_CLASS_OID
+            | BYTEA_BTREE_OPERATOR_CLASS_OID
+            | VARBIT_BTREE_OPERATOR_CLASS_OID
+            | BYTEA_HASH_OPERATOR_CLASS_OID
+            | CIDR_BTREE_OPERATOR_CLASS_OID
+            | CIDR_HASH_OPERATOR_CLASS_OID
+            | INET_BTREE_OPERATOR_CLASS_OID
+            | INET_HASH_OPERATOR_CLASS_OID
+            | MACADDR_BTREE_OPERATOR_CLASS_OID
+            | MACADDR_HASH_OPERATOR_CLASS_OID
+            | MACADDR8_BTREE_OPERATOR_CLASS_OID
+            | MACADDR8_HASH_OPERATOR_CLASS_OID
+            | RANGE_BTREE_OPERATOR_CLASS_OID
+            | RANGE_HASH_OPERATOR_CLASS_OID
+            | MULTIRANGE_BTREE_OPERATOR_CLASS_OID
+            | MULTIRANGE_HASH_OPERATOR_CLASS_OID
+            | PG_LSN_BTREE_OPERATOR_CLASS_OID
+            | PG_LSN_HASH_OPERATOR_CLASS_OID
+            | ACLITEM_HASH_OPERATOR_CLASS_OID
+    );
+    if builtin {
+        return Some(true);
+    }
+    let slot =
+        storage.operator_class_slot_by_oid(crate::storage::OperatorClassOid::parse(oid)?, txid)?;
+    let definition = storage.operator_class_for(slot, txid);
+    Some(storage.operator_class_slot_on_path(None, definition.name.as_str(), txid) == Some(slot))
+}
+
+pub(crate) fn operator_family_oid_visibility(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<bool> {
+    let builtin = matches!(
+        oid,
+        XID8_BTREE_OPERATOR_FAMILY_OID
+            | MONEY_BTREE_OPERATOR_FAMILY_OID
+            | TID_BTREE_OPERATOR_FAMILY_OID
+            | CID_HASH_OPERATOR_FAMILY_OID
+            | TID_HASH_OPERATOR_FAMILY_OID
+            | BIT_BTREE_OPERATOR_FAMILY_OID
+            | BYTEA_BTREE_OPERATOR_FAMILY_OID
+            | VARBIT_BTREE_OPERATOR_FAMILY_OID
+            | BYTEA_HASH_OPERATOR_FAMILY_OID
+            | NETWORK_BTREE_OPERATOR_FAMILY_OID
+            | NETWORK_HASH_OPERATOR_FAMILY_OID
+            | MACADDR_BTREE_OPERATOR_FAMILY_OID
+            | MACADDR_HASH_OPERATOR_FAMILY_OID
+            | MACADDR8_BTREE_OPERATOR_FAMILY_OID
+            | MACADDR8_HASH_OPERATOR_FAMILY_OID
+            | RANGE_BTREE_OPERATOR_FAMILY_OID
+            | RANGE_HASH_OPERATOR_FAMILY_OID
+            | MULTIRANGE_BTREE_OPERATOR_FAMILY_OID
+            | MULTIRANGE_HASH_OPERATOR_FAMILY_OID
+            | PG_LSN_BTREE_OPERATOR_FAMILY_OID
+            | PG_LSN_HASH_OPERATOR_FAMILY_OID
+            | ACLITEM_HASH_OPERATOR_FAMILY_OID
+    );
+    if builtin {
+        return Some(true);
+    }
+    let slot = storage.operator_family_slot_by_oid(oid, txid)?;
+    let definition = storage.operator_family_for(slot, txid);
+    Some(storage.operator_family_slot_on_path(None, definition.name.as_str(), txid) == Some(slot))
+}
+
+pub(crate) fn conversion_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
+    let (slot, definition) = storage
+        .conversions_visible_to(txid)
+        .find(|(slot, _)| storage.conversion(*slot).oid(*slot) == oid)?;
+    Some(storage.conversion_slot_on_path(None, definition.name.as_str(), txid) == Some(slot))
+}
+
+pub(crate) fn statistics_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
+    let (slot, statistics) = storage
+        .extended_statistics_visible(txid)
+        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)?;
+    let definition = statistics.definition_for(txid);
+    Some(
+        storage.extended_statistics_slot_on_path(None, definition.name.as_str(), txid)
+            == Some(slot),
+    )
+}
+
+pub(crate) fn text_search_oid_visibility(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    kind: crate::sql::ast::TextSearchObjectKind,
+) -> Option<bool> {
+    let (slot, object) = storage
+        .text_search_objects_visible_to(txid)
+        .find(|(_, object)| object.kind() == kind && object.oid() == oid)?;
+    Some(storage.text_search_slot_on_path(kind, None, object.name().as_str(), txid) == Some(slot))
+}
+
+pub(crate) fn intrinsic_routine_event_identity(
+    oid: i32,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let routine = INTRINSIC_ROUTINES
+        .iter()
+        .find(|routine| routine.oid == oid)?;
+    let object_type = if intrinsic_routine_kind(*routine) == "a" {
+        "aggregate"
+    } else {
+        "function"
+    };
+    Some((routine.name, routine.argument_types, object_type))
 }
 
 fn identifier_spelling_matches(written: &str, name: &str) -> bool {
@@ -12122,7 +12601,7 @@ pub fn function_result_text<'a>(
         .map_err(|_| super::eval::arena_full())
 }
 
-fn intrinsic_type_name(oid: i32) -> Option<&'static str> {
+pub(crate) fn intrinsic_type_name(oid: i32) -> Option<&'static str> {
     ColType::from_oid(oid).map(ColType::name).or_else(|| {
         Some(match oid {
             2276 => "\"any\"",
@@ -12149,6 +12628,19 @@ pub fn collation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool 
         || storage
             .collations_visible_to(txid)
             .any(|(slot, _)| crate::sql::ast::Collation::Catalog(slot as u8).oid() == oid)
+}
+
+pub(crate) fn collation_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
+    if crate::sql::ast::Collation::BUILTIN
+        .iter()
+        .any(|collation| collation.oid() == oid)
+    {
+        return Some(true);
+    }
+    let (slot, definition) = storage
+        .collations_visible_to(txid)
+        .find(|(slot, _)| crate::sql::ast::Collation::Catalog(*slot as u8).oid() == oid)?;
+    Some(storage.collation_slot_on_path(None, definition.name.as_str(), txid) == Some(slot))
 }
 
 pub(crate) fn collation_oid_by_name(storage: &Storage, txid: u32, written: &str) -> Option<i32> {
@@ -13400,6 +13892,62 @@ pub(crate) fn table_constraint_oid(
         .map(|(index, _)| {
             FIRST_NOT_NULL_OID + table_slot as i32 * MAX_COLUMNS as i32 + index as i32
         })
+}
+
+/// Resolve a table constraint OID back to its stable table/name identity.
+/// The forward and reverse paths deliberately meet at `table_constraint_oid`
+/// because generated NOT NULL and index-backed constraint positions can move
+/// after unrelated catalog edits.
+pub(crate) fn table_constraint_identity_by_oid(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+) -> Option<(usize, StackStr<128>)> {
+    for table_slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(table_slot, txid) {
+            continue;
+        }
+        let table = storage.table_def(table_slot, txid);
+        let candidate = |name: &str| {
+            (table_constraint_oid(storage, txid, table_slot, name) == Some(oid))
+                .then(|| (table_slot, StackStr::from_str(name)))
+        };
+        if let Some(found) = table
+            .partition
+            .detached_bound
+            .and_then(|constraint| candidate(constraint.name.as_str()))
+        {
+            return Some(found);
+        }
+        for check in table.checks() {
+            if let Some(found) = candidate(check.name.as_str()) {
+                return Some(found);
+            }
+        }
+        for foreign_key in table.fkeys() {
+            if let Some(found) = candidate(foreign_key.name.as_str()) {
+                return Some(found);
+            }
+        }
+        for column in table.columns() {
+            if column.not_null.is_required() {
+                let name = not_null_constraint_name(table, column);
+                if let Some(found) = candidate(name.as_str()) {
+                    return Some(found);
+                }
+            }
+        }
+        let mut index_name = None;
+        visit_indexes(storage, txid, |index| {
+            if index.table_slot == table_slot && index.is_constraint && index.oid + 500_000 == oid {
+                index_name = Some(StackStr::from_str(index.name.as_str()));
+            }
+        });
+        if let Some(name) = index_name {
+            return Some((table_slot, name));
+        }
+    }
+    None
 }
 
 /// Enumerates every foreign-key constraint, resolving each child/parent table to
@@ -22309,11 +22857,14 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 names[index] = Datum::Text(name);
             }
         }
-        let record_input_count = usize::from(routine.oid == 6119);
-        if routine.oid == 6119 {
-            all_types[0] = Datum::Oid(1009);
-            modes[0] = Datum::Char(b'v');
-            names[0] = Datum::Text("pubname");
+        let record_input_count = if record_outputs.is_some() {
+            argument_count
+        } else {
+            0
+        };
+        for input in 0..record_input_count {
+            all_types[input] = Datum::Oid(argument_oids[input] as u32);
+            modes[input] = Datum::Char(if routine.oid == 6119 { b'v' } else { b'i' });
         }
         if let Some((output_oids, output_names)) = record_outputs {
             for output in 0..output_oids.len() {
@@ -22332,42 +22883,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(routine.argument_count),
                 Datum::Int4(routine.result_oid),
                 Datum::Bool(intrinsic_routine_is_set_returning(*routine)),
-                Datum::Bpchar(
-                    if matches!(
-                        routine.oid,
-                        2901 | 2112
-                            | 2125
-                            | 2141
-                            | 2106
-                            | 2113
-                            | 2122
-                            | 2123
-                            | 2124
-                            | 2126
-                            | 2127
-                            | 2128
-                            | 2138
-                            | 2139
-                            | 2140
-                            | 2142
-                            | 2143
-                            | 2144
-                            | 2797
-                            | 2798
-                            | 3564
-                            | 3565
-                            | 4301
-                            | 4389
-                            | 4450
-                            | 6227
-                            | 4189
-                            | 4190
-                    ) {
-                        "a"
-                    } else {
-                        "f"
-                    },
-                ),
+                Datum::Bpchar(intrinsic_routine_kind(*routine)),
                 oidvector(&argument_oids[..argument_count], arena)?,
                 Datum::Bpchar(routine.volatility),
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
@@ -22497,17 +23013,17 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                             arena,
                         )?,
                     },
+                    (_, Some((output_oids, _))) => Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(
+                            &names[..record_input_count + output_oids.len()],
+                            arena,
+                        )?,
+                    },
                     (_, _) if intrinsic_names.is_some() => Datum::Array {
                         element: super::types::ArrElem::Text,
                         raw: super::array::build(
                             &names[..intrinsic_names.expect("checked").len()],
-                            arena,
-                        )?,
-                    },
-                    (_, Some((_, output_names))) => Datum::Array {
-                        element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &names[..record_input_count + output_names.len()],
                             arena,
                         )?,
                     },

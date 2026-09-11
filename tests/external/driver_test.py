@@ -758,6 +758,51 @@ bcur.close()
 cur.execute("DROP COLLATION public.drv_catalog_collation")
 print("catalog reference extended/binary protocol ok")
 
+# Object identities cross Parse/Bind/Describe/Execute as statically-shaped
+# records, and text[] address components round-trip through driver adaptation.
+cur.execute("CREATE SCHEMA drv_object_api")
+cur.execute("CREATE TABLE drv_object_api.items(id serial, value text)")
+cur.execute(
+    "SELECT (pg_identify_object('pg_class'::regclass, c.oid, 2)).* "
+    "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = %s AND c.relname = %s",
+    ("drv_object_api", "items"),
+)
+assert [column.type_code for column in cur.description] == [25, 25, 25, 25]
+assert cur.fetchone() == (
+    "table column",
+    "drv_object_api",
+    "items",
+    "drv_object_api.items.value",
+)
+cur.execute(
+    "SELECT (pg_get_object_address(%s, %s::text[], %s::text[])).classid, "
+    "       (pg_get_object_address(%s, %s::text[], %s::text[])).objid, "
+    "       (pg_get_object_address(%s, %s::text[], %s::text[])).objsubid",
+    (
+        "table column", ["drv_object_api", "items", "value"], [],
+        "table column", ["drv_object_api", "items", "value"], [],
+        "table column", ["drv_object_api", "items", "value"], [],
+    ),
+)
+class_id, object_id, sub_id = cur.fetchone()
+assert class_id == 1259 and sub_id == 2
+cur.execute(
+    "SELECT (pg_identify_object_as_address(%s, %s, %s)).*",
+    (class_id, object_id, sub_id),
+)
+assert [column.type_code for column in cur.description] == [25, 1009, 1009]
+assert cur.fetchone() == (
+    "table column",
+    ["drv_object_api", "items", "value"],
+    [],
+)
+cur.execute("SELECT pg_get_serial_sequence(%s, %s)", ("drv_object_api.items", "id"))
+assert cur.description[0].type_code == 25
+assert cur.fetchone() == ("drv_object_api.items_id_seq",)
+cur.execute("DROP SCHEMA drv_object_api CASCADE")
+print("catalog object address extended protocol ok")
+
 conn.close()
 observer_cur.execute("SELECT count(*) FROM pg_class WHERE relpersistence = 't'")
 assert observer_cur.fetchone() == (0,)

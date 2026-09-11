@@ -158,7 +158,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         | ColType::Regnamespace
         | ColType::Regrole
         | ColType::Regconfig
-        | ColType::Regdictionary) => match v {
+        | ColType::Regdictionary
+        | ColType::Regcollation) => match v {
             Datum::RegObject {
                 type_oid,
                 referenced_oid,

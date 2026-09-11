@@ -814,6 +814,18 @@ pub trait CatalogAccess {
     fn resolve_collation(&self, _schema: Option<&str>, _name: &str) -> Option<Collation> {
         None
     }
+    /// Resolve PostgreSQL's identifier syntax used by `regcollation` input.
+    fn collation_oid(&self, _name: &str) -> Option<i32> {
+        None
+    }
+    /// Render a collation OID using the current search path.
+    fn collation_name<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     /// Resolves a transaction-visible text-search configuration to its stable
     /// `regconfig` identity.
     fn resolve_text_search_configuration(&self, _schema: Option<&str>, _name: &str) -> Option<i32> {
@@ -1131,6 +1143,10 @@ pub trait CatalogAccess {
     fn role_oid(&self, _name: &str) -> Option<i32> {
         None
     }
+    /// Resolve PostgreSQL identifier spelling supplied to a `regrole` input function.
+    fn written_role_oid(&self, name: &str) -> Option<i32> {
+        self.role_oid(name)
+    }
     fn object_acl<'a>(
         &self,
         _classid: u32,
@@ -1147,6 +1163,10 @@ pub trait CatalogAccess {
     /// Resolve a namespace name to its catalog OID.
     fn schema_oid(&self, _name: &str) -> Option<i32> {
         None
+    }
+    /// Resolve PostgreSQL identifier spelling supplied to a `regnamespace` input function.
+    fn written_schema_oid(&self, name: &str) -> Option<i32> {
+        self.schema_oid(name)
     }
     /// Resolve a routine OID to its catalog spelling. `signature` selects the
     /// regprocedure spelling with argument types rather than regproc's name.
@@ -2203,24 +2223,7 @@ fn eval_full_inner<'a>(
             // varying`); an OID renders the type it names, an unknown OID
             // renders as the number and OID 0 as `-`, as PostgreSQL has it.
             if type_name.eq_ignore_ascii_case("regtype") {
-                match text_view(v) {
-                    Datum::Text(name) => {
-                        if let Some(referenced_oid) = hooks
-                            .catalog
-                            .and_then(|catalog| catalog.user_type_oid(name.trim()))
-                        {
-                            return Ok(Datum::Regtype {
-                                referenced_oid,
-                                name: arena.alloc_str(name.trim()).map_err(|_| arena_full())?,
-                            });
-                        }
-                        return regtype_of_name(name);
-                    }
-                    Datum::Int4(x) => return regtype_of_oid(x as i64, arena),
-                    Datum::Oid(x) => return regtype_of_oid(i64::from(x), arena),
-                    Datum::Int8(x) => return regtype_of_oid(x, arena),
-                    _ => {}
-                }
+                return regtype_cast(v, hooks.catalog, arena);
             }
             // integer -> bit(n): the low n bits, right-aligned. This is
             // PostgreSQL's int-to-bit conversion, distinct from bit-string
@@ -6523,8 +6526,15 @@ pub(crate) fn text_view(d: Datum<'_>) -> Datum<'_> {
 /// `oid::regtype`: the canonical SQL name of the type an OID names. An OID no
 /// type carries renders as the number itself, and 0 as `-`.
 pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
-    let referenced_oid = i32::try_from(o).map_err(|_| overflow("regtype"))?;
-    let name = if o == 0 {
+    let unsigned = if let Ok(value) = u32::try_from(o) {
+        value
+    } else if let Ok(value) = i32::try_from(o) {
+        value as u32
+    } else {
+        return Err(overflow("regtype"));
+    };
+    let referenced_oid = unsigned as i32;
+    let name = if unsigned == 0 {
         "-"
     } else if let Some(name) = regtype_builtin_name(referenced_oid) {
         name
@@ -6532,7 +6542,7 @@ pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, 
         ctype.name()
     } else {
         return arena
-            .alloc_str_display(o)
+            .alloc_str_display(unsigned)
             .map(|name| Datum::Regtype {
                 referenced_oid,
                 name,
@@ -6543,6 +6553,91 @@ pub(crate) fn regtype_of_oid<'a>(o: i64, arena: &'a Arena) -> Result<Datum<'a>, 
         referenced_oid,
         name,
     })
+}
+
+pub(crate) fn regtype_cast<'a>(
+    value: Datum<'a>,
+    catalog: Option<&dyn CatalogAccess>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    match value {
+        value @ Datum::Regtype { .. } => Ok(value),
+        Datum::Text(name) | Datum::Bpchar(name) => {
+            let name = name.trim();
+            if let Ok(oid) = name.parse::<u32>() {
+                return regtype_of_oid(i64::from(oid), arena);
+            }
+            if let Some(identity) = cross_database_catalog_reference(name, false) {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cross-database references are not implemented: {}",
+                    identity
+                ));
+            }
+            if let Some(catalog) = catalog
+                && let Some(referenced_oid) = catalog.user_type_oid(name)
+            {
+                return Ok(Datum::Regtype {
+                    referenced_oid,
+                    name: catalog.user_type_name(name, arena)?.unwrap_or(name),
+                });
+            }
+            regtype_of_name(name)
+        }
+        Datum::Oid(oid) => regtype_of_oid(i64::from(oid), arena),
+        Datum::Int4(oid) => regtype_of_oid(i64::from(oid), arena),
+        Datum::Int8(oid) => regtype_of_oid(oid, arena),
+        Datum::Null => Ok(Datum::Null),
+        value => Err(cast_unsupported(&value, "regtype")),
+    }
+}
+
+pub(crate) fn cross_database_catalog_reference(
+    written: &str,
+    signature_required: bool,
+) -> Option<&str> {
+    let written = written.trim();
+    let bytes = written.as_bytes();
+    let mut quoted = false;
+    let mut signature = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' if quoted && bytes.get(index + 1) == Some(&b'"') => index += 2,
+            b'"' => {
+                quoted = !quoted;
+                index += 1;
+            }
+            b'(' if !quoted => {
+                signature = Some(index);
+                break;
+            }
+            _ => index += 1,
+        }
+    }
+    if quoted || (signature_required && signature.is_none()) {
+        return None;
+    }
+    let identity = written[..signature.unwrap_or(written.len())].trim();
+    let mut quoted = false;
+    let mut separators = 0u8;
+    let mut input = identity.as_bytes().iter().copied().peekable();
+    while let Some(byte) = input.next() {
+        match byte {
+            b'"' if quoted && input.peek() == Some(&b'"') => {
+                input.next();
+            }
+            b'"' => quoted = !quoted,
+            b'.' if !quoted => {
+                separators += 1;
+                if separators == 2 {
+                    return Some(identity);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(crate) fn regobject_cast<'a>(
@@ -6573,13 +6668,32 @@ pub(crate) fn regobject_cast<'a>(
         Datum::RegObject { .. } => return Err(cast_unsupported(&value, target.name())),
         Datum::Int2(value) => i32::from(value),
         Datum::Int4(value) => value,
-        Datum::Oid(value) => i32::try_from(value).map_err(|_| overflow(target.name()))?,
-        Datum::Int8(value) => i32::try_from(value).map_err(|_| overflow(target.name()))?,
+        Datum::Oid(value) => value as i32,
+        Datum::Int8(value) => u32::try_from(value).map_err(|_| overflow(target.name()))? as i32,
         Datum::Text(name) | Datum::Bpchar(name) => {
             let name = name.trim_end_matches(' ');
-            if let Ok(value) = name.parse::<i32>() {
-                value
+            if let Ok(value) = name.parse::<u32>() {
+                value as i32
             } else {
+                let signature_required =
+                    matches!(target, ColType::Regprocedure | ColType::Regoperator);
+                if matches!(
+                    target,
+                    ColType::Regclass
+                        | ColType::Regproc
+                        | ColType::Regprocedure
+                        | ColType::Regoper
+                        | ColType::Regoperator
+                        | ColType::Regcollation
+                ) && let Some(identity) =
+                    cross_database_catalog_reference(name, signature_required)
+                {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cross-database references are not implemented: {}",
+                        identity
+                    ));
+                }
                 let catalog = catalog.ok_or_else(|| {
                     sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -6595,14 +6709,14 @@ pub(crate) fn regobject_cast<'a>(
                             name
                         )
                     })?,
-                    ColType::Regrole => catalog.role_oid(name).ok_or_else(|| {
+                    ColType::Regrole => catalog.written_role_oid(name).ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
                             "role \"{}\" does not exist",
                             name
                         )
                     })?,
-                    ColType::Regnamespace => catalog.schema_oid(name).ok_or_else(|| {
+                    ColType::Regnamespace => catalog.written_schema_oid(name).ok_or_else(|| {
                         sql_err!(
                             sqlstate::INVALID_SCHEMA_NAME,
                             "schema \"{}\" does not exist",
@@ -6651,6 +6765,13 @@ pub(crate) fn regobject_cast<'a>(
                             )
                         })?
                     }
+                    ColType::Regcollation => catalog.collation_oid(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "collation \"{}\" for encoding \"UTF8\" does not exist",
+                            name
+                        )
+                    })?,
                     _ => {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -6706,13 +6827,17 @@ pub(crate) fn regobject_cast<'a>(
         })
         .map(|name| arena.alloc_str(name.as_str()).map_err(|_| arena_full()))
         .transpose()?,
+        ColType::Regcollation => catalog
+            .map(|catalog| catalog.collation_name(object_oid, arena))
+            .transpose()?
+            .flatten(),
         _ => None,
     };
     let name = match name {
         Some(name) => name,
         None if object_oid == 0 => arena.alloc_str("-").map_err(|_| arena_full())?,
         None => arena
-            .alloc_str_display(object_oid)
+            .alloc_str_display(object_oid as u32)
             .map_err(|_| arena_full())?,
     };
     Ok(Datum::RegObject {
@@ -6749,7 +6874,7 @@ pub(crate) fn reg_array_cast<'a>(
     for (index, output) in items.iter_mut().take(count).enumerate() {
         let input = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
         *output = if element_type == ColType::Regtype {
-            cast_to(input, element_type, arena)?
+            regtype_cast(input, catalog, arena)?
         } else {
             regobject_cast(input, element_type, catalog, arena)?
         };
@@ -6773,6 +6898,7 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
         oid::REGROLE => "regrole",
         oid::REGCONFIG => "regconfig",
         oid::REGDICTIONARY => "regdictionary",
+        oid::REGCOLLATION => "regcollation",
         oid::ANYELEMENT => "anyelement",
         oid::ANYARRAY => "anyarray",
         oid::ANYNONARRAY => "anynonarray",
@@ -6853,6 +6979,7 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         | "regoperator"
         | "regconfig"
         | "regdictionary"
+        | "regcollation"
         | "anyelement"
         | "anyarray"
         | "anynonarray"
@@ -6875,6 +7002,7 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
             "regoperator" => "regoperator",
             "regconfig" => "regconfig",
             "regdictionary" => "regdictionary",
+            "regcollation" => "regcollation",
             "fdw_handler" => "fdw_handler",
             "anyelement" => "anyelement",
             "anyarray" => "anyarray",
@@ -6909,6 +7037,7 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         "regoperator" => crate::sql::types::oid::REGOPERATOR,
         "regconfig" => crate::sql::types::oid::REGCONFIG,
         "regdictionary" => crate::sql::types::oid::REGDICTIONARY,
+        "regcollation" => crate::sql::types::oid::REGCOLLATION,
         "anyelement" => crate::sql::types::oid::ANYELEMENT,
         "anyarray" => crate::sql::types::oid::ANYARRAY,
         "anynonarray" => crate::sql::types::oid::ANYNONARRAY,
@@ -7015,6 +7144,7 @@ fn type_name_of(d: &Datum) -> &'static str {
             crate::sql::types::oid::REGROLE => "regrole",
             crate::sql::types::oid::REGCONFIG => "regconfig",
             crate::sql::types::oid::REGDICTIONARY => "regdictionary",
+            crate::sql::types::oid::REGCOLLATION => "regcollation",
             _ => "regobject",
         },
         Datum::Date(_) => "date",

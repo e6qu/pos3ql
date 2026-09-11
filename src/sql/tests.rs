@@ -7,6 +7,341 @@
 use super::*;
 
 #[test]
+fn postgresql_18_catalog_reference_family_is_typed_and_catalogued() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA lookup_a; \
+         CREATE SCHEMA lookup_b; \
+         CREATE COLLATION lookup_a.same (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE COLLATION lookup_b.same (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE COLLATION lookup_a.\"dot.name\" (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE TABLE lookup_a.same (id integer); \
+         CREATE TYPE lookup_a.mood AS ENUM ('calm', 'busy'); \
+         CREATE FUNCTION lookup_a.pick(value integer) RETURNS integer \
+           LANGUAGE SQL IMMUTABLE AS $$ SELECT value $$; \
+         CREATE ROLE lookup_role; \
+         SET search_path = lookup_a, lookup_b, pg_catalog; \
+         CREATE TABLE catalog_refs (collation_value regcollation, collation_values regcollation[]); \
+         INSERT INTO catalog_refs VALUES ('same', ARRAY['same','lookup_b.same']::regcollation[]); \
+         CREATE TABLE type_refs (type_value regtype, type_values regtype[]); \
+         INSERT INTO type_refs VALUES ('mood'::regtype, ARRAY['mood']::regtype[]); \
+         CREATE INDEX catalog_refs_collation_idx ON catalog_refs (collation_value); \
+         CREATE VIEW collation_reference_view AS SELECT 'same'::regcollation AS value; \
+         CREATE VIEW dotted_collation_reference_view AS \
+           SELECT '\"dot.name\"'::regcollation AS value; \
+         SELECT collation_value, collation_values, pg_typeof(collation_value), \
+                pg_typeof(collation_values) FROM catalog_refs; \
+         SELECT count(*) FROM catalog_refs WHERE collation_value = 'same'::regcollation; \
+         COPY catalog_refs TO STDOUT; \
+         SELECT to_regclass('same'), to_regclass('missing') IS NULL, \
+                to_regproc('pick'), to_regprocedure('pick(integer)'), \
+                to_regoper('+') IS NULL, to_regoperator('+(integer,integer)'), \
+                to_regtype('varchar(12)'), to_regtype('mood'), \
+                to_regnamespace('lookup_a'), to_regrole('lookup_role'), \
+                to_regcollation('same'), to_regcollation('lookup_b.same'), \
+                to_regcollation('missing') IS NULL; \
+         SELECT to_regtypemod('varchar(12)'), to_regtypemod('numeric(10,3)'), \
+                to_regtypemod('timestamp(2) with time zone'), \
+                to_regtypemod('integer'), to_regtypemod('missing') IS NULL; \
+         SELECT '0'::regcollation, '999999'::regcollation, '4294967295'::regcollation, \
+                'pg_catalog.\"C\"'::regcollation, 'pg_catalog.default'::regcollation; \
+         SELECT oid, typname, typlen, typtype, typcategory, typelem, typarray, typinput, typoutput \
+           FROM pg_type WHERE oid IN (4191,4192) ORDER BY oid; \
+         SELECT oid, proname, prorettype, proargtypes::text, provolatile, proparallel, proisstrict \
+           FROM pg_proc WHERE oid IN (3476,3479,3492,3493,3494,3495,4086,4093,4195,6317) \
+           ORDER BY oid; \
+         SELECT castsource, casttarget, castfunc, castcontext, castmethod \
+           FROM pg_cast WHERE castsource = 4191 OR casttarget = 4191 ORDER BY oid; \
+         SELECT (SELECT count(*) FROM pg_operator WHERE oprleft IN (4191,4192) OR oprright IN (4191,4192)), \
+                (SELECT count(*) FROM pg_opclass WHERE opcintype IN (4191,4192))",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "same|{same,lookup_b.same}|regcollation|regcollation[]",
+            "1",
+            "same|t|pick|pick(integer)|t|+(integer,integer)|character varying|mood|lookup_a|lookup_role|same|lookup_b.same|t",
+            "16|655367|2|-1|t",
+            "-|999999|4294967295|\"C\"|\"default\"",
+            "4191|regcollation|4|b|N|0|4192|regcollationin|regcollationout",
+            "4192|_regcollation|-1|b|A|4191|0|array_in|array_out",
+            "3476|to_regoperator|2204|25|s|s|t",
+            "3479|to_regprocedure|2202|25|s|s|t",
+            "3492|to_regoper|2203|25|s|s|t",
+            "3493|to_regtype|2206|25|s|s|t",
+            "3494|to_regproc|24|25|s|s|t",
+            "3495|to_regclass|2205|25|s|s|t",
+            "4086|to_regnamespace|4089|25|s|s|t",
+            "4093|to_regrole|4096|25|s|s|t",
+            "4195|to_regcollation|4191|25|s|s|t",
+            "6317|to_regtypemod|23|25|s|s|t",
+            "26|4191|0|i|b",
+            "4191|26|0|i|b",
+            "20|4191|1287|i|f",
+            "21|4191|313|i|f",
+            "23|4191|0|i|b",
+            "4191|20|1288|a|f",
+            "4191|23|0|a|b",
+            "0|0",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+    assert_eq!(copy_data_rows(&output), ["same\t{same,lookup_b.same}"]);
+    assert_eq!(
+        row_description_type_oids(&output)[..4],
+        [
+            crate::sql::types::oid::REGCOLLATION,
+            crate::sql::types::oid::REGCOLLATION_ARRAY,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+        ]
+    );
+    let renamed_type = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE lookup_a.mood RENAME TO mood_v2; \
+         SELECT type_value, type_values FROM lookup_a.type_refs",
+    );
+    assert_eq!(
+        data_rows(&renamed_type),
+        ["lookup_a.mood_v2|{lookup_a.mood_v2}"],
+        "{}",
+        String::from_utf8_lossy(&renamed_type)
+    );
+    let identifier_inputs = run_with(
+        &mut engine,
+        &mut budget,
+        "SET search_path = lookup_a, lookup_b, pg_catalog; \
+         SELECT to_regnamespace('LOOKUP_A'), to_regrole('LOOKUP_ROLE'), \
+                to_regcollation('SAME'), to_regcollation('\"same\"'), \
+                to_regtype('VARCHAR(3)'); \
+         SELECT to_regcollation('-1') IS NULL",
+    );
+    assert_eq!(
+        data_rows(&identifier_inputs),
+        ["lookup_a|lookup_role|same|same|character varying", "t"],
+        "{}",
+        String::from_utf8_lossy(&identifier_inputs)
+    );
+    for (query, state) in [
+        ("SELECT '-1'::regcollation", "42704"),
+        ("SELECT to_regtype('-1')", "42601"),
+        ("SELECT to_regcollation('database.schema.name')", "0A000"),
+        ("SELECT to_regtype('database.schema.name')", "0A000"),
+        ("SELECT to_regproc('database.schema.name')", "0A000"),
+        (
+            "SELECT to_regprocedure('database.schema.name(integer)')",
+            "0A000",
+        ),
+    ] {
+        let error = run_with(&mut engine, &mut budget, query);
+        assert!(
+            String::from_utf8_lossy(&error).contains(state),
+            "{query}: {}",
+            String::from_utf8_lossy(&error)
+        );
+    }
+    let binary_copy = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT collation_value, collation_values FROM lookup_a.catalog_refs) \
+         TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&binary_copy).contains(&b'E')
+            && binary_copy.windows(6).any(|bytes| bytes == b"PGCOPY"),
+        "{}",
+        String::from_utf8_lossy(&binary_copy)
+    );
+
+    let arena = Arena::new(&mut budget, "regcollation binary parameters", 1 << 16).unwrap();
+    let first_oid = engine
+        .storage
+        .resolve_collation(Some("lookup_a"), "same", 0)
+        .unwrap()
+        .oid();
+    let second_oid = engine
+        .storage
+        .resolve_collation(Some("lookup_b"), "same", 0)
+        .unwrap()
+        .oid();
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::REGCOLLATION,
+                &first_oid.to_be_bytes(),
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "lookup_a.same"
+    );
+    let mut binary_array = Vec::new();
+    binary_array.extend_from_slice(&1_i32.to_be_bytes());
+    binary_array.extend_from_slice(&0_i32.to_be_bytes());
+    binary_array.extend_from_slice(&crate::sql::types::oid::REGCOLLATION.to_be_bytes());
+    binary_array.extend_from_slice(&2_i32.to_be_bytes());
+    binary_array.extend_from_slice(&1_i32.to_be_bytes());
+    for oid in [first_oid, second_oid] {
+        binary_array.extend_from_slice(&4_i32.to_be_bytes());
+        binary_array.extend_from_slice(&oid.to_be_bytes());
+    }
+    assert_eq!(
+        engine
+            .decode_binary_parameter(
+                crate::sql::types::oid::REGCOLLATION_ARRAY,
+                &binary_array,
+                &arena,
+                0,
+            )
+            .unwrap()
+            .to_string(),
+        "{lookup_a.same,lookup_b.same}"
+    );
+    drop(arena);
+
+    let blocked = run_with(&mut engine, &mut budget, "DROP COLLATION lookup_a.same");
+    assert!(
+        String::from_utf8_lossy(&blocked).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&blocked)
+    );
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER COLLATION lookup_a.same RENAME TO renamed; \
+         SELECT value FROM lookup_a.collation_reference_view; \
+         SELECT to_regcollation('lookup_a.same') IS NULL, \
+                to_regcollation('lookup_a.renamed')",
+    );
+    assert_eq!(
+        data_rows(&renamed),
+        ["lookup_a.renamed", "t|lookup_a.renamed"],
+        "{}",
+        String::from_utf8_lossy(&renamed)
+    );
+    let dotted = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER COLLATION lookup_a.\"dot.name\" RENAME TO \"dot.renamed\"; \
+         SELECT value FROM lookup_a.dotted_collation_reference_view",
+    );
+    assert_eq!(
+        data_rows(&dotted),
+        ["lookup_a.\"dot.renamed\""],
+        "{}",
+        String::from_utf8_lossy(&dotted)
+    );
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP COLLATION lookup_a.renamed CASCADE; \
+         SELECT to_regclass('lookup_a.collation_reference_view') IS NULL",
+    );
+    assert_eq!(data_rows(&cascaded), ["t"]);
+}
+
+#[test]
+fn regcollation_values_and_dependencies_survive_object_cold_recovery() {
+    let mut config = test_config("regcollation-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("regcollation-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA durable_collations; \
+         CREATE COLLATION durable_collations.byte_order (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE TABLE durable_collation_values ( \
+             id integer PRIMARY KEY, value regcollation, values regcollation[] \
+         ); \
+         INSERT INTO durable_collation_values VALUES ( \
+             1, 'durable_collations.byte_order', \
+             ARRAY['durable_collations.byte_order']::regcollation[] \
+         ); \
+         CREATE VIEW durable_collation_view AS \
+             SELECT 'durable_collations.byte_order'::regcollation AS value",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER COLLATION durable_collations.byte_order RENAME TO byte_order_v2; \
+         INSERT INTO durable_collation_values VALUES ( \
+             2, 'durable_collations.byte_order_v2', \
+             ARRAY['durable_collations.byte_order_v2']::regcollation[] \
+         )",
+    );
+    assert!(
+        !String::from_utf8_lossy(&renamed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&renamed)
+    );
+    let view_slot = engine
+        .storage
+        .views_visible_to(0)
+        .find_map(|(slot, view)| (view.name.as_str() == "durable_collation_view").then_some(slot))
+        .unwrap();
+    let dependency = engine.storage.view_dependencies(view_slot).entries()[0];
+    assert_eq!(dependency.schema.as_str(), "durable_collations");
+    assert_eq!(dependency.name.as_str(), "byte_order_v2");
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id, value, values, pg_typeof(value), pg_typeof(values) \
+           FROM durable_collation_values ORDER BY id; \
+         SELECT value FROM durable_collation_view; \
+         SELECT to_regcollation('durable_collations.byte_order') IS NULL, \
+                to_regcollation('durable_collations.byte_order_v2')",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "1|durable_collations.byte_order_v2|{durable_collations.byte_order_v2}|regcollation|regcollation[]",
+            "2|durable_collations.byte_order_v2|{durable_collations.byte_order_v2}|regcollation|regcollation[]",
+            "durable_collations.byte_order_v2",
+            "t|durable_collations.byte_order_v2",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    assert_eq!(
+        row_description_type_oids(&recovered),
+        [
+            crate::sql::types::oid::INT4,
+            crate::sql::types::oid::REGCOLLATION,
+            crate::sql::types::oid::REGCOLLATION_ARRAY,
+            crate::sql::types::oid::REGTYPE,
+            crate::sql::types::oid::REGTYPE,
+        ]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn postgresql_18_refcursor_type_catalog_and_native_plpgsql_cursors() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

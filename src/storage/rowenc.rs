@@ -410,7 +410,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Regnamespace
         | ColType::Regrole
         | ColType::Regconfig
-        | ColType::Regdictionary => {
+        | ColType::Regdictionary
+        | ColType::Regcollation => {
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
             Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
@@ -622,7 +623,8 @@ pub(crate) fn decode<'a>(
             | ColType::Regnamespace
             | ColType::Regrole
             | ColType::Regconfig
-            | ColType::Regdictionary) => {
+            | ColType::Regdictionary
+            | ColType::Regcollation) => {
                 let type_oid = i32::from_le_bytes(
                     bytes
                         .get(at..at + 4)

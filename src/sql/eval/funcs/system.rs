@@ -552,6 +552,15 @@ pub(crate) fn dispatch<'a>(
             | "pg_get_statisticsobjdef_columns"
             | "format_type"
             | "to_regclass"
+            | "to_regproc"
+            | "to_regprocedure"
+            | "to_regoper"
+            | "to_regoperator"
+            | "to_regtype"
+            | "to_regnamespace"
+            | "to_regrole"
+            | "to_regcollation"
+            | "to_regtypemod"
             | "pg_encoding_to_char"
             | "pg_char_to_encoding"
             | "getdatabaseencoding"
@@ -1633,30 +1642,95 @@ pub(crate) fn dispatch<'a>(
                     arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
                 ))
             }
-            "to_regclass" => {
+            "to_regclass" | "to_regproc" | "to_regprocedure" | "to_regoper" | "to_regoperator"
+            | "to_regtype" | "to_regnamespace" | "to_regrole" | "to_regcollation"
+            | "to_regtypemod" => {
                 arity(1)?;
                 let value = eval_full(args[0], arena, params, row, hooks)?;
-                let name = match value {
-                    Datum::Text(name) | Datum::Bpchar(name) => name.trim_end_matches(' '),
+                let written = match value {
+                    Datum::Text(written) | Datum::Bpchar(written) => written.trim_end_matches(' '),
                     Datum::Null => return Ok(Datum::Null),
-                    other => return Err(type_mismatch("to_regclass", &other)),
+                    other => return Err(type_mismatch(name, &other)),
                 };
-                let Some(cat) = hooks.catalog else {
-                    return Ok(Datum::Null);
+                if matches!(name, "to_regtype" | "to_regtypemod")
+                    && let Some(identity) =
+                        super::super::cross_database_catalog_reference(written, false)
+                {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cross-database references are not implemented: {}",
+                        identity
+                    ));
+                }
+                if name == "to_regtypemod" {
+                    let (type_name, type_mod) =
+                        crate::sql::parser::parse_type_name(written, arena)?;
+                    let exists = ColType::from_sql_name(type_name).is_some()
+                        || hooks
+                            .catalog
+                            .is_some_and(|catalog| catalog.user_type_oid(type_name).is_some());
+                    return Ok(if exists {
+                        Datum::Int4(type_mod)
+                    } else {
+                        Datum::Null
+                    });
+                }
+                if name == "to_regtype" {
+                    if let Ok(oid) = written.parse::<u32>() {
+                        return super::super::regtype_of_oid(i64::from(oid), arena);
+                    }
+                    let (type_name, _) = crate::sql::parser::parse_type_name(written, arena)?;
+                    if let Some(catalog) = hooks.catalog
+                        && let Some(referenced_oid) = catalog.user_type_oid(type_name)
+                    {
+                        let rendered = catalog
+                            .user_type_name(type_name, arena)?
+                            .unwrap_or(type_name);
+                        return Ok(Datum::Regtype {
+                            referenced_oid,
+                            name: rendered,
+                        });
+                    }
+                    return match super::super::regtype_of_name(type_name) {
+                        Ok(value) => Ok(value),
+                        Err(error) if error.sqlstate == sqlstate::UNDEFINED_OBJECT => {
+                            Ok(Datum::Null)
+                        }
+                        Err(error) => Err(error),
+                    };
+                }
+                let target = match name {
+                    "to_regclass" => ColType::Regclass,
+                    "to_regproc" => ColType::Regproc,
+                    "to_regprocedure" => ColType::Regprocedure,
+                    "to_regoper" => ColType::Regoper,
+                    "to_regoperator" => ColType::Regoperator,
+                    "to_regnamespace" => ColType::Regnamespace,
+                    "to_regrole" => ColType::Regrole,
+                    "to_regcollation" => ColType::Regcollation,
+                    _ => unreachable!(),
                 };
-                let referenced_oid = match name.parse::<i32>() {
-                    Ok(oid) if oid >= 0 => oid,
-                    _ => match cat.reloid(name) {
-                        Some(oid) => oid,
-                        None => return Ok(Datum::Null),
-                    },
-                };
-                let rendered = cat.relname(referenced_oid, arena)?.unwrap_or(name);
-                Ok(Datum::RegObject {
-                    type_oid: crate::sql::types::oid::REGCLASS,
-                    referenced_oid,
-                    name: rendered,
-                })
+                match super::super::regobject_cast(
+                    Datum::Text(written),
+                    target,
+                    hooks.catalog,
+                    arena,
+                ) {
+                    Ok(value) => Ok(value),
+                    Err(error)
+                        if matches!(
+                            error.sqlstate.as_str(),
+                            sqlstate::UNDEFINED_OBJECT
+                                | sqlstate::UNDEFINED_FUNCTION
+                                | sqlstate::UNDEFINED_TABLE
+                                | sqlstate::INVALID_SCHEMA_NAME
+                                | sqlstate::AMBIGUOUS_FUNCTION
+                        ) =>
+                    {
+                        Ok(Datum::Null)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             "pg_encoding_to_char" => {
                 arity(1)?;

@@ -4608,7 +4608,8 @@ pub(crate) fn decode_binary_param<'a>(
         | oids::REGNAMESPACE
         | oids::REGROLE
         | oids::REGCONFIG
-        | oids::REGDICTIONARY => {
+        | oids::REGDICTIONARY
+        | oids::REGCOLLATION => {
             let b: [u8; 4] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Int4(i32::from_be_bytes(b)))
         }
@@ -5947,6 +5948,7 @@ mod tests {
             crate::sql::types::oid::REGROLE,
             crate::sql::types::oid::REGCONFIG,
             crate::sql::types::oid::REGDICTIONARY,
+            crate::sql::types::oid::REGCOLLATION,
         ] {
             assert_eq!(
                 decode_binary_param(oid, &bytes, &arena).expect("OID-family parameter decodes"),

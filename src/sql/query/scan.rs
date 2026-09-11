@@ -14,7 +14,7 @@ use crate::sql::ast::{
     SetTree, TableRef, TableSampleMethod,
 };
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums_collated, eval_full,
+    CatalogAccess, ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums_collated, eval_full,
     hash_key_collated, sqlstate,
 };
 use crate::sql::types::{ColType, Datum};
@@ -349,6 +349,57 @@ fn refresh_catalog_object_names<'a>(
 ) -> Result<(), SqlError> {
     let catalog = super::storage_catalog(storage, arena, txid);
     for value in values {
+        if let Datum::Array { element, raw } = *value
+            && element.is_catalog_reference()
+        {
+            let shape = crate::sql::array::shape(raw).expect("stored array has a valid shape");
+            let count = shape.element_count();
+            let mut refreshed = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+            for (index, output) in refreshed.iter_mut().take(count).enumerate() {
+                let item = crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
+                *output = match item {
+                    Datum::Null => Datum::Null,
+                    Datum::Regtype { referenced_oid, .. } => {
+                        if let Some(name) = catalog.type_name(referenced_oid, arena)? {
+                            Datum::Regtype {
+                                referenced_oid,
+                                name,
+                            }
+                        } else {
+                            crate::sql::eval::regtype_of_oid(i64::from(referenced_oid), arena)?
+                        }
+                    }
+                    Datum::RegObject { referenced_oid, .. } => crate::sql::eval::regobject_cast(
+                        Datum::Int4(referenced_oid),
+                        element.to_coltype(),
+                        Some(&catalog),
+                        arena,
+                    )?,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "invalid catalog object array element"
+                        ));
+                    }
+                };
+            }
+            *value = Datum::Array {
+                element,
+                raw: crate::sql::array::build_shaped(&refreshed[..count], shape, arena)?,
+            };
+            continue;
+        }
+        if let Datum::Regtype { referenced_oid, .. } = *value {
+            *value = if let Some(name) = catalog.type_name(referenced_oid, arena)? {
+                Datum::Regtype {
+                    referenced_oid,
+                    name,
+                }
+            } else {
+                crate::sql::eval::regtype_of_oid(i64::from(referenced_oid), arena)?
+            };
+            continue;
+        }
         let Datum::RegObject {
             type_oid,
             referenced_oid,

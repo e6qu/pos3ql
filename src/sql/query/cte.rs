@@ -5096,6 +5096,53 @@ fn rewrite_stored_collation<'a>(
     ))
 }
 
+fn rewrite_stored_regcollation_operand<'a>(
+    operand: &'a Expr<'a>,
+    type_name: &str,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    if type_name != "regcollation" {
+        return Ok(operand);
+    }
+    let Expr::Str(written) = operand else {
+        return Ok(operand);
+    };
+    let Some(dependencies) = context.dependencies else {
+        return Ok(operand);
+    };
+    let Some((referenced_schema, referenced_name)) =
+        crate::sql::catalog::split_qualified_name(written)
+    else {
+        return Ok(operand);
+    };
+    let referenced_schema = referenced_schema.unwrap_or("");
+    let Some(dependency) = dependencies.entries().iter().find(|dependency| {
+        dependency.class == crate::storage::DependencyClass::Collation
+            && dependency.referenced_schema.as_str() == referenced_schema
+            && dependency.referenced_name.as_str() == referenced_name
+    }) else {
+        return Ok(operand);
+    };
+    if !context
+        .storage
+        .collations_visible_to(context.txid)
+        .any(|(slot, _)| slot == usize::from(dependency.slot))
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "stored collation dependency \"{}\" does not exist",
+            written
+        ));
+    }
+    let oid = crate::sql::ast::Collation::Catalog(dependency.slot as u8).oid();
+    let rendered = arena.alloc_str_display(oid).map_err(|_| arena_full())?;
+    arena
+        .alloc(Expr::Str(rendered))
+        .map(|expression| &*expression)
+        .map_err(|_| arena_full())
+}
+
 fn text_search_configuration_argument<'a>(
     function: &str,
     args: &'a [&'a Expr<'a>],
@@ -5364,11 +5411,14 @@ fn subst_expr<'a>(
             operand,
             type_name,
             type_mod,
-        } => Expr::Cast {
-            operand: subst_expr(operand, context, arena)?,
-            type_name: rewrite_stored_type_name(type_name, context, arena)?,
-            type_mod: *type_mod,
-        },
+        } => {
+            let operand = subst_expr(operand, context, arena)?;
+            Expr::Cast {
+                operand: rewrite_stored_regcollation_operand(operand, type_name, context, arena)?,
+                type_name: rewrite_stored_type_name(type_name, context, arena)?,
+                type_mod: *type_mod,
+            }
+        }
         Expr::Collate { operand, collation } => Expr::Collate {
             operand: subst_expr(operand, context, arena)?,
             collation: rewrite_stored_collation(*collation, context)?,

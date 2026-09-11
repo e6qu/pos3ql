@@ -6329,6 +6329,7 @@ impl Engine {
     fn flush_committed_notifications(&mut self, txn: &TxnState) -> Result<(), SqlError> {
         for &op in txn.pending_listen_ops() {
             self.notify.apply(op)?;
+            self.storage.apply_backend_listen(op);
         }
         for i in 0..txn.pending_notify_count() {
             self.notify.enqueue(txn.pending_notification(i))?;
@@ -7872,8 +7873,60 @@ impl Engine {
         self.notify.clear_outbox();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_backend(
+        &self,
+        pid: i32,
+        database: crate::storage::DatabaseOid,
+        role: u16,
+        application_name: &str,
+        client_addr: Option<crate::sql::net::NetAddr>,
+        client_port: i32,
+        backend_start: i64,
+        ssl: bool,
+        ssl_version: Option<&'static str>,
+        ssl_cipher: Option<&'static str>,
+        ssl_bits: Option<i32>,
+    ) -> Result<(), SqlError> {
+        self.storage.register_backend(
+            pid,
+            database,
+            role,
+            application_name,
+            client_addr,
+            client_port,
+            backend_start,
+            ssl,
+            ssl_version,
+            ssl_cipher,
+            ssl_bits,
+        )
+    }
+
+    pub(crate) fn finish_backend_statement(&self, txn: &TxnState, pid: i32) {
+        let backend_xid = self
+            .storage
+            .assigned_transaction_identity(txn.txid)
+            .map(|xid| xid as u32);
+        self.storage
+            .finish_backend_statement(pid, txn.is_active(), txn.failed, backend_xid);
+    }
+
+    pub(crate) fn park_backend_statement(&self, pid: i32, object_io: bool) {
+        self.storage.park_backend_statement(pid, object_io);
+    }
+
+    pub(crate) fn cancel_backend_wait(&self, pid: i32) {
+        self.storage.cancel_backend_wait(pid);
+    }
+
+    pub(crate) fn take_backend_signal(&self) -> Option<crate::storage::BackendSignal> {
+        self.storage.take_backend_signal()
+    }
+
     /// Drops a closing connection's LISTEN registrations.
     pub fn drop_connection(&mut self, conn_id: i32) {
+        self.storage.unregister_backend(conn_id);
         self.notify.drop_conn(conn_id);
         self.invalidate_replication_snapshot(conn_id);
         self.storage.release_connection_advisory_locks(conn_id);
@@ -8219,6 +8272,18 @@ impl Engine {
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit, guc);
+        let application_name = guc.get_owned("application_name").unwrap_or_default();
+        let backend_xid = self
+            .storage
+            .assigned_transaction_identity(txn.txid)
+            .map(|xid| xid as u32);
+        self.storage.begin_backend_statement(
+            conn_id,
+            text,
+            application_name.as_str(),
+            datetime::transaction_micros(),
+            backend_xid,
+        );
         let mut statements = [None; parser::MAX_LIST];
         let mut statement_count = 0usize;
         loop {
@@ -8457,6 +8522,18 @@ impl Engine {
             exec::PlpgsqlTransactionContext::NonAtomic
         };
         self.ensure_txn(txn, TxnMode::Implicit, guc);
+        let application_name = guc.get_owned("application_name").unwrap_or_default();
+        let backend_xid = self
+            .storage
+            .assigned_transaction_identity(txn.txid)
+            .map(|xid| xid as u32);
+        self.storage.begin_backend_statement(
+            conn_id,
+            text,
+            application_name.as_str(),
+            datetime::transaction_micros(),
+            backend_xid,
+        );
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         emit_parse_warnings(&mut parser, responder)?;

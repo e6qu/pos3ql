@@ -10657,6 +10657,59 @@ struct RecentTransactionStatus {
     committed: bool,
 }
 
+/// One live client backend.  This is process state, not catalog state: the
+/// fixed registry is rebuilt as connections authenticate and is never written
+/// to WAL or checkpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackendActivityState {
+    Idle,
+    Active,
+    IdleInTransaction,
+    IdleInTransactionAborted,
+}
+
+impl BackendActivityState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Active => "active",
+            Self::IdleInTransaction => "idle in transaction",
+            Self::IdleInTransactionAborted => "idle in transaction (aborted)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BackendActivity {
+    pub(crate) pid: i32,
+    pub(crate) database: DatabaseOid,
+    pub(crate) role: u16,
+    pub(crate) application_name: StackStr<64>,
+    pub(crate) client_addr: Option<crate::sql::net::NetAddr>,
+    pub(crate) client_port: i32,
+    pub(crate) backend_start: i64,
+    pub(crate) xact_start: Option<i64>,
+    pub(crate) query_start: Option<i64>,
+    pub(crate) state_change: i64,
+    pub(crate) state: BackendActivityState,
+    pub(crate) backend_xid: Option<u32>,
+    pub(crate) query: StackStr<1024>,
+    pub(crate) wait_event_type: Option<&'static str>,
+    pub(crate) wait_event: Option<&'static str>,
+    pub(crate) ssl: bool,
+    pub(crate) ssl_version: Option<&'static str>,
+    pub(crate) ssl_cipher: Option<&'static str>,
+    pub(crate) ssl_bits: Option<i32>,
+    listening_channels: [crate::sql::notify::Channel; crate::sql::notify::CHANNELS_PER_CONN],
+    listening_channel_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackendSignal {
+    Cancel(i32),
+    Terminate(i32),
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -10702,6 +10755,8 @@ pub struct Storage {
     databases: FixedVec<DatabaseDef>,
     current_database: DatabaseOid,
     current_connection_id: Cell<i32>,
+    backends: std::cell::RefCell<FixedVec<BackendActivity>>,
+    backend_signals: std::cell::RefCell<FixedVec<BackendSignal>>,
     /// Transactions that resolved a temporary relation. PREPARE TRANSACTION
     /// must reject them before state can outlive the owning connection.
     temporary_transactions: std::cell::RefCell<FixedVec<u32>>,
@@ -11546,6 +11601,289 @@ impl Storage {
 
     pub(crate) fn current_connection_id(&self) -> i32 {
         self.current_connection_id.get()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_backend(
+        &self,
+        pid: i32,
+        database: DatabaseOid,
+        role: u16,
+        application_name: &str,
+        client_addr: Option<crate::sql::net::NetAddr>,
+        client_port: i32,
+        backend_start: i64,
+        ssl: bool,
+        ssl_version: Option<&'static str>,
+        ssl_cipher: Option<&'static str>,
+        ssl_bits: Option<i32>,
+    ) -> Result<(), SqlError> {
+        let now = crate::sql::datetime::now_micros();
+        let activity = BackendActivity {
+            pid,
+            database,
+            role,
+            application_name: StackStr::from_str(application_name),
+            client_addr,
+            client_port,
+            backend_start,
+            xact_start: None,
+            query_start: None,
+            state_change: now,
+            state: BackendActivityState::Idle,
+            backend_xid: None,
+            query: StackStr::new(),
+            wait_event_type: None,
+            wait_event: None,
+            ssl,
+            ssl_version,
+            ssl_cipher,
+            ssl_bits,
+            listening_channels: [crate::sql::notify::Channel::new();
+                crate::sql::notify::CHANNELS_PER_CONN],
+            listening_channel_count: 0,
+        };
+        let mut backends = self.backends.borrow_mut();
+        if let Some(existing) = backends.iter().position(|entry| entry.pid == pid) {
+            backends[existing] = activity;
+            return Ok(());
+        }
+        backends.push(activity).map_err(|_| {
+            sql_err!(
+                sqlstate::TOO_MANY_CONNECTIONS,
+                "backend activity registry is full"
+            )
+        })?;
+        drop(backends);
+        Ok(())
+    }
+
+    pub(crate) fn begin_backend_statement(
+        &self,
+        pid: i32,
+        query: &str,
+        application_name: &str,
+        xact_start: i64,
+        backend_xid: Option<u32>,
+    ) {
+        let now = crate::sql::datetime::statement_micros();
+        if let Some(activity) = self
+            .backends
+            .borrow_mut()
+            .iter_mut()
+            .find(|activity| activity.pid == pid)
+        {
+            activity.application_name = StackStr::from_str(application_name);
+            activity.query = StackStr::from_str(query);
+            activity.query_start = Some(now);
+            activity.xact_start.get_or_insert(xact_start);
+            activity.backend_xid = backend_xid;
+            activity.state = BackendActivityState::Active;
+            activity.state_change = now;
+            activity.wait_event_type = None;
+            activity.wait_event = None;
+        }
+    }
+
+    pub(crate) fn park_backend_statement(&self, pid: i32, object_io: bool) {
+        let wait = if object_io {
+            (Some("IO"), Some("ObjectStorageRead"))
+        } else if self.advisory_locks.borrow().blocker_pid_count(pid) != 0 {
+            (Some("Lock"), Some("advisory"))
+        } else if self.row_locks.borrow().blocker_pid_count(pid) != 0 {
+            (Some("Lock"), Some("transactionid"))
+        } else {
+            (None, None)
+        };
+        if let Some(activity) = self
+            .backends
+            .borrow_mut()
+            .iter_mut()
+            .find(|activity| activity.pid == pid)
+            && (object_io || activity.wait_event_type.is_none())
+        {
+            activity.wait_event_type = wait.0;
+            activity.wait_event = wait.1;
+        }
+    }
+
+    fn mark_current_backend_wait(&self, wait_event_type: &'static str, wait_event: &'static str) {
+        let pid = self.current_connection_id.get();
+        if let Some(activity) = self
+            .backends
+            .borrow_mut()
+            .iter_mut()
+            .find(|activity| activity.pid == pid)
+        {
+            activity.wait_event_type = Some(wait_event_type);
+            activity.wait_event = Some(wait_event);
+        }
+    }
+
+    pub(crate) fn cancel_backend_wait(&self, pid: i32) {
+        self.advisory_locks
+            .borrow_mut()
+            .cancel_statement(pid, &mut self.row_locks.borrow_mut());
+    }
+
+    pub(crate) fn finish_backend_statement(
+        &self,
+        pid: i32,
+        transaction_active: bool,
+        transaction_failed: bool,
+        backend_xid: Option<u32>,
+    ) {
+        let now = crate::sql::datetime::now_micros();
+        if let Some(activity) = self
+            .backends
+            .borrow_mut()
+            .iter_mut()
+            .find(|activity| activity.pid == pid)
+        {
+            activity.state = if transaction_failed {
+                BackendActivityState::IdleInTransactionAborted
+            } else if transaction_active {
+                BackendActivityState::IdleInTransaction
+            } else {
+                BackendActivityState::Idle
+            };
+            activity.state_change = now;
+            activity.wait_event_type = None;
+            activity.wait_event = None;
+            activity.backend_xid = backend_xid;
+            if !transaction_active {
+                activity.xact_start = None;
+            }
+        }
+    }
+
+    pub(crate) fn unregister_backend(&self, pid: i32) {
+        let mut backends = self.backends.borrow_mut();
+        if let Some(index) = backends.iter().position(|activity| activity.pid == pid) {
+            backends.swap_remove(index);
+        }
+    }
+
+    pub(crate) fn backend_count(&self) -> usize {
+        self.backends.borrow().len()
+    }
+
+    pub(crate) fn visit_backends(&self, mut visit: impl FnMut(BackendActivity)) {
+        for &activity in self.backends.borrow().iter() {
+            visit(activity);
+        }
+    }
+
+    pub(crate) fn request_backend_signal(
+        &self,
+        pid: i32,
+        terminate: bool,
+        txid: u32,
+    ) -> Result<bool, SqlError> {
+        let Some(target) = self
+            .backends
+            .borrow()
+            .iter()
+            .find(|activity| activity.pid == pid)
+            .copied()
+        else {
+            return Ok(false);
+        };
+        let current_name = crate::sql::eval::funcs::system::current_user_owned();
+        let current_role = self
+            .find_role_visible(current_name.as_str(), txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
+        let current_superuser = self.role(current_role).attributes_to(txid).superuser;
+        let target_role = usize::from(target.role);
+        let target_superuser = self.role(target_role).attributes_to(txid).superuser;
+        if target.pid != self.current_connection_id.get()
+            && !current_superuser
+            && (target_superuser || !self.role_is_member_of(current_role, target_role, txid))
+        {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "must be a member of the role whose process is being signaled or a superuser"
+            ));
+        }
+        let signal = if terminate {
+            BackendSignal::Terminate(pid)
+        } else {
+            BackendSignal::Cancel(pid)
+        };
+        let mut signals = self.backend_signals.borrow_mut();
+        if !signals.contains(&signal) {
+            signals.push(signal).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many pending backend signals"
+                )
+            })?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn take_backend_signal(&self) -> Option<BackendSignal> {
+        self.backend_signals.borrow_mut().pop()
+    }
+
+    pub(crate) fn apply_backend_listen(&self, operation: crate::sql::notify::ListenOp) {
+        let (pid, channel, clear_all) = match operation {
+            crate::sql::notify::ListenOp::Listen { conn_id, channel } => {
+                (conn_id, Some((channel, true)), false)
+            }
+            crate::sql::notify::ListenOp::Unlisten { conn_id, channel } => {
+                (conn_id, Some((channel, false)), false)
+            }
+            crate::sql::notify::ListenOp::UnlistenAll { conn_id } => (conn_id, None, true),
+        };
+        let mut backends = self.backends.borrow_mut();
+        let Some(activity) = backends.iter_mut().find(|activity| activity.pid == pid) else {
+            return;
+        };
+        if clear_all {
+            activity.listening_channel_count = 0;
+            return;
+        }
+        let (channel, add) = channel.expect("single-channel operation");
+        let existing = activity.listening_channels[..activity.listening_channel_count]
+            .iter()
+            .position(|candidate| candidate == &channel);
+        if add {
+            if existing.is_none()
+                && activity.listening_channel_count < activity.listening_channels.len()
+            {
+                activity.listening_channels[activity.listening_channel_count] = channel;
+                activity.listening_channel_count += 1;
+            }
+        } else if let Some(index) = existing {
+            activity.listening_channel_count -= 1;
+            activity.listening_channels[index] =
+                activity.listening_channels[activity.listening_channel_count];
+        }
+    }
+
+    pub(crate) fn listening_channel_count(&self, pid: i32) -> usize {
+        self.backends
+            .borrow()
+            .iter()
+            .find(|activity| activity.pid == pid)
+            .map_or(0, |activity| activity.listening_channel_count)
+    }
+
+    pub(crate) fn listening_channel_at(
+        &self,
+        pid: i32,
+        index: usize,
+    ) -> Option<crate::sql::notify::Channel> {
+        self.backends
+            .borrow()
+            .iter()
+            .find(|activity| activity.pid == pid)
+            .and_then(|activity| {
+                activity.listening_channels[..activity.listening_channel_count]
+                    .get(index)
+                    .copied()
+            })
     }
 
     fn mark_temporary_transaction(&self, txid: u32) {
@@ -12666,6 +13004,8 @@ impl Storage {
             + MAX_DATABASES * size_of::<DatabaseDef>()
             + MAX_TABLESPACES * size_of::<TablespaceDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
+            + config.max_connections as usize * size_of::<BackendActivity>()
+            + config.max_connections as usize * size_of::<BackendSignal>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<(u32, u64)>()
             + (config.max_connections as usize + config.max_prepared_transactions)
@@ -13408,6 +13748,16 @@ impl Storage {
             "temporary_transactions",
             transaction_capacity,
         )?);
+        let backends = std::cell::RefCell::new(FixedVec::new(
+            budget,
+            "backend_activity",
+            config.max_connections as usize,
+        )?);
+        let backend_signals = std::cell::RefCell::new(FixedVec::new(
+            budget,
+            "backend_signals",
+            config.max_connections as usize,
+        )?);
         let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
             "table_locks",
@@ -13473,6 +13823,8 @@ impl Storage {
             databases,
             current_database: DatabaseOid::POSTGRES,
             current_connection_id: Cell::new(0),
+            backends,
+            backend_signals,
             temporary_transactions,
             tablespaces,
             schemas,
@@ -35761,6 +36113,7 @@ impl Storage {
             self.row_locks
                 .borrow_mut()
                 .wait_for(wait_owner, blocker.wait_owner)?;
+            self.mark_current_backend_wait("Lock", "relation");
             return Err(sql_err!(
                 sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for a relation lock"

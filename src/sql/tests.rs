@@ -9212,6 +9212,7 @@ fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
     let mut config = test_config("ordered-catalog-correlated-scratch");
     config.max_tables = 64;
     config.max_value_indexes = 64;
+    config.work_arena_bytes = 3 << 20;
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for relation in 0..14 {

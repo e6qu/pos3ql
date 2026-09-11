@@ -922,6 +922,7 @@ impl Server {
                 }
             }
         }
+        self.process_backend_signals();
         self.terminate_dropped_database_connections();
         if self.engine.take_system_settings_reload() {
             for slot in self.slots.iter() {
@@ -971,9 +972,38 @@ impl Server {
             .slots
             .iter()
             .position(|slot| request.matches(slot.conn.id(), &self.cancel_key))
-            && self.slots[index].conn.cancel_parked()
+            && self.slots[index].conn.cancel_parked(&mut self.engine)
         {
             self.sync_write_interest(index);
+        }
+    }
+
+    fn process_backend_signals(&mut self) {
+        while let Some(signal) = self.engine.take_backend_signal() {
+            let (pid, terminate) = match signal {
+                crate::storage::BackendSignal::Cancel(pid) => (pid, false),
+                crate::storage::BackendSignal::Terminate(pid) => (pid, true),
+            };
+            let Some(index) = self
+                .slots
+                .iter()
+                .position(|slot| slot.conn.is_open() && slot.conn.id() == pid)
+            else {
+                continue;
+            };
+            if terminate {
+                {
+                    let slot = &mut self.slots[index];
+                    self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
+                }
+                if self.slots[index].conn.terminate_by_administrator() {
+                    self.sync_write_interest(index);
+                } else {
+                    self.release(index);
+                }
+            } else if self.slots[index].conn.cancel_parked(&mut self.engine) {
+                self.sync_write_interest(index);
+            }
         }
     }
 

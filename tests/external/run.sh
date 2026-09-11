@@ -1304,8 +1304,12 @@ STLS_PID=$START_PID
 # (psql aborts if the SSLRequest is declined), so this both runs SQL over the
 # encrypted link and proves it is encrypted.
 enc=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=require" -X -t -A -c "SELECT 'ok'" 2>&1)
+tls_stats=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=require" -X -t -A \
+  -c "SELECT ssl AND version IN ('TLSv1.2','TLSv1.3') AND cipher IS NOT NULL AND bits IN (128,256) FROM pg_stat_ssl WHERE pid=pg_backend_pid()" 2>&1)
 # A plaintext client must still connect (the SSLRequest is declined with 'N').
 plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=disable" -X -t -A -c "SELECT 'plain'" 2>&1)
+plain_stats=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=disable" -X -t -A \
+  -c "SELECT NOT ssl AND version IS NULL AND cipher IS NULL AND bits IS NULL FROM pg_stat_ssl WHERE pid=pg_backend_pid()" 2>&1)
 # A large result (>64KiB, the send buffer) exercises the streaming drain through
 # the session: its bytes must match the same query over plaintext exactly.
 "$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=require" -X -q \
@@ -1314,10 +1318,10 @@ plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=disable"
 big_tls=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=require" -X -t -A -c "SELECT n, s FROM stls ORDER BY n" 2>&1 | md5sum | cut -d' ' -f1)
 big_plain=$("$PSQL" "host=127.0.0.1 port=${STLS_PORT} user=postgres sslmode=disable" -X -t -A -c "SELECT n, s FROM stls ORDER BY n" 2>&1 | md5sum | cut -d' ' -f1)
 kill -9 $STLS_PID 2>/dev/null; wait $STLS_PID 2>/dev/null
-if [[ "$enc" == "ok" && "$plain" == "plain" && "$big_tls" == "$big_plain" && -n "$big_tls" ]]; then
-  ok "server-side TLS (sslmode=require works, plaintext coexists, streaming byte-exact)"
+if [[ "$enc" == "ok" && "$tls_stats" == "t" && "$plain" == "plain" && "$plain_stats" == "t" && "$big_tls" == "$big_plain" && -n "$big_tls" ]]; then
+  ok "server-side TLS (live statistics, plaintext coexistence, streaming byte-exact)"
 else
-  bad "server-side TLS (enc=$enc plain=$plain tls_md5=$big_tls plain_md5=$big_plain)"
+  bad "server-side TLS (enc=$enc tls_stats=$tls_stats plain=$plain plain_stats=$plain_stats tls_md5=$big_tls plain_md5=$big_plain)"
   tail -10 "$WORK/server-tls.log"
 fi
 

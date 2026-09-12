@@ -41,9 +41,11 @@ logical-replication boundary is specified separately in
   complete startup-bounded hash map; durable equality probes use per-block
   filters. Checkpoints externally sort durable keys using PostgreSQL type and
   collation semantics, and prefix/range probes seek by immutable per-block key
-  bounds. Ordered result traversal and ORDER BY satisfaction,
-  join-parameterized scans, expression and partial matching, and
-  index-only scans remain production work.
+  bounds. Compatible `ORDER BY` clauses use forward/backward compact-key
+  ordering with equality-fixed prefixes and exact PostgreSQL NULL placement;
+  key-covered projections execute as index-only scans. `INCLUDE` payload
+  coverage, join-parameterized scans, and expression and partial matching
+  remain production work.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

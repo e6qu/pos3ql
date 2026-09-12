@@ -313,6 +313,31 @@ pub enum After {
     Close,
 }
 
+/// Work completed by a protocol input or parked-statement retry whose output
+/// must remain buffered until the server-wide durability barrier completes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingResponse {
+    after: After,
+    publication_mark: Option<usize>,
+}
+
+impl PendingResponse {
+    const fn closed() -> Self {
+        Self::unguarded(After::Close)
+    }
+
+    const fn unguarded(after: After) -> Self {
+        Self {
+            after,
+            publication_mark: None,
+        }
+    }
+
+    pub(crate) const fn closes(self) -> bool {
+        matches!(self.after, After::Close)
+    }
+}
+
 pub struct Conn {
     stream: Option<TcpStream>,
     pub recv: FixedBuf,
@@ -664,28 +689,21 @@ impl Conn {
         }
     }
 
-    pub fn on_readable(
+    pub(crate) fn on_readable(
         &mut self,
         engine: &mut Engine,
         cancel_key: &[u8],
         auth: &AuthContext,
         tls_config: Option<&std::sync::Arc<rustls::ServerConfig>>,
-    ) -> After {
+    ) -> PendingResponse {
         if self.stream.is_none() {
-            return After::Close;
+            return PendingResponse::closed();
         }
         if self.terminate_after_flush {
-            return match self.flush() {
-                Ok(()) if self.send.is_empty() => After::Close,
-                Ok(()) => After::Continue,
-                Err(()) => After::Close,
-            };
+            return PendingResponse::unguarded(After::Continue);
         }
         if self.parked {
-            return match self.flush() {
-                Ok(()) => After::Continue,
-                Err(()) => After::Close,
-            };
+            return PendingResponse::unguarded(After::Continue);
         }
         let space = self.recv.writable();
         if space.is_empty() {
@@ -696,8 +714,7 @@ impl Conn {
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "message exceeds the connection receive buffer",
             );
-            let _ = self.flush();
-            return After::Close;
+            return PendingResponse::unguarded(After::Close);
         }
         // Decrypted plaintext when a TLS session is live; raw bytes otherwise.
         let read_result = if let Some(tls) = self.tls.as_mut() {
@@ -706,24 +723,29 @@ impl Conn {
             self.stream.as_mut().unwrap().read(space)
         };
         match read_result {
-            Ok(0) => return After::Close,
+            Ok(0) => return PendingResponse::closed(),
             Ok(n) => self.recv.advance(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return After::Close,
-        }
-        // A failed prior publication is retried before this readable batch
-        // can observe its locally journaled state.  Close on failure: the
-        // client receives no success frame and can resolve the unknown
-        // outcome by reconnecting, rather than running behind a local-only
-        // commit.
-        if engine.commit_wal().is_err() {
-            return After::Close;
+            Err(_) => return PendingResponse::closed(),
         }
         let output_mark = self.send.mark();
-        let mut after = self.process(engine, cancel_key, auth, tls_config);
-        if after != After::Close
-            && let Err(error) = engine.commit_wal()
+        PendingResponse {
+            after: self.process(engine, cancel_key, auth, tls_config),
+            publication_mark: Some(output_mark),
+        }
+    }
+
+    /// Releases one buffered response after the reactor's shared publication
+    /// barrier. Every path that can execute SQL, including parked retries,
+    /// finishes here before any success bytes reach the socket.
+    pub(crate) fn finish_response(
+        &mut self,
+        mut pending: PendingResponse,
+        publication_error: Option<&SqlError>,
+    ) -> After {
+        if pending.after != After::Close
+            && let (Some(output_mark), Some(error)) = (pending.publication_mark, publication_error)
         {
             // No success response may cross the object-store durability
             // boundary.  The journal remains available for a later retry,
@@ -735,19 +757,14 @@ impl Conn {
                 .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
                 .is_err()
             {
-                after = After::Close;
+                pending.after = After::Close;
             }
-        }
-        if after != After::Close {
-            // Publication completed above, so checkpoint work can safely
-            // capture the committed state and keep the bounded local journal
-            // from filling under a sustained write stream.
-            engine.maybe_checkpoint();
         }
         let flushed = self.flush();
         self.activate_pending_tls();
         match flushed {
-            Ok(()) => after,
+            Ok(()) if self.terminate_after_flush && self.send.is_empty() => After::Close,
+            Ok(()) => pending.after,
             Err(()) => After::Close,
         }
     }
@@ -829,21 +846,22 @@ impl Conn {
         }
     }
 
-    pub fn retry_parked(
+    pub(crate) fn retry_parked(
         &mut self,
         engine: &mut Engine,
         generation: u64,
         retry_io_waiters: bool,
-    ) -> After {
+    ) -> Option<PendingResponse> {
         if !self.parked
             || (self.parked_for_io && !retry_io_waiters)
             || (!self.parked_for_io
                 && self.parked_generation == generation
                 && !self.lock_timeout_expired())
         {
-            return After::Continue;
+            return None;
         }
         self.parked = false;
+        let output_mark = self.send.mark();
         let after = loop {
             match self.process_message(engine) {
                 Step::Close => break After::Close,
@@ -856,10 +874,10 @@ impl Conn {
                 Step::Continue => {}
             }
         };
-        match self.flush() {
-            Ok(()) => after,
-            Err(()) => After::Close,
-        }
+        Some(PendingResponse {
+            after,
+            publication_mark: Some(output_mark),
+        })
     }
 
     pub(crate) fn lock_wait_remaining(&self) -> Option<Duration> {

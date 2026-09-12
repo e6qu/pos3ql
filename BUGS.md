@@ -54,3 +54,13 @@ derived tables, bit/character/type-input edges, and truncated enum diagnostics
 from `pg_input_error_info` were fixed in the same change. Unsupported hash-index execution,
 physical planner parity, and native server extensions are architecture limits
 recorded in the compatibility and performance plans, not deferred bugs.
+
+The performance and scaling review found that each readable connection owned
+its own synchronous object-publication barrier and that a statement resumed
+after a row-lock or object-read wait could flush success without any object
+publication barrier. Both paths now enter one fixed-capacity reactor-wide
+response batch, and the CI performance smoke test ratchets its durability,
+memory, cold-recovery, and request-amplification behavior. External driver
+testing then exposed deferred session teardown allowing another same-turn
+connection to observe a terminated session's temporary relation; close/EOF
+teardown now remains immediate while live responses retain group publication.

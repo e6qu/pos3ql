@@ -7,6 +7,12 @@
 
 use std::fmt;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStoreAddressing {
+    Path,
+    VirtualHosted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Address the PostgreSQL wire listener binds to.
@@ -134,7 +140,7 @@ pub struct Config {
     /// it is recreated empty at startup and never published to object storage.
     pub temporary_spill_bytes: usize,
     /// Durable object storage on/off. When on, checkpoints snapshot to the
-    /// configured namespace and a wiped node cold-starts from it.
+    /// configured bucket and prefix and a wiped node cold-starts from them.
     pub object_store_on: bool,
     /// `object_store = sim`: storage backed by the in-process deterministic
     /// virtual namespace instead of a network endpoint — the storage VOPR's
@@ -149,14 +155,22 @@ pub struct Config {
     pub wal_upload_sync: bool,
     /// Scratch for a published commit batch. Must hold one journal batch.
     pub wal_upload_buffer_bytes: usize,
-    /// Generic object-store gateway authority (host:port).
+    /// S3-compatible data-plane authority (`host:port`).
     pub object_store_endpoint: String,
-    /// Gateway namespace isolating this database's durable objects.
-    pub object_store_namespace: String,
-    /// Optional opaque bearer token for the gateway.
-    pub object_store_token: String,
-    /// Prepended to every object key within the namespace.
+    /// Bucket containing this database's durable objects.
+    pub object_store_bucket: String,
+    /// Prepended to every object key within the bucket.
     pub object_store_prefix: String,
+    /// Signature Version 4 region/signing scope.
+    pub object_store_region: String,
+    /// Explicit Signature Version 4 credentials. Credential discovery through
+    /// vendor SDKs or instance metadata is outside the engine.
+    pub object_store_access_key: String,
+    pub object_store_secret_key: String,
+    /// Optional temporary-credential session token.
+    pub object_store_session_token: String,
+    /// Standard S3 bucket addressing used for every request.
+    pub object_store_addressing: ObjectStoreAddressing,
     /// Request/response head assembly buffer.
     pub object_store_head_bytes: usize,
     /// Largest response body (bounds ranged GETs and LIST pages).
@@ -253,9 +267,13 @@ impl Config {
             wal_upload_sync: false,
             wal_upload_buffer_bytes: 8 * MIB,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
-            object_store_namespace: "pos3ql".to_string(),
-            object_store_token: String::new(),
+            object_store_bucket: "pos3ql".to_string(),
             object_store_prefix: String::new(),
+            object_store_region: "us-east-1".to_string(),
+            object_store_access_key: String::new(),
+            object_store_secret_key: String::new(),
+            object_store_session_token: String::new(),
+            object_store_addressing: ObjectStoreAddressing::Path,
             object_store_head_bytes: 16 * KIB,
             object_store_response_bytes: 4 * MIB,
             object_store_get_slots: 4,
@@ -537,9 +555,28 @@ impl Config {
                     }
                 },
                 "object_store_endpoint" => config.object_store_endpoint = value.to_string(),
-                "object_store_namespace" => config.object_store_namespace = value.to_string(),
-                "object_store_token" => config.object_store_token = value.to_string(),
+                "object_store_bucket" => config.object_store_bucket = value.to_string(),
                 "object_store_prefix" => config.object_store_prefix = value.to_string(),
+                "object_store_region" => config.object_store_region = value.to_string(),
+                "object_store_access_key" => config.object_store_access_key = value.to_string(),
+                "object_store_secret_key" => config.object_store_secret_key = value.to_string(),
+                "object_store_session_token" => {
+                    config.object_store_session_token = value.to_string()
+                }
+                "object_store_addressing" => {
+                    config.object_store_addressing = match value {
+                        "path" => ObjectStoreAddressing::Path,
+                        "virtual_hosted" => ObjectStoreAddressing::VirtualHosted,
+                        other => {
+                            return Err(ConfigError::at(
+                                line_no,
+                                format!(
+                                    "object_store_addressing must be path or virtual_hosted, got '{other}'"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 "object_store_head_bytes" => {
                     config.object_store_head_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
@@ -629,6 +666,27 @@ impl Config {
                     "object_store requires wal_upload = on and wal_upload_sync = on; local disk is a cache, not a durable fallback"
                         .to_string(),
                 ));
+            }
+            if !config.object_store_sim {
+                for (name, value) in [
+                    ("object_store_bucket", config.object_store_bucket.as_str()),
+                    ("object_store_region", config.object_store_region.as_str()),
+                    (
+                        "object_store_access_key",
+                        config.object_store_access_key.as_str(),
+                    ),
+                    (
+                        "object_store_secret_key",
+                        config.object_store_secret_key.as_str(),
+                    ),
+                ] {
+                    if value.is_empty() {
+                        return Err(ConfigError::at(
+                            0,
+                            format!("object_store = on requires {name}"),
+                        ));
+                    }
+                }
             }
         }
         // Server TLS needs a certificate and a key: refuse a half-configured
@@ -945,14 +1003,20 @@ sql_arena_bytes = 4096
     }
 
     #[test]
-    fn object_store_defaults_to_commit_durable_in_namespace() {
-        let c = Config::parse("object_store = on\n").unwrap();
+    fn object_store_requires_direct_s3_profile_and_commit_durability() {
+        let direct = "object_store = on\n\
+                      object_store_bucket = durable-data\n\
+                      object_store_region = local\n\
+                      object_store_access_key = access\n\
+                      object_store_secret_key = secret\n";
+        let c = Config::parse(direct).unwrap();
         assert!(
             c.wal_upload && c.wal_upload_sync,
             "the plan-of-record default"
         );
-        assert!(Config::parse("object_store = on\nwal_upload = off\n").is_err());
-        assert!(Config::parse("object_store = on\nwal_upload_sync = off\n").is_err());
+        assert!(Config::parse("object_store = on\n").is_err());
+        assert!(Config::parse(&format!("{direct}wal_upload = off\n")).is_err());
+        assert!(Config::parse(&format!("{direct}wal_upload_sync = off\n")).is_err());
         // Without object storage nothing is implied.
         let c = Config::parse("").unwrap();
         assert!(!c.object_store_on && !c.wal_upload && !c.wal_upload_sync);
@@ -963,33 +1027,29 @@ sql_arena_bytes = 4096
 
     #[test]
     fn object_store_get_slots_are_fixed_and_nonzero() {
-        let c = Config::parse("object_store = on\nobject_store_get_slots = 7\n").unwrap();
+        let c = Config::parse("object_store = sim\nobject_store_get_slots = 7\n").unwrap();
         assert_eq!(c.object_store_get_slots, 7);
-        let err = Config::parse("object_store = on\nobject_store_get_slots = 0\n").unwrap_err();
+        let err = Config::parse("object_store = sim\nobject_store_get_slots = 0\n").unwrap_err();
         assert!(err.message.contains("at least 1"), "{err}");
     }
 
     #[test]
     fn object_store_hedge_deadline_is_configured() {
-        let c = Config::parse("object_store = on\nobject_store_hedge_after_ms = 175\n").unwrap();
+        let c = Config::parse("object_store = sim\nobject_store_hedge_after_ms = 175\n").unwrap();
         assert_eq!(c.object_store_hedge_after_ms, 175);
         assert_eq!(Config::parse("").unwrap().object_store_hedge_after_ms, 0);
     }
 
     #[test]
-    fn provider_configuration_is_rejected() {
-        for key in [
-            "s3",
-            "s3_endpoint",
-            "object_store_bucket",
-            "object_store_region",
-            "object_store_access_key",
-            "object_store_secret_key",
-        ] {
-            let error = Config::parse(&format!("{key} = value\n")).unwrap_err();
-            assert_eq!(error.line, 1);
-            assert!(error.message.contains("unknown key"), "{error}");
-        }
+    fn s3_addressing_is_a_closed_protocol_state() {
+        assert_eq!(
+            Config::parse("object_store_addressing = virtual_hosted\n")
+                .unwrap()
+                .object_store_addressing,
+            ObjectStoreAddressing::VirtualHosted
+        );
+        let error = Config::parse("object_store_addressing = automatic\n").unwrap_err();
+        assert!(error.message.contains("path or virtual_hosted"), "{error}");
     }
 
     #[test]

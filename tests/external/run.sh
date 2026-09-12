@@ -35,7 +35,11 @@ select_port() { # explicit value, first automatic value, last automatic value
   printf '%s\n' "$selected"
 }
 
-GATEWAY_PORT=$(select_port "${POS3QL_GATEWAY_PORT:-}" 19311 19331)
+S3_TEST_PORT=$(select_port "${POS3QL_S3_TEST_PORT:-}" 19311 19331)
+S3_TEST_BUCKET=pos3ql-external
+S3_TEST_REGION=test-region
+S3_TEST_ACCESS_KEY=pos3ql-test-access
+S3_TEST_SECRET_KEY=pos3ql-test-secret
 PG_PORT=$(select_port "${POS3QL_PG_PORT:-}" 15433 15463)
 TORTURE_PG_PORT=$(select_port "${POS3QL_TORTURE_PG_PORT:-}" 15470 15490)
 # An externally managed publisher is an explicit fixture. When configured, its
@@ -151,8 +155,8 @@ cleanup() {
   if [[ -n "${RECVLOGICAL_PID:-}" ]]; then
     kill "$RECVLOGICAL_PID" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${GATEWAY_PID:-}" ]]; then
-    kill "$GATEWAY_PID" 2>/dev/null
+  if [[ -n "${S3_TEST_PID:-}" ]]; then
+    kill "$S3_TEST_PID" 2>/dev/null
   fi
   if [[ "$KEEP" == "--keep" ]]; then
     printf 'work dir kept: %s\n' "$WORK"
@@ -169,15 +173,17 @@ step "build pos3ql (release)"
 cargo build --release -q || { bad "build"; exit 1; }
 ok "build"
 
-step "start generic object-store gateway"
-python3 "$EXT/object_store_gateway.py" --root "$WORK/object-store" --port "$GATEWAY_PORT" \
+step "start S3-compatible test server"
+python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PORT" \
+  --bucket "$S3_TEST_BUCKET" --region "$S3_TEST_REGION" \
+  --access-key "$S3_TEST_ACCESS_KEY" --secret-key "$S3_TEST_SECRET_KEY" --page-size 7 \
   > "$WORK/object-store.log" 2>&1 &
-GATEWAY_PID=$!
+S3_TEST_PID=$!
 for _ in {1..50}; do
-  nc -z 127.0.0.1 "$GATEWAY_PORT" && break
+  nc -z 127.0.0.1 "$S3_TEST_PORT" && break
   sleep 0.1
 done
-ok "gateway (pid $GATEWAY_PID)"
+ok "S3-compatible test server (pid $S3_TEST_PID)"
 
 write_main_config() { # <object prefix> [data directory name]
   local object_prefix=$1
@@ -189,9 +195,12 @@ max_connections = 8
 memtable_bytes = 16MiB
 wal_bytes = 16MiB
 object_store = on
-object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
-object_store_namespace = pos3ql-external
+object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
+object_store_bucket = ${S3_TEST_BUCKET}
 object_store_prefix = ${object_prefix}
+object_store_region = ${S3_TEST_REGION}
+object_store_access_key = ${S3_TEST_ACCESS_KEY}
+object_store_secret_key = ${S3_TEST_SECRET_KEY}
 wal_upload = on
 wal_upload_sync = on
 sql_arena_bytes = 4MiB
@@ -462,7 +471,7 @@ rm -rf "$WORK/data"
 start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
 out=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
-[[ "$out" == "durable-a,durable-b,durable-c|600" ]] && ok "durable WAL upload recovers through the gateway (segments beyond the response buffer)" || bad "durable WAL recovery: '$out'"
+[[ "$out" == "durable-a,durable-b,durable-c|600" ]] && ok "durable WAL upload recovers through direct S3-compatible storage (segments beyond the response buffer)" || bad "durable WAL recovery: '$out'"
 
 step "commit-durable-on-bucket by default: ack, kill -9 at once, wipe, cold start"
 # A config that says nothing but `object_store = on` gets the plan-of-record
@@ -472,9 +481,12 @@ cat > "$WORK/rpo0.conf" <<EOF
 listen_addr = 127.0.0.1:$((PG_PORT + 2))
 data_dir = ${WORK}/rpo0-data
 object_store = on
-object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
-object_store_namespace = pos3ql-external
+object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
+object_store_bucket = ${S3_TEST_BUCKET}
 object_store_prefix = rpo0-$$/
+object_store_region = ${S3_TEST_REGION}
+object_store_access_key = ${S3_TEST_ACCESS_KEY}
+object_store_secret_key = ${S3_TEST_SECRET_KEY}
 EOF
 start_pos3ql "$WORK/rpo0.conf" "$WORK/rpo0.log" $((PG_PORT + 2))
 RPO0_PID=$START_PID
@@ -556,9 +568,12 @@ data_dir = ${WORK}/overlay-data
 memtable_bytes = 512KiB
 table_rows = 1024
 object_store = on
-object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
-object_store_namespace = pos3ql-external
+object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
+object_store_bucket = ${S3_TEST_BUCKET}
 object_store_prefix = overlay-$$/
+object_store_region = ${S3_TEST_REGION}
+object_store_access_key = ${S3_TEST_ACCESS_KEY}
+object_store_secret_key = ${S3_TEST_SECRET_KEY}
 work_arena_bytes = 96MiB
 EOF
 start_pos3ql "$WORK/overlay.conf" "$WORK/overlay.log" $((PG_PORT + 3))
@@ -976,9 +991,12 @@ max_connections = 6
 memtable_bytes = 8MiB
 wal_bytes = 8MiB
 object_store = on
-object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
-object_store_namespace = pos3ql-external
+object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
+object_store_bucket = ${S3_TEST_BUCKET}
 object_store_prefix = subscription-publisher-$$/
+object_store_region = ${S3_TEST_REGION}
+object_store_access_key = ${S3_TEST_ACCESS_KEY}
+object_store_secret_key = ${S3_TEST_SECRET_KEY}
 wal_upload = on
 wal_upload_sync = on
 sql_arena_bytes = 4MiB
@@ -1276,11 +1294,11 @@ fi # subscription
 
 if want tls; then
 
-step "object-store TLS is covered by the gateway unit suite"
+step "object-store TLS is covered by the direct S3 client unit suite"
 if cargo test --lib object_store::http::tests::tls_round_trip >/dev/null; then
-  ok "generic gateway TLS round trip"
+  ok "S3-compatible test server TLS round trip"
 else
-  bad "generic gateway TLS round trip"
+  bad "S3-compatible test server TLS round trip"
 fi
 # --- Server-side TLS: the client connects over TLS (no object store needed) --
 step "server-side TLS: psql connects with sslmode=require"
@@ -1353,8 +1371,11 @@ step "forced-spill differential: the whole suite with a 256KiB memtable over the
 # through the cache tiers — while the reference PostgreSQL sees plain SQL.
 # Pure-SQL semantics must be indistinguishable from the in-memory run.
 if [[ -n "${POS3QL_REFERENCE_PG_HOST:-}" || -x "${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}/postgres" ]]; then
-  if POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_DIFF_OBJECT_STORE_PREFIX="spilldiff-$$/" POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${GATEWAY_PORT}
-object_store_namespace = pos3ql-external
+  if POS3QL_DIFF_OBJECT_STORE=on POS3QL_DIFF_MEMTABLE=256KiB POS3QL_DIFF_OBJECT_STORE_PREFIX="spilldiff-$$/" POS3QL_EXTRA_CONF="object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
+object_store_bucket = ${S3_TEST_BUCKET}
+object_store_region = ${S3_TEST_REGION}
+object_store_access_key = ${S3_TEST_ACCESS_KEY}
+object_store_secret_key = ${S3_TEST_SECRET_KEY}
 wal_upload = on
 wal_upload_sync = on
 work_arena_bytes = 192MiB" tests/external/differential.sh > "$WORK/spilldiff.out" 2>&1; then

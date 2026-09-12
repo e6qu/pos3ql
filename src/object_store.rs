@@ -3,19 +3,20 @@
 //! WAL upload, manifests, garbage collection, checkpoints, and the block cache
 //! all speak this module's six semantics: immutable or conditional PUT,
 //! whole/ranged GET, LIST, DELETE, and compare-and-swap through an ETag.  A
-//! backend is selected by the gateway; code above this boundary cannot observe
-//! its concrete durable store.
+//! network client speaks the versioned S3-compatible profile directly; code
+//! above this boundary cannot observe the endpoint implementation.
 //!
-//! The concrete adapter choice is an enum rather than a trait object.  That
+//! The concrete client choice is an enum rather than a trait object. That
 //! keeps dispatch allocation-free and makes the fixed startup memory budget
 //! explicit while preserving one semantic interface for every durable object.
 
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
-use crate::object_store::http::HttpClient;
+use crate::object_store::http::S3Client;
 use crate::util::StackStr;
 
 pub mod http;
+pub(crate) mod signature_v4;
 pub(crate) mod sim;
 pub(crate) mod tls;
 
@@ -67,7 +68,7 @@ impl EntityTag {
 /// An inclusive byte range accepted by an object-store GET.
 ///
 /// The constructor is the sole way to form a range, so a backwards HTTP
-/// `Range` header cannot reach any provider adapter.
+/// `Range` header cannot reach the S3-compatible client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
     first: u64,
@@ -116,8 +117,13 @@ pub struct GetResult {
     reason = "error text is carried inline on the stack; boxing would heap-allocate"
 )]
 pub enum Error {
-    /// The provider rejected the operation with an HTTP-like status.
-    Status { code: u16, message: StackStr<256> },
+    /// The endpoint rejected the operation. `service_code` is the standard
+    /// S3 XML error code when the response supplied one.
+    Status {
+        code: u16,
+        service_code: StackStr<64>,
+        message: StackStr<256>,
+    },
     /// Connection-level failure after retries.
     Io {
         context: &'static str,
@@ -129,7 +135,7 @@ pub enum Error {
         content_length: usize,
         capacity: usize,
     },
-    /// The adapter received a malformed response.
+    /// The client received a malformed response.
     Protocol(&'static str),
     /// A non-blocking read is not yet ready (WouldBlock).
     WouldBlock,
@@ -138,12 +144,20 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Status { code, message } => {
-                write!(
-                    formatter,
-                    "object store returned {code}: {}",
-                    message.as_str()
-                )
+            Self::Status {
+                code,
+                service_code,
+                message,
+            } => {
+                if service_code.is_empty() {
+                    write!(formatter, "object store returned {code}: {message}")
+                } else {
+                    write!(
+                        formatter,
+                        "object store returned {code} ({}): {message}",
+                        service_code.as_str()
+                    )
+                }
             }
             Self::Io {
                 context,
@@ -175,7 +189,14 @@ impl std::fmt::Display for Error {
 
 impl Error {
     pub fn is_not_found(&self) -> bool {
-        matches!(self, Self::Status { code: 404, .. })
+        matches!(
+            self,
+            Self::Status {
+                code: 404,
+                service_code,
+                ..
+            } if service_code.as_str() == "NoSuchKey"
+        )
     }
 
     pub fn is_precondition_failed(&self) -> bool {
@@ -187,20 +208,34 @@ impl Error {
             }
         )
     }
+
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Status { code, .. } => matches!(code, 429 | 500 | 502 | 503 | 504),
+            Self::Io { kind, .. } => !matches!(
+                kind,
+                std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+            ),
+            Self::ResponseTooLarge { .. } | Self::Protocol(_) | Self::WouldBlock => false,
+        }
+    }
 }
 
 /// Startup failed before the provider-neutral client became usable.
 #[derive(Debug)]
 pub(crate) enum SetupError {
     Budget(BudgetError),
-    Adapter(http::HttpSetupError),
+    S3(http::S3SetupError),
 }
 
 impl std::fmt::Display for SetupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Budget(error) => write!(formatter, "{error}"),
-            Self::Adapter(error) => write!(formatter, "{error}"),
+            Self::S3(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -213,35 +248,35 @@ impl From<BudgetError> for SetupError {
     }
 }
 
-impl From<http::HttpSetupError> for SetupError {
-    fn from(error: http::HttpSetupError) -> Self {
-        Self::Adapter(error)
+impl From<http::S3SetupError> for SetupError {
+    fn from(error: http::S3SetupError) -> Self {
+        Self::S3(error)
     }
 }
 
 /// One durable-object client.
 ///
-/// The network client speaks the gateway contract; the simulator implements
-/// the same semantics for deterministic tests.
+/// The network client speaks S3-compatible HTTP; the in-process simulator
+/// implements the internal semantic contract for deterministic tests.
 #[allow(
     clippy::large_enum_variant,
     reason = "two long-lived instances per process; boxing buys nothing"
 )]
 pub(crate) enum Client {
-    Http(HttpClient),
+    S3(S3Client),
     Simulator(sim::SimClient),
 }
 
 impl Client {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
-        HttpClient::budget_bytes(config)
+        S3Client::budget_bytes(config)
     }
 
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, SetupError> {
         if config.object_store_sim {
             Ok(Self::Simulator(sim::SimClient::new(config, budget)?))
         } else {
-            Ok(Self::Http(HttpClient::new(config, budget)?))
+            Ok(Self::S3(S3Client::new(config, budget)?))
         }
     }
 
@@ -252,14 +287,14 @@ impl Client {
         precondition: Precondition<'_>,
     ) -> Result<EntityTag, Error> {
         match self {
-            Self::Http(client) => client.put(key, body, precondition),
+            Self::S3(client) => client.put(key, body, precondition),
             Self::Simulator(client) => client.put(key, body, precondition),
         }
     }
 
     pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
         match self {
-            Self::Http(client) => client.get(key, range),
+            Self::S3(client) => client.get(key, range),
             Self::Simulator(client) => client.get(key, range),
         }
     }
@@ -267,48 +302,48 @@ impl Client {
     /// Bytes returned by the most recent successful GET.
     pub(crate) fn body_bytes(&self) -> &[u8] {
         match self {
-            Self::Http(client) => client.body_bytes(),
+            Self::S3(client) => client.body_bytes(),
             Self::Simulator(client) => client.body_bytes(),
         }
     }
 
-    /// Maximum whole or ranged response the adapter can return.
+    /// Maximum whole or ranged response the client can return.
     pub(crate) fn response_capacity(&self) -> usize {
         match self {
-            Self::Http(client) => client.response_capacity(),
+            Self::S3(client) => client.response_capacity(),
             Self::Simulator(client) => client.response_capacity(),
         }
     }
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), Error> {
         match self {
-            Self::Http(client) => client.delete(key),
+            Self::S3(client) => client.delete(key),
             Self::Simulator(client) => client.delete(key),
         }
     }
 
     pub(crate) fn list(&mut self, prefix: &str, each: impl FnMut(&str)) -> Result<usize, Error> {
         match self {
-            Self::Http(client) => client.list(prefix, each),
+            Self::S3(client) => client.list(prefix, each),
             Self::Simulator(client) => client.list(prefix, each),
         }
     }
 
     pub(crate) fn pending_get_fd(&self) -> Option<std::os::fd::RawFd> {
         match self {
-            Self::Http(client) => client.pending_fd(),
+            Self::S3(client) => client.pending_fd(),
             Self::Simulator(_) => None,
         }
     }
 
     pub(crate) fn enable_async_gets(&mut self) {
-        if let Self::Http(client) = self {
+        if let Self::S3(client) = self {
             client.enable_async_gets();
         }
     }
 
     pub(crate) fn disable_async_gets(&mut self) {
-        if let Self::Http(client) = self {
+        if let Self::S3(client) = self {
             client.disable_async_gets();
         }
     }
@@ -318,7 +353,7 @@ impl Client {
     /// more data is needed.
     pub(crate) fn advance_get(&mut self) -> Result<(), Error> {
         match self {
-            Self::Http(client) => client.advance_pending().map(|_| ()),
+            Self::S3(client) => client.advance_pending().map(|_| ()),
             Self::Simulator(_) => Ok(()),
         }
     }
@@ -326,13 +361,13 @@ impl Client {
     /// Discards an incomplete response after a terminal read error.
     pub(crate) fn clear_pending_get(&mut self) {
         match self {
-            Self::Http(client) => client.clear_pending(),
+            Self::S3(client) => client.clear_pending(),
             Self::Simulator(_) => {}
         }
     }
 }
 
-/// Stable process-writer identity derived from the durable namespace and local
+/// Stable process-writer identity derived from the durable bucket and local
 /// journal identity. Ambiguous manifest CAS recovery uses this to distinguish
 /// its own lost response from another writer's publish.
 pub(crate) fn writer_id(config: &Config) -> u64 {
@@ -340,13 +375,13 @@ pub(crate) fn writer_id(config: &Config) -> u64 {
 
     let mut low = Crc32c::new();
     low.update(config.object_store_endpoint.as_bytes());
-    low.update(config.object_store_namespace.as_bytes());
+    low.update(config.object_store_bucket.as_bytes());
     low.update(config.object_store_prefix.as_bytes());
     low.update(config.data_dir.as_bytes());
     let mut high = Crc32c::new();
     high.update(config.data_dir.as_bytes());
     high.update(config.object_store_prefix.as_bytes());
-    high.update(config.object_store_namespace.as_bytes());
+    high.update(config.object_store_bucket.as_bytes());
     high.update(config.object_store_endpoint.as_bytes());
     (u64::from(high.finish()) << 32) | u64::from(low.finish())
 }
@@ -358,9 +393,9 @@ mod tests {
     fn simulated() -> Client {
         let mut config = Config::default_dev();
         config.object_store_sim = true;
-        config.object_store_namespace = format!("object-contract-{}", std::process::id());
-        sim::drop_namespace(&config.object_store_namespace);
-        let _namespace = sim::open_namespace(&config.object_store_namespace, 7);
+        config.object_store_bucket = format!("object-contract-{}", std::process::id());
+        sim::drop_namespace(&config.object_store_bucket);
+        let _namespace = sim::open_namespace(&config.object_store_bucket, 7);
         let mut budget = Budget::new(Client::budget_bytes(&config) + 4096);
         Client::new(&config, &mut budget).unwrap()
     }
@@ -419,12 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn writer_identity_covers_endpoint_namespace_prefix_and_journal() {
+    fn writer_identity_covers_endpoint_bucket_prefix_and_journal() {
         let base = Config::default_dev();
         let baseline = writer_id(&base);
         for mutate in [
             |config: &mut Config| config.object_store_endpoint.push('x'),
-            |config: &mut Config| config.object_store_namespace.push('x'),
+            |config: &mut Config| config.object_store_bucket.push('x'),
             |config: &mut Config| config.object_store_prefix.push('x'),
             |config: &mut Config| config.data_dir.push('x'),
         ] {

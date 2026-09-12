@@ -473,8 +473,8 @@ fn regcollation_values_and_dependencies_survive_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("regcollation-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("regcollation-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -558,7 +558,7 @@ fn regcollation_values_and_dependencies_survive_object_cold_recovery() {
         ]
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -675,8 +675,8 @@ fn refcursor_values_survive_checkpoint_wal_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("refcursor-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("refcursor-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -741,7 +741,7 @@ fn refcursor_values_survive_checkpoint_wal_and_object_cold_recovery() {
         before
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -796,8 +796,8 @@ fn regular_expression_expressions_survive_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("regex-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("regex-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -861,7 +861,7 @@ fn regular_expression_expressions_survive_object_cold_recovery() {
         before
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -928,8 +928,8 @@ fn unicode_text_expressions_survive_checkpoint_wal_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("unicode-text-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("unicode-text-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -984,7 +984,7 @@ fn unicode_text_expressions_survive_checkpoint_wal_and_object_cold_recovery() {
         before
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -1231,8 +1231,8 @@ fn sql_xml_crosses_dml_stored_query_and_object_recovery_boundaries() {
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.max_tables = 16;
-    config.object_store_namespace = format!("sql-xml-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("sql-xml-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -1358,7 +1358,7 @@ fn sql_xml_crosses_dml_stored_query_and_object_recovery_boundaries() {
             "<item name=\"wal\"><value>11</value></item>|<item name=\"wal\"><value>11</value></item>|wal"
         ]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -1366,8 +1366,8 @@ fn plpgsql_scalar_functions_are_typed_transactional_and_durable() {
     let mut config = test_config("plpgsql_scalar_functions");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("plpgsql-scalar-functions-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("plpgsql-scalar-functions-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -1457,7 +1457,7 @@ fn plpgsql_scalar_functions_are_typed_transactional_and_durable() {
     );
     assert_eq!(data_rows(&recovered), ["42", "14", "7", "8", "7"]);
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -1466,8 +1466,8 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
     let mut config = test_config("plpgsql_set_and_record_functions");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("plpgsql-set-functions-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("plpgsql-set-functions-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -1581,7 +1581,7 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -1590,8 +1590,8 @@ fn plpgsql_catalog_typed_locals_are_validated_and_durable() {
     let mut config = test_config("plpgsql-catalog-typed-locals");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("plpgsql-catalog-typed-locals-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("plpgsql-catalog-typed-locals-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -1684,7 +1684,7 @@ fn plpgsql_catalog_typed_locals_are_validated_and_durable() {
         String::from_utf8_lossy(&output)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -1693,8 +1693,8 @@ fn plpgsql_declaration_contracts_are_typed_and_durable() {
     let mut config = test_config("plpgsql-declaration-contracts");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("plpgsql-declaration-contracts-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("plpgsql-declaration-contracts-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -1790,7 +1790,7 @@ fn plpgsql_declaration_contracts_are_typed_and_durable() {
         String::from_utf8_lossy(&output)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -1799,8 +1799,8 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
     let mut config = test_config("plpgsql_dynamic_catalog_utilities");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("plpgsql-dynamic-catalog-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("plpgsql-dynamic-catalog-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -1994,7 +1994,7 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
         String::from_utf8_lossy(&cleanup)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -2003,9 +2003,8 @@ fn plpgsql_dynamic_administration_uses_static_catalog_boundaries() {
     let mut config = test_config("plpgsql-dynamic-administration");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("plpgsql-dynamic-administration-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("plpgsql-dynamic-administration-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -2166,7 +2165,7 @@ fn plpgsql_dynamic_administration_uses_static_catalog_boundaries() {
         );
     }
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -2214,9 +2213,9 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     let mut config = test_config("plpgsql_dynamic_session_and_maintenance");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("plpgsql-dynamic-session-{}", std::process::id());
+    config.object_store_bucket = format!("plpgsql-dynamic-session-{}", std::process::id());
     config.max_tables = 10;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -2448,7 +2447,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     );
     assert_eq!(data_rows(&recovered), ["5", "2"]);
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -2793,8 +2792,8 @@ fn foreign_data_catalogs_survive_object_cold_checkpoint_recovery() {
     let mut config = test_config("foreign-data-cold-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("foreign-data-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("foreign-data-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -2846,7 +2845,7 @@ fn foreign_data_catalogs_survive_object_cold_checkpoint_recovery() {
         "{}",
         String::from_utf8_lossy(&output)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -2856,8 +2855,8 @@ fn foreign_data_catalogs_survive_wal_replay_before_checkpoint() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("foreign-data-wal-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("foreign-data-wal-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -2906,7 +2905,7 @@ fn foreign_data_catalogs_survive_wal_replay_before_checkpoint() {
         "{}",
         String::from_utf8_lossy(&output)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -3123,8 +3122,8 @@ fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.max_prepared_transactions = 1;
-    config.object_store_namespace = format!("large-object-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("large-object-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -3231,7 +3230,7 @@ fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
         String::from_utf8_lossy(&committed)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -3242,8 +3241,8 @@ fn column_storage_and_compression_are_catalogued_and_object_cold_durable() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("column-storage-compression-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("column-storage-compression-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -3347,7 +3346,7 @@ fn column_storage_and_compression_are_catalogued_and_object_cold_durable() {
         ["id|p|", "body|x|", "payload|e|p"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -3642,8 +3641,8 @@ fn text_search_catalog_survives_checkpoint_and_cold_object_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("text-search-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("text-search-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -3710,7 +3709,7 @@ fn text_search_catalog_survives_checkpoint_and_cold_object_recovery() {
             "4",
         ]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -4044,8 +4043,8 @@ fn prepared_transaction_identity_is_in_progress_until_resolution() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("prepared-transaction-status-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("prepared-transaction-status-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -4170,7 +4169,7 @@ fn prepared_transaction_identity_is_in_progress_until_resolution() {
         String::from_utf8_lossy(&resolved)
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -4180,9 +4179,9 @@ fn transaction_identities_and_statuses_survive_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("transaction-identity-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -4266,7 +4265,7 @@ fn transaction_identities_and_statuses_survive_object_cold_recovery() {
     assert!(fields[3].contains(':'));
     assert_eq!(&fields[4..], ["committed", "aborted", "t"]);
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -4276,11 +4275,11 @@ fn unassigned_wal_transactions_stay_full_xid_gaps_after_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!(
+    config.object_store_bucket = format!(
         "unassigned-transaction-identity-recovery-{}",
         std::process::id()
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -4337,7 +4336,7 @@ fn unassigned_wal_transactions_stay_full_xid_gaps_after_cold_recovery() {
         ["t|3"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -4516,8 +4515,8 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("prepared-object-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("prepared-object-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -4726,7 +4725,7 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
         ["1|resolved", "2|new", "0"]
     );
     drop(final_engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -5286,8 +5285,8 @@ fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("rewrite-rule-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("rewrite-rule-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -5351,7 +5350,7 @@ fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
         ["24", "12", "18", "24", "object durable", "t"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -5362,9 +5361,8 @@ fn rewrite_rule_enablement_survives_wal_checkpoint_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace =
-        format!("rewrite-rule-enablement-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("rewrite-rule-enablement-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -5426,7 +5424,7 @@ fn rewrite_rule_enablement_survives_wal_checkpoint_and_object_cold_recovery() {
         String::from_utf8_lossy(&output)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -5438,9 +5436,9 @@ fn prepared_transaction_publication_failure_recovers_from_object_storage() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("prepared-publication-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
-    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 19);
+    config.object_store_bucket = format!("prepared-publication-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 19);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -5508,7 +5506,7 @@ fn prepared_transaction_publication_failure_recovers_from_object_storage() {
     );
 
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -6032,9 +6030,8 @@ fn event_trigger_catalog_dependents_and_toast_state_survive_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace =
-        format!("event-trigger-catalog-dependents-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("event-trigger-catalog-dependents-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -6121,7 +6118,7 @@ fn event_trigger_catalog_dependents_and_toast_state_survive_recovery() {
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(data_rows(&output), ["index|t", "toast table|t"]);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -6498,8 +6495,8 @@ fn event_triggers_survive_wal_checkpoint_and_object_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("event-trigger-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("event-trigger-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -6546,7 +6543,7 @@ fn event_triggers_survive_wal_checkpoint_and_object_recovery() {
          SELECT event, tag FROM durable_event_audit",
     );
     assert_eq!(data_rows(&output), ["ddl_command_end|CREATE TABLE"]);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -6779,8 +6776,8 @@ fn collation_and_conversion_survive_wal_checkpoint_and_cold_object_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("collation-conversion-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("collation-conversion-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -6833,7 +6830,7 @@ fn collation_and_conversion_survive_wal_checkpoint_and_cold_object_recovery() {
             "é"
         ]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -6911,7 +6908,7 @@ fn native_hook_ddl_rejects_before_catalog_publication() {
         ["0", "0"],
         "native hooks must reject before publishing any catalog identity"
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -7050,8 +7047,8 @@ fn operator_selectivity_ddl_matches_postgresql_and_survives_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("operator-selectivity-ddl-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("operator-selectivity-ddl-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -7167,7 +7164,7 @@ fn operator_selectivity_ddl_matches_postgresql_and_survives_cold_recovery() {
     );
     let output = String::from_utf8_lossy(&output);
     assert!(output.contains("0A000"), "{output}");
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -7359,8 +7356,8 @@ fn forward_operator_shells_are_typed_durable_and_fillable() {
     let mut config = test_config("operator-shell-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("operator-shell-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("operator-shell-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -7401,7 +7398,7 @@ fn forward_operator_shells_are_typed_durable_and_fillable() {
     let text = String::from_utf8_lossy(&filled);
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(data_rows(&filled), ["t|f", "f"]);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -7457,8 +7454,8 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("cast-operator-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("cast-operator-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let ddl = "CREATE TYPE public.mood AS ENUM ('sad', 'ok'); \
         CREATE FUNCTION public.keep_slot(integer) RETURNS integer LANGUAGE SQL RETURN $1; \
         CREATE FUNCTION public.catalog_gap(integer) RETURNS integer LANGUAGE SQL RETURN $1; \
@@ -7582,7 +7579,7 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
     let dropped = String::from_utf8_lossy(&dropped);
     assert!(!dropped.contains("ERROR"), "{dropped}");
     assert_eq!(cold.storage.checkpoint_comments().count(), 0);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -7650,8 +7647,8 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("extension-lifecycle-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("extension-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -7870,7 +7867,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         ["0", "0", "0"]
     );
     drop(replayed);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -8393,8 +8390,8 @@ fn like_metadata_survives_checkpoint_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("like-metadata-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("like-metadata-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -8457,7 +8454,7 @@ fn like_metadata_survives_checkpoint_and_object_cold_recovery() {
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -8546,8 +8543,8 @@ fn extended_statistics_mcv_base_frequencies_survive_checkpoint_recovery() {
     let mut config = test_config("extended-statistics-mcv-base-frequencies");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("extended-statistics-base-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("extended-statistics-base-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -8587,7 +8584,7 @@ fn extended_statistics_mcv_base_frequencies_survive_checkpoint_recovery() {
         String::from_utf8_lossy(&output)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -9201,8 +9198,8 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("instead-of-view-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("instead-of-view-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -9261,7 +9258,7 @@ fn instead_of_view_trigger_survives_checkpoint_recovery() {
         "{}",
         String::from_utf8_lossy(&recovered)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -9852,8 +9849,8 @@ fn role_catalog_replays_from_wal() {
     let mut config = test_config("role-wal-replay");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("role-wal-replay-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("role-wal-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let verifier = crate::pg::auth::ScramServer::derive_with_salt(
@@ -10885,8 +10882,8 @@ fn money_survives_checkpoint_wal_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("money-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("money-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -10952,7 +10949,7 @@ fn money_survives_checkpoint_wal_and_object_cold_recovery() {
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -10963,9 +10960,8 @@ fn binary_and_bit_strings_survive_checkpoint_wal_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace =
-        format!("binary-bit-string-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("binary-bit-string-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -11049,7 +11045,7 @@ fn binary_and_bit_strings_survive_checkpoint_wal_and_object_cold_recovery() {
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11060,11 +11056,11 @@ fn tuple_and_command_identities_survive_checkpoint_wal_and_object_cold_recovery(
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!(
+    config.object_store_bucket = format!(
         "tuple-command-identity-cold-recovery-{}",
         std::process::id()
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -11136,7 +11132,7 @@ fn tuple_and_command_identities_survive_checkpoint_wal_and_object_cold_recovery(
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -11144,12 +11140,12 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     let mut config = test_config("logical-slot-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("logical-slot-{}", std::process::id());
+    config.object_store_bucket = format!("logical-slot-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let restart_lsn = engine
@@ -11608,8 +11604,8 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
     let mut config = test_config("alter-view-security-invoker");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("alter-view-options-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("alter-view-options-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -11752,7 +11748,7 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
     );
     assert_eq!(data_rows(&reset), ["7"]);
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -11760,8 +11756,8 @@ fn view_check_option_is_typed_enforced_transactional_and_durable() {
     let mut config = test_config("view-check-option");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("view-check-option-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("view-check-option-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -11883,7 +11879,7 @@ fn view_check_option_is_typed_enforced_transactional_and_durable() {
         )),
         ["1"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -11981,8 +11977,8 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
     let mut config = test_config("view-output-columns");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("view-output-columns-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("view-output-columns-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -12059,7 +12055,7 @@ fn view_output_columns_are_typed_catalog_identity_and_durable() {
         String::from_utf8_lossy(&recovered_rows)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -12068,8 +12064,8 @@ fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
     let mut config = test_config("view-defaults");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("view-defaults-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("view-defaults-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -12151,7 +12147,7 @@ fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
         String::from_utf8_lossy(&after_recovery)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -12904,10 +12900,10 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
     let mut config = test_config("role-setting-cold-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("role-settings-{}", std::process::id());
+    config.object_store_bucket = format!("role-settings-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
@@ -13026,7 +13022,7 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
         )),
         ["1"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -13034,10 +13030,10 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
     let mut config = test_config("column-acl-cold-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("column-acls-{}", std::process::id());
+    config.object_store_bucket = format!("column-acls-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -13425,7 +13421,7 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
         ["f"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -13790,14 +13786,14 @@ fn parameter_acls_survive_cold_object_store_recovery() {
     let mut config = test_config(&format!("parameter-acl-cold-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("sql-parameter-acl-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-parameter-acl-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -13836,7 +13832,7 @@ fn parameter_acls_survive_cold_object_store_recovery() {
         String::from_utf8_lossy(&output)
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -13893,14 +13889,14 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     let mut config = test_config(&format!("role-acl-cold-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("sql-role-acl-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-role-acl-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -13975,7 +13971,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         String::from_utf8_lossy(&output)
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -14862,12 +14858,11 @@ fn object_resident_set_records_keep_their_structural_fields() {
     let mut config = test_config(&format!("set-record-spill-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("sql-set-record-spill-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-set-record-spill-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -16392,8 +16387,8 @@ fn prepared_advisory_locks_survive_object_cold_recovery() {
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.max_prepared_transactions = 1;
-    config.object_store_namespace = format!("prepared-advisory-lock-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("prepared-advisory-lock-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -16442,7 +16437,7 @@ fn prepared_advisory_locks_survive_object_cold_recovery() {
         String::from_utf8_lossy(&resolved)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -22873,8 +22868,8 @@ fn sql_json_survives_wal_savepoints_checkpoint_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("sql-json-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("sql-json-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -22973,7 +22968,7 @@ fn sql_json_survives_wal_savepoints_checkpoint_and_object_cold_recovery() {
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -23347,8 +23342,8 @@ fn interval_field_ranges_survive_checkpoint_and_object_store_cold_start() {
     let mut config = test_config("interval-range-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("interval-range-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("interval-range-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -23428,7 +23423,7 @@ fn interval_field_ranges_survive_checkpoint_and_object_store_cold_start() {
         )),
         ["02|03|04\t06|07|08.130", "-01|-02|-03\t-04|-05|-06.-130"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -25409,7 +25404,7 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
     let mut config = test_config(&format!("constraint-lifecycle-cold-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("sql-constraint-lifecycle-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
@@ -25417,7 +25412,7 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
     config.wal_upload_buffer_bytes = 256 * 1024;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -26351,8 +26346,8 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
     config.object_store_on = true;
     config.object_store_sim = true;
     config.max_tables = 32;
-    config.object_store_namespace = format!("partition-restart-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("partition-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -27319,8 +27314,8 @@ fn routine_parameter_contracts_drive_defaults_outputs_and_catalog_text() {
     let mut config = test_config("routine_parameter_contracts");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("routine-parameter-contracts-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("routine-parameter-contracts-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -27461,7 +27456,7 @@ fn routine_parameter_contracts_drive_defaults_outputs_and_catalog_text() {
         "{}",
         String::from_utf8_lossy(&recovered_output)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -27490,8 +27485,8 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
     config.max_tables = 16;
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("routine-body-attributes-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("routine-body-attributes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -27749,9 +27744,8 @@ fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace =
-        format!("plpgsql-non-atomic-transactions-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("plpgsql-non-atomic-transactions-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -27879,7 +27873,7 @@ fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
         )),
         ["1|1", "3|3", "4|4", "5|5", "6|6", "7|7", "8|8"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -27964,8 +27958,8 @@ fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("routine-creation-dependencies-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("routine-creation-dependencies-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -28044,7 +28038,7 @@ fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
         String::from_utf8_lossy(&recovered)
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -28613,10 +28607,10 @@ fn user_defined_aggregate_survives_wal_and_checkpoint_recovery() {
     config.max_tables = 16;
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("user-aggregate-recovery-{}", std::process::id());
+    config.object_store_bucket = format!("user-aggregate-recovery-{}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -28763,7 +28757,7 @@ fn user_defined_aggregate_survives_wal_and_checkpoint_recovery() {
             [format!("128|248|2|n|{}", crate::sql::types::oid::INT8)]
         );
     }
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -28866,8 +28860,8 @@ fn user_defined_aggregate_combines_bounded_spill_partitions() {
     config.max_tables = 16;
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("user-aggregate-spill-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("user-aggregate-spill-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
@@ -28894,7 +28888,7 @@ fn user_defined_aggregate_combines_bounded_spill_partitions() {
         "{}",
         String::from_utf8_lossy(&output)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -30878,8 +30872,8 @@ fn trigger_assert_and_strict_select_survive_checkpoint_recovery() {
     let mut config = test_config("trigger-diagnostic-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("trigger-diagnostic-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("trigger-diagnostic-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -31046,8 +31040,8 @@ fn trigger_case_and_foreach_survive_checkpoint_recovery() {
     let mut config = test_config("trigger-control-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("trigger-control-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("trigger-control-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -31095,8 +31089,8 @@ fn trigger_arguments_survive_checkpoint_and_recovery() {
     let mut config = test_config("trigger-arguments-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("trigger-arguments-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("trigger-arguments-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -32340,8 +32334,8 @@ fn transition_table_definition_survives_checkpoint_and_recovery() {
     let mut config = test_config("transition-table-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("transition-table-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("transition-table-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -32464,9 +32458,9 @@ fn statement_trigger_catalog_checkpoint_and_recovery_preserve_level() {
     let mut config = test_config("statement-trigger-catalog-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("statement-trigger-catalog-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -32507,9 +32501,8 @@ fn partition_trigger_modes_and_row_transitions_survive_wal_and_cold_recovery() {
     let mut config = test_config("partition-trigger-state-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("partition-trigger-state-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("partition-trigger-state-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -32589,8 +32582,8 @@ fn transition_dml_scope_survives_checkpoint_and_recovery() {
     let mut config = test_config("transition-dml-scope-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("transition-dml-scope-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("transition-dml-scope-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -32652,8 +32645,8 @@ fn trigger_catalog_checkpoint_and_recovery_preserve_definition() {
     let mut config = test_config("trigger-catalog-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("trigger-catalog-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("trigger-catalog-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -32776,8 +32769,8 @@ fn routine_identity_changes_are_typed_transactional_and_durable() {
     let mut config = test_config("routine-identity");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("routine-identity-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("routine-identity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -32855,7 +32848,7 @@ fn routine_identity_changes_are_typed_transactional_and_durable() {
         String::from_utf8_lossy(&output)
     );
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -33370,8 +33363,8 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
     let mut config = test_config("routine-user-types-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("routine-user-types-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("routine-user-types-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -33442,7 +33435,7 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
         String::from_utf8_lossy(&checkpoint_output)
     );
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -33451,8 +33444,8 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
     config.object_store_on = true;
     config.object_store_sim = true;
     config.work_arena_bytes = 16 << 20;
-    config.object_store_namespace = format!("rows-from-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("rows-from-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -33586,7 +33579,7 @@ fn rows_from_view_and_named_routine_parameters_survive_object_cold_recovery() {
         ["t"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -33844,12 +33837,11 @@ fn language_and_composite_privileges_survive_wal_checkpoint_and_cold_recovery() 
     let mut config = test_config(&format!("language-acl-recovery-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("language-acl-recovery-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("language-acl-recovery-{}-{sequence}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -33904,7 +33896,7 @@ fn language_and_composite_privileges_survive_wal_checkpoint_and_cold_recovery() 
         String::from_utf8_lossy(&allowed)
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -33917,12 +33909,12 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
     let mut config = test_config(&format!("routine-acl-checkpoint-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("routine-acl-checkpoint-{}-{sequence}", std::process::id());
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -33988,8 +33980,8 @@ fn matview_survives_restart() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("matview-restart-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("matview-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut e = Engine::new(&config, &mut budget).unwrap();
@@ -34431,8 +34423,8 @@ fn sequence_rename_preserves_value_comment_transaction_and_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("sequence-rename-lifecycle-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("sequence-rename-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -34541,7 +34533,7 @@ fn sequence_rename_preserves_value_comment_transaction_and_cold_recovery() {
         ["67", "renamed sequence"]
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -34552,8 +34544,8 @@ fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("schema-rename-lifecycle-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("schema-rename-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -34665,7 +34657,7 @@ fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -35211,9 +35203,8 @@ fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace =
-        format!("generated-expression-evolution-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("generated-expression-evolution-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -35383,7 +35374,7 @@ fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
         ["3|99", "4|40", "5|50", "6|8", "7|11"]
     );
     drop(final_cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -35787,8 +35778,8 @@ fn identity_generation_mode_survives_wal_checkpoint_and_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("identity-generation-mode-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("identity-generation-mode-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -35838,7 +35829,7 @@ fn identity_generation_mode_survives_wal_checkpoint_and_cold_recovery() {
         ["40|before", "41|accepted"]
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -35849,8 +35840,8 @@ fn identity_sequence_options_are_durable_metadata_operations() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("identity-sequence-options-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("identity-sequence-options-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -35932,7 +35923,7 @@ fn identity_sequence_options_are_durable_metadata_operations() {
         ]
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -36317,8 +36308,8 @@ fn dml_row_subquery_assignments_survive_object_only_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("dml-row-assignment-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("dml-row-assignment-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -36352,7 +36343,7 @@ fn dml_row_subquery_assignments_survive_object_only_recovery() {
         ["1|20|10"]
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -36585,8 +36576,8 @@ fn merge_by_source_survives_object_only_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("merge-by-source-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("merge-by-source-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -36617,7 +36608,7 @@ fn merge_by_source_survives_object_only_recovery() {
     );
     assert_eq!(data_rows(&recovered), ["1|kept"]);
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -36628,8 +36619,8 @@ fn merge_inherited_rows_preserve_physical_shape_after_object_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("merge-inherited-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("merge-inherited-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -36668,7 +36659,7 @@ fn merge_inherited_rows_preserve_physical_shape_after_object_recovery() {
         ["1|NULL", "1|77"]
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -36959,14 +36950,14 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
     let mut config = test_config("typed-complex-defaults");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("typed-complex-defaults-{}", std::process::id());
+    config.object_store_bucket = format!("typed-complex-defaults-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new((1 << 29) + (96 << 20));
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -37066,7 +37057,7 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
         ["00000000-0000-0000-0000-000000000099"]
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -39135,8 +39126,8 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("catalog-comment-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("catalog-comment-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -39227,7 +39218,7 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
         ]
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -40984,8 +40975,8 @@ fn network_family_survives_checkpoint_wal_and_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("network-family-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("network-family-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -41075,7 +41066,7 @@ fn network_family_survives_checkpoint_wal_and_object_cold_recovery() {
         String::from_utf8_lossy(&recovered)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -41499,8 +41490,8 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
     let mut config = test_config("composite-restart");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("composite-restart-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("composite-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -41618,7 +41609,7 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         "{}",
         String::from_utf8_lossy(&restored)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -41626,9 +41617,9 @@ fn dropped_composite_attribute_recovers_without_retired_identity() {
     let mut config = test_config("dropped-composite-attribute-restart");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("dropped-composite-attribute-restart-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -41680,7 +41671,7 @@ fn dropped_composite_attribute_recovers_without_retired_identity() {
         )),
         ["0"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -41781,8 +41772,8 @@ fn moved_enum_identity_survives_uploaded_wal_and_nested_references() {
     let mut config = test_config("moved-enum-restart");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("moved-enum-restart-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("moved-enum-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -41832,7 +41823,7 @@ fn moved_enum_identity_survives_uploaded_wal_and_nested_references() {
         )),
         ["moved_enum_schema"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -42572,8 +42563,8 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
     let mut config = test_config("geometric-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("geometric-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("geometric-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -42625,7 +42616,7 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
         ]
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -42935,8 +42926,8 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
     let mut config = test_config("composite-domain-restart");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("composite-domain-restart-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("composite-domain-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     {
         let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -43046,7 +43037,7 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
         "SELECT ((ARRAY[ROW(9,1,NULL)::durable_domain.moved_point]::point_value[])[1]).east",
     );
     assert_eq!(data_rows(&post_rollback), ["9"], "{post_rollback:?}");
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -43588,8 +43579,8 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
     let mut config = test_config("domain-identity");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("domain-identity-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("domain-identity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -43661,7 +43652,7 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
         String::from_utf8_lossy(&output)
     );
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -46025,8 +46016,8 @@ fn partial_indexes_are_typed_transactional_and_durable() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("partial-indexes-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("partial-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -46128,7 +46119,7 @@ fn partial_indexes_are_typed_transactional_and_durable() {
             "CREATE UNIQUE INDEX partial_active_value ON public.partial_rows USING btree (value) WHERE active"
         ]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -46139,8 +46130,8 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("included-index-columns-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("included-index-columns-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -46219,7 +46210,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
             "CREATE UNIQUE INDEX covered_key ON public.covered_rows USING btree (key) INCLUDE (payload, note)"
         ]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -46230,8 +46221,8 @@ fn unique_expression_indexes_are_transactional_and_durable() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("unique-expression-indexes-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("unique-expression-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -46317,7 +46308,7 @@ fn unique_expression_indexes_are_transactional_and_durable() {
         "INSERT INTO expression_key_rows VALUES ('ALICE@example.com', true)",
     );
     assert!(String::from_utf8_lossy(&duplicate_after_restart).contains("23505"));
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -46327,8 +46318,8 @@ fn unique_nulls_not_distinct_are_transactional_and_durable() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("unique-nulls-not-distinct-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("unique-nulls-not-distinct-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -46423,7 +46414,7 @@ fn unique_nulls_not_distinct_are_transactional_and_durable() {
         "INSERT INTO null_key_rows VALUES (NULL, 'after restart')",
     );
     assert!(String::from_utf8_lossy(&duplicate_after_restart).contains("23505"));
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -46486,8 +46477,8 @@ fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("reindex-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("reindex-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -46524,7 +46515,7 @@ fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
         .unwrap();
     assert!(restarted.storage.value_probe_complete(table, &[1]));
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -46535,8 +46526,8 @@ fn cluster_selection_survives_checkpoint_and_cold_restart() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("cluster-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("cluster-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -46581,7 +46572,7 @@ fn cluster_selection_survives_checkpoint_and_cold_restart() {
         ["cluster_recovery_id|f", "cluster_recovery_value|t", "2"]
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -46592,8 +46583,8 @@ fn alter_table_control_plane_is_typed_and_durable() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("alter-table-control-plane-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("alter-table-control-plane-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -46632,7 +46623,7 @@ fn alter_table_control_plane_is_typed_and_durable() {
         ["t", "1|one|new", "f"]
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -46643,8 +46634,8 @@ fn alter_table_of_and_not_of_preserve_the_typed_table_dependency_boundary() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("alter-table-of-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("alter-table-of-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -46692,7 +46683,7 @@ fn alter_table_of_and_not_of_preserve_the_typed_table_dependency_boundary() {
         String::from_utf8_lossy(&mismatch)
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -46862,8 +46853,8 @@ fn replica_identity_selection_survives_checkpoint_and_cold_restart() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("replica-identity-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("replica-identity-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -46898,7 +46889,7 @@ fn replica_identity_selection_survives_checkpoint_and_cold_restart() {
         ["i", "t"]
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -48460,14 +48451,14 @@ fn relation_persistence_survives_object_store_cold_recovery() {
     let mut config = test_config(&format!("relation-persistence-object-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!(
+    config.object_store_bucket = format!(
         "relation-persistence-object-{}-{sequence}",
         std::process::id()
     );
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -48521,7 +48512,7 @@ fn relation_persistence_survives_object_store_cold_recovery() {
         String::from_utf8_lossy(&output)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -48534,13 +48525,13 @@ fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
     let mut config = test_config(&format!("reused-spill-slot-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("reused-spill-slot-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("reused-spill-slot-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.memtable_bytes = 64 * 1024;
     config.table_rows = 512;
     config.wal_buffer_bytes = 256 * 1024;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -48664,7 +48655,7 @@ fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
         "a replacement table must not inherit the retired table's SSTs"
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -48677,12 +48668,11 @@ fn temporary_rows_spill_locally_without_object_publication() {
     let mut config = test_config(&format!("temporary-local-spill-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("temporary-local-spill-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("temporary-local-spill-{}-{sequence}", std::process::id());
     config.memtable_bytes = 256 * 1024;
     config.table_rows = 512;
     config.temporary_spill_bytes = 64 * crate::store::BLOCK_SIZE;
-    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 0);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(namespace.borrow().object_count(), 0);
@@ -48798,7 +48788,7 @@ fn temporary_rows_spill_locally_without_object_publication() {
     engine.drop_connection(42);
     assert_eq!(engine.temporary_spiller.as_ref().unwrap().block_count(), 0);
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -48857,8 +48847,8 @@ fn temporary_relation_ddl_never_enters_recovery_wal() {
     let mut config = test_config("temporary_relation_wal_isolation");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("temporary-relation-wal-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("temporary-relation-wal-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_as(
@@ -48953,7 +48943,7 @@ fn temporary_relation_ddl_never_enters_recovery_wal() {
         ["0", "0", "0", "0", "0", "0", "1", "0", "1"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -49486,8 +49476,8 @@ fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("pending-partition-detach-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("pending-partition-detach-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();
@@ -49580,7 +49570,7 @@ fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
         ["1"]
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -49922,8 +49912,8 @@ fn not_null_constraint_inheritance_survives_wal_checkpoint_and_object_cold_recov
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("not-null-inheritance-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("not-null-inheritance-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -49988,7 +49978,7 @@ fn not_null_constraint_inheritance_survives_wal_checkpoint_and_object_cold_recov
         String::from_utf8_lossy(&output)
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -50159,8 +50149,8 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("table-definition-metadata-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("table-definition-metadata-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
@@ -50337,7 +50327,7 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         ["1"]
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -50350,13 +50340,12 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     let mut config = test_config(&format!("database-template-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("sql-database-template-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-database-template-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -51048,8 +51037,8 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
     let mut config = test_config("publication-column-lists-replay");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("publication-column-lists-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("publication-column-lists-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -51109,7 +51098,7 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
         ["{id,visible}|(id > 0)"],
         "publication table projections render PostgreSQL row filters"
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -51323,9 +51312,8 @@ fn publication_row_filters_follow_column_renames_through_replication_and_recover
     let mut config = test_config("publication-filter-column-rename");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("publication-filter-column-rename-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("publication-filter-column-rename-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -51411,7 +51399,7 @@ fn publication_row_filters_follow_column_renames_through_replication_and_recover
         .expect("recovered publication transaction is retained");
     assert!(emitted);
     assert!(send.readable().contains(&b'I'));
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -51419,9 +51407,9 @@ fn publication_column_dependencies_restrict_cascade_and_remap_durably() {
     let mut config = test_config("publication-projection-column-drop");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("publication-projection-column-drop-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -51478,7 +51466,7 @@ fn publication_column_dependencies_restrict_cascade_and_remap_durably() {
         ["0"],
         "the cascaded publication membership removal survives object-store recovery"
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -51730,10 +51718,10 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
     let mut config = test_config("alter-subscription-definition");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("alter-subscription-definition-{}", std::process::id());
+    config.object_store_bucket = format!("alter-subscription-definition-{}", std::process::id());
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -51823,7 +51811,7 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
             "host=127.0.0.2 port=5433 user=repl dbname=publisher application_name=apply_changes sslmode=disable|{sales,inventory}"
         ]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -51831,11 +51819,11 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
     let mut config = test_config("subscription-effective-definition");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("subscription-effective-definition-{}", std::process::id());
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -51946,7 +51934,7 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
         runtime.bootstrap,
         crate::storage::SubscriptionBootstrap::Refresh { copy_data: false }
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -51954,10 +51942,10 @@ fn subscription_uri_conninfo_is_durable_and_resolves_the_protocol_default_once()
     let mut config = test_config("subscription-uri-conninfo");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("subscription-uri-conninfo-{}", std::process::id());
+    config.object_store_bucket = format!("subscription-uri-conninfo-{}", std::process::id());
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -52014,7 +52002,7 @@ fn subscription_uri_conninfo_is_durable_and_resolves_the_protocol_default_once()
             .password(),
         Some("secret word")
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -52221,11 +52209,10 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
     let mut config = test_config("subscription-relation-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("subscription-relation-recovery-{}", std::process::id());
+    config.object_store_bucket = format!("subscription-relation-recovery-{}", std::process::id());
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -52295,7 +52282,7 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
         ["r|0/2A"],
         "checkpoint recovery must retain table synchronization state"
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -52303,10 +52290,10 @@ fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
     let mut config = test_config("subscription-managed-cleanup");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("subscription-managed-cleanup-{}", std::process::id());
+    config.object_store_bucket = format!("subscription-managed-cleanup-{}", std::process::id());
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -52353,7 +52340,7 @@ fn managed_subscription_drop_retains_cleanup_until_durable_completion() {
         "cleanup completion releases the catalog slot: {}",
         String::from_utf8_lossy(&created)
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -52361,10 +52348,10 @@ fn subscription_failure_policy_is_durable_and_typed() {
     let mut config = test_config("subscription-failure-recovery");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("subscription-failure-{}", std::process::id());
+    config.object_store_bucket = format!("subscription-failure-{}", std::process::id());
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -52443,7 +52430,7 @@ fn subscription_failure_policy_is_durable_and_typed() {
             .is_none(),
         "an explicit refresh clears the durable failure before restarting"
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -53413,8 +53400,8 @@ fn publication_descendant_selection_is_typed_durable_and_protocol_visible() {
     let mut config = test_config("publication-descendants");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("publication-descendants-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("publication-descendants-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -53503,7 +53490,7 @@ fn publication_descendant_selection_is_typed_durable_and_protocol_visible() {
         "the explicit descendant contract survives the object-store manifest"
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -53511,8 +53498,8 @@ fn publication_schema_selection_is_transactional_catalog_accurate_and_replayable
     let mut config = test_config("publication-schema-replay");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("publication-schema-replay-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("publication-schema-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -53568,7 +53555,7 @@ fn publication_schema_selection_is_transactional_catalog_accurate_and_replayable
         )),
         ["0"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -53731,8 +53718,8 @@ fn publication_owner_changes_are_transactional_and_durable() {
     let mut config = test_config("publication-owner-replay");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("publication-owner-replay-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("publication-owner-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -53864,7 +53851,7 @@ fn publication_owner_changes_are_transactional_and_durable() {
         .expect("recovered renamed publication transaction is retained");
     assert!(emitted);
     assert!(send.readable().contains(&b'I'));
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -53915,8 +53902,8 @@ fn alter_index_rename_is_transactional_durable_and_typed() {
     let mut config = test_config("alter-index-rename-replay");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("alter-index-rename-replay-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("alter-index-rename-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -54024,7 +54011,7 @@ fn alter_index_rename_is_transactional_durable_and_typed() {
         )),
         ["renamed index comment"]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -54034,8 +54021,8 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("index-lifecycle-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("index-lifecycle-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -54337,7 +54324,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
         "DROP INDEX lifecycle_default_idx; DROP TABLESPACE lifecycle_space_renamed",
     );
     assert!(String::from_utf8_lossy(&dropped_tablespace).contains("DROP TABLESPACE"));
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]
@@ -54347,8 +54334,8 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("catalog-vectors-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("catalog-vectors-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     {
         let mut budget = Budget::new(1 << 29);
@@ -54384,7 +54371,7 @@ fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
     );
     assert_eq!(data_rows(&rows), ["{1,2}|{9,10}", "{3,-4}|{7,8}"]);
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -54733,8 +54720,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     let mut config = test_config(&format!("object-snapshot-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("sql-object-snapshot-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-object-snapshot-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
@@ -54742,7 +54728,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.value_index_rows = 1;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -54910,7 +54896,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         "an incomplete one-entry RAM cache must enforce uniqueness through the durable index"
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -54923,12 +54909,12 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     let mut config = test_config(&format!("commit-batch-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("sql-commit-batch-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-commit-batch-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -55021,7 +55007,7 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
         ["1", "2", "3"]
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -55034,13 +55020,12 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     let mut config = test_config(&format!("commit-batch-ambiguous-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("sql-commit-ambiguous-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-commit-ambiguous-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
-    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 17);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 17);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -55058,7 +55043,7 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     assert!(engine.checkpoint().unwrap());
     assert_eq!(engine.wal.pending_batch_bytes(), 0);
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -55071,12 +55056,12 @@ fn published_checkpoint_cleanup_retries_after_object_store_failure() {
     let mut config = test_config(&format!("post-publish-retry-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("sql-post-publish-retry-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
-    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 29);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 29);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -55106,7 +55091,7 @@ fn published_checkpoint_cleanup_retries_after_object_store_failure() {
     assert!(engine.maybe_checkpoint());
     assert!(!engine.checkpoint_work_pending());
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -55119,7 +55104,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     let mut config = test_config(&format!("object-pruning-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("sql-object-pruning-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-object-pruning-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
@@ -55129,7 +55114,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     const {
         assert!(600 > crate::storage::SPILL_SCAN_BATCH_ROWS);
     }
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -55227,7 +55212,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
         "the planner must not choose a primary-key probe more expensive than the sequential durable scan: selective={selective_gets}, full={full_gets}"
     );
     drop(selective);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -55251,8 +55236,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     let mut config = test_config(&format!("pax-column-demand-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("sql-pax-column-demand-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-pax-column-demand-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 32 << 20;
@@ -55260,7 +55244,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     config.memtable_bytes = 32 << 20;
     config.work_arena_bytes = 1 << 20;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     prepare_cold_pax_fixture(&config);
 
@@ -55459,7 +55443,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
     );
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 71);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 71);
     let mut fault_budget = Budget::new(1 << 30);
     let mut faulted = Engine::new(&config, &mut fault_budget).unwrap();
     namespace.borrow_mut().faults.rot_per_mille = 1000;
@@ -55567,7 +55551,7 @@ fn cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack() {
         "cold MERGE must decode only source ON and action columns: bytes={}",
         merge_reads.object_read_bytes
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -55642,7 +55626,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
     let mut config = test_config(&format!("external-runs-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("sql-external-runs-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-external-runs-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 20;
     config.wal_bytes = 16 << 20;
@@ -55653,7 +55637,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
     // The sorted projection is about 1.5 MiB. This bound proves execution
     // recycles batches instead of retaining the result in the work arena.
     config.work_arena_bytes = 512 << 10;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 28) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -56001,7 +55985,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
     }
 
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -56026,13 +56010,13 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
     let mut config = test_config(&format!("reconcile-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("sql-reconcile-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-reconcile-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
-    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 7);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 7);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
 
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -56099,7 +56083,7 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
         "row 2 survives a wiped journal because reconciliation uploaded it"
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -56124,13 +56108,12 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
     let mut config = test_config(&format!("cold-then-crash-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("sql-cold-then-crash-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-cold-then-crash-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
     config.wal_upload_buffer_bytes = 256 * 1024;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
 
     // Generation 1: write rows WITHOUT a checkpoint, so they live only as
@@ -56190,7 +56173,7 @@ fn cold_start_then_commit_then_crash_recovers_every_record_body() {
         "both generations survive the post-cold-start crash"
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -56203,11 +56186,11 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
     let mut config = test_config(&format!("external-sets-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("sql-external-sets-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-external-sets-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -56256,7 +56239,7 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
         "set multisets must traverse BlockStore: {traffic:?}"
     );
     drop(engine);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -56269,8 +56252,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     let mut config = test_config(&format!("external-windows-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
-        format!("sql-external-windows-{}-{sequence}", std::process::id());
+    config.object_store_bucket = format!("sql-external-windows-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
@@ -56287,7 +56269,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     // this arena, so only the spilled path can evaluate the queries below;
     // per-partition compute_window stays O(partition).
     config.work_arena_bytes = 2 << 20;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -56431,7 +56413,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
         "cold window evaluation must cross the durable block boundary: {cold_traffic:?}"
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -56456,7 +56438,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     let mut config = test_config(&format!("object-transaction-wal-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!(
+    config.object_store_bucket = format!(
         "sql-object-transaction-wal-{}-{sequence}",
         std::process::id()
     );
@@ -56467,7 +56449,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.max_tables = 16;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -56639,7 +56621,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
         ["15"]
     );
     drop(restarted);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -57486,13 +57468,13 @@ fn recursive_cte_search_cycle_uses_provider_neutral_spill() {
     let mut config = test_config(&format!("recursive-search-cycle-spill-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!(
+    config.object_store_bucket = format!(
         "recursive-search-cycle-spill-{}-{sequence}",
         std::process::id()
     );
     config.object_store_response_bytes = 1 << 20;
     config.work_arena_bytes = 1 << 20;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -57563,7 +57545,7 @@ fn recursive_cte_search_cycle_uses_provider_neutral_spill() {
         String::from_utf8_lossy(&recovered_rows)
     );
     drop(recovered);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -58145,8 +58127,8 @@ fn temporal_values_and_expressions_survive_object_cold_recovery() {
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("temporal-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("temporal-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -58202,7 +58184,7 @@ fn temporal_values_and_expressions_survive_object_cold_recovery() {
         before
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -60021,12 +60003,12 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     let mut config = test_config(&format!("external-in-witness-{sequence}"));
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace =
+    config.object_store_bucket =
         format!("sql-external-in-witness-{}-{sequence}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
@@ -60157,7 +60139,7 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
             "7|10|520", "8|10|530", "9|10|540"
         ]
     );
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -60323,8 +60305,8 @@ fn table_sources_survive_stored_queries_copy_cursors_and_object_cold_recovery() 
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("table-source-cold-recovery-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("table-source-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -60397,7 +60379,7 @@ fn table_sources_survive_stored_queries_copy_cursors_and_object_cold_recovery() 
         copy_before
     );
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
@@ -60408,8 +60390,8 @@ fn grouping_and_using_alias_semantics_survive_stored_queries_and_cold_recovery()
     config.object_store_sim = true;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.object_store_namespace = format!("grouping-using-cold-{}", std::process::id());
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    config.object_store_bucket = format!("grouping-using-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -60492,6 +60474,6 @@ fn grouping_and_using_alias_semantics_survive_stored_queries_and_cold_recovery()
     ));
     assert_eq!(after, before);
     drop(cold);
-    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

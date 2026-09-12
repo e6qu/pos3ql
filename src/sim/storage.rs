@@ -101,7 +101,7 @@ fn vopr_config(seed: u64) -> Config {
     config.data_dir = dir.to_str().unwrap().to_string();
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_namespace = format!("vopr-{}-{seed}", std::process::id());
+    config.object_store_bucket = format!("vopr-{}-{seed}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
@@ -131,8 +131,8 @@ impl World {
     fn new(seed: u64) -> Self {
         let config = vopr_config(seed);
         let _ = std::fs::remove_dir_all(&config.data_dir);
-        drop_namespace(&config.object_store_namespace);
-        let namespace = open_namespace(&config.object_store_namespace, seed);
+        drop_namespace(&config.object_store_bucket);
+        let namespace = open_namespace(&config.object_store_bucket, seed);
         let mut world = Self {
             seed,
             rng: Pcg32::new(seed, 0x5709a6e), // storage-VOPR stream
@@ -529,7 +529,7 @@ impl World {
 impl Drop for World {
     fn drop(&mut self) {
         self.session = None;
-        drop_namespace(&self.config.object_store_namespace);
+        drop_namespace(&self.config.object_store_bucket);
         let _ = std::fs::remove_dir_all(&self.config.data_dir);
     }
 }

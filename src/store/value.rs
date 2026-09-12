@@ -11,8 +11,14 @@ use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 const ENTRY_HEADER: usize = 8 + 8 + 8 + 4;
 pub(crate) const VALUE_INDEX_KEY_MAX: usize = MAX_PAYLOAD - ENTRY_HEADER;
 const ROSTER_CHAINED: u32 = 1 << 31;
+const ROSTER_BLOCK_FILTERS: u32 = 1 << 30;
+const ROSTER_COUNT_MASK: u32 = !(ROSTER_CHAINED | ROSTER_BLOCK_FILTERS);
 const ROSTER_HEADER: usize = 4 + 32;
-const MAX_BLOCKS: usize = (MAX_PAYLOAD - ROSTER_HEADER) / 32;
+/// Enough bits for the largest possible data block to retain a useful false
+/// positive rate while still grouping dozens of data blocks under one roster.
+const BLOCK_FILTER_BYTES: usize = 8 * 1024;
+const FILTERED_BLOCK_REF: usize = 32 + BLOCK_FILTER_BYTES;
+const MAX_BLOCKS: usize = (MAX_PAYLOAD - ROSTER_HEADER) / FILTERED_BLOCK_REF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ValueIndexHandle {
@@ -39,7 +45,9 @@ impl From<StoreError> for ValueIndexError {
 pub(crate) struct ValueIndexWriter {
     pending: Box<[u8]>,
     pending_len: usize,
+    pending_filter: Box<[u8]>,
     blocks: Box<[BlockId]>,
+    block_filters: Box<[u8]>,
     block_count: usize,
     roster_tail: Option<BlockId>,
     entries: u64,
@@ -50,7 +58,9 @@ impl ValueIndexWriter {
         Self {
             pending: vec![0; MAX_PAYLOAD].into_boxed_slice(),
             pending_len: 0,
+            pending_filter: vec![0; BLOCK_FILTER_BYTES].into_boxed_slice(),
             blocks: vec![BlockId([0; 32]); MAX_BLOCKS].into_boxed_slice(),
+            block_filters: vec![0; MAX_BLOCKS * BLOCK_FILTER_BYTES].into_boxed_slice(),
             block_count: 0,
             roster_tail: None,
             entries: 0,
@@ -58,11 +68,15 @@ impl ValueIndexWriter {
     }
 
     pub(crate) fn budget_bytes() -> usize {
-        MAX_PAYLOAD + MAX_BLOCKS * core::mem::size_of::<BlockId>()
+        MAX_PAYLOAD
+            + BLOCK_FILTER_BYTES
+            + MAX_BLOCKS * core::mem::size_of::<BlockId>()
+            + MAX_BLOCKS * BLOCK_FILTER_BYTES
     }
 
     pub(crate) fn reset(&mut self) {
         self.pending_len = 0;
+        self.pending_filter.fill(0);
         self.block_count = 0;
         self.roster_tail = None;
         self.entries = 0;
@@ -83,6 +97,7 @@ impl ValueIndexWriter {
         if self.pending_len + bytes > MAX_PAYLOAD {
             self.flush(store)?;
         }
+        super::bloom::insert(&mut self.pending_filter, hash);
         let at = self.pending_len;
         self.pending[at..at + 8].copy_from_slice(&hash.to_le_bytes());
         self.pending[at + 8..at + 16].copy_from_slice(&rowid.to_le_bytes());
@@ -106,8 +121,12 @@ impl ValueIndexWriter {
             BlockType::ValueIndexData,
             0,
         )?;
+        let filter_at = self.block_count * BLOCK_FILTER_BYTES;
+        self.block_filters[filter_at..filter_at + BLOCK_FILTER_BYTES]
+            .copy_from_slice(&self.pending_filter);
         self.block_count += 1;
         self.pending_len = 0;
+        self.pending_filter.fill(0);
         Ok(())
     }
 
@@ -116,16 +135,20 @@ impl ValueIndexWriter {
     /// not bounded by a single roster block.
     fn flush_roster(&mut self, store: &mut dyn BlockStore) -> Result<(), ValueIndexError> {
         let count = u32::try_from(self.block_count).map_err(|_| ValueIndexError::Corrupt)?;
-        self.pending[..4].copy_from_slice(&(count | ROSTER_CHAINED).to_le_bytes());
+        self.pending[..4]
+            .copy_from_slice(&(count | ROSTER_CHAINED | ROSTER_BLOCK_FILTERS).to_le_bytes());
         self.pending[4..36].fill(0);
         if let Some(previous) = self.roster_tail {
             self.pending[4..36].copy_from_slice(&previous.0);
         }
         for (index, id) in self.blocks[..self.block_count].iter().enumerate() {
-            let at = ROSTER_HEADER + index * 32;
+            let at = ROSTER_HEADER + index * FILTERED_BLOCK_REF;
             self.pending[at..at + 32].copy_from_slice(&id.0);
+            let filter_at = index * BLOCK_FILTER_BYTES;
+            self.pending[at + 32..at + FILTERED_BLOCK_REF]
+                .copy_from_slice(&self.block_filters[filter_at..filter_at + BLOCK_FILTER_BYTES]);
         }
-        let bytes = ROSTER_HEADER + self.block_count * 32;
+        let bytes = ROSTER_HEADER + self.block_count * FILTERED_BLOCK_REF;
         // The roster root is written with a stable lsn (0): a content-addressed
         // block must re-PUT the same bytes for the same payload, but the header
         // lsn is the checkpoint's and varies across incarnations — so it would
@@ -154,6 +177,26 @@ impl ValueIndexWriter {
     }
 }
 
+fn roster_layout(raw_count: u32, roster_len: usize) -> Result<(usize, usize), ValueIndexError> {
+    if raw_count & ROSTER_CHAINED == 0 {
+        return Err(ValueIndexError::Corrupt);
+    }
+    let block_count = (raw_count & ROSTER_COUNT_MASK) as usize;
+    let stride = if raw_count & ROSTER_BLOCK_FILTERS != 0 {
+        FILTERED_BLOCK_REF
+    } else {
+        32
+    };
+    let expected_len = block_count
+        .checked_mul(stride)
+        .and_then(|bytes| ROSTER_HEADER.checked_add(bytes))
+        .ok_or(ValueIndexError::Corrupt)?;
+    if roster_len != expected_len {
+        return Err(ValueIndexError::Corrupt);
+    }
+    Ok((block_count, stride))
+}
+
 /// Walks every roster node and data-block identity in a generation. Returning
 /// false from `visit` stops before any caller-owned keep-set can overflow.
 pub(crate) fn walk_value_roster(
@@ -172,13 +215,7 @@ pub(crate) fn walk_value_roster(
             return Err(ValueIndexError::Corrupt);
         }
         let raw_count = u32::from_le_bytes(scratch[..4].try_into().unwrap());
-        if raw_count & ROSTER_CHAINED == 0 {
-            return Err(ValueIndexError::Corrupt);
-        }
-        let block_count = (raw_count & !ROSTER_CHAINED) as usize;
-        if roster_len != ROSTER_HEADER + block_count * 32 {
-            return Err(ValueIndexError::Corrupt);
-        }
+        let (block_count, stride) = roster_layout(raw_count, roster_len)?;
         next = if scratch[4..36].iter().any(|byte| *byte != 0) {
             let mut id = [0; 32];
             id.copy_from_slice(&scratch[4..36]);
@@ -187,7 +224,7 @@ pub(crate) fn walk_value_roster(
             None
         };
         for block in 0..block_count {
-            let at = ROSTER_HEADER + block * 32;
+            let at = ROSTER_HEADER + block * stride;
             let mut id = [0; 32];
             id.copy_from_slice(&scratch[at..at + 32]);
             if !visit(BlockId(id)) {
@@ -217,10 +254,8 @@ impl<'a> ValueIndexReader<'a> {
         hash: u64,
         mut visit: impl FnMut(u64, u64, &[u8]),
     ) -> Result<(), ValueIndexError> {
-        self.walk(store, handle, |entry_hash, rowid, lsn, key| {
-            if entry_hash == hash {
-                visit(rowid, lsn, key);
-            }
+        self.walk_inner(store, handle, Some(hash), |_, rowid, lsn, key| {
+            visit(rowid, lsn, key);
         })
     }
 
@@ -228,6 +263,16 @@ impl<'a> ValueIndexReader<'a> {
         &mut self,
         store: &mut dyn BlockStore,
         handle: &ValueIndexHandle,
+        visit: impl FnMut(u64, u64, u64, &[u8]),
+    ) -> Result<(), ValueIndexError> {
+        self.walk_inner(store, handle, None, visit)
+    }
+
+    fn walk_inner(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &ValueIndexHandle,
+        target_hash: Option<u64>,
         mut visit: impl FnMut(u64, u64, u64, &[u8]),
     ) -> Result<(), ValueIndexError> {
         let mut seen = 0u64;
@@ -243,13 +288,7 @@ impl<'a> ValueIndexReader<'a> {
                 return Err(ValueIndexError::Corrupt);
             }
             let raw_count = u32::from_le_bytes(self.roster[..4].try_into().unwrap());
-            if raw_count & ROSTER_CHAINED == 0 {
-                return Err(ValueIndexError::Corrupt);
-            }
-            let block_count = (raw_count & !ROSTER_CHAINED) as usize;
-            if roster_len != ROSTER_HEADER + block_count * 32 {
-                return Err(ValueIndexError::Corrupt);
-            }
+            let (block_count, stride) = roster_layout(raw_count, roster_len)?;
             next = if self.roster[4..36].iter().any(|byte| *byte != 0) {
                 let mut id = [0; 32];
                 id.copy_from_slice(&self.roster[4..36]);
@@ -258,9 +297,18 @@ impl<'a> ValueIndexReader<'a> {
                 None
             };
             for block in 0..block_count {
-                let at = ROSTER_HEADER + block * 32;
+                let at = ROSTER_HEADER + block * stride;
                 let mut id = [0; 32];
                 id.copy_from_slice(&self.roster[at..at + 32]);
+                if let Some(hash) = target_hash
+                    && stride == FILTERED_BLOCK_REF
+                    && !super::bloom::maybe_contains(
+                        &self.roster[at + 32..at + FILTERED_BLOCK_REF],
+                        hash,
+                    )
+                {
+                    continue;
+                }
                 let (data_len, kind) = store.get(&BlockId(id), self.data)?;
                 if kind != BlockType::ValueIndexData {
                     return Err(ValueIndexError::Corrupt);
@@ -284,13 +332,15 @@ impl<'a> ValueIndexReader<'a> {
                         .and_then(|start| start.checked_add(key_len))
                         .filter(|end| *end <= data_len)
                         .ok_or(ValueIndexError::Corrupt)?;
-                    visit(hash, rowid, lsn, &self.data[cursor + ENTRY_HEADER..end]);
+                    if target_hash.is_none_or(|target| target == hash) {
+                        visit(hash, rowid, lsn, &self.data[cursor + ENTRY_HEADER..end]);
+                    }
                     seen += 1;
                     cursor = end;
                 }
             }
         }
-        if seen != handle.entries {
+        if target_hash.is_none() && seen != handle.entries {
             return Err(ValueIndexError::Corrupt);
         }
         Ok(())
@@ -321,6 +371,92 @@ mod tests {
             })
             .unwrap();
         assert_eq!(found, [(12, 4, b"beta".to_vec())]);
+    }
+
+    #[test]
+    fn per_block_filters_skip_irrelevant_value_data() {
+        let mut budget = Budget::new(8 << 20);
+        let mut store = MemoryBlockStore::new(&mut budget, "value filters", 4 << 20, 32).unwrap();
+        let mut writer = ValueIndexWriter::new();
+        let first_key = vec![b'a'; MAX_PAYLOAD / 2];
+        let second_key = vec![b'b'; MAX_PAYLOAD / 2];
+        writer.append(&mut store, 7, 11, 3, &first_key).unwrap();
+        writer.append(&mut store, 9, 12, 4, &second_key).unwrap();
+        let handle = writer.finish(&mut store, 10).unwrap().unwrap();
+
+        let mut roster = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        let before_missing = store.reads();
+        ValueIndexReader::over(&mut roster, &mut data)
+            .probe(&mut store, &handle, 99, |_, _, _| {
+                panic!("absent hash matched")
+            })
+            .unwrap();
+        assert_eq!(
+            store.reads() - before_missing,
+            1,
+            "an absent hash reads only the roster"
+        );
+
+        let before_present = store.reads();
+        let mut found = 0;
+        ValueIndexReader::over(&mut roster, &mut data)
+            .probe(&mut store, &handle, 7, |rowid, _, _| {
+                assert_eq!(rowid, 11);
+                found += 1;
+            })
+            .unwrap();
+        assert_eq!(found, 1);
+        assert_eq!(
+            store.reads() - before_present,
+            2,
+            "a present hash reads the roster and only its candidate data block"
+        );
+
+        let before_walk = store.reads();
+        ValueIndexReader::over(&mut roster, &mut data)
+            .walk(&mut store, &handle, |_, _, _, _| {})
+            .unwrap();
+        assert_eq!(
+            store.reads() - before_walk,
+            3,
+            "a full walk reads both data blocks"
+        );
+    }
+
+    #[test]
+    fn pre_filter_rosters_remain_readable() {
+        let mut budget = Budget::new(8 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "old value format", 4 << 20, 32).unwrap();
+        let key = b"old";
+        let mut entry = vec![0u8; ENTRY_HEADER + key.len()];
+        entry[..8].copy_from_slice(&17u64.to_le_bytes());
+        entry[8..16].copy_from_slice(&23u64.to_le_bytes());
+        entry[16..24].copy_from_slice(&29u64.to_le_bytes());
+        entry[24..28].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        entry[ENTRY_HEADER..].copy_from_slice(key);
+        let data_id = store.put(&entry, BlockType::ValueIndexData, 0).unwrap();
+        let mut roster_bytes = [0u8; ROSTER_HEADER + 32];
+        roster_bytes[..4].copy_from_slice(&(1 | ROSTER_CHAINED).to_le_bytes());
+        roster_bytes[ROSTER_HEADER..].copy_from_slice(&data_id.0);
+        let roster_id = store
+            .put(&roster_bytes, BlockType::ValueIndexRoster, 0)
+            .unwrap();
+        let handle = ValueIndexHandle {
+            roster: roster_id,
+            entries: 1,
+            published_lsn: 31,
+        };
+        let mut roster = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        let mut found = None;
+        ValueIndexReader::over(&mut roster, &mut data)
+            .probe(&mut store, &handle, 17, |rowid, lsn, key| {
+                found = Some((rowid, lsn, key.to_vec()));
+            })
+            .unwrap();
+        assert_eq!(found, Some((23, 29, b"old".to_vec())));
     }
 
     #[test]

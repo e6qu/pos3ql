@@ -78,21 +78,26 @@ the comparison does not pretend PostgreSQL itself has an S3 cache profile.
 Each workload reports attempted and completed operations, errors, elapsed
 time, operations per second, p50/p95/p99/maximum/mean latency, process CPU,
 peak RSS, RSS divided by the declared fixed memory plan, maintenance count,
-and object requests and payload bytes by PUT, full GET, ranged GET, LIST, and
-DELETE. The instrumented object-store oracle speaks the same locked S3 profile
-as the other test endpoints. Its optional metrics file and deterministic
-latency are test-process instrumentation; production code never calls a
-private endpoint or a provider branch.
+table index/sequential scan deltas, and object requests and payload bytes by
+PUT, full GET, ranged GET, LIST, and DELETE. The instrumented object-store
+oracle speaks the same locked S3 profile as the other test endpoints. Its
+optional metrics file and deterministic latency are test-process
+instrumentation; production code never calls a private endpoint or a provider
+branch.
 
 ## CI policy
 
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no
 more than 125% of the fixed plan, the stable object-operation metric schema,
-actual shared-object reads during empty-local-cache recovery, and concurrent
-commit PUT amplification below 1.75 PUTs per transaction. The ungrouped
-durable shape is two PUTs per transaction: an immutable journal object and a
-compare-and-swap commit-head update.
+at least one index scan per point-read or synchronized-update operation and
+zero sequential scans in the complete resident warm-memory paths, actual
+shared-object reads during empty-local-cache recovery, and concurrent commit
+PUT amplification below 1.75 PUTs per transaction. This access-path gate keeps
+a timing improvement from concealing a return to full-table point reads or
+updates. The
+ungrouped durable shape is two PUTs per transaction: an immutable journal
+object and a compare-and-swap commit-head update.
 
 Absolute timing is recorded but is not a hosted-runner gate. Stable regression
 thresholds require pinned hardware and an independently operated compatible
@@ -102,10 +107,13 @@ reported rather than required to be linear.
 ## What the measurements decide next
 
 Representative long runs, not the single-binary label or the small CI smoke
-dataset, decide optimization order. The known structural limits remain global
-query serialization, modeled rather than broadly physical secondary indexes,
-object-read amplification on larger cold datasets, and small startup-sized
-catalog/table ceilings. Multi-core execution must preserve fixed memory,
-MVCC, lock ordering, group publication order, and explicit backpressure.
-Writer fencing and promotion safety must exist before any failover benchmark
-or active-active claim is meaningful.
+dataset, decide optimization order. Plain-column btree equality probes now use
+resident exact maps or filtered immutable blocks for queries and direct DML;
+composite leading-prefix and range predicates avoid fetching non-candidate rows
+but still walk the durable key generation. The known structural limits remain global query
+serialization, ordered/richer secondary-index planning, object-read
+amplification on range walks and larger cold datasets, and small startup-sized
+catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
+lock ordering, group publication order, and explicit backpressure. Writer
+fencing and promotion safety must exist before any failover benchmark or
+active-active claim is meaningful.

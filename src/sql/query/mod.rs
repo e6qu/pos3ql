@@ -52,6 +52,7 @@ pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
     row_security_passes,
 };
+pub(crate) use scan::{dml_index_access_plan, dml_indexed_candidates, index_access_plan};
 
 mod scope;
 pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relations};

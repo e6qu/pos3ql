@@ -228,6 +228,27 @@ def setup_database(connection, rows):
     connection.query("CHECKPOINT")
 
 
+def read_access_path(connection):
+    rows = connection.query(
+        "SELECT seq_scan, seq_tup_read, idx_scan, idx_tup_fetch "
+        "FROM pg_stat_user_tables "
+        "WHERE schemaname = 'public' AND relname = 'benchmark_kv'"
+    )
+    if len(rows) != 1 or len(rows[0]) != 4:
+        return None
+    names = ("sequential_scans", "sequential_tuples_read", "index_scans", "index_tuples_fetched")
+    try:
+        return {name: int(value or 0) for name, value in zip(names, rows[0])}
+    except ValueError as error:
+        raise RuntimeError("invalid pg_stat_user_tables counters") from error
+
+
+def subtract_access_path(after, before):
+    if after is None or before is None:
+        return None
+    return {name: after[name] - before[name] for name in sorted(after)}
+
+
 def run(args):
     targets = args.targets or [(args.host, args.port)]
     control = PgConnection(*targets[0], args.user, args.database)
@@ -249,6 +270,12 @@ def run(args):
                    for index in range(args.clients)]
     latencies = []
     errors = []
+    before_access_path = None
+    if len(targets) == 1:
+        try:
+            before_access_path = read_access_path(connections[0])
+        except Exception as error:
+            errors.append(f"access-path baseline: {error}")
     result_lock = threading.Lock()
     start_barrier = threading.Barrier(args.clients + 1)
     operation_barrier = threading.Barrier(args.clients) if args.synchronized else None
@@ -269,6 +296,11 @@ def run(args):
         except Exception as error:  # surfaced in the result and by the exit code
             with result_lock:
                 errors.append(f"worker {worker_id}: {error}")
+            # One failed synchronized worker can never reach the next
+            # generation. Wake every peer with BrokenBarrierError instead of
+            # leaving the benchmark hung forever and losing the first error.
+            if operation_barrier:
+                operation_barrier.abort()
         finally:
             with result_lock:
                 latencies.extend(local)
@@ -312,6 +344,12 @@ def run(args):
     if args.object_metrics:
         time.sleep(0.1)
     after_metrics = read_metrics(args.object_metrics)
+    after_access_path = None
+    if len(targets) == 1:
+        try:
+            after_access_path = read_access_path(connections[0])
+        except Exception as error:
+            errors.append(f"access-path result: {error}")
     for connection in connections:
         connection.close()
 
@@ -332,6 +370,7 @@ def run(args):
             "operations_per_client": args.operations,
             "rows": args.rows,
             "synchronized": args.synchronized,
+            "require_index": args.require_index,
             "maintenance_interval_seconds": args.maintenance_interval,
             "target_count": len(targets),
         },
@@ -362,6 +401,7 @@ def run(args):
                 else None
             ),
             "maintenance_operations": maintenance_count[0],
+            "access_path": subtract_access_path(after_access_path, before_access_path),
             "object_store": object_metrics,
             "object_requests_per_operation": (
                 object_requests / completed
@@ -393,6 +433,15 @@ def validate(result):
     }:
         failures.append("object-store instrumentation has the wrong operation schema")
     workload = result.get("workload", {})
+    access_path = results.get("access_path")
+    if workload.get("require_index"):
+        if access_path is None:
+            failures.append("required index-access counters are unavailable")
+        else:
+            if access_path["index_scans"] < results["completed_operations"]:
+                failures.append("workload did not execute an index scan per operation")
+            if access_path["sequential_scans"] != 0:
+                failures.append("workload unexpectedly executed sequential scans")
     if (
         metrics is not None
         and workload.get("name") == "update"
@@ -427,6 +476,11 @@ def parse_args():
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--setup", action="store_true")
     parser.add_argument("--synchronized", action="store_true")
+    parser.add_argument(
+        "--require-index",
+        action="store_true",
+        help="fail validation unless every operation uses an index and none uses a sequential scan",
+    )
     parser.add_argument("--maintenance-interval", type=float, default=0.0)
     parser.add_argument("--object-metrics")
     parser.add_argument("--pid", type=int)
@@ -447,6 +501,10 @@ def parse_args():
         parser.error("clients, operations, and rows must be positive")
     if args.maintenance_interval < 0:
         parser.error("maintenance interval cannot be negative")
+    if args.require_index and (
+        args.workload not in ("point-read", "update") or len(args.targets) > 1
+    ):
+        parser.error("--require-index requires a point-read or update workload against one target")
     return args
 
 

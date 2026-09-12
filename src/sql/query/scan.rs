@@ -19,7 +19,7 @@ use crate::sql::eval::{
 };
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, PolicyCommandKind, Storage, rowenc};
+use crate::storage::{MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, TableDef, rowenc};
 
 use super::plan::{
     MAX_CONJUNCTS, conjunct_passes, expr_tables, fill_join_order, flatten_and, fold_null,
@@ -482,12 +482,30 @@ mod tests {
 /// A complete value probe over one base table. The rowids are sorted so
 /// taking the cache path does not make result/error order depend on hash-slot
 /// placement.
-struct IndexedCandidates<'a> {
+pub(crate) struct IndexedCandidates<'a> {
     table: usize,
     index_oid: i32,
     scan_executed: bool,
     index_entries: usize,
     rowids: &'a [u64],
+}
+
+impl<'a> IndexedCandidates<'a> {
+    pub(crate) const fn index_oid(&self) -> i32 {
+        self.index_oid
+    }
+
+    pub(crate) const fn scan_executed(&self) -> bool {
+        self.scan_executed
+    }
+
+    pub(crate) const fn index_entries(&self) -> usize {
+        self.index_entries
+    }
+
+    pub(crate) const fn rowids(&self) -> &'a [u64] {
+        self.rowids
+    }
 }
 
 /// A bound base-table row. Storage sources normally carry the canonical row
@@ -750,181 +768,471 @@ fn pax_column_demand_bounded(
     Some(columns)
 }
 
-/// Finds one single-column `indexed_column = constant` conjunct. This is
-/// intentionally conservative: joins, derived rows, parameters and
-/// multi-column keys stay on the ordinary scan until their access path can
-/// preserve the same visibility and coercion guarantees.
+#[derive(Clone, Copy)]
+struct IndexConstraint<'a> {
+    operand: &'a Expr<'a>,
+    operator: BinaryOp,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct IndexAccessPlan<'a> {
+    columns: [u16; MAX_INDEX_COLS],
+    constraints: [Option<IndexConstraint<'a>>; MAX_INDEX_COLS],
+    n_columns: usize,
+    n_constraints: usize,
+    exact: bool,
+}
+
+impl IndexAccessPlan<'_> {
+    pub(crate) fn columns(&self) -> &[u16] {
+        &self.columns[..self.n_columns]
+    }
+
+    pub(crate) const fn is_exact(&self) -> bool {
+        self.exact
+    }
+
+    pub(crate) fn expected_rows(
+        &self,
+        storage: &Storage,
+        slot: usize,
+        definition: &TableDef,
+        txid: u32,
+    ) -> u64 {
+        let statistics = storage.table_statistics(slot, txid);
+        let mut expected_rows = storage.planning_row_estimate(slot).max(1);
+        for position in 0..self.n_constraints {
+            let column = self.columns[position] as usize;
+            let constraint = self.constraints[position].expect("counted constraint");
+            if statistics.valid && statistics.columns[column].valid {
+                let distinct = crate::storage::column_distinct_estimate(
+                    &definition.columns[column],
+                    statistics.columns[column],
+                    statistics.rows,
+                    false,
+                );
+                let equality_rows =
+                    (statistics.rows as f64 / distinct.max(1.0)).ceil().max(1.0) as u64;
+                expected_rows = expected_rows.min(if constraint.operator == BinaryOp::Eq {
+                    equality_rows
+                } else {
+                    statistics.rows.div_ceil(3).max(1)
+                });
+            } else if constraint.operator == BinaryOp::Eq {
+                expected_rows = 1;
+            }
+        }
+        expected_rows
+    }
+}
+
+fn reverse_index_operator(operator: BinaryOp) -> BinaryOp {
+    match operator {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+fn collect_index_constraints<'a, Resolve, Invariant>(
+    expression: &'a Expr<'a>,
+    resolve_column: &mut Resolve,
+    operand_is_invariant: &Invariant,
+    constraints: &mut [Option<IndexConstraint<'a>>; MAX_COLUMNS],
+) where
+    Resolve: FnMut(&Expr<'a>) -> Option<usize>,
+    Invariant: Fn(&Expr<'a>) -> bool,
+{
+    if let Expr::Binary {
+        operator: BinaryOp::And,
+        left,
+        right,
+    } = expression
+    {
+        collect_index_constraints(left, resolve_column, operand_is_invariant, constraints);
+        collect_index_constraints(right, resolve_column, operand_is_invariant, constraints);
+        return;
+    }
+    let Expr::Binary {
+        operator,
+        left,
+        right,
+    } = expression
+    else {
+        return;
+    };
+    if !matches!(
+        operator,
+        BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+    ) {
+        return;
+    }
+    let mut bind = |column: &'a Expr<'a>, operand: &'a Expr<'a>, operator: BinaryOp| {
+        if !operand_is_invariant(operand) {
+            return false;
+        }
+        let Some(index) = resolve_column(column) else {
+            return false;
+        };
+        let replacement = IndexConstraint { operand, operator };
+        match constraints[index] {
+            // Equality is the strongest btree constraint. Retain the first
+            // equal-strength term; the full WHERE rechecks every term.
+            Some(current) if current.operator == BinaryOp::Eq => {}
+            _ => constraints[index] = Some(replacement),
+        }
+        true
+    };
+    if !bind(left, right, *operator) {
+        let _ = bind(right, left, reverse_index_operator(*operator));
+    }
+}
+
+fn select_index_access_plan<'a>(
+    storage: &Storage,
+    slot: usize,
+    by_column: &[Option<IndexConstraint<'a>>; MAX_COLUMNS],
+) -> Option<IndexAccessPlan<'a>> {
+    let mut selected: Option<(usize, IndexAccessPlan<'a>)> = None;
+    for binding in 0..storage.value_binding_count(slot) {
+        let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+        let mut constraints = [None; MAX_INDEX_COLS];
+        let mut n_constraints = 0usize;
+        let mut exact = true;
+        for (position, &column) in columns[..n_columns].iter().enumerate() {
+            let Some(constraint) = by_column[column as usize] else {
+                exact = false;
+                break;
+            };
+            constraints[position] = Some(constraint);
+            n_constraints += 1;
+            if constraint.operator != BinaryOp::Eq {
+                exact = false;
+                break;
+            }
+        }
+        exact &= n_constraints == n_columns;
+        if n_constraints == 0
+            || (exact && !storage.value_probe_complete(slot, &columns[..n_columns]))
+            || (!exact && !storage.value_durable_complete(slot, &columns[..n_columns]))
+        {
+            continue;
+        }
+        // Full equality gets the O(1) resident path. Otherwise prefer the
+        // binding with the longest usable btree prefix.
+        let score = if exact {
+            MAX_INDEX_COLS * 2 + n_constraints
+        } else {
+            n_constraints
+        };
+        if selected.is_none_or(|(best, _)| score > best) {
+            selected = Some((
+                score,
+                IndexAccessPlan {
+                    columns,
+                    constraints,
+                    n_columns,
+                    n_constraints,
+                    exact,
+                },
+            ));
+        }
+    }
+    selected.map(|(_, plan)| plan)
+}
+
+fn index_snapshot_is_current(storage: &Storage, slot: usize, txid: u32) -> bool {
+    // Resident and object generations carry the published base plus the
+    // latest overlay, not every intermediate key image retained for a
+    // repeatable-read snapshot. The ordinary MVCC scan owns that case.
+    storage.commit_snapshot() == storage.lsn()
+        // The committed index remains authoritative while another
+        // transaction owns a pending image. Only this transaction's visible
+        // writes can introduce a key absent from that index.
+        && !storage.has_visible_pending_rows(slot, txid)
+}
+
+/// Finds the strongest leading-key predicate served by one plain-column
+/// btree binding. Exact complete keys use the resident hash multimap; equality
+/// prefixes and a following range consume the immutable key generation. The
+/// ordinary WHERE remains the authority, so ignored or duplicate conjuncts
+/// can only add false-positive candidates.
+pub(crate) fn index_access_plan<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+) -> Option<IndexAccessPlan<'a>> {
+    if scope.n != 1
+        || scope.derived[0].is_some()
+        || scope.lateral[0]
+        || !index_snapshot_is_current(storage, scope.slots[0], txid)
+    {
+        return None;
+    }
+    let mut by_column = [None; MAX_COLUMNS];
+    let mut resolve_column = |expression: &Expr<'a>| {
+        let Expr::Column { qualifier, name } = expression else {
+            return None;
+        };
+        match scope.find_column(*qualifier, name) {
+            Ok(ResolvedColumn::Table(0, index)) => Some(index),
+            _ => None,
+        }
+    };
+    let operand_is_invariant = |operand: &Expr<'a>| {
+        // Parameters and pure casts around them are statement-invariant even
+        // though they are not compile-time constants. Calls and subqueries can
+        // change between candidate selection and recheck.
+        expr_tables(operand, scope) == Some(0)
+            && !operand.contains_call()
+            && !operand.contains_subquery()
+    };
+    collect_index_constraints(
+        where_clause?,
+        &mut resolve_column,
+        &operand_is_invariant,
+        &mut by_column,
+    );
+    select_index_access_plan(storage, scope.slots[0], &by_column)
+}
+
+fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
+    match expression {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::NumericLit(_)
+        | Expr::Str(_)
+        | Expr::Param(_) => true,
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. } => dml_index_operand_is_invariant(operand),
+        Expr::Binary { left, right, .. } => {
+            dml_index_operand_is_invariant(left) && dml_index_operand_is_invariant(right)
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => {
+            dml_index_operand_is_invariant(operand)
+                && dml_index_operand_is_invariant(low)
+                && dml_index_operand_is_invariant(high)
+        }
+        Expr::Like {
+            operand, pattern, ..
+        }
+        | Expr::Match {
+            operand, pattern, ..
+        } => dml_index_operand_is_invariant(operand) && dml_index_operand_is_invariant(pattern),
+        Expr::InList { operand, list, .. } => {
+            dml_index_operand_is_invariant(operand)
+                && list
+                    .iter()
+                    .all(|expression| dml_index_operand_is_invariant(expression))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn dml_index_access_plan<'a>(
+    storage: &Storage,
+    slot: usize,
+    definition: &TableDef,
+    alias: Option<&str>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+) -> Option<IndexAccessPlan<'a>> {
+    if !index_snapshot_is_current(storage, slot, txid) {
+        return None;
+    }
+    let mut by_column = [None; MAX_COLUMNS];
+    let mut resolve_column = |expression: &Expr<'a>| {
+        let Expr::Column { qualifier, name } = expression else {
+            return None;
+        };
+        if qualifier.is_some_and(|qualifier| {
+            !crate::sql::eval::qualifier_answers_target(definition, alias, qualifier)
+        }) {
+            return None;
+        }
+        definition.column_index(name)
+    };
+    collect_index_constraints(
+        where_clause?,
+        &mut resolve_column,
+        &dml_index_operand_is_invariant,
+        &mut by_column,
+    );
+    select_index_access_plan(storage, slot, &by_column)
+}
+
 fn indexed_candidates<'a>(
     storage: &'a Storage,
     scope: &QueryScope<'a>,
     txid: u32,
-    where_clause: Option<&Expr<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
-    if scope.n != 1
-        || scope.derived[0].is_some()
-        || scope.lateral[0]
-        // Resident and object generations carry the published base plus the
-        // latest overlay, not every intermediate key image retained for a
-        // repeatable-read snapshot. The ordinary MVCC scan owns that case.
-        || storage.commit_snapshot() != storage.lsn()
-        || storage.has_pending_rows(scope.slots[0])
-    {
+    let Some(plan) = index_access_plan(storage, scope, txid, where_clause) else {
         return Ok(None);
-    }
-    fn reverse(operator: BinaryOp) -> BinaryOp {
-        match operator {
-            BinaryOp::Lt => BinaryOp::Gt,
-            BinaryOp::LtEq => BinaryOp::GtEq,
-            BinaryOp::Gt => BinaryOp::Lt,
-            BinaryOp::GtEq => BinaryOp::LtEq,
-            other => other,
-        }
-    }
-    fn find<'a>(
-        expression: &'a Expr<'a>,
-        scope: &QueryScope<'_>,
-    ) -> Option<(usize, &'a Expr<'a>, BinaryOp)> {
-        match expression {
-            Expr::Binary {
-                operator: BinaryOp::And,
-                left,
-                right,
-            } => find(left, scope).or_else(|| find(right, scope)),
-            Expr::Binary {
-                operator,
-                left,
-                right,
-            } if matches!(
-                operator,
-                BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
-            ) =>
-            {
-                let side = |column: &'a Expr<'a>,
-                            constant: &'a Expr<'a>,
-                            operator: BinaryOp|
-                 -> Option<(usize, &'a Expr<'a>, BinaryOp)> {
-                    let Expr::Column { qualifier, name } = column else {
-                        return None;
-                    };
-                    // `is_constant` also admits stable/volatile scalar calls
-                    // for the expression planner. An index key must be
-                    // invariant between candidate selection and the ordinary
-                    // WHERE recheck, so decline every call here.
-                    if !constant.is_constant() || constant.contains_call() {
-                        return None;
-                    }
-                    match scope.find_column(*qualifier, name).ok()? {
-                        ResolvedColumn::Table(0, index) => Some((index, constant, operator)),
-                        _ => None,
-                    }
-                };
-                side(left, right, *operator).or_else(|| side(right, left, reverse(*operator)))
-            }
-            _ => None,
-        }
-    }
-    let Some((column, constant, operator)) = where_clause.and_then(|clause| find(clause, scope))
+    };
+    let slot = scope.slots[0];
+    let definition = scope.defs[0].expect("physical table has definition");
+    indexed_candidates_for_plan(storage, slot, definition, txid, plan, arena, params, hooks)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dml_indexed_candidates<'a>(
+    storage: &'a Storage,
+    slot: usize,
+    definition: &TableDef,
+    alias: Option<&str>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
+    let Some(plan) = dml_index_access_plan(storage, slot, definition, alias, txid, where_clause)
     else {
         return Ok(None);
     };
-    let columns = [column as u16];
-    let slot = scope.slots[0];
-    if (operator == BinaryOp::Eq && !storage.value_probe_complete(slot, &columns))
-        || (operator != BinaryOp::Eq && !storage.value_durable_complete(slot, &columns))
-    {
-        return Ok(None);
-    }
-    let target_type = scope.defs[0]
-        .expect("physical table has definition")
-        .columns[column]
-        .ctype;
-    let target_collation = scope.defs[0]
-        .expect("physical table has definition")
-        .columns[column]
-        .collation;
-    let statistics = storage.table_statistics(slot, txid);
-    let expected_rows = if statistics.valid && statistics.columns[column].valid {
-        let distinct = crate::storage::column_distinct_estimate(
-            &scope.defs[0]
-                .expect("physical table has definition")
-                .columns[column],
-            statistics.columns[column],
-            statistics.rows,
-            false,
-        );
-        (statistics.rows as f64 / distinct.max(1.0)).ceil().max(1.0) as u64
-    } else {
-        1
-    };
-    if storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid) {
-        return Ok(None);
-    }
-    let Some(index_oid) = crate::sql::catalog::value_index_oid(storage, txid, slot, column) else {
+    indexed_candidates_for_plan(storage, slot, definition, txid, plan, arena, params, hooks)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn indexed_candidates_for_plan<'a>(
+    storage: &'a Storage,
+    slot: usize,
+    definition: &TableDef,
+    txid: u32,
+    plan: IndexAccessPlan<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
+    let Some((index_oid, _)) = crate::sql::catalog::value_index_identity(
+        storage,
+        txid,
+        slot,
+        &plan.columns[..plan.n_columns],
+    ) else {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "value-index probe has no catalog index identity"
         ));
     };
-    let raw = eval_full(constant, arena, params, &NoColumns, hooks)?;
-    if raw.is_null() {
-        return Ok(Some(IndexedCandidates {
-            table: 0,
-            index_oid,
-            scan_executed: false,
-            index_entries: 0,
-            rowids: &[],
-        }));
-    }
-    let raw_type = ColType::from_oid(raw.type_oid());
-    let integer =
-        |column_type: ColType| matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8);
-    let integer_compatible = raw_type.is_some_and(integer) && integer(target_type);
-    // An untyped string literal is coerced to the indexed column by the
-    // equality operator. Already-typed constants are safe only when their
-    // representation has the same equality hash (the integer widths share
-    // one canonical hash). Declining other cross-type operators avoids, for
-    // example, turning `integer_column = 1.1::numeric` into an index probe for
-    // a rounded integer.
-    if !matches!(constant, Expr::Str(_)) && raw_type != Some(target_type) && !integer_compatible {
+    let expected_rows = plan.expected_rows(storage, slot, definition, txid);
+    if !(plan.exact && storage.value_cache_complete(slot, &plan.columns[..plan.n_columns]))
+        && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
+    {
         return Ok(None);
     }
-    let value = match target_type {
-        ColType::Enum(slot) => {
-            super::super::exec::coerce_enum_value(raw, slot, storage, txid, arena)?
+
+    let mut values = [Datum::Null; MAX_INDEX_COLS];
+    let mut types = [ColType::Bool; MAX_INDEX_COLS];
+    let mut collations = [Collation::None; MAX_INDEX_COLS];
+    for position in 0..plan.n_constraints {
+        let column = plan.columns[position] as usize;
+        let constraint = plan.constraints[position].expect("counted constraint");
+        let target_type = definition.columns[column].ctype;
+        let raw = eval_full(constraint.operand, arena, params, &NoColumns, hooks)?;
+        if raw.is_null() {
+            return Ok(Some(IndexedCandidates {
+                table: 0,
+                index_oid,
+                scan_executed: false,
+                index_entries: 0,
+                rowids: &[],
+            }));
         }
-        _ => cast_to(raw, target_type, arena)?,
-    };
+        let raw_type = ColType::from_oid(raw.type_oid());
+        let integer = |column_type: ColType| {
+            matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8)
+        };
+        let integer_compatible = raw_type.is_some_and(integer) && integer(target_type);
+        // Untyped strings and the integer-width family have the same equality
+        // semantics after coercion. Decline every other cross-type probe so a
+        // lossy cast can never discard a matching authoritative row.
+        if !matches!(constraint.operand, Expr::Str(_))
+            && raw_type != Some(target_type)
+            && !integer_compatible
+        {
+            return Ok(None);
+        }
+        values[position] = match target_type {
+            ColType::Enum(slot) => {
+                super::super::exec::coerce_enum_value(raw, slot, storage, txid, arena)?
+            }
+            _ => cast_to(raw, target_type, arena)?,
+        };
+        types[position] = target_type;
+        collations[position] = definition.columns[column].collation;
+    }
+    for (position, &column) in plan.columns[..plan.n_columns].iter().enumerate() {
+        types[position] = definition.columns[column as usize].ctype;
+        collations[position] = definition.columns[column as usize].collation;
+    }
     let key_matches = |key: &[u8]| -> Result<bool, SqlError> {
-        let mut decoded = [Datum::Null];
-        rowenc::decode(key, &[target_type], &mut decoded)?;
-        if decoded[0].is_null() {
-            return Ok(false);
+        let mut decoded = [Datum::Null; MAX_INDEX_COLS];
+        rowenc::decode(
+            key,
+            &types[..plan.n_columns],
+            &mut decoded[..plan.n_columns],
+        )?;
+        for position in 0..plan.n_constraints {
+            if decoded[position].is_null() {
+                return Ok(false);
+            }
+            let ordering = compare_datums_collated(
+                storage,
+                collations[position],
+                &decoded[position],
+                &values[position],
+            )?;
+            let operator = plan.constraints[position]
+                .expect("counted constraint")
+                .operator;
+            if !match operator {
+                BinaryOp::Eq => ordering.is_eq(),
+                BinaryOp::Lt => ordering.is_lt(),
+                BinaryOp::LtEq => ordering.is_le(),
+                BinaryOp::Gt => ordering.is_gt(),
+                BinaryOp::GtEq => ordering.is_ge(),
+                _ => unreachable!("filtered comparison"),
+            } {
+                return Ok(false);
+            }
         }
-        let ordering = compare_datums_collated(storage, target_collation, &decoded[0], &value)?;
-        Ok(match operator {
-            BinaryOp::Eq => ordering.is_eq(),
-            BinaryOp::Lt => ordering.is_lt(),
-            BinaryOp::LtEq => ordering.is_le(),
-            BinaryOp::Gt => ordering.is_gt(),
-            BinaryOp::GtEq => ordering.is_ge(),
-            _ => unreachable!("filtered comparison"),
-        })
+        Ok(true)
     };
-    let hash = hash_key_collated(&[value], &[0], &[target_collation]);
+    let compact_columns = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
+    let hash = plan.exact.then(|| {
+        hash_key_collated(
+            &values[..plan.n_columns],
+            &compact_columns[..plan.n_columns],
+            &collations[..plan.n_columns],
+        )
+    });
     let mut count = 0usize;
-    if operator == BinaryOp::Eq {
-        let complete = storage.probe_value(slot, &columns, hash, |_| count += 1)?;
+    if let Some(hash) = hash {
+        let complete =
+            storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |_| count += 1)?;
         debug_assert!(complete, "completeness checked before probe");
     } else {
-        let complete = storage.walk_value_index(slot, &columns, |_, key| {
-            if key_matches(key)? {
-                count += 1;
-            }
-            Ok(())
-        })?;
+        let complete =
+            storage.walk_value_index(slot, &plan.columns[..plan.n_columns], |_, key| {
+                if key_matches(key)? {
+                    count += 1;
+                }
+                Ok(())
+            })?;
         debug_assert!(complete, "durable completeness checked before scan");
     }
     let Ok(rowids) = arena.alloc_slice_with(count, |_| 0u64) else {
@@ -935,13 +1243,13 @@ fn indexed_candidates<'a>(
         return Ok(None);
     };
     let mut fill = 0usize;
-    if operator == BinaryOp::Eq {
-        storage.probe_value(slot, &columns, hash, |rowid| {
+    if let Some(hash) = hash {
+        storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |rowid| {
             rowids[fill] = rowid;
             fill += 1;
         })?;
     } else {
-        storage.walk_value_index(slot, &columns, |rowid, key| {
+        storage.walk_value_index(slot, &plan.columns[..plan.n_columns], |rowid, key| {
             if key_matches(key)? {
                 rowids[fill] = rowid;
                 fill += 1;

@@ -3250,6 +3250,9 @@ pub(crate) struct ExtendedStatisticsMcv {
     pub(crate) valid: bool,
     pub(crate) hash: u64,
     pub(crate) count: u64,
+    /// IEEE-754 bits of PostgreSQL's independent/base frequency. Zero marks
+    /// legacy statistics that predate persisted base frequencies.
+    pub(crate) base_frequency_bits: u64,
     pub(crate) values: StackStr<EXTENDED_STATISTICS_MCV_TEXT_MAX>,
 }
 
@@ -3258,6 +3261,7 @@ impl ExtendedStatisticsMcv {
         valid: false,
         hash: 0,
         count: 0,
+        base_frequency_bits: 0,
         values: StackStr::new(),
     };
 }
@@ -4673,6 +4677,9 @@ pub(crate) struct SubscriptionDef {
     /// advanced only after the same local commit has reached the WAL/object
     /// store durability boundary.
     pub confirmed_lsn: u64,
+    /// Local commit LSN paired with `confirmed_lsn` for replication-origin
+    /// progress. Both positions advance atomically and survive checkpoints.
+    pub origin_lsn: u64,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
 }
@@ -12661,7 +12668,7 @@ impl Storage {
 
     pub(crate) fn park_backend_statement(&self, pid: i32, object_io: bool) {
         let wait = if object_io {
-            (Some("IO"), Some("ObjectStorageRead"))
+            (Some("Extension"), Some("ObjectStorageRead"))
         } else if self.advisory_locks.borrow().blocker_pid_count(pid) != 0 {
             (Some("Lock"), Some("advisory"))
         } else if self.row_locks.borrow().blocker_pid_count(pid) != 0 {
@@ -14430,6 +14437,7 @@ impl Storage {
                     sync_error_count: 0,
                     stats_reset: None,
                     confirmed_lsn: 0,
+                    origin_lsn: 0,
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
                 })
@@ -27401,6 +27409,7 @@ impl Storage {
             sync_error_count: 0,
             stats_reset: None,
             confirmed_lsn: 0,
+            origin_lsn: 0,
             ownership: Ownership {
                 owner: owner as u16,
                 pending: None,
@@ -27900,7 +27909,11 @@ impl Storage {
         }))
     }
 
-    pub(crate) fn apply_subscription_advance(&mut self, advance: SubscriptionAdvance) {
+    pub(crate) fn apply_subscription_advance(
+        &mut self,
+        advance: SubscriptionAdvance,
+        origin_lsn: u64,
+    ) {
         let subscription = self
             .subscriptions
             .get_mut(advance.stream.slot)
@@ -27914,6 +27927,7 @@ impl Storage {
             })
             .expect("validated subscription must remain live until its WAL commit");
         subscription.confirmed_lsn = advance.confirmed_lsn;
+        subscription.origin_lsn = origin_lsn;
         subscription.bootstrap = SubscriptionBootstrap::Ready;
         for relation in self.subscription_relations.iter_mut() {
             if relation.ddl_state == CatalogDdlState::Present

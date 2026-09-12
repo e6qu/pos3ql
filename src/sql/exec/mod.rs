@@ -21882,7 +21882,15 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     name,
                     sql,
                     param_types,
-                } => engine.execute_prepare_statement(name, sql, param_types, sqlprep, responder),
+                } => engine.execute_prepare_statement(
+                    name,
+                    sql,
+                    param_types,
+                    sqlprep,
+                    context.arena,
+                    txn,
+                    responder,
+                ),
                 Stmt::Deallocate(name) => {
                     engine.execute_deallocate_statement(*name, sqlprep, responder)
                 }
@@ -46273,6 +46281,7 @@ pub(crate) fn analyze_extended_statistics(
                         valid: true,
                         hash: full_hash,
                         count: 1,
+                        base_frequency_bits: 0,
                         values: rendered,
                     };
                 } else if n_mcv < mcv.len() {
@@ -46280,6 +46289,7 @@ pub(crate) fn analyze_extended_statistics(
                         valid: true,
                         hash: full_hash,
                         count: 1,
+                        base_frequency_bits: 0,
                         values: rendered,
                     };
                     n_mcv += 1;
@@ -46305,8 +46315,19 @@ pub(crate) fn analyze_extended_statistics(
         }
         n_mcv = compacted;
         if n_mcv != 0 {
+            let mut marginal_counts =
+                [[0u64; MAX_EXTENDED_STATISTICS_KEYS]; MAX_EXTENDED_STATISTICS_MCV];
             for entry in &mut mcv[..n_mcv] {
                 entry.count = 0;
+                entry.base_frequency_bits = 0;
+            }
+            let mut candidate_values = [&[][..]; crate::storage::MAX_EXTENDED_STATISTICS_MCV];
+            for (candidate, entry) in mcv[..n_mcv].iter().enumerate() {
+                let source = arena
+                    .alloc_str(entry.values.as_str())
+                    .map_err(|_| arena_full())?;
+                candidate_values[candidate] =
+                    super::array::parse_literal(source, crate::sql::types::ArrElem::Text, arena)?;
             }
             super::query::select_into_rows_recycling(
                 storage,
@@ -46318,26 +46339,59 @@ pub(crate) fn analyze_extended_statistics(
                 None,
                 &mut |values| {
                     let hash = crate::sql::eval::hash_key(values, &indices[..n_keys]);
-                    if !mcv[..n_mcv].iter().any(|entry| entry.hash == hash) {
-                        return Ok(());
+                    let mut rendered_keys = [None; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+                    for (rendered, value) in
+                        rendered_keys[..n_keys].iter_mut().zip(&values[..n_keys])
+                    {
+                        if !value.is_null() {
+                            *rendered = Some(datum_to_text(*value, arena)?);
+                        }
                     }
                     let rendered = render_mcv_values(&values[..n_keys], arena)?;
-                    if let Some(entry) = mcv[..n_mcv]
-                        .iter_mut()
-                        .find(|entry| entry.hash == hash && entry.values == rendered)
-                    {
-                        entry.count = entry.count.saturating_add(1);
+                    for candidate in 0..n_mcv {
+                        let entry = &mut mcv[candidate];
+                        if entry.hash == hash && entry.values == rendered {
+                            entry.count = entry.count.saturating_add(1);
+                        }
+                        for (key, actual) in rendered_keys[..n_keys].iter().copied().enumerate() {
+                            let candidate_value = super::array::get(
+                                candidate_values[candidate],
+                                crate::sql::types::ArrElem::Text,
+                                key,
+                            )
+                            .expect("ANALYZE candidate retains every statistics key");
+                            let equal = match (candidate_value, actual) {
+                                (Datum::Null, None) => true,
+                                (Datum::Text(candidate), Some(actual)) => candidate == actual,
+                                _ => false,
+                            };
+                            if equal {
+                                marginal_counts[candidate][key] =
+                                    marginal_counts[candidate][key].saturating_add(1);
+                            }
+                        }
                     }
                     Ok(())
                 },
             )?;
+            for (candidate, entry) in mcv[..n_mcv].iter_mut().enumerate() {
+                let mut base_frequency = 1.0f64;
+                for marginal in &marginal_counts[candidate][..n_keys] {
+                    base_frequency *= *marginal as f64 / rows.max(1) as f64;
+                }
+                entry.base_frequency_bits = base_frequency.to_bits();
+            }
         }
-        mcv[..n_mcv].sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.hash.cmp(&right.hash))
-        });
+        // PostgreSQL retains encounter order for equal-frequency MCVs. A
+        // stable in-place insertion sort preserves that contract without the
+        // scratch allocation used by the standard stable slice sort.
+        for index in 1..n_mcv {
+            let mut position = index;
+            while position != 0 && mcv[position - 1].count < mcv[position].count {
+                mcv.swap(position - 1, position);
+                position -= 1;
+            }
+        }
         let target = usize::from(definition.definition_for(txn.txid).target.unwrap_or(100));
         n_mcv = n_mcv.min(target).min(MAX_EXTENDED_STATISTICS_MCV);
         if rows == 0 {
@@ -51618,7 +51672,11 @@ fn decode_binary_field_with_context<'a>(
     };
     let via = |oid| crate::pg::conn::decode_binary_param(oid, bytes, arena).map_err(|_| bad());
     match ctype {
-        ColType::Void | ColType::Internal | ColType::PgDdlCommand | ColType::AclItem => Err(bad()),
+        ColType::Void
+        | ColType::Internal
+        | ColType::PgDdlCommand
+        | ColType::AnyArray
+        | ColType::AclItem => Err(bad()),
         ColType::Bool => via(oids::BOOL),
         ColType::Int2 => {
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;
@@ -53470,7 +53528,7 @@ fn merge_source_columns(
 pub fn describe_merge_returning<'a>(
     storage: &'a Storage,
     txid: u32,
-    statement: &'a crate::sql::ast::Merge<'a>,
+    statement: &crate::sql::ast::Merge<'a>,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
 ) -> Result<usize, SqlError> {

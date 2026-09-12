@@ -134,6 +134,8 @@ pub struct QueryScope<'d> {
     pub names: &'d mut [&'d str],
     pub defs: &'d mut [Option<&'d TableDef>],
     pub slots: &'d mut [usize],
+    /// Per-source system fields encoded after the visible relation shape.
+    hidden_columns: &'d mut [usize],
     /// Effective authorization role for each physical relation. Stored views
     /// populate this with their owner; ordinary references leave it empty and
     /// execute as the session's current role.
@@ -213,7 +215,7 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
     fn column_user_type(&self, qualifier: Option<&str>, name: &str) -> Option<UserTypeName> {
         match self.0.find_column(qualifier, name).ok()? {
             ResolvedColumn::Table(table, column) => {
-                self.0.defs[table]?.columns().get(column)?.user_type
+                self.0.defs[table]?.columns.get(column)?.user_type
             }
             ResolvedColumn::Merged(_) => None,
         }
@@ -252,6 +254,9 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
         let slots = arena
+            .alloc_slice_with(table_count, |_| 0)
+            .map_err(|_| arena_full())?;
+        let hidden_columns = arena
             .alloc_slice_with(table_count, |_| 0)
             .map_err(|_| arena_full())?;
         let authorization_roles = arena
@@ -303,6 +308,7 @@ impl<'d> QueryScope<'d> {
             names,
             defs,
             slots,
+            hidden_columns,
             authorization_roles,
             view_accesses,
             derived,
@@ -774,6 +780,7 @@ impl<'d> QueryScope<'d> {
         self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
+        self.hidden_columns[self.n] = synth.hidden_columns;
         self.n += 1;
         Ok(())
     }
@@ -1146,7 +1153,7 @@ impl<'d> QueryScope<'d> {
                     ));
                 };
                 let left_type = self.output_type(left);
-                let right_type = right_def.columns()[right_c].ctype;
+                let right_type = right_def.columns[right_c].ctype;
                 let Some(ctype) = common_using_type(left_type, right_type) else {
                     // PostgreSQL fails resolving the merged column's `=`
                     // operator at parse time, even over empty tables.
@@ -1194,7 +1201,7 @@ impl<'d> QueryScope<'d> {
                     let right_ref = arena
                         .alloc(Expr::Column {
                             qualifier: Some(self.names[right_t]),
-                            name: right_def.columns()[right_c].name.as_str(),
+                            name: right_def.columns[right_c].name.as_str(),
                         })
                         .map_err(|_| arena_full())?;
                     let eq = arena
@@ -1262,9 +1269,7 @@ impl<'d> QueryScope<'d> {
     /// The exposed name of a join-tree output column.
     pub(crate) fn output_name(&self, entry: ResolvedColumn) -> &'d str {
         match entry {
-            ResolvedColumn::Table(t, c) => {
-                self.defs[t].expect("resolved").columns()[c].name.as_str()
-            }
+            ResolvedColumn::Table(t, c) => self.defs[t].expect("resolved").columns[c].name.as_str(),
             ResolvedColumn::Merged(m) => self.merged[m].name,
         }
     }
@@ -1272,7 +1277,7 @@ impl<'d> QueryScope<'d> {
     /// The type of a join-tree output column.
     pub fn output_type(&self, entry: ResolvedColumn) -> ColType {
         match entry {
-            ResolvedColumn::Table(t, c) => self.defs[t].expect("resolved").columns()[c].ctype,
+            ResolvedColumn::Table(t, c) => self.defs[t].expect("resolved").columns[c].ctype,
             ResolvedColumn::Merged(m) => self.merged[m].ctype,
         }
     }
@@ -1281,13 +1286,13 @@ impl<'d> QueryScope<'d> {
     pub(crate) fn output_collation(&self, entry: ResolvedColumn) -> crate::sql::ast::Collation {
         match entry {
             ResolvedColumn::Table(table, column) => {
-                self.defs[table].expect("resolved").columns()[column].collation
+                self.defs[table].expect("resolved").columns[column].collation
             }
             ResolvedColumn::Merged(merged) => self.merged[merged].parts
                 [..self.merged[merged].n_parts]
                 .first()
                 .map(|&(table, column)| {
-                    self.defs[table].expect("resolved").columns()[column].collation
+                    self.defs[table].expect("resolved").columns[column].collation
                 })
                 .unwrap_or(crate::sql::ast::Collation::None),
         }
@@ -1344,7 +1349,7 @@ impl<'d> QueryScope<'d> {
             ResolvedColumn::Table(t, c) => Ok(&*arena
                 .alloc(Expr::Column {
                     qualifier: Some(self.names[t]),
-                    name: self.defs[t].expect("resolved").columns()[c].name.as_str(),
+                    name: self.defs[t].expect("resolved").columns[c].name.as_str(),
                 })
                 .map_err(|_| arena_full())?),
             ResolvedColumn::Merged(m) => {
@@ -1354,7 +1359,7 @@ impl<'d> QueryScope<'d> {
                     args[i] = &*arena
                         .alloc(Expr::Column {
                             qualifier: Some(self.names[t]),
-                            name: self.defs[t].expect("resolved").columns()[c].name.as_str(),
+                            name: self.defs[t].expect("resolved").columns[c].name.as_str(),
                         })
                         .map_err(|_| arena_full())?;
                 }
@@ -1530,7 +1535,7 @@ impl<'d> QueryScope<'d> {
                         });
                 }
                 let t = self.table_index(q)?;
-                match self.defs[t].expect("resolved").column_index(name) {
+                match self.scope_column_index(t, name) {
                     Some(c) => Ok(ResolvedColumn::Table(t, c)),
                     None => Err(sql_err!(
                         sqlstate::UNDEFINED_COLUMN,
@@ -1568,7 +1573,7 @@ impl<'d> QueryScope<'d> {
                 }
                 let mut found = None;
                 for t in 0..self.n {
-                    if let Some(c) = self.defs[t].expect("resolved").column_index(name) {
+                    if let Some(c) = self.scope_column_index(t, name) {
                         if found.is_some() {
                             return Err(sql_err!(
                                 crate::sql::eval::sqlstate::AMBIGUOUS_COLUMN,
@@ -1594,5 +1599,16 @@ impl<'d> QueryScope<'d> {
         (0..self.n)
             .map(|t| self.defs[t].expect("resolved").n_columns)
             .sum()
+    }
+
+    fn scope_column_index(&self, table: usize, name: &str) -> Option<usize> {
+        let definition = self.defs[table].expect("resolved");
+        definition.column_index(name).or_else(|| {
+            definition.columns
+                [definition.n_columns..definition.n_columns + self.hidden_columns[table]]
+                .iter()
+                .position(|column| column.name.as_str() == name)
+                .map(|index| definition.n_columns + index)
+        })
     }
 }

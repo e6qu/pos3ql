@@ -8506,6 +8506,92 @@ fn extended_statistics_mcv_includes_null_combinations_and_empty_analyze_has_no_d
 }
 
 #[test]
+fn extended_statistics_views_preserve_mcv_shape_and_independent_frequencies() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE statistics_view_source(a integer, b integer, label text); \
+         INSERT INTO statistics_view_source \
+              SELECT 1, 1, 'ONE' FROM generate_series(1, 80) \
+          UNION ALL SELECT 1, 2, 'TWO' FROM generate_series(1, 10) \
+          UNION ALL SELECT 2, 1, 'THREE' FROM generate_series(1, 10); \
+         CREATE STATISTICS statistics_view_ab (ndistinct, dependencies, mcv) \
+           ON a, b FROM statistics_view_source; \
+         ALTER STATISTICS statistics_view_ab SET STATISTICS 2; \
+         CREATE STATISTICS statistics_view_label ON (lower(label)) \
+           FROM statistics_view_source; \
+         ANALYZE statistics_view_source; \
+         SELECT array_ndims(most_common_vals), array_length(most_common_vals, 1), \
+                array_length(most_common_vals, 2), most_common_vals::text, \
+                most_common_val_nulls::text, most_common_freqs[1], \
+                most_common_base_freqs[1] \
+           FROM pg_stats_ext WHERE statistics_name='statistics_view_ab'; \
+         SELECT expr, null_frac, avg_width, n_distinct \
+           FROM pg_stats_ext_exprs WHERE statistics_name='statistics_view_label'",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), 2, "{}", String::from_utf8_lossy(&output));
+    let fields: Vec<_> = rows[0].split('|').collect();
+    assert_eq!(&fields[..3], &["2", "2", "2"]);
+    assert_eq!(fields[3], "{{1,1},{1,2}}");
+    assert_eq!(fields[4], "{{f,f},{f,f}}");
+    assert_eq!(fields[5], "0.8");
+    assert_eq!(fields[6], "0.81");
+    assert!(rows[1].starts_with("lower(label)|0|"), "{rows:?}");
+}
+
+#[test]
+fn extended_statistics_mcv_base_frequencies_survive_checkpoint_recovery() {
+    let mut config = test_config("extended-statistics-mcv-base-frequencies");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("extended-statistics-base-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_statistics(a integer, b integer); \
+             INSERT INTO durable_statistics \
+                  SELECT 1, 1 FROM generate_series(1, 80) \
+              UNION ALL SELECT 1, 2 FROM generate_series(1, 10) \
+              UNION ALL SELECT 2, 1 FROM generate_series(1, 10); \
+             CREATE STATISTICS durable_statistics_ab (mcv) \
+               ON a, b FROM durable_statistics; \
+             ALTER STATISTICS durable_statistics_ab SET STATISTICS 2; \
+             ANALYZE durable_statistics",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT most_common_vals::text, most_common_base_freqs::text \
+           FROM pg_stats_ext WHERE statistics_name='durable_statistics_ab'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["{{1,1},{1,2}}|{0.81,0.09000000000000001}"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn extended_statistics_drive_plans_and_follow_schema_evolution() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -9212,7 +9298,7 @@ fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
     let mut config = test_config("ordered-catalog-correlated-scratch");
     config.max_tables = 64;
     config.max_value_indexes = 64;
-    config.work_arena_bytes = 3 << 20;
+    config.work_arena_bytes = 16 << 20;
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for relation in 0..14 {
@@ -9260,6 +9346,8 @@ fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
             WHERE (i.indisvalid OR t2.relkind='p') AND i.indisready
             ORDER BY i.indrelid,t.relname"#
     );
+    // Exact PostgreSQL 18 catalog rows make pg_attribute materially wider;
+    // the fixed work arena still proves correlated scratch is recycled.
     let output = run_with_arena_bytes(&mut engine, &mut budget, &query, 1 << 20);
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
@@ -19821,7 +19909,8 @@ fn catalog_index_relations_are_not_silently_capped() {
     let mut config = test_config("catalog_index_relations_are_not_silently_capped");
     config.max_tables = 17;
     config.max_value_indexes = 17 * 16;
-    let mut budget = Budget::new(1 << 28);
+    config.work_arena_bytes = 256 << 20;
+    let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut definition = String::new();
     for table in 0..17 {
@@ -19843,26 +19932,29 @@ fn catalog_index_relations_are_not_silently_capped() {
         "{}",
         String::from_utf8_lossy(&created)
     );
-    assert_eq!(
-        data_rows(&run_with_arena_bytes(
-            &mut engine,
-            &mut budget,
-            "SELECT count(*) FROM pg_index catalog_index \
+    let queries = [
+        "SELECT count(*) FROM pg_index catalog_index \
               JOIN pg_class relation ON relation.oid = catalog_index.indexrelid \
               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
-              WHERE namespace.nspname = 'public'; \
-             SELECT count(*) FROM pg_class relation \
+              WHERE namespace.nspname = 'public'",
+        "SELECT count(*) FROM pg_class relation \
               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
-              WHERE relation.relkind = 'i' AND namespace.nspname = 'public'; \
-             SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'; \
-             SELECT count(*) FROM pg_attribute attribute \
+              WHERE relation.relkind = 'i' AND namespace.nspname = 'public'",
+        "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'",
+        "SELECT count(*) FROM pg_attribute attribute \
               JOIN pg_class relation ON relation.oid = attribute.attrelid \
               JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
               WHERE relation.relkind = 'i' AND namespace.nspname = 'public'",
-            1 << 21,
-        )),
-        ["272", "272", "272", "272"]
-    );
+    ];
+    for query in queries {
+        let output = run_with_arena_bytes(&mut engine, &mut budget, query, 4 << 20);
+        assert_eq!(
+            data_rows(&output),
+            ["272"],
+            "{query}: {}",
+            String::from_utf8_lossy(&output),
+        );
+    }
 }
 
 #[test]
@@ -38861,7 +38953,7 @@ fn policy_statistics_publication_and_subscription_comments_keep_object_identity(
          ALTER STATISTICS comment_catalog_statistics RENAME TO comment_catalog_statistics_renamed; \
          ALTER PUBLICATION comment_catalog_publication RENAME TO comment_catalog_publication_renamed; \
          ALTER SUBSCRIPTION comment_catalog_subscription RENAME TO comment_catalog_subscription_renamed; \
-         SELECT description FROM pg_description WHERE classoid IN (3256, 3381, 6104, 6107) \
+         SELECT description FROM pg_description WHERE classoid IN (3256, 3381, 6100, 6104) \
            ORDER BY description",
     );
     assert_eq!(
@@ -52547,6 +52639,27 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         ["1|first|local"]
     );
     assert_eq!(apply.confirmed_lsn(), 41);
+    let first_origin_lsn = engine
+        .storage
+        .subscription("apply_changes", 0)
+        .unwrap()
+        .1
+        .origin_lsn;
+    assert!(first_origin_lsn > origin_floor);
+    let first_origin_text = format!("{:X}/{:X}", first_origin_lsn >> 32, first_origin_lsn as u32);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SELECT o.roident=s.local_id, o.roname=s.external_id, \
+                        s.remote_lsn='0/29'::pg_lsn, s.local_lsn='{first_origin_text}'::pg_lsn \
+                   FROM pg_replication_origin o \
+                   JOIN pg_replication_origin_status s ON s.local_id=o.roident"
+            ),
+        )),
+        ["t|t|t|t"]
+    );
     let mut origin_scratch =
         crate::mem::FixedBuf::new(&mut budget, "origin filter scratch", 1 << 16).unwrap();
     let mut origin_send =
@@ -52843,6 +52956,13 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     assert_eq!(error.sqlstate, sqlstate::PROTOCOL_VIOLATION);
     assert_eq!(no_origin_apply.confirmed_lsn(), 121);
     drop(no_origin_apply);
+    let durable_origin_lsn = engine
+        .storage
+        .subscription("apply_changes", 0)
+        .unwrap()
+        .1
+        .origin_lsn;
+    assert!(durable_origin_lsn > first_origin_lsn);
     drop(engine);
     let mut replay_budget = Budget::new(1 << 27);
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
@@ -52858,6 +52978,16 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         replayed.subscription_confirmed_lsn("apply_changes"),
         Some(121),
         "a restart cannot replay committed rows without their matching acknowledgement frontier"
+    );
+    assert_eq!(
+        replayed
+            .storage
+            .subscription("apply_changes", 0)
+            .unwrap()
+            .1
+            .origin_lsn,
+        durable_origin_lsn,
+        "replication-origin local progress must replay with its remote frontier"
     );
 }
 
@@ -58472,6 +58602,190 @@ fn prepare_coerces_args_to_declared_types() {
     // An unknown declared type is rejected at PREPARE.
     let unk = run_with(&mut e, &mut b, "PREPARE q (nosuchtype) AS SELECT $1");
     assert!(String::from_utf8_lossy(&unk).contains("42704"));
+}
+
+#[test]
+fn prepared_statement_catalog_describes_queries_and_dml_without_fallbacks() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE prepared_catalog_rows(id integer, payload text)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "PREPARE select_plan(integer) AS \
+             SELECT $1::integer AS id, 'selected'::text AS payload; \
+         PREPARE insert_plan(integer) AS \
+             INSERT INTO prepared_catalog_rows VALUES ($1, 'inserted') RETURNING id, payload; \
+         PREPARE values_plan AS VALUES (1, 'one'), (2, 'two'); \
+         SELECT name, parameter_types::text, result_types::text, from_sql, \
+                generic_plans, custom_plans, prepare_time IS NOT NULL \
+           FROM pg_prepared_statements ORDER BY name; \
+         EXECUTE select_plan(7); \
+         EXECUTE insert_plan(8); \
+         EXECUTE values_plan; \
+         SELECT name, custom_plans FROM pg_prepared_statements ORDER BY name; \
+         DEALLOCATE ALL; \
+         SELECT count(*) FROM pg_prepared_statements",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "insert_plan|{integer}|{integer,text}|t|0|0|t",
+            "select_plan|{integer}|{integer,text}|t|0|0|t",
+            "values_plan|{}|{integer,text}|t|0|0|t",
+            "7|selected",
+            "8|inserted",
+            "1|one",
+            "2|two",
+            "insert_plan|1",
+            "select_plan|1",
+            "values_plan|1",
+            "0",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "PREPARE invalid_utility AS CREATE TABLE prepared_utility(id integer)",
+    );
+    let rejected = String::from_utf8_lossy(&rejected);
+    assert!(
+        rejected.contains("42601") && rejected.contains("utility statements cannot be prepared"),
+        "{rejected}"
+    );
+}
+
+#[test]
+fn postgresql_18_catalog_registry_and_new_observability_views_are_coherent() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) >= 140 \
+           FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+          WHERE n.nspname='pg_catalog' AND c.relname LIKE 'pg_%'; \
+         SELECT count(*) FROM ( \
+           SELECT c.oid, c.relnatts, count(a.attnum) AS attributes \
+             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+             LEFT JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 \
+            WHERE n.nspname='pg_catalog' \
+           GROUP BY c.oid, c.relnatts \
+           HAVING c.relnatts <> count(a.attnum)) mismatched; \
+         SELECT oid, reltype, relnatts FROM pg_class \
+          WHERE relname='pg_subscription'; \
+         SELECT relname, relnatts FROM pg_class \
+          WHERE relname IN ('pg_class','pg_attribute','pg_prepared_statements', \
+                            'pg_wait_events','pg_timezone_names','pg_stats_ext') \
+          ORDER BY relname; \
+         SELECT type, name FROM pg_wait_events ORDER BY type, name; \
+         SELECT count(*), min(abbrev), max(abbrev) FROM pg_timezone_abbrevs; \
+         SELECT name, abbrev, utc_offset, is_dst FROM pg_timezone_names \
+          WHERE name='UTC'; \
+         SELECT (SELECT count(*) FROM pg_aios), \
+                (SELECT count(*) FROM pg_config), \
+                (SELECT count(*) FROM pg_file_settings), \
+                (SELECT count(*) FROM pg_hba_file_rules), \
+                (SELECT count(*) FROM pg_ident_file_mappings), \
+                (SELECT count(*) FROM pg_seclabel), \
+                (SELECT count(*) FROM pg_shmem_allocations)",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows[0], "t", "{}", String::from_utf8_lossy(&output));
+    assert_eq!(rows[1], "0", "{}", String::from_utf8_lossy(&output));
+    assert_eq!(rows[2], "6100|6101|18");
+    assert!(rows.contains(&"pg_attribute|25".to_string()));
+    assert!(rows.contains(&"pg_class|34".to_string()));
+    assert!(rows.contains(&"pg_prepared_statements|8".to_string()));
+    assert!(rows.contains(&"pg_stats_ext|15".to_string()));
+    assert!(rows.contains(&"pg_timezone_names|4".to_string()));
+    assert!(rows.contains(&"pg_wait_events|3".to_string()));
+    assert!(rows.contains(&"Extension|ObjectStorageRead".to_string()));
+    assert!(rows.contains(&"Lock|advisory".to_string()));
+    assert!(rows.contains(&"Lock|relation".to_string()));
+    assert!(rows.contains(&"Lock|transactionid".to_string()));
+    assert!(rows.contains(&"195|ACDT|ZULU".to_string()));
+    assert!(rows.contains(&"UTC|UTC|00:00:00|f".to_string()));
+    assert_eq!(rows.last().map(String::as_str), Some("0|0|0|0|0|0|0"));
+
+    let system_column = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tableoid, tableoid='pg_class'::regclass FROM pg_class \
+          WHERE relname='pg_class'",
+    );
+    assert_eq!(data_rows(&system_column), ["1259|t"]);
+    assert_eq!(
+        row_description_type_oids(&run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            "SELECT * FROM pg_class LIMIT 0",
+            1 << 20,
+        ))
+        .len(),
+        34,
+        "the addressable tableoid system column must remain hidden from star expansion",
+    );
+}
+
+#[test]
+fn pg_attribute_uses_the_declared_type_pass_by_value_contract() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE attribute_mood AS ENUM ('calm', 'busy'); \
+         CREATE DOMAIN attribute_clock AS time; \
+         CREATE TABLE attribute_probe( \
+             clock attribute_clock, mood attribute_mood, tuple_id tid, token uuid); \
+         SELECT a.attname, a.attbyval \
+           FROM pg_attribute a \
+          WHERE a.attrelid='attribute_probe'::regclass AND a.attnum > 0 \
+          ORDER BY a.attnum",
+    );
+    assert_eq!(
+        data_rows(&output),
+        vec!["clock|t", "mood|t", "tuple_id|f", "token|f"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn compatibility_role_views_expose_membership_settings_and_password_masking() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE reporting; \
+         CREATE ROLE report_reader LOGIN PASSWORD 'secret'; \
+         GRANT reporting TO report_reader; \
+         ALTER ROLE report_reader SET application_name TO 'catalog-reader'; \
+         SELECT groname, array_length(grolist, 1) FROM pg_group \
+          WHERE groname='reporting'; \
+         SELECT usename, usecreatedb, usesuper, userepl, usebypassrls, \
+                passwd, useconfig::text \
+           FROM pg_user WHERE usename='report_reader'; \
+         SELECT usename, passwd IS NOT NULL, useconfig::text \
+           FROM pg_shadow WHERE usename='report_reader'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "reporting|1",
+            "report_reader|f|f|f|f|********|{application_name=catalog-reader}",
+            "report_reader|t|{application_name=catalog-reader}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[test]

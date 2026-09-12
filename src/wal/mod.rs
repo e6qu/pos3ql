@@ -396,6 +396,8 @@ impl WalExtendedStatisticsData<'_> {
                         .iter()
                         .map(|entry| 8 + 8 + 2 + entry.values.as_str().len())
                         .sum::<usize>()
+                    + 4
+                    + usize::from(data.n_mcv) * 8
             }
             Self::Encoded(bytes) => bytes.len(),
         }
@@ -425,6 +427,10 @@ impl WalExtendedStatisticsData<'_> {
                         && buffer.append(&entry.count.to_le_bytes())
                         && buffer.append(&(entry.values.as_str().len() as u16).to_le_bytes())
                         && buffer.append(entry.values.as_str().as_bytes());
+                }
+                ok &= buffer.append(b"MCV2");
+                for entry in &data.mcv[..usize::from(data.n_mcv)] {
+                    ok &= buffer.append(&entry.base_frequency_bits.to_le_bytes());
                 }
                 ok
             }
@@ -696,6 +702,7 @@ pub(crate) enum WalOp<'a> {
         created_at: u64,
         definition_generation: u64,
         confirmed_lsn: u64,
+        local_lsn: u64,
     },
     SetSubscriptionEnabled {
         name: &'a str,
@@ -2543,7 +2550,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 }
         }
         WalOp::DropSubscription { name } => 1 + name.len(),
-        WalOp::AdvanceSubscription { name, .. } => 1 + name.len() + 8 + 8 + 8,
+        WalOp::AdvanceSubscription { name, .. } => 1 + name.len() + 8 + 8 + 8 + 8,
         WalOp::SetSubscriptionEnabled { name, .. } => 1 + name.len() + 1,
         WalOp::SetSubscriptionBootstrap { name, .. } => 1 + name.len() + 1,
         WalOp::ResetSubscriptionRelations { name, .. } => 1 + name.len() + 8 + 8,
@@ -4341,11 +4348,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             created_at,
             definition_generation,
             confirmed_lsn,
+            local_lsn,
         } => {
             name_bytes(buffer, name)
                 && buffer.append(&created_at.to_le_bytes())
                 && buffer.append(&definition_generation.to_le_bytes())
                 && buffer.append(&confirmed_lsn.to_le_bytes())
+                && buffer.append(&local_lsn.to_le_bytes())
         }
         WalOp::SetSubscriptionEnabled { name, enabled } => {
             name_bytes(buffer, name) && buffer.append(&[u8::from(*enabled)])
@@ -5883,10 +5892,27 @@ fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsD
             valid: true,
             hash,
             count,
+            base_frequency_bits: 0,
             values,
         };
     }
     data.n_mcv = n_mcv as u16;
+    if at == payload.len() {
+        // Legacy journal records predate exact MCV base frequencies. Zero
+        // deliberately select the compatibility estimate in catalog code.
+        return Some(data);
+    }
+    if payload.get(at..at + 4)? != b"MCV2" {
+        return None;
+    }
+    at += 4;
+    for entry in &mut data.mcv[..n_mcv] {
+        entry.base_frequency_bits = take_u64(&mut at)?;
+        let base_frequency = f64::from_bits(entry.base_frequency_bits);
+        if !base_frequency.is_finite() || !(0.0..=1.0).contains(&base_frequency) {
+            return None;
+        }
+    }
     (at == payload.len()).then_some(data)
 }
 
@@ -7356,11 +7382,21 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 8;
             let confirmed_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
+            // Records written before replication-origin catalog support end
+            // after confirmed_lsn. Their replay LSN supplies local progress.
+            let local_lsn = if at == payload.len() {
+                0
+            } else {
+                let value = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+                value
+            };
             (at == payload.len()).then_some(WalOp::AdvanceSubscription {
                 name,
                 created_at,
                 definition_generation,
                 confirmed_lsn,
+                local_lsn,
             })
         }
         KIND_SET_SUBSCRIPTION_ENABLED => {
@@ -11236,6 +11272,7 @@ mod tests {
                 created_at: 41,
                 definition_generation: 7,
                 confirmed_lsn: 99,
+                local_lsn: 101,
             },
         )
         .unwrap();
@@ -11244,6 +11281,7 @@ mod tests {
             created_at,
             definition_generation,
             confirmed_lsn,
+            local_lsn,
         } = decode_record(&buffer.readable()[16..]).unwrap()
         else {
             panic!("expected subscription advance WAL operation");
@@ -11252,6 +11290,51 @@ mod tests {
         assert_eq!(created_at, 41);
         assert_eq!(definition_generation, 7);
         assert_eq!(confirmed_lsn, 99);
+        assert_eq!(local_lsn, 101);
+
+        let legacy = &buffer.readable()[16..buffer.len() - 8];
+        let WalOp::AdvanceSubscription { local_lsn, .. } = decode_record(legacy).unwrap() else {
+            panic!("expected legacy subscription advance WAL operation");
+        };
+        assert_eq!(local_lsn, 0);
+    }
+
+    #[test]
+    fn extended_statistics_codec_retains_exact_mcv_base_frequency() {
+        let mut data = crate::storage::ExtendedStatisticsData::EMPTY;
+        data.valid = true;
+        data.rows = 100;
+        data.non_null_rows = 100;
+        data.distinct_values = 3;
+        data.mcv[0] = crate::storage::ExtendedStatisticsMcv {
+            valid: true,
+            hash: 17,
+            count: 80,
+            base_frequency_bits: 0.81f64.to_bits(),
+            values: StackStr::from_str("{1,1}"),
+        };
+        data.n_mcv = 1;
+        let captured = WalExtendedStatisticsData::Captured(&data);
+        let mut budget = Budget::new(4096);
+        let mut encoded = FixedBuf::new(
+            &mut budget,
+            "extended statistics wal",
+            captured.encoded_len(),
+        )
+        .unwrap();
+        assert!(captured.append(&mut encoded));
+        assert_eq!(
+            WalExtendedStatisticsData::Encoded(encoded.readable())
+                .materialize()
+                .unwrap(),
+            data
+        );
+
+        let legacy_len = encoded.len() - 4 - core::mem::size_of::<u64>();
+        let legacy = WalExtendedStatisticsData::Encoded(&encoded.readable()[..legacy_len])
+            .materialize()
+            .unwrap();
+        assert_eq!(legacy.mcv[0].base_frequency_bits, 0);
     }
 
     #[test]

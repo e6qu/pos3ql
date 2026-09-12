@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v11";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v12";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -1983,9 +1983,36 @@ impl Checkpointer {
                         valid: true,
                         hash,
                         count,
+                        base_frequency_bits: 0,
                         values,
                     };
                     statistics.data.n_mcv += 1;
+                }
+                Some("estatmcvbase") => {
+                    let created_at: u64 = parse_field(words.next(), "estatmcvbase identity")?;
+                    let hash: u64 = parse_field(words.next(), "estatmcvbase hash")?;
+                    let bits: u64 = parse_field(words.next(), "estatmcvbase bits")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatmcvbase"));
+                    }
+                    let statistics = extended_statistics
+                        .iter_mut()
+                        .find(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
+                        .ok_or(CheckpointSetupError::Corrupt("estatmcvbase precedes estat"))?;
+                    let entry = statistics.data.mcv[..usize::from(statistics.data.n_mcv)]
+                        .iter_mut()
+                        .find(|entry| entry.hash == hash)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "estatmcvbase precedes estatmcv",
+                        ))?;
+                    let base_frequency = f64::from_bits(bits);
+                    if !base_frequency.is_finite() || !(0.0..=1.0).contains(&base_frequency) {
+                        return Err(CheckpointSetupError::Corrupt("invalid estatmcvbase bits"));
+                    }
+                    entry.base_frequency_bits = bits;
                 }
                 Some("tsch") => {
                     let Some((_, def, _, _)) = pending_def.as_mut() else {
@@ -7184,6 +7211,15 @@ impl Checkpointer {
                         value_hex.as_str(),
                     ),
                 )?;
+                if entry.base_frequency_bits != 0 {
+                    write_manifest(
+                        &mut self.manifest_buf,
+                        format_args!(
+                            "estatmcvbase {} {} {}",
+                            statistics.created_at, entry.hash, entry.base_frequency_bits,
+                        ),
+                    )?;
+                }
             }
         }
         for (slot, entry) in storage.checkpoint_foreign_wrappers() {
@@ -7557,7 +7593,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
+                    "sub {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}{}",
                     name.as_str(),
                     subscription.ownership.owner,
                     u8::from(subscription.enabled),
@@ -7579,6 +7615,7 @@ impl Checkpointer {
                     subscription.created_at,
                     subscription.definition_generation,
                     subscription.confirmed_lsn,
+                    subscription.origin_lsn,
                     u8::from(
                         subscription.cleanup
                             == crate::storage::SubscriptionCleanup::DropManagedSlot
@@ -11182,6 +11219,12 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
     let created_at = parse_field(words.next(), "subscription creation stamp")?;
     let definition_generation = parse_field(words.next(), "subscription definition generation")?;
     let confirmed_lsn = parse_field(words.next(), "subscription confirmed LSN")?;
+    let origin_lsn = parse_field(words.next(), "subscription origin local LSN")?;
+    if (confirmed_lsn == 0) != (origin_lsn == 0) {
+        return Err(CheckpointSetupError::Corrupt(
+            "subscription origin position",
+        ));
+    }
     let cleanup = match parse_field::<u8>(words.next(), "subscription cleanup state")? {
         0 => false,
         1 => true,
@@ -11292,7 +11335,7 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
             .ok_or(CheckpointSetupError::Corrupt(
                 "subscription position did not advance",
             ))?;
-        storage.apply_subscription_advance(advance);
+        storage.apply_subscription_advance(advance, origin_lsn);
     }
     if cleanup {
         let dropped = storage

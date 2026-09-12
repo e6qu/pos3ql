@@ -47,6 +47,7 @@ pub struct TzifSlot(u16);
 struct TypeInfo {
     utoff: i32,
     abbrev: StackStr<8>,
+    is_dst: bool,
 }
 
 /// One parsed zone: its transition history plus the footer rule.
@@ -67,6 +68,7 @@ struct ZoneData {
 const EMPTY_TYPE: TypeInfo = TypeInfo {
     utoff: 0,
     abbrev: StackStr::new(),
+    is_dst: false,
 };
 
 const EMPTY_ZONE: ZoneData = ZoneData {
@@ -118,6 +120,8 @@ pub fn init_catalog() {
         });
         let mut prefix = String::new();
         walk(&mut catalog, root, &mut prefix);
+        catalog.names[..catalog.n]
+            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         *c = Some(catalog);
     });
     CACHE.with(|c| {
@@ -148,6 +152,7 @@ fn walk(catalog: &mut Catalog, dir: &std::path::Path, prefix: &mut String) {
         if name.starts_with('.')
             || name.contains('.')
             || name == "posixrules"
+            || name == "leapseconds"
             || name == "right"
             || name == "posix"
         {
@@ -163,7 +168,7 @@ fn walk(catalog: &mut Catalog, dir: &std::path::Path, prefix: &mut String) {
         prefix.push_str(name);
         if kind.is_dir() {
             walk(catalog, &entry.path(), prefix);
-        } else if catalog.n < MAX_CATALOG && prefix.len() <= 48 {
+        } else if catalog.n < MAX_CATALOG && prefix.len() <= 48 && is_tzif_file(&entry.path()) {
             let mut s = StackStr::new();
             let _ = write!(s, "{prefix}");
             catalog.names[catalog.n] = s;
@@ -171,6 +176,17 @@ fn walk(catalog: &mut Catalog, dir: &std::path::Path, prefix: &mut String) {
         }
         prefix.truncate(saved);
     }
+}
+
+/// Zoneinfo installations contain several extensionless metadata files beside
+/// real zones. Identify a zone by the format's required magic instead of
+/// maintaining a platform-specific denylist that inevitably goes stale.
+fn is_tzif_file(path: &std::path::Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).is_ok() && magic == *b"TZif"
 }
 
 /// Case-insensitive catalog match: the canonical installed name for `name`,
@@ -266,6 +282,74 @@ pub fn resolve(slot: TzifSlot, utc_micros: i64) -> (i32, StackStr<8>) {
         let t = zone.types[zone.type_after[i] as usize];
         (t.utoff, t.abbrev)
     })
+}
+
+/// Visits every installed zone at one instant without consuming retained
+/// cache slots. The shared read buffer and one stack zone keep the operation
+/// inside startup-bounded memory.
+pub(crate) fn visit_current(
+    utc_micros: i64,
+    mut visitor: impl FnMut(&str, i32, StackStr<8>, bool),
+) -> bool {
+    CATALOG.with(|catalog| {
+        let catalog = catalog.borrow();
+        let Some(catalog) = catalog.as_ref() else {
+            return false;
+        };
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let Some(cache) = cache.as_mut() else {
+                return false;
+            };
+            for name in &catalog.names[..catalog.n] {
+                let mut path = StackStr::<128>::new();
+                let _ = write!(path, "{}/{}", zoneinfo_root(), name.as_str());
+                let n_read = {
+                    let Ok(mut file) = std::fs::File::open(path.as_str()) else {
+                        return false;
+                    };
+                    let mut total = 0usize;
+                    loop {
+                        let Ok(read) = file.read(&mut cache.file_buf[total..]) else {
+                            return false;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        total += read;
+                        if total == cache.file_buf.len() {
+                            return false;
+                        }
+                    }
+                    total
+                };
+                let mut zone = EMPTY_ZONE;
+                if !parse_tzif(&cache.file_buf[..n_read], &mut zone) {
+                    return false;
+                }
+                let (offset, abbreviation, is_dst) = resolve_zone(&zone, utc_micros);
+                visitor(name.as_str(), offset, abbreviation, is_dst);
+            }
+            true
+        })
+    })
+}
+
+fn resolve_zone(zone: &ZoneData, utc_micros: i64) -> (i32, StackStr<8>, bool) {
+    let unix = utc_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECONDS;
+    let n = zone.n_transitions;
+    if n == 0 || unix < zone.times[0] {
+        let value = zone.types[zone.first_type as usize];
+        return (value.utoff, value.abbrev, value.is_dst);
+    }
+    if unix >= zone.times[n - 1]
+        && let Some(footer) = &zone.footer
+    {
+        return footer.resolve_info(utc_micros);
+    }
+    let index = zone.times[..n].partition_point(|&time| time <= unix) - 1;
+    let value = zone.types[zone.type_after[index] as usize];
+    (value.utoff, value.abbrev, value.is_dst)
 }
 
 /// Parses a TZif file (RFC 8536): the version-1 block is skipped when a
@@ -368,6 +452,7 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
     let abbrevs = &d[abbrevs_at..abbrevs_at + h.charcnt as usize];
     for i in 0..typecnt {
         let utoff = i32::from_be_bytes(d[at..at + 4].try_into().expect("4 bytes"));
+        let is_dst = d[at + 4] != 0;
         let abbrind = d[at + 5] as usize;
         at += 6;
         let mut abbrev = StackStr::new();
@@ -379,7 +464,11 @@ fn parse_block(h: &TzifHeader, d: &[u8], time_size: usize, out: &mut ZoneData) -
                 let _ = abbrev.write_char(b as char);
             }
         }
-        out.types[i] = TypeInfo { utoff, abbrev };
+        out.types[i] = TypeInfo {
+            utoff,
+            abbrev,
+            is_dst,
+        };
     }
     out.n_transitions = timecnt;
     // The type before history begins: RFC 8536 recommends the first standard

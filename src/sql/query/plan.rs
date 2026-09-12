@@ -393,7 +393,7 @@ pub(super) fn fold_null<'a>(
                 .ok()
                 .and_then(|entry| match entry {
                     ResolvedColumn::Table(t, c) => {
-                        scope.defs[t].map(|d| d.columns()[c].not_null.is_required())
+                        scope.defs[t].map(|d| d.columns[c].not_null.is_required())
                     }
                     ResolvedColumn::Merged(_) => None,
                 })

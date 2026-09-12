@@ -4317,7 +4317,7 @@ fn resolve_position_target<'a>(
                     return match scope.star_entry(remaining) {
                         ResolvedColumn::Table(t, c) => column_ref(
                             Some(scope.names[t]),
-                            scope.defs[t].expect("resolved").columns()[c].name.as_str(),
+                            scope.defs[t].expect("resolved").columns[c].name.as_str(),
                         ),
                         // Unqualified: resolves back to the merged column.
                         ResolvedColumn::Merged(m) => column_ref(None, scope.merged[m].name),
@@ -7539,7 +7539,7 @@ pub fn describe_scope_items<'q>(
                     out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
                         .with_type_mod(match entry {
                             ResolvedColumn::Table(table, column) => {
-                                scope.defs[table].expect("resolved").columns()[column].type_mod
+                                scope.defs[table].expect("resolved").columns[column].type_mod
                             }
                             ResolvedColumn::Merged(_) => -1,
                         });
@@ -7559,7 +7559,7 @@ pub fn describe_scope_items<'q>(
                     out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
                         .with_type_mod(match entry {
                             ResolvedColumn::Table(t, c) => {
-                                scope.defs[t].expect("resolved").columns()[c].type_mod
+                                scope.defs[t].expect("resolved").columns[c].type_mod
                             }
                             ResolvedColumn::Merged(_) => -1,
                         });
@@ -8566,7 +8566,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         let ctype = self.0.output_type(entry);
         let type_mod = match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                self.0.defs[table]?.columns().get(column)?.type_mod
+                self.0.defs[table]?.columns.get(column)?.type_mod
             }
             scope::ResolvedColumn::Merged(_) => -1,
         };
@@ -8611,7 +8611,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
             return None;
         }
         match entry {
-            scope::ResolvedColumn::Table(t, c) => Some(self.0.defs[t]?.columns()[c].type_mod),
+            scope::ResolvedColumn::Table(t, c) => Some(self.0.defs[t]?.columns[c].type_mod),
             _ => None,
         }
     }
@@ -8657,7 +8657,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         let ctype = scope.output_type(entry);
         let (type_oid, type_mod) = match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                let column = scope.defs[table]?.columns().get(column)?;
+                let column = scope.defs[table]?.columns.get(column)?;
                 (
                     self.storage
                         .routine_type_oid(column.ctype, column.user_type, self.txid)?,
@@ -8935,7 +8935,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         let ctype = scope.output_type(entry);
         let (type_oid, type_mod) = match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                let column = scope.defs[table]?.columns().get(column)?;
+                let column = scope.defs[table]?.columns.get(column)?;
                 (
                     self.storage
                         .routine_type_oid(column.ctype, column.user_type, self.txid)?,
@@ -8974,7 +8974,7 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         }
         match entry {
             scope::ResolvedColumn::Table(table, column) => {
-                Some(scope.defs[table]?.columns()[column].type_mod)
+                Some(scope.defs[table]?.columns[column].type_mod)
             }
             _ => None,
         }
@@ -9006,7 +9006,7 @@ fn scope_column_type_mod<'a>(
     };
     match found {
         Some((scope, ResolvedColumn::Table(table, column))) => {
-            scope.defs[table].expect("resolved").columns()[column].type_mod
+            scope.defs[table].expect("resolved").columns[column].type_mod
         }
         _ => -1,
     }

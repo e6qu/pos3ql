@@ -290,11 +290,11 @@ pub(crate) fn describe_items_with_output_aliases<'q>(
 
 /// Describe a single DML target's `RETURNING` list, including the names that
 /// PostgreSQL adds only to the output scope.
-pub(crate) fn describe_returning_items<'q>(
+pub(crate) fn describe_returning_items<'q, 'storage: 'q>(
     returning: crate::sql::ast::Returning<'q>,
-    definition: Option<&'q TableDef>,
-    target_alias: Option<&str>,
-    storage: Option<&'q crate::storage::Storage>,
+    definition: Option<&'storage TableDef>,
+    target_alias: Option<&'q str>,
+    storage: Option<&'storage crate::storage::Storage>,
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {

@@ -154,7 +154,6 @@ pub(crate) fn sha224(data: &[u8]) -> [u8; 28] {
 }
 
 /// Lowercase hex into a caller-provided buffer (2× input size).
-#[cfg(test)]
 pub(crate) fn hex_into(bytes: &[u8], out: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     assert!(out.len() >= bytes.len() * 2);
@@ -165,10 +164,8 @@ pub(crate) fn hex_into(bytes: &[u8], out: &mut [u8]) {
 }
 
 /// Hex of a 32-byte digest as a stack value.
-#[cfg(test)]
 pub(crate) struct HexDigest(pub [u8; 64]);
 
-#[cfg(test)]
 impl HexDigest {
     pub(crate) fn of(digest: &[u8; 32]) -> Self {
         let mut out = [0u8; 64];

@@ -43,6 +43,9 @@ jobs:
       - name: BUGS.md discipline guard
         run: bash tools/check-bugs.sh
 
+      - name: Object-store architecture guard
+        run: bash tools/check-object-store-boundary.sh
+
       - name: External harness liveness guard
         run: sh tests/external/liveness_test.sh
 
@@ -53,7 +56,6 @@ jobs:
         run: >-
           python3 -m unittest tools/tests/test_coverage_merge.py
           tools/tests/test_check_dups.py
-          tests/external/object_store_gateway_test.py
 
       - name: Duplicate-code guard
         run: sh tools/check-dups.sh
@@ -75,17 +77,136 @@ jobs:
           --skip sql::tests::external_lateral_runs_use_object_storage
           --skip sql::tests::external_set_runs_use_object_storage
 
-      - name: Object-store gateway contract
+      - name: S3 profile-v1 contract
         run: |
           set -eu
-          python3 tests/external/object_store_gateway.py \
-            --root "$RUNNER_TEMP/object-store-gateway" --port 19200 &
-          gateway_pid=$!
-          trap 'kill "$gateway_pid"' EXIT
+          python3 tests/external/s3_test_server.py \
+            --root "$RUNNER_TEMP/s3-profile-v1" --port 19200 \
+            --bucket pos3ql-contract --region test-region \
+            --access-key pos3ql-contract --secret-key pos3ql-contract-secret \
+            --page-size 7 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in $(seq 1 50); do
+            if curl --silent --output /dev/null http://127.0.0.1:19200/; then
+              break
+            fi
+            if [ "$attempt" = 50 ]; then
+              exit 1
+            fi
+            sleep 0.1
+          done
           POS3QL_OBJECT_STORE_ENDPOINT=127.0.0.1:19200 \
-          POS3QL_OBJECT_STORE_NAMESPACE=ci-contract \
+          POS3QL_OBJECT_STORE_BUCKET=pos3ql-contract \
+          POS3QL_OBJECT_STORE_REGION=test-region \
+          POS3QL_OBJECT_STORE_ACCESS_KEY=pos3ql-contract \
+          POS3QL_OBJECT_STORE_SECRET_KEY=pos3ql-contract-secret \
           POS3QL_OBJECT_STORE_TLS=off \
           cargo test --locked --test object_store_it -- --test-threads=1
+
+  object-store-compatibility:
+    name: object-store (${{ matrix.implementation }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Image provenance: release 4.46, published 2026-09-08 by the
+          # SeaweedFS release workflow; this is its multi-platform digest.
+          - implementation: seaweedfs
+            port: 19300
+            image: chrislusf/seaweedfs@sha256:08d516132314207d10c8e37cbffc1f32b147d870169688734cc61c6231625b62
+          # Image provenance: MinIO RELEASE.2025-09-07T16-13-09Z, the first
+          # release confirmed to fix the conditional-PutObject regression;
+          # the immutable image also contains `mc` for bucket creation.
+          - implementation: minio
+            port: 19400
+            image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-object-store-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Start independent S3-compatible implementation
+        env:
+          IMPLEMENTATION: ${{ matrix.implementation }}
+          IMAGE: ${{ matrix.image }}
+          PORT: ${{ matrix.port }}
+        run: |
+          set -eu
+          if [ "$IMPLEMENTATION" = seaweedfs ]; then
+            docker run -d --name object-store -p "$PORT:8333" \
+              -e AWS_ACCESS_KEY_ID=pos3ql-contract \
+              -e AWS_SECRET_ACCESS_KEY=pos3ql-contract-secret \
+              -e S3_BUCKET=pos3ql-contract "$IMAGE" mini -dir=/data
+          else
+            docker run -d --name object-store -p "$PORT:9000" \
+              -e MINIO_ROOT_USER=pos3ql-contract \
+              -e MINIO_ROOT_PASSWORD=pos3ql-contract-secret \
+              "$IMAGE" server /data
+          fi
+          for attempt in $(seq 1 100); do
+            if curl --silent --output /dev/null "http://127.0.0.1:$PORT/"; then
+              break
+            fi
+            if [ "$attempt" = 100 ]; then
+              docker logs object-store
+              exit 1
+            fi
+            sleep 0.2
+          done
+          if [ "$IMPLEMENTATION" = minio ]; then
+            docker exec object-store mc alias set local \
+              http://127.0.0.1:9000 pos3ql-contract pos3ql-contract-secret
+            docker exec object-store mc mb local/pos3ql-contract
+          fi
+
+      - name: Wait for the shared bucket contract
+        env:
+          POS3QL_OBJECT_STORE_ENDPOINT: 127.0.0.1:${{ matrix.port }}
+          POS3QL_OBJECT_STORE_BUCKET: pos3ql-contract
+          POS3QL_OBJECT_STORE_REGION: us-east-1
+          POS3QL_OBJECT_STORE_ACCESS_KEY: pos3ql-contract
+          POS3QL_OBJECT_STORE_SECRET_KEY: pos3ql-contract-secret
+          POS3QL_OBJECT_STORE_TLS: off
+        run: |
+          set -eu
+          for attempt in $(seq 1 50); do
+            if cargo test --quiet --locked --test object_store_it \
+              bucket_exists_and_is_listable -- --exact \
+              >"$RUNNER_TEMP/object-store-readiness.log" 2>&1; then
+              exit 0
+            fi
+            if [ "$attempt" = 50 ]; then
+              cat "$RUNNER_TEMP/object-store-readiness.log"
+              docker logs object-store
+              exit 1
+            fi
+            sleep 0.2
+          done
+
+      - name: Run the shared compatibility qualification
+        env:
+          POS3QL_OBJECT_STORE_ENDPOINT: 127.0.0.1:${{ matrix.port }}
+          POS3QL_OBJECT_STORE_BUCKET: pos3ql-contract
+          POS3QL_OBJECT_STORE_REGION: us-east-1
+          POS3QL_OBJECT_STORE_ACCESS_KEY: pos3ql-contract
+          POS3QL_OBJECT_STORE_SECRET_KEY: pos3ql-contract-secret
+          POS3QL_OBJECT_STORE_TLS: off
+        run: cargo test --locked --test object_store_it -- --test-threads=1
+
+      - name: Endpoint diagnostics
+        if: failure()
+        run: docker logs object-store
 
   # One fixed range per worker preserves the complete 16-seed sweep within
   # the five-minute job contract, including a cold rebuild.

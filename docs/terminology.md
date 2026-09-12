@@ -25,7 +25,7 @@
 ## Glossary
 
 - **block**: fixed-size, checksummed, content-addressed storage unit.
-- **block store**: provider-neutral interface over object storage and cache tiers.
+- **block store**: provider-neutral internal interface over object storage and cache tiers; it is not a network protocol or deployable storage service.
 - **checkpoint**: immutable SST publication through a compare-and-swap manifest.
 - **cold start**: recovery with RAM and local disk caches absent.
 - **declared type identity**: the schema-qualified type visible in catalog, parameter, and replication metadata; distinct from an executor value type.
@@ -35,6 +35,7 @@
 - **MVCC**: visibility by transaction and commit LSN.
 - **PAX**: column-oriented row groups inside an SST, allowing selective column reads.
 - **physical-demand proof**: the columns a query path may read from a physical row.
+- **S3-compatible API**: the qualified HTTP data-plane subset implemented by MinIO and compatible object stores; it does not imply a vendor SDK, vendor control plane, or provider-specific implementation.
 - **tuple identity value**: a PostgreSQL `tid` block/offset value carried at SQL and wire boundaries; it does not imply that an object-native row has a PostgreSQL heap address.
 - **SST**: immutable sorted table of versioned rows, index, filter, and roster blocks.
 - **VOPR**: deterministic simulation that injects faults from a reproducible seed.

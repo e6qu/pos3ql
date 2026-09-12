@@ -6,7 +6,7 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 
 - PostgreSQL clients: psql, JDBC, Npgsql, psycopg, node-postgres, and pgx use the ordinary wire protocol, including catalog-typed text/binary Bind, Result, COPY, and set-returning integer/numeric/temporal output for implemented types.
 - Durable state: immutable commit batches, immutable SST blocks, and compare-and-swap roots. A node can cold-start with an empty local disk.
-- Object storage: the engine depends only on a generic gateway with immutable or conditional PUT, full/ranged GET, LIST, DELETE, and strong-ETag compare-and-swap. Provider protocols and SDKs are outside the application. [Contract and qualification](docs/object-storage.md).
+- Object storage: the engine's production boundary is the common S3-compatible HTTP API implemented by MinIO and multiple object stores: direct signed requests, conditional PUT, full/ranged GET, paginated LIST, DELETE, and opaque-ETag compare-and-swap. pos3ql uses no vendor SDK, intermediary storage service, translation proxy, or endpoint-specific behavior. [Protocol subset, invariants, and qualification](docs/object-storage.md).
 - Memory: all runtime memory is budgeted at startup. Pools and queues have fixed limits; exhaustion is an error.
 - Determinism: the core is event-driven and runs under deterministic fault simulation.
 
@@ -167,14 +167,15 @@ remain distinct from `NaN` through storage and arithmetic.
 
 Permanent, unlogged, and session-temporary tables, views, indexes, identity sequences, standalone sequences, CTAS, and `SELECT INTO` have distinct PostgreSQL lifetimes. A view becomes temporary when requested or when any captured relation is temporary, including through another view. Temporary relations use isolated per-connection namespaces and `ON COMMIT` actions and never enter WAL, checkpoints, object storage, template clones, or logical publications. Committed temporary rows spill to a bounded, startup-sized local store (`temporary_spill_bytes`, or `0` to keep them resident-only) that is recreated empty on restart. Unlogged definitions are durable, retain rows after a clean shutdown, and reset table and sequence state after an unclean restart.
 
-Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.
+Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation. A versioned S3 compatibility profile is locked by golden-wire fixtures and required black-box CI against independently implemented compatible endpoints.
 
 All 183 PostgreSQL 18 top-level commands have a tested execution contract or an explicit architecture boundary; `tests/postgresql18_commands.tsv` is the ratchet. Logical replication interoperates with PostgreSQL 18 publishers, subscribers, and `pg_recvlogical` at the object-native boundary, including transactional and nontransactional logical messages, typed slot-management SQL, and replication monitoring views. Continuing differential, driver, and dump/restore testing remains the compatibility-discovery ratchet. Physical demand is proven through query execution and DML sources; PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md) and [the logical-replication boundary](docs/logical-replication.md).
 
 ## Quick start
 
 ```sh
-# Start any implementation of docs/object-storage.md's gateway contract.
+# The development configuration defaults to local-only durability. Its object
+# storage section documents the direct S3-compatible settings for durable mode.
 cargo run --release -- --config examples/dev.conf
 psql -h 127.0.0.1 -p 5433 -U you
 ```
@@ -184,7 +185,7 @@ psql -h 127.0.0.1 -p 5433 -U you
 - [PLAN.md](PLAN.md) — completion roadmap
 - [BUGS.md](BUGS.md) — unresolved, genuinely blocked bugs only
 - [docs/terminology.md](docs/terminology.md) — naming and glossary
-- [docs/object-storage.md](docs/object-storage.md) — portable durability contract
+- [docs/object-storage.md](docs/object-storage.md) — direct S3-compatible durability boundary
 - [docs/logical-replication.md](docs/logical-replication.md) — PostgreSQL 18 protocol, SQL, monitoring, and architecture boundary
 - [docs/sql-json.md](docs/sql-json.md) — PostgreSQL 18 SQL/JSON, jsonpath, wire, and durability boundary
 - [docs/sql-xml.md](docs/sql-xml.md) — PostgreSQL 18 SQL/XML, XPath, wire, and durability boundary

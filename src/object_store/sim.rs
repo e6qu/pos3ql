@@ -64,7 +64,7 @@ struct StoredObject {
 /// The shared namespace state. One per name, held behind `Rc<RefCell<..>>` by
 /// every [`SimClient`] opened on it and by the test harness steering faults.
 pub(crate) struct SimNamespace {
-    /// Sorted by key, matching the gateway's lexicographic LIST order.
+    /// Sorted by key, matching S3's lexicographic listing order.
     objects: Vec<StoredObject>,
     next_etag: u64,
     /// Operations served so far — the clock `fail_from_op` is measured on.
@@ -174,7 +174,7 @@ pub(crate) struct SimClient {
 impl SimClient {
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         Ok(Self {
-            namespace: open_namespace(&config.object_store_namespace, 0),
+            namespace: open_namespace(&config.object_store_bucket, 0),
             key_prefix: config.object_store_prefix.clone(),
             body: FixedBuf::new(
                 budget,
@@ -332,6 +332,16 @@ impl SimClient {
 fn status(code: u16, message: &str) -> Error {
     Error::Status {
         code,
+        service_code: stack_format!(
+            64,
+            "{}",
+            match code {
+                404 => "NoSuchKey",
+                412 => "PreconditionFailed",
+                500 => "InternalError",
+                _ => "",
+            }
+        ),
         message: stack_format!(256, "{message}"),
     }
 }
@@ -344,7 +354,7 @@ mod tests {
         drop_namespace(name);
         let bucket = open_namespace(name, 7);
         let mut config = Config::default_dev();
-        config.object_store_namespace = name.to_string();
+        config.object_store_bucket = name.to_string();
         config.object_store_prefix = "p/".to_string();
         config.object_store_response_bytes = 64;
         let mut budget = Budget::new(1 << 20);

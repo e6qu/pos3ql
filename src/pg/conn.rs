@@ -5065,9 +5065,9 @@ mod tests {
         config.wal_upload_sync = true;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
-        config.object_store_namespace =
+        config.object_store_bucket =
             format!("fast-path-large-object-{}-{suffix}", std::process::id());
-        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         config.max_tables = 8;
         config.table_rows = 256;
         config.large_object_pages = 64;
@@ -5141,7 +5141,7 @@ mod tests {
 
         drop(connection);
         drop(engine);
-        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -5163,8 +5163,8 @@ mod tests {
         config.wal_upload_sync = true;
         config.block_cache_bytes = 0;
         config.disk_cache_bytes = 0;
-        config.object_store_namespace = format!("binary-char-{}-{suffix}", std::process::id());
-        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        config.object_store_bucket = format!("binary-char-{}-{suffix}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         config.max_tables = 8;
         config.table_rows = 256;
         config.wal_bytes = 1 << 20;
@@ -5233,7 +5233,7 @@ mod tests {
 
         drop(connection);
         drop(engine);
-        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
         let _ = std::fs::remove_dir_all(directory);
     }
 

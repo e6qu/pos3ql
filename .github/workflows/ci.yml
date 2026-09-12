@@ -60,6 +60,7 @@ jobs:
           python3 -m unittest tools/tests/test_coverage_merge.py
           tools/tests/test_check_dups.py
           tools/tests/test_postgres_regress_diff.py
+          tools/tests/test_benchmark.py
 
       - name: Duplicate-code guard
         run: sh tools/check-dups.sh
@@ -211,6 +212,38 @@ jobs:
       - name: Endpoint diagnostics
         if: failure()
         run: docker logs object-store
+
+  performance-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache release build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-performance-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+
+      # This gates result-schema integrity, fixed-memory occupancy, cold
+      # object reads, and concurrent-commit request amplification. Absolute
+      # timing remains an artifact, not a flaky hosted-runner threshold.
+      - name: Cache and group-commit benchmark smoke
+        run: tools/run-performance.sh smoke "$RUNNER_TEMP/performance-smoke"
+
+      - name: Upload raw performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-smoke
+          path: ${{ runner.temp }}/performance-smoke
 
   # One fixed range per worker preserves the complete 16-seed sweep within
   # the five-minute job contract, including a cold rebuild.

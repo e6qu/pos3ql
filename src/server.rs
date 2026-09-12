@@ -12,7 +12,7 @@ use crate::mem::fixed_vec::FixedVec;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::pg::auth::{AuthMode, SCRAM_ITERATIONS, ScramServer};
-use crate::pg::conn::{After, AuthContext, CancelRequest, Conn};
+use crate::pg::conn::{After, AuthContext, CancelRequest, Conn, PendingResponse};
 use crate::sql::Engine;
 
 const LISTENER_TOKEN: u64 = u64::MAX;
@@ -68,6 +68,7 @@ struct Slot {
     generation: u32,
     want_read: bool,
     want_write: bool,
+    pending_response: Option<PendingResponse>,
 }
 
 struct SubscriptionWorker {
@@ -419,6 +420,22 @@ impl From<BudgetError> for ServerSetupError {
 }
 
 impl Server {
+    /// Bytes reserved directly by the server around the separately budgeted
+    /// per-connection buffers and engine storage.
+    pub fn budget_bytes(config: &Config) -> usize {
+        let connections = config.max_connections as usize;
+        let block_reads = if config.object_store_on {
+            config.object_store_get_slots
+        } else {
+            0
+        };
+        Reactor::budget_bytes(connections + 2 + block_reads + 2 * config.max_subscriptions)
+            + 128
+            + connections * (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>())
+            + block_reads * core::mem::size_of::<Option<i32>>()
+            + Self::extra_budget_bytes(config)
+    }
+
     /// TLS-pool capacity for the complete fixed outbound subscription worker
     /// set.  The workers are allocated at startup even when their catalog
     /// entries are disabled, so enabling one cannot grow runtime memory.
@@ -495,6 +512,7 @@ impl Server {
                     generation: 0,
                     want_read: false,
                     want_write: false,
+                    pending_response: None,
                 })
                 .expect("sized to max_conns");
             free.push(i).expect("sized to max_conns");
@@ -730,6 +748,12 @@ impl Server {
             .flatten()
             .min();
             let n = self.reactor.poll(timeout)?;
+            // Retry any journal publication left by a failed prior turn once,
+            // before another statement can observe the local-only commit.
+            // All readable connections in this poll then share the one
+            // publication barrier at the end of the turn.
+            let publication_ready = self.engine.commit_wal().is_ok();
+            let mut completed_block_read = false;
             for i in 0..n {
                 let event = self.reactor.event(i);
                 if event.token == SHUTDOWN_TOKEN {
@@ -742,18 +766,39 @@ impl Server {
                 } else if event.token == LISTENER_TOKEN {
                     self.accept_pending();
                 } else if let Some(slot) = self.block_slot(event.token) {
-                    self.advance_block_io(slot)?;
+                    completed_block_read |= self.advance_block_io(slot)?;
                 } else if let Some((subscription, sql)) = self.subscription_slot(event.token) {
-                    self.advance_subscription(subscription, sql, event.readable, event.writable)?;
+                    if publication_ready {
+                        self.advance_subscription(
+                            subscription,
+                            sql,
+                            event.readable,
+                            event.writable,
+                        )?;
+                    }
                 } else {
-                    self.dispatch(event.token, event.readable, event.writable);
+                    self.dispatch(
+                        event.token,
+                        event.readable,
+                        event.writable,
+                        publication_ready,
+                    );
                 }
             }
-            self.pump_replication_streams();
-            self.reconcile_subscriptions()?;
-            // A lock timeout can be the event that woke the reactor, with no
-            // socket readiness and no lock-generation change.
-            self.wake_lock_waiters();
+            if publication_ready {
+                if completed_block_read {
+                    self.wake_io_waiters();
+                }
+                // A lock timeout can be the event that woke the reactor, with
+                // no socket readiness and no lock-generation change.
+                self.wake_lock_waiters();
+            }
+            let (had_responses, responses_durable) = self.finish_response_batch();
+            if publication_ready && responses_durable {
+                self.process_committed_side_effects();
+                self.pump_replication_streams();
+                self.reconcile_subscriptions()?;
+            }
             self.engine
                 .issue_due_block_read_hedges(std::time::Instant::now());
             if self.block_read_fds.iter().all(Option::is_none) {
@@ -768,7 +813,7 @@ impl Server {
             // message to finish what it started, and a merge owes its beats
             // regardless of traffic. One beat per loop turn, backing off
             // when the bucket errors.
-            if self.engine.checkpoint_work_pending() {
+            if self.engine.checkpoint_work_pending() || (had_responses && responses_durable) {
                 beat_backoff = if self.engine.maybe_checkpoint() {
                     Duration::ZERO
                 } else {
@@ -864,7 +909,7 @@ impl Server {
         }
     }
 
-    fn dispatch(&mut self, token: u64, readable: bool, writable: bool) {
+    fn dispatch(&mut self, token: u64, readable: bool, writable: bool, publication_ready: bool) {
         let index = (token & 0xffff_ffff) as usize;
         let generation = (token >> 32) as u32;
         if index >= self.slots.len() {
@@ -875,22 +920,67 @@ impl Server {
             // Stale event for a slot that was already recycled.
             return;
         }
+        if readable && !publication_ready {
+            // Match the per-connection barrier's prior behavior: no command
+            // is allowed to run behind an unpublished local commit.
+            self.complete_dispatch(index, After::Close);
+            return;
+        }
         let (after, cancel_request) = if readable {
-            let after = slot.conn.on_readable(
+            let pending = slot.conn.on_readable(
                 &mut self.engine,
                 &self.cancel_key,
                 &self.auth,
                 self.tls_config.as_ref(),
             );
+            let after = if pending.closes() {
+                // Session teardown is visible immediately: a later event in
+                // this reactor turn must not observe temporary objects or
+                // locks owned by a client that already sent Terminate/EOF.
+                Some(slot.conn.finish_response(pending, None))
+            } else {
+                slot.pending_response = Some(pending);
+                None
+            };
             (after, slot.conn.take_cancel_request())
         } else if writable {
-            (slot.conn.on_writable(), None)
+            (Some(slot.conn.on_writable()), None)
         } else {
-            (After::Continue, None)
+            (Some(After::Continue), None)
         };
         if let Some(request) = cancel_request {
             self.cancel(request);
         }
+        if let Some(after) = after {
+            self.complete_dispatch(index, after);
+        }
+    }
+
+    /// Publishes all journal records produced during one reactor turn, then
+    /// releases every buffered response. The fixed slot array is also the
+    /// fixed-capacity group-commit queue.
+    fn finish_response_batch(&mut self) -> (bool, bool) {
+        let had_responses = self
+            .slots
+            .iter()
+            .any(|slot| slot.pending_response.is_some());
+        if !had_responses {
+            return (false, true);
+        }
+        let publication_error = self.engine.commit_wal().err();
+        for index in 0..self.slots.len() {
+            let Some(pending) = self.slots[index].pending_response.take() else {
+                continue;
+            };
+            let after = self.slots[index]
+                .conn
+                .finish_response(pending, publication_error.as_ref());
+            self.complete_dispatch(index, after);
+        }
+        (true, publication_error.is_none())
+    }
+
+    fn complete_dispatch(&mut self, index: usize, after: After) {
         match after {
             After::Close => self.release(index),
             After::Continue => {
@@ -922,6 +1012,9 @@ impl Server {
                 }
             }
         }
+    }
+
+    fn process_committed_side_effects(&mut self) {
         self.process_backend_signals();
         self.terminate_dropped_database_connections();
         if self.engine.take_system_settings_reload() {
@@ -1024,18 +1117,14 @@ impl Server {
     /// Called when the block-store client's non-blocking GET socket is
     /// readable. Advances the pending response read; if it completes, the
     /// block is now cached and any parked statement is retried.
-    fn advance_block_io(&mut self, slot: usize) -> std::io::Result<()> {
-        if self
+    fn advance_block_io(&mut self, slot: usize) -> std::io::Result<bool> {
+        let completed = self
             .engine
             .advance_pending_block_read(slot)
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?
-        {
-            // The GET completed and the block is cached. Wake only statements
-            // that are parked on object I/O; lock waiters have a separate
-            // generation-driven wakeup path.
-            self.wake_io_waiters();
-        }
-        Ok(())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?;
+        // Wakeups run after all reactor events, so resumed statements join the
+        // same fixed-capacity response/publication batch as readable clients.
+        Ok(completed)
     }
 
     /// Reconciles every fixed object-read slot with the reactor. Registration
@@ -1883,16 +1972,16 @@ impl Server {
         for _ in 0..=self.slots.len() {
             let generation = self.engine.lock_generation();
             for index in 0..self.slots.len() {
-                if !self.slots[index].conn.is_open() {
+                if !self.slots[index].conn.is_open() || self.slots[index].pending_response.is_some()
+                {
                     continue;
                 }
-                match self.slots[index].conn.retry_parked(
+                if let Some(pending) = self.slots[index].conn.retry_parked(
                     &mut self.engine,
                     generation,
                     retry_io_waiters,
                 ) {
-                    After::Continue => self.sync_write_interest(index),
-                    After::Close => self.release(index),
+                    self.slots[index].pending_response = Some(pending);
                 }
             }
             if self.engine.lock_generation() == generation {
@@ -1996,6 +2085,7 @@ impl Server {
         slot.generation = slot.generation.wrapping_add(1);
         slot.want_read = false;
         slot.want_write = false;
+        slot.pending_response = None;
         self.free
             .push(index as u32)
             .expect("released slot cannot exceed capacity");

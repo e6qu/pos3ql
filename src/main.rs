@@ -1,7 +1,6 @@
 use std::process::ExitCode;
 
 use pos3ql::config::{Config, FmtBytes};
-use pos3ql::io::reactor::Reactor;
 use pos3ql::mem;
 use pos3ql::server::Server;
 
@@ -36,18 +35,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let config = load_config()?;
-    let block_read_slots = if config.object_store_on {
-        config.object_store_get_slots
-    } else {
-        0
-    };
-    let server_bytes = Reactor::budget_bytes(
-        config.max_connections as usize + 2 + block_read_slots + config.max_subscriptions,
-    )
-        + 128 // canned refusal message scratch
-        + (config.max_connections as usize) * 8
-        + block_read_slots * core::mem::size_of::<Option<i32>>()
-        + Server::extra_budget_bytes(&config);
+    let server_bytes = Server::budget_bytes(&config);
     let plan = config.memory_plan(
         server_bytes,
         pos3ql::sql::Engine::extra_budget_bytes(&config),

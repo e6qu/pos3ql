@@ -5,9 +5,11 @@ import argparse
 import hashlib
 import hmac
 import http.server
+import json
 import os
 import pathlib
 import threading
+import time
 import urllib.parse
 import xml.sax.saxutils
 
@@ -33,9 +35,44 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     session_token = None
     page_size = 1000
     mutation_lock = threading.Lock()
+    metrics_lock = threading.Lock()
+    metrics_file = None
+    latency_seconds = 0.0
+    metrics = {
+        "schema_version": 1,
+        "requests": {"put": 0, "get": 0, "range_get": 0, "list": 0, "delete": 0},
+        "request_body_bytes": 0,
+        "response_body_bytes": 0,
+        "errors": 0,
+    }
 
     def log_message(self, *_):
         pass
+
+    @classmethod
+    def record(cls, operation, request_bytes=0, response_bytes=0, error=False):
+        if cls.metrics_file is None:
+            return
+        with cls.metrics_lock:
+            cls.metrics["requests"][operation] += 1
+            cls.metrics["request_body_bytes"] += request_bytes
+            cls.metrics["response_body_bytes"] += response_bytes
+            cls.metrics["errors"] += int(error)
+
+    @classmethod
+    def write_metrics_forever(cls):
+        while True:
+            with cls.metrics_lock:
+                snapshot = json.dumps(cls.metrics, sort_keys=True) + "\n"
+            temporary = cls.metrics_file.with_suffix(cls.metrics_file.suffix + ".tmp")
+            temporary.write_text(snapshot, encoding="utf-8")
+            os.replace(temporary, cls.metrics_file)
+            time.sleep(0.05)
+
+    @classmethod
+    def delay(cls):
+        if cls.latency_seconds:
+            time.sleep(cls.latency_seconds)
 
     def error(self, status, code, message):
         body = (
@@ -163,21 +200,25 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         try:
             body, _, key = self.begin()
+            self.delay()
             path = self.object_path(key)
             with self.mutation_lock:
                 exists = path.exists()
                 if self.headers.get("if-none-match") == "*" and exists:
+                    self.record("put", request_bytes=len(body), error=True)
                     return self.error(412, "PreconditionFailed", "object exists")
                 expected = self.headers.get("if-match")
                 if expected is not None and (
                     not exists or self.etag(path.read_bytes()) != expected
                 ):
+                    self.record("put", request_bytes=len(body), error=True)
                     return self.error(412, "PreconditionFailed", "generation changed")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = self.root / ".temporary" / self.bucket / key
                 temporary.parent.mkdir(parents=True, exist_ok=True)
                 temporary.write_bytes(body)
                 os.replace(temporary, path)
+            self.record("put", request_bytes=len(body))
             self.send_response(200)
             self.send_header("etag", self.etag(body))
             self.send_header("content-length", "0")
@@ -192,6 +233,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             _, parsed, key = self.begin()
+            self.delay()
             query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
             if not key and query.get("list-type") == ["2"]:
                 return self.list_objects(query)
@@ -207,6 +249,8 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
                     return self.error(416, "InvalidRange", "range not satisfiable")
                 body = data[first : min(last + 1, len(data))]
                 status = 206
+            operation = "range_get" if status == 206 else "get"
+            self.record(operation, response_bytes=len(body))
             self.send_response(status)
             self.send_header("etag", self.etag(data))
             self.send_header("content-length", str(len(body)))
@@ -253,6 +297,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
             f"<IsTruncated>{str(truncated).lower()}</IsTruncated>"
             f"{contents}{next_token}</ListBucketResult>"
         ).encode()
+        self.record("list", response_bytes=len(body))
         self.send_response(200)
         self.send_header("content-type", "application/xml")
         self.send_header("content-length", str(len(body)))
@@ -262,9 +307,11 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         try:
             _, _, key = self.begin()
+            self.delay()
             path = self.object_path(key)
             with self.mutation_lock:
                 path.unlink(missing_ok=True)
+            self.record("delete")
             self.send_response(204)
             self.end_headers()
         except PermissionError as error:
@@ -285,6 +332,8 @@ def main():
     parser.add_argument("--secret-key", required=True)
     parser.add_argument("--session-token")
     parser.add_argument("--page-size", type=int, default=1000)
+    parser.add_argument("--metrics-file")
+    parser.add_argument("--latency-ms", type=float, default=0.0)
     args = parser.parse_args()
     S3TestServer.root = pathlib.Path(args.root).resolve()
     S3TestServer.bucket = args.bucket
@@ -293,6 +342,11 @@ def main():
     S3TestServer.secret_key = args.secret_key
     S3TestServer.session_token = args.session_token
     S3TestServer.page_size = args.page_size
+    S3TestServer.latency_seconds = args.latency_ms / 1000.0
+    if args.metrics_file:
+        S3TestServer.metrics_file = pathlib.Path(args.metrics_file).resolve()
+        S3TestServer.metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        threading.Thread(target=S3TestServer.write_metrics_forever, daemon=True).start()
     (S3TestServer.root / args.bucket).mkdir(parents=True, exist_ok=True)
     http.server.ThreadingHTTPServer(("127.0.0.1", args.port), S3TestServer).serve_forever()
 

@@ -17,7 +17,7 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 | `object_store = off` | local journal sync | no |
 | `object_store = on` | immutable commit batch PUT and commit-head CAS | yes |
 
-With object storage enabled, the server groups transactions received in one readable protocol batch, publishes their immutable journal bytes, then advances a CAS commit head before releasing success responses. Checkpoints publish immutable table state through a separate CAS manifest. Recovery follows the commit head beyond that manifest; local disk is a cache.
+With object storage enabled, the server groups transactions completed in one reactor turn—including statements resumed after lock and object-read waits—publishes their immutable journal bytes, then advances a CAS commit head before releasing success responses. Checkpoints publish immutable table state through a separate CAS manifest. Recovery follows the commit head beyond that manifest; local disk is a cache. [The benchmark suite](docs/performance.md) measures the request shape, cache tiers, interference, and logical read-replica scaling against PostgreSQL 18.
 
 ## Status
 

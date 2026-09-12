@@ -1,55 +1,111 @@
 # Performance and scaling boundary
 
-pos3ql does not yet have evidence for a production performance claim. The
-single executable avoids a storage gateway and talks directly to the common
-S3-compatible HTTP data-plane API, but process shape alone does not establish
-throughput or latency.
+pos3ql has a reproducible measurement harness, not a blanket production
+performance claim. The same dependency-free PostgreSQL v3 client drives
+pos3ql and PostgreSQL 18; every run records database identity, workload shape,
+latency and throughput summaries, and resource evidence as schema-versioned
+JSON. `tools/benchmark-report.py` derives a report from those raw files.
 
 ## Current topology
 
-- One server process owns one writable database state and currently
+- One server process owns one writable database state and
   serializes query execution. Startup-sized pools bound memory and make
   saturation an explicit error.
-- Object storage is durable; memory and local disk are caches. Commit batches
-  and checkpoint manifests amortize object requests, but cold reads,
-  compaction, and object latency still need measurement.
-- Logical publications and subscriptions can build independently durable read
-  copies and interoperate with PostgreSQL. They are asynchronous logical
-  replicas, not transparent shared-storage replicas.
-- Starting several writable processes on one object prefix is unsupported.
-  Writer fencing, ownership leases, failover, and a read-only shared-snapshot
-  protocol do not exist yet. Multiple processes therefore do not provide
-  safe active-active or automatic read scaling.
+- Object storage is durable; memory and local disk are disposable caches.
+  Immutable journal batches and a compare-and-swap commit head are published
+  before success reaches a client.
+- One reactor turn is the group-commit unit. Readable clients and statements
+  resumed after row-lock or object-read waits retain their response in their
+  fixed connection buffer, share one journal publication barrier, and only
+  then flush. A failed barrier replaces every guarded success response with an
+  explicit unknown-outcome error. No runtime queue or buffer grows.
+- Logical publications and subscriptions build independently durable read
+  copies. They are asynchronous logical replicas, not transparent
+  shared-storage replicas.
+- Several writable processes on one object prefix remain unsupported. Writer
+  fencing, ownership leases, automatic failover, and a read-only
+  shared-snapshot protocol do not exist.
 
-## Measurement sequence
+## Running the suite
 
-The baseline must use pinned binaries, hardware, object-store implementation,
-dataset, configuration, and workload seed, and retain raw results. Report at
-least operations per second; p50, p95, p99, and maximum latency; CPU time;
-fixed-memory occupancy and exhaustion; object requests and bytes by operation;
-cache hit rates; checkpoint/compaction overlap; replication lag; and recovery
-time.
+The smoke suite needs Rust, Python 3, and `nc`:
 
-1. Measure one process at concurrency 1, then increase connections until
-   throughput plateaus or a bounded resource rejects work. Separate point
-   reads, indexed reads, inserts, updates, mixed OLTP, COPY ingest, scans,
-   joins, grouping, sorting, and spill.
-2. Repeat each workload with warm memory/local-disk caches, cold memory with a
-   warm disk cache, and both caches empty. Inject fixed object latency and
-   bandwidth limits and count request amplification.
-3. Overlap the same workloads with commit publication, checkpointing,
-   compaction, and garbage collection. Measure tail latency and backpressure,
-   not only average throughput.
-4. Benchmark one writer plus one through N logical read replicas. Report
-   aggregate read throughput and freshness/lag separately. A load balancer is
-   external to this measurement and must not route writes to replicas.
-5. Only after writer fencing and failover exist, measure promotion time,
-   acknowledged-commit safety, stale-writer rejection, and recovery with empty
-   local caches. Active-active claims require a separate consistency design;
-   they cannot be inferred from logical-replica throughput.
+```sh
+tools/run-performance.sh smoke /tmp/pos3ql-performance-smoke
+```
 
-The first expected bottleneck is global execution serialization; the next
-likely boundaries are physical secondary-index access, object-request
-amplification under cold reads, and the current small fixed catalog/table
-ceilings. Measurements, rather than the single-binary label, decide their
-order.
+The full suite additionally needs Docker unless
+`POS3QL_BENCH_POSTGRES_PORT` names an existing PostgreSQL 18 instance:
+
+```sh
+tools/run-performance.sh full ./performance-results/local
+```
+
+The full run records Docker's resolved PostgreSQL image ID and `version()`
+output, rather than treating a mutable image tag as provenance. Its defaults
+can be overridden with `POS3QL_BENCH_ROWS`,
+`POS3QL_BENCH_TABLE_CAPACITY`, `POS3QL_BENCH_OPERATIONS`,
+`POS3QL_BENCH_CLIENTS`, `POS3QL_BENCH_REPLICAS`, and
+`POS3QL_BENCH_OBJECT_LATENCY_MS`. The capacity must cover both the setup rows
+and all rows inserted by the configured clients and operations.
+CPU and resident-memory sampling uses `/proc` on Linux; peak RSS remains
+available through `ps` on other supported systems.
+
+The output directory contains an environment manifest with the commit, binary
+hash, toolchain, machine, resources, and workload sizing; one raw JSON file
+per workload; separate
+recovery JSON intervals for initial/warm-disk/empty-local-cache starts, one
+freshness interval per logical replica, the PostgreSQL 18 resolved image ID,
+the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
+
+The PostgreSQL comparison covers the same SQL workload, concurrency, row
+count, and operation count. PostgreSQL does not use pos3ql's durable-object
+layout, so cache-tier and object-request measurements apply only to pos3ql;
+the comparison does not pretend PostgreSQL itself has an S3 cache profile.
+
+## Measured scenarios
+
+| Scenario | Boundary measured |
+|---|---|
+| warm memory | Repeated point reads in the process that created and checkpointed the data |
+| warm disk | Graceful restart with the same disposable local data directory |
+| empty local caches | Restart from a new local directory against the unchanged durable object prefix |
+| concurrent updates | Synchronized clients, commit latency, and immutable-batch/commit-head PUT amplification |
+| checkpoint interference | Mixed reads and updates with and without overlapping explicit checkpoints |
+| PostgreSQL 18 | Single/concurrent point reads, inserts, scans, and mixed-workload throughput through the same wire client |
+| logical replicas | Aggregate reads across one through N durable subscribers, plus observed catch-up time |
+
+Each workload reports attempted and completed operations, errors, elapsed
+time, operations per second, p50/p95/p99/maximum/mean latency, process CPU,
+peak RSS, RSS divided by the declared fixed memory plan, maintenance count,
+and object requests and payload bytes by PUT, full GET, ranged GET, LIST, and
+DELETE. The instrumented object-store oracle speaks the same locked S3 profile
+as the other test endpoints. Its optional metrics file and deterministic
+latency are test-process instrumentation; production code never calls a
+private endpoint or a provider branch.
+
+## CI policy
+
+CI runs the smoke suite and retains all raw artifacts. It gates zero errors
+and complete operation counts, present and ordered percentiles, peak RSS no
+more than 125% of the fixed plan, the stable object-operation metric schema,
+actual shared-object reads during empty-local-cache recovery, and concurrent
+commit PUT amplification below 1.75 PUTs per transaction. The ungrouped
+durable shape is two PUTs per transaction: an immutable journal object and a
+compare-and-swap commit-head update.
+
+Absolute timing is recorded but is not a hosted-runner gate. Stable regression
+thresholds require pinned hardware and an independently operated compatible
+object store; noisy CI timing is not evidence. Logical-replica speedup is also
+reported rather than required to be linear.
+
+## What the measurements decide next
+
+Representative long runs, not the single-binary label or the small CI smoke
+dataset, decide optimization order. The known structural limits remain global
+query serialization, modeled rather than broadly physical secondary indexes,
+object-read amplification on larger cold datasets, and small startup-sized
+catalog/table ceilings. Multi-core execution must preserve fixed memory,
+MVCC, lock ordering, group publication order, and explicit backpressure.
+Writer fencing and promotion safety must exist before any failover benchmark
+or active-active claim is meaningful.

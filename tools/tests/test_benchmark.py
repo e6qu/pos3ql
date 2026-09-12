@@ -66,6 +66,22 @@ class BenchmarkTest(unittest.TestCase):
             },
         )
 
+    def test_tail_range_is_bounded_at_the_high_end_of_the_index(self):
+        self.assertEqual(
+            benchmark.workload_sql("tail-range", 7, 19, 1000),
+            "SELECT sum(payload), count(*) FROM benchmark_kv WHERE id >= 969",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("tail-range", 0, 0, 8),
+            "SELECT sum(payload), count(*) FROM benchmark_kv WHERE id >= 1",
+        )
+
+    def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
+        self.assertEqual(
+            benchmark.workload_sql("insert", 2, 7, 1000),
+            "INSERT INTO benchmark_kv(id, payload) VALUES (2001008, 0)",
+        )
+
     def test_validation_enforces_required_index_access(self):
         result = {
             "workload": {"require_index": True},

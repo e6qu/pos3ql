@@ -225,6 +225,8 @@ bench_pos3ql point-concurrency-1 --workload point-read --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --setup --require-index
 bench_pos3ql warm-memory-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-tail-range --workload tail-range --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql concurrent-update --workload update --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --synchronized --require-index
 
@@ -247,6 +249,8 @@ stop_pos3ql
 
 DATA_COLD="$WORK/data-cold"
 start_pos3ql "$DATA_COLD" primary cold-object-recovery yes
+bench_pos3ql cold-object-tail-range --workload tail-range --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS"
 
@@ -260,7 +264,7 @@ if [ "$MODE" = full ]; then
     replica_port=$(choose_free_port $((19800 + replica * 10)) $((19809 + replica * 10)))
     launch_replica "replica-$replica" "$replica_port"
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" \
-      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, payload bigint NOT NULL); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
+      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" --expect "$SCALE_ROWS" \
       --timeout 30 "SELECT count(*) FROM benchmark_kv" >/dev/null
     REPLICA_TARGETS="$REPLICA_TARGETS --target 127.0.0.1:$replica_port"
@@ -299,6 +303,10 @@ if [ "$MODE" = full ]; then
     --label postgresql18-point --workload point-read --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --check \
     --output "$OUTPUT/postgresql18-point.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label postgresql18-tail-range --workload tail-range --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/postgresql18-tail-range.json" >/dev/null
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-insert --workload insert --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --check \

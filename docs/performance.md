@@ -68,6 +68,7 @@ the comparison does not pretend PostgreSQL itself has an S3 cache profile.
 | Scenario | Boundary measured |
 |---|---|
 | warm memory | Repeated point reads in the process that created and checkpointed the data |
+| indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
 | warm disk | Graceful restart with the same disposable local data directory |
 | empty local caches | Restart from a new local directory against the unchanged durable object prefix |
 | concurrent updates | Synchronized clients, commit latency, and immutable-batch/commit-head PUT amplification |
@@ -90,12 +91,14 @@ branch.
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no
 more than 125% of the fixed plan, the stable object-operation metric schema,
-at least one index scan per point-read or synchronized-update operation and
+at least one index scan per point-read, tail-range, or synchronized-update operation and
 zero sequential scans in the complete resident warm-memory paths, actual
 shared-object reads during empty-local-cache recovery, and concurrent commit
 PUT amplification below 1.75 PUTs per transaction. This access-path gate keeps
 a timing improvement from concealing a return to full-table point reads or
-updates. The
+updates. The analyzed fixture has a fixed 8 KiB non-projected row body, so the
+small smoke dataset spans enough immutable table blocks for a selective cold
+index probe to remain a meaningful costed physical choice. The
 ungrouped durable shape is two PUTs per transaction: an immutable journal
 object and a compare-and-swap commit-head update.
 
@@ -108,12 +111,12 @@ reported rather than required to be linear.
 
 Representative long runs, not the single-binary label or the small CI smoke
 dataset, decide optimization order. Plain-column btree equality probes now use
-resident exact maps or filtered immutable blocks for queries and direct DML;
-composite leading-prefix and range predicates avoid fetching non-candidate rows
-but still walk the durable key generation. The known structural limits remain global query
-serialization, ordered/richer secondary-index planning, object-read
-amplification on range walks and larger cold datasets, and small startup-sized
-catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
+resident exact maps or filtered immutable blocks for queries and direct DML.
+Composite leading-prefix and range predicates seek across checkpoint-sorted
+immutable keys and skip disjoint object blocks; the harness records both warm
+and cold tail-range workloads alongside PostgreSQL 18. The known structural
+limits remain global query serialization, ordered-result/richer secondary-index
+planning, and small startup-sized catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
 lock ordering, group publication order, and explicit backpressure. Writer
 fencing and promotion safety must exist before any failover benchmark or
 active-active claim is meaningful.

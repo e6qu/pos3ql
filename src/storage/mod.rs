@@ -286,6 +286,22 @@ fn spill_read_error(error: crate::store::SstError) -> SqlError {
     }
 }
 
+fn value_index_read_error(error: crate::store::ValueIndexError) -> SqlError {
+    match error {
+        crate::store::ValueIndexError::Store(crate::store::StoreError::NotReady) => {
+            sql_err!(
+                sqlstate::INTERNAL_IO_WAIT,
+                "durable value-index read in progress"
+            )
+        }
+        other => sql_err!(
+            sqlstate::IO_ERROR,
+            "persistent value-index read: {:?}",
+            other
+        ),
+    }
+}
+
 /// An SQL identifier, owned inline. PostgreSQL caps names at 63 bytes
 /// (NAMEDATALEN - 1); so does this.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -25553,13 +25569,7 @@ impl Storage {
                         hash,
                         |rowid, _, _| visit(rowid),
                     )
-                    .map_err(|error| {
-                        sql_err!(
-                            sqlstate::IO_ERROR,
-                            "persistent value-index read: {:?}",
-                            error
-                        )
-                    })?;
+                    .map_err(value_index_read_error)?;
                 // The published generation is a complete base. Every later
                 // committed change remains in the bounded resident overlay
                 // until its replacement generation publishes.
@@ -25676,13 +25686,7 @@ impl Storage {
                         }
                     },
                 )
-                .map_err(|error| {
-                    sql_err!(
-                        sqlstate::IO_ERROR,
-                        "persistent value-index read: {:?}",
-                        error
-                    )
-                })?;
+                .map_err(value_index_read_error)?;
             callback_error?;
         }
         // Overlay entries supersede or extend the published base. Duplicate
@@ -25696,6 +25700,86 @@ impl Storage {
             let (len, _) =
                 self.encode_value_binding_key(table_index, binding, rowid, home, key_buffer)?;
             visit(rowid, &key_buffer[..len])?;
+        }
+        Ok(true)
+    }
+
+    /// Scans only the durable key blocks intersecting a typed btree interval,
+    /// then applies the same interval to the committed resident overlay.
+    /// `classify` describes a key relative to that interval; the value-index
+    /// format uses it for block pruning without taking SQL types into storage.
+    pub(crate) fn range_value_index(
+        &self,
+        table_index: usize,
+        columns: &[u16],
+        mut classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
+        mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        let table = &self.tables[table_index];
+        let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
+            let enforcer = table.enforcers[binding].expect("enforcer");
+            (enforcer.columns() == columns).then_some((binding, enforcer.durable?))
+        }) else {
+            return Ok(false);
+        };
+        if self.commit_snapshot < handle.published_lsn {
+            return Ok(false);
+        }
+        let Some(spill) = &self.spill else {
+            return Ok(false);
+        };
+        let Some(mut scratch) = spill
+            .value_scratch
+            .as_ref()
+            .expect("durable value indexes have reader scratch")
+            .iter()
+            .find_map(|candidate| candidate.try_borrow_mut().ok())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "persistent value scans nested deeper than reader scratch"
+            ));
+        };
+        {
+            let ValueIndexScratch { roster, data } = &mut *scratch;
+            let callback_error = std::cell::RefCell::new(None);
+            crate::store::ValueIndexReader::over(roster, data)
+                .range(
+                    &mut *spill
+                        .blocks
+                        .as_ref()
+                        .expect("value-index generations are durable")
+                        .borrow_mut(),
+                    &handle,
+                    |key| match classify(key) {
+                        Ok(position) => position,
+                        Err(error) => {
+                            *callback_error.borrow_mut() = Some(error);
+                            crate::store::ValueIndexPosition::Match
+                        }
+                    },
+                    |_, rowid, _, key| {
+                        let ready = callback_error.borrow().is_none();
+                        if ready && let Err(error) = visit(rowid, key) {
+                            *callback_error.borrow_mut() = Some(error);
+                        }
+                    },
+                )
+                .map_err(value_index_read_error)?;
+            if let Some(error) = callback_error.into_inner() {
+                return Err(error);
+            }
+        }
+        for (&rowid, state) in table.rows.iter() {
+            let Some(home) = state.committed else {
+                continue;
+            };
+            let key_buffer = &mut scratch.roster;
+            let (len, _) =
+                self.encode_value_binding_key(table_index, binding, rowid, home, key_buffer)?;
+            if classify(&key_buffer[..len])? == crate::store::ValueIndexPosition::Match {
+                visit(rowid, &key_buffer[..len])?;
+            }
         }
         Ok(true)
     }
@@ -25796,6 +25880,60 @@ impl Storage {
             rowenc::encode(key, &mut output[..len]);
             Ok((len, hash_table_key(&table.def, &values, enforcer.columns())))
         })
+    }
+
+    /// Compares two encoded keys with the indexed columns' PostgreSQL types
+    /// and collations. Checkpoint sorting and range navigation share this
+    /// boundary so byte encoding can never accidentally become SQL order.
+    pub(crate) fn compare_value_binding_keys(
+        &self,
+        table_index: usize,
+        binding: usize,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<core::cmp::Ordering, SqlError> {
+        let table = &self.tables[table_index];
+        let enforcer = table.enforcers[binding].expect("binding");
+        let mut types = [ColType::Bool; MAX_INDEX_COLS];
+        let mut collations = [crate::sql::ast::Collation::None; MAX_INDEX_COLS];
+        for (position, &column) in enforcer.columns()[..enforcer.n_cols].iter().enumerate() {
+            types[position] = table.def.columns[column as usize].ctype;
+            collations[position] = table.def.columns[column as usize].collation;
+        }
+        let mut left_values = [Datum::Null; MAX_INDEX_COLS];
+        let mut right_values = [Datum::Null; MAX_INDEX_COLS];
+        rowenc::decode(
+            left,
+            &types[..enforcer.n_cols],
+            &mut left_values[..enforcer.n_cols],
+        )?;
+        rowenc::decode(
+            right,
+            &types[..enforcer.n_cols],
+            &mut right_values[..enforcer.n_cols],
+        )?;
+        for position in 0..enforcer.n_cols {
+            // The internal generation order is NULLS FIRST regardless of an
+            // index's display ordering. Range classifiers likewise place a
+            // NULL before every comparable search key, so this explicit total
+            // order keeps navigation monotonic without asking SQL to compare
+            // two values of the unknown type.
+            let ordering = match (left_values[position], right_values[position]) {
+                (Datum::Null, Datum::Null) => core::cmp::Ordering::Equal,
+                (Datum::Null, _) => core::cmp::Ordering::Less,
+                (_, Datum::Null) => core::cmp::Ordering::Greater,
+                (left, right) => crate::sql::eval::compare_datums_collated(
+                    self,
+                    collations[position],
+                    &left,
+                    &right,
+                )?,
+            };
+            if !ordering.is_eq() {
+                return Ok(ordering);
+            }
+        }
+        Ok(core::cmp::Ordering::Equal)
     }
 
     /// Whether the current command can see one of `txid`'s pending images.
@@ -40953,6 +41091,14 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_value_index_object_read_is_an_internal_wait() {
+        let error = value_index_read_error(crate::store::ValueIndexError::Store(
+            crate::store::StoreError::NotReady,
+        ));
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_IO_WAIT);
+    }
 
     #[test]
     fn column_metadata_stays_within_recovery_stack_budget() {

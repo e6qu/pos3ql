@@ -775,9 +775,25 @@ struct IndexConstraint<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct IndexConstraintSet<'a> {
+    equality: Option<IndexConstraint<'a>>,
+    lower: Option<IndexConstraint<'a>>,
+    upper: Option<IndexConstraint<'a>>,
+}
+
+impl IndexConstraintSet<'_> {
+    const EMPTY: Self = Self {
+        equality: None,
+        lower: None,
+        upper: None,
+    };
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct IndexAccessPlan<'a> {
     columns: [u16; MAX_INDEX_COLS],
     constraints: [Option<IndexConstraint<'a>>; MAX_INDEX_COLS],
+    additional_constraints: [Option<IndexConstraint<'a>>; MAX_INDEX_COLS],
     n_columns: usize,
     n_constraints: usize,
     exact: bool,
@@ -840,7 +856,7 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
     expression: &'a Expr<'a>,
     resolve_column: &mut Resolve,
     operand_is_invariant: &Invariant,
-    constraints: &mut [Option<IndexConstraint<'a>>; MAX_COLUMNS],
+    constraints: &mut [IndexConstraintSet<'a>; MAX_COLUMNS],
 ) where
     Resolve: FnMut(&Expr<'a>) -> Option<usize>,
     Invariant: Fn(&Expr<'a>) -> bool,
@@ -877,11 +893,18 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
             return false;
         };
         let replacement = IndexConstraint { operand, operator };
-        match constraints[index] {
-            // Equality is the strongest btree constraint. Retain the first
-            // equal-strength term; the full WHERE rechecks every term.
-            Some(current) if current.operator == BinaryOp::Eq => {}
-            _ => constraints[index] = Some(replacement),
+        let set = &mut constraints[index];
+        match operator {
+            BinaryOp::Eq => {
+                set.equality.get_or_insert(replacement);
+            }
+            BinaryOp::Gt | BinaryOp::GtEq => {
+                set.lower.get_or_insert(replacement);
+            }
+            BinaryOp::Lt | BinaryOp::LtEq => {
+                set.upper.get_or_insert(replacement);
+            }
+            _ => unreachable!("filtered index operator"),
         }
         true
     };
@@ -893,25 +916,34 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
 fn select_index_access_plan<'a>(
     storage: &Storage,
     slot: usize,
-    by_column: &[Option<IndexConstraint<'a>>; MAX_COLUMNS],
+    by_column: &[IndexConstraintSet<'a>; MAX_COLUMNS],
 ) -> Option<IndexAccessPlan<'a>> {
     let mut selected: Option<(usize, IndexAccessPlan<'a>)> = None;
     for binding in 0..storage.value_binding_count(slot) {
         let (columns, n_columns) = storage.value_binding_columns(slot, binding);
         let mut constraints = [None; MAX_INDEX_COLS];
+        let mut additional_constraints = [None; MAX_INDEX_COLS];
         let mut n_constraints = 0usize;
         let mut exact = true;
         for (position, &column) in columns[..n_columns].iter().enumerate() {
-            let Some(constraint) = by_column[column as usize] else {
+            let set = by_column[column as usize];
+            if let Some(equality) = set.equality {
+                constraints[position] = Some(equality);
+                n_constraints += 1;
+                continue;
+            }
+            let Some(range) = set.lower.or(set.upper) else {
                 exact = false;
                 break;
             };
-            constraints[position] = Some(constraint);
+            constraints[position] = Some(range);
+            additional_constraints[position] = match (set.lower, set.upper) {
+                (Some(_), Some(upper)) => Some(upper),
+                _ => None,
+            };
             n_constraints += 1;
-            if constraint.operator != BinaryOp::Eq {
-                exact = false;
-                break;
-            }
+            exact = false;
+            break;
         }
         exact &= n_constraints == n_columns;
         if n_constraints == 0
@@ -933,6 +965,7 @@ fn select_index_access_plan<'a>(
                 IndexAccessPlan {
                     columns,
                     constraints,
+                    additional_constraints,
                     n_columns,
                     n_constraints,
                     exact,
@@ -972,7 +1005,7 @@ pub(crate) fn index_access_plan<'a>(
     {
         return None;
     }
-    let mut by_column = [None; MAX_COLUMNS];
+    let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
         let Expr::Column { qualifier, name } = expression else {
             return None;
@@ -1049,7 +1082,7 @@ pub(crate) fn dml_index_access_plan<'a>(
     if !index_snapshot_is_current(storage, slot, txid) {
         return None;
     }
-    let mut by_column = [None; MAX_COLUMNS];
+    let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
         let Expr::Column { qualifier, name } = expression else {
             return None;
@@ -1135,43 +1168,53 @@ fn indexed_candidates_for_plan<'a>(
         return Ok(None);
     }
 
-    let mut values = [Datum::Null; MAX_INDEX_COLS];
+    let mut values = [[Datum::Null; MAX_INDEX_COLS]; 2];
     let mut types = [ColType::Bool; MAX_INDEX_COLS];
     let mut collations = [Collation::None; MAX_INDEX_COLS];
     for position in 0..plan.n_constraints {
         let column = plan.columns[position] as usize;
-        let constraint = plan.constraints[position].expect("counted constraint");
         let target_type = definition.columns[column].ctype;
-        let raw = eval_full(constraint.operand, arena, params, &NoColumns, hooks)?;
-        if raw.is_null() {
-            return Ok(Some(IndexedCandidates {
-                table: 0,
-                index_oid,
-                scan_executed: false,
-                index_entries: 0,
-                rowids: &[],
-            }));
-        }
-        let raw_type = ColType::from_oid(raw.type_oid());
-        let integer = |column_type: ColType| {
-            matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8)
-        };
-        let integer_compatible = raw_type.is_some_and(integer) && integer(target_type);
-        // Untyped strings and the integer-width family have the same equality
-        // semantics after coercion. Decline every other cross-type probe so a
-        // lossy cast can never discard a matching authoritative row.
-        if !matches!(constraint.operand, Expr::Str(_))
-            && raw_type != Some(target_type)
-            && !integer_compatible
+        for (bound, constraint) in [
+            plan.constraints[position],
+            plan.additional_constraints[position],
+        ]
+        .into_iter()
+        .enumerate()
         {
-            return Ok(None);
-        }
-        values[position] = match target_type {
-            ColType::Enum(slot) => {
-                super::super::exec::coerce_enum_value(raw, slot, storage, txid, arena)?
+            let Some(constraint) = constraint else {
+                continue;
+            };
+            let raw = eval_full(constraint.operand, arena, params, &NoColumns, hooks)?;
+            if raw.is_null() {
+                return Ok(Some(IndexedCandidates {
+                    table: 0,
+                    index_oid,
+                    scan_executed: false,
+                    index_entries: 0,
+                    rowids: &[],
+                }));
             }
-            _ => cast_to(raw, target_type, arena)?,
-        };
+            let raw_type = ColType::from_oid(raw.type_oid());
+            let integer = |column_type: ColType| {
+                matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8)
+            };
+            let integer_compatible = raw_type.is_some_and(integer) && integer(target_type);
+            // Untyped strings and the integer-width family have the same
+            // comparison semantics after coercion. Decline every other
+            // cross-type probe so a lossy cast cannot discard an MVCC row.
+            if !matches!(constraint.operand, Expr::Str(_))
+                && raw_type != Some(target_type)
+                && !integer_compatible
+            {
+                return Ok(None);
+            }
+            values[bound][position] = match target_type {
+                ColType::Enum(slot) => {
+                    super::super::exec::coerce_enum_value(raw, slot, storage, txid, arena)?
+                }
+                _ => cast_to(raw, target_type, arena)?,
+            };
+        }
         types[position] = target_type;
         collations[position] = definition.columns[column].collation;
     }
@@ -1179,7 +1222,8 @@ fn indexed_candidates_for_plan<'a>(
         types[position] = definition.columns[column as usize].ctype;
         collations[position] = definition.columns[column as usize].collation;
     }
-    let key_matches = |key: &[u8]| -> Result<bool, SqlError> {
+    let key_position = |key: &[u8]| -> Result<crate::store::ValueIndexPosition, SqlError> {
+        use crate::store::ValueIndexPosition::{After, Before, Match};
         let mut decoded = [Datum::Null; MAX_INDEX_COLS];
         rowenc::decode(
             key,
@@ -1188,34 +1232,43 @@ fn indexed_candidates_for_plan<'a>(
         )?;
         for position in 0..plan.n_constraints {
             if decoded[position].is_null() {
-                return Ok(false);
+                return Ok(Before);
             }
-            let ordering = compare_datums_collated(
-                storage,
-                collations[position],
-                &decoded[position],
-                &values[position],
-            )?;
-            let operator = plan.constraints[position]
-                .expect("counted constraint")
-                .operator;
-            if !match operator {
-                BinaryOp::Eq => ordering.is_eq(),
-                BinaryOp::Lt => ordering.is_lt(),
-                BinaryOp::LtEq => ordering.is_le(),
-                BinaryOp::Gt => ordering.is_gt(),
-                BinaryOp::GtEq => ordering.is_ge(),
-                _ => unreachable!("filtered comparison"),
-            } {
-                return Ok(false);
+            for (bound, constraint) in [
+                plan.constraints[position],
+                plan.additional_constraints[position],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let Some(constraint) = constraint else {
+                    continue;
+                };
+                let ordering = compare_datums_collated(
+                    storage,
+                    collations[position],
+                    &decoded[position],
+                    &values[bound][position],
+                )?;
+                match constraint.operator {
+                    BinaryOp::Eq if ordering.is_lt() => return Ok(Before),
+                    BinaryOp::Eq if ordering.is_gt() => return Ok(After),
+                    BinaryOp::Eq => {}
+                    BinaryOp::Lt if !ordering.is_lt() => return Ok(After),
+                    BinaryOp::LtEq if !ordering.is_le() => return Ok(After),
+                    BinaryOp::Gt if !ordering.is_gt() => return Ok(Before),
+                    BinaryOp::GtEq if !ordering.is_ge() => return Ok(Before),
+                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {}
+                    _ => unreachable!("filtered comparison"),
+                }
             }
         }
-        Ok(true)
+        Ok(Match)
     };
     let compact_columns = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
     let hash = plan.exact.then(|| {
         hash_key_collated(
-            &values[..plan.n_columns],
+            &values[0][..plan.n_columns],
             &compact_columns[..plan.n_columns],
             &collations[..plan.n_columns],
         )
@@ -1226,13 +1279,15 @@ fn indexed_candidates_for_plan<'a>(
             storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |_| count += 1)?;
         debug_assert!(complete, "completeness checked before probe");
     } else {
-        let complete =
-            storage.walk_value_index(slot, &plan.columns[..plan.n_columns], |_, key| {
-                if key_matches(key)? {
-                    count += 1;
-                }
+        let complete = storage.range_value_index(
+            slot,
+            &plan.columns[..plan.n_columns],
+            key_position,
+            |_, _| {
+                count += 1;
                 Ok(())
-            })?;
+            },
+        )?;
         debug_assert!(complete, "durable completeness checked before scan");
     }
     let Ok(rowids) = arena.alloc_slice_with(count, |_| 0u64) else {
@@ -1249,13 +1304,16 @@ fn indexed_candidates_for_plan<'a>(
             fill += 1;
         })?;
     } else {
-        storage.walk_value_index(slot, &plan.columns[..plan.n_columns], |rowid, key| {
-            if key_matches(key)? {
+        storage.range_value_index(
+            slot,
+            &plan.columns[..plan.n_columns],
+            key_position,
+            |rowid, _| {
                 rowids[fill] = rowid;
                 fill += 1;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+        )?;
     }
     rowids.sort_unstable();
     let mut unique = 0usize;

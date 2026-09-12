@@ -203,9 +203,15 @@ def workload_sql(workload, worker, operation, rows):
         return f"UPDATE benchmark_kv SET payload = payload + 1 WHERE id = {key}"
     if workload == "scan":
         return "SELECT sum(payload), count(*) FROM benchmark_kv"
+    if workload == "tail-range":
+        lower = max(1, rows - 31)
+        return (
+            "SELECT sum(payload), count(*) FROM benchmark_kv "
+            f"WHERE id >= {lower}"
+        )
     if workload == "insert":
         inserted_key = rows + worker * 1_000_000 + operation + 1
-        return f"INSERT INTO benchmark_kv VALUES ({inserted_key}, 0)"
+        return f"INSERT INTO benchmark_kv(id, payload) VALUES ({inserted_key}, 0)"
     raise ValueError(f"unknown workload {workload}")
 
 
@@ -216,15 +222,23 @@ def identify(connection):
 
 def setup_database(connection, rows):
     connection.query("DROP TABLE IF EXISTS benchmark_kv")
-    connection.query("CREATE TABLE benchmark_kv(id integer PRIMARY KEY, payload bigint NOT NULL)")
+    # A realistic row body makes even the small CI dataset span immutable
+    # table blocks, so a selective cold index probe competes against an actual
+    # multi-block table scan instead of a degenerate one-block fixture.
+    connection.query(
+        "CREATE TABLE benchmark_kv("
+        "id integer PRIMARY KEY, payload bigint NOT NULL, "
+        "padding text NOT NULL DEFAULT repeat('x', 8192))"
+    )
     # Keep setup valid for startup-sized transaction pools smaller than the
     # dataset; each chunk is its own implicit transaction on both engines.
     for first in range(1, rows + 1, 1000):
         last = min(rows, first + 999)
         connection.query(
-            "INSERT INTO benchmark_kv "
+            "INSERT INTO benchmark_kv(id, payload) "
             f"SELECT value, 0 FROM generate_series({first}, {last}) AS value"
         )
+    connection.query("ANALYZE benchmark_kv")
     connection.query("CHECKPOINT")
 
 
@@ -468,7 +482,7 @@ def parse_args():
     parser.add_argument("--label", required=True)
     parser.add_argument(
         "--workload",
-        choices=("point-read", "update", "mixed", "scan", "insert"),
+        choices=("point-read", "tail-range", "update", "mixed", "scan", "insert"),
         required=True,
     )
     parser.add_argument("--clients", type=int, default=1)
@@ -502,9 +516,11 @@ def parse_args():
     if args.maintenance_interval < 0:
         parser.error("maintenance interval cannot be negative")
     if args.require_index and (
-        args.workload not in ("point-read", "update") or len(args.targets) > 1
+        args.workload not in ("point-read", "tail-range", "update") or len(args.targets) > 1
     ):
-        parser.error("--require-index requires a point-read or update workload against one target")
+        parser.error(
+            "--require-index requires a point-read, tail-range, or update workload against one target"
+        )
     return args
 
 

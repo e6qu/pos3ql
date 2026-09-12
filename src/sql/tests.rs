@@ -46238,13 +46238,15 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    for start in [1, 1001, 2001, 3001] {
+    // Insert most keys in descending SQL order so the checkpoint cannot rely
+    // on row identity or insertion order when building its durable btree run.
+    for start in [1, 1001, 2001, 3001, 4001, 5001, 6001, 7001] {
         let filler = run_with(
             &mut engine,
             &mut budget,
             &format!(
                 "INSERT INTO composite_seek
-                 SELECT 9, value, repeat('f', 512) || value::text
+                 SELECT 9000 - value, value, repeat('f', 512) || value::text
                  FROM generate_series({start}, {}) AS filler(value)",
                 start + 999
             ),
@@ -46309,6 +46311,49 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
             .value_durable_complete(restarted_slot, &[0, 1])
     );
     assert!(restarted.storage.spill_generation_count(restarted_slot) > 0);
+    let before_range = restarted.storage.block_io_stats();
+    let mut durable_candidates = 0usize;
+    assert!(
+        restarted
+            .storage
+            .range_value_index(
+                restarted_slot,
+                &[0, 1],
+                |key| {
+                    let mut values = [Datum::Null; 2];
+                    crate::storage::rowenc::decode(
+                        key,
+                        &[ColType::Int4, ColType::Int4],
+                        &mut values,
+                    )?;
+                    let (Datum::Int4(tenant), Datum::Int4(id)) = (values[0], values[1]) else {
+                        panic!("composite integer index key decoded with the wrong types")
+                    };
+                    Ok(if tenant < 2 || (tenant == 2 && id < 2) {
+                        crate::store::ValueIndexPosition::Before
+                    } else if tenant > 2 {
+                        crate::store::ValueIndexPosition::After
+                    } else {
+                        crate::store::ValueIndexPosition::Match
+                    })
+                },
+                |_, _| {
+                    durable_candidates += 1;
+                    Ok(())
+                },
+            )
+            .unwrap()
+    );
+    assert_eq!(durable_candidates, 2);
+    let range_gets = restarted
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_range)
+        .object_gets;
+    assert!(
+        range_gets <= 2,
+        "a cold narrow range reads one roster and one intersecting value block, got {range_gets}"
+    );
     let prefix_plan = data_rows(&run_with(
         &mut restarted,
         &mut restart_budget,
@@ -46319,6 +46364,42 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
             .iter()
             .any(|row| row.contains("Index Scan using composite_seek_pkey")),
         "{prefix_plan:?}"
+    );
+    let bounded_output = run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "PREPARE composite_window(integer, integer, integer) AS
+             SELECT id FROM composite_seek
+             WHERE tenant = $1 AND id >= $2 AND id < $3 ORDER BY id;
+         EXECUTE composite_window(2, 1, 3);
+         EXPLAIN (GENERIC_PLAN) EXECUTE composite_window(2, 1, 3);
+         SELECT id FROM composite_seek
+         WHERE 1 <= id AND 3 > id AND tenant = 2 ORDER BY id;
+         SELECT id FROM composite_seek
+         WHERE tenant = 2 AND id >= 9 AND id <= 4",
+    );
+    let bounded_rows = data_rows(&bounded_output);
+    assert_eq!(
+        bounded_rows
+            .iter()
+            .filter(|row| row.as_str() == "1")
+            .count(),
+        2,
+        "prepared and reverse-spelled lower bounds must agree: {bounded_rows:?}"
+    );
+    assert_eq!(
+        bounded_rows
+            .iter()
+            .filter(|row| row.as_str() == "2")
+            .count(),
+        2,
+        "prepared and reverse-spelled upper bounds must agree: {bounded_rows:?}"
+    );
+    assert!(
+        bounded_rows
+            .iter()
+            .any(|row| row.contains("Index Scan using composite_seek_pkey")),
+        "two-sided prepared range must retain the physical index plan: {bounded_rows:?}"
     );
     assert_eq!(
         data_rows(&run_with(
@@ -46368,9 +46449,10 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
         data_rows(&run_with(
             &mut restarted,
             &mut restart_budget,
-            "SELECT pg_stat_reset_single_table_counters('composite_seek'::regclass)"
+            "SELECT pg_stat_reset_single_table_counters('composite_seek'::regclass);
+             SELECT pg_stat_reset_single_table_counters('composite_seek_pkey'::regclass)"
         )),
-        [""]
+        ["", ""]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -46383,7 +46465,7 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
              SELECT seq_scan, idx_scan FROM pg_stat_user_tables
              WHERE relname = 'composite_seek'"
         )),
-        ["20|updated", "updated", "0|3"]
+        ["20|updated", "updated", "0|1"]
     );
 
     // Another transaction's uncommitted image must not disable the committed

@@ -639,7 +639,7 @@ fn scan_node<'a>(
     let selectivity = predicate.map_or(1.0, |predicate| {
         predicate_selectivity(storage, scope, table, predicate, txid, arena)
     });
-    let output_rows = if rows == 0 {
+    let predicate_rows = if rows == 0 {
         0
     } else {
         (rows as f64 * selectivity).ceil().max(1.0) as u64
@@ -666,6 +666,14 @@ fn scan_node<'a>(
     let index_plan = (table == 0)
         .then(|| query::index_access_plan(storage, scope, txid, predicate))
         .flatten();
+    let index_rows = index_plan.map_or(predicate_rows, |plan| {
+        plan.expected_rows(storage, slot, scope.defs[table].expect("base table"), txid)
+    });
+    // Predicate statistics remain authoritative for rows emitted by the scan:
+    // unlike the access path, they can use joint statistics and non-index
+    // filters. The access estimate instead prices the index candidates that
+    // execution must fetch before the complete predicate recheck.
+    let output_rows = predicate_rows;
     let index_identity = index_plan.and_then(|plan| {
         crate::sql::catalog::value_index_identity(storage, txid, slot, plan.columns())
             .map(|(_, name)| (plan, name))
@@ -676,12 +684,12 @@ fn scan_node<'a>(
     let use_index = index_identity.is_some()
         && (resident_index
             || (generations != 0
-                && !storage.sequential_spill_scan_is_cheaper(slot, output_rows, txid)));
+                && !storage.sequential_spill_scan_is_cheaper(slot, index_rows, txid)));
     let blocks = if use_index {
         // One bounded key-generation descent per immutable generation, then
         // only the row blocks expected to survive the predicate.
         generations.saturating_mul(3).saturating_add(
-            output_rows
+            index_rows
                 .saturating_mul(u64::from(width))
                 .div_ceil(crate::store::MAX_PAYLOAD as u64),
         )
@@ -697,7 +705,7 @@ fn scan_node<'a>(
     let io_cost = object_requests as f64 * object_request_cost(storage.block_io_stats())
         + (blocks.saturating_sub(object_requests) as f64)
             * (ram_probability * 0.01 + disk_probability * 0.1);
-    let cpu_rows = if use_index { output_rows } else { rows };
+    let cpu_rows = if use_index { index_rows } else { rows };
     let cpu_cost = cpu_rows as f64 * 0.01;
     let mut relation = StackStr::new();
     let _ = write!(relation, "{}", scope.names[table]);

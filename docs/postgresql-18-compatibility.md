@@ -36,13 +36,14 @@ logical-replication boundary is specified separately in
 - Hash, GiST, GIN, SP-GiST, and BRIN index execution are not implemented.
   Plain-column btree indexes physically execute complete single/composite
   equality probes (including prepared parameters) and equality-leading
-  prefixes with one following range constraint for queries and direct
+  prefixes with lower, upper, or two-sided bounds on the following column for queries and direct
   UPDATE/DELETE target scans. Exact resident probes use the
   complete startup-bounded hash map; durable equality probes use per-block
-  filters; prefix/range probes currently walk the immutable key generation.
-  Ordered seeks and ORDER BY satisfaction, join-parameterized scans,
-  expression and partial matching, and index-only scans remain production
-  work.
+  filters. Checkpoints externally sort durable keys using PostgreSQL type and
+  collation semantics, and prefix/range probes seek by immutable per-block key
+  bounds. Ordered result traversal and ORDER BY satisfaction,
+  join-parameterized scans, expression and partial matching, and
+  index-only scans remain production work.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

@@ -31,11 +31,27 @@ const MANIFEST_HEADER: &str = "pos3ql-manifest-v12";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
+const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4; // hash | rowid | commit_lsn | key length
 
 /// io_error — object storage trouble surfaced to a statement.
 const SQLSTATE_IO: &str = "58030";
 /// serialization_failure — manifest CAS lost to another writer.
 const SQLSTATE_CAS: &str = "40001";
+
+fn value_sort_key(entry: &[u8]) -> Result<&[u8], SqlError> {
+    if entry.len() < VALUE_SORT_ENTRY_HEADER {
+        return Err(sql_err!(
+            SQLSTATE_IO,
+            "persistent value-index sort row is truncated"
+        ));
+    }
+    let key_len = u32::from_le_bytes(entry[24..28].try_into().unwrap()) as usize;
+    let end = VALUE_SORT_ENTRY_HEADER
+        .checked_add(key_len)
+        .filter(|end| *end == entry.len())
+        .ok_or_else(|| sql_err!(SQLSTATE_IO, "persistent value-index sort row is malformed"))?;
+    Ok(&entry[VALUE_SORT_ENTRY_HEADER..end])
+}
 
 /// Identity of one immutable commit batch.  The LSN and checksum always
 /// travel together, so a recovered head cannot pair either with another
@@ -9679,16 +9695,34 @@ impl Checkpointer {
         if storage.value_binding_count(slot) == 0 {
             return Ok(());
         }
+        // Checkpoints run between statements, so they can lease the same
+        // startup-bounded external-run contexts as query materializers rather
+        // than reserving another multi-megabyte merge fan-in.
+        let mut value_sorter = storage.external_sorter()?;
+        let mut value_sort_reader = storage.external_run_reader()?;
         self.sst_arena.reset();
         let key = self
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index key scratch"))?;
+        let sorted_entry = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index sort scratch"))?;
         let published_lsn = storage.lsn();
         for binding in 0..storage.value_binding_count(slot) {
             if !storage.value_binding_is_committed(slot, binding) {
                 continue;
             }
+            value_sorter.reset();
+            let mut compare = |left: &[u8], right: &[u8]| {
+                storage.compare_value_binding_keys(
+                    slot,
+                    binding,
+                    value_sort_key(left)?,
+                    value_sort_key(right)?,
+                )
+            };
             self.value_writer.reset();
             storage.for_each_row_state(slot, &mut |rowid, state| {
                 use core::ops::ControlFlow;
@@ -9697,17 +9731,53 @@ impl Checkpointer {
                 };
                 let (key_len, hash) =
                     storage.encode_value_binding_key(slot, binding, rowid, home, key)?;
-                self.value_writer
-                    .append(
-                        &mut *self.blocks.borrow_mut(),
-                        hash,
-                        rowid,
-                        state.committed_lsn,
-                        &key[..key_len],
-                    )
-                    .map_err(value_index_to_sql)?;
+                let entry_len = VALUE_SORT_ENTRY_HEADER + key_len;
+                sorted_entry[..8].copy_from_slice(&hash.to_le_bytes());
+                sorted_entry[8..16].copy_from_slice(&rowid.to_le_bytes());
+                sorted_entry[16..24].copy_from_slice(&state.committed_lsn.to_le_bytes());
+                sorted_entry[24..28].copy_from_slice(&(key_len as u32).to_le_bytes());
+                sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len].copy_from_slice(&key[..key_len]);
+                value_sorter.push_encoded(
+                    &mut *self.blocks.borrow_mut(),
+                    &sorted_entry[..entry_len],
+                    &mut compare,
+                )?;
                 Ok(ControlFlow::Continue(()))
             })?;
+            let run = value_sorter.finish(&mut *self.blocks.borrow_mut(), &mut compare)?;
+            if let Some(run) = run {
+                value_sort_reader.start(&mut *self.blocks.borrow_mut(), run)?;
+                while let Some(entry) = value_sort_reader.row() {
+                    let key = value_sort_key(entry)?;
+                    let hash = u64::from_le_bytes(entry[..8].try_into().unwrap());
+                    let rowid = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+                    let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+                    let mut comparison_error = None;
+                    let mut compare_keys = |left: &[u8], right: &[u8]| match storage
+                        .compare_value_binding_keys(slot, binding, left, right)
+                    {
+                        Ok(ordering) => ordering,
+                        Err(error) => {
+                            comparison_error = Some(error);
+                            core::cmp::Ordering::Equal
+                        }
+                    };
+                    self.value_writer
+                        .append(
+                            &mut *self.blocks.borrow_mut(),
+                            hash,
+                            rowid,
+                            commit_lsn,
+                            key,
+                            &mut compare_keys,
+                        )
+                        .map_err(value_index_to_sql)?;
+                    if let Some(error) = comparison_error {
+                        return Err(error);
+                    }
+                    value_sort_reader.advance(&mut *self.blocks.borrow_mut())?;
+                }
+            }
             let handle = self
                 .value_writer
                 .finish(&mut *self.blocks.borrow_mut(), published_lsn)

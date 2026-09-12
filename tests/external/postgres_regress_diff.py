@@ -255,15 +255,21 @@ def main():
                               dbname="postgres", autocommit=True)
     pg = pg_conn.cursor()
     p3 = p3_conn.cursor()
-    sources = [(args.setup, 1, 0), *manifest_entries(args.manifest)]
-    total = 0
+    sources = [(args.setup, 1, 0, False)] + [
+        (*entry, True) for entry in manifest_entries(args.manifest)
+    ]
+    setup_total = 0
+    upstream_total = 0
     mismatches = 0
     printed = 0
     try:
-        for filename, first_line, last_line in sources:
+        for filename, first_line, last_line, upstream in sources:
             source = read_upstream(filename, first_line, last_line)
             for line, sql, copy_data in split_sql(source):
-                total += 1
+                if upstream:
+                    upstream_total += 1
+                else:
+                    setup_total += 1
                 pg_result = run_one(pg, sql, copy_data)
                 p3_result = run_one(p3, sql, copy_data)
                 if results_match(pg_result, p3_result, sql):
@@ -277,7 +283,10 @@ def main():
     finally:
         pg_conn.close()
         p3_conn.close()
-    print(f"TOTAL: {total} upstream statements  mismatches={mismatches}")
+    print(
+        f"TOTAL: {upstream_total} upstream statements + "
+        f"{setup_total} setup statements  mismatches={mismatches}"
+    )
     return 1 if mismatches else 0
 
 

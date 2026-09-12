@@ -3,6 +3,9 @@
 -- native regress.so helpers and unrelated schedule state are deliberately
 -- absent.
 
+-- Keep locale-sensitive expected values independent of the host/container.
+SET lc_monetary = 'C';
+
 CREATE TABLE FLOAT8_TBL(f1 float8);
 INSERT INTO FLOAT8_TBL(f1) VALUES
   ('0.0'),

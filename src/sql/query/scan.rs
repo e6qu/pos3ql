@@ -891,7 +891,12 @@ fn indexed_candidates<'a>(
     if !matches!(constant, Expr::Str(_)) && raw_type != Some(target_type) && !integer_compatible {
         return Ok(None);
     }
-    let value = cast_to(raw, target_type, arena)?;
+    let value = match target_type {
+        ColType::Enum(slot) => {
+            super::super::exec::coerce_enum_value(raw, slot, storage, txid, arena)?
+        }
+        _ => cast_to(raw, target_type, arena)?,
+    };
     let key_matches = |key: &[u8]| -> Result<bool, SqlError> {
         let mut decoded = [Datum::Null];
         rowenc::decode(key, &[target_type], &mut decoded)?;

@@ -43520,15 +43520,23 @@ pub fn alter_type(
                     crate::storage::MAX_ENUM_LABELS
                 ));
             }
-            let sort = match compute_add_value_sort(&current, before.as_deref(), after.as_deref()) {
-                Ok(s) => s,
-                Err(e) => return sql_fail(e),
-            };
+            if label.len() > 63 {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_NAME,
+                    "invalid enum label \"{}\"",
+                    label
+                ));
+            }
+            let mut altered = current;
+            let (sort, renumbered) =
+                match compute_add_value_sort(&mut altered, before.as_deref(), after.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => return sql_fail(e),
+                };
             let new_label = match SqlName::parse(label) {
                 Ok(n) => n,
                 Err(e) => return sql_fail(e),
             };
-            let mut altered = current;
             altered.members[altered.n_members] = crate::storage::EnumMember {
                 label: new_label,
                 sort,
@@ -43538,6 +43546,17 @@ pub fn alter_type(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
+            if let Err(error) = storage.mark_enum_label_uncommitted(slot, new_label, txn.txid) {
+                storage.rollback_enum_alter(slot, prior);
+                return sql_fail(error);
+            }
+            if renumbered
+                && let Err(error) =
+                    rewrite_enum_values(storage, txn, slot as u16, None, &altered, arena)
+            {
+                storage.rollback_enum_alter(slot, prior);
+                return sql_fail(error);
+            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(
                 txn.txid,
@@ -43683,7 +43702,7 @@ pub fn alter_type(
                 .position(|member| member.label.as_str() == *from)
             else {
                 return sql_fail(sql_err!(
-                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    sqlstate::INVALID_PARAMETER_VALUE,
                     "\"{}\" is not an existing enum label",
                     from
                 ));
@@ -43705,9 +43724,14 @@ pub fn alter_type(
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
-            if let Err(e) =
-                rewrite_enum_label(storage, txn, slot as u16, from, renamed.as_str(), arena)
-            {
+            if let Err(e) = rewrite_enum_values(
+                storage,
+                txn,
+                slot as u16,
+                Some((from, renamed.as_str())),
+                &altered,
+                arena,
+            ) {
                 storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
             }
@@ -45240,17 +45264,17 @@ fn write_identifier<const N: usize>(output: &mut crate::util::StackStr<N>, ident
     let _ = output.write_char('"');
 }
 
-/// Rewrites the inline label carried by every stored value of one enum. The
-/// sort key and type slot are stable, so comparisons and indexes keep their
-/// identity; scalar enum columns, enum arrays, and domain arrays over the enum
-/// all pass through this one walk. Writes are ordinary transaction-pending row
-/// changes, hence rollback/savepoint semantics come for free.
-fn rewrite_enum_label(
+/// Rewrites the inline label and sort key carried by every stored value of one
+/// enum. PostgreSQL stores enum ordering in a float4 and occasionally
+/// renumbers a densely split range; scalar columns and arrays must move with
+/// that catalog change. Ordinary transaction-pending row writes preserve
+/// rollback and savepoint semantics and rebuild affected index entries.
+fn rewrite_enum_values(
     storage: &mut Storage,
     txn: &mut TxnState,
     enum_slot: u16,
-    from: &str,
-    to: &str,
+    rename: Option<(&str, &str)>,
+    definition: &crate::storage::EnumDef,
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for table_index in 0..storage.table_count() {
@@ -45279,7 +45303,7 @@ fn rewrite_enum_label(
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "enum rename exceeds the statement arena"
+                    "enum alteration exceeds the statement arena"
                 )
             })?;
         let mut n = 0;
@@ -45298,7 +45322,7 @@ fn rewrite_enum_label(
             let bytes = arena.alloc_slice_copy(source).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "enum rename exceeds the statement arena"
+                    "enum alteration exceeds the statement arena"
                 )
             })?;
             let mut values = [Datum::Null; MAX_COLUMNS];
@@ -45309,14 +45333,23 @@ fn rewrite_enum_label(
                     continue;
                 }
                 match values[column_index] {
-                    Datum::Enum { slot, sort, label } if slot == enum_slot && label == from => {
+                    Datum::Enum { slot, sort, label } if slot == enum_slot => {
+                        let target_label = rename
+                            .filter(|(from, _)| label == *from)
+                            .map_or(label, |(_, to)| to);
+                        let target_sort = definition
+                            .sort_of(target_label)
+                            .expect("stored enum label remains in altered definition");
+                        if target_label == label && target_sort == sort {
+                            continue;
+                        }
                         values[column_index] = Datum::Enum {
                             slot,
-                            sort,
-                            label: arena.alloc_str(to).map_err(|_| {
+                            sort: target_sort,
+                            label: arena.alloc_str(target_label).map_err(|_| {
                                 sql_err!(
                                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "enum rename exceeds the statement arena"
+                                    "enum alteration exceeds the statement arena"
                                 )
                             })?,
                         };
@@ -45332,15 +45365,23 @@ fn rewrite_enum_label(
                                 crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
                             if let Datum::Enum { slot, sort, label } = *item
                                 && slot == enum_slot
-                                && label == from
                             {
+                                let target_label = rename
+                                    .filter(|(from, _)| label == *from)
+                                    .map_or(label, |(_, to)| to);
+                                let target_sort = definition
+                                    .sort_of(target_label)
+                                    .expect("stored enum label remains in altered definition");
+                                if target_label == label && target_sort == sort {
+                                    continue;
+                                }
                                 *item = Datum::Enum {
                                     slot,
-                                    sort,
-                                    label: arena.alloc_str(to).map_err(|_| {
+                                    sort: target_sort,
+                                    label: arena.alloc_str(target_label).map_err(|_| {
                                         sql_err!(
                                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                            "enum rename exceeds the statement arena"
+                                            "enum alteration exceeds the statement arena"
                                         )
                                     })?,
                                 };
@@ -45376,57 +45417,84 @@ fn rewrite_enum_label(
     Ok(())
 }
 
-/// The sort key for a new enum member: appended past the current maximum, or —
-/// with BEFORE/AFTER — midway between the named neighbour and its adjacent
-/// member (fractional, so existing members and stored rows are undisturbed).
+/// Computes PostgreSQL's float4 enum sort key. Repeated insertions into one gap
+/// eventually exhaust float4 precision; at that point every existing member
+/// is renumbered to consecutive integers before the insertion is retried.
 fn compute_add_value_sort(
-    def: &crate::storage::EnumDef,
+    def: &mut crate::storage::EnumDef,
     before: Option<&str>,
     after: Option<&str>,
-) -> Result<f64, SqlError> {
-    let members = def.members();
+) -> Result<(f64, bool), SqlError> {
     let neighbour = before.or(after);
     let Some(pivot) = neighbour else {
         // Append: one past the current maximum sort (or 1.0 for an empty enum).
-        let max = members
+        let max = def
+            .members()
             .iter()
-            .map(|m| m.sort)
-            .fold(f64::NEG_INFINITY, f64::max);
-        return Ok(if members.is_empty() { 1.0 } else { max + 1.0 });
+            .map(|m| m.sort as f32)
+            .fold(f32::NEG_INFINITY, f32::max);
+        return Ok((
+            f64::from(if def.members().is_empty() {
+                1.0
+            } else {
+                max + 1.0
+            }),
+            false,
+        ));
     };
-    let Some(pivot_sort) = def.sort_of(pivot) else {
+    if def.sort_of(pivot).is_none() {
         return Err(sql_err!(
-            sqlstate::INVALID_TEXT_REPRESENTATION,
+            sqlstate::INVALID_PARAMETER_VALUE,
             "\"{}\" is not an existing enum label",
             pivot
         ));
-    };
-    // Sorted neighbours around the pivot bound the fractional insertion.
-    let mut sorts: [f64; crate::storage::MAX_ENUM_LABELS] = [0.0; crate::storage::MAX_ENUM_LABELS];
-    for (i, m) in members.iter().enumerate() {
-        sorts[i] = m.sort;
     }
-    sorts[..members.len()].sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pos = sorts[..members.len()]
-        .iter()
-        .position(|&s| s == pivot_sort)
-        .unwrap();
-    let new_sort = if before.is_some() {
-        let lower = if pos == 0 {
-            pivot_sort - 1.0
+    let mut renumbered = false;
+    loop {
+        let members = def.members();
+        let pivot_sort = def.sort_of(pivot).expect("pivot was validated") as f32;
+        let mut sorts = [0.0f32; crate::storage::MAX_ENUM_LABELS];
+        for (index, member) in members.iter().enumerate() {
+            sorts[index] = member.sort as f32;
+        }
+        sorts[..members.len()].sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pos = sorts[..members.len()]
+            .iter()
+            .position(|&sort| sort == pivot_sort)
+            .expect("pivot sort remains present");
+        let adjacent = if before.is_some() {
+            pos.checked_sub(1).map(|index| sorts[index])
         } else {
-            sorts[pos - 1]
+            (pos + 1 < members.len()).then(|| sorts[pos + 1])
         };
-        (lower + pivot_sort) / 2.0
-    } else {
-        let upper = if pos + 1 == members.len() {
-            pivot_sort + 1.0
-        } else {
-            sorts[pos + 1]
+        let Some(adjacent) = adjacent else {
+            let edge = if before.is_some() {
+                pivot_sort - 1.0
+            } else {
+                pivot_sort + 1.0
+            };
+            return Ok((f64::from(edge), renumbered));
         };
-        (pivot_sort + upper) / 2.0
-    };
-    Ok(new_sort)
+        let new_sort = adjacent + (pivot_sort - adjacent) / 2.0;
+        if new_sort != adjacent && new_sort != pivot_sort {
+            return Ok((f64::from(new_sort), renumbered));
+        }
+
+        let mut order = [0usize; crate::storage::MAX_ENUM_LABELS];
+        for (index, entry) in order.iter_mut().take(def.n_members).enumerate() {
+            *entry = index;
+        }
+        order[..def.n_members].sort_by(|left, right| {
+            def.members[*left]
+                .sort
+                .partial_cmp(&def.members[*right].sort)
+                .unwrap()
+        });
+        for (rank, member_index) in order[..def.n_members].iter().copied().enumerate() {
+            def.members[member_index].sort = (rank + 1) as f64;
+        }
+        renumbered = true;
+    }
 }
 
 /// Resolves a name to a live sequence slot. A relation that exists but is not a
@@ -66783,6 +66851,7 @@ pub(crate) fn coerce_enum_value<'a>(
             label
         ));
     };
+    ensure_enum_value_is_safe(storage, slot, label, txid)?;
     Ok(Datum::Enum {
         slot,
         sort,
@@ -66790,6 +66859,24 @@ pub(crate) fn coerce_enum_value<'a>(
             .alloc_str(label)
             .map_err(|_| super::query::arena_full_pub())?,
     })
+}
+
+pub(crate) fn ensure_enum_value_is_safe(
+    storage: &Storage,
+    slot: u16,
+    label: &str,
+    txid: u32,
+) -> Result<(), SqlError> {
+    if !storage.enum_label_is_uncommitted(slot as usize, label, txid) {
+        return Ok(());
+    }
+    let definition = storage.enum_for(slot as usize, txid);
+    Err(sql_err!(
+        sqlstate::UNSAFE_NEW_ENUM_VALUE_USAGE,
+        "unsafe use of new value \"{}\" of enum type {}",
+        label,
+        definition.name.as_str()
+    ))
 }
 
 /// Applies a type modifier to an explicit cast result. Differs from column
@@ -66919,7 +67006,32 @@ pub fn apply_typmod<'a>(
             apply_numeric_typmod(&n, precision as usize, scale as usize, arena).map(Datum::Numeric)
         }
         (ColType::Bit { varying }, TypeMod::Length(n), Datum::Bit { bits, .. }) => {
-            super::eval::fit_bits(bits, n, varying, arena)
+            let invalid = if varying {
+                bits.len() > n
+            } else {
+                bits.len() != n
+            };
+            if invalid {
+                return Err(sql_err!(
+                    if varying {
+                        sqlstate::STRING_DATA_RIGHT_TRUNCATION
+                    } else {
+                        sqlstate::STRING_DATA_LENGTH_MISMATCH
+                    },
+                    "{}",
+                    if varying {
+                        crate::stack_format!(96, "bit string too long for type bit varying({})", n)
+                    } else {
+                        crate::stack_format!(
+                            96,
+                            "bit string length {} does not match type bit({})",
+                            bits.len(),
+                            n
+                        )
+                    }
+                ));
+            }
+            Ok(Datum::Bit { bits, varying })
         }
         // Fractional-second precision: micros round half-away-from-zero in
         // integer arithmetic, as PostgreSQL's AdjustTimestampForTypmod.

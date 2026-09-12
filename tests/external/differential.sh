@@ -115,9 +115,9 @@ else
   DIFF_AUXILIARY=all
 fi
 case "$DIFF_AUXILIARY" in
-all | none | exact | copy | types | slt) ;;
+all | none | exact | copy | types | slt | pg_regress) ;;
 *)
-  printf 'FAIL: POS3QL_DIFF_AUXILIARY must be all, none, exact, copy, types, or slt (got %q)\n' "$DIFF_AUXILIARY"
+  printf 'FAIL: POS3QL_DIFF_AUXILIARY must be all, none, exact, copy, types, slt, or pg_regress (got %q)\n' "$DIFF_AUXILIARY"
   exit 1
   ;;
 esac
@@ -367,6 +367,23 @@ if [[ "$CORPUS_SHARD_MODE" != none ]]; then
     reset_pair
     corpus_ordinal=$((corpus_ordinal + 1))
   done
+fi
+
+if want_auxiliary pg_regress; then
+printf '%s\n' '' '=== vendored PostgreSQL regression inputs ==='
+reset_pair
+if "$ROOT_VENV/bin/python" "$EXT/postgres_regress_diff.py" \
+    --pg "$PG_PORT" --p3 "$P3_PORT" \
+    --setup "$EXT/postgres_regress_setup.sql" \
+    --manifest "$EXT/postgres_regress_schedule.tsv" \
+    --max-print "${POSTGRES_REGRESS_MAX_PRINT:-30}" \
+    > "$WORK/postgres-regress.out" 2>&1; then
+  ok "vendored PostgreSQL regression inputs ($(tail -1 "$WORK/postgres-regress.out"))"
+else
+  bad "vendored PostgreSQL regression inputs"
+  cat "$WORK/postgres-regress.out"
+fi
+reset_pair
 fi
 
 if want_auxiliary exact; then

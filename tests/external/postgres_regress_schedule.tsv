@@ -1,0 +1,20 @@
+# Upstream SQL path	first included source line	last included source line (0 means EOF)
+vendor/test/postgres-regress/sql/boolean.sql	1	0
+vendor/test/postgres-regress/sql/text.sql	1	0
+vendor/test/postgres-regress/sql/int4.sql	1	0
+vendor/test/postgres-regress/sql/int8.sql	1	0
+vendor/test/postgres-regress/sql/float8.sql	1	348
+vendor/test/postgres-regress/sql/case.sql	1	0
+vendor/test/postgres-regress/sql/bit.sql	1	0
+vendor/test/postgres-regress/sql/uuid.sql	1	66
+vendor/test/postgres-regress/sql/uuid.sql	89	156
+vendor/test/postgres-regress/sql/uuid.sql	159	0
+vendor/test/postgres-regress/sql/enum.sql	1	164
+vendor/test/postgres-regress/sql/enum.sql	168	181
+vendor/test/postgres-regress/sql/enum.sql	196	0
+vendor/test/postgres-regress/sql/varchar.sql	1	0
+vendor/test/postgres-regress/sql/char.sql	1	0
+vendor/test/postgres-regress/sql/name.sql	1	0
+vendor/test/postgres-regress/sql/md5.sql	1	0
+vendor/test/postgres-regress/sql/pg_lsn.sql	1	45
+vendor/test/postgres-regress/sql/pg_lsn.sql	55	0

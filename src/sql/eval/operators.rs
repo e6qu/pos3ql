@@ -1150,6 +1150,7 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
         Datum::Timestamp(_) => Datum::Timestamp(datetime::parse_timestamp(s, false)?),
         Datum::Timestamptz(_) => Datum::Timestamptz(datetime::parse_timestamp(s, true)?),
         Datum::Uuid(_) => Datum::Uuid(parse_uuid(s)?),
+        Datum::PgLsn(_) => Datum::PgLsn(crate::sql::lsn::parse(s)?),
         Datum::Bpchar(_) => Datum::Bpchar(s),
         Datum::Time(_) => Datum::Time(datetime::parse_time(s)?),
         Datum::Timetz(..) => {
@@ -1624,7 +1625,14 @@ pub(crate) fn arithmetic<'a>(
                 if b == 0 {
                     return Err(division_by_zero());
                 }
-                a.checked_rem(b)
+                // Unlike division, PostgreSQL defines MIN % -1 as zero: the
+                // mathematical quotient is unrepresentable but the remainder
+                // is exact and representable.
+                if a == i64::MIN && b == -1 {
+                    Some(0)
+                } else {
+                    a.checked_rem(b)
+                }
             }
             _ => unreachable!(),
         };
@@ -1662,13 +1670,31 @@ pub(crate) fn arithmetic<'a>(
             BinaryOp::Sub => a - b,
             BinaryOp::Mul => a * b,
             BinaryOp::Div => {
-                if b == 0.0 {
+                if b == 0.0 && !a.is_nan() {
                     return Err(division_by_zero());
                 }
                 a / b
             }
             _ => unreachable!("Mod on floats rejected above"),
         };
+        if out.is_infinite() && a.is_finite() && b.is_finite() {
+            return Err(sql_err!(
+                sqlstate::NUMERIC_OUT_OF_RANGE,
+                "value out of range: overflow"
+            ));
+        }
+        if out == 0.0
+            && a != 0.0
+            && b != 0.0
+            && a.is_finite()
+            && b.is_finite()
+            && matches!(operator, BinaryOp::Mul | BinaryOp::Div)
+        {
+            return Err(sql_err!(
+                sqlstate::NUMERIC_OUT_OF_RANGE,
+                "value out of range: underflow"
+            ));
+        }
         return Ok(Datum::Float4(out));
     }
     if let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) {
@@ -1677,7 +1703,7 @@ pub(crate) fn arithmetic<'a>(
             BinaryOp::Sub => a - b,
             BinaryOp::Mul => a * b,
             BinaryOp::Div => {
-                if b == 0.0 {
+                if b == 0.0 && !a.is_nan() {
                     return Err(division_by_zero());
                 }
                 a / b
@@ -1690,6 +1716,24 @@ pub(crate) fn arithmetic<'a>(
             }
             _ => unreachable!(),
         };
+        if out.is_infinite() && a.is_finite() && b.is_finite() {
+            return Err(sql_err!(
+                sqlstate::NUMERIC_OUT_OF_RANGE,
+                "value out of range: overflow"
+            ));
+        }
+        if out == 0.0
+            && a != 0.0
+            && b != 0.0
+            && a.is_finite()
+            && b.is_finite()
+            && matches!(operator, BinaryOp::Mul | BinaryOp::Div)
+        {
+            return Err(sql_err!(
+                sqlstate::NUMERIC_OUT_OF_RANGE,
+                "value out of range: underflow"
+            ));
+        }
         return Ok(Datum::Float8(out));
     }
     // No arithmetic operator is defined for this operand pair (e.g. int - date,
@@ -2390,6 +2434,24 @@ pub(crate) fn binary<'a>(
     {
         r = cast_to(r, ColType::Geometry(target), arena)?;
     }
+    if operator == BinaryOp::Pow {
+        if l_unknown && matches!(l, Datum::Text(_)) {
+            let target = if matches!(r, Datum::Numeric(_)) {
+                ColType::Numeric
+            } else {
+                ColType::Float8
+            };
+            l = cast_to(l, target, arena)?;
+        }
+        if r_unknown && matches!(r, Datum::Text(_)) {
+            let target = if matches!(l, Datum::Numeric(_)) {
+                ColType::Numeric
+            } else {
+                ColType::Float8
+            };
+            r = cast_to(r, target, arena)?;
+        }
+    }
     if (matches!(l, Datum::Geometry { .. }) || matches!(r, Datum::Geometry { .. }))
         && let Some(name) = operator.operator_name()
     {
@@ -2654,7 +2716,32 @@ pub(crate) fn binary<'a>(
                 return Ok(Datum::Numeric(numeric::pow(&a, &b, arena)?));
             }
             let (a, b) = (datum_f64("^", l)?, datum_f64("^", r)?);
-            Ok(Datum::Float8(a.powf(b)))
+            if a < 0.0 && b.is_finite() && b.fract() != 0.0 {
+                return Err(sql_err!(
+                    sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+                    "a negative number raised to a non-integer power yields a complex result"
+                ));
+            }
+            if a == 0.0 && b < 0.0 {
+                return Err(sql_err!(
+                    sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+                    "zero raised to a negative power is undefined"
+                ));
+            }
+            let result = a.powf(b);
+            if result.is_infinite() && a.is_finite() && b.is_finite() {
+                return Err(sql_err!(
+                    sqlstate::NUMERIC_OUT_OF_RANGE,
+                    "value out of range: overflow"
+                ));
+            }
+            if result == 0.0 && a != 0.0 && a.is_finite() && b.is_finite() {
+                return Err(sql_err!(
+                    sqlstate::NUMERIC_OUT_OF_RANGE,
+                    "value out of range: underflow"
+                ));
+            }
+            Ok(Datum::Float8(result))
         }
     }
 }

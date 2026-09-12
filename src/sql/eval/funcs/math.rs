@@ -405,6 +405,7 @@ pub(crate) fn dispatch<'a>(
             | "erfc"
             | "gamma"
             | "lgamma"
+            | "float8"
             | "pi"
             | "random"
             | "random_normal"
@@ -427,6 +428,14 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "float8" => {
+                arity(1)?;
+                super::super::cast_to(
+                    eval_full(args[0], arena, params, row, hooks)?,
+                    crate::sql::types::ColType::Float8,
+                    arena,
+                )
+            }
             "abs" => {
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
@@ -582,11 +591,24 @@ pub(crate) fn dispatch<'a>(
                         "cannot take logarithm of a non-positive number"
                     ));
                 }
-                Ok(Datum::Float8(match name {
+                let result = match name {
                     "sqrt" => x.sqrt(),
                     "exp" => x.exp(),
                     _ => x.ln(),
-                }))
+                };
+                if name == "exp" && x.is_finite() && result.is_infinite() {
+                    return Err(sql_err!(
+                        sqlstate::NUMERIC_OUT_OF_RANGE,
+                        "value out of range: overflow"
+                    ));
+                }
+                if name == "exp" && x.is_finite() && result == 0.0 {
+                    return Err(sql_err!(
+                        sqlstate::NUMERIC_OUT_OF_RANGE,
+                        "value out of range: underflow"
+                    ));
+                }
+                Ok(Datum::Float8(result))
             }
             "log" | "log10" => {
                 // log(x)/log10(x) are base-10; log(b, x) is base-b. A numeric
@@ -649,7 +671,7 @@ pub(crate) fn dispatch<'a>(
                 let (a, bb) = (datum_f64(name, da)?, datum_f64(name, db)?);
                 // PostgreSQL rejects the cases whose real result is undefined,
                 // rather than returning NaN/Inf as libm's powf would.
-                if a < 0.0 && bb.fract() != 0.0 {
+                if a < 0.0 && bb.is_finite() && bb.fract() != 0.0 {
                     return Err(sql_err!(
                         sqlstate::INVALID_ARGUMENT_FOR_POWER_FUNCTION,
                         "a negative number raised to a non-integer power yields a complex result"
@@ -661,7 +683,20 @@ pub(crate) fn dispatch<'a>(
                         "zero raised to a negative power is undefined"
                     ));
                 }
-                Ok(Datum::Float8(a.powf(bb)))
+                let result = a.powf(bb);
+                if result.is_infinite() && a.is_finite() && bb.is_finite() {
+                    return Err(sql_err!(
+                        sqlstate::NUMERIC_OUT_OF_RANGE,
+                        "value out of range: overflow"
+                    ));
+                }
+                if result == 0.0 && a != 0.0 && a.is_finite() && bb.is_finite() {
+                    return Err(sql_err!(
+                        sqlstate::NUMERIC_OUT_OF_RANGE,
+                        "value out of range: underflow"
+                    ));
+                }
+                Ok(Datum::Float8(result))
             }
             "mod" => {
                 arity(2)?;

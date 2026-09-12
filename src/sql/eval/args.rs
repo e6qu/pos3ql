@@ -22,6 +22,66 @@ use super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, parse_bytea, sqlstate, type_mismatch,
 };
 
+/// Evaluates the variadic tail of a built-in call.  In explicit `VARIADIC`
+/// syntax PostgreSQL passes the members of the final array as individual
+/// arguments; a NULL array makes the whole variadic call NULL.  Keeping this
+/// at the call boundary prevents individual built-ins from accidentally
+/// stringifying an array or accepting a scalar.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn variadic_tail<'a, 'out>(
+    name: &str,
+    args: &[&Expr<'a>],
+    fixed: usize,
+    explicit: bool,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+    out: &'out mut [Datum<'a>],
+) -> Result<Option<&'out [Datum<'a>]>, SqlError> {
+    if !explicit {
+        let tail = args
+            .get(fixed..)
+            .ok_or_else(|| arity_err(name, args.len()))?;
+        if tail.len() > out.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many arguments for {}()",
+                name
+            ));
+        }
+        for (target, expression) in out.iter_mut().zip(tail) {
+            *target = eval_full(expression, arena, params, row, hooks)?;
+        }
+        return Ok(Some(&out[..tail.len()]));
+    }
+    if args.len() != fixed + 1 {
+        return Err(arity_err(name, args.len()));
+    }
+    match eval_full(args[fixed], arena, params, row, hooks)? {
+        Datum::Null => Ok(None),
+        Datum::Array { element, raw } => {
+            let count = crate::sql::array::len(raw);
+            if count > out.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many arguments for {}()",
+                    name
+                ));
+            }
+            for (index, target) in out[..count].iter_mut().enumerate() {
+                *target = crate::sql::array::get(raw, element, index)
+                    .expect("validated array carries every member");
+            }
+            Ok(Some(&out[..count]))
+        }
+        _ => Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "VARIADIC argument must be an array"
+        )),
+    }
+}
+
 pub(crate) fn arity_err(name: &str, got: usize) -> SqlError {
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
@@ -227,17 +287,18 @@ pub(crate) fn format_append_str<'a>(
 
 /// `format()` `%I`: a SQL identifier, double-quoted only when it is not a bare
 /// lowercase identifier.
-pub(crate) fn format_append_ident(out: &mut StackStr<4096>, v: Datum<'_>) -> Result<(), SqlError> {
+pub(crate) fn format_append_ident<'a>(
+    out: &mut StackStr<4096>,
+    v: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
     if v.is_null() {
         return Err(sql_err!(
             sqlstate::NULL_VALUE_NOT_ALLOWED,
             "null value cannot be formatted as SQL identifier"
         ));
     }
-    let s = match v {
-        Datum::Text(s) => s,
-        other => return Err(type_mismatch("format", &other)),
-    };
+    let s = datum_to_text(v, arena)?;
     let bare = !s.is_empty()
         && s.bytes()
             .enumerate()
@@ -522,10 +583,11 @@ pub(crate) fn parse_qualified_ident<'a>(
     input: &str,
     out: &mut [Datum<'a>],
     arena: &'a Arena,
+    strict: bool,
 ) -> Result<usize, SqlError> {
     let bad = || {
         sql_err!(
-            sqlstate::SYNTAX_ERROR,
+            sqlstate::INVALID_PARAMETER_VALUE,
             "string is not a valid identifier: \"{}\"",
             input
         )
@@ -570,10 +632,16 @@ pub(crate) fn parse_qualified_ident<'a>(
             }
             arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?
         } else {
-            // Unquoted part: letters/digits/underscore, folded to lowercase.
+            // Unquoted identifiers cannot start with a digit. PostgreSQL also
+            // permits `$` after the first character.
             let start = i;
+            if !matches!(bytes[i], b'_' | b'A'..=b'Z' | b'a'..=b'z' | 0x80..=0xff) {
+                return Err(bad());
+            }
             while i < bytes.len()
-                && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric() || bytes[i] >= 0x80)
+                && (matches!(bytes[i], b'_' | b'$')
+                    || bytes[i].is_ascii_alphanumeric()
+                    || bytes[i] >= 0x80)
             {
                 i += 1;
             }
@@ -594,6 +662,7 @@ pub(crate) fn parse_qualified_ident<'a>(
         match bytes.get(i) {
             Some(b'.') => i += 1,
             None => return Ok(n),
+            _ if !strict => return Ok(n),
             _ => return Err(bad()),
         }
     }

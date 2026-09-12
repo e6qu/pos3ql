@@ -738,7 +738,7 @@ pub(super) fn factor_common_or_terms<'a>(
 /// The plan-time boolean value of a condition, when PostgreSQL's
 /// `eval_const_expressions` can decide it: a constant subtree, or an AND/OR
 /// settled by one constant side. `None` = not decidable at plan time.
-pub(super) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
+pub(crate) fn plan_time_bool(e: &Expr, arena: &Arena) -> Option<bool> {
     use crate::sql::ast::BinaryOp;
     if e.is_constant() {
         return match crate::sql::eval::eval(

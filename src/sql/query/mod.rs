@@ -40,6 +40,7 @@ use materialize::{
 };
 
 mod scan;
+pub(crate) use plan::plan_time_bool;
 pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
@@ -3515,12 +3516,42 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         ))
     }
 
-    fn enum_label_sort(&self, slot: u16, label: &str) -> Option<f64> {
+    fn enum_label_sort(&self, slot: u16, label: &str) -> Result<Option<f64>, SqlError> {
         let def = self.storage.enum_for(slot as usize, self.txid);
         if !def.visible_to(self.txid) {
-            return None;
+            return Ok(None);
         }
-        def.sort_of(label)
+        super::exec::ensure_enum_value_is_safe(self.storage, slot, label, self.txid)?;
+        Ok(def.sort_of(label))
+    }
+
+    fn ensure_enum_label_safe(&self, slot: u16, label: &str) -> Result<(), SqlError> {
+        super::exec::ensure_enum_value_is_safe(self.storage, slot, label, self.txid)
+    }
+
+    fn enum_values<'a>(
+        &self,
+        slot: u16,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+        let def = self.storage.enum_for(slot as usize, self.txid);
+        if !def.visible_to(self.txid) {
+            return Ok(None);
+        }
+        let def = def.definition_for(self.txid);
+        let values = arena
+            .alloc_slice_with(def.members().len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (value, member) in values.iter_mut().zip(def.members()) {
+            *value = Datum::Enum {
+                slot,
+                sort: member.sort,
+                label: arena
+                    .alloc_str(member.label.as_str())
+                    .map_err(|_| arena_full())?,
+            };
+        }
+        Ok(Some(values))
     }
 
     fn enum_slot_of_name(&self, type_name: &str) -> Option<u16> {

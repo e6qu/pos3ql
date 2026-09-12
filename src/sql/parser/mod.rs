@@ -2590,8 +2590,9 @@ impl<'a> Parser<'a> {
             self.peeked = saved_peeked;
             self.peek_at = saved_peek_at;
         }
-        // Derived table: `(SELECT ...) [AS] alias`. PostgreSQL requires the
-        // alias, so a missing one is a syntax error.
+        // Derived table: `(SELECT ...) [[AS] alias]`. PostgreSQL 16 and newer
+        // permit an omitted alias; the scope layer gives that otherwise
+        // unaddressable relation an internal name.
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             let select = self.query_select()?;
@@ -2600,21 +2601,29 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc(select)
                 .map_err(|_| self.err_here("statement too large for SQL arena"))?;
-            let _ = self.eat_ident("as")?;
-            let Tok::Ident(word) = self.peeked else {
-                return Err(self.err_here("subquery in FROM must have an alias"));
+            let explicit_as = self.eat_ident("as")?;
+            let alias = if let Tok::Ident(word) = self.peeked {
+                if is_column_name_keyword(word) {
+                    if explicit_as {
+                        return Err(self.err_here("subquery alias is missing"));
+                    }
+                    None
+                } else {
+                    self.advance()?;
+                    Some(word)
+                }
+            } else if explicit_as {
+                return Err(self.err_here("subquery alias is missing"));
+            } else {
+                None
             };
-            if is_column_name_keyword(word) {
-                return Err(self.err_here("subquery in FROM must have an alias"));
-            }
-            self.advance()?;
             // Optional column-alias list `alias(c1, c2, ...)` renames the
             // derived table's output columns.
             let col_alias = self.column_alias_list()?;
             return Ok(TableRef {
                 schema: None,
                 table: "",
-                alias: Some(word),
+                alias,
                 subquery: Some(boxed),
                 func_args: None,
                 func_argument_names: &[],
@@ -10222,6 +10231,22 @@ mod tests {
             assert_eq!(base.alias, Some("v"));
             assert_eq!(base.col_alias, Some(&["id", "name"][..]));
             assert!(base.subquery.is_some());
+        });
+    }
+
+    #[test]
+    fn derived_table_alias_is_optional() {
+        with_parser("SELECT * FROM (VALUES (1, 'a'))", |p| {
+            let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                panic!()
+            };
+            let base = &s.from.unwrap().base;
+            assert_eq!(base.alias, None);
+            assert!(base.subquery.is_some());
+        });
+        with_parser("SELECT * FROM (SELECT 1) AS", |p| {
+            let error = p.next_stmt().unwrap_err();
+            assert_eq!(error.message.as_str(), "subquery alias is missing");
         });
     }
 

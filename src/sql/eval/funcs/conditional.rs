@@ -27,7 +27,14 @@ pub(crate) fn dispatch<'a>(
 ) -> Option<Result<Datum<'a>, SqlError>> {
     if !matches!(
         name,
-        "coalesce" | "num_nonnulls" | "num_nulls" | "greatest" | "least" | "nullif"
+        "coalesce"
+            | "num_nonnulls"
+            | "num_nulls"
+            | "greatest"
+            | "least"
+            | "nullif"
+            | "booleq"
+            | "boolne"
     ) {
         return None;
     }
@@ -45,6 +52,18 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "booleq" | "boolne" => {
+                arity(2)?;
+                let left = eval_full(args[0], arena, params, row, hooks)?;
+                let right = eval_full(args[1], arena, params, row, hooks)?;
+                match (left, right) {
+                    (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
+                    (Datum::Bool(left), Datum::Bool(right)) => {
+                        Ok(Datum::Bool((left == right) == (name == "booleq")))
+                    }
+                    _ => Err(arity_err(name, 2)),
+                }
+            }
             "coalesce" => {
                 for arg in args {
                     let v = eval_full(arg, arena, params, row, hooks)?;

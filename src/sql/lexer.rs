@@ -21,7 +21,7 @@ pub enum Tok<'a> {
     Num(&'a str),
     /// String literal, unescaped.
     Str(&'a str),
-    /// Bit-string literal (`B'1010'` or `X'1F'`), expanded to `'0'`/`'1'` chars.
+    /// Bit-string literal with its `B`/`X` prefix retained for input validation.
     Bit(&'a str),
     /// `$n` parameter placeholder, 1-based.
     Param(u32),
@@ -329,6 +329,21 @@ impl<'a> Lexer<'a> {
                         at: start,
                         message: "unterminated string",
                     })?;
+                    if matches!(esc, b'0'..=b'7') {
+                        let mut value = 0u16;
+                        let mut digits = 0usize;
+                        while digits < 3 {
+                            let Some(&digit @ b'0'..=b'7') = bytes.get(i + 1 + digits) else {
+                                break;
+                            };
+                            value = value * 8 + u16::from(digit - b'0');
+                            digits += 1;
+                        }
+                        scratch[w] = value as u8;
+                        w += 1;
+                        i += 1 + digits;
+                        continue;
+                    }
                     let replacement = match esc {
                         b'n' => b'\n',
                         b't' => b'\t',
@@ -360,8 +375,9 @@ impl<'a> Lexer<'a> {
             })
     }
 
-    /// Lexes a `B'…'` (binary) or `X'…'` (hexadecimal) bit-string literal into
-    /// its canonical `'0'`/`'1'` character form. The leading letter is already
+    /// Lexes a `B'…'` (binary) or `X'…'` (hexadecimal) bit-string literal.
+    /// Content validation belongs to the type-input boundary, where PostgreSQL
+    /// reports 22P02 rather than a syntax error. The leading letter is already
     /// consumed; `self.at` points at the opening quote.
     fn bit_string(&mut self, hex: bool) -> Result<Tok<'a>, LexError> {
         let start = self.at;
@@ -382,43 +398,15 @@ impl<'a> Lexer<'a> {
         }
         let raw = &self.text[self.at..i];
         self.at = i + 1;
-        if !hex {
-            for c in raw.bytes() {
-                if c != b'0' && c != b'1' {
-                    return Err(LexError {
-                        at: start,
-                        message: "\"B\" bit-string literal may only contain 0 or 1",
-                    });
-                }
-            }
-            return Ok(Tok::Bit(raw));
-        }
-        // Hex: expand each hex digit to four bits, most significant first.
+        // Retain the spelling class so the evaluator can distinguish binary
+        // and hexadecimal input errors without widening the AST.
         let out = self
             .arena
-            .alloc_slice_with(raw.len() * 4, |_| 0u8)
+            .alloc_slice_with(raw.len() + 1, |_| 0u8)
             .map_err(|_| self.arena_full(start))?;
-        let mut w = 0;
-        for c in raw.bytes() {
-            let nibble = match c {
-                b'0'..=b'9' => c - b'0',
-                b'a'..=b'f' => c - b'a' + 10,
-                b'A'..=b'F' => c - b'A' + 10,
-                _ => {
-                    return Err(LexError {
-                        at: start,
-                        message: "invalid hexadecimal digit in \"X\" bit-string literal",
-                    });
-                }
-            };
-            for bit in (0..4).rev() {
-                out[w] = if nibble & (1 << bit) != 0 { b'1' } else { b'0' };
-                w += 1;
-            }
-        }
-        Ok(Tok::Bit(unsafe {
-            core::str::from_utf8_unchecked(&out[..w])
-        }))
+        out[0] = if hex { b'X' } else { b'B' };
+        out[1..].copy_from_slice(raw.as_bytes());
+        Ok(Tok::Bit(unsafe { core::str::from_utf8_unchecked(out) }))
     }
 
     fn quoted_ident(&mut self) -> Result<Tok<'a>, LexError> {
@@ -619,11 +607,11 @@ mod tests {
 
     #[test]
     fn bit_string_literals() {
-        // B'…' keeps the bits; X'…' expands each hex digit to four bits.
-        assert_eq!(lex_all("B'1010'"), ["Bit(\"1010\")"]);
-        assert_eq!(lex_all("x'1f'"), ["Bit(\"00011111\")"]);
-        assert_eq!(lex_all("B''"), ["Bit(\"\")"]);
-        assert_eq!(lex_all("X'A'"), ["Bit(\"1010\")"]);
+        // The prefix survives lexing so invalid digits fail at type input.
+        assert_eq!(lex_all("B'1010'"), ["Bit(\"B1010\")"]);
+        assert_eq!(lex_all("x'1f'"), ["Bit(\"X1f\")"]);
+        assert_eq!(lex_all("B''"), ["Bit(\"B\")"]);
+        assert_eq!(lex_all("X'A'"), ["Bit(\"XA\")"]);
         // A bare identifier starting with b/x is unaffected.
         assert_eq!(lex_all("bit box"), ["Ident(\"bit\")", "Ident(\"box\")"]);
     }

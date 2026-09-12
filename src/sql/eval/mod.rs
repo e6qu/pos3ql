@@ -162,6 +162,7 @@ pub mod sqlstate {
     pub const DUPLICATE_FUNCTION: &str = "42723";
     pub const UNDEFINED_CURSOR: &str = "34000";
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
+    pub const UNSAFE_NEW_ENUM_VALUE_USAGE: &str = "55P04";
     pub const AMBIGUOUS_ALIAS: &str = "42P09";
     pub const INVALID_SCHEMA_NAME: &str = "3F000";
     pub const INVALID_CATALOG_NAME: &str = "3D000";
@@ -1491,8 +1492,20 @@ pub trait CatalogAccess {
     /// The sort key of `label` in the enum type at `slot`, resolving a text
     /// literal against an enum in a comparison. `None` if the slot holds no
     /// live enum or the label is not a member.
-    fn enum_label_sort(&self, _slot: u16, _label: &str) -> Option<f64> {
-        None
+    fn enum_label_sort(&self, _slot: u16, _label: &str) -> Result<Option<f64>, SqlError> {
+        Ok(None)
+    }
+    fn ensure_enum_label_safe(&self, _slot: u16, _label: &str) -> Result<(), SqlError> {
+        Ok(())
+    }
+    /// Ordered members of a visible enum, materialized into the statement
+    /// arena for `enum_first`/`enum_last`/`enum_range`.
+    fn enum_values<'a>(
+        &self,
+        _slot: u16,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
+        Ok(None)
     }
     /// The catalog slot of the (possibly schema-qualified) enum type named
     /// `type_name`, or `None` if no such live enum is visible — used to
@@ -1924,8 +1937,9 @@ fn eval_binary_expression<'a>(
     } else {
         None
     };
-    let l = materialize_named_composite(eval_full(left, arena, params, row, hooks)?, hooks, arena)?;
-    let r =
+    let mut l =
+        materialize_named_composite(eval_full(left, arena, params, row, hooks)?, hooks, arena)?;
+    let mut r =
         materialize_named_composite(eval_full(right, arena, params, row, hooks)?, hooks, arena)?;
     if search_catalog
         && let Some(catalog) = hooks.catalog
@@ -1945,6 +1959,12 @@ fn eval_binary_expression<'a>(
     }
     let left_unknown = is_unknown_literal(left);
     let right_unknown = is_unknown_literal(right);
+    if left_unknown && static_type(right, row) == Some(ColType::Name) {
+        l = cast_to(l, ColType::Name, arena)?;
+    }
+    if right_unknown && static_type(left, row) == Some(ColType::Name) {
+        r = cast_to(r, ColType::Name, arena)?;
+    }
     let (l, r) = coerce_enum_literal(l, r, left_unknown, right_unknown, hooks, arena)?;
     if let Some(collation) = comparison_collation
         && matches!(
@@ -2146,7 +2166,7 @@ fn eval_full_inner<'a>(
         Expr::NumericLit(s) => Ok(Datum::Numeric(Numeric::parse(s, arena)?)),
         Expr::Str(s) => Ok(Datum::Text(s)),
         Expr::BitLit(s) => Ok(Datum::Bit {
-            bits: s,
+            bits: cast::parse_bits_text(s, arena)?,
             varying: false,
         }),
         Expr::Column { qualifier, name } => match row.lookup(qualifier, name) {
@@ -2535,8 +2555,16 @@ fn eval_full_inner<'a>(
                     saw_null = true;
                     continue;
                 }
-                let l = coerce_unknown(v, &member)?;
-                let r = coerce_unknown(member, &l)?;
+                let (left, right) = coerce_enum_literal(
+                    v,
+                    member,
+                    is_unknown_literal(operand),
+                    is_unknown_literal(item),
+                    hooks,
+                    arena,
+                )?;
+                let l = coerce_unknown(left, &right)?;
+                let r = coerce_unknown(right, &l)?;
                 match (&l, &r) {
                     (Datum::Text(_) | Datum::Bpchar(_), Datum::Text(_) | Datum::Bpchar(_)) => {
                         let collation =
@@ -3518,7 +3546,9 @@ fn eval_full_inner<'a>(
             let mut saw_null = false;
             for i in 0..n {
                 let el = super::array::get(raw, element, i).unwrap_or(Datum::Null);
-                match binary(operator, lhs, el, false, false, arena)? {
+                let (left, right) =
+                    coerce_enum_literal(lhs, el, is_unknown_literal(operand), false, hooks, arena)?;
+                match binary(operator, left, right, false, false, arena)? {
                     Datum::Bool(true) if !all => return Ok(Datum::Bool(true)),
                     Datum::Bool(false) if all => return Ok(Datum::Bool(false)),
                     Datum::Null => saw_null = true,
@@ -4135,6 +4165,30 @@ fn call<'a>(
         args
     };
     let name = regex_srf_name.unwrap_or(written_name);
+    if name.eq_ignore_ascii_case("parse_ident") && argument_names.iter().any(Option::is_some) {
+        if args.len() != 2 || star || variadic {
+            return Err(undefined_function(name, args, row));
+        }
+        let mut parse_ident_args = [&Expr::Null; 2];
+        reorder_required_arguments(
+            name,
+            args,
+            argument_names,
+            &["string", "strict"],
+            &mut parse_ident_args[..args.len()],
+        )?;
+        return funcs::string::dispatch(
+            name,
+            &parse_ident_args[..args.len()],
+            false,
+            false,
+            arena,
+            params,
+            row,
+            hooks,
+        )
+        .expect("parse_ident is a string builtin");
+    }
     let arity = |n: usize| -> Result<(), SqlError> {
         if args.len() != n || star {
             Err(sql_err!(
@@ -4201,7 +4255,8 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
-        && let Some(result) = funcs::string::dispatch(name, args, star, arena, params, row, hooks)
+        && let Some(result) =
+            funcs::string::dispatch(name, args, star, variadic, arena, params, row, hooks)
     {
         return result;
     }
@@ -4264,7 +4319,8 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
-        && let Some(result) = funcs::misc::dispatch(name, args, star, arena, params, row, hooks)
+        && let Some(result) =
+            funcs::misc::dispatch(name, args, star, variadic, arena, params, row, hooks)
     {
         return result;
     }
@@ -5205,9 +5261,9 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         // column or cast.
         Expr::Call { name, args, .. } => match *name {
             "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "convert_to"
-            | "convert" | "byteacat" | "byteasend" | "bytea_larger" | "bytea_smaller"
-            | "byteain" | "bit_send" | "varbit_send" | "bytea" | "inet_send" | "cidr_send"
-            | "macaddr_send" | "macaddr8_send" => Some(ColType::Bytea),
+            | "convert" | "byteacat" | "byteasend" | "float8send" | "bytea_larger"
+            | "bytea_smaller" | "byteain" | "bit_send" | "varbit_send" | "bytea" | "inet_send"
+            | "cidr_send" | "macaddr_send" | "macaddr8_send" => Some(ColType::Bytea),
             "set_bit" => match args.first().and_then(|argument| static_type(argument, row)) {
                 Some(ColType::Bit { .. }) => Some(ColType::Bit { varying: false }),
                 _ => Some(ColType::Bytea),
@@ -5259,6 +5315,7 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
             "int2" => Some(ColType::Int2),
             "int4" => Some(ColType::Int4),
             "int8" => Some(ColType::Int8),
+            "float8" => Some(ColType::Float8),
             "inet_in" | "broadcast" | "netmask" | "hostmask" | "set_masklen" | "network_larger"
             | "network_smaller" | "inetnot" | "inetand" | "inetor" | "inetpl" | "int8pl_inet"
             | "inetmi_int8" => Some(ColType::Inet),
@@ -6283,6 +6340,18 @@ fn concat<'a>(
         };
         return array_concat(coerce(l, l_unknown)?, coerce(r, r_unknown)?, arena);
     }
+    if !l_unknown
+        && !r_unknown
+        && !matches!(l, Datum::Text(_) | Datum::Bpchar(_))
+        && !matches!(r, Datum::Text(_) | Datum::Bpchar(_))
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} || {}",
+            type_name_of(&l),
+            type_name_of(&r)
+        ));
+    }
     let left = cast_to_text(l, arena)?;
     let right = cast_to_text(r, arena)?;
     let bytes = arena
@@ -6477,21 +6546,102 @@ pub(crate) fn boolean_argument<'a>(v: Datum<'a>, context: &str) -> Result<Datum<
 }
 
 pub(crate) fn parse_bool(s: &str) -> Result<bool, SqlError> {
-    // Accepted spellings per PostgreSQL's boolean input, case-insensitive.
+    // PostgreSQL accepts every unambiguous, case-insensitive prefix of these
+    // words.  `o` alone is ambiguous between on/off, while `of` is false.
     let t = s.trim();
-    if ["t", "true", "yes", "on", "1"]
-        .iter()
-        .any(|w| t.eq_ignore_ascii_case(w))
-    {
-        Ok(true)
-    } else if ["f", "false", "no", "off", "0"]
-        .iter()
-        .any(|w| t.eq_ignore_ascii_case(w))
-    {
-        Ok(false)
-    } else {
-        Err(bad_text(s, "boolean"))
+    if t == "1" {
+        return Ok(true);
     }
+    if t == "0" {
+        return Ok(false);
+    }
+    let mut matched = None;
+    for (word, value) in [
+        ("true", true),
+        ("yes", true),
+        ("on", true),
+        ("false", false),
+        ("no", false),
+        ("off", false),
+    ] {
+        if !t.is_empty()
+            && word
+                .get(..t.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(t))
+        {
+            match matched {
+                None => matched = Some(value),
+                Some(previous) if previous == value => {}
+                Some(_) => return Err(bad_text(s, "boolean")),
+            }
+        }
+    }
+    matched.ok_or_else(|| bad_text(s, "boolean"))
+}
+
+/// Runs a type's text-input boundary without throwing its input error.  An
+/// unknown type is still an error: only failure of a resolved input function
+/// is data returned by `pg_input_is_valid` / `pg_input_error_info`.
+pub(crate) struct InputError<'a> {
+    pub(crate) sqlstate: SqlState,
+    pub(crate) message: &'a str,
+}
+
+pub(crate) fn input_error<'a>(
+    input: &'a str,
+    type_name: &str,
+    arena: &'a Arena,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<InputError<'a>>, SqlError> {
+    let (base_name, type_mod) = crate::sql::parser::parse_type_name(type_name, arena)?;
+    let parsed = if let Some(target) = ColType::from_sql_name(base_name) {
+        Some(
+            cast::cast_to(Datum::Text(input), target, arena)
+                .and_then(|value| super::exec::apply_typmod(value, target, type_mod, arena)),
+        )
+    } else if let Some(catalog) = hooks.catalog {
+        match catalog.cast_user_type(base_name, Datum::Text(input), arena) {
+            Ok(Some(_)) => return Ok(None),
+            Ok(None) => None,
+            Err(error) => {
+                let message = if error.message.is_truncated()
+                    && catalog.enum_slot_of_name(base_name).is_some()
+                {
+                    arena.alloc_str_display(format_args!(
+                        "invalid input value for enum {}: \"{}\"",
+                        base_name, input
+                    ))
+                } else {
+                    arena.alloc_str(error.message.as_str())
+                }
+                .map_err(|_| arena_full())?;
+                return Ok(Some(InputError {
+                    sqlstate: error.sqlstate,
+                    message,
+                }));
+            }
+        }
+    } else {
+        None
+    };
+    let Some(parsed) = parsed else {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "type \"{}\" does not exist",
+            type_name
+        ));
+    };
+    parsed
+        .err()
+        .map(|error| {
+            Ok(InputError {
+                sqlstate: error.sqlstate,
+                message: arena
+                    .alloc_str(error.message.as_str())
+                    .map_err(|_| arena_full())?,
+            })
+        })
+        .transpose()
 }
 
 /// Promotes an integer or numeric datum to Numeric (arena-allocated).
@@ -7200,7 +7350,7 @@ fn coerce_enum_literal<'a>(
                 label
             )
         })?;
-        let Some(sort) = cat.enum_label_sort(slot, label) else {
+        let Some(sort) = cat.enum_label_sort(slot, label)? else {
             return Err(sql_err!(
                 sqlstate::INVALID_TEXT_REPRESENTATION,
                 "invalid input value for enum: \"{}\"",
@@ -7500,6 +7650,11 @@ mod tests {
                 Datum::Text("true")
             );
             assert_eq!(eval_one(a, "SELECT 'on'::bool").unwrap(), Datum::Bool(true));
+            assert_eq!(eval_one(a, "SELECT 'y'::bool").unwrap(), Datum::Bool(true));
+            assert_eq!(
+                eval_one(a, "SELECT 'of'::bool").unwrap(),
+                Datum::Bool(false)
+            );
             assert_eq!(
                 eval_one(a, "SELECT '2.5'::float8").unwrap(),
                 Datum::Float8(2.5)
@@ -7508,6 +7663,16 @@ mod tests {
             assert_eq!(err.sqlstate, "22P02");
             let err = eval_one(a, "SELECT 1::geometry").unwrap_err();
             assert_eq!(err.sqlstate, "42704");
+        });
+    }
+
+    #[test]
+    fn minimum_bigint_remainder_negative_one_is_zero() {
+        with_arena(|arena| {
+            assert_eq!(
+                eval_one(arena, "SELECT (-9223372036854775808)::int8 % (-1)::int8").unwrap(),
+                Datum::Int8(0)
+            );
         });
     }
 

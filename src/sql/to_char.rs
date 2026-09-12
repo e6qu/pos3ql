@@ -31,8 +31,8 @@ enum Tok {
     Point,
     /// `,` / `G`: group separator.
     Group,
-    /// `L` / `$`: currency marker (`$` in the C locale).
-    Currency,
+    /// `L`: locale currency symbol (empty in the C locale), or an explicit `$`.
+    Currency { locale: bool },
     /// `MI`: `-` for negatives, a space otherwise (nothing under FM).
     SignMinus,
     /// `PL`: `+` for non-negatives, a space otherwise (nothing under FM).
@@ -115,6 +115,30 @@ pub fn number<'a>(
     };
     while i < bytes.len() {
         let c = bytes[i];
+        if c == b'"' {
+            i += 1;
+            let mut closed = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    push(&mut toks, &mut ntok, Tok::Literal(bytes[i + 1]))?;
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    closed = true;
+                    break;
+                } else {
+                    push(&mut toks, &mut ntok, Tok::Literal(bytes[i]))?;
+                    i += 1;
+                }
+            }
+            if !closed {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unterminated quoted string in to_char format"
+                ));
+            }
+            continue;
+        }
         let up = c.to_ascii_uppercase();
         // Two-character codes first.
         let two = if i + 1 < bytes.len() {
@@ -290,7 +314,7 @@ pub fn number<'a>(
                 push(&mut toks, &mut ntok, Tok::Point)?;
             }
             b',' | b'G' => push(&mut toks, &mut ntok, Tok::Group)?,
-            b'L' | b'$' => push(&mut toks, &mut ntok, Tok::Currency)?,
+            b'L' | b'$' => push(&mut toks, &mut ntok, Tok::Currency { locale: up == b'L' })?,
             b'S' => {
                 if sign_seen {
                     return Err(sql_err!(sqlstate::SYNTAX_ERROR, "cannot use \"S\" twice"));
@@ -898,7 +922,8 @@ fn render<'a>(
                     emit(&mut out, &mut olen, b'.')?;
                 }
             }
-            Tok::Currency => emit(&mut out, &mut olen, b'$')?,
+            Tok::Currency { locale: false } => emit(&mut out, &mut olen, b'$')?,
+            Tok::Currency { locale: true } => emit(&mut out, &mut olen, b' ')?,
             Tok::SignMinus => {
                 if neg {
                     emit(&mut out, &mut olen, b'-')?;
@@ -1058,7 +1083,8 @@ fn render_nonfinite<'a>(
                     emit(&mut out, &mut olen, b' ')?;
                 }
             }
-            Tok::Currency => emit(&mut out, &mut olen, b'$')?,
+            Tok::Currency { locale: false } => emit(&mut out, &mut olen, b'$')?,
+            Tok::Currency { locale: true } => emit(&mut out, &mut olen, b' ')?,
             Tok::SignMinus => {
                 if neg {
                     emit(&mut out, &mut olen, b'-')?;
@@ -2121,7 +2147,8 @@ mod tests {
         assert_eq!(tc("1.0", "FM9.99", &a), "1.");
         // Sign codes and currency.
         assert_eq!(tc("1234.5", "S9,999.99", &a), "+1,234.50");
-        assert_eq!(tc("1234.5", "L9999.99", &a), "$ 1234.50");
+        assert_eq!(tc("1234.5", "L9999.99", &a), "  1234.50");
+        assert_eq!(tc("1234.5", "$9999.99", &a), "$ 1234.50");
         // Overflow fills the number field with '#', keeping the point.
         assert_eq!(tc("12345", "999", &a), " ###");
         assert_eq!(tc("12345", "9,999.99", &a), " #,###.##");

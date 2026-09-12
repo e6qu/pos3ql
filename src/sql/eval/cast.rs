@@ -311,11 +311,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Float4(x) => Datum::Float8(f64::from(x)),
             Datum::Float8(_) => v,
             Datum::Numeric(n) => Datum::Float8(n.to_f64()),
-            Datum::Text(s) => Datum::Float8(
-                s.trim()
-                    .parse()
-                    .map_err(|_| bad_text(s, "double precision"))?,
-            ),
+            Datum::Text(s) => Datum::Float8(parse_float8_text(s)?),
             _ => return Err(cast_unsupported(&v, "double precision")),
         },
         // real/float4 rounds every input through single precision. A finite
@@ -362,7 +358,16 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 return Ok(v);
             }
             let text = cast_to_text(v, arena)?;
-            Datum::Char(text.as_bytes().first().copied().unwrap_or(0))
+            let bytes = text.as_bytes();
+            let byte = if bytes.len() == 4
+                && bytes[0] == b'\\'
+                && bytes[1..].iter().all(|byte| matches!(byte, b'0'..=b'7'))
+            {
+                (bytes[1] - b'0') * 64 + (bytes[2] - b'0') * 8 + (bytes[3] - b'0')
+            } else {
+                bytes.first().copied().unwrap_or(0)
+            };
+            Datum::Char(byte)
         }
         ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
         ColType::Name => {
@@ -645,7 +650,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         ColType::Bit { varying } => match v {
             Datum::Bit { bits, .. } => Datum::Bit { bits, varying },
             Datum::Text(s) => Datum::Bit {
-                bits: validate_bits(s)?,
+                bits: parse_bits_text(s, arena)?,
                 varying,
             },
             // int -> bit yields the two's-complement bits at the type's full
@@ -863,6 +868,48 @@ pub(crate) fn validate_bits(s: &str) -> Result<&str, SqlError> {
     Ok(s)
 }
 
+/// PostgreSQL bit/varbit text input accepts an optional `B` binary or `X`
+/// hexadecimal marker. SQL bit literals retain that marker through lexing so
+/// malformed digits reach this input boundary with SQLSTATE 22P02.
+pub(crate) fn parse_bits_text<'a>(s: &'a str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let Some((&prefix, body)) = s.as_bytes().split_first() else {
+        return Ok(s);
+    };
+    if matches!(prefix, b'b' | b'B') {
+        return validate_bits(&s[1..]);
+    }
+    if !matches!(prefix, b'x' | b'X') {
+        return validate_bits(s);
+    }
+    let out = arena
+        .alloc_slice_with(body.len().saturating_mul(4), |_| b'0')
+        .map_err(|_| arena_full())?;
+    let mut at = 0;
+    for &digit in body {
+        let nibble = match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'a'..=b'f' => digit - b'a' + 10,
+            b'A'..=b'F' => digit - b'A' + 10,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "\"{}\" is not a valid hexadecimal digit",
+                    digit as char
+                ));
+            }
+        };
+        for shift in (0..4).rev() {
+            out[at] = if nibble & (1 << shift) == 0 {
+                b'0'
+            } else {
+                b'1'
+            };
+            at += 1;
+        }
+    }
+    Ok(unsafe { core::str::from_utf8_unchecked(out) })
+}
+
 /// Interprets a `'0'`/`'1'` bit string as an unsigned integer (most significant
 /// bit first). Bit strings wider than `max_bits` overflow the target loudly.
 fn bits_to_uint(bits: &str, max_bits: usize, target: &'static str) -> Result<u64, SqlError> {
@@ -1027,14 +1074,22 @@ pub(crate) fn parse_bytea<'a>(s: &str, arena: &'a Arena) -> Result<&'a [u8], Sql
 /// Cast-to-text semantics (`true`/`false`), unlike wire output (`t`/`f`).
 pub(crate) fn cast_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
-        Datum::Char(byte) if byte.is_ascii() => {
+        Datum::Char(0) => Ok(""),
+        Datum::Char(byte @ 0x20..=0x7e) => {
             let bytes = arena.alloc_slice_copy(&[byte]).map_err(|_| arena_full())?;
             Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
         }
-        Datum::Char(_) => Err(sql_err!(
-            sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
-            "invalid byte sequence for encoding \"UTF8\""
-        )),
+        Datum::Char(byte) => {
+            let bytes = arena
+                .alloc_slice_copy(&[
+                    b'\\',
+                    b'0' + (byte >> 6),
+                    b'0' + ((byte >> 3) & 7),
+                    b'0' + (byte & 7),
+                ])
+                .map_err(|_| arena_full())?;
+            Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
+        }
         Datum::Text(s) => Ok(s),
         // bpchar-to-text strips the padding (`c || 'x'` sees "hi", not "hi   ").
         Datum::Bpchar(s) => Ok(s.trim_end_matches(' ')),
@@ -1088,11 +1143,33 @@ pub(crate) fn is_infinity_text(t: &str) -> bool {
     body.eq_ignore_ascii_case("inf") || body.eq_ignore_ascii_case("infinity")
 }
 
+fn parse_float8_text(text: &str) -> Result<f64, SqlError> {
+    let trimmed = text.trim();
+    let parsed: f64 = trimmed
+        .parse()
+        .map_err(|_| bad_text(text, "double precision"))?;
+    if parsed.is_infinite() && !is_infinity_text(trimmed) {
+        return Err(float_out_of_range(trimmed, "double precision"));
+    }
+    if parsed == 0.0 {
+        let mantissa = trimmed
+            .strip_prefix(['+', '-'])
+            .unwrap_or(trimmed)
+            .split(['e', 'E'])
+            .next()
+            .unwrap_or(trimmed);
+        if mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')) {
+            return Err(float_out_of_range(trimmed, "double precision"));
+        }
+    }
+    Ok(parsed)
+}
+
 /// Rounds a float to the nearest i64, ties to even, as PostgreSQL's float→int
 /// casts do. Wrapped in `Ok` at the call sites via `?`.
 fn float_to_i64(x: f64, target: &'static str) -> Result<i64, SqlError> {
     let rounded = x.round_ties_even();
-    if rounded >= i64::MIN as f64 && rounded <= i64::MAX as f64 {
+    if rounded >= i64::MIN as f64 && rounded < -(i64::MIN as f64) {
         Ok(rounded as i64)
     } else {
         Err(overflow(target))
@@ -1175,18 +1252,18 @@ fn classify_int_literal(s: &str) -> IntLiteral {
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
     use IntLiteral::{Malformed, Overflow, Value};
-    let (radix, digits) =
+    let (radix, digits, prefixed) =
         if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-            (16, r)
+            (16, r, true)
         } else if let Some(r) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
-            (8, r)
+            (8, r, true)
         } else if let Some(r) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
-            (2, r)
+            (2, r, true)
         } else {
-            (10, rest)
+            (10, rest, false)
         };
     let db = digits.as_bytes();
-    if db.is_empty() || db[0] == b'_' || db[db.len() - 1] == b'_' {
+    if db.is_empty() || db[db.len() - 1] == b'_' || db[0] == b'_' && !prefixed {
         return Malformed;
     }
     let mut buffer = [0u8; 80];
@@ -1281,6 +1358,7 @@ mod tests {
         assert_eq!(ok("-2147483648"), -2147483648);
         assert_eq!(ok("2147483647"), 2147483647);
         assert_eq!(ok("0x1F"), 31);
+        assert_eq!(ok("0b_10_0101"), 37);
         assert_eq!(ok("1_000"), 1000);
         assert_eq!(ok("+7"), 7);
     }

@@ -17,6 +17,54 @@ use super::super::{
     type_mismatch,
 };
 
+fn decimal(bytes: &[u8], at: &mut usize) -> Result<Option<usize>, SqlError> {
+    let start = *at;
+    let mut value = 0usize;
+    while bytes.get(*at).is_some_and(u8::is_ascii_digit) {
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(usize::from(bytes[*at] - b'0')))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "format specifies an argument position that is too large"
+                )
+            })?;
+        *at += 1;
+    }
+    Ok((*at != start).then_some(value))
+}
+
+fn format_argument<'a>(
+    values: &[Datum<'a>],
+    position: Option<usize>,
+    next: &mut usize,
+) -> Result<Datum<'a>, SqlError> {
+    let index = match position {
+        Some(0) => {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "format specifies argument 0, but arguments are numbered from 1"
+            ));
+        }
+        Some(position) => {
+            *next = (*next).max(position);
+            position - 1
+        }
+        None => {
+            let index = *next;
+            *next += 1;
+            index
+        }
+    };
+    values.get(index).copied().ok_or_else(|| {
+        sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "too few arguments for format()"
+        )
+    })
+}
+
 /// Handles the miscellaneous scalar family. Returns `None` if `name` is not one
 /// of these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -24,6 +72,7 @@ pub(crate) fn dispatch<'a>(
     name: &str,
     args: &[&Expr<'a>],
     star: bool,
+    variadic: bool,
     arena: &'a crate::mem::arena::Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -146,17 +195,92 @@ pub(crate) fn dispatch<'a>(
                 let Some(fmt) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
+                let mut evaluated = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+                let values = super::super::args::variadic_tail(
+                    name,
+                    args,
+                    1,
+                    variadic,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                    &mut evaluated,
+                )?;
+                let values = values.unwrap_or(&[]);
                 let mut out = StackStr::<4096>::new();
-                let mut argi = 1usize;
+                let mut next = 0usize;
                 let bytes = fmt.as_bytes();
                 let mut i = 0usize;
                 while i < bytes.len() {
                     if bytes[i] != b'%' {
-                        let _ = out.write_char(bytes[i] as char);
-                        i += 1;
+                        let end = fmt[i..].find('%').map_or(bytes.len(), |offset| i + offset);
+                        let _ = out.write_str(&fmt[i..end]);
+                        i = end;
                         continue;
                     }
                     i += 1;
+                    if bytes.get(i) == Some(&b'%') {
+                        let _ = out.write_char('%');
+                        i += 1;
+                        continue;
+                    }
+                    if i == bytes.len() {
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "unterminated format specifier"
+                        ));
+                    }
+
+                    let position_start = i;
+                    let possible_position = decimal(bytes, &mut i)?;
+                    let position = if possible_position.is_some() && bytes.get(i) == Some(&b'$') {
+                        i += 1;
+                        possible_position
+                    } else {
+                        i = position_start;
+                        None
+                    };
+                    let mut left = false;
+                    if bytes.get(i) == Some(&b'-') {
+                        left = true;
+                        i += 1;
+                    }
+                    let mut width = None;
+                    if bytes.get(i) == Some(&b'*') {
+                        i += 1;
+                        let width_start = i;
+                        let possible_width_position = decimal(bytes, &mut i)?;
+                        let width_position =
+                            if possible_width_position.is_some() && bytes.get(i) == Some(&b'$') {
+                                i += 1;
+                                possible_width_position
+                            } else {
+                                i = width_start;
+                                None
+                            };
+                        width = match format_argument(values, width_position, &mut next)? {
+                            Datum::Null => None,
+                            Datum::Int2(value) => Some(i64::from(value)),
+                            Datum::Int4(value) => Some(i64::from(value)),
+                            Datum::Int8(value) => Some(value),
+                            other => return Err(type_mismatch("format", &other)),
+                        };
+                    } else if let Some(written) = decimal(bytes, &mut i)? {
+                        width = Some(i64::try_from(written).map_err(|_| {
+                            sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "format width is too large"
+                            )
+                        })?);
+                    }
+                    if width.is_some_and(|width| width < 0) {
+                        left = true;
+                    }
+                    let width = width
+                        .map(i64::unsigned_abs)
+                        .and_then(|width| usize::try_from(width).ok())
+                        .unwrap_or(0);
                     let Some(&spec) = bytes.get(i) else {
                         return Err(sql_err!(
                             sqlstate::INVALID_PARAMETER_VALUE,
@@ -164,30 +288,45 @@ pub(crate) fn dispatch<'a>(
                         ));
                     };
                     i += 1;
-                    if spec == b'%' {
-                        let _ = out.write_char('%');
-                        continue;
-                    }
-                    if argi >= args.len() {
+                    if !matches!(spec, b's' | b'I' | b'L') {
                         return Err(sql_err!(
                             sqlstate::INVALID_PARAMETER_VALUE,
-                            "too few arguments for format()"
+                            "unrecognized format() type specifier \"{}\"",
+                            spec as char
                         ));
                     }
-                    let v = eval_full(args[argi], arena, params, row, hooks)?;
-                    argi += 1;
+                    let value = format_argument(values, position, &mut next)?;
+                    let mut rendered = StackStr::<4096>::new();
                     match spec {
-                        b's' => format_append_str(&mut out, v, arena)?,
-                        b'I' => format_append_ident(&mut out, v)?,
-                        b'L' => format_append_literal(&mut out, v, arena)?,
-                        other => {
-                            return Err(sql_err!(
-                                sqlstate::INVALID_PARAMETER_VALUE,
-                                "unrecognized format() type specifier \"{}\"",
-                                other as char
-                            ));
+                        b's' => format_append_str(&mut rendered, value, arena)?,
+                        b'I' => format_append_ident(&mut rendered, value, arena)?,
+                        b'L' => format_append_literal(&mut rendered, value, arena)?,
+                        _ => unreachable!("specifier validated above"),
+                    }
+                    if rendered.is_truncated() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "formatted value exceeds the statement formatting buffer"
+                        ));
+                    }
+                    let padding = width.saturating_sub(rendered.as_str().chars().count());
+                    if !left {
+                        for _ in 0..padding {
+                            let _ = out.write_char(' ');
                         }
                     }
+                    let _ = out.write_str(rendered.as_str());
+                    if left {
+                        for _ in 0..padding {
+                            let _ = out.write_char(' ');
+                        }
+                    }
+                }
+                if out.is_truncated() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "format() result exceeds the statement formatting buffer"
+                    ));
                 }
                 Ok(Datum::Text(
                     arena.alloc_str(out.as_str()).map_err(|_| arena_full())?,

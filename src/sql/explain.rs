@@ -620,6 +620,10 @@ fn predicate_selectivity<'a>(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "physical plan inputs are explicit"
+)]
 fn scan_node<'a>(
     storage: &Storage,
     scope: &QueryScope<'a>,
@@ -628,6 +632,8 @@ fn scan_node<'a>(
     txid: u32,
     depth: u8,
     arena: &Arena,
+    ordered: Option<query::OrderedIndexAccessPlan<'a>>,
+    index_only: bool,
 ) -> PlanNode {
     let slot = scope.slots[table];
     let derived = scope.derived[table].is_some() || slot == usize::MAX;
@@ -663,9 +669,12 @@ fn scan_node<'a>(
     // Execution and EXPLAIN consume the same typed leading-key plan. A
     // complete resident equality map has no durable-read cost and therefore
     // wins even when the immutable table and index estimates tie.
-    let index_plan = (table == 0)
-        .then(|| query::index_access_plan(storage, scope, txid, predicate))
-        .flatten();
+    let ordered = ordered.filter(|_| table == 0);
+    let index_plan = ordered.map(|plan| plan.access()).or_else(|| {
+        (table == 0)
+            .then(|| query::index_access_plan(storage, scope, txid, predicate))
+            .flatten()
+    });
     let index_rows = index_plan.map_or(predicate_rows, |plan| {
         plan.expected_rows(storage, slot, scope.defs[table].expect("base table"), txid)
     });
@@ -674,17 +683,22 @@ fn scan_node<'a>(
     // filters. The access estimate instead prices the index candidates that
     // execution must fetch before the complete predicate recheck.
     let output_rows = predicate_rows;
-    let index_identity = index_plan.and_then(|plan| {
-        crate::sql::catalog::value_index_identity(storage, txid, slot, plan.columns())
-            .map(|(_, name)| (plan, name))
-    });
+    let index_identity = ordered
+        .map(|ordered| (ordered.access(), ordered.index_name()))
+        .or_else(|| {
+            index_plan.and_then(|plan| {
+                crate::sql::catalog::value_index_identity(storage, txid, slot, plan.columns())
+                    .map(|(_, name)| (plan, name))
+            })
+        });
     let resident_index = index_identity.is_some_and(|(plan, _)| {
         plan.is_exact() && storage.value_cache_complete(slot, plan.columns())
     });
-    let use_index = index_identity.is_some()
-        && (resident_index
-            || (generations != 0
-                && !storage.sequential_spill_scan_is_cheaper(slot, index_rows, txid)));
+    let use_index = ordered.is_some()
+        || index_identity.is_some()
+            && (resident_index
+                || (generations != 0
+                    && !storage.sequential_spill_scan_is_cheaper(slot, index_rows, txid)));
     let blocks = if use_index {
         // One bounded key-generation descent per immutable generation, then
         // only the row blocks expected to survive the predicate.
@@ -711,7 +725,12 @@ fn scan_node<'a>(
     let _ = write!(relation, "{}", scope.names[table]);
     let name = if let Some((_, index)) = index_identity.filter(|_| use_index) {
         let mut name = StackStr::new();
-        let _ = write!(name, "Index Scan using {}", index.as_str());
+        let kind = if index_only && ordered.is_some() {
+            "Index Only Scan"
+        } else {
+            "Index Scan"
+        };
+        let _ = write!(name, "{kind} using {}", index.as_str());
         name
     } else {
         StackStr::from_str(if derived { "Subquery Scan" } else { "Seq Scan" })
@@ -744,6 +763,50 @@ pub(super) fn plan_select(
         None => None,
     };
     let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
+    let ordered_index = if !statement.distinct
+        && statement.distinct_on.is_empty()
+        && !statement.order_by.is_empty()
+        && !has_aggregate(statement)
+        && !has_window(statement)
+        && scope.as_ref().is_some_and(|scope| scope.n == 1)
+        && statement
+            .from
+            .as_ref()
+            .is_some_and(|from| from.joins.is_empty() && from.base.sample.is_none())
+    {
+        query::ordered_index_access_plan(
+            storage,
+            scope.as_ref().expect("checked"),
+            txid,
+            statement.where_clause,
+            statement.items,
+            statement.order_by,
+            arena,
+        )?
+    } else {
+        None
+    };
+    let ordered_index_only = match (
+        ordered_index,
+        scope.as_ref(),
+        statement.from.as_ref(),
+        storage.current_role_slot(txid),
+    ) {
+        (Some(index), Some(scope), Some(from), Some(current_role)) => {
+            let role = scope.authorization_roles[0].map_or(current_role, usize::from);
+            statement.locking.is_empty()
+                && !storage.row_security_applies(scope.slots[0], role, txid)
+                && query::streaming_pax_columns(
+                    scope,
+                    from,
+                    statement.items,
+                    statement.where_clause,
+                )
+                .selected_mask(0)
+                .is_some_and(|demanded| index.covers(demanded))
+        }
+        _ => false,
+    };
 
     if statement
         .where_clause
@@ -790,6 +853,8 @@ pub(super) fn plan_select(
                 txid,
                 1,
                 arena,
+                ordered_index,
+                ordered_index_only,
             );
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
             total_cost += scan.total_cost;
@@ -891,7 +956,7 @@ pub(super) fn plan_select(
             },
         )?;
     }
-    if !statement.order_by.is_empty() {
+    if !statement.order_by.is_empty() && ordered_index.is_none() {
         total_cost += estimated_rows as f64 * (estimated_rows.max(2) as f64).log2() * 0.0025;
         add_stage(
             &mut stages,
@@ -972,6 +1037,8 @@ pub(super) fn plan_select(
                 txid,
                 stage_count as u8,
                 arena,
+                ordered_index,
+                ordered_index_only,
             );
             scan.output = output;
             plan.push(scan)?;

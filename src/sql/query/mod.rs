@@ -45,14 +45,18 @@ pub use scan::JoinRow;
 pub(crate) use scan::select_hash_join_plan;
 use scan::{
     Chained, PaxReadDemand, pax_column_demand,
-    scan_source_recycling_retaining_match_with_pax_columns, scan_source_recycling_with_pax_columns,
+    scan_source_recycling_retaining_match_with_pax_columns,
+    scan_source_recycling_with_indexed_candidates, scan_source_recycling_with_pax_columns,
     scan_source_with_pax_columns,
+};
+pub(crate) use scan::{
+    OrderedIndexAccessPlan, dml_index_access_plan, dml_indexed_candidates, index_access_plan,
+    ordered_index_access_plan,
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,
     row_security_passes,
 };
-pub(crate) use scan::{dml_index_access_plan, dml_indexed_candidates, index_access_plan};
 
 mod scope;
 pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relations};
@@ -4290,7 +4294,7 @@ fn resolve_group_ordinals<'a>(
 /// one position per expanded column, as in PostgreSQL. A position inside a
 /// star synthesizes the column reference; names and expressions delegate to
 /// the select-list name-binding rules.
-fn resolve_order_target<'a>(
+pub(super) fn resolve_order_target<'a>(
     expression: &'a Expr<'a>,
     items: &'a [SelectItem<'a>],
     scope: &QueryScope<'a>,
@@ -7345,7 +7349,7 @@ fn select_into_rows_mode<'a>(
     }
 }
 
-fn streaming_pax_columns<'a>(
+pub(super) fn streaming_pax_columns<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     items: &'a [SelectItem<'a>],

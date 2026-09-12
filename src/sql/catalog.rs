@@ -10993,6 +10993,7 @@ pub(crate) fn value_index_identity(
     table_slot: usize,
     columns: &[u16],
 ) -> Option<(i32, StackStr<64>)> {
+    let definition = storage.table_def(table_slot, txid);
     let mut found = None;
     visit_indexes(storage, txid, |index| {
         if found.is_none()
@@ -11001,9 +11002,87 @@ pub(crate) fn value_index_identity(
             && &index.columns[..index.n_cols] == columns
             && !index.expression_keys[..index.n_cols].iter().any(|key| *key)
             && index.predicate.is_none()
+            && index.columns[..index.n_cols]
+                .iter()
+                .enumerate()
+                .all(|(position, column)| {
+                    !index.explicit_collations[position]
+                        || index.collations[position]
+                            == definition.columns[*column as usize].collation
+                })
+            && !index.resolved_operator_classes[..index.n_cols]
+                .iter()
+                .any(|class| matches!(class, Some(crate::storage::IndexOperatorClass::Catalog(_))))
         {
             found = Some((index.oid, index.name));
         }
+    });
+    found
+}
+
+/// Resolves the concrete plain-column btree whose declared ordering satisfies
+/// `ORDER BY`. Equality-fixed key positions do not constrain scan direction;
+/// every remaining position must agree with either one forward scan or one
+/// backward scan of the same index.
+pub(crate) fn ordered_value_index_identity(
+    storage: &Storage,
+    txid: u32,
+    table_slot: usize,
+    columns: &[u16],
+    equality_prefix: usize,
+    order_positions: &[u8],
+    order: &[crate::sql::ast::OrderBy<'_>],
+) -> Option<(i32, StackStr<64>)> {
+    if order_positions.len() != order.len() {
+        return None;
+    }
+    let definition = storage.table_def(table_slot, txid);
+    let mut found = None;
+    visit_indexes(storage, txid, |index| {
+        if found.is_some()
+            || index.table_slot != table_slot
+            || index.n_cols != columns.len()
+            || &index.columns[..index.n_cols] != columns
+            || index.expression_keys[..index.n_cols].iter().any(|key| *key)
+            || index.predicate.is_some()
+            || index.columns[..index.n_cols]
+                .iter()
+                .enumerate()
+                .any(|(position, column)| {
+                    index.explicit_collations[position]
+                        && index.collations[position]
+                            != definition.columns[*column as usize].collation
+                })
+            || index.resolved_operator_classes[..index.n_cols]
+                .iter()
+                .any(|class| matches!(class, Some(crate::storage::IndexOperatorClass::Catalog(_))))
+        {
+            return;
+        }
+        let mut backwards = None;
+        for (&raw_position, requested) in order_positions.iter().zip(order) {
+            let position = usize::from(raw_position);
+            if position >= index.n_cols {
+                return;
+            }
+            if position < equality_prefix {
+                continue;
+            }
+            let forward = requested.descending == index.descending[position]
+                && requested.nulls_first == index.nulls_first[position];
+            let reverse = requested.descending != index.descending[position]
+                && requested.nulls_first != index.nulls_first[position];
+            let direction = match (forward, reverse) {
+                (true, false) => false,
+                (false, true) => true,
+                _ => return,
+            };
+            if backwards.is_some_and(|prior| prior != direction) {
+                return;
+            }
+            backwards = Some(direction);
+        }
+        found = Some((index.oid, index.name));
     });
     found
 }

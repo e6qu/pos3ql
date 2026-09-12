@@ -742,6 +742,7 @@ impl Server {
                 checkpoint_timeout,
                 self.next_lock_wait_timeout(),
                 self.next_replication_keepalive_timeout(),
+                self.next_termination_timeout(),
                 hedge_timeout,
             ]
             .into_iter()
@@ -799,6 +800,7 @@ impl Server {
                 self.pump_replication_streams();
                 self.reconcile_subscriptions()?;
             }
+            self.close_expired_terminations();
             self.engine
                 .issue_due_block_read_hedges(std::time::Instant::now());
             if self.block_read_fds.iter().all(Option::is_none) {
@@ -1112,6 +1114,21 @@ impl Server {
             .iter()
             .filter_map(|slot| slot.conn.replication_keepalive_remaining())
             .min()
+    }
+
+    fn next_termination_timeout(&self) -> Option<Duration> {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.conn.termination_remaining())
+            .min()
+    }
+
+    fn close_expired_terminations(&mut self) {
+        for index in 0..self.slots.len() {
+            if self.slots[index].conn.is_open() && self.slots[index].conn.termination_expired() {
+                self.release(index);
+            }
+        }
     }
 
     /// Called when the block-store client's non-blocking GET socket is

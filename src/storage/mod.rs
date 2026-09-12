@@ -23777,6 +23777,14 @@ impl Storage {
             }))
     }
 
+    /// Returns only a row state already present in the bounded mutable
+    /// overlay. Immutable index generations use this to detect keys shadowed
+    /// by later changes without point-reading the immutable table for every
+    /// unchanged index entry.
+    pub(crate) fn resident_row_state(&self, table_slot: usize, rowid: u64) -> Option<RowState> {
+        self.tables[table_slot].rows.get(&rowid).copied()
+    }
+
     /// The single visibility choke point for heap and object-resident row
     /// versions. Pending command visibility wins first; then the resident
     /// committed chain; finally immutable SSTs supply an older admissible
@@ -25513,15 +25521,18 @@ impl Storage {
     }
 
     /// Probes the value cache for the indexed tuple covering exactly `columns`,
-    /// visiting every candidate rowid whose key hashes to `hash`. Returns true
-    /// only when the cache is complete, so a caller may trust a negative
-    /// answer; false means the authoritative row store must be scanned.
+    /// visiting every candidate rowid whose key hashes to `hash`. Durable and
+    /// overlay candidates carry their encoded key; hash-only resident-cache
+    /// candidates do not. A durable callback runs under the value reader's
+    /// block-stack borrow and must use that key instead of reentering storage.
+    /// Returns true only when the cache is complete, so a caller may trust a
+    /// negative answer; false means the authoritative row store must be scanned.
     pub fn probe_value(
         &self,
         table_index: usize,
         columns: &[u16],
         hash: u64,
-        mut visit: impl FnMut(u64),
+        mut visit: impl FnMut(u64, Option<&[u8]>) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         for i in 0..table.n_enforcers {
@@ -25532,8 +25543,18 @@ impl Storage {
                     .as_ref()
                     .expect("value index pool present")
                     .get(e.slot);
-                index.probe(hash, &mut visit);
                 if index.is_complete() {
+                    let mut callback_error = None;
+                    index.probe(hash, |rowid| {
+                        if callback_error.is_none()
+                            && let Err(error) = visit(rowid, None)
+                        {
+                            callback_error = Some(error);
+                        }
+                    });
+                    if let Some(error) = callback_error {
+                        return Err(error);
+                    }
                     return Ok(true);
                 }
                 let Some(handle) = e.durable else {
@@ -25558,23 +25579,39 @@ impl Storage {
                     ));
                 };
                 let scratch = &mut *scratch;
-                crate::store::ValueIndexReader::over(&mut scratch.roster, &mut scratch.data)
-                    .probe(
-                        &mut *spill
-                            .blocks
-                            .as_ref()
-                            .expect("value-index generations are durable")
-                            .borrow_mut(),
-                        &handle,
-                        hash,
-                        |rowid, _, _| visit(rowid),
-                    )
-                    .map_err(value_index_read_error)?;
+                {
+                    let ValueIndexScratch { roster, data } = scratch;
+                    let mut callback_error = None;
+                    crate::store::ValueIndexReader::over(roster, data)
+                        .probe(
+                            &mut *spill
+                                .blocks
+                                .as_ref()
+                                .expect("value-index generations are durable")
+                                .borrow_mut(),
+                            &handle,
+                            hash,
+                            |rowid, _, key| {
+                                if callback_error.is_none()
+                                    && let Err(error) = visit(rowid, Some(key))
+                                {
+                                    callback_error = Some(error);
+                                }
+                            },
+                        )
+                        .map_err(value_index_read_error)?;
+                    if let Some(error) = callback_error {
+                        return Err(error);
+                    }
+                }
                 // The published generation is a complete base. Every later
                 // committed change remains in the bounded resident overlay
                 // until its replacement generation publishes.
                 let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
                 for (&rowid, state) in self.tables[table_index].rows.iter() {
+                    if state.committed_lsn <= handle.published_lsn {
+                        continue;
+                    }
                     let Some(home) = state.committed else {
                         continue;
                     };
@@ -25583,7 +25620,10 @@ impl Storage {
                         .iter()
                         .any(|(binding, candidate)| *binding == i && *candidate == hash)
                     {
-                        visit(rowid);
+                        let key_buffer = &mut scratch.roster;
+                        let (len, _) =
+                            self.encode_value_binding_key(table_index, i, rowid, home, key_buffer)?;
+                        visit(rowid, Some(&key_buffer[..len]))?;
                     }
                 }
                 return Ok(true);
@@ -25668,7 +25708,7 @@ impl Storage {
             ));
         };
         {
-            let ValueIndexScratch { roster, data } = &mut *scratch;
+            let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             let mut callback_error = Ok(());
             crate::store::ValueIndexReader::over(roster, data)
                 .walk(
@@ -25693,6 +25733,9 @@ impl Storage {
         // rowids are harmless because the ordinary WHERE/MVCC path rechecks
         // them; callers sort and deduplicate candidates before execution.
         for (&rowid, state) in table.rows.iter() {
+            if state.committed_lsn <= handle.published_lsn {
+                continue;
+            }
             let Some(home) = state.committed else {
                 continue;
             };
@@ -25713,7 +25756,7 @@ impl Storage {
         table_index: usize,
         columns: &[u16],
         mut classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
-        mut visit: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
+        mut visit: impl FnMut(u64, u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
@@ -25741,7 +25784,7 @@ impl Storage {
             ));
         };
         {
-            let ValueIndexScratch { roster, data } = &mut *scratch;
+            let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             let callback_error = std::cell::RefCell::new(None);
             crate::store::ValueIndexReader::over(roster, data)
                 .range(
@@ -25758,9 +25801,9 @@ impl Storage {
                             crate::store::ValueIndexPosition::Match
                         }
                     },
-                    |_, rowid, _, key| {
+                    |_, rowid, lsn, key| {
                         let ready = callback_error.borrow().is_none();
-                        if ready && let Err(error) = visit(rowid, key) {
+                        if ready && let Err(error) = visit(rowid, lsn, key) {
                             *callback_error.borrow_mut() = Some(error);
                         }
                     },
@@ -25771,6 +25814,9 @@ impl Storage {
             }
         }
         for (&rowid, state) in table.rows.iter() {
+            if state.committed_lsn <= handle.published_lsn {
+                continue;
+            }
             let Some(home) = state.committed else {
                 continue;
             };
@@ -25778,7 +25824,7 @@ impl Storage {
             let (len, _) =
                 self.encode_value_binding_key(table_index, binding, rowid, home, key_buffer)?;
             if classify(&key_buffer[..len])? == crate::store::ValueIndexPosition::Match {
-                visit(rowid, &key_buffer[..len])?;
+                visit(rowid, state.committed_lsn, &key_buffer[..len])?;
             }
         }
         Ok(true)
@@ -26056,6 +26102,7 @@ impl Storage {
         // startup-reserved pool slot.
         let table_schema = self.tables[table_index].def.schema;
         let table_name = self.tables[table_index].def.name;
+        let table_definition = self.tables[table_index].def;
         for index in self.indexes.iter().filter(|index| {
             txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
                 index.visible_to(owner)
@@ -26068,6 +26115,16 @@ impl Storage {
                 // Expression keys cannot be represented by a column-tuple
                 // cache without changing their SQL semantics.
                 && index.expressions[..index.n_cols].iter().all(Option::is_none)
+                // The shared value binding compares and hashes with the table
+                // columns' collations. An explicitly different index
+                // collation requires a distinct physical representation.
+                && index.columns[..index.n_cols]
+                    .iter()
+                    .enumerate()
+                    .all(|(position, column)| {
+                        index.collations[position]
+                            == table_definition.columns[*column as usize].collation
+                    })
         }) {
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()

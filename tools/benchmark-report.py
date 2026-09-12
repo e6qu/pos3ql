@@ -46,8 +46,8 @@ def main():
             f"{suite['rows']} rows, {suite['clients']} clients, "
             f"{suite['object_latency_ms']} ms injected object latency.\n"
         )
-    print("| Scenario | ops/s | p50 ms | p95 ms | p99 ms | max ms | max RSS MiB | object req/op | errors |")
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("| Scenario | ops/s | p50 ms | p95 ms | p99 ms | max ms | max RSS MiB | index scans | seq scans | object req/op | errors |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for label, value in results.items():
         measured = value["results"]
         latency = measured["latency_ms"]
@@ -58,11 +58,14 @@ def main():
                 1, measured["completed_operations"]
             )
         rss = measured.get("maximum_rss_bytes")
+        access_path = measured.get("access_path") or {}
         print(
             f"| {label} | {number(measured['throughput_ops_per_second'])} | "
             f"{number(latency['p50'])} | {number(latency['p95'])} | "
             f"{number(latency['p99'])} | {number(latency['maximum'])} | "
             f"{number(rss / 1048576 if rss is not None else None)} | "
+            f"{access_path.get('index_scans', '—')} | "
+            f"{access_path.get('sequential_scans', '—')} | "
             f"{number(object_requests, 3)} | {len(measured['errors'])} |"
         )
 

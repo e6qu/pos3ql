@@ -1,5 +1,7 @@
 import importlib.util
 import pathlib
+import threading
+import types
 import unittest
 
 
@@ -40,6 +42,57 @@ class BenchmarkTest(unittest.TestCase):
                 "errors": 1,
             },
         )
+
+    def test_access_path_counters_are_subtracted(self):
+        before = {
+            "sequential_scans": 2,
+            "sequential_tuples_read": 20,
+            "index_scans": 3,
+            "index_tuples_fetched": 3,
+        }
+        after = {
+            "sequential_scans": 2,
+            "sequential_tuples_read": 20,
+            "index_scans": 11,
+            "index_tuples_fetched": 11,
+        }
+        self.assertEqual(
+            benchmark.subtract_access_path(after, before),
+            {
+                "index_scans": 8,
+                "index_tuples_fetched": 8,
+                "sequential_scans": 0,
+                "sequential_tuples_read": 0,
+            },
+        )
+
+    def test_validation_enforces_required_index_access(self):
+        result = {
+            "workload": {"require_index": True},
+            "results": {
+                "attempted_operations": 4,
+                "completed_operations": 4,
+                "errors": [],
+                "latency_ms": {
+                    "minimum": 1,
+                    "p50": 1,
+                    "p95": 1,
+                    "p99": 1,
+                    "maximum": 1,
+                },
+                "fixed_memory_occupancy": None,
+                "object_store": None,
+                "access_path": {
+                    "index_scans": 3,
+                    "index_tuples_fetched": 3,
+                    "sequential_scans": 1,
+                    "sequential_tuples_read": 4,
+                },
+            },
+        }
+        failures = benchmark.validate(result)
+        self.assertIn("workload did not execute an index scan per operation", failures)
+        self.assertIn("workload unexpectedly executed sequential scans", failures)
 
     def test_validation_rejects_missing_work_and_unordered_latency(self):
         result = {
@@ -93,6 +146,57 @@ class BenchmarkTest(unittest.TestCase):
             "concurrent commit PUT amplification exceeded the regression bound",
             benchmark.validate(result),
         )
+
+    def test_synchronized_worker_failure_aborts_peer_barriers(self):
+        original = benchmark.PgConnection
+
+        class Connection:
+            created = 0
+
+            def __init__(self, *_args):
+                self.identifier = Connection.created
+                Connection.created += 1
+
+            def close(self):
+                pass
+
+            def query(self, sql):
+                if sql == "SELECT version()":
+                    return [["PostgreSQL 18 test double"]]
+                if self.identifier == 2 and sql.startswith("UPDATE benchmark_kv"):
+                    raise RuntimeError("injected worker failure")
+                return []
+
+        args = types.SimpleNamespace(
+            targets=[],
+            host="127.0.0.1",
+            port=5432,
+            user="postgres",
+            database="postgres",
+            setup=False,
+            rows=8,
+            clients=4,
+            operations=2,
+            synchronized=True,
+            require_index=False,
+            workload="update",
+            maintenance_interval=0.0,
+            object_metrics=None,
+            pid=None,
+            fixed_memory_bytes=None,
+            label="barrier-failure",
+        )
+        outcome = []
+        benchmark.PgConnection = Connection
+        try:
+            runner = threading.Thread(target=lambda: outcome.append(benchmark.run(args)), daemon=True)
+            runner.start()
+            runner.join(1)
+            self.assertFalse(runner.is_alive(), "peer workers remained blocked at the barrier")
+        finally:
+            benchmark.PgConnection = original
+        self.assertTrue(outcome)
+        self.assertTrue(outcome[0]["results"]["errors"])
 
 
 if __name__ == "__main__":

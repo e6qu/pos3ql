@@ -10173,10 +10173,7 @@ fn cumulative_statistics_cover_tables_indexes_transactions_resets_and_catalogs()
         .split('|')
         .map(|value| value.parse().unwrap())
         .collect();
-    assert!(counters[0] >= 2, "{transaction_rows:?}");
-    assert!(counters[1] >= 6, "{transaction_rows:?}");
-    assert!(counters[2] >= 1, "{transaction_rows:?}");
-    assert!(counters[3] >= 1, "{transaction_rows:?}");
+    assert_eq!(&counters[..4], &[1, 3, 2, 2], "{transaction_rows:?}");
     assert_eq!(&counters[4..], &[1, 1, 1, 0, 0]);
 
     let cumulative = run_with(
@@ -38009,7 +38006,9 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
          EXPLAIN (GENERIC_PLAN) EXECUTE ep_by_id(2)",
     ));
     assert!(
-        generic.iter().any(|row| row.contains("Seq Scan on ep")),
+        generic
+            .iter()
+            .any(|row| row.contains("Index Scan using ep_pkey on ep")),
         "{generic:?}"
     );
     let analyzed_prepared = data_rows(&run_with(
@@ -38064,7 +38063,9 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "{detailed:?}"
     );
     assert!(
-        detailed.iter().any(|row| row.contains("Seq Scan on ep")),
+        detailed
+            .iter()
+            .any(|row| row.contains("Index Scan using ep_pkey on ep")),
         "{detailed:?}"
     );
 
@@ -46196,6 +46197,247 @@ fn create_index_and_unique() {
     let out = String::from_utf8_lossy(&run_with(&mut e, &mut b, "INSERT INTO t VALUES (1,1,7)"))
         .to_string();
     assert!(!out.contains("23505"), "constraint should be gone: {out}");
+}
+
+#[test]
+fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
+    let mut config = test_config("composite-index-access");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.txn_rows = 8192;
+    config.table_rows = 8192;
+    config.value_index_rows = 8192;
+    config.object_store_bucket = format!("composite-index-access-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE composite_seek (
+             tenant integer,
+             id integer,
+             payload text,
+             PRIMARY KEY (tenant, id)
+         );
+         INSERT INTO composite_seek VALUES
+             (1, 1, 'one-one'),
+             (1, 2, 'one-two'),
+             (2, 1, 'two-one'),
+             (2, 2, 'two-two'),
+             (2, 3, 'two-three')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for start in [1, 1001, 2001, 3001] {
+        let filler = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO composite_seek
+                 SELECT 9, value, repeat('f', 512) || value::text
+                 FROM generate_series({start}, {}) AS filler(value)",
+                start + 999
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&filler).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&filler)
+        );
+    }
+    run_with(&mut engine, &mut budget, "ANALYZE composite_seek");
+
+    let exact_output = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT payload FROM composite_seek WHERE id = 2 AND tenant = 2",
+    );
+    let exact_plan = data_rows(&exact_output);
+    assert!(
+        exact_plan
+            .iter()
+            .any(|row| row.contains("Index Scan using composite_seek_pkey")),
+        "{}: {exact_plan:?}",
+        String::from_utf8_lossy(&exact_output)
+    );
+    let parameter_output = run_with(
+        &mut engine,
+        &mut budget,
+        "PREPARE composite_lookup(integer, integer) AS
+             SELECT payload FROM composite_seek WHERE tenant = $1 AND id = $2;
+         EXECUTE composite_lookup(2, 3);
+         EXPLAIN (GENERIC_PLAN) EXECUTE composite_lookup(2, 3)",
+    );
+    let parameter_plan = data_rows(&parameter_output);
+    assert!(
+        parameter_plan.iter().any(|row| row == "two-three"),
+        "{}: {parameter_plan:?}",
+        String::from_utf8_lossy(&parameter_output)
+    );
+    assert!(
+        parameter_plan
+            .iter()
+            .any(|row| row.contains("Index Scan using composite_seek_pkey")),
+        "{}: {parameter_plan:?}",
+        String::from_utf8_lossy(&parameter_output)
+    );
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut restart_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restart_budget).unwrap();
+    let restarted_slot = restarted
+        .storage
+        .find_table("public", "composite_seek")
+        .unwrap();
+    assert!(
+        restarted
+            .storage
+            .value_durable_complete(restarted_slot, &[0, 1])
+    );
+    assert!(restarted.storage.spill_generation_count(restarted_slot) > 0);
+    let prefix_plan = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "EXPLAIN SELECT id FROM composite_seek WHERE tenant = 2 AND id >= 2",
+    ));
+    assert!(
+        prefix_plan
+            .iter()
+            .any(|row| row.contains("Index Scan using composite_seek_pkey")),
+        "{prefix_plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restart_budget,
+            "SELECT id, payload FROM composite_seek
+             WHERE tenant = 2 AND id >= 2 ORDER BY id"
+        )),
+        ["2|two-two", "3|two-three"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restart_budget,
+            "SELECT id FROM composite_seek
+             WHERE 2 <= id AND 2 = tenant ORDER BY id"
+        )),
+        ["2", "3"]
+    );
+    let nonleading_plan = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "EXPLAIN SELECT tenant FROM composite_seek WHERE id = 2",
+    ));
+    assert!(
+        nonleading_plan
+            .iter()
+            .any(|row| row.contains("Seq Scan on composite_seek")),
+        "{nonleading_plan:?}"
+    );
+    let dml_plans = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "EXPLAIN UPDATE composite_seek SET payload = payload
+         WHERE tenant = 2 AND id = 2;
+         EXPLAIN DELETE FROM composite_seek WHERE tenant = 2 AND id = 3",
+    ));
+    assert_eq!(
+        dml_plans
+            .iter()
+            .filter(|row| row.contains("Index Scan using composite_seek_pkey"))
+            .count(),
+        2,
+        "{dml_plans:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restart_budget,
+            "SELECT pg_stat_reset_single_table_counters('composite_seek'::regclass)"
+        )),
+        [""]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restart_budget,
+            "UPDATE composite_seek SET id = 20, payload = 'updated'
+             WHERE tenant = 2 AND id = 2 RETURNING id, payload;
+             SELECT payload FROM composite_seek WHERE tenant = 2 AND id = 2;
+             SELECT payload FROM composite_seek WHERE tenant = 2 AND id = 20;
+             SELECT seq_scan, idx_scan FROM pg_stat_user_tables
+             WHERE relname = 'composite_seek'"
+        )),
+        ["20|updated", "updated", "0|3"]
+    );
+
+    // Another transaction's uncommitted image must not disable the committed
+    // index for readers: they see the old row and its old key. The owner still
+    // falls back to the MVCC scan because its new key is absent from that map.
+    let mut owner = TxnState::new(&mut restart_budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut restart_budget, 256).unwrap();
+    run_txn(&mut restarted, &mut restart_budget, &mut owner, "BEGIN");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut restarted,
+            &mut restart_budget,
+            &mut owner,
+            "UPDATE composite_seek SET id = 21, payload = 'pending'
+             WHERE tenant = 2 AND id = 1 RETURNING id, payload"
+        )),
+        ["21|pending"]
+    );
+    let observer_output = run_with_txn_bytes(
+        &mut restarted,
+        &mut restart_budget,
+        &mut observer,
+        "EXPLAIN SELECT payload FROM composite_seek WHERE tenant = 2 AND id = 1;
+         SELECT payload FROM composite_seek WHERE tenant = 2 AND id = 1",
+    );
+    let observer_rows = data_rows(&observer_output);
+    assert!(
+        observer_rows
+            .iter()
+            .any(|row| row.contains("Index Scan using composite_seek_pkey")),
+        "{}: {observer_rows:?}",
+        String::from_utf8_lossy(&observer_output)
+    );
+    assert!(observer_rows.iter().any(|row| row == "two-one"));
+    let owner_output = run_with_txn_bytes(
+        &mut restarted,
+        &mut restart_budget,
+        &mut owner,
+        "EXPLAIN SELECT payload FROM composite_seek WHERE tenant = 2 AND id = 21;
+         SELECT payload FROM composite_seek WHERE tenant = 2 AND id = 21",
+    );
+    let owner_rows = data_rows(&owner_output);
+    assert!(
+        owner_rows
+            .iter()
+            .any(|row| row.contains("Seq Scan on composite_seek")),
+        "{}: {owner_rows:?}",
+        String::from_utf8_lossy(&owner_output)
+    );
+    assert!(owner_rows.iter().any(|row| row == "pending"));
+    run_txn(&mut restarted, &mut restart_budget, &mut owner, "ROLLBACK");
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

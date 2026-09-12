@@ -65855,15 +65855,41 @@ fn collect_matches<'a>(
         scratch.sort_unstable_by_key(|row| row.sort_key());
         return Ok(());
     }
+    let indexed = if transition.is_none() && !storage.relation_has_descendants(table_index, txid) {
+        super::query::dml_indexed_candidates(
+            storage,
+            table_index,
+            def,
+            alias,
+            txid,
+            where_clause,
+            arena,
+            params,
+            hooks,
+        )?
+    } else {
+        None
+    };
     for &leaf in dml_leaf_slots(storage, table_index, txid, arena)? {
         storage.record_serializable_read(txid, leaf);
-        storage.record_relation_scan(txid, leaf, None, 0)?;
-        storage.for_each_row_state(leaf, &mut |rowid, state| {
-            use core::ops::ControlFlow;
+        let access = indexed.as_ref().filter(|_| leaf == table_index);
+        if access.is_none_or(|access| access.scan_executed()) {
+            storage.record_relation_scan(
+                txid,
+                leaf,
+                access.map(|access| access.index_oid()),
+                access.map_or(0, |access| access.index_entries()),
+            )?;
+        }
+        let mut visit = |rowid, state| {
             let Some(loc) = storage.visible_row_home(leaf, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
+                return Ok(());
             };
-            storage.record_relation_tuple_read(txid, leaf, None)?;
+            storage.record_relation_tuple_read(
+                txid,
+                leaf,
+                access.map(|access| access.index_oid()),
+            )?;
             if row_matches(
                 storage,
                 leaf,
@@ -65890,8 +65916,20 @@ fn collect_matches<'a>(
                         )
                     })?;
             }
-            Ok(ControlFlow::Continue(()))
-        })?;
+            Ok::<(), SqlError>(())
+        };
+        if let Some(access) = access {
+            for &rowid in access.rowids() {
+                if let Some(state) = storage.row_state(leaf, rowid)? {
+                    visit(rowid, state)?;
+                }
+            }
+        } else {
+            storage.for_each_row_state(leaf, &mut |rowid, state| {
+                visit(rowid, state)?;
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
+        }
     }
     // DML RETURNING follows the target table's physical row order. The row
     // map is hash-addressed, so restore the monotonic row identity assigned

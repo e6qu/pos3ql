@@ -222,11 +222,11 @@ python3 "$ROOT/tools/benchmark-environment.py" \
 DATA_WARM="$WORK/data-warm"
 start_pos3ql "$DATA_WARM" primary initial-start
 bench_pos3ql point-concurrency-1 --workload point-read --clients 1 \
-  --operations "$OPERATIONS" --rows "$ROWS" --setup
+  --operations "$OPERATIONS" --rows "$ROWS" --setup --require-index
 bench_pos3ql warm-memory-point --workload point-read --clients "$CLIENTS" \
-  --operations "$OPERATIONS" --rows "$ROWS"
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql concurrent-update --workload update --clients "$CLIENTS" \
-  --operations "$OPERATIONS" --rows "$ROWS" --synchronized
+  --operations "$OPERATIONS" --rows "$ROWS" --synchronized --require-index
 
 if [ "$MODE" = full ]; then
   bench_pos3ql concurrent-insert --workload insert --clients "$CLIENTS" \

@@ -10984,25 +10984,25 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
     }
 }
 
-/// Resolves the catalog identity of the single-column value index selected by
+/// Resolves the catalog identity of the plain-column value index selected by
 /// the storage probe path. Duplicate indexes must not all receive credit for
 /// one physical scan.
-pub(crate) fn value_index_oid(
+pub(crate) fn value_index_identity(
     storage: &Storage,
     txid: u32,
     table_slot: usize,
-    column: usize,
-) -> Option<i32> {
+    columns: &[u16],
+) -> Option<(i32, StackStr<64>)> {
     let mut found = None;
     visit_indexes(storage, txid, |index| {
         if found.is_none()
             && index.table_slot == table_slot
-            && index.n_cols == 1
-            && index.columns[0] as usize == column
-            && !index.expression_keys[0]
+            && index.n_cols == columns.len()
+            && &index.columns[..index.n_cols] == columns
+            && !index.expression_keys[..index.n_cols].iter().any(|key| *key)
             && index.predicate.is_none()
         {
-            found = Some(index.oid);
+            found = Some((index.oid, index.name));
         }
     });
     found

@@ -64,3 +64,17 @@ memory, cold-recovery, and request-amplification behavior. External driver
 testing then exposed deferred session teardown allowing another same-turn
 connection to observe a terminated session's temporary relation; close/EOF
 teardown now remains immediate while live responses retain group publication.
+
+The physical-index review found that execution recognized only one-column
+literal predicates, `EXPLAIN` maintained a different decision path, resident
+exact probes could lose a cost tie to a full scan, and durable equality probes
+read every value-index data block. It also found that one transaction's pending
+row unnecessarily disabled committed index access for every observer. One
+typed leading-key plan now covers
+execution and explanation for exact/composite/parameter/prefix/range cases;
+resident equality and filtered durable generations close the point-read path,
+and pending-row visibility now preserves observer index access without hiding a
+writer's own unindexed key. The performance harness now gates the actual scan
+counters for reads and synchronized updates, and a synchronized worker failure
+aborts its peer barrier instead of hanging the run. No
+externally blocked defect remains from this review.

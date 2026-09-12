@@ -620,52 +620,11 @@ fn predicate_selectivity<'a>(
     }
 }
 
-fn index_name(
+fn scan_node<'a>(
     storage: &Storage,
-    scope: &QueryScope<'_>,
+    scope: &QueryScope<'a>,
     table: usize,
-    predicate: Option<&Expr<'_>>,
-    txid: u32,
-) -> Option<StackStr<96>> {
-    let (owner, column, operator) = predicate_column(predicate?, scope)?;
-    if owner != table || scope.derived[table].is_some() {
-        return None;
-    }
-    let slot = scope.slots[table];
-    let columns = [column as u16];
-    let complete = if operator == BinaryOp::Eq {
-        storage.value_probe_complete(slot, &columns)
-    } else {
-        storage.value_durable_complete(slot, &columns)
-    };
-    if !complete {
-        return None;
-    }
-    let definition = scope.defs[table]?;
-    let mut name = StackStr::new();
-    if definition.columns()[column].primary {
-        let _ = write!(name, "{}_pkey", definition.name.as_str());
-    } else if definition.columns()[column].unique {
-        let _ = write!(
-            name,
-            "{}_{}_key",
-            definition.name.as_str(),
-            definition.columns()[column].name.as_str()
-        );
-    } else {
-        let index = storage
-            .indexes_for(definition.schema.as_str(), definition.name.as_str(), txid)
-            .find(|index| index.n_cols == 1 && index.columns[0] as usize == column)?;
-        let _ = write!(name, "{}", index.name_for(txid).as_str());
-    }
-    Some(name)
-}
-
-fn scan_node(
-    storage: &Storage,
-    scope: &QueryScope<'_>,
-    table: usize,
-    predicate: Option<&Expr<'_>>,
+    predicate: Option<&'a Expr<'a>>,
     txid: u32,
     depth: u8,
     arena: &Arena,
@@ -701,10 +660,23 @@ fn scan_node(
             .div_ceil(crate::store::MAX_PAYLOAD as u64)
             .saturating_add(generations.saturating_mul(2))
     };
-    let index = index_name(storage, scope, table, predicate, txid);
-    let use_index = index.is_some()
-        && generations != 0
-        && !storage.sequential_spill_scan_is_cheaper(slot, output_rows, txid);
+    // Execution and EXPLAIN consume the same typed leading-key plan. A
+    // complete resident equality map has no durable-read cost and therefore
+    // wins even when the immutable table and index estimates tie.
+    let index_plan = (table == 0)
+        .then(|| query::index_access_plan(storage, scope, txid, predicate))
+        .flatten();
+    let index_identity = index_plan.and_then(|plan| {
+        crate::sql::catalog::value_index_identity(storage, txid, slot, plan.columns())
+            .map(|(_, name)| (plan, name))
+    });
+    let resident_index = index_identity.is_some_and(|(plan, _)| {
+        plan.is_exact() && storage.value_cache_complete(slot, plan.columns())
+    });
+    let use_index = index_identity.is_some()
+        && (resident_index
+            || (generations != 0
+                && !storage.sequential_spill_scan_is_cheaper(slot, output_rows, txid)));
     let blocks = if use_index {
         // One bounded key-generation descent per immutable generation, then
         // only the row blocks expected to survive the predicate.
@@ -729,7 +701,7 @@ fn scan_node(
     let cpu_cost = cpu_rows as f64 * 0.01;
     let mut relation = StackStr::new();
     let _ = write!(relation, "{}", scope.names[table]);
-    let name = if let Some(index) = index.filter(|_| use_index) {
+    let name = if let Some((_, index)) = index_identity.filter(|_| use_index) {
         let mut name = StackStr::new();
         let _ = write!(name, "Index Scan using {}", index.as_str());
         name
@@ -1015,9 +987,13 @@ fn physical_scan_node(
     filtered: bool,
     txid: u32,
     depth: u8,
+    index: Option<(&str, u64)>,
 ) -> PlanNode {
     let rows = storage.planning_row_estimate(slot);
-    let output_rows = if filtered { rows.div_ceil(10) } else { rows };
+    let output_rows = index.map_or_else(
+        || if filtered { rows.div_ceil(10) } else { rows },
+        |(_, expected_rows)| expected_rows,
+    );
     let statistics = storage.table_statistics(slot, txid);
     let width = if statistics.valid {
         statistics.average_row_width.max(1)
@@ -1025,12 +1001,21 @@ fn physical_scan_node(
         32
     };
     let generations = storage.spill_generation_count(slot) as u64;
-    let blocks = if generations == 0 {
+    let full_scan_blocks = if generations == 0 {
         0
     } else {
         rows.saturating_mul(u64::from(width))
             .div_ceil(crate::store::MAX_PAYLOAD as u64)
             .saturating_add(generations.saturating_mul(2))
+    };
+    let blocks = if index.is_some() {
+        generations.saturating_mul(3).saturating_add(
+            output_rows
+                .saturating_mul(u64::from(width))
+                .div_ceil(crate::store::MAX_PAYLOAD as u64),
+        )
+    } else {
+        full_scan_blocks
     };
     let (ram_probability, disk_probability) = cache_probabilities(storage.block_io_stats());
     let cache_probability = (ram_probability + disk_probability).min(1.0);
@@ -1038,9 +1023,17 @@ fn physical_scan_node(
     let object_requests = blocks.saturating_sub(cache_blocks);
     let total_cost = object_requests as f64 * object_request_cost(storage.block_io_stats())
         + cache_blocks as f64 * (ram_probability * 0.01 + disk_probability * 0.1)
-        + rows as f64 * 0.01;
+        + if index.is_some() { output_rows } else { rows } as f64 * 0.01;
+    let name = index.map_or_else(
+        || StackStr::from_str("Seq Scan"),
+        |(index_name, _)| {
+            let mut name = StackStr::new();
+            let _ = write!(name, "Index Scan using {index_name}");
+            name
+        },
+    );
     PlanNode {
-        name: StackStr::from_str("Seq Scan"),
+        name,
         relation: StackStr::from_str(relation_name),
         output: StackStr::new(),
         depth,
@@ -1177,11 +1170,43 @@ pub(super) fn plan_modification(
     arena: &Arena,
 ) -> Result<Plan, SqlError> {
     let started = std::time::Instant::now();
-    let (verb, target, filtered, source) = match statement {
-        Stmt::Insert(insert) => ("Insert", insert.table, false, insert.select),
-        Stmt::Update(update) => ("Update", update.table, update.where_clause.is_some(), None),
-        Stmt::Delete(delete) => ("Delete", delete.table, delete.where_clause.is_some(), None),
-        Stmt::Merge(merge) => ("Merge", merge.target, true, None),
+    let (verb, target, filtered, source, predicate, alias, joined) = match statement {
+        Stmt::Insert(insert) => (
+            "Insert",
+            insert.table,
+            false,
+            insert.select,
+            None,
+            None,
+            false,
+        ),
+        Stmt::Update(update) => (
+            "Update",
+            update.table,
+            update.where_clause.is_some(),
+            None,
+            update.where_clause,
+            update.alias,
+            update.from.is_some(),
+        ),
+        Stmt::Delete(delete) => (
+            "Delete",
+            delete.table,
+            delete.where_clause.is_some(),
+            None,
+            delete.where_clause,
+            delete.alias,
+            delete.using.is_some(),
+        ),
+        Stmt::Merge(merge) => (
+            "Merge",
+            merge.target,
+            true,
+            None,
+            None,
+            merge.target_alias,
+            true,
+        ),
         _ => {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1242,7 +1267,37 @@ pub(super) fn plan_modification(
                 ..PlanNode::EMPTY
             }
         } else {
-            physical_scan_node(storage, slot, target.name, filtered, txid, 1)
+            let index = (!joined && !storage.relation_has_descendants(slot, txid))
+                .then(|| {
+                    let definition = storage.table_def(slot, txid);
+                    query::dml_index_access_plan(storage, slot, definition, alias, txid, predicate)
+                        .and_then(|plan| {
+                            crate::sql::catalog::value_index_identity(
+                                storage,
+                                txid,
+                                slot,
+                                plan.columns(),
+                            )
+                            .map(|(_, name)| (plan, name))
+                        })
+                })
+                .flatten();
+            let index = index.filter(|(plan, _)| {
+                plan.is_exact() && storage.value_cache_complete(slot, plan.columns())
+                    || (storage.spill_generation_count(slot) != 0
+                        && !storage.sequential_spill_scan_is_cheaper(
+                            slot,
+                            plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid),
+                            txid,
+                        ))
+            });
+            let index_name = index.as_ref().map(|(plan, name)| {
+                (
+                    name.as_str(),
+                    plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid),
+                )
+            });
+            physical_scan_node(storage, slot, target.name, filtered, txid, 1, index_name)
         };
         plan.push(child)?;
         child

@@ -23444,7 +23444,7 @@ impl Storage {
     }
 
     /// Whether an unshadowed sequential spill walk costs no more durable block
-    /// traffic than a single-column index probe. Both estimates use only
+    /// traffic than a value-index probe. Both estimates use only
     /// manifest and ANALYZE metadata, so choosing the access path cannot warm
     /// the cache or perform a speculative read.
     pub(crate) fn sequential_spill_scan_is_cheaper(
@@ -25798,15 +25798,15 @@ impl Storage {
         })
     }
 
-    /// Whether any row in the resident overlay has an uncommitted image.
-    /// Access paths over the committed value cache conservatively decline
-    /// while this is true; the ordinary scan then supplies exact command
-    /// visibility for every transaction.
-    pub fn has_pending_rows(&self, table_index: usize) -> bool {
+    /// Whether the current command can see one of `txid`'s pending images.
+    /// Other transactions' pending images do not invalidate the committed
+    /// value cache: row visibility ignores them and the committed key remains
+    /// installed until their transaction commits.
+    pub(crate) fn has_visible_pending_rows(&self, table_index: usize, txid: u32) -> bool {
         self.tables[table_index]
             .rows
             .iter()
-            .any(|(_, state)| state.pending.is_some())
+            .any(|(_, state)| state.pending.visible_at(txid, self.read_snapshot).is_some())
     }
 
     /// Releases a table's enforcer index slots back to the pool and clears its

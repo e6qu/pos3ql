@@ -47,3 +47,10 @@ Record only a genuinely intractable or externally blocked defect here. A row mus
 
 | ID | Status | Found | Description | Repro | Blocker |
 |----|--------|-------|-------------|-------|---------|
+
+The PostgreSQL 18.6 vendored regression expansion found no externally blocked
+defect. Float4 enum-order exhaustion, uncommitted enum-value safety, aliasless
+derived tables, bit/character/type-input edges, and truncated enum diagnostics
+from `pg_input_error_info` were fixed in the same change. Unsupported hash-index execution,
+physical planner parity, and native server extensions are architecture limits
+recorded in the compatibility and performance plans, not deferred bugs.

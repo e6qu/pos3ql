@@ -509,7 +509,7 @@ impl<'d> QueryScope<'d> {
             }
             return self.add(storage, tref, txid, arena);
         };
-        let exposed = tref.alias.expect("parser requires a derived-table alias");
+        let exposed = tref.alias.unwrap_or("*SELECT*");
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
@@ -690,7 +690,7 @@ impl<'d> QueryScope<'d> {
             }
             return self.add(storage, tref, txid, arena);
         };
-        let exposed = tref.alias.expect("parser requires a derived-table alias");
+        let exposed = tref.alias.unwrap_or("*SELECT*");
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,

@@ -51,6 +51,7 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("aclexplode")
         || name.eq_ignore_ascii_case("pg_get_sequence_data")
         || name.eq_ignore_ascii_case("pg_get_publication_tables")
+        || name.eq_ignore_ascii_case("pg_input_error_info")
         || name.eq_ignore_ascii_case("ts_parse")
         || name.eq_ignore_ascii_case("ts_token_type")
         || name.eq_ignore_ascii_case("ts_debug")
@@ -977,6 +978,42 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
             }
             return Ok(values);
         }
+        if name.eq_ignore_ascii_case("pg_input_error_info") {
+            if args.len() != 2 || *variadic {
+                return Err(srf_signature_error(name));
+            }
+            let input = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::Text(value) | Datum::Bpchar(value) => value,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(name)),
+            };
+            let type_name = match eval_full(args[1], arena, params, row, hooks)? {
+                Datum::Text(value) | Datum::Bpchar(value) => value,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(name)),
+            };
+            let error = crate::sql::eval::input_error(input, type_name, arena, hooks)?;
+            let fields = arena
+                .alloc_slice_with(4, |index| crate::sql::types::RecordField {
+                    name: ["message", "detail", "hint", "sql_error_code"][index],
+                    type_oid: crate::sql::types::oid::TEXT,
+                    value: Datum::Null,
+                })
+                .map_err(|_| arena_full())?;
+            if let Some(error) = error {
+                fields[0].value =
+                    Datum::Text(arena.alloc_str(error.message).map_err(|_| arena_full())?);
+                fields[3].value = Datum::Text(
+                    arena
+                        .alloc_str(error.sqlstate.as_str())
+                        .map_err(|_| arena_full())?,
+                );
+            }
+            let values = arena
+                .alloc_slice_with(1, |_| Datum::Record(fields))
+                .map_err(|_| arena_full())?;
+            return Ok(values);
+        }
         if name.eq_ignore_ascii_case("jsonb_path_query")
             || name.eq_ignore_ascii_case("jsonb_path_query_tz")
         {
@@ -1402,6 +1439,17 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
                 .and_then(|catalog| catalog.sequence_state_by_oid(oid))
                 .is_some(),
         ))
+    } else if name.eq_ignore_ascii_case("pg_input_error_info") {
+        if args.len() != 2 {
+            return Err(srf_signature_error(name));
+        }
+        let input = eval_full(args[0], arena, params, row, hooks)?;
+        let type_name = eval_full(args[1], arena, params, row, hooks)?;
+        match (input, type_name) {
+            (Datum::Null, _) | (_, Datum::Null) => Ok(0),
+            (Datum::Text(_) | Datum::Bpchar(_), Datum::Text(_) | Datum::Bpchar(_)) => Ok(1),
+            _ => Err(srf_signature_error(name)),
+        }
     } else if name.eq_ignore_ascii_case("regexp_matches") {
         // Number of matches: 0/1 without the `g` flag, else all non-overlapping.
         if !(2..=3).contains(&args.len()) {
@@ -2479,6 +2527,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_acl_explode = tref.table.eq_ignore_ascii_case("aclexplode");
     let is_sequence_data = tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
     let is_publication_tables = tref.table.eq_ignore_ascii_case("pg_get_publication_tables");
+    let is_input_error_info = tref.table.eq_ignore_ascii_case("pg_input_error_info");
+    let is_parse_ident = tref.table.eq_ignore_ascii_case("parse_ident");
     let is_ts_parse = tref.table.eq_ignore_ascii_case("ts_parse");
     let is_ts_token_type = tref.table.eq_ignore_ascii_case("ts_token_type");
     let is_ts_debug = tref.table.eq_ignore_ascii_case("ts_debug");
@@ -2507,6 +2557,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_acl_explode
         || is_sequence_data
         || is_publication_tables
+        || is_input_error_info
+        || is_parse_ident
         || is_ts_parse
         || is_ts_token_type
         || is_ts_debug
@@ -2535,7 +2587,24 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
     let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
-    let n_default = if is_object_address_record {
+    let n_default = if is_input_error_info {
+        if tref.func_args.unwrap_or(&[]).len() != 2 {
+            return Err(srf_signature_error(tref.table));
+        }
+        for (index, name) in ["message", "detail", "hint", "sql_error_code"]
+            .into_iter()
+            .enumerate()
+        {
+            default_cols[index] = table_function_column(
+                SqlName::parse(name)?,
+                ColType::Text,
+                None,
+                -1,
+                crate::sql::ast::Collation::Default,
+            );
+        }
+        4
+    } else if is_object_address_record {
         let arguments = tref.func_args.unwrap_or(&[]);
         if arguments.len() != 3 {
             return Err(srf_signature_error(tref.table));
@@ -3062,7 +3131,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             } else {
                 ColType::Xid8
             }
-        } else if is_re {
+        } else if is_re || is_parse_ident {
             ColType::Array(crate::sql::types::ArrElem::Text)
         } else if is_keys || is_rstt || is_stt {
             ColType::Text
@@ -3465,6 +3534,61 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
         None => crate::sql::eval::eval(argument, arena, params, columns),
     };
+    if tref.table.eq_ignore_ascii_case("parse_ident") {
+        if !(1..=2).contains(&args.len()) || tref.func_variadic {
+            return Err(srf_signature_error(tref.table));
+        }
+        let hooks = eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS);
+        let value = crate::sql::eval::funcs::string::dispatch(
+            tref.table, args, false, false, arena, params, columns, &hooks,
+        )
+        .ok_or_else(|| srf_signature_error(tref.table))??;
+        let encoded = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+        return arena
+            .alloc_slice_with(1, |_| encoded)
+            .map(|rows| &*rows)
+            .map_err(|_| arena_full());
+    }
+    if tref.table.eq_ignore_ascii_case("pg_input_error_info") {
+        if args.len() != 2 || tref.func_variadic {
+            return Err(srf_signature_error(tref.table));
+        }
+        let input = match eval_argument(args[0])? {
+            Datum::Text(value) | Datum::Bpchar(value) => value,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(srf_signature_error(tref.table)),
+        };
+        let type_name = match eval_argument(args[1])? {
+            Datum::Text(value) | Datum::Bpchar(value) => value,
+            Datum::Null => return Ok(&[]),
+            _ => return Err(srf_signature_error(tref.table)),
+        };
+        let catalog = super::storage_catalog(storage, arena, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+        };
+        let error = crate::sql::eval::input_error(input, type_name, arena, &hooks)?;
+        let values = if let Some(error) = error {
+            [
+                Datum::Text(arena.alloc_str(error.message).map_err(|_| arena_full())?),
+                Datum::Null,
+                Datum::Null,
+                Datum::Text(
+                    arena
+                        .alloc_str(error.sqlstate.as_str())
+                        .map_err(|_| arena_full())?,
+                ),
+            ]
+        } else {
+            [Datum::Null; 4]
+        };
+        let encoded = crate::sql::exec::encode_projected_pub(&values, arena)?;
+        return arena
+            .alloc_slice_with(1, |_| encoded)
+            .map(|rows| &*rows)
+            .map_err(|_| arena_full());
+    }
     if is_object_address_record_function(tref.table) {
         let catalog = super::storage_catalog(storage, arena, txid);
         let hooks = EvalHooks {

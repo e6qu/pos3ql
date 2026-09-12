@@ -17,7 +17,7 @@ use crate::sql_err;
 use crate::stack_format;
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate, type_mismatch,
+    ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate, text_arg, type_mismatch,
 };
 
 /// A catalog OID accepted by identity predicates.  Keeping conversion at the
@@ -796,6 +796,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_event_trigger_table_rewrite_oid"
             | "pg_event_trigger_table_rewrite_reason"
             | "pg_extension_config_dump"
+            | "pg_input_is_valid"
             | "current_database"
             | "current_catalog"
             | "current_schema"
@@ -1264,6 +1265,18 @@ pub(crate) fn dispatch<'a>(
                     env!("CARGO_PKG_VERSION"),
                     ") on aarch64-apple-darwin"
                 )))
+            }
+            "pg_input_is_valid" => {
+                arity(2)?;
+                let (Some(input), Some(type_name)) = (
+                    text_arg(name, args, 0, arena, params, row, hooks)?,
+                    text_arg(name, args, 1, arena, params, row, hooks)?,
+                ) else {
+                    return Ok(Datum::Null);
+                };
+                Ok(Datum::Bool(
+                    super::super::input_error(input, type_name, arena, hooks)?.is_none(),
+                ))
             }
             // pos3ql is a single-primary server and has no recovery/standby mode.
             "pg_is_in_recovery" => {

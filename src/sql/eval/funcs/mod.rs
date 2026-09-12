@@ -24,7 +24,7 @@ pub(super) mod money;
 pub(super) mod net;
 pub(super) mod range;
 pub(super) mod regex;
-pub(super) mod string;
+pub(crate) mod string;
 pub mod system;
 pub(super) mod uuid;
 pub(super) mod xml;

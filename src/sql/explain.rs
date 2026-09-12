@@ -37,6 +37,7 @@ struct PlanNode {
     width: u32,
     object_requests: u64,
     cache_blocks: u64,
+    constant_false: bool,
 }
 
 impl PlanNode {
@@ -51,6 +52,7 @@ impl PlanNode {
         width: 0,
         object_requests: 0,
         cache_blocks: 0,
+        constant_false: false,
     };
 }
 
@@ -745,6 +747,7 @@ fn scan_node(
         width,
         object_requests,
         cache_blocks,
+        constant_false: false,
     }
 }
 
@@ -761,6 +764,24 @@ pub(super) fn plan_select(
         None => None,
     };
     let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
+
+    if statement
+        .where_clause
+        .and_then(|predicate| query::plan_time_bool(predicate, arena))
+        == Some(false)
+    {
+        plan.push(PlanNode {
+            name: StackStr::from_str("Result"),
+            output,
+            rows: 0,
+            width,
+            total_cost: 0.0,
+            constant_false: true,
+            ..PlanNode::EMPTY
+        })?;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
+    }
 
     let mut estimated_rows = 1u64;
     let mut total_cost = 0.01f64;
@@ -1029,6 +1050,7 @@ fn physical_scan_node(
         width,
         object_requests,
         cache_blocks,
+        constant_false: false,
     }
 }
 
@@ -1086,6 +1108,7 @@ fn push_set_tree(
                 width: left.width.max(right.width),
                 object_requests: left.object_requests.saturating_add(right.object_requests),
                 cache_blocks: left.cache_blocks.saturating_add(right.cache_blocks),
+                constant_false: false,
             };
             plan.nodes[at] = node;
             Ok(node)
@@ -1190,6 +1213,7 @@ pub(super) fn plan_modification(
         width: 0,
         object_requests: 0,
         cache_blocks: 0,
+        constant_false: false,
     };
     plan.push(target_node)?;
     let child = if let Some(select) = source {
@@ -1312,6 +1336,14 @@ pub(super) fn visit_text_rows<E>(
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
             emit(output.as_str())?;
+        }
+        if node.constant_false {
+            let mut filter = StackStr::<64>::new();
+            for _ in 0..=node.depth {
+                let _ = write!(filter, "  ");
+            }
+            let _ = write!(filter, "One-Time Filter: false");
+            emit(filter.as_str())?;
         }
         if index == 0 && options.buffers {
             let actual = actual.expect("BUFFERS requires ANALYZE");
@@ -1593,6 +1625,9 @@ fn render_json_node(
         }
         let _ = write!(out, "]");
     }
+    if node.constant_false {
+        let _ = write!(out, ",\"One-Time Filter\":\"false\"");
+    }
     if at == 0
         && let Some(actual) = actual
     {
@@ -1760,6 +1795,9 @@ fn render_xml_node(
         }
         let _ = write!(out, "</Output>");
     }
+    if node.constant_false {
+        xml_field(out, "One-Time-Filter", "false");
+    }
     xml_field(out, "Disabled", "false");
     if at == 0
         && let Some(actual) = actual
@@ -1903,6 +1941,9 @@ fn render_yaml_node(
             json_string(out, column);
             let _ = writeln!(out);
         }
+    }
+    if node.constant_false {
+        yaml_field(out, field_indent, "One-Time Filter", "false");
     }
     yaml_number(out, field_indent, "Disabled", "false");
     if at == 0

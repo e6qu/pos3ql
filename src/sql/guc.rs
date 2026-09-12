@@ -411,6 +411,9 @@ pub struct RenderContext {
     /// instead of `\x` hex.
     pub bytea_escape: bool,
     pub xml_document: bool,
+    /// PostgreSQL's legacy significant-digit reduction for negative values.
+    /// Non-negative values use shortest-round-trip output.
+    pub extra_float_digits: i8,
 }
 
 impl Default for RenderContext {
@@ -422,6 +425,7 @@ impl Default for RenderContext {
             min_message_level: MessageLevel::Notice,
             bytea_escape: false,
             xml_document: false,
+            extra_float_digits: 1,
         }
     }
 }
@@ -2403,6 +2407,7 @@ impl GucState {
             min_message_level: values.client_min_messages,
             bytea_escape: values.bytea_escape,
             xml_document: values.xml_document,
+            extra_float_digits: values.extra_float_digits.as_str().parse().unwrap_or(1),
         }
     }
 }

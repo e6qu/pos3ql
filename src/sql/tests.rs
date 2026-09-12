@@ -38313,18 +38313,19 @@ fn hash_join_matches_nested_loop() {
         hash_plan.iter().any(|line| line.contains("Hash Join")),
         "EXPLAIN must expose the selected hash plan: {hash_plan:?}"
     );
-    // Predicate simplification may make this query return no rows, but it
-    // cannot retroactively change the physical plan EXPLAIN reports.
+    // PostgreSQL folds an immutable constant-false conjunct before choosing a
+    // scan, producing a Result with a one-time false filter.
     let simplified_hash_plan = data_rows(&run_with(
         &mut e,
         &mut b,
         "EXPLAIN SELECT e.name, d.dep FROM emp e, d WHERE e.did = d.id AND FALSE",
     ));
-    assert!(
-        simplified_hash_plan
-            .iter()
-            .any(|line| line.contains("Hash Join")),
-        "EXPLAIN must retain the parsed hash plan through simplification: {simplified_hash_plan:?}"
+    assert_eq!(
+        simplified_hash_plan,
+        [
+            "Result  (cost=0.00..0.00 rows=0 width=64)",
+            "  One-Time Filter: false"
+        ]
     );
     let nested_plan = data_rows(&run_with(
         &mut e,
@@ -44044,6 +44045,70 @@ fn enums_order_and_enforce() {
 }
 
 #[test]
+fn enum_float4_renumbering_and_new_value_safety() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE split_enum AS ENUM ('L1', 'L2'); \
+         CREATE TABLE split_rows (value split_enum); \
+         INSERT INTO split_rows VALUES ('L1'), ('L2')",
+    );
+    for index in 1..=30 {
+        let statement = format!("ALTER TYPE split_enum ADD VALUE 'i{index}' BEFORE 'L2'");
+        let output = run_with(&mut engine, &mut budget, &statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("ALTER TYPE"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT enumlabel, enumsortorder FROM pg_enum \
+             WHERE enumtypid = 'split_enum'::regtype AND enumsortorder <= 4 \
+             ORDER BY enumsortorder"
+        )),
+        ["L1|1", "i1|2", "i2|3", "i3|4"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM split_rows ORDER BY value"
+        )),
+        ["L1", "L2"]
+    );
+
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ALTER TYPE split_enum ADD VALUE 'uncommitted'",
+    );
+    let unsafe_use = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT 'uncommitted'::split_enum",
+    );
+    assert!(unsafe_use.contains("55P04"), "{unsafe_use}");
+    run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
+
+    let created_in_transaction = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "BEGIN; CREATE TYPE fresh_enum AS ENUM ('usable'); SELECT 'usable'::fresh_enum; ROLLBACK",
+    );
+    assert_eq!(data_rows(&created_in_transaction), ["usable"]);
+}
+
+#[test]
 fn enums_survive_restart() {
     let config = test_config("enum-durable");
     {
@@ -45850,6 +45915,38 @@ fn scalar_functions() {
         ["a,b"]
     );
     assert_eq!(
+        r(&mut e, &mut b, "SELECT concat(VARIADIC ARRAY[1,2,3])"),
+        ["123"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT concat_ws(',', VARIADIC ARRAY[1,2,3])"
+        ),
+        ["1,2,3"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT format('%1$s %3$s >>%2$*1$L<<', 10, 'Hello', 3)"
+        ),
+        ["10 3 >>   'Hello'<<"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT format('%2$s, %1$s', VARIADIC ARRAY['first','second'])"
+        ),
+        ["second, first"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT format('>>%-10s<<', 'Hello')"),
+        [">>Hello     <<"]
+    );
+    assert_eq!(
         r(&mut e, &mut b, "SELECT initcap('hello world')"),
         ["Hello World"]
     );
@@ -45860,6 +45957,98 @@ fn scalar_functions() {
     assert_eq!(r(&mut e, &mut b, "SELECT least(3, 1, 2)"), ["1"]);
     assert_eq!(r(&mut e, &mut b, "SELECT nullif(5, 5)"), ["NULL"]);
     assert_eq!(r(&mut e, &mut b, "SELECT nullif(5, 6)"), ["5"]);
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT pg_input_is_valid('34', 'int4'), pg_input_is_valid('bad', 'int4')"
+        ),
+        ["t|f"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT message, detail, hint, sql_error_code FROM pg_input_error_info('bad', 'int4')"
+        ),
+        ["invalid input syntax for type integer: \"bad\"|NULL|NULL|22P02"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT encode(float8send(1.0::float8), 'hex')"
+        ),
+        ["3ff0000000000000"]
+    );
+    assert_eq!(r(&mut e, &mut b, "SELECT float8(42::bigint)"), ["42"]);
+}
+
+#[test]
+fn upstream_type_input_and_identifier_regressions() {
+    let (mut e, mut b) = test_engine();
+    let r = |e: &mut Engine, b: &mut Budget, sql: &str| {
+        let output = run_with(e, b, sql);
+        let rows = data_rows(&output);
+        assert!(
+            !rows.is_empty(),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        rows
+    };
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT overlay(B'0101011100' placing '001' from 2 for 3), position(B'' in B'')"
+        ),
+        ["0001011100|0"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT '\\101'::\"char\", '\\000'::\"char\"::text"
+        ),
+        ["A|"]
+    );
+    assert_eq!(
+        r(&mut e, &mut b, "SELECT '0/16AE7F8' = '0/16AE7F8'::pg_lsn"),
+        ["t"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT pg_input_is_valid('01010001', 'bit(10)')"
+        ),
+        ["f"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT pg_input_is_valid('abcd  ', 'varchar(4)')"
+        ),
+        ["t"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT parse_ident('Foo.\"Bar\"'), parse_ident('foo.boo[]', strict => false)"
+        ),
+        ["{foo,Bar}|{foo,boo}"]
+    );
+    assert_eq!(
+        r(
+            &mut e,
+            &mut b,
+            "SELECT length(parts[1]), length(parts[2]) FROM parse_ident('\"long name\".second') AS parts"
+        ),
+        ["9|6"]
+    );
 }
 
 #[test]
@@ -57597,10 +57786,11 @@ fn derived_tables() {
         )),
         ["3|30", "4|40"]
     );
-    // A derived table must have an alias.
-    assert!(
-        String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT * FROM (SELECT 1)"))
-            .contains("42601")
+    // PostgreSQL 16 and newer synthesize an internal relation name when a
+    // derived table has no explicit alias.
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT * FROM (SELECT 1)")),
+        ["1"]
     );
     // A derived table as a set-operation branch (exercises describe_leaf).
     assert_eq!(

@@ -7950,7 +7950,8 @@ pub(crate) const MAX_COMPOSITE_FIELDS: usize = 16;
 /// One member of an enum type: a label plus its sort key. Ordering among enum
 /// values is by `sort` (PostgreSQL's `pg_enum.enumsortorder`), *not* by label
 /// text, so `ALTER TYPE ... ADD VALUE ... BEFORE/AFTER` inserts a value between
-/// two others by choosing a fractional sort key without renumbering the rest.
+/// two others by choosing a fractional float4 sort key, renumbering the type
+/// when no distinct midpoint remains.
 #[derive(Debug, Clone, Copy)]
 pub struct EnumMember {
     pub label: SqlName,
@@ -7988,6 +7989,7 @@ pub(crate) struct PendingEnumDefinition {
     pub name: SqlName,
     pub members: [EnumMember; MAX_ENUM_LABELS],
     pub n_members: usize,
+    pub unsafe_member_bits: u64,
 }
 
 impl EnumDef {
@@ -30337,6 +30339,27 @@ impl Storage {
         self.enums[slot].database == self.current_database && self.enums[slot].visible_to(txid)
     }
 
+    /// Whether `label` was added to a pre-existing enum by this transaction.
+    /// PostgreSQL makes such labels visible in the catalog but rejects their
+    /// use until commit; labels of a type created in the same transaction and
+    /// renamed committed labels are immediately safe.
+    pub(crate) fn enum_label_is_uncommitted(&self, slot: usize, label: &str, txid: u32) -> bool {
+        let enumeration = &self.enums[slot];
+        if enumeration.ddl_state == (CatalogDdlState::PendingCreate { txid }) {
+            return false;
+        }
+        let Some(pending) = enumeration
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+        else {
+            return false;
+        };
+        pending.members[..pending.n_members]
+            .iter()
+            .position(|member| member.label.as_str() == label)
+            .is_some_and(|index| pending.unsafe_member_bits & (1u64 << index) != 0)
+    }
+
     /// Committed enums carrying their slot indices, for the checkpoint,
     /// `pg_type` and `pg_enum`.
     pub fn live_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
@@ -30561,8 +30584,31 @@ impl Storage {
             name: definition.name,
             members: definition.members,
             n_members: definition.n_members,
+            unsafe_member_bits: prior.map_or(0, |pending| pending.unsafe_member_bits),
         });
         Ok(prior)
+    }
+
+    pub(crate) fn mark_enum_label_uncommitted(
+        &mut self,
+        slot: usize,
+        label: SqlName,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if self.enums[slot].ddl_state == (CatalogDdlState::PendingCreate { txid }) {
+            return Ok(());
+        }
+        let pending = self.enums[slot]
+            .pending_definition
+            .as_mut()
+            .filter(|pending| pending.txid == txid)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "enum alteration is not staged"))?;
+        let index = pending.members[..pending.n_members]
+            .iter()
+            .position(|member| member.label == label)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "new enum label is not staged"))?;
+        pending.unsafe_member_bits |= 1u64 << index;
+        Ok(())
     }
 
     pub(crate) fn commit_enum_alter(&mut self, slot: usize, txid: u32) {

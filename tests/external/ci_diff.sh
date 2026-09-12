@@ -1387,6 +1387,23 @@ for f in "$EXT"/differential/*.sql; do
   reset_corpus_pair
 done
 
+# These are unmodified inputs from PostgreSQL's own regression suite. Run the
+# selected dependency-closed schedule against both engines; PostgreSQL remains
+# the output and SQLSTATE oracle.
+echo "=== vendored PostgreSQL regression inputs ==="
+reset_corpus_pair
+if "$PY" "$EXT/postgres_regress_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" \
+    --setup "$EXT/postgres_regress_setup.sql" \
+    --manifest "$EXT/postgres_regress_schedule.tsv" \
+    --max-print "${POSTGRES_REGRESS_MAX_PRINT:-30}" \
+    > "$WORK/postgres-regress.out" 2>&1; then
+  ok "vendored PostgreSQL regression inputs ($(tail -1 "$WORK/postgres-regress.out"))"
+else
+  bad "vendored PostgreSQL regression inputs"
+  cat "$WORK/postgres-regress.out"
+fi
+reset_corpus_pair
+
 # --- exact-error corpora (message wording must match) -----------------------
 # Each phase owns its fixed 64-table test budget.  Reusing the curated corpus
 # server made otherwise independent checks fail only after its catalog filled.

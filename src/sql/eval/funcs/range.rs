@@ -45,6 +45,9 @@ pub(crate) fn dispatch<'a>(
             | "tsmultirange"
             | "tstzmultirange"
             | "multirange"
+            | "enum_first"
+            | "enum_last"
+            | "enum_range"
             | "isempty"
             | "lower_inc"
             | "upper_inc"
@@ -137,6 +140,90 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "enum_first" | "enum_last" | "enum_range" => {
+                if star
+                    || name != "enum_range" && args.len() != 1
+                    || name == "enum_range" && !(1..=2).contains(&args.len())
+                {
+                    return Err(arity_err(name, args.len()));
+                }
+                let mut bounds = [Datum::Null; 2];
+                for (target, expression) in bounds.iter_mut().zip(args) {
+                    *target = eval_full(expression, arena, params, row, hooks)?;
+                }
+                let slot = bounds
+                    .iter()
+                    .find_map(|value| match value {
+                        Datum::Enum { slot, .. } => Some(*slot),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        args.iter().find_map(|expression| match expression {
+                            Expr::Cast { type_name, .. } => hooks
+                                .catalog
+                                .and_then(|catalog| catalog.enum_slot_of_name(type_name)),
+                            _ => None,
+                        })
+                    })
+                    .ok_or_else(|| arity_err(name, args.len()))?;
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "enum catalog is unavailable"
+                    )
+                })?;
+                let values = catalog.enum_values(slot, arena)?.ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "enum type does not exist")
+                })?;
+                if name == "enum_first" {
+                    let value = values.first().copied().unwrap_or(Datum::Null);
+                    if let Datum::Enum { label, .. } = value {
+                        catalog.ensure_enum_label_safe(slot, label)?;
+                    }
+                    return Ok(value);
+                }
+                if name == "enum_last" {
+                    let value = values.last().copied().unwrap_or(Datum::Null);
+                    if let Datum::Enum { label, .. } = value {
+                        catalog.ensure_enum_label_safe(slot, label)?;
+                    }
+                    return Ok(value);
+                }
+                let lower = match bounds[0] {
+                    Datum::Enum { sort, .. } => Some(sort),
+                    Datum::Null => None,
+                    _ => return Err(arity_err(name, args.len())),
+                };
+                let upper = if args.len() == 2 {
+                    match bounds[1] {
+                        Datum::Enum { sort, .. } => Some(sort),
+                        Datum::Null => None,
+                        _ => return Err(arity_err(name, args.len())),
+                    }
+                } else {
+                    None
+                };
+                let selected = arena
+                    .alloc_slice_with(values.len(), |_| Datum::Null)
+                    .map_err(|_| super::super::arena_full())?;
+                let mut count = 0usize;
+                for &value in values {
+                    let Datum::Enum { sort, label, .. } = value else {
+                        unreachable!("enum catalog returned an enum member")
+                    };
+                    if lower.is_none_or(|lower| sort >= lower)
+                        && upper.is_none_or(|upper| sort <= upper)
+                    {
+                        catalog.ensure_enum_label_safe(slot, label)?;
+                        selected[count] = value;
+                        count += 1;
+                    }
+                }
+                Ok(Datum::Array {
+                    element: crate::sql::types::ArrElem::Enum(slot),
+                    raw: crate::sql::array::build(&selected[..count], arena)?,
+                })
+            }
             "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
                 let kind = RangeKind::from_name(name).expect("matched a range name");
                 if !(2..=3).contains(&args.len()) {

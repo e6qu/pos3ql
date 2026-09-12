@@ -159,6 +159,7 @@ pub(crate) fn dispatch<'a>(
     name: &str,
     args: &[&Expr<'a>],
     star: bool,
+    variadic: bool,
     arena: &'a crate::mem::arena::Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -352,7 +353,12 @@ pub(crate) fn dispatch<'a>(
                         }
                         Ok(Datum::Float8(total))
                     }
-                    other => Err(type_mismatch("length", &other)),
+                    other => Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function {}({}) does not exist",
+                        name,
+                        other.type_oid()
+                    )),
                 }
             }
             "upper" | "lower" => {
@@ -625,13 +631,27 @@ pub(crate) fn dispatch<'a>(
             "concat" => {
                 // Concatenates every argument's text form, skipping NULLs.
                 let mut total = 0usize;
-                let mut parts: [&str; 32] = [""; 32];
-                if args.len() > 32 || star {
+                let mut values = [Datum::Null; array::MAX_ELEMENTS];
+                let Some(values) = super::super::args::variadic_tail(
+                    name,
+                    args,
+                    0,
+                    variadic,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                    &mut values,
+                )?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let mut parts: [&str; array::MAX_ELEMENTS] = [""; array::MAX_ELEMENTS];
+                if star {
                     return Err(arity_err(name, args.len()));
                 }
                 let mut np = 0;
-                for a in args {
-                    let v = eval_full(a, arena, params, row, hooks)?;
+                for &v in values {
                     if v.is_null() {
                         continue;
                     }
@@ -650,25 +670,51 @@ pub(crate) fn dispatch<'a>(
                     Some(s) => s,
                     None => return Ok(Datum::Null),
                 };
-                let mut parts: [&str; 64] = [""; 64];
+                let mut values = [Datum::Null; array::MAX_ELEMENTS];
+                let Some(values) = super::super::args::variadic_tail(
+                    name,
+                    args,
+                    1,
+                    variadic,
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                    &mut values,
+                )?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let mut parts: [&str; array::MAX_ELEMENTS] = [""; array::MAX_ELEMENTS];
                 let mut np = 0;
                 let mut total = 0usize;
-                for a in &args[1..] {
-                    let v = eval_full(a, arena, params, row, hooks)?;
+                for &v in values {
                     if v.is_null() {
                         continue;
                     }
                     if np > 0 {
-                        parts[np] = sep;
                         total += sep.len();
-                        np += 1;
                     }
                     let t = datum_to_text(v, arena)?;
                     parts[np] = t;
                     total += t.len();
                     np += 1;
                 }
-                alloc_text(arena, &parts[..np], total)
+                let output = arena
+                    .alloc_slice_with(total, |_| 0u8)
+                    .map_err(|_| arena_full())?;
+                let mut at = 0usize;
+                for (index, part) in parts[..np].iter().enumerate() {
+                    if index > 0 {
+                        output[at..at + sep.len()].copy_from_slice(sep.as_bytes());
+                        at += sep.len();
+                    }
+                    output[at..at + part.len()].copy_from_slice(part.as_bytes());
+                    at += part.len();
+                }
+                Ok(Datum::Text(unsafe {
+                    core::str::from_utf8_unchecked(output)
+                }))
             }
             "initcap" => {
                 arity(1)?;
@@ -976,12 +1022,23 @@ pub(crate) fn dispatch<'a>(
             }
             // `parse_ident(text)`: split a qualified name into its parts as text[].
             "parse_ident" => {
-                arity(1)?;
+                if !(1..=2).contains(&args.len()) || star {
+                    return Err(super::super::arity_err(name, args.len()));
+                }
                 let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
+                let strict = if args.len() == 2 {
+                    match eval_full(args[1], arena, params, row, hooks)? {
+                        Datum::Bool(value) => value,
+                        Datum::Null => return Ok(Datum::Null),
+                        other => return Err(type_mismatch(name, &other)),
+                    }
+                } else {
+                    true
+                };
                 let mut parts = [Datum::Null; 64];
-                let n = parse_qualified_ident(s, &mut parts, arena)?;
+                let n = parse_qualified_ident(s, &mut parts, arena, strict)?;
                 Ok(Datum::Array {
                     element: ArrElem::Text,
                     raw: array::build(&parts[..n], arena)?,

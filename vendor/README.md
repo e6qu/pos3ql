@@ -50,14 +50,18 @@ subset here keeps the repo small while covering the core.
 
 ### `test/postgres-regress/` — testing only
 - **Upstream:** https://github.com/postgres/postgres (`src/test/regress`)
-- **Pinned tag/commit:** `REL_18_4` = `f5cc81719e6da4cbdb1f797c48b693e91018153a`
+- **Pinned tag/commit:** `REL_18_6` = `724edf9bde9d356724ad384a2e196edc3c9f80f7`
 - **License:** The PostgreSQL License — see `test/postgres-regress/COPYRIGHT`.
 - **What:** a slice of the official regression `.sql` inputs (and their
-  `expected/*.out`) that exercises features pos3ql implements: `int4`,
-  `int8`, `float8`, `text`, `boolean`, `case`. PostgreSQL's own suite is
-  thousands of statements across ~200 files; most of it uses features
-  outside our subset, so we vendor the parts we can meaningfully diff and
-  let the harness categorize the rest as "unsupported".
+  `expected/*.out`) that exercises `boolean`, `text`, `int4`, `int8`,
+  `float8`, `case`, `bit`, `uuid`, `enum`, `varchar`, `char`, `name`, `md5`,
+  and `pg_lsn`. The manifest in
+  `tests/external/postgres_regress_schedule.tsv` is executable policy: every
+  listed statement-boundary range is run against PostgreSQL and pos3ql with a
+  zero-mismatch budget. Its explicit gaps require review and correspond to
+  documented architecture limits rather than hidden expected failures.
+  `float8.sql` stops before its native `regress.so` test type; that
+  server-extension ABI is intentionally outside pos3ql's architecture.
 
 ## Integrity
 

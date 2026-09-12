@@ -60,6 +60,7 @@ pub(crate) fn dispatch<'a>(
             | "byteain"
             | "byteaout"
             | "byteasend"
+            | "float8send"
             | "byteaeq"
             | "byteane"
             | "bytealt"
@@ -172,6 +173,17 @@ pub(crate) fn dispatch<'a>(
                 bytea_arg(name, args, 0, arena, params, row, hooks)
                     .map(|value| value.map_or(Datum::Null, Datum::Bytea))
             }
+            "float8send" => {
+                arity(1)?;
+                match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Null => Ok(Datum::Null),
+                    Datum::Float8(value) => arena
+                        .alloc_slice_copy(&value.to_bits().to_be_bytes())
+                        .map(|bytes| Datum::Bytea(&*bytes))
+                        .map_err(|_| arena_full()),
+                    other => Err(type_mismatch(name, &other)),
+                }
+            }
             "byteaeq" | "byteane" | "bytealt" | "byteale" | "byteagt" | "byteage" | "byteacmp"
             | "byteacat" | "bytealike" | "byteanlike" | "bytea_larger" | "bytea_smaller" => {
                 arity(2)?;
@@ -253,7 +265,7 @@ pub(crate) fn dispatch<'a>(
                 let Some(type_modifier) = int_arg(name, args, 2, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let bits = super::super::validate_bits(text)?;
+                let bits = super::super::cast::parse_bits_text(text, arena)?;
                 if type_modifier >= 0
                     && (bits.len() > type_modifier as usize
                         || name == "bit_in" && bits.len() != type_modifier as usize)
@@ -755,9 +767,26 @@ pub(crate) fn dispatch<'a>(
                     return Err(super::super::arity_err(name, args.len()));
                 }
                 let source = eval_full(args[0], arena, params, row, hooks)?;
-                let replacement = eval_full(args[1], arena, params, row, hooks)?;
+                let mut replacement = eval_full(args[1], arena, params, row, hooks)?;
                 if source.is_null() || replacement.is_null() {
                     return Ok(Datum::Null);
+                }
+                if matches!(args[1], Expr::Str(_)) {
+                    replacement = match source {
+                        Datum::Bytea(_) => {
+                            super::super::cast_to(replacement, ColType::Bytea, arena)?
+                        }
+                        Datum::Bit { varying, .. } => Datum::Bit {
+                            bits: match replacement {
+                                Datum::Text(text) => {
+                                    super::super::cast::parse_bits_text(text, arena)?
+                                }
+                                _ => unreachable!("unknown literal evaluates as text"),
+                            },
+                            varying,
+                        },
+                        _ => replacement,
+                    };
                 }
                 let Some(start) = int_arg(name, args, 2, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
@@ -835,7 +864,11 @@ pub(crate) fn dispatch<'a>(
                 let found = match (haystack, needle) {
                     (Datum::Bytea(haystack), Datum::Bytea(needle)) => find_bytes(haystack, needle),
                     (Datum::Bit { bits: haystack, .. }, Datum::Bit { bits: needle, .. }) => {
-                        find_bytes(haystack.as_bytes(), needle.as_bytes())
+                        if needle.is_empty() && haystack.is_empty() {
+                            None
+                        } else {
+                            find_bytes(haystack.as_bytes(), needle.as_bytes())
+                        }
                     }
                     (left, right) => {
                         return Err(sql_err!(

@@ -3257,6 +3257,11 @@ impl<'a> Datum<'a> {
 /// `{}` never chooses scientific notation, so `1e300` printed as 301
 /// digits until a COPY-of-every-type corpus caught it.
 fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
+    let extra = super::guc::active_render().map_or(1, |render| render.extra_float_digits);
+    write_pg_float8_with_extra(f, v, extra)
+}
+
+fn write_pg_float8_with_extra(f: &mut fmt::Formatter<'_>, v: f64, extra: i8) -> fmt::Result {
     if v.is_infinite() {
         return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
     }
@@ -3270,6 +3275,11 @@ fn write_pg_float8(f: &mut fmt::Formatter<'_>, v: f64) -> fmt::Result {
     // boundary handling, which Rust's `{:e}` does not reproduce). float8out
     // uses fixed notation for decimal exponents in [-4, 15).
     let (digits, exp10) = crate::sql::ryu::f64_shortest(v);
+    let (digits, exp10) = if extra <= 0 {
+        rounded_float_digits(digits, exp10, (15i8 + extra).max(1) as usize)
+    } else {
+        (digits, exp10)
+    };
     let mut buf = crate::util::StackStr::<24>::new();
     let _ = write!(buf, "{digits}");
     let digits = buf.as_str();
@@ -3287,12 +3297,25 @@ impl fmt::Display for PgFloat8 {
     }
 }
 
+pub(crate) struct PgFloat8Rendered(pub f64, pub i8);
+
+impl fmt::Display for PgFloat8Rendered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_pg_float8_with_extra(f, self.0, self.1)
+    }
+}
+
 /// `real`/float4 output, byte-for-byte with PostgreSQL. Its shortest digits
 /// come from PostgreSQL's own Ryū (see [`crate::sql::ryu`]) — Rust's
 /// `{:e}` resolves boundary cases differently — and its notation window is
 /// narrower: fixed notation for decimal exponents in [-4, 6), scientific
 /// otherwise.
 fn write_pg_float4(f: &mut fmt::Formatter<'_>, v: f32) -> fmt::Result {
+    let extra = super::guc::active_render().map_or(1, |render| render.extra_float_digits);
+    write_pg_float4_with_extra(f, v, extra)
+}
+
+fn write_pg_float4_with_extra(f: &mut fmt::Formatter<'_>, v: f32, extra: i8) -> fmt::Result {
     if v.is_infinite() {
         return f.write_str(if v > 0.0 { "Infinity" } else { "-Infinity" });
     }
@@ -3303,6 +3326,12 @@ fn write_pg_float4(f: &mut fmt::Formatter<'_>, v: f32) -> fmt::Result {
         return f.write_str(if v.is_sign_negative() { "-0" } else { "0" });
     }
     let (digits, exp10) = crate::sql::ryu::f32_shortest(v);
+    let digits = u64::from(digits);
+    let (digits, exp10) = if extra <= 0 {
+        rounded_float_digits(digits, exp10, (6i8 + extra).max(1) as usize)
+    } else {
+        (digits, exp10)
+    };
     let mut buf = crate::util::StackStr::<16>::new();
     let _ = write!(buf, "{digits}");
     let digits = buf.as_str();
@@ -3311,6 +3340,31 @@ fn write_pg_float4(f: &mut fmt::Formatter<'_>, v: f32) -> fmt::Result {
     let exp = exp10 + (digits.len() as i32 - 1);
     let sign = if v.is_sign_negative() { "-" } else { "" };
     write_pg_float_notation(f, sign, head, tail, exp, 6)
+}
+
+pub(crate) struct PgFloat4Rendered(pub f32, pub i8);
+
+impl fmt::Display for PgFloat4Rendered {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_pg_float4_with_extra(f, self.0, self.1)
+    }
+}
+
+/// Reduces a Ryū mantissa to PostgreSQL's requested number of significant
+/// digits, rounding half upward as the legacy float output path does.
+fn rounded_float_digits(mut digits: u64, mut exponent: i32, significant: usize) -> (u64, i32) {
+    let count = digits.ilog10() as usize + 1;
+    if count > significant {
+        let discarded = count - significant;
+        let divisor = 10u64.pow(discarded as u32);
+        digits = (digits + divisor / 2) / divisor;
+        exponent += discarded as i32;
+        while digits > 0 && digits.is_multiple_of(10) {
+            digits /= 10;
+            exponent += 1;
+        }
+    }
+    (digits, exponent)
 }
 
 /// Renders shortest-decimal digits under PostgreSQL's float output rule: fixed
@@ -3390,11 +3444,9 @@ impl fmt::Display for Datum<'_> {
             Datum::Int8(v) => write!(f, "{v}"),
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
-            // Direct protocol and COPY output bypass `Display` so an
-            // arbitrary byte remains arbitrary there. `Display` is used only
-            // by SQL text construction, which must stay valid UTF-8.
             Datum::Char(0) => Ok(()),
-            Datum::Char(value) => f.write_char(char::from(*value)),
+            Datum::Char(value @ 0x20..=0x7e) => f.write_char(char::from(*value)),
+            Datum::Char(value) => write!(f, "\\{value:03o}"),
             // The output function emits the padding — psql shows `hi   `.
             Datum::Text(s)
             | Datum::Bpchar(s)

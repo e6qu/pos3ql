@@ -1822,6 +1822,11 @@ fn json_each_value_type(name: &str) -> Option<ColType> {
 }
 
 fn builtin_record_srf_field(name: &str, index: usize) -> Option<(&'static str, ColType)> {
+    if name.eq_ignore_ascii_case("pg_input_error_info") {
+        return ["message", "detail", "hint", "sql_error_code"]
+            .get(index)
+            .map(|name| (*name, ColType::Text));
+    }
     if let Some(value_type) = json_each_value_type(name) {
         return match index {
             0 => Some(("key", ColType::Text)),
@@ -3613,7 +3618,10 @@ pub fn infer_type_res(
             | "has_server_privilege"
             | "has_largeobject_privilege"
             | "has_parameter_privilege"
-            | "pg_relation_is_publishable" => of(ColType::Bool),
+            | "pg_relation_is_publishable"
+            | "pg_input_is_valid"
+            | "booleq"
+            | "boolne" => of(ColType::Bool),
             "pg_get_replica_identity_index" => of(ColType::Regclass),
             "pg_is_other_temp_schema" => of(ColType::Bool),
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
@@ -4281,6 +4289,7 @@ pub fn infer_type_res(
             | "aclexplode"
             | "pg_get_sequence_data"
             | "pg_get_publication_tables"
+            | "pg_input_error_info"
             | "_pg_expandarray" => (oid::RECORD, -1),
             "grouping" => of(ColType::Int4),
             "make_date" => of(ColType::Date),
@@ -4349,7 +4358,7 @@ pub fn infer_type_res(
             "date_mi" => of(ColType::Int4),
             // Encoding / hashing / bytea manipulation.
             "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "convert_to"
-            | "convert" | "byteain" | "byteasend" | "byteacat" | "bytea_larger"
+            | "convert" | "byteain" | "byteasend" | "float8send" | "byteacat" | "bytea_larger"
             | "bytea_smaller" | "bit_send" | "varbit_send" | "bytea" => of(ColType::Bytea),
             "set_bit" => match args
                 .first()
@@ -4367,6 +4376,7 @@ pub fn infer_type_res(
             }
             "int2" => of(ColType::Int2),
             "int8" | "crc32" | "crc32c" | "hashbyteaextended" => of(ColType::Int8),
+            "float8" => of(ColType::Float8),
             "byteaeq" | "byteane" | "bytealt" | "byteale" | "byteagt" | "byteage" | "bytealike"
             | "byteanlike" | "biteq" | "bitne" | "bitlt" | "bitle" | "bitgt" | "bitge"
             | "varbiteq" | "varbitne" | "varbitlt" | "varbitle" | "varbitgt" | "varbitge" => {

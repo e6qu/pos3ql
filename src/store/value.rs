@@ -1,21 +1,28 @@
 //! Object-resident secondary-index generations.
 //!
-//! A generation is an immutable sequence of key-only data blocks plus one
+//! A generation is an immutable sequence of data blocks plus one
 //! roster block naming them. Each entry carries the equality hash, encoded
-//! key tuple, row identity, and commit LSN. Readers can therefore reject an
-//! equality miss without fetching a row; every candidate is still checked
-//! against the authoritative MVCC row image by the storage layer.
+//! key tuple, optional included-column payload, row identity, and commit LSN.
+//! Readers can therefore reject an equality miss and satisfy a covering scan
+//! without fetching a row; every candidate is still checked against the
+//! authoritative MVCC row identity by the storage layer.
 
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
 const ENTRY_HEADER: usize = 8 + 8 + 8 + 4;
+const COVERING_ENTRY_HEADER: usize = ENTRY_HEADER + 4;
 // Checkpoint construction externally sorts the complete entry with an
 // eight-byte stable ordinal inside an SST row, whose own header is 20 bytes.
 pub(crate) const VALUE_INDEX_KEY_MAX: usize = MAX_PAYLOAD - ENTRY_HEADER - 8 - 20;
+/// Maximum combined encoded key and INCLUDE payload accepted before commit.
+/// The headroom is the external sort ordinal and row header used by checkpoint.
+pub(crate) const VALUE_INDEX_TUPLE_MAX: usize = MAX_PAYLOAD - COVERING_ENTRY_HEADER - 8 - 20;
 const ROSTER_CHAINED: u32 = 1 << 31;
 const ROSTER_BLOCK_FILTERS: u32 = 1 << 30;
 const ROSTER_ORDERED_BOUNDS: u32 = 1 << 29;
-const ROSTER_COUNT_MASK: u32 = !(ROSTER_CHAINED | ROSTER_BLOCK_FILTERS | ROSTER_ORDERED_BOUNDS);
+const ROSTER_COVERING_PAYLOADS: u32 = 1 << 28;
+const ROSTER_COUNT_MASK: u32 =
+    !(ROSTER_CHAINED | ROSTER_BLOCK_FILTERS | ROSTER_ORDERED_BOUNDS | ROSTER_COVERING_PAYLOADS);
 const ROSTER_HEADER: usize = 4 + 32;
 /// Enough bits for the largest possible data block to retain a useful false
 /// positive rate while still grouping dozens of data blocks under one roster.
@@ -64,6 +71,7 @@ pub(crate) struct ValueIndexWriter {
     block_count: usize,
     roster_tail: Option<BlockId>,
     entries: u64,
+    covering: Option<bool>,
 }
 
 impl ValueIndexWriter {
@@ -79,6 +87,7 @@ impl ValueIndexWriter {
             block_count: 0,
             roster_tail: None,
             entries: 0,
+            covering: None,
         }
     }
 
@@ -95,6 +104,7 @@ impl ValueIndexWriter {
         self.block_count = 0;
         self.roster_tail = None;
         self.entries = 0;
+        self.covering = None;
     }
 
     pub(crate) fn append(
@@ -106,7 +116,39 @@ impl ValueIndexWriter {
         key: &[u8],
         compare: &mut impl FnMut(&[u8], &[u8]) -> core::cmp::Ordering,
     ) -> Result<(), ValueIndexError> {
+        self.append_inner(store, (hash, rowid, commit_lsn), key, None, compare)
+    }
+
+    pub(crate) fn append_covering(
+        &mut self,
+        store: &mut dyn BlockStore,
+        identity: (u64, u64, u64),
+        key: &[u8],
+        payload: &[u8],
+        compare: &mut impl FnMut(&[u8], &[u8]) -> core::cmp::Ordering,
+    ) -> Result<(), ValueIndexError> {
+        self.append_inner(store, identity, key, Some(payload), compare)
+    }
+
+    fn append_inner(
+        &mut self,
+        store: &mut dyn BlockStore,
+        identity: (u64, u64, u64),
+        key: &[u8],
+        payload: Option<&[u8]>,
+        compare: &mut impl FnMut(&[u8], &[u8]) -> core::cmp::Ordering,
+    ) -> Result<(), ValueIndexError> {
+        let (hash, rowid, commit_lsn) = identity;
         if key.len() > VALUE_INDEX_KEY_MAX {
+            return Err(ValueIndexError::KeyTooLarge);
+        }
+        let covering = payload.is_some();
+        if self.covering.is_some_and(|prior| prior != covering) {
+            return Err(ValueIndexError::Corrupt);
+        }
+        self.covering = Some(covering);
+        let payload = payload.unwrap_or_default();
+        if covering && key.len().saturating_add(payload.len()) > VALUE_INDEX_TUPLE_MAX {
             return Err(ValueIndexError::KeyTooLarge);
         }
         if self.entries > 0 {
@@ -121,7 +163,12 @@ impl ValueIndexWriter {
                 return Err(ValueIndexError::KeyOutOfOrder);
             }
         }
-        let bytes = ENTRY_HEADER + key.len();
+        let header = if covering {
+            COVERING_ENTRY_HEADER
+        } else {
+            ENTRY_HEADER
+        };
+        let bytes = header + key.len() + payload.len();
         if self.pending_len + bytes > MAX_PAYLOAD {
             self.flush(store)?;
         }
@@ -131,8 +178,12 @@ impl ValueIndexWriter {
         self.pending[at + 8..at + 16].copy_from_slice(&rowid.to_le_bytes());
         self.pending[at + 16..at + 24].copy_from_slice(&commit_lsn.to_le_bytes());
         self.pending[at + 24..at + 28].copy_from_slice(&(key.len() as u32).to_le_bytes());
-        self.pending[at + ENTRY_HEADER..at + bytes].copy_from_slice(key);
-        let key_extent = (at + ENTRY_HEADER, key.len());
+        if covering {
+            self.pending[at + 28..at + 32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        }
+        self.pending[at + header..at + header + key.len()].copy_from_slice(key);
+        self.pending[at + header + key.len()..at + bytes].copy_from_slice(payload);
+        let key_extent = (at + header, key.len());
         self.pending_first.get_or_insert(key_extent);
         self.pending_last = Some(key_extent);
         self.pending_len += bytes;
@@ -194,7 +245,16 @@ impl ValueIndexWriter {
     fn flush_roster(&mut self, store: &mut dyn BlockStore) -> Result<(), ValueIndexError> {
         let count = u32::try_from(self.block_count).map_err(|_| ValueIndexError::Corrupt)?;
         self.roster[..4].copy_from_slice(
-            &(count | ROSTER_CHAINED | ROSTER_BLOCK_FILTERS | ROSTER_ORDERED_BOUNDS).to_le_bytes(),
+            &(count
+                | ROSTER_CHAINED
+                | ROSTER_BLOCK_FILTERS
+                | ROSTER_ORDERED_BOUNDS
+                | if self.covering == Some(true) {
+                    ROSTER_COVERING_PAYLOADS
+                } else {
+                    0
+                })
+            .to_le_bytes(),
         );
         self.roster[4..36].fill(0);
         if let Some(previous) = self.roster_tail {
@@ -242,7 +302,7 @@ enum RosterFormat {
 fn roster_layout(
     raw_count: u32,
     roster_len: usize,
-) -> Result<(usize, RosterFormat), ValueIndexError> {
+) -> Result<(usize, RosterFormat, bool), ValueIndexError> {
     if raw_count & ROSTER_CHAINED == 0 {
         return Err(ValueIndexError::Corrupt);
     }
@@ -271,7 +331,11 @@ fn roster_layout(
             return Err(ValueIndexError::Corrupt);
         }
     }
-    Ok((block_count, format))
+    Ok((
+        block_count,
+        format,
+        raw_count & ROSTER_COVERING_PAYLOADS != 0,
+    ))
 }
 
 type RosterRef<'a> = (BlockId, Option<&'a [u8]>, Option<(&'a [u8], &'a [u8])>);
@@ -342,7 +406,7 @@ pub(crate) fn walk_value_roster(
             return Err(ValueIndexError::Corrupt);
         }
         let raw_count = u32::from_le_bytes(scratch[..4].try_into().unwrap());
-        let (block_count, format) = roster_layout(raw_count, roster_len)?;
+        let (block_count, format, _) = roster_layout(raw_count, roster_len)?;
         next = if scratch[4..36].iter().any(|byte| *byte != 0) {
             let mut id = [0; 32];
             id.copy_from_slice(&scratch[4..36]);
@@ -383,8 +447,21 @@ impl<'a> ValueIndexReader<'a> {
         hash: u64,
         mut visit: impl FnMut(u64, u64, &[u8]),
     ) -> Result<(), ValueIndexError> {
-        self.walk_inner(store, handle, Some(hash), |_, rowid, lsn, key| {
+        self.walk_inner(store, handle, Some(hash), |_, rowid, lsn, key, _| {
             visit(rowid, lsn, key);
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_covering(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &ValueIndexHandle,
+        hash: u64,
+        mut visit: impl FnMut(u64, u64, &[u8], &[u8]),
+    ) -> Result<(), ValueIndexError> {
+        self.walk_inner(store, handle, Some(hash), |_, rowid, lsn, key, payload| {
+            visit(rowid, lsn, key, payload);
         })
     }
 
@@ -392,20 +469,38 @@ impl<'a> ValueIndexReader<'a> {
         &mut self,
         store: &mut dyn BlockStore,
         handle: &ValueIndexHandle,
-        visit: impl FnMut(u64, u64, u64, &[u8]),
+        mut visit: impl FnMut(u64, u64, u64, &[u8]),
     ) -> Result<(), ValueIndexError> {
-        self.walk_inner(store, handle, None, visit)
+        self.walk_inner(store, handle, None, |hash, rowid, lsn, key, _| {
+            visit(hash, rowid, lsn, key);
+        })
     }
 
     /// Visits only the ordered interval selected by `classify`. Legacy
     /// generations have no block bounds and remain readable through the same
     /// path, but cannot skip their data blocks until the next checkpoint.
+    #[cfg(test)]
     pub(crate) fn range(
         &mut self,
         store: &mut dyn BlockStore,
         handle: &ValueIndexHandle,
         mut classify: impl FnMut(&[u8]) -> ValueIndexPosition,
         mut visit: impl FnMut(u64, u64, u64, &[u8]),
+    ) -> Result<(), ValueIndexError> {
+        self.range_covering(
+            store,
+            handle,
+            |key| classify(key),
+            |hash, rowid, lsn, key, _| visit(hash, rowid, lsn, key),
+        )
+    }
+
+    pub(crate) fn range_covering(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &ValueIndexHandle,
+        mut classify: impl FnMut(&[u8]) -> ValueIndexPosition,
+        mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
         let mut next = Some(handle.roster);
         let mut roster_count = 0u64;
@@ -419,7 +514,7 @@ impl<'a> ValueIndexReader<'a> {
                 return Err(ValueIndexError::Corrupt);
             }
             let raw_count = u32::from_le_bytes(self.roster[..4].try_into().unwrap());
-            let (block_count, format) = roster_layout(raw_count, roster_len)?;
+            let (block_count, format, covering) = roster_layout(raw_count, roster_len)?;
             next = roster_predecessor(&self.roster[..roster_len]);
             let mut cursor = ROSTER_HEADER;
             for _ in 0..block_count {
@@ -434,11 +529,15 @@ impl<'a> ValueIndexReader<'a> {
                 if kind != BlockType::ValueIndexData {
                     return Err(ValueIndexError::Corrupt);
                 }
-                walk_data(&self.data[..data_len], |hash, rowid, lsn, key| {
-                    if classify(key) == ValueIndexPosition::Match {
-                        visit(hash, rowid, lsn, key);
-                    }
-                })?;
+                walk_data(
+                    &self.data[..data_len],
+                    covering,
+                    |hash, rowid, lsn, key, payload| {
+                        if classify(key) == ValueIndexPosition::Match {
+                            visit(hash, rowid, lsn, key, payload);
+                        }
+                    },
+                )?;
             }
             if cursor != roster_len {
                 return Err(ValueIndexError::Corrupt);
@@ -452,7 +551,7 @@ impl<'a> ValueIndexReader<'a> {
         store: &mut dyn BlockStore,
         handle: &ValueIndexHandle,
         target_hash: Option<u64>,
-        mut visit: impl FnMut(u64, u64, u64, &[u8]),
+        mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
         let mut seen = 0u64;
         let mut next = Some(handle.roster);
@@ -467,7 +566,7 @@ impl<'a> ValueIndexReader<'a> {
                 return Err(ValueIndexError::Corrupt);
             }
             let raw_count = u32::from_le_bytes(self.roster[..4].try_into().unwrap());
-            let (block_count, format) = roster_layout(raw_count, roster_len)?;
+            let (block_count, format, covering) = roster_layout(raw_count, roster_len)?;
             next = roster_predecessor(&self.roster[..roster_len]);
             let mut roster_cursor = ROSTER_HEADER;
             for _ in 0..block_count {
@@ -482,12 +581,16 @@ impl<'a> ValueIndexReader<'a> {
                 if kind != BlockType::ValueIndexData {
                     return Err(ValueIndexError::Corrupt);
                 }
-                walk_data(&self.data[..data_len], |hash, rowid, lsn, key| {
-                    if target_hash.is_none_or(|target| target == hash) {
-                        visit(hash, rowid, lsn, key);
-                    }
-                    seen += 1;
-                })?;
+                walk_data(
+                    &self.data[..data_len],
+                    covering,
+                    |hash, rowid, lsn, key, payload| {
+                        if target_hash.is_none_or(|target| target == hash) {
+                            visit(hash, rowid, lsn, key, payload);
+                        }
+                        seen += 1;
+                    },
+                )?;
             }
             if roster_cursor != roster_len {
                 return Err(ValueIndexError::Corrupt);
@@ -510,11 +613,17 @@ fn roster_predecessor(bytes: &[u8]) -> Option<BlockId> {
 
 fn walk_data(
     data: &[u8],
-    mut visit: impl FnMut(u64, u64, u64, &[u8]),
+    covering: bool,
+    mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
 ) -> Result<(), ValueIndexError> {
     let mut cursor = 0usize;
     while cursor < data.len() {
-        if data.len() - cursor < ENTRY_HEADER {
+        let header = if covering {
+            COVERING_ENTRY_HEADER
+        } else {
+            ENTRY_HEADER
+        };
+        if data.len() - cursor < header {
             return Err(ValueIndexError::Corrupt);
         }
         let hash = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
@@ -522,12 +631,26 @@ fn walk_data(
         let lsn = u64::from_le_bytes(data[cursor + 16..cursor + 24].try_into().unwrap());
         let key_len =
             u32::from_le_bytes(data[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
+        let payload_len = if covering {
+            u32::from_le_bytes(data[cursor + 28..cursor + 32].try_into().unwrap()) as usize
+        } else {
+            0
+        };
         let end = cursor
-            .checked_add(ENTRY_HEADER)
+            .checked_add(header)
             .and_then(|start| start.checked_add(key_len))
+            .and_then(|start| start.checked_add(payload_len))
             .filter(|end| *end <= data.len())
             .ok_or(ValueIndexError::Corrupt)?;
-        visit(hash, rowid, lsn, &data[cursor + ENTRY_HEADER..end]);
+        let key_at = cursor + header;
+        let payload_at = key_at + key_len;
+        visit(
+            hash,
+            rowid,
+            lsn,
+            &data[key_at..payload_at],
+            &data[payload_at..end],
+        );
         cursor = end;
     }
     Ok(())
@@ -562,6 +685,78 @@ mod tests {
             })
             .unwrap();
         assert_eq!(found, [(12, 4, b"beta".to_vec())]);
+    }
+
+    #[test]
+    fn covering_generation_round_trips_payloads() {
+        let mut budget = Budget::new(8 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "covering value test", 4 << 20, 32).unwrap();
+        let mut writer = ValueIndexWriter::new();
+        let mut compare = |left: &[u8], right: &[u8]| left.cmp(right);
+        writer
+            .append_covering(
+                &mut store,
+                (7, 11, 3),
+                b"alpha",
+                b"first payload",
+                &mut compare,
+            )
+            .unwrap();
+        writer
+            .append_covering(
+                &mut store,
+                (9, 12, 4),
+                b"beta",
+                b"second payload",
+                &mut compare,
+            )
+            .unwrap();
+        let handle = writer.finish(&mut store, 10).unwrap().unwrap();
+        let mut roster = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        let mut found = None;
+        ValueIndexReader::over(&mut roster, &mut data)
+            .probe_covering(&mut store, &handle, 9, |rowid, lsn, key, payload| {
+                found = Some((rowid, lsn, key.to_vec(), payload.to_vec()));
+            })
+            .unwrap();
+        assert_eq!(
+            found,
+            Some((12, 4, b"beta".to_vec(), b"second payload".to_vec()))
+        );
+    }
+
+    #[test]
+    fn malformed_covering_payload_length_is_rejected() {
+        let mut budget = Budget::new(8 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "bad covering value", 4 << 20, 32).unwrap();
+        let mut entry = [0u8; COVERING_ENTRY_HEADER + 1];
+        entry[..8].copy_from_slice(&7u64.to_le_bytes());
+        entry[8..16].copy_from_slice(&11u64.to_le_bytes());
+        entry[16..24].copy_from_slice(&3u64.to_le_bytes());
+        entry[24..28].copy_from_slice(&1u32.to_le_bytes());
+        entry[28..32].copy_from_slice(&99u32.to_le_bytes());
+        entry[COVERING_ENTRY_HEADER] = b'k';
+        let data = store.put(&entry, BlockType::ValueIndexData, 0).unwrap();
+        let mut roster = [0u8; ROSTER_HEADER + 32];
+        roster[..4].copy_from_slice(&(1 | ROSTER_CHAINED | ROSTER_COVERING_PAYLOADS).to_le_bytes());
+        roster[ROSTER_HEADER..].copy_from_slice(&data.0);
+        let roster = store.put(&roster, BlockType::ValueIndexRoster, 0).unwrap();
+        let handle = ValueIndexHandle {
+            roster,
+            entries: 1,
+            published_lsn: 3,
+        };
+        let mut roster_scratch = vec![0; MAX_PAYLOAD];
+        let mut data_scratch = vec![0; MAX_PAYLOAD];
+        assert_eq!(
+            ValueIndexReader::over(&mut roster_scratch, &mut data_scratch)
+                .probe_covering(&mut store, &handle, 7, |_, _, _, _| {})
+                .unwrap_err(),
+            ValueIndexError::Corrupt
+        );
     }
 
     #[test]

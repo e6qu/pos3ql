@@ -210,7 +210,7 @@ def workload_sql(workload, worker, operation, rows):
             f"WHERE id >= {lower}"
         )
     if workload == "ordered-limit":
-        return "SELECT id FROM benchmark_kv ORDER BY id DESC LIMIT 32"
+        return "SELECT id, payload FROM benchmark_kv ORDER BY id DESC LIMIT 32"
     if workload == "join-probe":
         lower = max(1, min(key, rows - 31))
         upper = min(rows, lower + 31)
@@ -239,6 +239,10 @@ def setup_database(connection, rows):
         "CREATE TABLE benchmark_kv("
         "id integer PRIMARY KEY, payload bigint NOT NULL, "
         "padding text NOT NULL DEFAULT repeat('x', 8192))"
+    )
+    connection.query(
+        "CREATE INDEX benchmark_covering "
+        "ON benchmark_kv (id DESC) INCLUDE (payload)"
     )
     # Keep setup valid for startup-sized transaction pools smaller than the
     # dataset; each chunk is its own implicit transaction on both engines.

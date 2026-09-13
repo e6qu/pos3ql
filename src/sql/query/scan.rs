@@ -489,6 +489,8 @@ struct IndexKeyCandidate {
     commit_lsn: u64,
     key_at: usize,
     key_len: usize,
+    payload_at: usize,
+    payload_len: usize,
 }
 
 pub(crate) struct IndexedCandidates<'a> {
@@ -500,6 +502,8 @@ pub(crate) struct IndexedCandidates<'a> {
     rowids: &'a [u64],
     columns: [u16; MAX_INDEX_COLS],
     n_columns: usize,
+    include_mask: u64,
+    payload_mask: u64,
     keys: Option<&'a [IndexKeyCandidate]>,
     encoded_keys: &'a [u8],
 }
@@ -523,9 +527,11 @@ impl<'a> IndexedCandidates<'a> {
 
     fn covers(&self, demanded: u64) -> bool {
         self.keys.is_some()
-            && (self.columns[..self.n_columns]
+            && self.include_mask & !self.payload_mask == 0
+            && ((self.columns[..self.n_columns]
                 .iter()
                 .fold(0u64, |mask, column| mask | (1u64 << column))
+                | self.include_mask)
                 & demanded)
                 == demanded
     }
@@ -827,6 +833,8 @@ pub(crate) struct OrderedIndexAccessPlan<'a> {
     access: IndexAccessPlan<'a>,
     index_oid: i32,
     index_name: StackStr<64>,
+    include_mask: u64,
+    covering_ready: bool,
     order_positions: [u8; MAX_INDEX_COLS],
     order: &'a [OrderBy<'a>],
 }
@@ -841,10 +849,11 @@ impl<'a> OrderedIndexAccessPlan<'a> {
     }
 
     pub(crate) fn covers(&self, demanded: u64) -> bool {
-        !self.access.exact
-            && (self.access.columns[..self.access.n_columns]
+        self.covering_ready
+            && ((self.access.columns[..self.access.n_columns]
                 .iter()
                 .fold(0u64, |mask, column| mask | (1u64 << column))
+                | self.include_mask)
                 & demanded)
                 == demanded
     }
@@ -1333,15 +1342,17 @@ pub(crate) fn ordered_index_access_plan<'a>(
         if !contiguous {
             continue;
         }
-        let Some((index_oid, index_name)) = crate::sql::catalog::ordered_value_index_identity(
-            storage,
-            txid,
-            slot,
-            &access.columns[..access.n_columns],
-            equality_prefix,
-            &order_positions[..order.len()],
-            order,
-        ) else {
+        let Some((index_oid, index_name, include_mask)) =
+            crate::sql::catalog::ordered_value_index_identity(
+                storage,
+                txid,
+                slot,
+                &access.columns[..access.n_columns],
+                equality_prefix,
+                &order_positions[..order.len()],
+                order,
+            )
+        else {
             continue;
         };
         let score = access.n_constraints * (MAX_INDEX_COLS + 1) + order.len();
@@ -1349,6 +1360,9 @@ pub(crate) fn ordered_index_access_plan<'a>(
             access,
             index_oid,
             index_name,
+            include_mask,
+            covering_ready: storage
+                .value_durable_complete(slot, &access.columns[..access.n_columns]),
             order_positions,
             order,
         };
@@ -1562,6 +1576,18 @@ fn indexed_candidates_for_plan<'a>(
                     rowids: &[],
                     columns: plan.columns,
                     n_columns: plan.n_columns,
+                    include_mask: ordered_plan.map_or(0, |ordered| ordered.include_mask),
+                    payload_mask: storage.value_binding_include_mask(
+                        slot,
+                        (0..storage.value_binding_count(slot))
+                            .find(|binding| {
+                                let (columns, n_columns) =
+                                    storage.value_binding_columns(slot, *binding);
+                                n_columns == plan.n_columns
+                                    && columns[..n_columns] == plan.columns[..plan.n_columns]
+                            })
+                            .expect("planned binding exists"),
+                    ),
                     keys: None,
                     encoded_keys: &[],
                 }));
@@ -1645,10 +1671,12 @@ fn indexed_candidates_for_plan<'a>(
             &collations[..plan.n_columns],
         )
     });
-    let retain_keys = ordered_plan.is_some() && !plan.exact;
+    let retain_keys = ordered_plan.is_some()
+        && storage.value_durable_complete(slot, &plan.columns[..plan.n_columns]);
+    let probe_hash = hash.filter(|_| !retain_keys);
     let mut count = 0usize;
-    let mut key_bytes = 0usize;
-    if let Some(hash) = hash {
+    let mut entry_bytes = 0usize;
+    if let Some(hash) = probe_hash {
         let complete =
             storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |_, _| {
                 count += 1;
@@ -1660,10 +1688,13 @@ fn indexed_candidates_for_plan<'a>(
             slot,
             &plan.columns[..plan.n_columns],
             key_position,
-            |_, _, key| {
+            |_, _, key, payload| {
                 count += 1;
                 if retain_keys {
-                    key_bytes = key_bytes.checked_add(key.len()).ok_or_else(arena_full)?;
+                    entry_bytes = entry_bytes
+                        .checked_add(key.len())
+                        .and_then(|bytes| bytes.checked_add(payload.len()))
+                        .ok_or_else(arena_full)?;
                 }
                 Ok(())
             },
@@ -1680,7 +1711,7 @@ fn indexed_candidates_for_plan<'a>(
     let mut encoded_keys = if retain_keys {
         Some(
             arena
-                .alloc_slice_with(key_bytes, |_| 0u8)
+                .alloc_slice_with(entry_bytes, |_| 0u8)
                 .map_err(|_| arena_full())?,
         )
     } else {
@@ -1694,6 +1725,8 @@ fn indexed_candidates_for_plan<'a>(
                     commit_lsn: 0,
                     key_at: 0,
                     key_len: 0,
+                    payload_at: 0,
+                    payload_len: 0,
                 })
                 .map_err(|_| arena_full())?,
         )
@@ -1701,8 +1734,8 @@ fn indexed_candidates_for_plan<'a>(
         None
     };
     let mut fill = 0usize;
-    let mut key_at = 0usize;
-    if let Some(hash) = hash {
+    let mut entry_at = 0usize;
+    if let Some(hash) = probe_hash {
         storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |rowid, _| {
             rowids[fill] = rowid;
             fill += 1;
@@ -1713,19 +1746,23 @@ fn indexed_candidates_for_plan<'a>(
             slot,
             &plan.columns[..plan.n_columns],
             key_position,
-            |rowid, commit_lsn, key| {
+            |rowid, commit_lsn, key, payload| {
                 rowids[fill] = rowid;
                 if let (Some(encoded), Some(candidates)) =
                     (encoded_keys.as_deref_mut(), keyed_candidates.as_deref_mut())
                 {
-                    encoded[key_at..key_at + key.len()].copy_from_slice(key);
+                    encoded[entry_at..entry_at + key.len()].copy_from_slice(key);
+                    let payload_at = entry_at + key.len();
+                    encoded[payload_at..payload_at + payload.len()].copy_from_slice(payload);
                     candidates[fill] = IndexKeyCandidate {
                         rowid,
                         commit_lsn,
-                        key_at,
+                        key_at: entry_at,
                         key_len: key.len(),
+                        payload_at,
+                        payload_len: payload.len(),
                     };
-                    key_at += key.len();
+                    entry_at = payload_at + payload.len();
                 }
                 fill += 1;
                 Ok(())
@@ -1733,12 +1770,12 @@ fn indexed_candidates_for_plan<'a>(
         )?;
     }
     debug_assert_eq!(fill, count);
-    debug_assert!(!retain_keys || key_at == key_bytes);
+    debug_assert!(!retain_keys || entry_at == entry_bytes);
     let mut live = 0usize;
     let mut ordered_keys = None;
     let mut retained_key_bytes: &'a [u8] = &[];
     if let Some(ordered) = ordered_plan
-        && !plan.exact
+        && retain_keys
     {
         let encoded: &'a [u8] = encoded_keys.take().expect("ordered scan retains keys");
         let candidates = keyed_candidates.expect("ordered scan retains candidates");
@@ -1806,6 +1843,15 @@ fn indexed_candidates_for_plan<'a>(
         rowids: &rowids[..live],
         columns: plan.columns,
         n_columns: plan.n_columns,
+        include_mask: ordered_plan.map_or(0, |ordered| ordered.include_mask),
+        payload_mask: (0..storage.value_binding_count(slot))
+            .find_map(|binding| {
+                let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+                (n_columns == plan.n_columns
+                    && columns[..n_columns] == plan.columns[..plan.n_columns])
+                    .then(|| storage.value_binding_include_mask(slot, binding))
+            })
+            .unwrap_or(0),
         keys: ordered_keys,
         encoded_keys: retained_key_bytes,
     }))
@@ -4508,6 +4554,14 @@ fn scan_source_mode<'a>(
                 for (position, &column) in access.columns[..access.n_columns].iter().enumerate() {
                     key_types[position] = definition.columns[column as usize].ctype;
                 }
+                let mut payload_types = [ColType::Bool; MAX_COLUMNS];
+                let mut n_payload = 0usize;
+                for (column, metadata) in definition.columns().iter().enumerate() {
+                    if access.payload_mask & (1u64 << column) != 0 {
+                        payload_types[n_payload] = metadata.ctype;
+                        n_payload += 1;
+                    }
+                }
                 for (this, candidate) in keys.iter().enumerate() {
                     check_timeout()?;
                     debug_assert_eq!(candidate.rowid, access.rowids[this]);
@@ -4527,6 +4581,25 @@ fn scan_source_mode<'a>(
                             access.columns[..access.n_columns].iter().enumerate()
                         {
                             values[column as usize] = key_values[position];
+                        }
+                        let payload = &access.encoded_keys
+                            [candidate.payload_at..candidate.payload_at + candidate.payload_len];
+                        let mut payload_values = [Datum::Null; MAX_COLUMNS];
+                        if n_payload != 0 {
+                            rowenc::decode(
+                                payload,
+                                &payload_types[..n_payload],
+                                &mut payload_values[..n_payload],
+                            )?;
+                        }
+                        let mut payload_position = 0usize;
+                        for (column, value) in
+                            values.iter_mut().enumerate().take(definition.n_columns)
+                        {
+                            if access.payload_mask & (1u64 << column) != 0 {
+                                *value = payload_values[payload_position];
+                                payload_position += 1;
+                            }
                         }
                         refresh_catalog_object_names(storage, txid, values, arena)?;
                         visit_candidate!(this, BoundRow::Values(values), Some(candidate.rowid))

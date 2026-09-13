@@ -154,3 +154,15 @@ partly unbound probes before execution. `EXPLAIN`, physical statistics,
 object-cold recovery, committed overlays, bounded-memory stress, and the
 performance smoke suite now exercise the same decision. No externally blocked
 defect remains from this review.
+
+The covering-index review found that `INCLUDE` columns survived catalogs and
+recovery but were absent from physical value-index generations, forcing base
+tuple reads, and that exact ordered plans could describe coverage without
+retaining durable key bytes. The versioned generation now stores a separately
+framed included-column payload, the manifest binds its exact column mask, and
+the committed overlay uses the same encoding. Execution and `EXPLAIN` share
+the resulting coverage proof for exact and range ordered scans, while stale
+durable payloads are rejected by commit LSN before decoding. Full physical
+tuple limits are enforced before row and CREATE INDEX commit, including the
+union used by redundant compatible indexes. No externally blocked defect
+remains from this review.

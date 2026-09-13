@@ -46764,7 +46764,7 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
                         crate::store::ValueIndexPosition::Match
                     })
                 },
-                |_, _, _| {
+                |_, _, _, _| {
                     durable_candidates += 1;
                     Ok(())
                 },
@@ -47314,9 +47314,9 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
     run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE covered_rows (key integer, payload text, note text); \
+        "CREATE TABLE covered_rows (key integer, payload text, note text, heap_only text); \
          CREATE UNIQUE INDEX covered_key ON covered_rows (key) INCLUDE (payload, note); \
-         INSERT INTO covered_rows VALUES (1, 'one', 'first')",
+         INSERT INTO covered_rows VALUES (1, 'one', 'first', 'cold')",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -47335,7 +47335,7 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
     let duplicate = run_with(
         &mut engine,
         &mut budget,
-        "INSERT INTO covered_rows VALUES (1, 'different', 'also different')",
+        "INSERT INTO covered_rows VALUES (1, 'different', 'also different', 'duplicate')",
     );
     assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
     let repeated = run_with(
@@ -47362,7 +47362,8 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
     run_with(
         &mut engine,
         &mut budget,
-        "BEGIN; CREATE INDEX rolled_cover ON covered_rows (key) INCLUDE (payload); ROLLBACK",
+        "CREATE INDEX covered_note ON covered_rows (key) INCLUDE (note); \
+         BEGIN; CREATE INDEX rolled_cover ON covered_rows (key) INCLUDE (payload); ROLLBACK",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -47372,9 +47373,23 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
         )),
         ["0"]
     );
+    let oversized_insert = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "INSERT INTO covered_rows VALUES (3, repeat('x', {}), 'wide', 'heap')",
+            crate::store::VALUE_INDEX_TUPLE_MAX
+        ),
+    );
+    assert!(
+        String::from_utf8_lossy(&oversized_insert).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&oversized_insert)
+    );
     engine.commit_wal().unwrap();
     assert!(engine.checkpoint().unwrap());
     drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut replay_budget = Budget::new(1 << 29);
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     assert_eq!(
@@ -47386,6 +47401,66 @@ fn included_index_columns_are_distinct_durable_covering_metadata() {
         [
             "CREATE UNIQUE INDEX covered_key ON public.covered_rows USING btree (key) INCLUDE (payload, note)"
         ]
+    );
+    let covering_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT key, payload, note FROM covered_rows \
+         WHERE key >= 1 ORDER BY key",
+    ));
+    assert!(
+        covering_plan
+            .iter()
+            .any(|row| row.contains("Index Only Scan using covered_key")),
+        "{covering_plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT pg_stat_reset_single_table_counters('covered_key'::regclass); \
+             SELECT key, payload, note FROM covered_rows WHERE key >= 1 ORDER BY key; \
+             SELECT idx_scan, idx_tup_read, idx_tup_fetch FROM pg_stat_user_indexes \
+             WHERE indexrelname = 'covered_key'",
+        )),
+        ["", "1|one|first", "1|1|0"]
+    );
+    let exact_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT payload, note FROM covered_rows WHERE key = 1 ORDER BY key",
+    ));
+    assert!(
+        exact_plan
+            .iter()
+            .any(|row| row.contains("Index Only Scan using covered_key")),
+        "{exact_plan:?}"
+    );
+    let heap_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT heap_only FROM covered_rows WHERE key >= 1 ORDER BY key",
+    ));
+    assert!(
+        heap_plan
+            .iter()
+            .any(|row| row.contains("Index Scan using covered_key")),
+        "{heap_plan:?}"
+    );
+    assert!(heap_plan.iter().all(|row| !row.contains("Index Only Scan")));
+    run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "UPDATE covered_rows SET payload = 'ONE', note = NULL WHERE key = 1; \
+         INSERT INTO covered_rows VALUES (2, 'two', 'second', 'cold-two')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT key, payload, note FROM covered_rows WHERE key >= 1 ORDER BY key",
+        )),
+        ["1|ONE|NULL", "2|two|second"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

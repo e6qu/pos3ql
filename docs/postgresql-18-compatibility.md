@@ -43,10 +43,12 @@ logical-replication boundary is specified separately in
   collation semantics, and prefix/range probes seek by immutable per-block key
   bounds. Compatible `ORDER BY` clauses use forward/backward compact-key
   ordering with equality-fixed prefixes and exact PostgreSQL NULL placement;
-  key-covered projections execute as index-only scans. Nested-loop joins and
+  key- or `INCLUDE`-covered projections execute as index-only scans from
+  versioned immutable payloads, including cold recovery and committed
+  post-checkpoint overlays. Nested-loop joins and
   joined UPDATE/DELETE sources parameterize exact or range keys from rows
-  already bound on their outer side. `INCLUDE` payload coverage and expression
-  and partial matching remain production work.
+  already bound on their outer side. Expression and partial matching remain
+  production work.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

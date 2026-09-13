@@ -70,6 +70,7 @@ the comparison does not pretend PostgreSQL itself has an S3 cache profile.
 | warm memory | Repeated point reads in the process that created and checkpointed the data |
 | indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
 | ordered limit | Repeated descending key-only `ORDER BY ... LIMIT` scans that must fetch no base tuples, warm and object-cold |
+| parameterized join | Repeated 32-key nested-loop probes whose inner table must use its B-tree, warm and after a dedicated empty-local-cache restart |
 | warm disk | Graceful restart with the same disposable local data directory |
 | empty local caches | Restart from a new local directory against the unchanged durable object prefix |
 | concurrent updates | Synchronized clients, commit latency, and immutable-batch/commit-head PUT amplification |
@@ -92,7 +93,7 @@ branch.
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no
 more than 125% of the fixed plan, the stable object-operation metric schema,
-at least one index scan per point-read, tail-range, ordered-limit, or synchronized-update operation and
+at least one index scan per point-read, tail-range, ordered-limit, parameterized-join, or synchronized-update operation and
 zero sequential scans in the complete resident warm-memory paths, actual
 shared-object reads during empty-local-cache recovery, and concurrent commit
 PUT amplification below 1.75 PUTs per transaction. Ordered-limit runs also

@@ -24375,6 +24375,7 @@ fn hash_join_rejects_conflicting_column_collations() {
         &mut budget,
         "CREATE TABLE collation_left (value text COLLATE \"C\"); \
          CREATE TABLE collation_right (value text COLLATE \"POSIX\"); \
+         CREATE INDEX collation_right_value ON collation_right (value); \
          SELECT * FROM collation_left AS left_value \
          JOIN collation_right AS right_value ON left_value.value = right_value.value",
     );
@@ -38471,6 +38472,432 @@ fn hash_join_matches_nested_loop() {
         "stale reltuples must fail loudly: {}",
         String::from_utf8_lossy(&result)
     );
+}
+
+#[test]
+fn nested_loops_parameterize_plain_column_btree_probes() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE probe_keys (tenant int, wanted int, low int, high int, label text); \
+         CREATE TABLE indexed_events (tenant int, event_id int, payload text); \
+         CREATE INDEX indexed_events_key ON indexed_events (tenant, event_id); \
+         INSERT INTO probe_keys VALUES \
+           (1, 2, 1, 3, 'one'), (2, 1, 1, 4, 'two'), \
+           (3, 9, 1, 10, 'missing'), (NULL, 1, 1, 3, 'null'); \
+         INSERT INTO indexed_events VALUES \
+           (1, 1, 'a'), (1, 2, 'b'), (1, 2, 'b2'), \
+           (2, 1, 'c'), (2, 3, 'd'), (NULL, 1, 'null-key')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT p.label, e.payload
+         FROM probe_keys p JOIN indexed_events e
+           ON e.tenant = p.tenant AND e.event_id = p.wanted",
+    ));
+    assert!(
+        plan.iter().any(|row| row.contains("Nested Loop")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|row| row.contains("Index Scan using indexed_events_key on e")),
+        "the reported inner scan must be the same parameterized path execution uses: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|row| !row.contains("Hash Join")),
+        "{plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT p.label, e.payload
+             FROM probe_keys p JOIN indexed_events e
+               ON e.tenant = p.tenant AND e.event_id = p.wanted
+             ORDER BY 1, 2"
+        )),
+        ["one|b", "one|b2", "two|c"]
+    );
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT p.label, e.payload
+             FROM probe_keys p LEFT JOIN indexed_events e
+               ON e.tenant = p.tenant AND e.event_id = p.wanted
+             ORDER BY 1, 2"
+        )),
+        ["missing|NULL", "null|NULL", "one|b", "one|b2", "two|c"]
+    );
+
+    // A cross join can use the same bound-key path from WHERE, including a
+    // prepared offset expression. The complete predicate remains the recheck.
+    let prepared = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "PREPARE joined_offset(int) AS
+           SELECT p.label, e.payload FROM probe_keys p, indexed_events e
+           WHERE e.tenant = p.tenant AND e.event_id = p.wanted + $1
+           ORDER BY 1, 2;
+         EXECUTE joined_offset(0);
+         EXPLAIN (GENERIC_PLAN) EXECUTE joined_offset(0)",
+    ));
+    assert!(prepared.iter().any(|row| row == "one|b"), "{prepared:?}");
+    assert!(prepared.iter().any(|row| row == "one|b2"), "{prepared:?}");
+    assert!(prepared.iter().any(|row| row == "two|c"), "{prepared:?}");
+    assert!(
+        prepared
+            .iter()
+            .any(|row| row.contains("Index Scan using indexed_events_key on e")),
+        "{prepared:?}"
+    );
+
+    // One equality prefix plus a bound-dependent range uses the ordered
+    // generation and can return several rows for each outer row.
+    let range_plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT p.label, e.event_id FROM probe_keys p JOIN indexed_events e
+           ON e.tenant = p.tenant
+          AND e.event_id >= p.low AND e.event_id < p.high",
+    ));
+    // Before a checkpoint only the complete equality map is available; the
+    // range correctly remains a sequential inner scan.
+    assert!(
+        range_plan.iter().any(|row| row.contains("Seq Scan on e")),
+        "{range_plan:?}"
+    );
+
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_stat_reset_single_table_counters('indexed_events'::regclass); \
+             SELECT pg_stat_reset_single_table_counters('indexed_events_key'::regclass); \
+             SELECT count(*) FROM probe_keys p JOIN indexed_events e \
+               ON e.tenant = p.tenant AND e.event_id = p.wanted; \
+             SELECT seq_scan, idx_scan > 0 FROM pg_stat_user_tables \
+               WHERE relname = 'indexed_events'; \
+             SELECT idx_scan > 0, idx_tup_read > 0, idx_tup_fetch > 0 FROM pg_stat_user_indexes \
+               WHERE indexrelname = 'indexed_events_key'"
+        )),
+        ["", "", "3", "0|t", "t|t|t"]
+    );
+
+    // UPDATE FROM and DELETE USING evaluate their auxiliary source once per
+    // target row. That source can probe an index with the target row supplied
+    // through the executor's outer lookup.
+    let joined_dml_plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN UPDATE probe_keys p SET label = e.payload FROM indexed_events e
+           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted;
+         EXPLAIN DELETE FROM probe_keys p USING indexed_events e
+           WHERE p.tenant = 2 AND e.tenant = p.tenant AND e.event_id = p.wanted",
+    ));
+    assert_eq!(
+        joined_dml_plan
+            .iter()
+            .filter(|row| row.contains("Nested Loop"))
+            .count(),
+        2,
+        "{joined_dml_plan:?}"
+    );
+    assert_eq!(
+        joined_dml_plan
+            .iter()
+            .filter(|row| row.contains("Index Scan using indexed_events_key on e"))
+            .count(),
+        2,
+        "joined DML explanation must expose the parameterized source: {joined_dml_plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_stat_reset_single_table_counters('indexed_events'::regclass); \
+             SELECT pg_stat_reset_single_table_counters('indexed_events_key'::regclass); \
+             UPDATE probe_keys p SET label = e.payload FROM indexed_events e \
+               WHERE p.tenant = 2 AND e.tenant = p.tenant \
+                 AND e.event_id = p.wanted RETURNING p.label; \
+             SELECT seq_scan, idx_scan > 0 FROM pg_stat_user_tables \
+               WHERE relname = 'indexed_events'; \
+             DELETE FROM probe_keys p USING indexed_events e \
+               WHERE p.tenant = 2 AND e.tenant = p.tenant \
+                 AND e.event_id = p.wanted RETURNING p.tenant; \
+             SELECT seq_scan, idx_scan > 0 FROM pg_stat_user_tables \
+               WHERE relname = 'indexed_events'"
+        )),
+        ["", "", "c", "0|t", "2", "0|t"]
+    );
+
+    let details = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE event_details (tenant int, event_id int, note text); \
+         CREATE INDEX event_details_key ON event_details (tenant, event_id); \
+         INSERT INTO event_details VALUES \
+           (1, 2, 'detail-b'), (2, 1, 'detail-c'), (9, 9, 'unused')",
+    );
+    assert!(!String::from_utf8_lossy(&details).contains("ERROR"));
+    let multiway_plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT p.label, e.payload, d.note
+         FROM probe_keys p
+         JOIN indexed_events e
+           ON e.tenant = p.tenant AND e.event_id = p.wanted
+         JOIN event_details d
+           ON d.tenant = e.tenant AND d.event_id = e.event_id",
+    ));
+    assert_eq!(
+        multiway_plan
+            .iter()
+            .filter(|row| row.contains("Index Scan using"))
+            .count(),
+        2,
+        "every bound inner source should expose its physical probe: {multiway_plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT p.label, e.payload, d.note
+             FROM probe_keys p
+             JOIN indexed_events e
+               ON e.tenant = p.tenant AND e.event_id = p.wanted
+             JOIN event_details d
+               ON d.tenant = e.tenant AND d.event_id = e.event_id
+             ORDER BY 1, 2, 3"
+        )),
+        ["one|b|detail-b", "one|b2|detail-b"]
+    );
+
+    // An outer-target expression is parameterizable only when it does not
+    // also read the source being probed. This mixed operand must retain the
+    // sequential path and evaluate against each complete candidate row.
+    let mixed_plan = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN UPDATE probe_keys p SET label = 'mixed' FROM indexed_events e \
+           WHERE p.tenant = 1 \
+             AND e.tenant = p.tenant + e.event_id - e.event_id \
+             AND e.event_id = p.wanted",
+    ));
+    assert!(
+        mixed_plan.iter().any(|row| row.contains("Seq Scan on e")),
+        "{mixed_plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "UPDATE probe_keys p SET label = 'mixed' FROM indexed_events e \
+               WHERE p.tenant = 1 \
+                 AND e.tenant = p.tenant + e.event_id - e.event_id \
+                 AND e.event_id = p.wanted RETURNING p.tenant"
+        )),
+        ["1"]
+    );
+}
+
+#[test]
+fn parameterized_join_recycles_candidate_scratch() {
+    let mut config = test_config("parameterized-join-scratch");
+    config.wal_buffer_bytes = 1 << 20;
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE repeated_probes (key int); \
+         CREATE TABLE repeated_matches (key int, payload int); \
+         CREATE INDEX repeated_matches_key ON repeated_matches (key); \
+         INSERT INTO repeated_probes SELECT 1 FROM generate_series(1, 800); \
+         INSERT INTO repeated_matches SELECT 1, g FROM generate_series(1, 100) g",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let bounded = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM repeated_probes p JOIN repeated_matches m ON m.key = p.key",
+        256 << 10,
+    );
+    assert_eq!(
+        data_rows(&bounded),
+        ["80000"],
+        "per-probe candidate scratch must recycle inside the fixed statement arena: {}",
+        String::from_utf8_lossy(&bounded)
+    );
+}
+
+#[test]
+fn parameterized_range_join_reads_cold_object_index_generations() {
+    let mut config = test_config("parameterized-range-join");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.txn_rows = 10_000;
+    config.table_rows = 10_000;
+    config.value_index_rows = 10_000;
+    config.object_store_bucket = format!("parameterized-range-join-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE range_windows (tenant int, low_id int, high_id int); \
+         CREATE TABLE durable_events (tenant int, event_id int, payload text); \
+         CREATE INDEX durable_events_key ON durable_events (tenant, event_id); \
+         INSERT INTO range_windows VALUES (1, 2, 4), (2, 1, 2), (99, 1, 9); \
+         INSERT INTO durable_events VALUES \
+           (1, 1, 'one'), (1, 2, 'two'), (1, 3, 'three'), (1, 5, 'five'), \
+           (2, 1, 'other')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for start in [1, 1001, 2001, 3001, 4001, 5001, 6001, 7001] {
+        let filler = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO durable_events
+                 SELECT 100 + g, g, repeat('x', 512)
+                 FROM generate_series({start}, {}) g",
+                start + 999
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&filler).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&filler)
+        );
+    }
+    run_with(&mut engine, &mut budget, "ANALYZE durable_events");
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let durable_slot = replayed
+        .storage
+        .find_table("public", "durable_events")
+        .unwrap();
+    assert!(
+        replayed
+            .storage
+            .value_durable_complete(durable_slot, &[0, 1]),
+        "the checkpoint must publish the composite value-index generation"
+    );
+    assert!(replayed.storage.spill_generation_count(durable_slot) > 0);
+    let exact_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT w.tenant, e.payload
+         FROM range_windows w JOIN durable_events e
+           ON e.tenant = w.tenant AND e.event_id = w.low_id",
+    ));
+    assert!(
+        exact_plan
+            .iter()
+            .any(|row| row.contains("Index Scan using durable_events_key on e")),
+        "{exact_plan:?}"
+    );
+    let plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT w.tenant, e.event_id, e.payload
+         FROM range_windows w JOIN durable_events e
+           ON e.tenant = w.tenant
+          AND e.event_id >= w.low_id AND e.event_id < w.high_id",
+    ));
+    assert!(
+        plan.iter().any(|row| row.contains("Nested Loop")),
+        "{plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|row| row.contains("Index Scan using durable_events_key on e")),
+        "a cold equality-prefix range must retain the durable B-tree plan: {plan:?}"
+    );
+    assert!(
+        plan.iter().all(|row| !row.contains("Hash Join")),
+        "{plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT pg_stat_reset_single_table_counters('durable_events'::regclass); \
+             SELECT pg_stat_reset_single_table_counters('durable_events_key'::regclass); \
+             SELECT w.tenant, e.event_id, e.payload \
+             FROM range_windows w JOIN durable_events e \
+               ON e.tenant = w.tenant \
+              AND e.event_id >= w.low_id AND e.event_id < w.high_id \
+             ORDER BY 1, 2; \
+             SELECT seq_scan, idx_scan > 0 FROM pg_stat_user_tables \
+               WHERE relname = 'durable_events'"
+        )),
+        ["", "", "1|2|two", "1|3|three", "2|1|other", "0|t"]
+    );
+
+    // Committed resident changes shadow the immutable generation while the
+    // same parameterized plan rechecks MVCC-visible rows.
+    let changes = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "UPDATE durable_events SET event_id = 4, payload = 'moved' \
+           WHERE tenant = 1 AND event_id = 3; \
+         INSERT INTO durable_events VALUES (1, 3, 'overlay')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&changes).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&changes)
+    );
+    let overlay_output = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "SELECT e.event_id, e.payload \
+         FROM range_windows w JOIN durable_events e \
+           ON e.tenant = w.tenant \
+          AND e.event_id >= w.low_id AND e.event_id < w.high_id \
+         WHERE w.tenant = 1 ORDER BY 1, 2",
+    );
+    assert!(
+        !String::from_utf8_lossy(&overlay_output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&overlay_output)
+    );
+    assert_eq!(data_rows(&overlay_output), ["2|two", "3|overlay"]);
+    drop(replayed);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

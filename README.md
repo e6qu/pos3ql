@@ -26,7 +26,9 @@ The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DM
 Plain-column btree indexes are physical access paths for exact single and
 composite keys, prepared parameters, and equality-leading prefixes with lower,
 upper, or two-sided bounds on the following column in queries and direct
-UPDATE/DELETE target scans.
+UPDATE/DELETE target scans. Nested loops use those same exact and range probes
+when their keys depend on already-bound rows, including multiway joins,
+prepared expressions, `UPDATE ... FROM`, and `DELETE ... USING`.
 Complete resident equality maps avoid table walks;
 durable equality generations carry per-block filters so cold probes skip
 unrelated key blocks. Durable keys are checkpoint-sorted with PostgreSQL type
@@ -36,8 +38,7 @@ visibility and the SQL qualification. Compatible `ORDER BY` clauses traverse
 those compact keys in declared forward or backward order, including equality-
 fixed prefixes and PostgreSQL NULL placement, without materializing or sorting
 wide rows. Key-covered ordered queries execute as index-only scans; `INCLUDE`
-payload coverage, expression and partial matching, and join-parameterized
-scans remain explicit limits.
+payload coverage and expression and partial matching remain explicit limits.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

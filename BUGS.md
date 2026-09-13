@@ -131,3 +131,26 @@ their write side, and drain raced input within a fixed deadline before release.
 The same tests cover stale-key replacement after committed update/delete,
 mixed directions, NULLs, and exact index statistics. No externally blocked
 defect remains from this review.
+
+The join-index review found that the typed B-tree plan was hard-coded to the
+first source and evaluated every key against a no-column context. Consequently,
+indexed inner relations were repeatedly scanned, hash joins masked the missing
+plan for some equalities, joined UPDATE/DELETE rescanned their source for every
+target row, and joined DML `EXPLAIN` omitted the source tree altogether. One
+bound-row plan now selects exact, composite, and range keys only from sources
+already available at that nested-loop depth; execution evaluates those keys
+through the same chained lookup used by predicate rechecks and recycles each
+candidate set inside fixed statement memory. The plan applies to inner, cross,
+left, multiway, prepared, `UPDATE ... FROM`, and `DELETE ... USING` paths,
+while right/full joins, row security, sampling, stale snapshots, unsupported
+collation derivations, expression indexes, and partial indexes retain their
+authoritative scan paths. The review also found two unsafe classifications:
+an inner-table constant equality could lose to the equivalent bound-row
+equality and reread one immutable index for every outer row, while a joined-DML
+operand mixing the outer target with an unbound inner column could be mistaken
+for a complete probe key. Statement-invariant keys now stay on the
+once-per-statement hash/scan path, and column-reference classification rejects
+partly unbound probes before execution. `EXPLAIN`, physical statistics,
+object-cold recovery, committed overlays, bounded-memory stress, and the
+performance smoke suite now exercise the same decision. No externally blocked
+defect remains from this review.

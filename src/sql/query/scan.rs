@@ -1094,6 +1094,156 @@ pub(crate) fn index_access_plan<'a>(
     select_index_access_plan(storage, scope.slots[0], &by_column)
 }
 
+/// Finds a B-tree whose leading key can be evaluated from sources already
+/// bound by a nested loop. The target column must be wholly on the current
+/// source and the other operand wholly outside it, which makes the probe key
+/// stable for the duration of this inner scan.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "join position and outer-scope availability are explicit plan inputs"
+)]
+pub(crate) fn parameterized_index_access_plan<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    where_clause: Option<&'a Expr<'a>>,
+    order: &[usize],
+    depth: usize,
+    txid: u32,
+    outer_available: bool,
+) -> Option<IndexAccessPlan<'a>> {
+    if depth >= scope.n || (depth == 0 && !outer_available) {
+        return None;
+    }
+    let table = order[depth];
+    let current_role = storage.current_role_slot(txid)?;
+    let authorization_role = scope.authorization_roles[table].map_or(current_role, usize::from);
+    if scope.derived[table].is_some()
+        || scope.lateral[table]
+        || source_ref(from, table).sample.is_some()
+        || storage.relation_has_descendants(scope.slots[table], txid)
+        || storage.row_security_applies(scope.slots[table], authorization_role, txid)
+        || !index_snapshot_is_current(storage, scope.slots[table], txid)
+    {
+        return None;
+    }
+    // Explicit ON clauses are position-sensitive, so only all-CROSS joins
+    // can have a non-identity execution order; those have no ON predicate.
+    let join = depth.checked_sub(1).map(|join| &from.joins[join]);
+    if join.is_some_and(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full)) {
+        return None;
+    }
+    let bound_tables = order[..depth]
+        .iter()
+        .fold(0u64, |mask, source| mask | (1u64 << source));
+    let target_bit = 1u64 << table;
+    let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
+    let mut resolve_column = |expression: &Expr<'a>| {
+        let Expr::Column { qualifier, name } = expression else {
+            return None;
+        };
+        match scope.find_column(*qualifier, name) {
+            Ok(ResolvedColumn::Table(source, column)) if source == table => Some(column),
+            _ => None,
+        }
+    };
+    let operand_bindings = |operand: &Expr<'a>| {
+        if operand.contains_call() || operand.contains_subquery() {
+            return None;
+        }
+        let mut tables = 0u64;
+        let mut has_outer_column = false;
+        let mut unresolved = false;
+        operand.for_each_column_reference(&mut |qualifier, name| match scope
+            .find_column(qualifier, name)
+        {
+            Ok(ResolvedColumn::Table(source, _)) => tables |= 1u64 << source,
+            Ok(ResolvedColumn::Merged(merged)) => {
+                for &(source, _) in &scope.merged[merged].parts[..scope.merged[merged].n_parts] {
+                    tables |= 1u64 << source;
+                }
+            }
+            Err(_) if outer_available => has_outer_column = true,
+            Err(_) => unresolved = true,
+        });
+        (!unresolved).then_some((tables, has_outer_column))
+    };
+    let operand_is_bound = |operand: &Expr<'a>| {
+        operand_bindings(operand)
+            .is_some_and(|(tables, _)| tables & target_bit == 0 && tables & !bound_tables == 0)
+    };
+    if (outer_available
+        || from
+            .joins
+            .iter()
+            .all(|join| matches!(join.kind, JoinKind::Inner | JoinKind::Cross)))
+        && let Some(predicate) = where_clause
+    {
+        collect_index_constraints(
+            predicate,
+            &mut resolve_column,
+            &operand_is_bound,
+            &mut by_column,
+        );
+    }
+    if let Some(on) = join.and_then(|join| join.on.or(scope.join_on[depth - 1])) {
+        collect_index_constraints(on, &mut resolve_column, &operand_is_bound, &mut by_column);
+    }
+    let plan = select_index_access_plan(storage, scope.slots[table], &by_column)?;
+    // A statement-invariant key belongs to a once-per-statement scan, not a
+    // probe repeated for every outer row. Leaving that shape to the hash or
+    // ordinary plan avoids rereading the same cold index blocks N times.
+    let uses_bound_row = plan.constraints[..plan.n_constraints]
+        .iter()
+        .chain(plan.additional_constraints[..plan.n_constraints].iter())
+        .flatten()
+        .any(|constraint| {
+            operand_bindings(constraint.operand)
+                .is_some_and(|(tables, has_outer)| has_outer || tables & bound_tables != 0)
+        });
+    if !uses_bound_row {
+        return None;
+    }
+    for (position, &column) in plan.columns[..plan.n_constraints].iter().enumerate() {
+        let target = &scope.defs[table].expect("resolved").columns[column as usize];
+        if !target.ctype.is_collatable() {
+            continue;
+        }
+        for constraint in [
+            plan.constraints[position],
+            plan.additional_constraints[position],
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let compatible = match constraint.operand {
+                Expr::Null | Expr::Str(_) | Expr::Param(_) => true,
+                Expr::Column { qualifier, name } => scope
+                    .find_column(*qualifier, name)
+                    .ok()
+                    .is_some_and(|resolved| scope.output_collation(resolved) == target.collation),
+                // A cast, concatenation, explicit COLLATE, or outer DML
+                // column needs the full comparison-collation derivation. The
+                // physical key must not guess that identity and risk omitting
+                // a row (or a collation error), so retain the ordinary scan.
+                _ => false,
+            };
+            if !compatible {
+                return None;
+            }
+        }
+    }
+    let slot = scope.slots[table];
+    let definition = scope.defs[table].expect("resolved");
+    let expected_rows = plan.expected_rows(storage, slot, definition, txid);
+    if !(plan.exact && storage.value_cache_complete(slot, plan.columns()))
+        && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
+    {
+        return None;
+    }
+    Some(plan)
+}
+
 /// Selects one plain-column btree that supplies the requested result order.
 /// A leading equality prefix may be omitted from `ORDER BY`; every varying
 /// key must then be a contiguous suffix of the same index. The concrete
@@ -1295,7 +1445,7 @@ fn indexed_candidates<'a>(
     let slot = scope.slots[0];
     let definition = scope.defs[0].expect("physical table has definition");
     indexed_candidates_for_plan(
-        storage, slot, definition, txid, plan, None, arena, params, hooks,
+        storage, 0, slot, definition, txid, plan, None, arena, params, &NoColumns, hooks,
     )
 }
 
@@ -1313,6 +1463,7 @@ pub(super) fn ordered_indexed_candidates<'a>(
     let definition = scope.defs[0].expect("physical table has definition");
     indexed_candidates_for_plan(
         storage,
+        0,
         slot,
         definition,
         txid,
@@ -1320,6 +1471,7 @@ pub(super) fn ordered_indexed_candidates<'a>(
         Some(plan),
         arena,
         params,
+        &NoColumns,
         hooks,
     )
 }
@@ -1341,13 +1493,14 @@ pub(crate) fn dml_indexed_candidates<'a>(
         return Ok(None);
     };
     indexed_candidates_for_plan(
-        storage, slot, definition, txid, plan, None, arena, params, hooks,
+        storage, 0, slot, definition, txid, plan, None, arena, params, &NoColumns, hooks,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn indexed_candidates_for_plan<'a>(
     storage: &'a Storage,
+    table: usize,
     slot: usize,
     definition: &TableDef,
     txid: u32,
@@ -1355,6 +1508,7 @@ fn indexed_candidates_for_plan<'a>(
     ordered_plan: Option<OrderedIndexAccessPlan<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    columns: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let index_oid = if let Some(ordered) = ordered_plan {
@@ -1397,10 +1551,10 @@ fn indexed_candidates_for_plan<'a>(
             let Some(constraint) = constraint else {
                 continue;
             };
-            let raw = eval_full(constraint.operand, arena, params, &NoColumns, hooks)?;
+            let raw = eval_full(constraint.operand, arena, params, columns, hooks)?;
             if raw.is_null() {
                 return Ok(Some(IndexedCandidates {
-                    table: 0,
+                    table,
                     index_oid,
                     scan_executed: false,
                     index_entries: 0,
@@ -1644,7 +1798,7 @@ fn indexed_candidates_for_plan<'a>(
         }
     }
     Ok(Some(IndexedCandidates {
-        table: 0,
+        table,
         index_oid,
         scan_executed: true,
         index_entries: count,
@@ -2672,6 +2826,21 @@ pub(crate) fn select_hash_join_plan<'a>(
     txid: u32,
 ) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
     if scope.n != 2 || from.joins.len() != 1 {
+        return Ok(None);
+    }
+    if (1..scope.n).any(|depth| {
+        parameterized_index_access_plan(
+            storage,
+            scope,
+            from,
+            where_clause,
+            order,
+            depth,
+            txid,
+            false,
+        )
+        .is_some()
+    }) {
         return Ok(None);
     }
     let join = &from.joins[0];
@@ -3882,6 +4051,7 @@ fn scan_source_mode<'a>(
         // Execution order: `order[depth]` is the scope-table joined at this depth
         // (identity unless a cross join was cost-reordered).
         order: &[usize],
+        parameterized: &[Option<IndexAccessPlan<'a>>],
         indexed: Option<&IndexedCandidates<'a>>,
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         recycle_rows: bool,
@@ -3968,6 +4138,7 @@ fn scan_source_mode<'a>(
                         pushdown,
                         sample_plans,
                         order,
+                        parameterized,
                         indexed,
                         decode_buffers,
                         recycle_rows,
@@ -4014,6 +4185,40 @@ fn scan_source_mode<'a>(
                         Ok(core::ops::ControlFlow::Continue(()))
                     },
                 )?;
+            }};
+        }
+        macro_rules! visit_sequential_physical_rows {
+            ($slot:expr) => {{
+                storage.record_relation_scan(txid, $slot, None, 0)?;
+                let mut index = 0usize;
+                let mut aborted = false;
+                if storage.spill_rows_are_unshadowed($slot) {
+                    visit_spilled_rows!($slot, index, aborted);
+                } else {
+                    storage.for_each_row_state($slot, &mut |rowid, state| {
+                        use core::ops::ControlFlow;
+                        check_timeout()?;
+                        let Some(home) = storage.visible_row_home($slot, rowid, state, txid)?
+                        else {
+                            return Ok(ControlFlow::Continue(()));
+                        };
+                        storage.record_relation_tuple_read(txid, $slot, None)?;
+                        let this = index;
+                        index += 1;
+                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                            let bytes = storage.row_bytes($slot, rowid, home, arena)?;
+                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                        })?;
+                        if !keep_scanning {
+                            aborted = true;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        Ok(ControlFlow::Continue(()))
+                    })?;
+                }
+                if aborted {
+                    return Ok(false);
+                }
             }};
         }
         // A LATERAL FROM item is re-run per outer row: assemble the row bound by
@@ -4113,6 +4318,72 @@ fn scan_source_mode<'a>(
                 if !keep_scanning {
                     return Ok(false);
                 }
+            }
+        } else if let Some(plan) = parameterized[depth] {
+            let slot = scope.slots[order[depth]];
+            let probed = recycled(arena, recycle_rows, retain_match, || {
+                let outer_row = assemble(
+                    storage,
+                    txid,
+                    scope,
+                    bound,
+                    bound_rowids,
+                    order,
+                    depth,
+                    decode_buffers,
+                    arena,
+                )?;
+                let lookup = Chained {
+                    inner: &outer_row,
+                    outer,
+                };
+                let Some(access) = indexed_candidates_for_plan(
+                    storage,
+                    order[depth],
+                    slot,
+                    scope.defs[order[depth]].expect("resolved"),
+                    txid,
+                    plan,
+                    None,
+                    arena,
+                    params,
+                    &lookup,
+                    hooks,
+                )?
+                else {
+                    return Ok::<Option<bool>, SqlError>(None);
+                };
+                if access.scan_executed {
+                    storage.record_relation_scan(
+                        txid,
+                        slot,
+                        Some(access.index_oid),
+                        access.index_entries,
+                    )?;
+                }
+                for (index, &rowid) in access.rowids.iter().enumerate() {
+                    check_timeout()?;
+                    let Some(state) = storage.row_state(slot, rowid)? else {
+                        continue;
+                    };
+                    let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
+                        continue;
+                    };
+                    storage.record_relation_tuple_read(txid, slot, Some(access.index_oid))?;
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                        let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+                        visit_candidate!(index, BoundRow::Encoded(bytes), Some(rowid))
+                    })?;
+                    if !keep_scanning {
+                        return Ok(Some(false));
+                    }
+                }
+                Ok(Some(true))
+            })?;
+            match probed {
+                Some(false) => return Ok(false),
+                Some(true) => {}
+                None => visit_sequential_physical_rows!(slot),
             }
         } else if depth == 0
             || (scope.derived[order[depth]].is_none()
@@ -4347,35 +4618,7 @@ fn scan_source_mode<'a>(
             }
         } else {
             let slot = scope.slots[order[depth]];
-            storage.record_relation_scan(txid, slot, None, 0)?;
-            let mut index = 0usize;
-            let mut aborted = false;
-            if storage.spill_rows_are_unshadowed(slot) {
-                visit_spilled_rows!(slot, index, aborted);
-            } else {
-                storage.for_each_row_state(slot, &mut |rowid, state| {
-                    use core::ops::ControlFlow;
-                    check_timeout()?;
-                    let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
-                        return Ok(ControlFlow::Continue(()));
-                    };
-                    storage.record_relation_tuple_read(txid, slot, None)?;
-                    let this = index;
-                    index += 1;
-                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                        let bytes = storage.row_bytes(slot, rowid, home, arena)?;
-                        visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                    })?;
-                    if !keep_scanning {
-                        aborted = true;
-                        return Ok(ControlFlow::Break(()));
-                    }
-                    Ok(ControlFlow::Continue(()))
-                })?;
-            }
-            if aborted {
-                return Ok(false);
-            }
+            visit_sequential_physical_rows!(slot);
         }
         // LEFT/FULL join with no match at this level: emit one null row (the
         // left side preserved, this table nulled).
@@ -4401,6 +4644,7 @@ fn scan_source_mode<'a>(
                 pushdown,
                 sample_plans,
                 order,
+                parameterized,
                 indexed,
                 decode_buffers,
                 recycle_rows,
@@ -4540,6 +4784,27 @@ fn scan_source_mode<'a>(
         indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?
     };
     let indexed = indexed_override.or(automatic_indexed.as_ref());
+    let parameterized = arena
+        .alloc_slice_with(scope.n, |depth| {
+            if !automatic_index
+                || security_plans[order[depth]].is_some()
+                || sample_plans[order[depth]].is_some()
+            {
+                None
+            } else {
+                parameterized_index_access_plan(
+                    storage,
+                    scope,
+                    from,
+                    planning_where_clause,
+                    order,
+                    depth,
+                    txid,
+                    outer.is_some(),
+                )
+            }
+        })
+        .map_err(|_| arena_full())?;
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
@@ -4555,6 +4820,7 @@ fn scan_source_mode<'a>(
     let hash_plan = if retain_match.is_none()
         && security_plans.iter().all(Option::is_none)
         && sample_plans.iter().all(Option::is_none)
+        && parameterized.iter().all(Option::is_none)
     {
         select_hash_join_plan(storage, scope, from, planning_where_clause, order, txid)?
     } else {
@@ -4610,6 +4876,7 @@ fn scan_source_mode<'a>(
             pushdown,
             sample_plans,
             order,
+            parameterized,
             indexed,
             decode_buffers,
             recycle_rows,
@@ -4725,6 +4992,7 @@ fn scan_source_mode<'a>(
                     pushdown,
                     sample_plans,
                     order,
+                    parameterized,
                     indexed,
                     decode_buffers,
                     recycle_rows,

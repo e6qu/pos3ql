@@ -633,6 +633,7 @@ fn scan_node<'a>(
     depth: u8,
     arena: &Arena,
     ordered: Option<query::OrderedIndexAccessPlan<'a>>,
+    parameterized: Option<query::IndexAccessPlan<'a>>,
     index_only: bool,
 ) -> PlanNode {
     let slot = scope.slots[table];
@@ -670,11 +671,14 @@ fn scan_node<'a>(
     // complete resident equality map has no durable-read cost and therefore
     // wins even when the immutable table and index estimates tie.
     let ordered = ordered.filter(|_| table == 0);
-    let index_plan = ordered.map(|plan| plan.access()).or_else(|| {
-        (table == 0)
-            .then(|| query::index_access_plan(storage, scope, txid, predicate))
-            .flatten()
-    });
+    let index_plan = ordered
+        .map(|plan| plan.access())
+        .or(parameterized)
+        .or_else(|| {
+            (table == 0)
+                .then(|| query::index_access_plan(storage, scope, txid, predicate))
+                .flatten()
+        });
     let index_rows = index_plan.map_or(predicate_rows, |plan| {
         plan.expected_rows(storage, slot, scope.defs[table].expect("base table"), txid)
     });
@@ -832,6 +836,7 @@ pub(super) fn plan_select(
     let mut cache_blocks = 0u64;
     let mut hash_join = false;
     let mut table_order: [usize; query::MAX_JOIN_TABLES] = core::array::from_fn(|index| index);
+    let mut parameterized_indexes = [None; query::MAX_JOIN_TABLES];
     if let Some(scope) = &scope {
         let reorderable = statement.from.as_ref().is_some_and(|from| {
             from.joins
@@ -841,6 +846,21 @@ pub(super) fn plan_select(
         });
         if reorderable {
             table_order = query::join_order(storage, scope, statement.where_clause);
+        }
+        if let Some(from) = statement.from.as_ref() {
+            for depth in 1..scope.n {
+                let table = table_order[depth];
+                parameterized_indexes[table] = query::parameterized_index_access_plan(
+                    storage,
+                    scope,
+                    from,
+                    statement.where_clause,
+                    &table_order[..scope.n],
+                    depth,
+                    txid,
+                    false,
+                );
+            }
         }
         estimated_rows = 1;
         total_cost = 0.0;
@@ -854,6 +874,7 @@ pub(super) fn plan_select(
                 1,
                 arena,
                 ordered_index,
+                parameterized_indexes[table],
                 ordered_index_only,
             );
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
@@ -1038,6 +1059,7 @@ pub(super) fn plan_select(
                 stage_count as u8,
                 arena,
                 ordered_index,
+                parameterized_indexes[table],
                 ordered_index_only,
             );
             scan.output = output;
@@ -1289,6 +1311,11 @@ pub(super) fn plan_modification(
             ));
         }
     };
+    let joined_from = match statement {
+        Stmt::Update(update) => update.from,
+        Stmt::Delete(delete) => delete.using,
+        _ => None,
+    };
     if storage
         .resolve_relation(target.schema, target.name, txid)
         .is_none()
@@ -1316,6 +1343,80 @@ pub(super) fn plan_modification(
         constant_false: false,
     };
     plan.push(target_node)?;
+    if let Some(from) = joined_from {
+        let target_slot = relation_slot(storage, txid, target.schema, target.name)
+            .expect("target existence checked above");
+        let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
+        let mut order: [usize; query::MAX_JOIN_TABLES] = core::array::from_fn(|index| index);
+        if from
+            .joins
+            .iter()
+            .all(|join| matches!(join.kind, JoinKind::Cross))
+            && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
+        {
+            order = query::join_order(storage, &scope, predicate);
+        }
+        let mut parameterized = [None; query::MAX_JOIN_TABLES];
+        for depth in 0..scope.n {
+            let table = order[depth];
+            parameterized[table] = query::parameterized_index_access_plan(
+                storage,
+                &scope,
+                from,
+                predicate,
+                &order[..scope.n],
+                depth,
+                txid,
+                true,
+            );
+        }
+        let target_scan =
+            physical_scan_node(storage, target_slot, target.name, false, txid, 2, None);
+        let mut total_cost = target_scan.total_cost;
+        let mut rows = target_scan.rows.max(1);
+        let mut object_requests = target_scan.object_requests;
+        let mut cache_blocks = target_scan.cache_blocks;
+        let mut source_nodes = [PlanNode::EMPTY; query::MAX_JOIN_TABLES];
+        for &table in &order[..scope.n] {
+            let node = scan_node(
+                storage,
+                &scope,
+                table,
+                predicate,
+                txid,
+                2,
+                arena,
+                None,
+                parameterized[table],
+                false,
+            );
+            total_cost += node.total_cost;
+            rows = rows.saturating_mul(node.rows.max(1));
+            object_requests = object_requests.saturating_add(node.object_requests);
+            cache_blocks = cache_blocks.saturating_add(node.cache_blocks);
+            source_nodes[table] = node;
+        }
+        let join = PlanNode {
+            name: StackStr::from_str("Nested Loop"),
+            depth: 1,
+            total_cost: total_cost + rows as f64 * 0.01,
+            rows,
+            width: target_scan.width,
+            object_requests,
+            cache_blocks,
+            ..PlanNode::EMPTY
+        };
+        plan.push(join)?;
+        plan.push(target_scan)?;
+        for &table in &order[..scope.n] {
+            plan.push(source_nodes[table])?;
+        }
+        plan.nodes[0].total_cost = join.total_cost;
+        plan.nodes[0].object_requests = join.object_requests;
+        plan.nodes[0].cache_blocks = join.cache_blocks;
+        plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        return Ok(plan);
+    }
     let child = if let Some(select) = source {
         let source_plan = plan_select(storage, txid, select, arena)?;
         let root = source_plan.nodes[0];

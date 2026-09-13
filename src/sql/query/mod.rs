@@ -50,8 +50,8 @@ use scan::{
     scan_source_with_pax_columns,
 };
 pub(crate) use scan::{
-    OrderedIndexAccessPlan, dml_index_access_plan, dml_indexed_candidates, index_access_plan,
-    ordered_index_access_plan,
+    IndexAccessPlan, OrderedIndexAccessPlan, dml_index_access_plan, dml_indexed_candidates,
+    index_access_plan, ordered_index_access_plan, parameterized_index_access_plan,
 };
 pub(crate) use scan::{
     RowSecurityExpression, RowSecurityPlan, conjoin_row_security, plan_row_security,

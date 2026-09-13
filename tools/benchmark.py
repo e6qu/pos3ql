@@ -211,6 +211,14 @@ def workload_sql(workload, worker, operation, rows):
         )
     if workload == "ordered-limit":
         return "SELECT id FROM benchmark_kv ORDER BY id DESC LIMIT 32"
+    if workload == "join-probe":
+        lower = max(1, min(key, rows - 31))
+        upper = min(rows, lower + 31)
+        return (
+            "SELECT sum(kv.payload), count(*) "
+            f"FROM generate_series({lower}, {upper}) AS probe(id) "
+            "JOIN benchmark_kv AS kv ON kv.id = probe.id"
+        )
     if workload == "insert":
         inserted_key = rows + worker * 1_000_000 + operation + 1
         return f"INSERT INTO benchmark_kv(id, payload) VALUES ({inserted_key}, 0)"
@@ -493,6 +501,7 @@ def parse_args():
             "point-read",
             "tail-range",
             "ordered-limit",
+            "join-probe",
             "update",
             "mixed",
             "scan",
@@ -531,11 +540,12 @@ def parse_args():
     if args.maintenance_interval < 0:
         parser.error("maintenance interval cannot be negative")
     if args.require_index and (
-        args.workload not in ("point-read", "tail-range", "ordered-limit", "update")
+        args.workload
+        not in ("point-read", "tail-range", "ordered-limit", "join-probe", "update")
         or len(args.targets) > 1
     ):
         parser.error(
-            "--require-index requires a point-read, tail-range, ordered-limit, or update workload against one target"
+            "--require-index requires a point-read, tail-range, ordered-limit, join-probe, or update workload against one target"
         )
     return args
 

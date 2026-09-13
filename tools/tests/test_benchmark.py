@@ -82,6 +82,20 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT id FROM benchmark_kv ORDER BY id DESC LIMIT 32",
         )
 
+    def test_join_probe_uses_a_bounded_parameterized_key_set(self):
+        self.assertEqual(
+            benchmark.workload_sql("join-probe", 7, 19, 1000),
+            "SELECT sum(kv.payload), count(*) "
+            "FROM generate_series(331, 362) AS probe(id) "
+            "JOIN benchmark_kv AS kv ON kv.id = probe.id",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("join-probe", 0, 99, 100),
+            "SELECT sum(kv.payload), count(*) "
+            "FROM generate_series(69, 100) AS probe(id) "
+            "JOIN benchmark_kv AS kv ON kv.id = probe.id",
+        )
+
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),

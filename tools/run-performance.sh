@@ -229,6 +229,8 @@ bench_pos3ql warm-memory-tail-range --workload tail-range --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-ordered-limit --workload ordered-limit --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-join-probe --workload join-probe --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql concurrent-update --workload update --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --synchronized --require-index
 
@@ -257,6 +259,12 @@ bench_pos3ql cold-object-ordered-limit --workload ordered-limit --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS"
+stop_pos3ql
+
+DATA_COLD_JOIN="$WORK/data-cold-join"
+start_pos3ql "$DATA_COLD_JOIN" primary cold-object-join-recovery yes
+bench_pos3ql cold-object-join-probe --workload join-probe --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 
 if [ "$MODE" = full ]; then
   SCALE_ROWS=$((ROWS + CLIENTS * OPERATIONS))
@@ -315,6 +323,10 @@ if [ "$MODE" = full ]; then
     --label postgresql18-ordered-limit --workload ordered-limit --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --check \
     --output "$OUTPUT/postgresql18-ordered-limit.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label postgresql18-join-probe --workload join-probe --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/postgresql18-join-probe.json" >/dev/null
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-insert --workload insert --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --check \

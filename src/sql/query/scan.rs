@@ -10,8 +10,8 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    BinaryOp, Collation, Expr, FromClause, JoinKind, RelationInheritance, Select, SelectItem,
-    SetTree, TableRef, TableSampleMethod,
+    BinaryOp, Collation, Expr, FromClause, JoinKind, OrderBy, RelationInheritance, Select,
+    SelectItem, SetTree, TableRef, TableSampleMethod,
 };
 use crate::sql::eval::{
     CatalogAccess, ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums_collated, eval_full,
@@ -20,6 +20,7 @@ use crate::sql::eval::{
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, TableDef, rowenc};
+use crate::util::StackStr;
 
 use super::plan::{
     MAX_CONJUNCTS, conjunct_passes, expr_tables, fill_join_order, flatten_and, fold_null,
@@ -482,12 +483,25 @@ mod tests {
 /// A complete value probe over one base table. The rowids are sorted so
 /// taking the cache path does not make result/error order depend on hash-slot
 /// placement.
+#[derive(Clone, Copy)]
+struct IndexKeyCandidate {
+    rowid: u64,
+    commit_lsn: u64,
+    key_at: usize,
+    key_len: usize,
+}
+
 pub(crate) struct IndexedCandidates<'a> {
     table: usize,
     index_oid: i32,
     scan_executed: bool,
     index_entries: usize,
+    preserves_order: bool,
     rowids: &'a [u64],
+    columns: [u16; MAX_INDEX_COLS],
+    n_columns: usize,
+    keys: Option<&'a [IndexKeyCandidate]>,
+    encoded_keys: &'a [u8],
 }
 
 impl<'a> IndexedCandidates<'a> {
@@ -505,6 +519,15 @@ impl<'a> IndexedCandidates<'a> {
 
     pub(crate) const fn rowids(&self) -> &'a [u64] {
         self.rowids
+    }
+
+    fn covers(&self, demanded: u64) -> bool {
+        self.keys.is_some()
+            && (self.columns[..self.n_columns]
+                .iter()
+                .fold(0u64, |mask, column| mask | (1u64 << column))
+                & demanded)
+                == demanded
     }
 }
 
@@ -544,7 +567,7 @@ pub(super) enum PaxFullRowReason {
 /// complete set of observable base fields. Full-row state is explicit for
 /// whole-row or derived expressions; it is never an absent proof.
 #[derive(Clone, Copy)]
-pub(super) struct PaxReadDemand(PaxReadMode);
+pub(crate) struct PaxReadDemand(PaxReadMode);
 
 #[derive(Clone, Copy)]
 enum PaxReadMode {
@@ -568,7 +591,7 @@ impl PaxReadDemand {
     }
 
     /// The selected PAX fields for `table`, if this scan has a proof.
-    fn selected_mask(self, table: usize) -> Option<u64> {
+    pub(crate) fn selected_mask(self, table: usize) -> Option<u64> {
         match self.0 {
             PaxReadMode::FullRow {
                 reason:
@@ -799,6 +822,34 @@ pub(crate) struct IndexAccessPlan<'a> {
     exact: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OrderedIndexAccessPlan<'a> {
+    access: IndexAccessPlan<'a>,
+    index_oid: i32,
+    index_name: StackStr<64>,
+    order_positions: [u8; MAX_INDEX_COLS],
+    order: &'a [OrderBy<'a>],
+}
+
+impl<'a> OrderedIndexAccessPlan<'a> {
+    pub(crate) const fn access(&self) -> IndexAccessPlan<'a> {
+        self.access
+    }
+
+    pub(crate) const fn index_name(&self) -> StackStr<64> {
+        self.index_name
+    }
+
+    pub(crate) fn covers(&self, demanded: u64) -> bool {
+        !self.access.exact
+            && (self.access.columns[..self.access.n_columns]
+                .iter()
+                .fold(0u64, |mask, column| mask | (1u64 << column))
+                & demanded)
+                == demanded
+    }
+}
+
 impl IndexAccessPlan<'_> {
     pub(crate) fn columns(&self) -> &[u16] {
         &self.columns[..self.n_columns]
@@ -920,60 +971,71 @@ fn select_index_access_plan<'a>(
 ) -> Option<IndexAccessPlan<'a>> {
     let mut selected: Option<(usize, IndexAccessPlan<'a>)> = None;
     for binding in 0..storage.value_binding_count(slot) {
-        let (columns, n_columns) = storage.value_binding_columns(slot, binding);
-        let mut constraints = [None; MAX_INDEX_COLS];
-        let mut additional_constraints = [None; MAX_INDEX_COLS];
-        let mut n_constraints = 0usize;
-        let mut exact = true;
-        for (position, &column) in columns[..n_columns].iter().enumerate() {
-            let set = by_column[column as usize];
-            if let Some(equality) = set.equality {
-                constraints[position] = Some(equality);
-                n_constraints += 1;
-                continue;
-            }
-            let Some(range) = set.lower.or(set.upper) else {
-                exact = false;
-                break;
-            };
-            constraints[position] = Some(range);
-            additional_constraints[position] = match (set.lower, set.upper) {
-                (Some(_), Some(upper)) => Some(upper),
-                _ => None,
-            };
-            n_constraints += 1;
-            exact = false;
-            break;
-        }
-        exact &= n_constraints == n_columns;
-        if n_constraints == 0
-            || (exact && !storage.value_probe_complete(slot, &columns[..n_columns]))
-            || (!exact && !storage.value_durable_complete(slot, &columns[..n_columns]))
-        {
+        let Some(plan) = index_access_plan_for_binding(storage, slot, binding, by_column, false)
+        else {
             continue;
-        }
+        };
         // Full equality gets the O(1) resident path. Otherwise prefer the
         // binding with the longest usable btree prefix.
-        let score = if exact {
-            MAX_INDEX_COLS * 2 + n_constraints
+        let score = if plan.exact {
+            MAX_INDEX_COLS * 2 + plan.n_constraints
         } else {
-            n_constraints
+            plan.n_constraints
         };
         if selected.is_none_or(|(best, _)| score > best) {
-            selected = Some((
-                score,
-                IndexAccessPlan {
-                    columns,
-                    constraints,
-                    additional_constraints,
-                    n_columns,
-                    n_constraints,
-                    exact,
-                },
-            ));
+            selected = Some((score, plan));
         }
     }
     selected.map(|(_, plan)| plan)
+}
+
+fn index_access_plan_for_binding<'a>(
+    storage: &Storage,
+    slot: usize,
+    binding: usize,
+    by_column: &[IndexConstraintSet<'a>; MAX_COLUMNS],
+    allow_unconstrained: bool,
+) -> Option<IndexAccessPlan<'a>> {
+    let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+    let mut constraints = [None; MAX_INDEX_COLS];
+    let mut additional_constraints = [None; MAX_INDEX_COLS];
+    let mut n_constraints = 0usize;
+    let mut exact = true;
+    for (position, &column) in columns[..n_columns].iter().enumerate() {
+        let set = by_column[column as usize];
+        if let Some(equality) = set.equality {
+            constraints[position] = Some(equality);
+            n_constraints += 1;
+            continue;
+        }
+        let Some(range) = set.lower.or(set.upper) else {
+            exact = false;
+            break;
+        };
+        constraints[position] = Some(range);
+        additional_constraints[position] = match (set.lower, set.upper) {
+            (Some(_), Some(upper)) => Some(upper),
+            _ => None,
+        };
+        n_constraints += 1;
+        exact = false;
+        break;
+    }
+    exact &= n_constraints == n_columns;
+    if (!allow_unconstrained && n_constraints == 0)
+        || (exact && !storage.value_probe_complete(slot, &columns[..n_columns]))
+        || (!exact && !storage.value_durable_complete(slot, &columns[..n_columns]))
+    {
+        return None;
+    }
+    Some(IndexAccessPlan {
+        columns,
+        constraints,
+        additional_constraints,
+        n_columns,
+        n_constraints,
+        exact,
+    })
 }
 
 fn index_snapshot_is_current(storage: &Storage, slot: usize, txid: u32) -> bool {
@@ -1030,6 +1092,121 @@ pub(crate) fn index_access_plan<'a>(
         &mut by_column,
     );
     select_index_access_plan(storage, scope.slots[0], &by_column)
+}
+
+/// Selects one plain-column btree that supplies the requested result order.
+/// A leading equality prefix may be omitted from `ORDER BY`; every varying
+/// key must then be a contiguous suffix of the same index. The concrete
+/// catalog index, including its declared direction and NULL placement, is
+/// retained so duplicate physical bindings cannot receive the wrong plan.
+pub(crate) fn ordered_index_access_plan<'a>(
+    storage: &Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    items: &'a [SelectItem<'a>],
+    order: &'a [OrderBy<'a>],
+    arena: &'a Arena,
+) -> Result<Option<OrderedIndexAccessPlan<'a>>, SqlError> {
+    if order.is_empty()
+        || order.len() > MAX_INDEX_COLS
+        || scope.n != 1
+        || scope.derived[0].is_some()
+        || scope.lateral[0]
+        || !index_snapshot_is_current(storage, scope.slots[0], txid)
+    {
+        return Ok(None);
+    }
+    let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
+    let mut resolve_column = |expression: &Expr<'a>| {
+        let Expr::Column { qualifier, name } = expression else {
+            return None;
+        };
+        match scope.find_column(*qualifier, name) {
+            Ok(ResolvedColumn::Table(0, index)) => Some(index),
+            _ => None,
+        }
+    };
+    let operand_is_invariant = |operand: &Expr<'a>| {
+        expr_tables(operand, scope) == Some(0)
+            && !operand.contains_call()
+            && !operand.contains_subquery()
+    };
+    if let Some(predicate) = where_clause {
+        collect_index_constraints(
+            predicate,
+            &mut resolve_column,
+            &operand_is_invariant,
+            &mut by_column,
+        );
+    }
+    let mut order_columns = [0u16; MAX_INDEX_COLS];
+    for (position, requested) in order.iter().enumerate() {
+        let expression = super::resolve_order_target(requested.expression, items, scope, arena)?;
+        let Some(column) = resolve_column(expression) else {
+            return Ok(None);
+        };
+        order_columns[position] = column as u16;
+    }
+
+    let slot = scope.slots[0];
+    let mut selected: Option<(usize, OrderedIndexAccessPlan<'a>)> = None;
+    for binding in 0..storage.value_binding_count(slot) {
+        let Some(access) = index_access_plan_for_binding(storage, slot, binding, &by_column, true)
+        else {
+            continue;
+        };
+        let equality_prefix = access.constraints[..access.n_constraints]
+            .iter()
+            .take_while(|constraint| {
+                constraint.is_some_and(|constraint| constraint.operator == BinaryOp::Eq)
+            })
+            .count();
+        let Some(start) = access.columns[..access.n_columns]
+            .iter()
+            .position(|column| *column == order_columns[0])
+        else {
+            continue;
+        };
+        if start > equality_prefix || start + order.len() > access.n_columns {
+            continue;
+        }
+        let mut order_positions = [0u8; MAX_INDEX_COLS];
+        let mut contiguous = true;
+        for (offset, &column) in order_columns[..order.len()].iter().enumerate() {
+            if access.columns[start + offset] != column {
+                contiguous = false;
+                break;
+            }
+            order_positions[offset] = (start + offset) as u8;
+        }
+        if !contiguous {
+            continue;
+        }
+        let Some((index_oid, index_name)) = crate::sql::catalog::ordered_value_index_identity(
+            storage,
+            txid,
+            slot,
+            &access.columns[..access.n_columns],
+            equality_prefix,
+            &order_positions[..order.len()],
+            order,
+        ) else {
+            continue;
+        };
+        let score = access.n_constraints * (MAX_INDEX_COLS + 1) + order.len();
+        let plan = OrderedIndexAccessPlan {
+            access,
+            index_oid,
+            index_name,
+            order_positions,
+            order,
+        };
+        if selected.is_none_or(|(best, _)| score > best) {
+            selected = Some((score, plan));
+        }
+    }
+    Ok(selected.map(|(_, plan)| plan))
 }
 
 fn dml_index_operand_is_invariant(expression: &Expr<'_>) -> bool {
@@ -1117,7 +1294,34 @@ fn indexed_candidates<'a>(
     };
     let slot = scope.slots[0];
     let definition = scope.defs[0].expect("physical table has definition");
-    indexed_candidates_for_plan(storage, slot, definition, txid, plan, arena, params, hooks)
+    indexed_candidates_for_plan(
+        storage, slot, definition, txid, plan, None, arena, params, hooks,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ordered_indexed_candidates<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    txid: u32,
+    plan: OrderedIndexAccessPlan<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
+    let slot = scope.slots[0];
+    let definition = scope.defs[0].expect("physical table has definition");
+    indexed_candidates_for_plan(
+        storage,
+        slot,
+        definition,
+        txid,
+        plan.access,
+        Some(plan),
+        arena,
+        params,
+        hooks,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1136,7 +1340,9 @@ pub(crate) fn dml_indexed_candidates<'a>(
     else {
         return Ok(None);
     };
-    indexed_candidates_for_plan(storage, slot, definition, txid, plan, arena, params, hooks)
+    indexed_candidates_for_plan(
+        storage, slot, definition, txid, plan, None, arena, params, hooks,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1146,23 +1352,30 @@ fn indexed_candidates_for_plan<'a>(
     definition: &TableDef,
     txid: u32,
     plan: IndexAccessPlan<'a>,
+    ordered_plan: Option<OrderedIndexAccessPlan<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
-    let Some((index_oid, _)) = crate::sql::catalog::value_index_identity(
-        storage,
-        txid,
-        slot,
-        &plan.columns[..plan.n_columns],
-    ) else {
-        return Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
-            "value-index probe has no catalog index identity"
-        ));
+    let index_oid = if let Some(ordered) = ordered_plan {
+        ordered.index_oid
+    } else {
+        let Some((index_oid, _)) = crate::sql::catalog::value_index_identity(
+            storage,
+            txid,
+            slot,
+            &plan.columns[..plan.n_columns],
+        ) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "value-index probe has no catalog index identity"
+            ));
+        };
+        index_oid
     };
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
-    if !(plan.exact && storage.value_cache_complete(slot, &plan.columns[..plan.n_columns]))
+    if ordered_plan.is_none()
+        && !(plan.exact && storage.value_cache_complete(slot, &plan.columns[..plan.n_columns]))
         && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
     {
         return Ok(None);
@@ -1191,7 +1404,12 @@ fn indexed_candidates_for_plan<'a>(
                     index_oid,
                     scan_executed: false,
                     index_entries: 0,
+                    preserves_order: ordered_plan.is_some(),
                     rowids: &[],
+                    columns: plan.columns,
+                    n_columns: plan.n_columns,
+                    keys: None,
+                    encoded_keys: &[],
                 }));
             }
             let raw_type = ColType::from_oid(raw.type_oid());
@@ -1273,18 +1491,26 @@ fn indexed_candidates_for_plan<'a>(
             &collations[..plan.n_columns],
         )
     });
+    let retain_keys = ordered_plan.is_some() && !plan.exact;
     let mut count = 0usize;
+    let mut key_bytes = 0usize;
     if let Some(hash) = hash {
         let complete =
-            storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |_| count += 1)?;
+            storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |_, _| {
+                count += 1;
+                Ok(())
+            })?;
         debug_assert!(complete, "completeness checked before probe");
     } else {
         let complete = storage.range_value_index(
             slot,
             &plan.columns[..plan.n_columns],
             key_position,
-            |_, _| {
+            |_, _, key| {
                 count += 1;
+                if retain_keys {
+                    key_bytes = key_bytes.checked_add(key.len()).ok_or_else(arena_full)?;
+                }
                 Ok(())
             },
         )?;
@@ -1297,30 +1523,124 @@ fn indexed_candidates_for_plan<'a>(
         // instead of changing a successful query into a 54000 error.
         return Ok(None);
     };
+    let mut encoded_keys = if retain_keys {
+        Some(
+            arena
+                .alloc_slice_with(key_bytes, |_| 0u8)
+                .map_err(|_| arena_full())?,
+        )
+    } else {
+        None
+    };
+    let mut keyed_candidates = if retain_keys {
+        Some(
+            arena
+                .alloc_slice_with(count, |_| IndexKeyCandidate {
+                    rowid: 0,
+                    commit_lsn: 0,
+                    key_at: 0,
+                    key_len: 0,
+                })
+                .map_err(|_| arena_full())?,
+        )
+    } else {
+        None
+    };
     let mut fill = 0usize;
+    let mut key_at = 0usize;
     if let Some(hash) = hash {
-        storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |rowid| {
+        storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |rowid, _| {
             rowids[fill] = rowid;
             fill += 1;
+            Ok(())
         })?;
     } else {
         storage.range_value_index(
             slot,
             &plan.columns[..plan.n_columns],
             key_position,
-            |rowid, _| {
+            |rowid, commit_lsn, key| {
                 rowids[fill] = rowid;
+                if let (Some(encoded), Some(candidates)) =
+                    (encoded_keys.as_deref_mut(), keyed_candidates.as_deref_mut())
+                {
+                    encoded[key_at..key_at + key.len()].copy_from_slice(key);
+                    candidates[fill] = IndexKeyCandidate {
+                        rowid,
+                        commit_lsn,
+                        key_at,
+                        key_len: key.len(),
+                    };
+                    key_at += key.len();
+                }
                 fill += 1;
                 Ok(())
             },
         )?;
     }
-    rowids.sort_unstable();
-    let mut unique = 0usize;
-    for read in 0..rowids.len() {
-        if read == 0 || rowids[read] != rowids[read - 1] {
-            rowids[unique] = rowids[read];
-            unique += 1;
+    debug_assert_eq!(fill, count);
+    debug_assert!(!retain_keys || key_at == key_bytes);
+    let mut live = 0usize;
+    let mut ordered_keys = None;
+    let mut retained_key_bytes: &'a [u8] = &[];
+    if let Some(ordered) = ordered_plan
+        && !plan.exact
+    {
+        let encoded: &'a [u8] = encoded_keys.take().expect("ordered scan retains keys");
+        let candidates = keyed_candidates.expect("ordered scan retains candidates");
+        candidates.sort_unstable_by_key(|candidate| candidate.rowid);
+        for read in 0..candidates.len() {
+            let candidate = candidates[read];
+            if let Some(state) = storage.resident_row_state(slot, candidate.rowid)
+                && (state.committed_lsn != candidate.commit_lsn
+                    || storage
+                        .visible_row_home(slot, candidate.rowid, state, txid)?
+                        .is_none())
+            {
+                continue;
+            }
+            if live > 0 && candidates[live - 1].rowid == candidate.rowid {
+                continue;
+            }
+            candidates[live] = candidate;
+            live += 1;
+        }
+        let mut comparison_error = None;
+        candidates[..live].sort_unstable_by(|left, right| {
+            if comparison_error.is_some() {
+                return core::cmp::Ordering::Equal;
+            }
+            let left_key = &encoded[left.key_at..left.key_at + left.key_len];
+            let right_key = &encoded[right.key_at..right.key_at + right.key_len];
+            match compare_ordered_index_keys(
+                storage, definition, &plan, &ordered, left_key, right_key,
+            ) {
+                Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    comparison_error = Some(error);
+                    core::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(error) = comparison_error {
+            return Err(error);
+        }
+        for (output, candidate) in rowids.iter_mut().zip(candidates[..live].iter()) {
+            *output = candidate.rowid;
+        }
+        let keys = arena
+            .alloc_slice_with(live, |index| candidates[index])
+            .map_err(|_| arena_full())?;
+        ordered_keys = Some(&*keys);
+        retained_key_bytes = encoded;
+    } else {
+        rowids.sort_unstable();
+        for read in 0..rowids.len() {
+            if read == 0 || rowids[read] != rowids[read - 1] {
+                rowids[live] = rowids[read];
+                live += 1;
+            }
         }
     }
     Ok(Some(IndexedCandidates {
@@ -1328,8 +1648,79 @@ fn indexed_candidates_for_plan<'a>(
         index_oid,
         scan_executed: true,
         index_entries: count,
-        rowids: &rowids[..unique],
+        preserves_order: ordered_plan.is_some(),
+        rowids: &rowids[..live],
+        columns: plan.columns,
+        n_columns: plan.n_columns,
+        keys: ordered_keys,
+        encoded_keys: retained_key_bytes,
     }))
+}
+
+fn compare_ordered_index_keys(
+    storage: &Storage,
+    definition: &TableDef,
+    access: &IndexAccessPlan<'_>,
+    ordered: &OrderedIndexAccessPlan<'_>,
+    left: &[u8],
+    right: &[u8],
+) -> Result<core::cmp::Ordering, SqlError> {
+    let mut types = [ColType::Bool; MAX_INDEX_COLS];
+    let mut left_values = [Datum::Null; MAX_INDEX_COLS];
+    let mut right_values = [Datum::Null; MAX_INDEX_COLS];
+    for (position, &column) in access.columns[..access.n_columns].iter().enumerate() {
+        types[position] = definition.columns[column as usize].ctype;
+    }
+    rowenc::decode(
+        left,
+        &types[..access.n_columns],
+        &mut left_values[..access.n_columns],
+    )?;
+    rowenc::decode(
+        right,
+        &types[..access.n_columns],
+        &mut right_values[..access.n_columns],
+    )?;
+    for (key, requested) in ordered.order.iter().enumerate() {
+        let position = usize::from(ordered.order_positions[key]);
+        let left = left_values[position];
+        let right = right_values[position];
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => {
+                if requested.nulls_first {
+                    core::cmp::Ordering::Less
+                } else {
+                    core::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if requested.nulls_first {
+                    core::cmp::Ordering::Greater
+                } else {
+                    core::cmp::Ordering::Less
+                }
+            }
+            (false, false) => {
+                let column = access.columns[position] as usize;
+                let ordering = compare_datums_collated(
+                    storage,
+                    definition.columns[column].collation,
+                    &left,
+                    &right,
+                )?;
+                if requested.descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+        };
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(core::cmp::Ordering::Equal)
 }
 
 /// One assembled source row: per table, decoded values (empty slice =
@@ -2022,6 +2413,8 @@ pub(super) fn scan_source_with_pax_columns<'a>(
         false,
         None,
         pax_demand,
+        None,
+        true,
         f,
     )
 }
@@ -2055,6 +2448,8 @@ pub(super) fn scan_source_recycling_with_pax_columns<'a>(
         true,
         None,
         pax_demand,
+        None,
+        true,
         f,
     )
 }
@@ -2089,6 +2484,46 @@ pub(super) fn scan_source_recycling_retaining_match_with_pax_columns<'a>(
         true,
         Some(retain_match),
         pax_demand,
+        None,
+        true,
+        f,
+    )
+}
+
+/// Recycling source scan whose base-table candidate order has already been
+/// fixed by an ORDER-BY-compatible index plan. Reusing the same candidate set
+/// across materialization's sizing and encoding passes avoids duplicate
+/// object reads and makes the no-sort guarantee explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scan_source_recycling_with_indexed_candidates<'a>(
+    storage: &'a Storage,
+    scope: &QueryScope<'a>,
+    from: &'a FromClause<'a>,
+    txid: u32,
+    where_clause: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    hooks: &EvalHooks<'_, 'a>,
+    outer: Option<&dyn ColumnLookup<'a>>,
+    pax_demand: PaxReadDemand,
+    indexed: &IndexedCandidates<'a>,
+    f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
+) -> Result<(), SqlError> {
+    scan_source_mode(
+        storage,
+        scope,
+        from,
+        txid,
+        where_clause,
+        arena,
+        params,
+        hooks,
+        outer,
+        true,
+        None,
+        pax_demand,
+        Some(indexed),
+        false,
         f,
     )
 }
@@ -2328,6 +2763,8 @@ fn scan_source_mode<'a>(
     recycle_rows: bool,
     retain_match: Option<&core::cell::Cell<bool>>,
     pax_demand: PaxReadDemand,
+    indexed_override: Option<&IndexedCandidates<'a>>,
+    automatic_index: bool,
     f: &mut dyn FnMut(&JoinRow<'_, 'a, '_>) -> Result<bool, SqlError>,
 ) -> Result<(), SqlError> {
     let current_role = storage.current_role_slot(txid).ok_or_else(|| {
@@ -3782,6 +4219,76 @@ fn scan_source_mode<'a>(
                 }
                 return Ok(true);
             }
+            // A key-carrying ordered candidate set can satisfy the scan
+            // without fetching the base tuple when the physical demand proof
+            // names only index key columns. This is deliberately narrower
+            // than PostgreSQL INCLUDE coverage: payload columns are not yet
+            // stored in the value-index generation.
+            if let Some(access) = access.filter(|access| {
+                access.preserves_order
+                    && pax_demand
+                        .selected_mask(order[depth])
+                        .is_some_and(|demanded| access.covers(demanded))
+            }) {
+                let definition = scope.defs[order[depth]].expect("resolved");
+                let keys = access.keys.expect("covering access retains keys");
+                debug_assert_eq!(keys.len(), access.rowids.len());
+                let mut key_types = [ColType::Bool; MAX_INDEX_COLS];
+                for (position, &column) in access.columns[..access.n_columns].iter().enumerate() {
+                    key_types[position] = definition.columns[column as usize].ctype;
+                }
+                for (this, candidate) in keys.iter().enumerate() {
+                    check_timeout()?;
+                    debug_assert_eq!(candidate.rowid, access.rowids[this]);
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                        let values = arena
+                            .alloc_slice_with(definition.n_columns, |_| Datum::Null)
+                            .map_err(|_| arena_full())?;
+                        let mut key_values = [Datum::Null; MAX_INDEX_COLS];
+                        let key = &access.encoded_keys
+                            [candidate.key_at..candidate.key_at + candidate.key_len];
+                        rowenc::decode(
+                            key,
+                            &key_types[..access.n_columns],
+                            &mut key_values[..access.n_columns],
+                        )?;
+                        for (position, &column) in
+                            access.columns[..access.n_columns].iter().enumerate()
+                        {
+                            values[column as usize] = key_values[position];
+                        }
+                        refresh_catalog_object_names(storage, txid, values, arena)?;
+                        visit_candidate!(this, BoundRow::Values(values), Some(candidate.rowid))
+                    })?;
+                    if !keep_scanning {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            // An order-providing index already fixed candidate order. Resolve
+            // and fetch one row at a time so LIMIT can stop before unrelated
+            // object-resident table rows are point-read.
+            if let Some(access) = access.filter(|access| access.preserves_order) {
+                for (this, &rowid) in access.rowids.iter().enumerate() {
+                    check_timeout()?;
+                    let Some(state) = storage.row_state(slot, rowid)? else {
+                        continue;
+                    };
+                    let Some(home) = storage.visible_row_home(slot, rowid, state, txid)? else {
+                        continue;
+                    };
+                    storage.record_relation_tuple_read(txid, slot, Some(access.index_oid))?;
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                        let bytes = storage.row_bytes(slot, rowid, home, arena)?;
+                        visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                    })?;
+                    if !keep_scanning {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
             let count = candidates
                 .map(<[u64]>::len)
                 .unwrap_or(storage.visible_row_count(slot, txid)?);
@@ -3817,10 +4324,12 @@ fn scan_source_mode<'a>(
             // Spilled rows sort by rowid (their SST order — the physical order
             // they were written in); heap rows keep heap-offset order after
             // them, matching insertion order within each group.
-            ordered[..fill].sort_unstable_by_key(|(rowid, home)| match home {
-                crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
-                crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
-            });
+            if access.is_none_or(|access| !access.preserves_order) {
+                ordered[..fill].sort_unstable_by_key(|(rowid, home)| match home {
+                    crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
+                    crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
+                });
+            }
             for (this, &(rowid, home)) in ordered[..fill].iter().enumerate() {
                 check_timeout()?;
                 storage.record_relation_tuple_read(
@@ -4025,11 +4534,12 @@ fn scan_source_mode<'a>(
         })
         .map_err(|_| arena_full())?;
 
-    let indexed = if sample_plans.iter().any(Option::is_some) {
+    let automatic_indexed = if !automatic_index || sample_plans.iter().any(Option::is_some) {
         None
     } else {
         indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?
     };
+    let indexed = indexed_override.or(automatic_indexed.as_ref());
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
@@ -4100,7 +4610,7 @@ fn scan_source_mode<'a>(
             pushdown,
             sample_plans,
             order,
-            indexed.as_ref(),
+            indexed,
             decode_buffers,
             recycle_rows,
             retain_match,
@@ -4215,7 +4725,7 @@ fn scan_source_mode<'a>(
                     pushdown,
                     sample_plans,
                     order,
-                    indexed.as_ref(),
+                    indexed,
                     decode_buffers,
                     recycle_rows,
                     retain_match,

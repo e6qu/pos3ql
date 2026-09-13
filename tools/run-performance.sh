@@ -227,6 +227,8 @@ bench_pos3ql warm-memory-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-tail-range --workload tail-range --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-ordered-limit --workload ordered-limit --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql concurrent-update --workload update --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --synchronized --require-index
 
@@ -250,6 +252,8 @@ stop_pos3ql
 DATA_COLD="$WORK/data-cold"
 start_pos3ql "$DATA_COLD" primary cold-object-recovery yes
 bench_pos3ql cold-object-tail-range --workload tail-range --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-ordered-limit --workload ordered-limit --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS"
@@ -307,6 +311,10 @@ if [ "$MODE" = full ]; then
     --label postgresql18-tail-range --workload tail-range --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --check \
     --output "$OUTPUT/postgresql18-tail-range.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label postgresql18-ordered-limit --workload ordered-limit --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/postgresql18-ordered-limit.json" >/dev/null
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-insert --workload insert --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --check \

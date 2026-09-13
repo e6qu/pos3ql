@@ -103,3 +103,31 @@ writer buffer exceeding the established 512 MiB qualification envelope; the
 pending block now doubles as the ordering cursor, preserving the fixed budget
 without weakening the test. No externally blocked defect remains from this
 review.
+
+The ORDER BY execution review found that materialization always sorted wide
+rows even when one durable btree supplied the exact requested order. The
+shared typed plan now validates forward/backward direction, NULL placement,
+equality-fixed prefixes, aliases, and ordinals; execution orders compact keys,
+streams row identities through `LIMIT`, and decodes key-covered projections
+without a base-tuple fetch. Cold testing exposed two request-amplification
+bugs: ordered candidate validation point-read every immutable row, and the
+resident overlay re-encoded rows already captured by the published index
+generation. Immutable commit LSNs are now checked only against newer resident
+changes, and only those newer changes enter the overlay. A partial resident
+hash cache is no longer visited before its authoritative durable generation.
+The review also found that an explicitly different index collation could share
+a table-column value binding whose hash and comparison contract it did not
+own; such indexes now remain outside that physical binding.
+Removing redundant partial-cache probes exposed a reentrant block-stack borrow
+when durable uniqueness candidates point-read their rows inside the index
+reader callback. Durable probes now expose their encoded key to uniqueness,
+which compares it directly without a nested object read or an artificial
+limit on the number of durable hash matches.
+Coverage-instrumented driver testing also exposed an administrative-termination
+race: closing a socket with a concurrently queued frontend message could reset
+the connection and discard its already-written `57P01` FatalResponse. Terminating
+connections now flush the complete plaintext or TLS transport output, half-close
+their write side, and drain raced input within a fixed deadline before release.
+The same tests cover stale-key replacement after committed update/delete,
+mixed directions, NULLs, and exact index statistics. No externally blocked
+defect remains from this review.

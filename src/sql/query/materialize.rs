@@ -21,8 +21,8 @@ use super::{
     Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, has_project_set,
     merge_correlated, pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping,
-    record_star_width, resolve_order_target, scan_source_recycling_with_pax_columns, sql_fail,
-    sql_ok,
+    record_star_width, resolve_order_target, scan_source_recycling_with_indexed_candidates,
+    scan_source_recycling_with_pax_columns, sql_fail, sql_ok,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
@@ -681,6 +681,33 @@ pub(crate) fn materialized_rows<'a>(
         any_postponed,
         has_srf,
     } = plan;
+    let ordered_candidates = if !statement.distinct
+        && statement.distinct_on.is_empty()
+        && n_order > 0
+        && n_keys == n_order
+        && correlated.is_empty()
+        && !has_srf
+        && scope.n == 1
+        && from.joins.is_empty()
+        && from.base.sample.is_none()
+    {
+        match super::scan::ordered_index_access_plan(
+            storage,
+            scope,
+            txid,
+            where_in_scan,
+            statement.items,
+            statement.order_by,
+            arena,
+        )? {
+            Some(ordered) => super::scan::ordered_indexed_candidates(
+                storage, scope, txid, ordered, arena, params, hooks,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let routine_cursor = hooks
         .catalog
@@ -699,18 +726,101 @@ pub(crate) fn materialized_rows<'a>(
     // so they are skipped here too.
     let mut count = 0usize;
     let mut encoded_bytes = 0usize;
-    scan_source_recycling_with_pax_columns(
-        storage,
-        scope,
-        from,
-        txid,
-        where_in_scan,
-        arena,
-        params,
-        hooks,
-        outer,
-        pax_columns,
-        &mut |row| {
+    let mut measure = |row: &JoinRow<'_, 'a, '_>| {
+        for_each_materialized_projection(
+            storage,
+            scope,
+            statement,
+            row,
+            txid,
+            arena,
+            params,
+            hooks,
+            correlated,
+            base,
+            &where_correlated[..n_where_correlated],
+            &order_exprs,
+            n_keys,
+            if any_postponed {
+                Some(&postponed)
+            } else {
+                None
+            },
+            has_srf,
+            outer,
+            &mut |row, projected, keys| {
+                let row_bytes = crate::sql::exec::projected_row_len_by(stored_width, |index| {
+                    materialized_value_at(
+                        scope,
+                        row,
+                        projected,
+                        keys,
+                        width,
+                        n_keys,
+                        identities_at,
+                        index,
+                    )
+                })?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(row_bytes)
+                    .ok_or_else(arena_full)?;
+                count += 1;
+                Ok(())
+            },
+        )?;
+        Ok(true)
+    };
+    if let Some(indexed) = ordered_candidates.as_ref() {
+        scan_source_recycling_with_indexed_candidates(
+            storage,
+            scope,
+            from,
+            txid,
+            where_in_scan,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            indexed,
+            &mut measure,
+        )?;
+    } else {
+        scan_source_recycling_with_pax_columns(
+            storage,
+            scope,
+            from,
+            txid,
+            where_in_scan,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            &mut measure,
+        )?;
+    }
+    let empty: &[u8] = &[];
+    let rows: &mut [&[u8]] = arena
+        .alloc_slice_with(count, |_| empty)
+        .map_err(|_| arena_full())?;
+    let encoded_rows = arena
+        .alloc_slice_with(encoded_bytes, |_| 0_u8)
+        .map_err(|_| arena_full())?;
+    let encoded_rows_ptr = encoded_rows.as_mut_ptr();
+    if let (Some(catalog), Some(cursor)) = (hooks.catalog, routine_cursor) {
+        catalog.restore_routine_invocation_cursor(cursor);
+    }
+    if let (Some(sequences), Some(cursor)) = (hooks.sequences, sequence_cursor) {
+        sequences.restore_statement_cursor(cursor);
+    }
+    // Pass 2: project + keys, encode into the persistent block measured above.
+    // The recycling scan can then release catalog rows and correlated-subquery
+    // scratch after each source row without releasing a materialized result.
+    {
+        let mut at = 0usize;
+        let mut encoded_at = 0usize;
+        let mut encode = |row: &JoinRow<'_, 'a, '_>| {
             for_each_materialized_projection(
                 storage,
                 scope,
@@ -733,8 +843,19 @@ pub(crate) fn materialized_rows<'a>(
                 has_srf,
                 outer,
                 &mut |row, projected, keys| {
-                    let row_bytes =
-                        crate::sql::exec::projected_row_len_by(stored_width, |index| {
+                    debug_assert_eq!(projected.len(), width);
+                    let remaining = encoded_bytes
+                        .checked_sub(encoded_at)
+                        .ok_or_else(arena_full)?;
+                    // SAFETY: pass 1 measured this persistent block exactly.
+                    // Each callback receives the still-unwritten suffix, so
+                    // its mutable slice is disjoint from every stored row.
+                    let output = unsafe {
+                        core::slice::from_raw_parts_mut(encoded_rows_ptr.add(encoded_at), remaining)
+                    };
+                    let len = crate::sql::exec::encode_projected_by_into(
+                        stored_width,
+                        |index| {
                             materialized_value_at(
                                 scope,
                                 row,
@@ -745,115 +866,53 @@ pub(crate) fn materialized_rows<'a>(
                                 identities_at,
                                 index,
                             )
-                        })?;
-                    encoded_bytes = encoded_bytes
-                        .checked_add(row_bytes)
-                        .ok_or_else(arena_full)?;
-                    count += 1;
+                        },
+                        output,
+                    )?;
+                    // SAFETY: encoding initialized this prefix of the
+                    // current disjoint suffix, and the arena owns the block
+                    // for 'a. Later callbacks only write after this slice.
+                    let encoded_row: &'a [u8] = unsafe {
+                        core::slice::from_raw_parts(encoded_rows_ptr.add(encoded_at), len)
+                    };
+                    rows[at] = encoded_row;
+                    encoded_at += len;
+                    at += 1;
                     Ok(())
                 },
             )?;
             Ok(true)
-        },
-    )?;
-    let empty: &[u8] = &[];
-    let rows: &mut [&[u8]] = arena
-        .alloc_slice_with(count, |_| empty)
-        .map_err(|_| arena_full())?;
-    let encoded_rows = arena
-        .alloc_slice_with(encoded_bytes, |_| 0_u8)
-        .map_err(|_| arena_full())?;
-    let encoded_rows_ptr = encoded_rows.as_mut_ptr();
-    if let (Some(catalog), Some(cursor)) = (hooks.catalog, routine_cursor) {
-        catalog.restore_routine_invocation_cursor(cursor);
-    }
-    if let (Some(sequences), Some(cursor)) = (hooks.sequences, sequence_cursor) {
-        sequences.restore_statement_cursor(cursor);
-    }
-    // Pass 2: project + keys, encode into the persistent block measured above.
-    // The recycling scan can then release catalog rows and correlated-subquery
-    // scratch after each source row without releasing a materialized result.
-    {
-        let mut at = 0usize;
-        let mut encoded_at = 0usize;
-        scan_source_recycling_with_pax_columns(
-            storage,
-            scope,
-            from,
-            txid,
-            where_in_scan,
-            arena,
-            params,
-            hooks,
-            outer,
-            pax_columns,
-            &mut |row| {
-                for_each_materialized_projection(
-                    storage,
-                    scope,
-                    statement,
-                    row,
-                    txid,
-                    arena,
-                    params,
-                    hooks,
-                    correlated,
-                    base,
-                    &where_correlated[..n_where_correlated],
-                    &order_exprs,
-                    n_keys,
-                    if any_postponed {
-                        Some(&postponed)
-                    } else {
-                        None
-                    },
-                    has_srf,
-                    outer,
-                    &mut |row, projected, keys| {
-                        debug_assert_eq!(projected.len(), width);
-                        let remaining = encoded_bytes
-                            .checked_sub(encoded_at)
-                            .ok_or_else(arena_full)?;
-                        // SAFETY: pass 1 measured this persistent block exactly.
-                        // Each callback receives the still-unwritten suffix, so
-                        // its mutable slice is disjoint from every stored row.
-                        let output = unsafe {
-                            core::slice::from_raw_parts_mut(
-                                encoded_rows_ptr.add(encoded_at),
-                                remaining,
-                            )
-                        };
-                        let len = crate::sql::exec::encode_projected_by_into(
-                            stored_width,
-                            |index| {
-                                materialized_value_at(
-                                    scope,
-                                    row,
-                                    projected,
-                                    keys,
-                                    width,
-                                    n_keys,
-                                    identities_at,
-                                    index,
-                                )
-                            },
-                            output,
-                        )?;
-                        // SAFETY: encoding initialized this prefix of the
-                        // current disjoint suffix, and the arena owns the block
-                        // for 'a. Later callbacks only write after this slice.
-                        let encoded_row: &'a [u8] = unsafe {
-                            core::slice::from_raw_parts(encoded_rows_ptr.add(encoded_at), len)
-                        };
-                        rows[at] = encoded_row;
-                        encoded_at += len;
-                        at += 1;
-                        Ok(())
-                    },
-                )?;
-                Ok(true)
-            },
-        )?;
+        };
+        if let Some(indexed) = ordered_candidates.as_ref() {
+            scan_source_recycling_with_indexed_candidates(
+                storage,
+                scope,
+                from,
+                txid,
+                where_in_scan,
+                arena,
+                params,
+                hooks,
+                outer,
+                pax_columns,
+                indexed,
+                &mut encode,
+            )?;
+        } else {
+            scan_source_recycling_with_pax_columns(
+                storage,
+                scope,
+                from,
+                txid,
+                where_in_scan,
+                arena,
+                params,
+                hooks,
+                outer,
+                pax_columns,
+                &mut encode,
+            )?;
+        }
         debug_assert_eq!(at, count);
         debug_assert_eq!(encoded_at, encoded_bytes);
     }
@@ -872,7 +931,7 @@ pub(crate) fn materialized_rows<'a>(
     // ascending as a tiebreak — a no-op when ORDER BY already begins with them
     // (as PostgreSQL requires), but it groups equal keys when ORDER BY is
     // absent so the run dedup below works.
-    if n_order > 0 || n_on > 0 {
+    if (n_order > 0 && ordered_candidates.is_none()) || n_on > 0 {
         for row in rows.iter() {
             for (key, &collation) in key_collations.iter().enumerate().take(n_keys) {
                 storage.validate_text_collation(
@@ -1253,6 +1312,93 @@ pub(crate) fn external_materialized_into<'a>(
 ) -> Result<u64, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
+    let ordered_candidates = if !statement.distinct
+        && statement.distinct_on.is_empty()
+        && plan.n_order > 0
+        && plan.n_keys == plan.n_order
+        && correlated.is_empty()
+        && !plan.has_srf
+        && scope.n == 1
+        && from.joins.is_empty()
+        && from.base.sample.is_none()
+    {
+        match super::scan::ordered_index_access_plan(
+            storage,
+            scope,
+            txid,
+            plan.where_in_scan,
+            statement.items,
+            statement.order_by,
+            arena,
+        )? {
+            Some(ordered) => super::scan::ordered_indexed_candidates(
+                storage, scope, txid, ordered, arena, params, hooks,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    if !statement.with_ties
+        && statement.locking.is_empty()
+        && let Some(indexed) = ordered_candidates.as_ref()
+    {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let window = offset.saturating_add(limit);
+        let mut logical_index = 0u64;
+        let mut emitted = 0u64;
+        let mut keep_emitting = true;
+        scan_source_recycling_with_indexed_candidates(
+            storage,
+            scope,
+            from,
+            txid,
+            plan.where_in_scan,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            indexed,
+            &mut |row| {
+                if !super::lock_result_row(storage, txid, statement, scope, row.rowids)? {
+                    return Ok(true);
+                }
+                let mut source_rowids = [None; super::MAX_JOIN_TABLES];
+                source_rowids[..row.rowids.len()].copy_from_slice(row.rowids);
+                for_each_materialized_projection(
+                    storage,
+                    scope,
+                    statement,
+                    row,
+                    txid,
+                    arena,
+                    params,
+                    hooks,
+                    correlated,
+                    base,
+                    &plan.where_correlated[..plan.n_where_correlated],
+                    &plan.order_exprs,
+                    plan.n_keys,
+                    None,
+                    false,
+                    outer,
+                    &mut |_row, projected, _keys| {
+                        if logical_index >= offset {
+                            keep_emitting = emit(projected, &source_rowids)?;
+                            emitted += 1;
+                        }
+                        logical_index += 1;
+                        Ok(())
+                    },
+                )?;
+                Ok(keep_emitting && logical_index < window)
+            },
+        )?;
+        return Ok(emitted);
+    }
     let mut sorter = storage.external_sorter()?;
     sorter.reset();
     let mut compare = |left: &[u8], right: &[u8]| {
@@ -1267,89 +1413,106 @@ pub(crate) fn external_materialized_into<'a>(
             right,
         )
     };
-    let scan = scan_source_recycling_with_pax_columns(
-        storage,
-        scope,
-        from,
-        txid,
-        plan.where_in_scan,
-        arena,
-        params,
-        hooks,
-        outer,
-        pax_columns,
-        &mut |row| {
-            let mark = arena.mark();
-            let result = for_each_materialized_projection(
-                storage,
-                scope,
-                statement,
-                row,
-                txid,
-                arena,
-                params,
-                hooks,
-                correlated,
-                base,
-                &plan.where_correlated[..plan.n_where_correlated],
-                &plan.order_exprs,
-                plan.n_keys,
-                if plan.any_postponed {
-                    Some(&plan.postponed)
-                } else {
-                    None
-                },
-                plan.has_srf,
-                outer,
-                &mut |row, projected, keys| {
-                    storage
-                        .with_block_store(|blocks| {
-                            sorter.push_projected_by(
-                                blocks,
-                                plan.width + plan.n_keys + plan.n_raw + plan.n_identities,
-                                |index| {
-                                    if index < plan.width {
-                                        return projected[index];
+    let mut push = |row: &JoinRow<'_, 'a, '_>| {
+        let mark = arena.mark();
+        let result = for_each_materialized_projection(
+            storage,
+            scope,
+            statement,
+            row,
+            txid,
+            arena,
+            params,
+            hooks,
+            correlated,
+            base,
+            &plan.where_correlated[..plan.n_where_correlated],
+            &plan.order_exprs,
+            plan.n_keys,
+            if plan.any_postponed {
+                Some(&plan.postponed)
+            } else {
+                None
+            },
+            plan.has_srf,
+            outer,
+            &mut |row, projected, keys| {
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_projected_by(
+                            blocks,
+                            plan.width + plan.n_keys + plan.n_raw + plan.n_identities,
+                            |index| {
+                                if index < plan.width {
+                                    return projected[index];
+                                }
+                                if index < plan.width + plan.n_keys {
+                                    return keys[index - plan.width];
+                                }
+                                if index >= plan.identities_at {
+                                    return row.rowids[index - plan.identities_at]
+                                        .and_then(|rowid| i64::try_from(rowid).ok())
+                                        .map(Datum::Int8)
+                                        .unwrap_or(Datum::Null);
+                                }
+                                let mut raw_index = index - plan.width - plan.n_keys;
+                                for table in 0..scope.n {
+                                    let column_count =
+                                        scope.defs[table].expect("resolved").n_columns;
+                                    if raw_index < column_count {
+                                        let values = row.values[table].expect("bound");
+                                        return if values.is_empty() {
+                                            Datum::Null
+                                        } else {
+                                            values[raw_index]
+                                        };
                                     }
-                                    if index < plan.width + plan.n_keys {
-                                        return keys[index - plan.width];
-                                    }
-                                    if index >= plan.identities_at {
-                                        return row.rowids[index - plan.identities_at]
-                                            .and_then(|rowid| i64::try_from(rowid).ok())
-                                            .map(Datum::Int8)
-                                            .unwrap_or(Datum::Null);
-                                    }
-                                    let mut raw_index = index - plan.width - plan.n_keys;
-                                    for table in 0..scope.n {
-                                        let column_count =
-                                            scope.defs[table].expect("resolved").n_columns;
-                                        if raw_index < column_count {
-                                            let values = row.values[table].expect("bound");
-                                            return if values.is_empty() {
-                                                Datum::Null
-                                            } else {
-                                                values[raw_index]
-                                            };
-                                        }
-                                        raw_index -= column_count;
-                                    }
-                                    unreachable!("raw projected column is in scope")
-                                },
-                                &mut compare,
-                            )
-                        })
-                        .expect("spill-attached block store")
-                },
-            );
-            // SAFETY: every value allocated above `mark` was encoded into the
-            // external run before the callback returned; none escapes.
-            unsafe { arena.rewind_to(mark) };
-            result?;
-            Ok(true)
-        },
-    );
-    scan?;
+                                    raw_index -= column_count;
+                                }
+                                unreachable!("raw projected column is in scope")
+                            },
+                            &mut compare,
+                        )
+                    })
+                    .expect("spill-attached block store")
+            },
+        );
+        // SAFETY: every value allocated above `mark` was encoded into the
+        // external run before the callback returned; none escapes.
+        unsafe { arena.rewind_to(mark) };
+        result?;
+        Ok(true)
+    };
+    if let Some(indexed) = ordered_candidates.as_ref() {
+        scan_source_recycling_with_indexed_candidates(
+            storage,
+            scope,
+            from,
+            txid,
+            plan.where_in_scan,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            indexed,
+            &mut push,
+        )?;
+    } else {
+        scan_source_recycling_with_pax_columns(
+            storage,
+            scope,
+            from,
+            txid,
+            plan.where_in_scan,
+            arena,
+            params,
+            hooks,
+            outer,
+            pax_columns,
+            &mut push,
+        )?;
+    }
     let run = storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
         .expect("spill-attached block store")?;

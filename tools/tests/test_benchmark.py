@@ -76,6 +76,12 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT sum(payload), count(*) FROM benchmark_kv WHERE id >= 1",
         )
 
+    def test_ordered_limit_is_a_key_only_bounded_result(self):
+        self.assertEqual(
+            benchmark.workload_sql("ordered-limit", 7, 19, 1000),
+            "SELECT id FROM benchmark_kv ORDER BY id DESC LIMIT 32",
+        )
+
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),
@@ -109,6 +115,34 @@ class BenchmarkTest(unittest.TestCase):
         failures = benchmark.validate(result)
         self.assertIn("workload did not execute an index scan per operation", failures)
         self.assertIn("workload unexpectedly executed sequential scans", failures)
+
+    def test_ordered_limit_validation_requires_index_only_execution(self):
+        result = {
+            "workload": {"name": "ordered-limit", "require_index": True},
+            "results": {
+                "attempted_operations": 2,
+                "completed_operations": 2,
+                "errors": [],
+                "latency_ms": {
+                    "minimum": 1,
+                    "p50": 1,
+                    "p95": 1,
+                    "p99": 1,
+                    "maximum": 1,
+                },
+                "fixed_memory_occupancy": None,
+                "object_store": None,
+                "access_path": {
+                    "index_scans": 2,
+                    "index_tuples_fetched": 1,
+                    "sequential_scans": 0,
+                    "sequential_tuples_read": 0,
+                },
+            },
+        }
+        self.assertIn(
+            "ordered-limit workload fetched base tuples", benchmark.validate(result)
+        )
 
     def test_validation_rejects_missing_work_and_unordered_latency(self):
         result = {

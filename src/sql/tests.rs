@@ -46337,7 +46337,7 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
                         crate::store::ValueIndexPosition::Match
                     })
                 },
-                |_, _| {
+                |_, _, _| {
                     durable_candidates += 1;
                     Ok(())
                 },
@@ -46364,6 +46364,61 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
             .iter()
             .any(|row| row.contains("Index Scan using composite_seek_pkey")),
         "{prefix_plan:?}"
+    );
+    let ordered_plan = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "EXPLAIN SELECT id, payload FROM composite_seek
+         WHERE tenant = 2 ORDER BY id DESC",
+    ));
+    assert!(
+        ordered_plan
+            .iter()
+            .any(|row| row.contains("Index Scan using composite_seek_pkey")),
+        "{ordered_plan:?}"
+    );
+    assert!(
+        ordered_plan.iter().all(|row| !row.contains("Sort")),
+        "an equality-prefix btree order must not retain a wide-row Sort: {ordered_plan:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restart_budget,
+            "SELECT id FROM composite_seek WHERE tenant = 2 ORDER BY id DESC LIMIT 2"
+        )),
+        ["3", "2"]
+    );
+    let full_order_plan = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "EXPLAIN SELECT tenant, id FROM composite_seek ORDER BY tenant, id LIMIT 3",
+    ));
+    assert!(
+        full_order_plan
+            .iter()
+            .any(|row| row.contains("Index Only Scan using composite_seek_pkey")),
+        "{full_order_plan:?}"
+    );
+    assert!(full_order_plan.iter().all(|row| !row.contains("Sort")));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restart_budget,
+            "SELECT pg_stat_reset_single_table_counters('composite_seek_pkey'::regclass)"
+        )),
+        [""]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restart_budget,
+            "SELECT tenant, id FROM composite_seek ORDER BY tenant, id LIMIT 3;
+             SELECT idx_scan, idx_tup_read, idx_tup_fetch
+             FROM pg_stat_user_indexes
+             WHERE indexrelname = 'composite_seek_pkey'"
+        )),
+        ["1|1", "1|2", "2|1", "1|8005|0"]
     );
     let bounded_output = run_with(
         &mut restarted,
@@ -46398,7 +46453,7 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     assert!(
         bounded_rows
             .iter()
-            .any(|row| row.contains("Index Scan using composite_seek_pkey")),
+            .any(|row| row.contains("Index Only Scan using composite_seek_pkey")),
         "two-sided prepared range must retain the physical index plan: {bounded_rows:?}"
     );
     assert_eq!(
@@ -46518,6 +46573,188 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     assert!(owner_rows.iter().any(|row| row == "pending"));
     run_txn(&mut restarted, &mut restart_budget, &mut owner, "ROLLBACK");
     drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn ordered_index_scans_honor_direction_nulls_aliases_and_committed_overlays() {
+    let mut config = test_config("ordered-index-scans");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("ordered-index-scans-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ordered_rows (a integer, b integer, payload text);
+         INSERT INTO ordered_rows VALUES
+             (2, NULL, 'two-null'), (2, 1, 'two-one'), (2, 3, 'two-three'),
+             (1, NULL, 'one-null'), (NULL, 2, 'null-two'), (3, 2, 'three-two');
+         CREATE INDEX mixed_order_idx ON ordered_rows
+             (a DESC NULLS LAST, b ASC NULLS FIRST);
+         CREATE TABLE collated_rows (value text);
+         INSERT INTO collated_rows VALUES ('b'), ('a');
+         CREATE INDEX collated_c_idx ON collated_rows (value COLLATE \"C\")",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let collated_slot = engine
+        .storage
+        .find_table("public", "collated_rows")
+        .unwrap();
+    assert!(
+        !engine.storage.value_cache_complete(collated_slot, &[0]),
+        "an explicitly different collation cannot share the table-column value binding"
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let collated_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT value FROM collated_rows
+         WHERE value = 'a' ORDER BY value",
+    ));
+    assert!(collated_plan.iter().any(|row| row.contains("Seq Scan")));
+    assert!(collated_plan.iter().any(|row| row.contains("Sort")));
+    assert!(collated_plan.iter().all(|row| !row.contains("Index Scan")));
+    let forward_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT a, b FROM ordered_rows
+         ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST",
+    ));
+    assert!(
+        forward_plan
+            .iter()
+            .any(|row| row.contains("Index Only Scan using mixed_order_idx")),
+        "{forward_plan:?}"
+    );
+    assert!(forward_plan.iter().all(|row| !row.contains("Sort")));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT a, b FROM ordered_rows
+             ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST;
+             SELECT a, b FROM ordered_rows
+             ORDER BY a ASC NULLS FIRST, b DESC NULLS LAST"
+        )),
+        [
+            "3|2", "2|NULL", "2|1", "2|3", "1|NULL", "NULL|2", "NULL|2", "1|NULL", "2|3", "2|1",
+            "2|NULL", "3|2",
+        ]
+    );
+
+    let alias_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT a AS first_key, b FROM ordered_rows
+         ORDER BY first_key DESC NULLS LAST, 2 ASC NULLS FIRST",
+    ));
+    assert!(
+        alias_plan
+            .iter()
+            .any(|row| row.contains("Index Only Scan using mixed_order_idx")),
+        "{alias_plan:?}"
+    );
+    assert!(alias_plan.iter().all(|row| !row.contains("Sort")));
+    let incompatible = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT a, b FROM ordered_rows
+         ORDER BY a DESC NULLS LAST, b DESC NULLS LAST",
+    ));
+    assert!(
+        incompatible.iter().any(|row| row.contains("Sort")),
+        "mixed forward/backward directions require a Sort: {incompatible:?}"
+    );
+
+    let prefix_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT b, payload FROM ordered_rows
+         WHERE a = 2 ORDER BY b DESC NULLS LAST",
+    ));
+    assert!(
+        prefix_plan
+            .iter()
+            .any(|row| row.contains("Index Scan using mixed_order_idx")),
+        "{prefix_plan:?}"
+    );
+    assert!(prefix_plan.iter().all(|row| !row.contains("Sort")));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT b, payload FROM ordered_rows
+             WHERE a = 2 ORDER BY b DESC NULLS LAST"
+        )),
+        ["3|two-three", "1|two-one", "NULL|two-null"]
+    );
+
+    let changed = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "UPDATE ordered_rows SET a = 0, b = NULL, payload = 'moved'
+         WHERE a = 3 AND b = 2;
+         DELETE FROM ordered_rows WHERE a = 1;
+         INSERT INTO ordered_rows VALUES (4, 0, 'inserted')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&changed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT a, b FROM ordered_rows
+             ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST"
+        )),
+        ["4|0", "2|NULL", "2|1", "2|3", "0|NULL", "NULL|2"]
+    );
+    let ties_plan = data_rows(&run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "EXPLAIN SELECT a FROM ordered_rows
+         ORDER BY a DESC NULLS LAST FETCH FIRST 2 ROWS WITH TIES",
+    ));
+    assert!(
+        ties_plan
+            .iter()
+            .any(|row| row.contains("Index Only Scan using mixed_order_idx")),
+        "{ties_plan:?}"
+    );
+    assert!(ties_plan.iter().all(|row| !row.contains("Sort")));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT pg_stat_reset_single_table_counters('mixed_order_idx'::regclass);
+             SELECT a FROM ordered_rows
+             ORDER BY a DESC NULLS LAST FETCH FIRST 2 ROWS WITH TIES;
+             SELECT idx_tup_fetch FROM pg_stat_user_indexes
+             WHERE indexrelname = 'mixed_order_idx'"
+        )),
+        ["", "4", "2", "2", "2", "0"]
+    );
+
+    drop(replayed);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -47474,6 +47711,56 @@ fn uniqueness_cache_capacity_never_limits_table_correctness() {
         String::from_utf8_lossy(&duplicate).contains("23505"),
         "an incomplete acceleration cache must fall through to authoritative rows"
     );
+}
+
+#[test]
+fn durable_value_probe_is_not_capped_by_the_resident_overlay() {
+    let mut config = test_config("durable-value-probe-capacity");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.table_rows = 4;
+    config.txn_rows = 4;
+    config.value_index_rows = 1;
+    config.object_store_bucket = format!("durable-value-probe-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE repeated_keys (id int PRIMARY KEY, key int);
+         CREATE INDEX repeated_keys_key_idx ON repeated_keys (key);
+         INSERT INTO repeated_keys VALUES (1,7),(2,7),(3,7),(4,7)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    let second_batch = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO repeated_keys VALUES (5,7),(6,7),(7,7),(8,7)",
+    );
+    assert!(!String::from_utf8_lossy(&second_batch).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT count(*) FROM repeated_keys WHERE key = 7"
+        )),
+        ["8"]
+    );
+
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

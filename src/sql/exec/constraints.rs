@@ -285,6 +285,50 @@ fn key_equal(
     Ok(true)
 }
 
+/// Compares one encoded plain-column value-index key with a candidate row.
+/// Durable probes already carry this key, so uniqueness need not reenter the
+/// object-backed row reader while its value-index block is borrowed.
+fn encoded_key_equal(
+    storage: &Storage,
+    def: &TableDef,
+    columns: &[u16],
+    values: &[Datum],
+    encoded: &[u8],
+    nulls_not_distinct: bool,
+) -> Result<bool, SqlError> {
+    let mut types = [ColType::Bool; crate::storage::MAX_INDEX_COLS];
+    for (position, &column) in columns.iter().enumerate() {
+        types[position] = def.columns()[column as usize].ctype;
+    }
+    let mut other = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    rowenc::decode(
+        encoded,
+        &types[..columns.len()],
+        &mut other[..columns.len()],
+    )?;
+    for (position, &column) in columns.iter().enumerate() {
+        let value = values[column as usize];
+        let candidate = other[position];
+        if value.is_null() || candidate.is_null() {
+            if nulls_not_distinct && value.is_null() && candidate.is_null() {
+                continue;
+            }
+            return Ok(false);
+        }
+        if !compare_datums_collated(
+            storage,
+            def.columns()[column as usize].collation,
+            &value,
+            &candidate,
+        )?
+        .is_eq()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn key_values_equal(
     storage: &Storage,
     collations: &[crate::sql::ast::Collation],
@@ -455,6 +499,7 @@ fn enforce_expression_index_uniqueness<'a>(
     txid: u32,
     columns: &[u16],
     expressions: &[Option<&'a Expr<'a>>],
+    collations: &[crate::sql::ast::Collation],
     operator_classes: &[crate::storage::IndexOperatorClass],
     nulls_not_distinct: bool,
     name: &ConstraintName,
@@ -467,7 +512,6 @@ fn enforce_expression_index_uniqueness<'a>(
         return Ok(());
     }
     let keys = index_key_values(def, values, columns, expressions, arena)?;
-    let collations = index_key_collations(storage, txid, def, columns, expressions, arena)?;
     if !nulls_not_distinct && keys[..columns.len()].iter().any(Datum::is_null) {
         return Ok(());
     }
@@ -482,7 +526,7 @@ fn enforce_expression_index_uniqueness<'a>(
             &IndexKeyEquality {
                 storage,
                 txid,
-                collations: &collations[..columns.len()],
+                collations,
                 operator_classes,
                 nulls_not_distinct,
                 arena,
@@ -591,24 +635,31 @@ fn enforce_key_uniqueness(
             collations[index] = def.columns()[*column as usize].collation;
         }
         let hash = hash_key_collated(values, columns, &collations[..columns.len()]);
-        storage.probe_value(table_index, columns, hash, |rowid| {
+        storage.probe_value(table_index, columns, hash, |rowid, encoded_key| {
             if result.is_err() || Some(rowid) == self_rowid {
-                return;
+                return Ok(());
             }
-            match committed_key_matches(
-                storage,
-                table_index,
-                def,
-                schema,
-                columns,
-                values,
-                nulls_not_distinct,
-                rowid,
-            ) {
+            let matched = match encoded_key {
+                Some(encoded) => {
+                    encoded_key_equal(storage, def, columns, values, encoded, nulls_not_distinct)
+                }
+                None => committed_key_matches(
+                    storage,
+                    table_index,
+                    def,
+                    schema,
+                    columns,
+                    values,
+                    nulls_not_distinct,
+                    rowid,
+                ),
+            };
+            match matched {
                 Ok(true) => result = Err(unique_violation(def, name)),
                 Ok(false) => {}
                 Err(e) => result = Err(e),
             }
+            Ok(())
         })?
     };
     result?;
@@ -1021,7 +1072,15 @@ pub fn check_unique_indexes(
         let custom = resolved[..index.n_cols]
             .iter()
             .any(|class| matches!(class, Some(crate::storage::IndexOperatorClass::Catalog(_))));
+        let custom_collation =
+            index.columns[..index.n_cols]
+                .iter()
+                .enumerate()
+                .any(|(position, column)| {
+                    index.collations[position] != def.columns[*column as usize].collation
+                });
         if custom
+            || custom_collation
             || index.expressions[..index.n_cols]
                 .iter()
                 .any(Option::is_some)
@@ -1051,6 +1110,7 @@ pub fn check_unique_indexes(
                 txid,
                 icols,
                 &expressions[..index.n_cols],
+                &index.collations[..index.n_cols],
                 &classes[..index.n_cols],
                 index.nulls_not_distinct,
                 &name,

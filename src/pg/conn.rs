@@ -3,7 +3,7 @@
 //! server startup and reused across connections.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -174,6 +174,13 @@ enum ReplicationMode {
     None,
     Physical,
     Logical,
+}
+
+#[derive(Clone, Copy)]
+enum TerminationState {
+    Open,
+    Flushing { deadline: Instant },
+    Draining { deadline: Instant },
 }
 
 /// The credential selected during startup. A configured password is solely
@@ -398,7 +405,7 @@ pub struct Conn {
     /// the plaintext `S` acknowledgement has left the socket.
     pending_tls: Option<crate::pg::tls::ServerSession>,
     cancel_request: Option<CancelRequest>,
-    terminate_after_flush: bool,
+    termination: TerminationState,
 }
 
 impl Conn {
@@ -490,7 +497,7 @@ impl Conn {
             tls: None,
             pending_tls: None,
             cancel_request: None,
-            terminate_after_flush: false,
+            termination: TerminationState::Open,
         })
     }
 
@@ -542,7 +549,7 @@ impl Conn {
         self.tls = None;
         self.pending_tls = None;
         self.cancel_request = None;
-        self.terminate_after_flush = false;
+        self.termination = TerminationState::Open;
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
@@ -568,7 +575,8 @@ impl Conn {
     }
 
     pub(crate) fn wants_read(&self) -> bool {
-        !self.parked && !self.terminate_after_flush
+        matches!(self.termination, TerminationState::Draining { .. })
+            || (!self.parked && matches!(self.termination, TerminationState::Open))
     }
 
     /// The connection's id (the backend PID reported in BackendKeyData and in
@@ -586,14 +594,37 @@ impl Conn {
     }
 
     pub(crate) fn is_terminating(&self) -> bool {
-        self.terminate_after_flush
+        !matches!(self.termination, TerminationState::Open)
+    }
+
+    fn start_termination(&mut self) {
+        if matches!(self.termination, TerminationState::Open) {
+            self.termination = TerminationState::Flushing {
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+        }
+    }
+
+    pub(crate) fn termination_remaining(&self) -> Option<Duration> {
+        let deadline = match self.termination {
+            TerminationState::Open => return None,
+            TerminationState::Flushing { deadline } | TerminationState::Draining { deadline } => {
+                deadline
+            }
+        };
+        Some(deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub(crate) fn termination_expired(&self) -> bool {
+        self.termination_remaining() == Some(Duration::ZERO)
     }
 
     pub(crate) fn terminate_by_administrator(&mut self) -> bool {
         self.recv.clear();
         self.send.clear();
         self.finish_lock_wait();
-        self.terminate_after_flush = true;
+        self.replication_completion_pending = false;
+        self.start_termination();
         Responder::new(&mut self.send)
             .fatal(
                 sqlstate::ADMIN_SHUTDOWN,
@@ -689,6 +720,61 @@ impl Conn {
         }
     }
 
+    fn transport_output_empty(&self) -> bool {
+        self.send.is_empty() && self.tls.as_ref().is_none_or(|tls| !tls.wants_write())
+    }
+
+    /// Half-closes only after the complete FatalResponse is on the socket.
+    /// The peer's remaining input is then drained before descriptor close, so
+    /// a raced frontend message cannot turn the graceful FIN into a reset that
+    /// discards the PostgreSQL error.
+    fn finish_termination_output(&mut self) -> Option<After> {
+        match self.termination {
+            TerminationState::Open => None,
+            TerminationState::Flushing { deadline } if self.transport_output_empty() => {
+                if self
+                    .stream
+                    .as_ref()
+                    .expect("open terminating connection")
+                    .shutdown(Shutdown::Write)
+                    .is_err()
+                {
+                    return Some(After::Close);
+                }
+                self.termination = TerminationState::Draining { deadline };
+                Some(After::Continue)
+            }
+            TerminationState::Flushing { .. } | TerminationState::Draining { .. } => {
+                Some(After::Continue)
+            }
+        }
+    }
+
+    fn drain_termination_input(&mut self) -> After {
+        if !matches!(self.termination, TerminationState::Draining { .. }) {
+            return After::Continue;
+        }
+        let mut discard = [0u8; 4096];
+        match self
+            .stream
+            .as_mut()
+            .expect("open terminating connection")
+            .read(&mut discard)
+        {
+            Ok(0) => After::Close,
+            Ok(_) => After::Continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                After::Continue
+            }
+            Err(_) => After::Close,
+        }
+    }
+
     pub(crate) fn on_readable(
         &mut self,
         engine: &mut Engine,
@@ -699,8 +785,8 @@ impl Conn {
         if self.stream.is_none() {
             return PendingResponse::closed();
         }
-        if self.terminate_after_flush {
-            return PendingResponse::unguarded(After::Continue);
+        if self.is_terminating() {
+            return PendingResponse::unguarded(self.drain_termination_input());
         }
         if self.parked {
             return PendingResponse::unguarded(After::Continue);
@@ -762,8 +848,12 @@ impl Conn {
         }
         let flushed = self.flush();
         self.activate_pending_tls();
+        if flushed.is_ok()
+            && let Some(after) = self.finish_termination_output()
+        {
+            return after;
+        }
         match flushed {
-            Ok(()) if self.terminate_after_flush && self.send.is_empty() => After::Close,
             Ok(()) => pending.after,
             Err(()) => After::Close,
         }
@@ -772,6 +862,11 @@ impl Conn {
     pub fn on_writable(&mut self) -> After {
         let flushed = self.flush();
         self.activate_pending_tls();
+        if flushed.is_ok()
+            && let Some(after) = self.finish_termination_output()
+        {
+            return after;
+        }
         if flushed.is_ok()
             && self.send.is_empty()
             && self.tls.as_ref().is_none_or(|tls| !tls.wants_write())
@@ -794,7 +889,6 @@ impl Conn {
         // A TLS session mid-handshake may still owe the peer bytes after the
         // socket accepted what it could; keep the connection alive.
         match flushed {
-            Ok(()) if self.terminate_after_flush && self.send.is_empty() => After::Close,
             Ok(()) => After::Continue,
             Err(()) => After::Close,
         }
@@ -835,9 +929,7 @@ impl Conn {
             match after {
                 Step::NeedMoreData => return After::Continue,
                 Step::Parked => return After::Continue,
-                Step::Continue
-                    if self.terminate_after_flush || self.replication_completion_pending =>
-                {
+                Step::Continue if self.is_terminating() || self.replication_completion_pending => {
                     return After::Continue;
                 }
                 Step::Continue => {}
@@ -866,9 +958,7 @@ impl Conn {
             match self.process_message(engine) {
                 Step::Close => break After::Close,
                 Step::NeedMoreData | Step::Parked => break After::Continue,
-                Step::Continue
-                    if self.terminate_after_flush || self.replication_completion_pending =>
-                {
+                Step::Continue if self.is_terminating() || self.replication_completion_pending => {
                     break After::Continue;
                 }
                 Step::Continue => {}
@@ -2086,7 +2176,7 @@ impl Conn {
             }
             Err(error) => {
                 self.send.truncate_to(mark);
-                self.terminate_after_flush = true;
+                self.start_termination();
                 if Responder::new(&mut self.send)
                     .error(error.sqlstate, error.message.as_str())
                     .is_ok()
@@ -2108,7 +2198,7 @@ impl Conn {
 
     fn fail_replication_stream(&mut self, engine: &mut Engine, error: SqlError) -> Step {
         self.stop_replication(engine);
-        self.terminate_after_flush = true;
+        self.start_termination();
         if Responder::new(&mut self.send)
             .error(error.sqlstate, error.message.as_str())
             .is_ok()
@@ -5850,6 +5940,42 @@ mod tests {
         let response = connection.send.readable();
         assert!(response.windows(6).any(|bytes| bytes == b"FATAL\0"));
         assert!(response.windows(5).any(|bytes| bytes == b"57P01"));
+    }
+
+    #[test]
+    fn administrative_termination_flushes_fatal_before_draining_raced_input() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let mut client = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect client");
+        let (server, _) = listener.accept().expect("accept client");
+        server.set_nonblocking(true).expect("nonblocking server");
+
+        let config = Config::default_dev();
+        let mut budget = Budget::new(64 << 20);
+        let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
+        connection.open(server, 71);
+        assert!(connection.terminate_by_administrator());
+
+        // Model the coverage-CI race: a query reaches the kernel after the
+        // backend queued its FatalResponse but before it closes the socket.
+        client
+            .write_all(b"Q\0\0\0\x0dSELECT 1\0")
+            .expect("send raced query");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finish client input");
+        assert_eq!(connection.on_writable(), After::Continue);
+        assert!(connection.wants_read());
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .expect("read complete fatal response");
+        assert!(response.windows(6).any(|bytes| bytes == b"FATAL\0"));
+        assert!(response.windows(5).any(|bytes| bytes == b"57P01"));
+
+        assert_eq!(connection.drain_termination_input(), After::Continue);
+        assert_eq!(connection.drain_termination_input(), After::Close);
     }
 
     fn num_str(bytes: &[u8]) -> String {

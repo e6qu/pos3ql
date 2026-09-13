@@ -32,9 +32,12 @@ durable equality generations carry per-block filters so cold probes skip
 unrelated key blocks. Durable keys are checkpoint-sorted with PostgreSQL type
 and collation semantics; first/last-key block bounds let prefix and range
 probes avoid disjoint object reads. The executor always rechecks MVCC
-visibility and the SQL qualification. Ordered-result/ORDER BY, expression,
-partial, join-parameterized, and index-only planning remain
-explicit limits.
+visibility and the SQL qualification. Compatible `ORDER BY` clauses traverse
+those compact keys in declared forward or backward order, including equality-
+fixed prefixes and PostgreSQL NULL placement, without materializing or sorting
+wide rows. Key-covered ordered queries execute as index-only scans; `INCLUDE`
+payload coverage, expression and partial matching, and join-parameterized
+scans remain explicit limits.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

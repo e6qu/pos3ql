@@ -209,6 +209,8 @@ def workload_sql(workload, worker, operation, rows):
             "SELECT sum(payload), count(*) FROM benchmark_kv "
             f"WHERE id >= {lower}"
         )
+    if workload == "ordered-limit":
+        return "SELECT id FROM benchmark_kv ORDER BY id DESC LIMIT 32"
     if workload == "insert":
         inserted_key = rows + worker * 1_000_000 + operation + 1
         return f"INSERT INTO benchmark_kv(id, payload) VALUES ({inserted_key}, 0)"
@@ -456,6 +458,11 @@ def validate(result):
                 failures.append("workload did not execute an index scan per operation")
             if access_path["sequential_scans"] != 0:
                 failures.append("workload unexpectedly executed sequential scans")
+            if (
+                workload.get("name") == "ordered-limit"
+                and access_path["index_tuples_fetched"] != 0
+            ):
+                failures.append("ordered-limit workload fetched base tuples")
     if (
         metrics is not None
         and workload.get("name") == "update"
@@ -482,7 +489,15 @@ def parse_args():
     parser.add_argument("--label", required=True)
     parser.add_argument(
         "--workload",
-        choices=("point-read", "tail-range", "update", "mixed", "scan", "insert"),
+        choices=(
+            "point-read",
+            "tail-range",
+            "ordered-limit",
+            "update",
+            "mixed",
+            "scan",
+            "insert",
+        ),
         required=True,
     )
     parser.add_argument("--clients", type=int, default=1)
@@ -516,10 +531,11 @@ def parse_args():
     if args.maintenance_interval < 0:
         parser.error("maintenance interval cannot be negative")
     if args.require_index and (
-        args.workload not in ("point-read", "tail-range", "update") or len(args.targets) > 1
+        args.workload not in ("point-read", "tail-range", "ordered-limit", "update")
+        or len(args.targets) > 1
     ):
         parser.error(
-            "--require-index requires a point-read, tail-range, or update workload against one target"
+            "--require-index requires a point-read, tail-range, ordered-limit, or update workload against one target"
         )
     return args
 

@@ -27,7 +27,8 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v13";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v14";
+const LEGACY_MANIFEST_HEADER: &str = "pos3ql-manifest-v13";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -102,9 +103,19 @@ struct ValueInstall {
     slot: usize,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_columns: usize,
+    index_created_at: Option<u64>,
     include_mask: u64,
     handle: Option<ValueIndexHandle>,
 }
+
+type LoadedValueIndex = (
+    usize,
+    [u16; crate::storage::MAX_INDEX_COLS],
+    usize,
+    Option<u64>,
+    u64,
+    ValueIndexHandle,
+);
 
 /// A prior checkpoint's SST reference for one table slot.
 #[derive(Clone, Copy)]
@@ -1336,7 +1347,9 @@ impl Checkpointer {
         text: &str,
     ) -> Result<u64, CheckpointSetupError> {
         let mut lines = text.lines();
-        if lines.next() != Some(MANIFEST_HEADER) {
+        let header = lines.next();
+        let manifest_v14 = header == Some(MANIFEST_HEADER);
+        if !manifest_v14 && header != Some(LEGACY_MANIFEST_HEADER) {
             return Err(CheckpointSetupError::Corrupt("bad manifest header"));
         }
         let mut lsn = 0u64;
@@ -1350,13 +1363,7 @@ impl Checkpointer {
             None;
         // (mindex, list index, count, crc, handle) — the block-grid form.
         let mut bssts: Vec<(usize, usize, u64, u32, Option<SstHandle>)> = Vec::new();
-        let mut value_indexes: Vec<(
-            usize,
-            [u16; crate::storage::MAX_INDEX_COLS],
-            usize,
-            u64,
-            ValueIndexHandle,
-        )> = Vec::new();
+        let mut value_indexes: Vec<LoadedValueIndex> = Vec::new();
         let mut table_statistics: Vec<(usize, crate::storage::TableStatistics)> = Vec::new();
         struct LoadedExtendedStatistics {
             database: crate::storage::DatabaseOid,
@@ -3008,6 +3015,17 @@ impl Checkpointer {
                         *column = parse_field(words.next(), "vix column")?;
                     }
                     let include_mask = parse_field(words.next(), "vix include mask")?;
+                    let index_created_at = if manifest_v14 {
+                        match words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("vix index identity"))?
+                        {
+                            "-" => None,
+                            value => Some(parse_field(Some(value), "vix index identity")?),
+                        }
+                    } else {
+                        None
+                    };
                     let roster = parse_block_id(
                         words
                             .next()
@@ -3022,6 +3040,7 @@ impl Checkpointer {
                         mindex,
                         columns,
                         n_columns,
+                        index_created_at,
                         include_mask,
                         ValueIndexHandle {
                             roster,
@@ -5771,7 +5790,7 @@ impl Checkpointer {
                 error.message.as_str()
             ))
         })?;
-        for (mindex, columns, n_columns, include_mask, handle) in value_indexes {
+        for (mindex, columns, n_columns, index_created_at, include_mask, handle) in value_indexes {
             let slot =
                 slot_of
                     .get(mindex)
@@ -5781,7 +5800,13 @@ impl Checkpointer {
                         "vix references unknown table",
                     ))?;
             storage
-                .install_value_binding(slot, &columns[..n_columns], include_mask, Some(handle))
+                .install_value_binding(
+                    slot,
+                    &columns[..n_columns],
+                    index_created_at,
+                    include_mask,
+                    Some(handle),
+                )
                 .map_err(|error| {
                     CheckpointSetupError::ObjectStore(format!(
                         "manifest value index rejected: {}",
@@ -7100,6 +7125,7 @@ impl Checkpointer {
             }
             for binding in 0..storage.value_binding_count(slot) {
                 let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+                let index_created_at = storage.value_binding_created_at(slot, binding);
                 let include_mask = storage.value_binding_include_mask(slot, binding);
                 let handle = self
                     .pending_value_installs
@@ -7108,6 +7134,7 @@ impl Checkpointer {
                         install.slot == slot
                             && install.n_columns == n_columns
                             && install.columns[..n_columns] == columns[..n_columns]
+                            && install.index_created_at == index_created_at
                             && install.include_mask == include_mask
                     })
                     .and_then(|install| install.handle)
@@ -7123,8 +7150,12 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "vix {slot} {n_columns} {}{include_mask} {} {} {}",
+                        "vix {slot} {n_columns} {}{include_mask} {} {} {} {}",
                         column_text.as_str(),
+                        index_created_at.map_or_else(
+                            || StackStr::<32>::from_str("-"),
+                            |identity| stack_format!(32, "{identity}"),
+                        ),
                         core::str::from_utf8(&roster).expect("hex"),
                         handle.entries,
                         handle.published_lsn,
@@ -9445,6 +9476,7 @@ impl Checkpointer {
             storage.install_value_binding(
                 install.slot,
                 &install.columns[..install.n_columns],
+                install.index_created_at,
                 install.include_mask,
                 install.handle,
             )?;
@@ -9743,8 +9775,11 @@ impl Checkpointer {
                 let Some(home) = state.committed else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                let (key_len, payload_len, hash) =
-                    storage.encode_value_binding_entry(slot, binding, rowid, home, key)?;
+                let Some((key_len, payload_len, hash)) =
+                    storage.encode_value_binding_entry(slot, binding, rowid, home, key)?
+                else {
+                    return Ok(ControlFlow::Continue(()));
+                };
                 let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + payload_len;
                 sorted_entry[..8].copy_from_slice(&hash.to_le_bytes());
                 sorted_entry[8..16].copy_from_slice(&rowid.to_le_bytes());
@@ -9815,6 +9850,7 @@ impl Checkpointer {
                 slot,
                 columns,
                 n_columns,
+                index_created_at: storage.value_binding_created_at(slot, binding),
                 include_mask,
                 handle,
             });

@@ -502,6 +502,8 @@ pub(crate) struct IndexedCandidates<'a> {
     rowids: &'a [u64],
     columns: [u16; MAX_INDEX_COLS],
     n_columns: usize,
+    expression_mask: u16,
+    key_types: [ColType; MAX_INDEX_COLS],
     include_mask: u64,
     payload_mask: u64,
     keys: Option<&'a [IndexKeyCandidate]>,
@@ -530,7 +532,9 @@ impl<'a> IndexedCandidates<'a> {
             && self.include_mask & !self.payload_mask == 0
             && ((self.columns[..self.n_columns]
                 .iter()
-                .fold(0u64, |mask, column| mask | (1u64 << column))
+                .enumerate()
+                .filter(|(position, _)| self.expression_mask & (1 << position) == 0)
+                .fold(0u64, |mask, (_, column)| mask | (1u64 << column))
                 | self.include_mask)
                 & demanded)
                 == demanded
@@ -820,7 +824,14 @@ impl IndexConstraintSet<'_> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct IndexAccessPlan<'a> {
+    binding: usize,
+    index_oid: i32,
+    index_name: StackStr<64>,
+    include_mask: u64,
+    expression_mask: u16,
     columns: [u16; MAX_INDEX_COLS],
+    key_types: [ColType; MAX_INDEX_COLS],
+    collations: [Collation; MAX_INDEX_COLS],
     constraints: [Option<IndexConstraint<'a>>; MAX_INDEX_COLS],
     additional_constraints: [Option<IndexConstraint<'a>>; MAX_INDEX_COLS],
     n_columns: usize,
@@ -852,7 +863,9 @@ impl<'a> OrderedIndexAccessPlan<'a> {
         self.covering_ready
             && ((self.access.columns[..self.access.n_columns]
                 .iter()
-                .fold(0u64, |mask, column| mask | (1u64 << column))
+                .enumerate()
+                .filter(|(position, _)| self.access.expression_mask & (1 << position) == 0)
+                .fold(0u64, |mask, (_, column)| mask | (1u64 << column))
                 | self.include_mask)
                 & demanded)
                 == demanded
@@ -860,12 +873,16 @@ impl<'a> OrderedIndexAccessPlan<'a> {
 }
 
 impl IndexAccessPlan<'_> {
-    pub(crate) fn columns(&self) -> &[u16] {
-        &self.columns[..self.n_columns]
-    }
-
     pub(crate) const fn is_exact(&self) -> bool {
         self.exact
+    }
+
+    pub(crate) const fn binding(&self) -> usize {
+        self.binding
+    }
+
+    pub(crate) const fn index_name(&self) -> StackStr<64> {
+        self.index_name
     }
 
     pub(crate) fn expected_rows(
@@ -880,7 +897,10 @@ impl IndexAccessPlan<'_> {
         for position in 0..self.n_constraints {
             let column = self.columns[position] as usize;
             let constraint = self.constraints[position].expect("counted constraint");
-            if statistics.valid && statistics.columns[column].valid {
+            if self.expression_mask & (1 << position) == 0
+                && statistics.valid
+                && statistics.columns[column].valid
+            {
                 let distinct = crate::storage::column_distinct_estimate(
                     &definition.columns[column],
                     statistics.columns[column],
@@ -973,14 +993,290 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
     }
 }
 
+fn index_expression_matches<'a, Resolve>(
+    stored: &Expr<'_>,
+    candidate: &Expr<'a>,
+    definition: &TableDef,
+    resolve_candidate: &mut Resolve,
+) -> bool
+where
+    Resolve: FnMut(&Expr<'a>) -> Option<usize>,
+{
+    if stored == candidate {
+        return true;
+    }
+    match (stored, candidate) {
+        (Expr::Column { name: stored, .. }, candidate @ Expr::Column { .. }) => {
+            definition.column_index(stored) == resolve_candidate(candidate)
+        }
+        (
+            Expr::Unary {
+                operator: left_op,
+                operand: left,
+            },
+            Expr::Unary {
+                operator: right_op,
+                operand: right,
+            },
+        ) => {
+            left_op == right_op
+                && index_expression_matches(left, right, definition, resolve_candidate)
+        }
+        (
+            Expr::Binary {
+                operator: left_op,
+                left: left_lhs,
+                right: left_rhs,
+            },
+            Expr::Binary {
+                operator: right_op,
+                left: right_lhs,
+                right: right_rhs,
+            },
+        ) => {
+            left_op == right_op
+                && index_expression_matches(left_lhs, right_lhs, definition, resolve_candidate)
+                && index_expression_matches(left_rhs, right_rhs, definition, resolve_candidate)
+        }
+        (
+            Expr::Cast {
+                operand: left,
+                type_name: left_name,
+                type_mod: left_mod,
+            },
+            Expr::Cast {
+                operand: right,
+                type_name: right_name,
+                type_mod: right_mod,
+            },
+        ) => {
+            left_mod == right_mod
+                && left_name.eq_ignore_ascii_case(right_name)
+                && index_expression_matches(left, right, definition, resolve_candidate)
+        }
+        (
+            Expr::Collate {
+                operand: left,
+                collation: left_collation,
+            },
+            Expr::Collate {
+                operand: right,
+                collation: right_collation,
+            },
+        ) => {
+            left_collation == right_collation
+                && index_expression_matches(left, right, definition, resolve_candidate)
+        }
+        (
+            Expr::IsNull {
+                operand: left,
+                negated: left_negated,
+            },
+            Expr::IsNull {
+                operand: right,
+                negated: right_negated,
+            },
+        ) => {
+            left_negated == right_negated
+                && index_expression_matches(left, right, definition, resolve_candidate)
+        }
+        (
+            Expr::Call {
+                name: left_name,
+                args: left_args,
+                argument_names: left_argument_names,
+                variadic: left_variadic,
+                star: left_star,
+                distinct: left_distinct,
+                order_by: left_order,
+                over: left_over,
+                filter: left_filter,
+            },
+            Expr::Call {
+                name: right_name,
+                args: right_args,
+                argument_names: right_argument_names,
+                variadic: right_variadic,
+                star: right_star,
+                distinct: right_distinct,
+                order_by: right_order,
+                over: right_over,
+                filter: right_filter,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_argument_names == right_argument_names
+                && left_variadic == right_variadic
+                && left_star == right_star
+                && left_distinct == right_distinct
+                && left_order == right_order
+                && left_over == right_over
+                && left_filter == right_filter
+                && left_args.len() == right_args.len()
+                && left_args.iter().zip(*right_args).all(|(left, right)| {
+                    index_expression_matches(left, right, definition, resolve_candidate)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn comparison_implies(query: BinaryOp, required: BinaryOp) -> bool {
+    query == required
+        || matches!(
+            (query, required),
+            (BinaryOp::Eq, BinaryOp::LtEq | BinaryOp::GtEq)
+                | (BinaryOp::Lt, BinaryOp::LtEq)
+                | (BinaryOp::Gt, BinaryOp::GtEq)
+        )
+}
+
+fn conjunct_implies<'a, Resolve>(
+    query: &Expr<'a>,
+    required: &Expr<'_>,
+    definition: &TableDef,
+    resolve_candidate: &mut Resolve,
+) -> bool
+where
+    Resolve: FnMut(&Expr<'a>) -> Option<usize>,
+{
+    if index_expression_matches(required, query, definition, resolve_candidate) {
+        return true;
+    }
+    if let Expr::Binary {
+        operator: BinaryOp::Eq,
+        left,
+        right,
+    } = query
+    {
+        if matches!(**right, Expr::Bool(true))
+            && index_expression_matches(required, left, definition, resolve_candidate)
+            || matches!(**left, Expr::Bool(true))
+                && index_expression_matches(required, right, definition, resolve_candidate)
+        {
+            return true;
+        }
+        if let Expr::Unary {
+            operator: crate::sql::ast::UnaryOp::Not,
+            operand,
+        } = required
+            && (matches!(**right, Expr::Bool(false))
+                && index_expression_matches(operand, left, definition, resolve_candidate)
+                || matches!(**left, Expr::Bool(false))
+                    && index_expression_matches(operand, right, definition, resolve_candidate))
+        {
+            return true;
+        }
+    }
+    if let Expr::IsNull {
+        operand,
+        negated: true,
+    } = required
+        && let Expr::Binary {
+            operator: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+            left,
+            right,
+        } = query
+    {
+        return index_expression_matches(operand, left, definition, resolve_candidate)
+            || index_expression_matches(operand, right, definition, resolve_candidate);
+    }
+    let (
+        Expr::Binary {
+            operator: required_op,
+            left: required_lhs,
+            right: required_rhs,
+        },
+        Expr::Binary {
+            operator: query_op,
+            left: query_lhs,
+            right: query_rhs,
+        },
+    ) = (required, query)
+    else {
+        return false;
+    };
+    if !index_expression_matches(required_lhs, query_lhs, definition, resolve_candidate) {
+        return false;
+    }
+    if index_expression_matches(required_rhs, query_rhs, definition, resolve_candidate) {
+        return comparison_implies(*query_op, *required_op);
+    }
+    let (Expr::Int(query_value), Expr::Int(required_value)) = (**query_rhs, **required_rhs) else {
+        return false;
+    };
+    match (query_op, required_op) {
+        (BinaryOp::Eq, BinaryOp::Eq) => query_value == required_value,
+        (BinaryOp::Eq, BinaryOp::Gt) => query_value > required_value,
+        (BinaryOp::Eq, BinaryOp::GtEq) => query_value >= required_value,
+        (BinaryOp::Eq, BinaryOp::Lt) => query_value < required_value,
+        (BinaryOp::Eq, BinaryOp::LtEq) => query_value <= required_value,
+        (BinaryOp::Gt, BinaryOp::Gt | BinaryOp::GtEq) => query_value >= required_value,
+        (BinaryOp::GtEq, BinaryOp::Gt) => query_value > required_value,
+        (BinaryOp::GtEq, BinaryOp::GtEq) => query_value >= required_value,
+        (BinaryOp::Lt, BinaryOp::Lt | BinaryOp::LtEq) => query_value <= required_value,
+        (BinaryOp::LtEq, BinaryOp::Lt) => query_value < required_value,
+        (BinaryOp::LtEq, BinaryOp::LtEq) => query_value <= required_value,
+        _ => false,
+    }
+}
+
+fn any_conjunct_implies<'a, Resolve>(
+    query: &Expr<'a>,
+    required: &Expr<'_>,
+    definition: &TableDef,
+    resolve_candidate: &mut Resolve,
+) -> bool
+where
+    Resolve: FnMut(&Expr<'a>) -> Option<usize>,
+{
+    if let Expr::Binary {
+        operator: BinaryOp::And,
+        left,
+        right,
+    } = query
+    {
+        any_conjunct_implies(left, required, definition, resolve_candidate)
+            || any_conjunct_implies(right, required, definition, resolve_candidate)
+    } else {
+        conjunct_implies(query, required, definition, resolve_candidate)
+    }
+}
+
+fn predicate_is_implied<'a, Resolve>(
+    required: &Expr<'_>,
+    queries: &[Option<&'a Expr<'a>>],
+    definition: &TableDef,
+    resolve_candidate: &mut Resolve,
+) -> bool
+where
+    Resolve: FnMut(&Expr<'a>) -> Option<usize>,
+{
+    if let Expr::Binary {
+        operator: BinaryOp::And,
+        left,
+        right,
+    } = required
+    {
+        return predicate_is_implied(left, queries, definition, resolve_candidate)
+            && predicate_is_implied(right, queries, definition, resolve_candidate);
+    }
+    queries
+        .iter()
+        .flatten()
+        .any(|query| any_conjunct_implies(query, required, definition, resolve_candidate))
+}
+
 fn select_index_access_plan<'a>(
     storage: &Storage,
     slot: usize,
+    txid: u32,
     by_column: &[IndexConstraintSet<'a>; MAX_COLUMNS],
 ) -> Option<IndexAccessPlan<'a>> {
     let mut selected: Option<(usize, IndexAccessPlan<'a>)> = None;
     for binding in 0..storage.value_binding_count(slot) {
-        let Some(plan) = index_access_plan_for_binding(storage, slot, binding, by_column, false)
+        let Some(plan) =
+            index_access_plan_for_binding(storage, slot, binding, txid, by_column, false)
         else {
             continue;
         };
@@ -1002,9 +1298,13 @@ fn index_access_plan_for_binding<'a>(
     storage: &Storage,
     slot: usize,
     binding: usize,
+    txid: u32,
     by_column: &[IndexConstraintSet<'a>; MAX_COLUMNS],
     allow_unconstrained: bool,
 ) -> Option<IndexAccessPlan<'a>> {
+    if storage.value_binding_created_at(slot, binding).is_some() {
+        return None;
+    }
     let (columns, n_columns) = storage.value_binding_columns(slot, binding);
     let mut constraints = [None; MAX_INDEX_COLS];
     let mut additional_constraints = [None; MAX_INDEX_COLS];
@@ -1032,19 +1332,210 @@ fn index_access_plan_for_binding<'a>(
     }
     exact &= n_constraints == n_columns;
     if (!allow_unconstrained && n_constraints == 0)
-        || (exact && !storage.value_probe_complete(slot, &columns[..n_columns]))
-        || (!exact && !storage.value_durable_complete(slot, &columns[..n_columns]))
+        || (exact && !storage.value_binding_probe_complete(slot, binding))
+        || (!exact && !storage.value_binding_durable_complete(slot, binding))
     {
         return None;
     }
+    let (index_oid, index_name) =
+        crate::sql::catalog::value_index_identity(storage, txid, slot, &columns[..n_columns])?;
+    let (key_types, _) = storage.value_binding_key_types(slot, binding);
+    let (collations, _) = storage.value_binding_collations(slot, binding);
     Some(IndexAccessPlan {
+        binding,
+        index_oid,
+        index_name,
+        include_mask: storage.value_binding_include_mask(slot, binding),
+        expression_mask: 0,
         columns,
+        key_types,
+        collations,
         constraints,
         additional_constraints,
         n_columns,
         n_constraints,
         exact,
     })
+}
+
+fn index_plan_score(plan: IndexAccessPlan<'_>) -> usize {
+    if plan.exact {
+        MAX_INDEX_COLS * 2 + plan.n_constraints
+    } else {
+        plan.n_constraints
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn special_index_access_plan<'a, Resolve, Invariant>(
+    storage: &Storage,
+    slot: usize,
+    txid: u32,
+    queries: &[Option<&'a Expr<'a>>],
+    definition: &TableDef,
+    resolve_candidate: &mut Resolve,
+    operand_is_invariant: &Invariant,
+    allow_unconstrained: bool,
+    required_order: Option<(&[&'a Expr<'a>], &[OrderBy<'a>])>,
+    arena: &'a Arena,
+) -> Result<Option<IndexAccessPlan<'a>>, SqlError>
+where
+    Resolve: FnMut(&Expr<'a>) -> Option<usize>,
+    Invariant: Fn(&Expr<'a>) -> bool,
+{
+    let mut selected: Option<(usize, IndexAccessPlan<'a>)> = None;
+    for index in storage.indexes_for(definition.schema.as_str(), definition.name.as_str(), txid) {
+        let Some(binding) = storage.value_binding_for_index(slot, index.created_at) else {
+            continue;
+        };
+        let mut expressions = [None; MAX_INDEX_COLS];
+        let mut expression_mask = 0u16;
+        for (position, source) in index.expressions[..index.n_cols].iter().enumerate() {
+            if let Some(source) = source {
+                let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+                expression_mask |= 1 << position;
+            }
+        }
+        if let Some(source) = index.predicate {
+            let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+            let predicate = crate::sql::parser::parse_expr(source, arena)?;
+            if !predicate_is_implied(predicate, queries, definition, resolve_candidate) {
+                continue;
+            }
+        }
+        let mut by_key = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
+        let mut resolve_key = |candidate: &Expr<'a>| {
+            for (position, expression) in expressions[..index.n_cols].iter().enumerate() {
+                let matches = match expression {
+                    Some(stored) => {
+                        index_expression_matches(stored, candidate, definition, resolve_candidate)
+                    }
+                    None => resolve_candidate(candidate) == Some(index.columns[position] as usize),
+                };
+                if matches {
+                    return Some(position);
+                }
+            }
+            None
+        };
+        for query in queries.iter().flatten() {
+            collect_index_constraints(query, &mut resolve_key, operand_is_invariant, &mut by_key);
+        }
+        let mut constraints = [None; MAX_INDEX_COLS];
+        let mut additional_constraints = [None; MAX_INDEX_COLS];
+        let mut n_constraints = 0usize;
+        let mut exact = true;
+        for position in 0..index.n_cols {
+            let set = by_key[position];
+            if let Some(equality) = set.equality {
+                constraints[position] = Some(equality);
+                n_constraints += 1;
+                continue;
+            }
+            let Some(range) = set.lower.or(set.upper) else {
+                exact = false;
+                break;
+            };
+            constraints[position] = Some(range);
+            additional_constraints[position] = match (set.lower, set.upper) {
+                (Some(_), Some(upper)) => Some(upper),
+                _ => None,
+            };
+            n_constraints += 1;
+            exact = false;
+            break;
+        }
+        exact &= n_constraints == index.n_cols;
+        if (!allow_unconstrained && n_constraints == 0)
+            || (exact && !storage.value_binding_probe_complete(slot, binding))
+            || (!exact && !storage.value_binding_durable_complete(slot, binding))
+        {
+            continue;
+        }
+        let (key_types, _) = storage.value_binding_key_types(slot, binding);
+        let (collations, _) = storage.value_binding_collations(slot, binding);
+        let plan = IndexAccessPlan {
+            binding,
+            index_oid: crate::sql::catalog::explicit_index_oid(&index),
+            index_name: StackStr::<64>::from_str(index.name_for(txid).as_str()),
+            include_mask: storage.value_binding_include_mask(slot, binding),
+            expression_mask,
+            columns: index.columns,
+            key_types,
+            collations,
+            constraints,
+            additional_constraints,
+            n_columns: index.n_cols,
+            n_constraints,
+            exact,
+        };
+        if let Some((targets, order)) = required_order {
+            let equality_prefix = plan.constraints[..plan.n_constraints]
+                .iter()
+                .take_while(|constraint| {
+                    constraint.is_some_and(|constraint| constraint.operator == BinaryOp::Eq)
+                })
+                .count();
+            let key_matches =
+                |position: usize, target: &Expr<'a>, resolve_candidate: &mut Resolve| {
+                    match expressions[position] {
+                        Some(stored) => {
+                            index_expression_matches(stored, target, definition, resolve_candidate)
+                        }
+                        None => resolve_candidate(target) == Some(index.columns[position] as usize),
+                    }
+                };
+            let Some(start) = (0..index.n_cols)
+                .find(|position| key_matches(*position, targets[0], resolve_candidate))
+            else {
+                continue;
+            };
+            if start > equality_prefix || start + targets.len() > index.n_cols {
+                continue;
+            }
+            if targets
+                .iter()
+                .enumerate()
+                .any(|(offset, target)| !key_matches(start + offset, target, resolve_candidate))
+            {
+                continue;
+            }
+            let mut backwards = None;
+            let mut compatible = true;
+            for (offset, requested) in order.iter().enumerate() {
+                let position = start + offset;
+                if position < equality_prefix {
+                    continue;
+                }
+                let forward = requested.descending == index.descending[position]
+                    && requested.nulls_first == index.nulls_first[position];
+                let reverse = requested.descending != index.descending[position]
+                    && requested.nulls_first != index.nulls_first[position];
+                let direction = match (forward, reverse) {
+                    (true, false) => false,
+                    (false, true) => true,
+                    _ => {
+                        compatible = false;
+                        break;
+                    }
+                };
+                if backwards.is_some_and(|prior| prior != direction) {
+                    compatible = false;
+                    break;
+                }
+                backwards = Some(direction);
+            }
+            if !compatible {
+                continue;
+            }
+        }
+        let score = index_plan_score(plan);
+        if selected.is_none_or(|(best, _)| score > best) {
+            selected = Some((score, plan));
+        }
+    }
+    Ok(selected.map(|(_, plan)| plan))
 }
 
 fn index_snapshot_is_current(storage: &Storage, slot: usize, txid: u32) -> bool {
@@ -1068,13 +1559,14 @@ pub(crate) fn index_access_plan<'a>(
     scope: &QueryScope<'a>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
-) -> Option<IndexAccessPlan<'a>> {
+    arena: &'a Arena,
+) -> Result<Option<IndexAccessPlan<'a>>, SqlError> {
     if scope.n != 1
         || scope.derived[0].is_some()
         || scope.lateral[0]
         || !index_snapshot_is_current(storage, scope.slots[0], txid)
     {
-        return None;
+        return Ok(None);
     }
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
@@ -1094,13 +1586,35 @@ pub(crate) fn index_access_plan<'a>(
             && !operand.contains_call()
             && !operand.contains_subquery()
     };
+    let Some(predicate) = where_clause else {
+        return Ok(None);
+    };
     collect_index_constraints(
-        where_clause?,
+        predicate,
         &mut resolve_column,
         &operand_is_invariant,
         &mut by_column,
     );
-    select_index_access_plan(storage, scope.slots[0], &by_column)
+    let plain = select_index_access_plan(storage, scope.slots[0], txid, &by_column);
+    let special = special_index_access_plan(
+        storage,
+        scope.slots[0],
+        txid,
+        &[Some(predicate)],
+        scope.defs[0].expect("physical table has definition"),
+        &mut resolve_column,
+        &operand_is_invariant,
+        false,
+        None,
+        arena,
+    )?;
+    Ok(match (plain, special) {
+        (Some(left), Some(right)) if index_plan_score(right) > index_plan_score(left) => {
+            Some(right)
+        }
+        (Some(left), _) => Some(left),
+        (None, right) => right,
+    })
 }
 
 /// Finds a B-tree whose leading key can be evaluated from sources already
@@ -1120,12 +1634,15 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     depth: usize,
     txid: u32,
     outer_available: bool,
-) -> Option<IndexAccessPlan<'a>> {
+    arena: &'a Arena,
+) -> Result<Option<IndexAccessPlan<'a>>, SqlError> {
     if depth >= scope.n || (depth == 0 && !outer_available) {
-        return None;
+        return Ok(None);
     }
     let table = order[depth];
-    let current_role = storage.current_role_slot(txid)?;
+    let Some(current_role) = storage.current_role_slot(txid) else {
+        return Ok(None);
+    };
     let authorization_role = scope.authorization_roles[table].map_or(current_role, usize::from);
     if scope.derived[table].is_some()
         || scope.lateral[table]
@@ -1134,13 +1651,13 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         || storage.row_security_applies(scope.slots[table], authorization_role, txid)
         || !index_snapshot_is_current(storage, scope.slots[table], txid)
     {
-        return None;
+        return Ok(None);
     }
     // Explicit ON clauses are position-sensitive, so only all-CROSS joins
     // can have a non-identity execution order; those have no ON predicate.
     let join = depth.checked_sub(1).map(|join| &from.joins[join]);
     if join.is_some_and(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full)) {
-        return None;
+        return Ok(None);
     }
     let bound_tables = order[..depth]
         .iter()
@@ -1198,7 +1715,29 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     if let Some(on) = join.and_then(|join| join.on.or(scope.join_on[depth - 1])) {
         collect_index_constraints(on, &mut resolve_column, &operand_is_bound, &mut by_column);
     }
-    let plan = select_index_access_plan(storage, scope.slots[table], &by_column)?;
+    let plain = select_index_access_plan(storage, scope.slots[table], txid, &by_column);
+    let on = join.and_then(|join| join.on.or(scope.join_on[depth - 1]));
+    let special = special_index_access_plan(
+        storage,
+        scope.slots[table],
+        txid,
+        &[where_clause, on],
+        scope.defs[table].expect("resolved"),
+        &mut resolve_column,
+        &operand_is_bound,
+        false,
+        None,
+        arena,
+    )?;
+    let Some(plan) = (match (plain, special) {
+        (Some(left), Some(right)) if index_plan_score(right) > index_plan_score(left) => {
+            Some(right)
+        }
+        (Some(left), _) => Some(left),
+        (None, right) => right,
+    }) else {
+        return Ok(None);
+    };
     // A statement-invariant key belongs to a once-per-statement scan, not a
     // probe repeated for every outer row. Leaving that shape to the hash or
     // ordinary plan avoids rereading the same cold index blocks N times.
@@ -1211,11 +1750,11 @@ pub(crate) fn parameterized_index_access_plan<'a>(
                 .is_some_and(|(tables, has_outer)| has_outer || tables & bound_tables != 0)
         });
     if !uses_bound_row {
-        return None;
+        return Ok(None);
     }
-    for (position, &column) in plan.columns[..plan.n_constraints].iter().enumerate() {
-        let target = &scope.defs[table].expect("resolved").columns[column as usize];
-        if !target.ctype.is_collatable() {
+    for position in 0..plan.n_constraints {
+        let target_collation = plan.collations[position];
+        if !plan.key_types[position].is_collatable() {
             continue;
         }
         for constraint in [
@@ -1230,7 +1769,7 @@ pub(crate) fn parameterized_index_access_plan<'a>(
                 Expr::Column { qualifier, name } => scope
                     .find_column(*qualifier, name)
                     .ok()
-                    .is_some_and(|resolved| scope.output_collation(resolved) == target.collation),
+                    .is_some_and(|resolved| scope.output_collation(resolved) == target_collation),
                 // A cast, concatenation, explicit COLLATE, or outer DML
                 // column needs the full comparison-collation derivation. The
                 // physical key must not guess that identity and risk omitting
@@ -1238,19 +1777,19 @@ pub(crate) fn parameterized_index_access_plan<'a>(
                 _ => false,
             };
             if !compatible {
-                return None;
+                return Ok(None);
             }
         }
     }
     let slot = scope.slots[table];
     let definition = scope.defs[table].expect("resolved");
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
-    if !(plan.exact && storage.value_cache_complete(slot, plan.columns()))
+    if !(plan.exact && storage.value_binding_cache_complete(slot, plan.binding))
         && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
     {
-        return None;
+        return Ok(None);
     }
-    Some(plan)
+    Ok(Some(plan))
 }
 
 /// Selects one plain-column btree that supplies the requested result order.
@@ -1299,19 +1838,22 @@ pub(crate) fn ordered_index_access_plan<'a>(
             &mut by_column,
         );
     }
-    let mut order_columns = [0u16; MAX_INDEX_COLS];
+    let mut order_columns = [None; MAX_INDEX_COLS];
+    let mut order_targets = [&Expr::Null; MAX_INDEX_COLS];
     for (position, requested) in order.iter().enumerate() {
         let expression = super::resolve_order_target(requested.expression, items, scope, arena)?;
-        let Some(column) = resolve_column(expression) else {
-            return Ok(None);
-        };
-        order_columns[position] = column as u16;
+        order_targets[position] = expression;
+        order_columns[position] = resolve_column(expression).map(|column| column as u16);
     }
 
     let slot = scope.slots[0];
     let mut selected: Option<(usize, OrderedIndexAccessPlan<'a>)> = None;
     for binding in 0..storage.value_binding_count(slot) {
-        let Some(access) = index_access_plan_for_binding(storage, slot, binding, &by_column, true)
+        if order_columns[..order.len()].iter().any(Option::is_none) {
+            break;
+        }
+        let Some(access) =
+            index_access_plan_for_binding(storage, slot, binding, txid, &by_column, true)
         else {
             continue;
         };
@@ -1323,7 +1865,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
             .count();
         let Some(start) = access.columns[..access.n_columns]
             .iter()
-            .position(|column| *column == order_columns[0])
+            .position(|column| Some(*column) == order_columns[0])
         else {
             continue;
         };
@@ -1333,7 +1875,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
         let mut order_positions = [0u8; MAX_INDEX_COLS];
         let mut contiguous = true;
         for (offset, &column) in order_columns[..order.len()].iter().enumerate() {
-            if access.columns[start + offset] != column {
+            if Some(access.columns[start + offset]) != column {
                 contiguous = false;
                 break;
             }
@@ -1361,12 +1903,71 @@ pub(crate) fn ordered_index_access_plan<'a>(
             index_oid,
             index_name,
             include_mask,
-            covering_ready: storage
-                .value_durable_complete(slot, &access.columns[..access.n_columns]),
+            covering_ready: storage.value_binding_durable_complete(slot, access.binding),
             order_positions,
             order,
         };
         if selected.is_none_or(|(best, _)| score > best) {
+            selected = Some((score, plan));
+        }
+    }
+    let definition = scope.defs[0].expect("physical table has definition");
+    if let Some(access) = special_index_access_plan(
+        storage,
+        slot,
+        txid,
+        &[where_clause],
+        definition,
+        &mut resolve_column,
+        &operand_is_invariant,
+        true,
+        Some((&order_targets[..order.len()], order)),
+        arena,
+    )? {
+        let created_at = storage
+            .value_binding_created_at(slot, access.binding)
+            .expect("special binding has catalog identity");
+        let index = storage
+            .indexes_for(definition.schema.as_str(), definition.name.as_str(), txid)
+            .find(|index| index.created_at == created_at)
+            .expect("special binding catalog identity was planned");
+        let mut expressions = [None; MAX_INDEX_COLS];
+        for (position, source) in index.expressions[..index.n_cols].iter().enumerate() {
+            if let Some(source) = source {
+                let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+            }
+        }
+        let mut key_matches = |position: usize, target: &Expr<'a>| match expressions[position] {
+            Some(stored) => {
+                index_expression_matches(stored, target, definition, &mut resolve_column)
+            }
+            None => resolve_column(target) == Some(index.columns[position] as usize),
+        };
+        let equality_prefix = access.constraints[..access.n_constraints]
+            .iter()
+            .take_while(|constraint| {
+                constraint.is_some_and(|constraint| constraint.operator == BinaryOp::Eq)
+            })
+            .count();
+        let start = (0..index.n_cols)
+            .find(|position| key_matches(*position, order_targets[0]))
+            .expect("ordered special index was filtered before selection");
+        let mut order_positions = [0u8; MAX_INDEX_COLS];
+        for (offset, position) in order_positions.iter_mut().enumerate().take(order.len()) {
+            *position = (start + offset) as u8;
+        }
+        let score = access.n_constraints * (MAX_INDEX_COLS + 1) + order.len();
+        let plan = OrderedIndexAccessPlan {
+            access,
+            index_oid: access.index_oid,
+            index_name: access.index_name,
+            include_mask: access.include_mask,
+            covering_ready: storage.value_binding_durable_complete(slot, access.binding),
+            order_positions,
+            order,
+        };
+        if start <= equality_prefix && selected.is_none_or(|(best, _)| score > best) {
             selected = Some((score, plan));
         }
     }
@@ -1419,9 +2020,10 @@ pub(crate) fn dml_index_access_plan<'a>(
     alias: Option<&str>,
     txid: u32,
     where_clause: Option<&'a Expr<'a>>,
-) -> Option<IndexAccessPlan<'a>> {
+    arena: &'a Arena,
+) -> Result<Option<IndexAccessPlan<'a>>, SqlError> {
     if !index_snapshot_is_current(storage, slot, txid) {
-        return None;
+        return Ok(None);
     }
     let mut by_column = [IndexConstraintSet::EMPTY; MAX_COLUMNS];
     let mut resolve_column = |expression: &Expr<'a>| {
@@ -1435,13 +2037,35 @@ pub(crate) fn dml_index_access_plan<'a>(
         }
         definition.column_index(name)
     };
+    let Some(predicate) = where_clause else {
+        return Ok(None);
+    };
     collect_index_constraints(
-        where_clause?,
+        predicate,
         &mut resolve_column,
         &dml_index_operand_is_invariant,
         &mut by_column,
     );
-    select_index_access_plan(storage, slot, &by_column)
+    let plain = select_index_access_plan(storage, slot, txid, &by_column);
+    let special = special_index_access_plan(
+        storage,
+        slot,
+        txid,
+        &[Some(predicate)],
+        definition,
+        &mut resolve_column,
+        &dml_index_operand_is_invariant,
+        false,
+        None,
+        arena,
+    )?;
+    Ok(match (plain, special) {
+        (Some(left), Some(right)) if index_plan_score(right) > index_plan_score(left) => {
+            Some(right)
+        }
+        (Some(left), _) => Some(left),
+        (None, right) => right,
+    })
 }
 
 fn indexed_candidates<'a>(
@@ -1453,7 +2077,7 @@ fn indexed_candidates<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
-    let Some(plan) = index_access_plan(storage, scope, txid, where_clause) else {
+    let Some(plan) = index_access_plan(storage, scope, txid, where_clause, arena)? else {
         return Ok(None);
     };
     let slot = scope.slots[0];
@@ -1502,7 +2126,8 @@ pub(crate) fn dml_indexed_candidates<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
-    let Some(plan) = dml_index_access_plan(storage, slot, definition, alias, txid, where_clause)
+    let Some(plan) =
+        dml_index_access_plan(storage, slot, definition, alias, txid, where_clause, arena)?
     else {
         return Ok(None);
     };
@@ -1525,25 +2150,10 @@ fn indexed_candidates_for_plan<'a>(
     columns: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
-    let index_oid = if let Some(ordered) = ordered_plan {
-        ordered.index_oid
-    } else {
-        let Some((index_oid, _)) = crate::sql::catalog::value_index_identity(
-            storage,
-            txid,
-            slot,
-            &plan.columns[..plan.n_columns],
-        ) else {
-            return Err(sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "value-index probe has no catalog index identity"
-            ));
-        };
-        index_oid
-    };
+    let index_oid = ordered_plan.map_or(plan.index_oid, |ordered| ordered.index_oid);
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
     if ordered_plan.is_none()
-        && !(plan.exact && storage.value_cache_complete(slot, &plan.columns[..plan.n_columns]))
+        && !(plan.exact && storage.value_binding_cache_complete(slot, plan.binding))
         && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
     {
         return Ok(None);
@@ -1553,8 +2163,7 @@ fn indexed_candidates_for_plan<'a>(
     let mut types = [ColType::Bool; MAX_INDEX_COLS];
     let mut collations = [Collation::None; MAX_INDEX_COLS];
     for position in 0..plan.n_constraints {
-        let column = plan.columns[position] as usize;
-        let target_type = definition.columns[column].ctype;
+        let target_type = plan.key_types[position];
         for (bound, constraint) in [
             plan.constraints[position],
             plan.additional_constraints[position],
@@ -1576,18 +2185,10 @@ fn indexed_candidates_for_plan<'a>(
                     rowids: &[],
                     columns: plan.columns,
                     n_columns: plan.n_columns,
+                    expression_mask: plan.expression_mask,
+                    key_types: plan.key_types,
                     include_mask: ordered_plan.map_or(0, |ordered| ordered.include_mask),
-                    payload_mask: storage.value_binding_include_mask(
-                        slot,
-                        (0..storage.value_binding_count(slot))
-                            .find(|binding| {
-                                let (columns, n_columns) =
-                                    storage.value_binding_columns(slot, *binding);
-                                n_columns == plan.n_columns
-                                    && columns[..n_columns] == plan.columns[..plan.n_columns]
-                            })
-                            .expect("planned binding exists"),
-                    ),
+                    payload_mask: storage.value_binding_include_mask(slot, plan.binding),
                     keys: None,
                     encoded_keys: &[],
                 }));
@@ -1614,12 +2215,10 @@ fn indexed_candidates_for_plan<'a>(
             };
         }
         types[position] = target_type;
-        collations[position] = definition.columns[column].collation;
+        collations[position] = plan.collations[position];
     }
-    for (position, &column) in plan.columns[..plan.n_columns].iter().enumerate() {
-        types[position] = definition.columns[column as usize].ctype;
-        collations[position] = definition.columns[column as usize].collation;
-    }
+    types[..plan.n_columns].copy_from_slice(&plan.key_types[..plan.n_columns]);
+    collations[..plan.n_columns].copy_from_slice(&plan.collations[..plan.n_columns]);
     let key_position = |key: &[u8]| -> Result<crate::store::ValueIndexPosition, SqlError> {
         use crate::store::ValueIndexPosition::{After, Before, Match};
         let mut decoded = [Datum::Null; MAX_INDEX_COLS];
@@ -1671,22 +2270,21 @@ fn indexed_candidates_for_plan<'a>(
             &collations[..plan.n_columns],
         )
     });
-    let retain_keys = ordered_plan.is_some()
-        && storage.value_durable_complete(slot, &plan.columns[..plan.n_columns]);
+    let retain_keys =
+        ordered_plan.is_some() && storage.value_binding_durable_complete(slot, plan.binding);
     let probe_hash = hash.filter(|_| !retain_keys);
     let mut count = 0usize;
     let mut entry_bytes = 0usize;
     if let Some(hash) = probe_hash {
-        let complete =
-            storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |_, _| {
-                count += 1;
-                Ok(())
-            })?;
+        let complete = storage.probe_value_binding(slot, plan.binding, hash, |_, _| {
+            count += 1;
+            Ok(())
+        })?;
         debug_assert!(complete, "completeness checked before probe");
     } else {
-        let complete = storage.range_value_index(
+        let complete = storage.range_value_index_binding(
             slot,
-            &plan.columns[..plan.n_columns],
+            plan.binding,
             key_position,
             |_, _, key, payload| {
                 count += 1;
@@ -1736,15 +2334,15 @@ fn indexed_candidates_for_plan<'a>(
     let mut fill = 0usize;
     let mut entry_at = 0usize;
     if let Some(hash) = probe_hash {
-        storage.probe_value(slot, &plan.columns[..plan.n_columns], hash, |rowid, _| {
+        storage.probe_value_binding(slot, plan.binding, hash, |rowid, _| {
             rowids[fill] = rowid;
             fill += 1;
             Ok(())
         })?;
     } else {
-        storage.range_value_index(
+        storage.range_value_index_binding(
             slot,
-            &plan.columns[..plan.n_columns],
+            plan.binding,
             key_position,
             |rowid, commit_lsn, key, payload| {
                 rowids[fill] = rowid;
@@ -1803,9 +2401,7 @@ fn indexed_candidates_for_plan<'a>(
             }
             let left_key = &encoded[left.key_at..left.key_at + left.key_len];
             let right_key = &encoded[right.key_at..right.key_at + right.key_len];
-            match compare_ordered_index_keys(
-                storage, definition, &plan, &ordered, left_key, right_key,
-            ) {
+            match compare_ordered_index_keys(storage, &plan, &ordered, left_key, right_key) {
                 Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
                 Ok(ordering) => ordering,
                 Err(error) => {
@@ -1843,15 +2439,10 @@ fn indexed_candidates_for_plan<'a>(
         rowids: &rowids[..live],
         columns: plan.columns,
         n_columns: plan.n_columns,
+        expression_mask: plan.expression_mask,
+        key_types: plan.key_types,
         include_mask: ordered_plan.map_or(0, |ordered| ordered.include_mask),
-        payload_mask: (0..storage.value_binding_count(slot))
-            .find_map(|binding| {
-                let (columns, n_columns) = storage.value_binding_columns(slot, binding);
-                (n_columns == plan.n_columns
-                    && columns[..n_columns] == plan.columns[..plan.n_columns])
-                    .then(|| storage.value_binding_include_mask(slot, binding))
-            })
-            .unwrap_or(0),
+        payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: ordered_keys,
         encoded_keys: retained_key_bytes,
     }))
@@ -1859,7 +2450,6 @@ fn indexed_candidates_for_plan<'a>(
 
 fn compare_ordered_index_keys(
     storage: &Storage,
-    definition: &TableDef,
     access: &IndexAccessPlan<'_>,
     ordered: &OrderedIndexAccessPlan<'_>,
     left: &[u8],
@@ -1868,9 +2458,7 @@ fn compare_ordered_index_keys(
     let mut types = [ColType::Bool; MAX_INDEX_COLS];
     let mut left_values = [Datum::Null; MAX_INDEX_COLS];
     let mut right_values = [Datum::Null; MAX_INDEX_COLS];
-    for (position, &column) in access.columns[..access.n_columns].iter().enumerate() {
-        types[position] = definition.columns[column as usize].ctype;
-    }
+    types[..access.n_columns].copy_from_slice(&access.key_types[..access.n_columns]);
     rowenc::decode(
         left,
         &types[..access.n_columns],
@@ -1902,13 +2490,8 @@ fn compare_ordered_index_keys(
                 }
             }
             (false, false) => {
-                let column = access.columns[position] as usize;
-                let ordering = compare_datums_collated(
-                    storage,
-                    definition.columns[column].collation,
-                    &left,
-                    &right,
-                )?;
+                let ordering =
+                    compare_datums_collated(storage, access.collations[position], &left, &right)?;
                 if requested.descending {
                     ordering.reverse()
                 } else {
@@ -2870,12 +3453,13 @@ pub(crate) fn select_hash_join_plan<'a>(
     where_clause: Option<&'a Expr<'a>>,
     order: &[usize],
     txid: u32,
+    arena: &'a Arena,
 ) -> Result<Option<HashJoinPlan<'a>>, SqlError> {
     if scope.n != 2 || from.joins.len() != 1 {
         return Ok(None);
     }
-    if (1..scope.n).any(|depth| {
-        parameterized_index_access_plan(
+    for depth in 1..scope.n {
+        if parameterized_index_access_plan(
             storage,
             scope,
             from,
@@ -2884,10 +3468,12 @@ pub(crate) fn select_hash_join_plan<'a>(
             depth,
             txid,
             false,
-        )
+            arena,
+        )?
         .is_some()
-    }) {
-        return Ok(None);
+        {
+            return Ok(None);
+        }
     }
     let join = &from.joins[0];
     if !matches!(
@@ -4550,10 +5136,7 @@ fn scan_source_mode<'a>(
                 let definition = scope.defs[order[depth]].expect("resolved");
                 let keys = access.keys.expect("covering access retains keys");
                 debug_assert_eq!(keys.len(), access.rowids.len());
-                let mut key_types = [ColType::Bool; MAX_INDEX_COLS];
-                for (position, &column) in access.columns[..access.n_columns].iter().enumerate() {
-                    key_types[position] = definition.columns[column as usize].ctype;
-                }
+                let key_types = access.key_types;
                 let mut payload_types = [ColType::Bool; MAX_COLUMNS];
                 let mut n_payload = 0usize;
                 for (column, metadata) in definition.columns().iter().enumerate() {
@@ -4580,7 +5163,9 @@ fn scan_source_mode<'a>(
                         for (position, &column) in
                             access.columns[..access.n_columns].iter().enumerate()
                         {
-                            values[column as usize] = key_values[position];
+                            if access.expression_mask & (1 << position) == 0 {
+                                values[column as usize] = key_values[position];
+                            }
                         }
                         let payload = &access.encoded_keys
                             [candidate.payload_at..candidate.payload_at + candidate.payload_len];
@@ -4857,26 +5442,27 @@ fn scan_source_mode<'a>(
         indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?
     };
     let indexed = indexed_override.or(automatic_indexed.as_ref());
+    let mut parameterized_plans = [None; MAX_JOIN_TABLES];
+    for depth in 0..scope.n {
+        if automatic_index
+            && security_plans[order[depth]].is_none()
+            && sample_plans[order[depth]].is_none()
+        {
+            parameterized_plans[depth] = parameterized_index_access_plan(
+                storage,
+                scope,
+                from,
+                planning_where_clause,
+                order,
+                depth,
+                txid,
+                outer.is_some(),
+                arena,
+            )?;
+        }
+    }
     let parameterized = arena
-        .alloc_slice_with(scope.n, |depth| {
-            if !automatic_index
-                || security_plans[order[depth]].is_some()
-                || sample_plans[order[depth]].is_some()
-            {
-                None
-            } else {
-                parameterized_index_access_plan(
-                    storage,
-                    scope,
-                    from,
-                    planning_where_clause,
-                    order,
-                    depth,
-                    txid,
-                    outer.is_some(),
-                )
-            }
-        })
+        .alloc_slice_with(scope.n, |depth| parameterized_plans[depth])
         .map_err(|_| arena_full())?;
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
@@ -4895,7 +5481,15 @@ fn scan_source_mode<'a>(
         && sample_plans.iter().all(Option::is_none)
         && parameterized.iter().all(Option::is_none)
     {
-        select_hash_join_plan(storage, scope, from, planning_where_clause, order, txid)?
+        select_hash_join_plan(
+            storage,
+            scope,
+            from,
+            planning_where_clause,
+            order,
+            txid,
+            arena,
+        )?
     } else {
         None
     };

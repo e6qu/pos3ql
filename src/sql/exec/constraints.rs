@@ -10,7 +10,7 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::Expr;
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, compare_datums_collated, eval, eval_full, hash_key_collated,
+    ColumnLookup, EvalHooks, SqlError, compare_datums_collated, eval_full, hash_key_collated,
     resolved_expression_collation, sqlstate,
 };
 use crate::sql::txn::TxnState;
@@ -460,6 +460,8 @@ pub(crate) fn index_key_collations(
 }
 
 pub(crate) fn index_key_values<'a>(
+    storage: &Storage,
+    txid: u32,
     def: &TableDef,
     row: &[Datum<'a>],
     columns: &[u16],
@@ -467,9 +469,14 @@ pub(crate) fn index_key_values<'a>(
     arena: &'a Arena,
 ) -> Result<[Datum<'a>; crate::storage::MAX_INDEX_COLS], SqlError> {
     let mut keys = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
     for (position, expression) in expressions.iter().enumerate() {
         keys[position] = match expression {
-            Some(expression) => eval(
+            Some(expression) => eval_full(
                 expression,
                 arena,
                 crate::sql::eval::NO_PARAMS,
@@ -478,6 +485,7 @@ pub(crate) fn index_key_values<'a>(
                     values: row,
                     alias: None,
                 },
+                &hooks,
             )?,
             None => row[columns[position] as usize],
         };
@@ -507,21 +515,21 @@ fn enforce_expression_index_uniqueness<'a>(
     arena: &'a Arena,
 ) -> Result<(), SqlError> {
     if let Some(predicate) = predicate
-        && !index_predicate_matches(def, values, predicate, arena)?
+        && !index_predicate_matches(storage, txid, def, values, predicate, arena)?
     {
         return Ok(());
     }
-    let keys = index_key_values(def, values, columns, expressions, arena)?;
+    let keys = index_key_values(storage, txid, def, values, columns, expressions, arena)?;
     if !nulls_not_distinct && keys[..columns.len()].iter().any(Datum::is_null) {
         return Ok(());
     }
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
         if let Some(predicate) = predicate
-            && !index_predicate_matches(def, other, predicate, arena)?
+            && !index_predicate_matches(storage, txid, def, other, predicate, arena)?
         {
             return Ok(false);
         }
-        let other_keys = index_key_values(def, other, columns, expressions, arena)?;
+        let other_keys = index_key_values(storage, txid, def, other, columns, expressions, arena)?;
         index_key_values_equal(
             &IndexKeyEquality {
                 storage,
@@ -792,7 +800,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    if !index_predicate_matches(def, values, predicate, arena)?
+    if !index_predicate_matches(storage, txid, def, values, predicate, arena)?
         || (!nulls_not_distinct
             && columns
                 .iter()
@@ -801,8 +809,10 @@ pub(crate) fn enforce_partial_index_uniqueness(
         return Ok(());
     }
     let matches = |other: &[Datum]| -> Result<bool, SqlError> {
-        Ok(index_predicate_matches(def, other, predicate, arena)?
-            && key_equal(storage, def, columns, values, other, nulls_not_distinct)?)
+        Ok(
+            index_predicate_matches(storage, txid, def, other, predicate, arena)?
+                && key_equal(storage, def, columns, values, other, nulls_not_distinct)?,
+        )
     };
     storage.for_each_row_state(table_index, &mut |rowid, state| {
         use core::ops::ControlFlow;
@@ -854,12 +864,19 @@ pub(crate) fn enforce_partial_index_uniqueness(
 }
 
 pub(crate) fn index_predicate_matches(
+    storage: &Storage,
+    txid: u32,
     def: &TableDef,
     values: &[Datum],
     predicate: &Expr,
     arena: &Arena,
 ) -> Result<bool, SqlError> {
-    match eval(
+    let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    match eval_full(
         predicate,
         arena,
         crate::sql::eval::NO_PARAMS,
@@ -868,6 +885,7 @@ pub(crate) fn index_predicate_matches(
             values,
             alias: None,
         },
+        &hooks,
     )? {
         Datum::Bool(value) => Ok(value),
         Datum::Null => Ok(false),
@@ -979,7 +997,15 @@ pub(crate) fn check_index_tuple_size_with_include(
             )
         })?;
     }
-    let encoded = rowenc::encoded_len(&key[..columns.len()]);
+    check_index_key_tuple_size(&key[..columns.len()], include_columns, values)
+}
+
+fn check_index_key_tuple_size(
+    key: &[Datum],
+    include_columns: &[u16],
+    values: &[Datum],
+) -> Result<(), SqlError> {
+    let encoded = rowenc::encoded_len(key);
     if encoded > crate::store::VALUE_INDEX_KEY_MAX {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1021,6 +1047,22 @@ pub(crate) fn check_index_tuple_sizes(
     def: &TableDef,
     values: &[Datum],
     txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mark = arena.mark();
+    let result = check_index_tuple_sizes_inner(storage, def, values, txid, arena);
+    // SAFETY: parsed definitions and evaluated keys are consumed completely
+    // by the size check and never escape this call.
+    unsafe { arena.rewind_to(mark) };
+    result
+}
+
+fn check_index_tuple_sizes_inner(
+    storage: &Storage,
+    def: &TableDef,
+    values: &[Datum],
+    txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     for (column, metadata) in def.columns().iter().enumerate() {
         if metadata.unique {
@@ -1041,17 +1083,7 @@ pub(crate) fn check_index_tuple_sizes(
             )
         })?;
     let index_source = storage.table_def(table_slot, txid);
-    let mut physical = [([0u16; crate::storage::MAX_INDEX_COLS], 0usize, 0u64);
-        crate::storage::MAX_VALUE_ENFORCERS];
-    let mut n_physical = 0usize;
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
-        if index.predicate.is_some()
-            || index.expressions[..index.n_cols]
-                .iter()
-                .any(Option::is_some)
-        {
-            continue;
-        }
         let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
         let mut include_columns = [0u16; crate::storage::MAX_INDEX_COLS];
         for (target, source) in columns.iter_mut().zip(&index.columns[..index.n_cols]) {
@@ -1099,42 +1131,36 @@ pub(crate) fn check_index_tuple_sizes(
                 )
             })? as u16;
         }
-        let include_mask = include_columns[..index.n_include_cols]
-            .iter()
-            .fold(0u64, |mask, column| mask | (1u64 << column));
-        if let Some((_, _, mask)) =
-            physical[..n_physical]
-                .iter_mut()
-                .find(|(prior, n_columns, _)| {
-                    *n_columns == index.n_cols && prior[..*n_columns] == columns[..index.n_cols]
-                })
-        {
-            *mask |= include_mask;
-        } else {
-            if n_physical == physical.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many distinct value-indexed column tuples"
-                ));
-            }
-            physical[n_physical] = (columns, index.n_cols, include_mask);
-            n_physical += 1;
-        }
-    }
-    for (columns, n_columns, include_mask) in &physical[..n_physical] {
-        let mut include_columns = [0u16; crate::storage::MAX_COLUMNS];
-        let mut n_include = 0usize;
-        for column in 0..def.n_columns {
-            if include_mask & (1u64 << column) != 0
-                && !columns[..*n_columns].contains(&(column as u16))
-            {
-                include_columns[n_include] = column as u16;
-                n_include += 1;
+        if let Some(source) = index.predicate {
+            let source = arena
+                .alloc_str(source.as_str())
+                .map_err(|_| crate::sql::eval::arena_full())?;
+            let predicate = crate::sql::parser::parse_expr(source, arena)?;
+            if !index_predicate_matches(storage, txid, def, values, predicate, arena)? {
+                continue;
             }
         }
-        check_index_tuple_size_with_include(
-            &columns[..*n_columns],
-            &include_columns[..n_include],
+        let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
+        for (position, source) in index.expressions[..index.n_cols].iter().enumerate() {
+            if let Some(source) = source {
+                let source = arena
+                    .alloc_str(source.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
+            }
+        }
+        let key = index_key_values(
+            storage,
+            txid,
+            def,
+            values,
+            &columns[..index.n_cols],
+            &expressions[..index.n_cols],
+            arena,
+        )?;
+        check_index_key_tuple_size(
+            &key[..index.n_cols],
+            &include_columns[..index.n_include_cols],
             values,
         )?;
     }
@@ -1342,7 +1368,7 @@ pub(crate) fn enforce_row_constraints(
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
-    check_index_tuple_sizes(storage, def, values, txid)?;
+    check_index_tuple_sizes(storage, def, values, txid, arena)?;
     let constraint_table = storage
         .find_visible(def.schema.as_str(), def.name.as_str(), txid)
         .unwrap_or(table_index);
@@ -1454,7 +1480,7 @@ pub(crate) fn check_row_content(
     txid: u32,
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
-    check_index_tuple_sizes(storage, def, values, txid)?;
+    check_index_tuple_sizes(storage, def, values, txid, arena)?;
     check_detached_partition_bound(def, values)?;
     check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;

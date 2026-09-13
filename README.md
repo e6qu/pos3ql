@@ -23,8 +23,8 @@ With object storage enabled, the server groups transactions completed in one rea
 
 The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, full transaction IDs and snapshots, views, materialized views, modeled indexes, sequences, domains, enums, PostgreSQL large objects, full-text search, SQL functions (scalar, `SETOF`, and `TABLE`, including mutable and nested calls), CTEs, joins, windows, COPY, PostgreSQL 18 SQL/JSON and SQL/XML, PostgreSQL 18-interoperable logical-replication publishing and bounded subscription bootstrap/apply, and PostgreSQL catalog introspection used by common clients and dump/restore tools. [The PostgreSQL 18 matrix](docs/postgresql-18-compatibility.md) distinguishes implemented behavior, explicit architecture boundaries, and extension support.
 
-Plain-column btree indexes are physical access paths for exact single and
-composite keys, prepared parameters, and equality-leading prefixes with lower,
+Modeled btree indexes are physical access paths for exact single and
+composite keys, expressions, prepared parameters, and equality-leading prefixes with lower,
 upper, or two-sided bounds on the following column in queries and direct
 UPDATE/DELETE target scans. Nested loops use those same exact and range probes
 when their keys depend on already-bound rows, including multiway joins,
@@ -39,8 +39,9 @@ those compact keys in declared forward or backward order, including equality-
 fixed prefixes and PostgreSQL NULL placement, without materializing or sorting
 wide rows. Immutable generations carry versioned `INCLUDE` payloads, so
 key-and-payload-covered ordered queries execute as index-only scans after a
-cold start and across post-checkpoint updates. Expression and partial matching
-remain explicit limits.
+cold start and across post-checkpoint updates. Partial indexes own physical
+membership-filtered bindings and are selected only when a conservative typed
+implication proof establishes that the query entails their predicate.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

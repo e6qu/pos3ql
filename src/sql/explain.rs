@@ -631,11 +631,11 @@ fn scan_node<'a>(
     predicate: Option<&'a Expr<'a>>,
     txid: u32,
     depth: u8,
-    arena: &Arena,
+    arena: &'a Arena,
     ordered: Option<query::OrderedIndexAccessPlan<'a>>,
     parameterized: Option<query::IndexAccessPlan<'a>>,
     index_only: bool,
-) -> PlanNode {
+) -> Result<PlanNode, SqlError> {
     let slot = scope.slots[table];
     let derived = scope.derived[table].is_some() || slot == usize::MAX;
     let rows = if derived {
@@ -671,14 +671,15 @@ fn scan_node<'a>(
     // complete resident equality map has no durable-read cost and therefore
     // wins even when the immutable table and index estimates tie.
     let ordered = ordered.filter(|_| table == 0);
+    let fallback_index = if table == 0 {
+        query::index_access_plan(storage, scope, txid, predicate, arena)?
+    } else {
+        None
+    };
     let index_plan = ordered
         .map(|plan| plan.access())
         .or(parameterized)
-        .or_else(|| {
-            (table == 0)
-                .then(|| query::index_access_plan(storage, scope, txid, predicate))
-                .flatten()
-        });
+        .or(fallback_index);
     let index_rows = index_plan.map_or(predicate_rows, |plan| {
         plan.expected_rows(storage, slot, scope.defs[table].expect("base table"), txid)
     });
@@ -689,14 +690,9 @@ fn scan_node<'a>(
     let output_rows = predicate_rows;
     let index_identity = ordered
         .map(|ordered| (ordered.access(), ordered.index_name()))
-        .or_else(|| {
-            index_plan.and_then(|plan| {
-                crate::sql::catalog::value_index_identity(storage, txid, slot, plan.columns())
-                    .map(|(_, name)| (plan, name))
-            })
-        });
+        .or_else(|| index_plan.map(|plan| (plan, plan.index_name())));
     let resident_index = index_identity.is_some_and(|(plan, _)| {
-        plan.is_exact() && storage.value_cache_complete(slot, plan.columns())
+        plan.is_exact() && storage.value_binding_cache_complete(slot, plan.binding())
     });
     let use_index = ordered.is_some()
         || index_identity.is_some()
@@ -739,7 +735,7 @@ fn scan_node<'a>(
     } else {
         StackStr::from_str(if derived { "Subquery Scan" } else { "Seq Scan" })
     };
-    PlanNode {
+    Ok(PlanNode {
         name,
         relation,
         output: StackStr::new(),
@@ -751,7 +747,7 @@ fn scan_node<'a>(
         object_requests,
         cache_blocks,
         constant_false: false,
-    }
+    })
 }
 
 pub(super) fn plan_select(
@@ -859,7 +855,8 @@ pub(super) fn plan_select(
                     depth,
                     txid,
                     false,
-                );
+                    arena,
+                )?;
             }
         }
         estimated_rows = 1;
@@ -876,7 +873,7 @@ pub(super) fn plan_select(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
-            );
+            )?;
             estimated_rows = estimated_rows.saturating_mul(scan.rows.max(1));
             total_cost += scan.total_cost;
             object_requests = object_requests.saturating_add(scan.object_requests);
@@ -890,6 +887,7 @@ pub(super) fn plan_select(
                 statement.where_clause,
                 &table_order[..scope.n],
                 txid,
+                arena,
             )?
             .is_some();
         }
@@ -1061,7 +1059,7 @@ pub(super) fn plan_select(
                 ordered_index,
                 parameterized_indexes[table],
                 ordered_index_only,
-            );
+            )?;
             scan.output = output;
             plan.push(scan)?;
         }
@@ -1368,7 +1366,8 @@ pub(super) fn plan_modification(
                 depth,
                 txid,
                 true,
-            );
+                arena,
+            )?;
         }
         let target_scan =
             physical_scan_node(storage, target_slot, target.name, false, txid, 2, None);
@@ -1389,7 +1388,7 @@ pub(super) fn plan_modification(
                 None,
                 parameterized[table],
                 false,
-            );
+            )?;
             total_cost += node.total_cost;
             rows = rows.saturating_mul(node.rows.max(1));
             object_requests = object_requests.saturating_add(node.object_requests);
@@ -1446,20 +1445,15 @@ pub(super) fn plan_modification(
             let index = (!joined && !storage.relation_has_descendants(slot, txid))
                 .then(|| {
                     let definition = storage.table_def(slot, txid);
-                    query::dml_index_access_plan(storage, slot, definition, alias, txid, predicate)
-                        .and_then(|plan| {
-                            crate::sql::catalog::value_index_identity(
-                                storage,
-                                txid,
-                                slot,
-                                plan.columns(),
-                            )
-                            .map(|(_, name)| (plan, name))
-                        })
+                    query::dml_index_access_plan(
+                        storage, slot, definition, alias, txid, predicate, arena,
+                    )
                 })
-                .flatten();
+                .transpose()?
+                .flatten()
+                .map(|plan| (plan, plan.index_name()));
             let index = index.filter(|(plan, _)| {
-                plan.is_exact() && storage.value_cache_complete(slot, plan.columns())
+                plan.is_exact() && storage.value_binding_cache_complete(slot, plan.binding())
                     || (storage.spill_generation_count(slot) != 0
                         && !storage.sequential_spill_scan_is_cheaper(
                             slot,

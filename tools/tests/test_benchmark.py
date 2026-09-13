@@ -76,10 +76,10 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT sum(payload), count(*) FROM benchmark_kv WHERE id >= 1",
         )
 
-    def test_ordered_limit_is_a_key_only_bounded_result(self):
+    def test_ordered_limit_is_a_covering_bounded_result(self):
         self.assertEqual(
             benchmark.workload_sql("ordered-limit", 7, 19, 1000),
-            "SELECT id FROM benchmark_kv ORDER BY id DESC LIMIT 32",
+            "SELECT id, payload FROM benchmark_kv ORDER BY id DESC LIMIT 32",
         )
 
     def test_join_probe_uses_a_bounded_parameterized_key_set(self):

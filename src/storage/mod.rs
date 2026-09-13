@@ -3422,6 +3422,9 @@ pub(crate) struct Enforcer {
     slot: u32,
     columns: [u16; MAX_INDEX_COLS],
     n_cols: usize,
+    /// Union of included columns for compatible named indexes sharing this
+    /// physical key binding. Key columns are never repeated in this mask.
+    include_mask: u64,
     durable: Option<crate::store::ValueIndexHandle>,
 }
 
@@ -25621,9 +25624,14 @@ impl Storage {
                         .any(|(binding, candidate)| *binding == i && *candidate == hash)
                     {
                         let key_buffer = &mut scratch.roster;
-                        let (len, _) =
-                            self.encode_value_binding_key(table_index, i, rowid, home, key_buffer)?;
-                        visit(rowid, Some(&key_buffer[..len]))?;
+                        let (key_len, _, _) = self.encode_value_binding_entry(
+                            table_index,
+                            i,
+                            rowid,
+                            home,
+                            key_buffer,
+                        )?;
+                        visit(rowid, Some(&key_buffer[..key_len]))?;
                     }
                 }
                 return Ok(true);
@@ -25740,9 +25748,9 @@ impl Storage {
                 continue;
             };
             let key_buffer = &mut scratch.roster;
-            let (len, _) =
-                self.encode_value_binding_key(table_index, binding, rowid, home, key_buffer)?;
-            visit(rowid, &key_buffer[..len])?;
+            let (key_len, _, _) =
+                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?;
+            visit(rowid, &key_buffer[..key_len])?;
         }
         Ok(true)
     }
@@ -25756,7 +25764,7 @@ impl Storage {
         table_index: usize,
         columns: &[u16],
         mut classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
-        mut visit: impl FnMut(u64, u64, &[u8]) -> Result<(), SqlError>,
+        mut visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
         let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
@@ -25787,7 +25795,7 @@ impl Storage {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             let callback_error = std::cell::RefCell::new(None);
             crate::store::ValueIndexReader::over(roster, data)
-                .range(
+                .range_covering(
                     &mut *spill
                         .blocks
                         .as_ref()
@@ -25801,9 +25809,9 @@ impl Storage {
                             crate::store::ValueIndexPosition::Match
                         }
                     },
-                    |_, rowid, lsn, key| {
+                    |_, rowid, lsn, key, payload| {
                         let ready = callback_error.borrow().is_none();
-                        if ready && let Err(error) = visit(rowid, lsn, key) {
+                        if ready && let Err(error) = visit(rowid, lsn, key, payload) {
                             *callback_error.borrow_mut() = Some(error);
                         }
                     },
@@ -25821,10 +25829,15 @@ impl Storage {
                 continue;
             };
             let key_buffer = &mut scratch.roster;
-            let (len, _) =
-                self.encode_value_binding_key(table_index, binding, rowid, home, key_buffer)?;
-            if classify(&key_buffer[..len])? == crate::store::ValueIndexPosition::Match {
-                visit(rowid, state.committed_lsn, &key_buffer[..len])?;
+            let (key_len, payload_len, _) =
+                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?;
+            if classify(&key_buffer[..key_len])? == crate::store::ValueIndexPosition::Match {
+                visit(
+                    rowid,
+                    state.committed_lsn,
+                    &key_buffer[..key_len],
+                    &key_buffer[key_len..key_len + payload_len],
+                )?;
             }
         }
         Ok(true)
@@ -25841,6 +25854,12 @@ impl Storage {
     ) -> ([u16; MAX_INDEX_COLS], usize) {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         (enforcer.columns, enforcer.n_cols)
+    }
+
+    pub(crate) fn value_binding_include_mask(&self, table_index: usize, binding: usize) -> u64 {
+        self.tables[table_index].enforcers[binding]
+            .expect("binding")
+            .include_mask
     }
 
     pub(crate) fn value_binding_handle(
@@ -25878,13 +25897,16 @@ impl Storage {
         &mut self,
         table_index: usize,
         columns: &[u16],
+        include_mask: u64,
         handle: Option<crate::store::ValueIndexHandle>,
     ) -> Result<(), SqlError> {
         let n_enforcers = self.tables[table_index].n_enforcers;
         let Some(enforcer) = self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
-            .find(|enforcer| enforcer.columns() == columns)
+            .find(|enforcer| {
+                enforcer.columns() == columns && enforcer.include_mask == include_mask
+            })
         else {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -25895,15 +25917,16 @@ impl Storage {
         Ok(())
     }
 
-    /// Encodes one binding's key tuple into caller-owned checkpoint scratch.
-    pub(crate) fn encode_value_binding_key(
+    /// Encodes one binding's key followed by its included-column payload into
+    /// caller-owned scratch. The returned lengths are the sole split point.
+    pub(crate) fn encode_value_binding_entry(
         &self,
         table_index: usize,
         binding: usize,
         rowid: u64,
         home: RowHome,
         output: &mut [u8],
-    ) -> Result<(usize, u64), SqlError> {
+    ) -> Result<(usize, usize, u64), SqlError> {
         let table = &self.tables[table_index];
         let enforcer = table.enforcers[binding].expect("binding");
         let mut schema = [ColType::Bool; MAX_COLUMNS];
@@ -25916,15 +25939,42 @@ impl Storage {
                 key[at] = values[*column as usize];
             }
             let key = &key[..enforcer.n_cols];
-            let len = rowenc::encoded_len(key);
-            if len > crate::store::VALUE_INDEX_KEY_MAX || len > output.len() {
+            let key_len = rowenc::encoded_len(key);
+            let mut payload = [Datum::Null; MAX_COLUMNS];
+            let mut n_payload = 0usize;
+            for (column, value) in values[..n_columns].iter().enumerate() {
+                if enforcer.include_mask & (1u64 << column) != 0 {
+                    payload[n_payload] = *value;
+                    n_payload += 1;
+                }
+            }
+            let payload_len = if n_payload == 0 {
+                0
+            } else {
+                rowenc::encoded_len(&payload[..n_payload])
+            };
+            if key_len > crate::store::VALUE_INDEX_KEY_MAX
+                || (n_payload != 0
+                    && key_len.saturating_add(payload_len) > crate::store::VALUE_INDEX_TUPLE_MAX)
+                || key_len.saturating_add(payload_len) > output.len()
+            {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "index tuple exceeds the persistent block-key limit"
+                    "index tuple exceeds the persistent block limit"
                 ));
             }
-            rowenc::encode(key, &mut output[..len]);
-            Ok((len, hash_table_key(&table.def, &values, enforcer.columns())))
+            rowenc::encode(key, &mut output[..key_len]);
+            if n_payload != 0 {
+                rowenc::encode(
+                    &payload[..n_payload],
+                    &mut output[key_len..key_len + payload_len],
+                );
+            }
+            Ok((
+                key_len,
+                payload_len,
+                hash_table_key(&table.def, &values, enforcer.columns()),
+            ))
         })
     }
 
@@ -26058,14 +26108,19 @@ impl Storage {
     ) -> Result<(), SqlError> {
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
-        let mut published = [([0u16; MAX_INDEX_COLS], 0usize, None); MAX_VALUE_ENFORCERS];
+        let mut published = [([0u16; MAX_INDEX_COLS], 0usize, 0u64, None); MAX_VALUE_ENFORCERS];
         let n_published = self.tables[table_index].n_enforcers;
         for (index, entry) in published.iter_mut().enumerate().take(n_published) {
             let enforcer = self.tables[table_index].enforcers[index].expect("enforcer");
-            *entry = (enforcer.columns, enforcer.n_cols, enforcer.durable);
+            *entry = (
+                enforcer.columns,
+                enforcer.n_cols,
+                enforcer.include_mask,
+                enforcer.durable,
+            );
         }
         self.release_enforcers(table_index);
-        let mut want = [([0u16; MAX_INDEX_COLS], 0usize); MAX_VALUE_ENFORCERS];
+        let mut want = [([0u16; MAX_INDEX_COLS], 0usize, 0u64); MAX_VALUE_ENFORCERS];
         let mut n_want = 0usize;
         let too_many = || {
             sql_err!(
@@ -26133,10 +26188,18 @@ impl Storage {
                 continue;
             }
             let columns = &index.columns[..index.n_cols];
-            if want[..n_want]
+            let key_mask = columns
                 .iter()
-                .any(|(cached, n)| &cached[..*n] == columns)
+                .fold(0u64, |mask, column| mask | (1u64 << column));
+            let include_mask = index.include_columns[..index.n_include_cols]
+                .iter()
+                .fold(0u64, |mask, column| mask | (1u64 << column))
+                & !key_mask;
+            if let Some((_, _, cached_include_mask)) = want[..n_want]
+                .iter_mut()
+                .find(|(cached, n, _)| &cached[..*n] == columns)
             {
+                *cached_include_mask |= include_mask;
                 continue;
             }
             if n_want == MAX_VALUE_ENFORCERS {
@@ -26144,9 +26207,12 @@ impl Storage {
             }
             want[n_want].0[..columns.len()].copy_from_slice(columns);
             want[n_want].1 = columns.len();
+            want[n_want].2 = include_mask;
             n_want += 1;
         }
-        for (w, (wanted_columns, wanted_count)) in want.iter().take(n_want).enumerate() {
+        for (w, (wanted_columns, wanted_count, wanted_include_mask)) in
+            want.iter().take(n_want).enumerate()
+        {
             let slot = match self.value_indexes.as_mut().expect("pool present").acquire() {
                 Some(s) => s,
                 None => {
@@ -26162,13 +26228,15 @@ impl Storage {
                 slot,
                 columns: *wanted_columns,
                 n_cols: *wanted_count,
+                include_mask: *wanted_include_mask,
                 durable: published[..n_published]
                     .iter()
-                    .find(|(columns, n_columns, _)| {
+                    .find(|(columns, n_columns, include_mask, _)| {
                         *n_columns == *wanted_count
+                            && *include_mask == *wanted_include_mask
                             && columns[..*n_columns] == wanted_columns[..*wanted_count]
                     })
-                    .and_then(|(_, _, handle)| *handle),
+                    .and_then(|(_, _, _, handle)| *handle),
             });
             // Keep the installed prefix visible to `release_enforcers`, so an
             // acquire failure later in this loop returns every slot already

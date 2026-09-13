@@ -37,8 +37,10 @@ probes avoid disjoint object reads. The executor always rechecks MVCC
 visibility and the SQL qualification. Compatible `ORDER BY` clauses traverse
 those compact keys in declared forward or backward order, including equality-
 fixed prefixes and PostgreSQL NULL placement, without materializing or sorting
-wide rows. Key-covered ordered queries execute as index-only scans; `INCLUDE`
-payload coverage and expression and partial matching remain explicit limits.
+wide rows. Immutable generations carry versioned `INCLUDE` payloads, so
+key-and-payload-covered ordered queries execute as index-only scans after a
+cold start and across post-checkpoint updates. Expression and partial matching
+remain explicit limits.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

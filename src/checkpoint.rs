@@ -27,11 +27,11 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v12";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v13";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
-const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4; // hash | rowid | commit_lsn | key length
+const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
 
 /// io_error — object storage trouble surfaced to a statement.
 const SQLSTATE_IO: &str = "58030";
@@ -46,11 +46,18 @@ fn value_sort_key(entry: &[u8]) -> Result<&[u8], SqlError> {
         ));
     }
     let key_len = u32::from_le_bytes(entry[24..28].try_into().unwrap()) as usize;
-    let end = VALUE_SORT_ENTRY_HEADER
+    let payload_len = u32::from_le_bytes(entry[28..32].try_into().unwrap()) as usize;
+    VALUE_SORT_ENTRY_HEADER
         .checked_add(key_len)
+        .and_then(|end| end.checked_add(payload_len))
         .filter(|end| *end == entry.len())
         .ok_or_else(|| sql_err!(SQLSTATE_IO, "persistent value-index sort row is malformed"))?;
-    Ok(&entry[VALUE_SORT_ENTRY_HEADER..end])
+    Ok(&entry[VALUE_SORT_ENTRY_HEADER..VALUE_SORT_ENTRY_HEADER + key_len])
+}
+
+fn value_sort_payload(entry: &[u8]) -> Result<&[u8], SqlError> {
+    let key = value_sort_key(entry)?;
+    Ok(&entry[VALUE_SORT_ENTRY_HEADER + key.len()..])
 }
 
 /// Identity of one immutable commit batch.  The LSN and checksum always
@@ -95,6 +102,7 @@ struct ValueInstall {
     slot: usize,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_columns: usize,
+    include_mask: u64,
     handle: Option<ValueIndexHandle>,
 }
 
@@ -1346,6 +1354,7 @@ impl Checkpointer {
             usize,
             [u16; crate::storage::MAX_INDEX_COLS],
             usize,
+            u64,
             ValueIndexHandle,
         )> = Vec::new();
         let mut table_statistics: Vec<(usize, crate::storage::TableStatistics)> = Vec::new();
@@ -2998,6 +3007,7 @@ impl Checkpointer {
                     for column in columns.iter_mut().take(n_columns) {
                         *column = parse_field(words.next(), "vix column")?;
                     }
+                    let include_mask = parse_field(words.next(), "vix include mask")?;
                     let roster = parse_block_id(
                         words
                             .next()
@@ -3012,6 +3022,7 @@ impl Checkpointer {
                         mindex,
                         columns,
                         n_columns,
+                        include_mask,
                         ValueIndexHandle {
                             roster,
                             entries,
@@ -5760,7 +5771,7 @@ impl Checkpointer {
                 error.message.as_str()
             ))
         })?;
-        for (mindex, columns, n_columns, handle) in value_indexes {
+        for (mindex, columns, n_columns, include_mask, handle) in value_indexes {
             let slot =
                 slot_of
                     .get(mindex)
@@ -5770,7 +5781,7 @@ impl Checkpointer {
                         "vix references unknown table",
                     ))?;
             storage
-                .install_value_binding(slot, &columns[..n_columns], Some(handle))
+                .install_value_binding(slot, &columns[..n_columns], include_mask, Some(handle))
                 .map_err(|error| {
                     CheckpointSetupError::ObjectStore(format!(
                         "manifest value index rejected: {}",
@@ -7089,6 +7100,7 @@ impl Checkpointer {
             }
             for binding in 0..storage.value_binding_count(slot) {
                 let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+                let include_mask = storage.value_binding_include_mask(slot, binding);
                 let handle = self
                     .pending_value_installs
                     .iter()
@@ -7096,6 +7108,7 @@ impl Checkpointer {
                         install.slot == slot
                             && install.n_columns == n_columns
                             && install.columns[..n_columns] == columns[..n_columns]
+                            && install.include_mask == include_mask
                     })
                     .and_then(|install| install.handle)
                     .or_else(|| storage.value_binding_handle(slot, binding));
@@ -7110,7 +7123,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "vix {slot} {n_columns} {}{} {} {}",
+                        "vix {slot} {n_columns} {}{include_mask} {} {} {}",
                         column_text.as_str(),
                         core::str::from_utf8(&roster).expect("hex"),
                         handle.entries,
@@ -9432,6 +9445,7 @@ impl Checkpointer {
             storage.install_value_binding(
                 install.slot,
                 &install.columns[..install.n_columns],
+                install.include_mask,
                 install.handle,
             )?;
         }
@@ -9729,14 +9743,16 @@ impl Checkpointer {
                 let Some(home) = state.committed else {
                     return Ok(ControlFlow::Continue(()));
                 };
-                let (key_len, hash) =
-                    storage.encode_value_binding_key(slot, binding, rowid, home, key)?;
-                let entry_len = VALUE_SORT_ENTRY_HEADER + key_len;
+                let (key_len, payload_len, hash) =
+                    storage.encode_value_binding_entry(slot, binding, rowid, home, key)?;
+                let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + payload_len;
                 sorted_entry[..8].copy_from_slice(&hash.to_le_bytes());
                 sorted_entry[8..16].copy_from_slice(&rowid.to_le_bytes());
                 sorted_entry[16..24].copy_from_slice(&state.committed_lsn.to_le_bytes());
                 sorted_entry[24..28].copy_from_slice(&(key_len as u32).to_le_bytes());
-                sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len].copy_from_slice(&key[..key_len]);
+                sorted_entry[28..32].copy_from_slice(&(payload_len as u32).to_le_bytes());
+                sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
+                    .copy_from_slice(&key[..key_len + payload_len]);
                 value_sorter.push_encoded(
                     &mut *self.blocks.borrow_mut(),
                     &sorted_entry[..entry_len],
@@ -9749,6 +9765,7 @@ impl Checkpointer {
                 value_sort_reader.start(&mut *self.blocks.borrow_mut(), run)?;
                 while let Some(entry) = value_sort_reader.row() {
                     let key = value_sort_key(entry)?;
+                    let payload = value_sort_payload(entry)?;
                     let hash = u64::from_le_bytes(entry[..8].try_into().unwrap());
                     let rowid = u64::from_le_bytes(entry[8..16].try_into().unwrap());
                     let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
@@ -9762,8 +9779,9 @@ impl Checkpointer {
                             core::cmp::Ordering::Equal
                         }
                     };
-                    self.value_writer
-                        .append(
+                    let include_mask = storage.value_binding_include_mask(slot, binding);
+                    let write = if include_mask == 0 {
+                        self.value_writer.append(
                             &mut *self.blocks.borrow_mut(),
                             hash,
                             rowid,
@@ -9771,7 +9789,16 @@ impl Checkpointer {
                             key,
                             &mut compare_keys,
                         )
-                        .map_err(value_index_to_sql)?;
+                    } else {
+                        self.value_writer.append_covering(
+                            &mut *self.blocks.borrow_mut(),
+                            (hash, rowid, commit_lsn),
+                            key,
+                            payload,
+                            &mut compare_keys,
+                        )
+                    };
+                    write.map_err(value_index_to_sql)?;
                     if let Some(error) = comparison_error {
                         return Err(error);
                     }
@@ -9783,10 +9810,12 @@ impl Checkpointer {
                 .finish(&mut *self.blocks.borrow_mut(), published_lsn)
                 .map_err(value_index_to_sql)?;
             let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+            let include_mask = storage.value_binding_include_mask(slot, binding);
             self.pending_value_installs.push(ValueInstall {
                 slot,
                 columns,
                 n_columns,
+                include_mask,
                 handle,
             });
         }

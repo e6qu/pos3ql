@@ -454,7 +454,7 @@ use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build
 
 pub(crate) mod constraints;
 use constraints::{
-    MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions, check_index_tuple_size,
+    MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions, check_index_tuple_sizes,
     enforce_row_constraints, parse_checks, parse_generated, referenced_key_changed,
     table_is_referenced,
 };
@@ -46927,7 +46927,7 @@ pub fn create_index(
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
             if command.predicate.is_none() && expressions[..n_cols].iter().all(Option::is_none) {
-                check_index_tuple_size(&columns[..n_cols], &values[..tdef.n_columns])?;
+                check_index_tuple_sizes(storage, &tdef, &values[..tdef.n_columns], txn.txid)?;
             }
             if command.unique {
                 check_unique_indexes(
@@ -47189,9 +47189,11 @@ fn create_partition_index_children(
                             .iter()
                             .all(Option::is_none)
                     {
-                        check_index_tuple_size(
-                            &index.columns[..index.n_cols],
+                        check_index_tuple_sizes(
+                            storage,
+                            &table,
                             &values[..table.n_columns],
+                            txn.txid,
                         )?;
                     }
                     if index.unique {

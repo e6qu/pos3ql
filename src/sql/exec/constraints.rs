@@ -944,12 +944,28 @@ pub fn check_all_unique(
 /// the immutable object generation cannot represent the key. Checkpoint is
 /// never the first observer of this physical limit.
 pub(crate) fn check_index_tuple_size(columns: &[u16], values: &[Datum]) -> Result<(), SqlError> {
+    check_index_tuple_size_with_include(columns, &[], values)
+}
+
+pub(crate) fn check_index_tuple_size_with_include(
+    columns: &[u16],
+    include_columns: &[u16],
+    values: &[Datum],
+) -> Result<(), SqlError> {
     if columns.len() > crate::storage::MAX_INDEX_COLS {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "index has {} columns, exceeding the internal limit {}",
             columns.len(),
             crate::storage::MAX_INDEX_COLS
+        ));
+    }
+    if include_columns.len() > crate::storage::MAX_COLUMNS {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "index has {} included columns, exceeding the internal limit {}",
+            include_columns.len(),
+            crate::storage::MAX_COLUMNS
         ));
     }
     let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
@@ -972,12 +988,35 @@ pub(crate) fn check_index_tuple_size(columns: &[u16], values: &[Datum]) -> Resul
             crate::store::VALUE_INDEX_KEY_MAX
         ));
     }
+    if !include_columns.is_empty() {
+        let mut payload = [Datum::Null; crate::storage::MAX_COLUMNS];
+        for (at, column) in include_columns.iter().enumerate() {
+            payload[at] = *values.get(*column as usize).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "included column position {} is outside row width {}",
+                    column,
+                    values.len()
+                )
+            })?;
+        }
+        let physical =
+            encoded.saturating_add(rowenc::encoded_len(&payload[..include_columns.len()]));
+        if physical > crate::store::VALUE_INDEX_TUPLE_MAX {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "index row size {} exceeds maximum {}",
+                physical,
+                crate::store::VALUE_INDEX_TUPLE_MAX
+            ));
+        }
+    }
     Ok(())
 }
 
 /// Validates every persistent tuple shape visible on a table, including
 /// non-unique named indexes (which uniqueness-only enforcement does not walk).
-fn check_index_tuple_sizes(
+pub(crate) fn check_index_tuple_sizes(
     storage: &Storage,
     def: &TableDef,
     values: &[Datum],
@@ -1002,6 +1041,9 @@ fn check_index_tuple_sizes(
             )
         })?;
     let index_source = storage.table_def(table_slot, txid);
+    let mut physical = [([0u16; crate::storage::MAX_INDEX_COLS], 0usize, 0u64);
+        crate::storage::MAX_VALUE_ENFORCERS];
+    let mut n_physical = 0usize;
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         if index.predicate.is_some()
             || index.expressions[..index.n_cols]
@@ -1011,6 +1053,7 @@ fn check_index_tuple_sizes(
             continue;
         }
         let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+        let mut include_columns = [0u16; crate::storage::MAX_INDEX_COLS];
         for (target, source) in columns.iter_mut().zip(&index.columns[..index.n_cols]) {
             let name = index_source
                 .columns()
@@ -1032,7 +1075,68 @@ fn check_index_tuple_sizes(
                 )
             })? as u16;
         }
-        check_index_tuple_size(&columns[..index.n_cols], values)?;
+        for (target, source) in include_columns
+            .iter_mut()
+            .zip(&index.include_columns[..index.n_include_cols])
+        {
+            let name = index_source
+                .columns()
+                .get(usize::from(*source))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "included column position {} is outside table width {}",
+                        source,
+                        index_source.n_columns
+                    )
+                })?
+                .name;
+            *target = def.column_index(name.as_str()).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "visible index references removed column {}",
+                    name.as_str()
+                )
+            })? as u16;
+        }
+        let include_mask = include_columns[..index.n_include_cols]
+            .iter()
+            .fold(0u64, |mask, column| mask | (1u64 << column));
+        if let Some((_, _, mask)) =
+            physical[..n_physical]
+                .iter_mut()
+                .find(|(prior, n_columns, _)| {
+                    *n_columns == index.n_cols && prior[..*n_columns] == columns[..index.n_cols]
+                })
+        {
+            *mask |= include_mask;
+        } else {
+            if n_physical == physical.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many distinct value-indexed column tuples"
+                ));
+            }
+            physical[n_physical] = (columns, index.n_cols, include_mask);
+            n_physical += 1;
+        }
+    }
+    for (columns, n_columns, include_mask) in &physical[..n_physical] {
+        let mut include_columns = [0u16; crate::storage::MAX_COLUMNS];
+        let mut n_include = 0usize;
+        for column in 0..def.n_columns {
+            if include_mask & (1u64 << column) != 0
+                && !columns[..*n_columns].contains(&(column as u16))
+            {
+                include_columns[n_include] = column as u16;
+                n_include += 1;
+            }
+        }
+        check_index_tuple_size_with_include(
+            &columns[..*n_columns],
+            &include_columns[..n_include],
+            values,
+        )?;
     }
     Ok(())
 }
@@ -2603,11 +2707,25 @@ mod tests {
         let error = check_index_tuple_size(&[0], &[Datum::Text(&text)]).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("index row size"));
+
+        let payload = "y".repeat(crate::store::VALUE_INDEX_TUPLE_MAX);
+        let error = check_index_tuple_size_with_include(
+            &[0],
+            &[1],
+            &[Datum::Int4(1), Datum::Text(&payload)],
+        )
+        .unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("index row size"));
     }
 
     #[test]
     fn malformed_index_column_is_an_error_instead_of_a_panic() {
         let error = check_index_tuple_size(&[1], &[Datum::Int4(7)]).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+        assert!(error.message.as_str().contains("outside row width 1"));
+
+        let error = check_index_tuple_size_with_include(&[0], &[1], &[Datum::Int4(7)]).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
         assert!(error.message.as_str().contains("outside row width 1"));
     }

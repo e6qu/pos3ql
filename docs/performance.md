@@ -101,7 +101,10 @@ require zero base-tuple fetches. These access-path gates keep a timing
 improvement from concealing a return to full-table reads or updates. The
 analyzed fixture has a fixed 8 KiB non-projected row body, so the
 small smoke dataset spans enough immutable table blocks for a selective cold
-index probe to remain a meaningful costed physical choice. The
+index probe to remain a meaningful costed physical choice. The ordered-limit
+fixture uses a descending btree with `INCLUDE (payload)` and projects both key
+and payload, so its zero-fetch gate exercises durable covering-index behavior
+rather than only key decoding. The
 ungrouped durable shape is two PUTs per transaction: an immutable journal
 object and a compare-and-swap commit-head update.
 
@@ -119,7 +122,7 @@ Composite leading-prefix and range predicates seek across checkpoint-sorted
 immutable keys and skip disjoint object blocks; the harness records both warm
 and cold tail-range workloads alongside PostgreSQL 18. Compatible ordered
 queries sort only compact index keys, stream base reads through `LIMIT`, and
-avoid them entirely for key-covered projections. The known structural limits
+avoid them entirely for key- and `INCLUDE`-covered projections. The known structural limits
 remain global query serialization, richer secondary-index planning, and small
 startup-sized catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
 lock ordering, group publication order, and explicit backpressure. Writer

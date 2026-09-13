@@ -11032,15 +11032,14 @@ pub(crate) fn ordered_value_index_identity(
     equality_prefix: usize,
     order_positions: &[u8],
     order: &[crate::sql::ast::OrderBy<'_>],
-) -> Option<(i32, StackStr<64>)> {
+) -> Option<(i32, StackStr<64>, u64)> {
     if order_positions.len() != order.len() {
         return None;
     }
     let definition = storage.table_def(table_slot, txid);
     let mut found = None;
     visit_indexes(storage, txid, |index| {
-        if found.is_some()
-            || index.table_slot != table_slot
+        if index.table_slot != table_slot
             || index.n_cols != columns.len()
             || &index.columns[..index.n_cols] != columns
             || index.expression_keys[..index.n_cols].iter().any(|key| *key)
@@ -11082,7 +11081,18 @@ pub(crate) fn ordered_value_index_identity(
             }
             backwards = Some(direction);
         }
-        found = Some((index.oid, index.name));
+        let key_mask = index.columns[..index.n_cols]
+            .iter()
+            .fold(0u64, |mask, column| mask | (1u64 << column));
+        let include_mask = index.include_columns[..index.n_include_cols]
+            .iter()
+            .fold(0u64, |mask, column| mask | (1u64 << column))
+            & !key_mask;
+        if found.is_none_or(|(_, _, prior_mask): (i32, StackStr<64>, u64)| {
+            include_mask.count_ones() > prior_mask.count_ones()
+        }) {
+            found = Some((index.oid, index.name, include_mask));
+        }
     });
     found
 }

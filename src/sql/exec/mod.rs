@@ -4312,6 +4312,8 @@ fn find_conflict<'a>(
                         key_hit(&columns[..*n_columns], *nulls_not_distinct)
                     } else {
                         let keys = crate::sql::exec::constraints::index_key_values(
+                            storage,
+                            txid,
                             def,
                             values,
                             &columns[..*n_columns],
@@ -4319,6 +4321,8 @@ fn find_conflict<'a>(
                             arena,
                         )?;
                         let other_keys = crate::sql::exec::constraints::index_key_values(
+                            storage,
+                            txid,
                             def,
                             &other,
                             &columns[..*n_columns],
@@ -4370,16 +4374,18 @@ fn find_conflict<'a>(
                         let candidate_member =
                             partial_index.predicate.map_or(Ok(true), |predicate| {
                                 crate::sql::exec::constraints::index_predicate_matches(
-                                    def, values, predicate, arena,
+                                    storage, txid, def, values, predicate, arena,
                                 )
                             })?;
                         let other_member =
                             partial_index.predicate.map_or(Ok(true), |predicate| {
                                 crate::sql::exec::constraints::index_predicate_matches(
-                                    def, &other, predicate, arena,
+                                    storage, txid, def, &other, predicate, arena,
                                 )
                             })?;
                         let candidate_keys = crate::sql::exec::constraints::index_key_values(
+                            storage,
+                            txid,
                             def,
                             values,
                             &partial_index.columns[..partial_index.n_columns],
@@ -4387,6 +4393,8 @@ fn find_conflict<'a>(
                             arena,
                         )?;
                         let other_keys = crate::sql::exec::constraints::index_key_values(
+                            storage,
+                            txid,
                             def,
                             &other,
                             &partial_index.columns[..partial_index.n_columns],
@@ -46926,9 +46934,7 @@ pub fn create_index(
         storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
-            if command.predicate.is_none() && expressions[..n_cols].iter().all(Option::is_none) {
-                check_index_tuple_sizes(storage, &tdef, &values[..tdef.n_columns], txn.txid)?;
-            }
+            check_index_tuple_sizes(storage, &tdef, &values[..tdef.n_columns], txn.txid, arena)?;
             if command.unique {
                 check_unique_indexes(
                     storage,
@@ -47018,7 +47024,6 @@ pub fn create_index(
                 root_index: slot,
                 root: def,
                 columns: command.columns,
-                predicate: command.predicate,
                 arena,
             },
         )
@@ -47097,7 +47102,6 @@ struct PartitionIndexCreate<'a> {
     root_index: usize,
     root: crate::storage::IndexDef,
     columns: &'a [crate::sql::ast::IndexColumn<'a>],
-    predicate: Option<&'a Expr<'a>>,
     arena: &'a Arena,
 }
 
@@ -47184,18 +47188,13 @@ fn create_partition_index_children(
                 storage.with_row_bytes(table_slot, rowid, home, |bytes| {
                     let mut values = [Datum::Null; MAX_COLUMNS];
                     rowenc::decode(bytes, &schema[..table.n_columns], &mut values)?;
-                    if command.predicate.is_none()
-                        && index.expressions[..index.n_cols]
-                            .iter()
-                            .all(Option::is_none)
-                    {
-                        check_index_tuple_sizes(
-                            storage,
-                            &table,
-                            &values[..table.n_columns],
-                            txn.txid,
-                        )?;
-                    }
+                    check_index_tuple_sizes(
+                        storage,
+                        &table,
+                        &values[..table.n_columns],
+                        txn.txid,
+                        command.arena,
+                    )?;
                     if index.unique {
                         check_unique_indexes(
                             storage,

@@ -34,8 +34,8 @@ logical-replication boundary is specified separately in
   physical implementation, physical XLOG, physical streaming replication,
   hot standby, and binary-WAL tooling are not targets.
 - Hash, GiST, GIN, SP-GiST, and BRIN index execution are not implemented.
-  Plain-column btree indexes physically execute complete single/composite
-  equality probes (including prepared parameters) and equality-leading
+  Modeled btree indexes physically execute complete single/composite and
+  expression equality probes (including prepared parameters) and equality-leading
   prefixes with lower, upper, or two-sided bounds on the following column for queries and direct
   UPDATE/DELETE target scans. Exact resident probes use the
   complete startup-bounded hash map; durable equality probes use per-block
@@ -47,8 +47,11 @@ logical-replication boundary is specified separately in
   versioned immutable payloads, including cold recovery and committed
   post-checkpoint overlays. Nested-loop joins and
   joined UPDATE/DELETE sources parameterize exact or range keys from rows
-  already bound on their outer side. Expression and partial matching remain
-  production work.
+  already bound on their outer side. Partial indexes have distinct filtered
+  generations and are selected only when the query conservatively implies the
+  stored predicate; expression and partial keys also support compatible
+  ordered traversal. Expression-key results themselves are recomputed from a
+  fetched row rather than projected directly from an index tuple.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

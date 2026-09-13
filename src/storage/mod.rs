@@ -12,6 +12,7 @@ use core::cell::Cell;
 use core::hash::{Hash, Hasher};
 
 use crate::config::Config;
+use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_map::FixedMap;
@@ -3422,6 +3423,15 @@ pub(crate) struct Enforcer {
     slot: u32,
     columns: [u16; MAX_INDEX_COLS],
     n_cols: usize,
+    /// A partial or expression index owns a distinct physical binding. Full
+    /// plain-column indexes keep sharing the column tuple represented by
+    /// `None`.
+    index_created_at: Option<u64>,
+    /// Catalog snapshot used while evaluating a transaction-private index.
+    /// Committed bindings use zero, the storage catalog's committed view.
+    evaluation_txid: u32,
+    key_types: [ColType; MAX_INDEX_COLS],
+    collations: [Collation; MAX_INDEX_COLS],
     /// Union of included columns for compatible named indexes sharing this
     /// physical key binding. Key columns are never repeated in this mask.
     include_mask: u64,
@@ -8578,13 +8588,6 @@ impl IndexOperatorClass {
     }
 }
 
-fn hash_table_key(definition: &TableDef, values: &[Datum], columns: &[u16]) -> u64 {
-    let mut collations = [Collation::None; MAX_INDEX_COLS];
-    for (index, column) in columns.iter().enumerate() {
-        collations[index] = definition.columns()[*column as usize].collation;
-    }
-    hash_key_collated(values, columns, &collations[..columns.len()])
-}
 /// Maximum stored source length of a partial-index membership predicate.
 ///
 /// Predicate text is catalog data, not request-owned parser memory. A fixed
@@ -11080,9 +11083,15 @@ pub struct Storage {
     /// in an `Option` so a rebuild can take it out for the duration of a row
     /// walk (which borrows the rest of `self`) and put it back.
     value_indexes: Option<ValueIndexPool>,
+    /// Parser/evaluator scratch for durable expression and partial-index keys.
+    /// Every use rewinds to its entry mark, so runtime evaluation is bounded
+    /// and cannot accumulate across rows or checkpoints.
+    index_arena: Arena,
     /// The process-independent locale state selected at engine startup.
     collation: Option<CollationRuntime>,
 }
+
+const INDEX_ARENA_BYTES: usize = 2 * crate::store::MAX_PAYLOAD;
 
 struct CollationScratch {
     left: FixedBuf,
@@ -13971,7 +13980,8 @@ impl Storage {
 
     /// Bytes drawn beyond the row heap itself, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
-        2 * config.collation_scratch_bytes
+        INDEX_ARENA_BYTES
+            + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
                 * (size_of::<Table>()
                     + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
@@ -14774,6 +14784,7 @@ impl Storage {
         }
         let value_indexes =
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
+        let index_arena = Arena::new(budget, "index expression evaluation", INDEX_ARENA_BYTES)?;
         let transaction_capacity =
             config.max_connections as usize + config.max_prepared_transactions;
         let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
@@ -14957,6 +14968,7 @@ impl Storage {
             replay_table_rewrite: None,
             spill: None,
             value_indexes: Some(value_indexes),
+            index_arena,
             collation: None,
         })
     }
@@ -25436,9 +25448,10 @@ impl Storage {
         table.mark_dirty();
     }
 
-    /// Decodes the row at `home` and hashes every enforcer key whose columns are
-    /// all non-NULL (a NULL key is SQL-distinct, never indexed), writing
-    /// `(enforcer_index, hash)` for each into `out`. Returns the count.
+    /// Decodes the row at `home` and hashes every enforcer key whose values are
+    /// all non-NULL, writing `(enforcer_index, hash)` for each into `out`.
+    /// NULL keys remain in durable ordered generations but cannot satisfy an
+    /// equality probe, so the resident exact map deliberately omits them.
     fn row_enforcer_hashes(
         &self,
         table_index: usize,
@@ -25451,27 +25464,108 @@ impl Storage {
         if n_enf == 0 {
             return Ok(0);
         }
+        let mut n_out = 0;
+        for binding in 0..n_enf {
+            self.with_value_binding_key(table_index, binding, rowid, home, |key, _, enforcer| {
+                let Some(key) = key else { return Ok(()) };
+                if key.iter().any(Datum::is_null) {
+                    return Ok(());
+                }
+                let compact = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
+                out[n_out] = (
+                    binding,
+                    hash_key_collated(
+                        key,
+                        &compact[..enforcer.n_cols],
+                        &enforcer.collations[..enforcer.n_cols],
+                    ),
+                );
+                n_out += 1;
+                Ok(())
+            })?;
+        }
+        Ok(n_out)
+    }
+
+    fn with_value_binding_key<R>(
+        &self,
+        table_index: usize,
+        binding: usize,
+        rowid: u64,
+        home: RowHome,
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let table = &self.tables[table_index];
+        let enforcer = table.enforcers[binding].expect("binding");
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = table.def.schema(&mut schema);
-        let mut cols = [([0u16; MAX_INDEX_COLS], 0usize); MAX_VALUE_ENFORCERS];
-        for (i, entry) in cols.iter_mut().enumerate().take(n_enf) {
-            let e = table.enforcers[i].expect("enforcer present");
-            *entry = (e.columns, e.n_cols);
-        }
-        self.with_row_bytes(table_index, rowid, home, |bytes| {
+        let mark = self.index_arena.mark();
+        let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            let mut n_out = 0;
-            for (i, (c, n)) in cols.iter().take(n_enf).enumerate() {
-                let columns = &c[..*n];
-                if columns.iter().any(|&col| values[col as usize].is_null()) {
-                    continue;
+            let mut key = [Datum::Null; MAX_INDEX_COLS];
+            if let Some(created_at) = enforcer.index_created_at {
+                let index = self
+                    .indexes
+                    .iter()
+                    .find(|index| {
+                        index.ddl_state != CatalogDdlState::Absent
+                            && index.created_at == created_at
+                            && index.database == table.database
+                    })
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "physical index binding has no catalog definition"
+                        )
+                    })?;
+                if let Some(source) = index.predicate {
+                    let predicate =
+                        crate::sql::parser::parse_expr(source.as_str(), &self.index_arena)?;
+                    if !crate::sql::exec::constraints::index_predicate_matches(
+                        self,
+                        enforcer.evaluation_txid,
+                        &table.def,
+                        &values[..n_columns],
+                        predicate,
+                        &self.index_arena,
+                    )? {
+                        return visit(None, &values[..n_columns], &enforcer);
+                    }
                 }
-                out[n_out] = (i, hash_table_key(&table.def, &values, columns));
-                n_out += 1;
+                let mut expressions = [None; MAX_INDEX_COLS];
+                for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
+                    if let Some(source) = source {
+                        expressions[position] = Some(crate::sql::parser::parse_expr(
+                            source.as_str(),
+                            &self.index_arena,
+                        )?);
+                    }
+                }
+                key = crate::sql::exec::constraints::index_key_values(
+                    self,
+                    enforcer.evaluation_txid,
+                    &table.def,
+                    &values[..n_columns],
+                    &index.columns[..index.n_cols],
+                    &expressions[..index.n_cols],
+                    &self.index_arena,
+                )?;
+            } else {
+                for (position, column) in enforcer.columns().iter().enumerate() {
+                    key[position] = values[*column as usize];
+                }
             }
-            Ok(n_out)
-        })
+            visit(
+                Some(&key[..enforcer.n_cols]),
+                &values[..n_columns],
+                &enforcer,
+            )
+        });
+        // SAFETY: `visit` cannot return a borrowed key, and all expression
+        // values have been encoded or hashed before this row-local rewind.
+        unsafe { self.index_arena.rewind_to(mark) };
+        result
     }
 
     /// The value-index maintenance for one committed row transition: remove the
@@ -25526,7 +25620,6 @@ impl Storage {
     /// Probes the value cache for the indexed tuple covering exactly `columns`,
     /// visiting every candidate rowid whose key hashes to `hash`. Durable and
     /// overlay candidates carry their encoded key; hash-only resident-cache
-    /// candidates do not. A durable callback runs under the value reader's
     /// block-stack borrow and must use that key instead of reentering storage.
     /// Returns true only when the cache is complete, so a caller may trust a
     /// negative answer; false means the authoritative row store must be scanned.
@@ -25535,107 +25628,120 @@ impl Storage {
         table_index: usize,
         columns: &[u16],
         hash: u64,
+        visit: impl FnMut(u64, Option<&[u8]>) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        let table = &self.tables[table_index];
+        let Some(i) = (0..table.n_enforcers).find(|index| {
+            let enforcer = table.enforcers[*index].expect("enforcer present");
+            enforcer.index_created_at.is_none() && enforcer.columns() == columns
+        }) else {
+            return Ok(false);
+        };
+        self.probe_value_binding(table_index, i, hash, visit)
+    }
+
+    pub(crate) fn probe_value_binding(
+        &self,
+        table_index: usize,
+        i: usize,
+        hash: u64,
         mut visit: impl FnMut(u64, Option<&[u8]>) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        for i in 0..table.n_enforcers {
+        if i < table.n_enforcers {
             let e = table.enforcers[i].expect("enforcer present");
-            if e.columns() == columns {
-                let index = self
-                    .value_indexes
-                    .as_ref()
-                    .expect("value index pool present")
-                    .get(e.slot);
-                if index.is_complete() {
-                    let mut callback_error = None;
-                    index.probe(hash, |rowid| {
-                        if callback_error.is_none()
-                            && let Err(error) = visit(rowid, None)
-                        {
-                            callback_error = Some(error);
-                        }
-                    });
-                    if let Some(error) = callback_error {
-                        return Err(error);
-                    }
-                    return Ok(true);
-                }
-                let Some(handle) = e.durable else {
-                    return Ok(false);
-                };
-                if self.commit_snapshot < handle.published_lsn {
-                    return Ok(false);
-                }
-                let Some(spill) = &self.spill else {
-                    return Ok(false);
-                };
-                let Some(mut scratch) = spill
-                    .value_scratch
-                    .as_ref()
-                    .expect("durable value indexes have reader scratch")
-                    .iter()
-                    .find_map(|candidate| candidate.try_borrow_mut().ok())
-                else {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "persistent value probes nested deeper than reader scratch"
-                    ));
-                };
-                let scratch = &mut *scratch;
-                {
-                    let ValueIndexScratch { roster, data } = scratch;
-                    let mut callback_error = None;
-                    crate::store::ValueIndexReader::over(roster, data)
-                        .probe(
-                            &mut *spill
-                                .blocks
-                                .as_ref()
-                                .expect("value-index generations are durable")
-                                .borrow_mut(),
-                            &handle,
-                            hash,
-                            |rowid, _, key| {
-                                if callback_error.is_none()
-                                    && let Err(error) = visit(rowid, Some(key))
-                                {
-                                    callback_error = Some(error);
-                                }
-                            },
-                        )
-                        .map_err(value_index_read_error)?;
-                    if let Some(error) = callback_error {
-                        return Err(error);
-                    }
-                }
-                // The published generation is a complete base. Every later
-                // committed change remains in the bounded resident overlay
-                // until its replacement generation publishes.
-                let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-                for (&rowid, state) in self.tables[table_index].rows.iter() {
-                    if state.committed_lsn <= handle.published_lsn {
-                        continue;
-                    }
-                    let Some(home) = state.committed else {
-                        continue;
-                    };
-                    let n = self.row_enforcer_hashes(table_index, rowid, home, &mut hashes)?;
-                    if hashes[..n]
-                        .iter()
-                        .any(|(binding, candidate)| *binding == i && *candidate == hash)
+            let index = self
+                .value_indexes
+                .as_ref()
+                .expect("value index pool present")
+                .get(e.slot);
+            if index.is_complete() {
+                let mut callback_error = None;
+                index.probe(hash, |rowid| {
+                    if callback_error.is_none()
+                        && let Err(error) = visit(rowid, None)
                     {
-                        let key_buffer = &mut scratch.roster;
-                        let (key_len, _, _) = self.encode_value_binding_entry(
-                            table_index,
-                            i,
-                            rowid,
-                            home,
-                            key_buffer,
-                        )?;
-                        visit(rowid, Some(&key_buffer[..key_len]))?;
+                        callback_error = Some(error);
                     }
+                });
+                if let Some(error) = callback_error {
+                    return Err(error);
                 }
                 return Ok(true);
             }
+            let Some(handle) = e.durable else {
+                return Ok(false);
+            };
+            if self.commit_snapshot < handle.published_lsn {
+                return Ok(false);
+            }
+            let Some(spill) = &self.spill else {
+                return Ok(false);
+            };
+            let Some(mut scratch) = spill
+                .value_scratch
+                .as_ref()
+                .expect("durable value indexes have reader scratch")
+                .iter()
+                .find_map(|candidate| candidate.try_borrow_mut().ok())
+            else {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "persistent value probes nested deeper than reader scratch"
+                ));
+            };
+            let scratch = &mut *scratch;
+            {
+                let ValueIndexScratch { roster, data } = scratch;
+                let mut callback_error = None;
+                crate::store::ValueIndexReader::over(roster, data)
+                    .probe(
+                        &mut *spill
+                            .blocks
+                            .as_ref()
+                            .expect("value-index generations are durable")
+                            .borrow_mut(),
+                        &handle,
+                        hash,
+                        |rowid, _, key| {
+                            if callback_error.is_none()
+                                && let Err(error) = visit(rowid, Some(key))
+                            {
+                                callback_error = Some(error);
+                            }
+                        },
+                    )
+                    .map_err(value_index_read_error)?;
+                if let Some(error) = callback_error {
+                    return Err(error);
+                }
+            }
+            // The published generation is a complete base. Every later
+            // committed change remains in the bounded resident overlay
+            // until its replacement generation publishes.
+            let mut hashes = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
+            for (&rowid, state) in self.tables[table_index].rows.iter() {
+                if state.committed_lsn <= handle.published_lsn {
+                    continue;
+                }
+                let Some(home) = state.committed else {
+                    continue;
+                };
+                let n = self.row_enforcer_hashes(table_index, rowid, home, &mut hashes)?;
+                if hashes[..n]
+                    .iter()
+                    .any(|(binding, candidate)| *binding == i && *candidate == hash)
+                {
+                    let key_buffer = &mut scratch.roster;
+                    let Some((key_len, _, _)) =
+                        self.encode_value_binding_entry(table_index, i, rowid, home, key_buffer)?
+                    else {
+                        continue;
+                    };
+                    visit(rowid, Some(&key_buffer[..key_len]))?;
+                }
+            }
+            return Ok(true);
         }
         Ok(false)
     }
@@ -25644,7 +25750,8 @@ impl Storage {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
             let enforcer = table.enforcers[index].expect("enforcer present");
-            enforcer.columns() == columns
+            enforcer.index_created_at.is_none()
+                && enforcer.columns() == columns
                 && self
                     .value_indexes
                     .as_ref()
@@ -25658,7 +25765,8 @@ impl Storage {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
             let enforcer = table.enforcers[index].expect("enforcer present");
-            enforcer.columns() == columns
+            enforcer.index_created_at.is_none()
+                && enforcer.columns() == columns
                 && (self
                     .value_indexes
                     .as_ref()
@@ -25675,11 +25783,87 @@ impl Storage {
         let table = &self.tables[table_index];
         (0..table.n_enforcers).any(|index| {
             let enforcer = table.enforcers[index].expect("enforcer present");
-            enforcer.columns() == columns
+            enforcer.index_created_at.is_none()
+                && enforcer.columns() == columns
                 && enforcer
                     .durable
                     .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
         })
+    }
+
+    pub(crate) fn value_binding_for_index(
+        &self,
+        table_index: usize,
+        created_at: u64,
+    ) -> Option<usize> {
+        let table = &self.tables[table_index];
+        (0..table.n_enforcers).find(|binding| {
+            table.enforcers[*binding]
+                .is_some_and(|enforcer| enforcer.index_created_at == Some(created_at))
+        })
+    }
+
+    pub(crate) fn value_binding_cache_complete(&self, table_index: usize, binding: usize) -> bool {
+        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
+            self.value_indexes
+                .as_ref()
+                .expect("value index pool present")
+                .get(enforcer.slot)
+                .is_complete()
+        })
+    }
+
+    pub(crate) fn value_binding_probe_complete(&self, table_index: usize, binding: usize) -> bool {
+        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
+            self.value_indexes
+                .as_ref()
+                .expect("value index pool present")
+                .get(enforcer.slot)
+                .is_complete()
+                || enforcer
+                    .durable
+                    .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
+        })
+    }
+
+    pub(crate) fn value_binding_durable_complete(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> bool {
+        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
+            enforcer
+                .durable
+                .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
+        })
+    }
+
+    pub(crate) fn value_binding_key_types(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> ([ColType; MAX_INDEX_COLS], usize) {
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        (enforcer.key_types, enforcer.n_cols)
+    }
+
+    pub(crate) fn value_binding_collations(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> ([Collation; MAX_INDEX_COLS], usize) {
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        (enforcer.collations, enforcer.n_cols)
+    }
+
+    pub(crate) fn value_binding_created_at(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> Option<u64> {
+        self.tables[table_index].enforcers[binding]
+            .expect("binding")
+            .index_created_at
     }
 
     /// Walks a manifest-published key generation and the resident changes
@@ -25693,7 +25877,8 @@ impl Storage {
         let table = &self.tables[table_index];
         let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
             let enforcer = table.enforcers[binding].expect("enforcer");
-            (enforcer.columns() == columns).then_some((binding, enforcer.durable?))
+            (enforcer.index_created_at.is_none() && enforcer.columns() == columns)
+                .then_some((binding, enforcer.durable?))
         }) else {
             return Ok(false);
         };
@@ -25748,8 +25933,11 @@ impl Storage {
                 continue;
             };
             let key_buffer = &mut scratch.roster;
-            let (key_len, _, _) =
-                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?;
+            let Some((key_len, _, _)) =
+                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?
+            else {
+                continue;
+            };
             visit(rowid, &key_buffer[..key_len])?;
         }
         Ok(true)
@@ -25759,18 +25947,33 @@ impl Storage {
     /// then applies the same interval to the committed resident overlay.
     /// `classify` describes a key relative to that interval; the value-index
     /// format uses it for block pruning without taking SQL types into storage.
+    #[cfg(test)]
     pub(crate) fn range_value_index(
         &self,
         table_index: usize,
         columns: &[u16],
+        classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
+        visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        let table = &self.tables[table_index];
+        let Some(binding) = (0..table.n_enforcers).find(|binding| {
+            let enforcer = table.enforcers[*binding].expect("enforcer");
+            enforcer.index_created_at.is_none() && enforcer.columns() == columns
+        }) else {
+            return Ok(false);
+        };
+        self.range_value_index_binding(table_index, binding, classify, visit)
+    }
+
+    pub(crate) fn range_value_index_binding(
+        &self,
+        table_index: usize,
+        binding: usize,
         mut classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
         mut visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
         let table = &self.tables[table_index];
-        let Some((binding, handle)) = (0..table.n_enforcers).find_map(|binding| {
-            let enforcer = table.enforcers[binding].expect("enforcer");
-            (enforcer.columns() == columns).then_some((binding, enforcer.durable?))
-        }) else {
+        let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
             return Ok(false);
         };
         if self.commit_snapshot < handle.published_lsn {
@@ -25829,8 +26032,11 @@ impl Storage {
                 continue;
             };
             let key_buffer = &mut scratch.roster;
-            let (key_len, payload_len, _) =
-                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?;
+            let Some((key_len, payload_len, _)) =
+                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?
+            else {
+                continue;
+            };
             if classify(&key_buffer[..key_len])? == crate::store::ValueIndexPosition::Match {
                 visit(
                     rowid,
@@ -25874,8 +26080,19 @@ impl Storage {
 
     pub(crate) fn value_binding_is_committed(&self, table_index: usize, binding: usize) -> bool {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        if let Some(created_at) = enforcer.index_created_at {
+            let table = &self.tables[table_index];
+            return self.indexes.iter().any(|index| {
+                index.ddl_state == CatalogDdlState::Present
+                    && index.database == table.database
+                    && index.schema == table.def.schema
+                    && index.table == table.def.name
+                    && index.created_at == created_at
+            });
+        }
         let columns = enforcer.columns();
-        let definition = &self.tables[table_index].def;
+        let table = &self.tables[table_index];
+        let definition = &table.def;
         definition
             .columns()
             .iter()
@@ -25887,9 +26104,20 @@ impl Storage {
                 .any(|unique| unique.columns() == columns)
             || self.indexes.iter().any(|index| {
                 index.ddl_state == CatalogDdlState::Present
+                    && index.database == table.database
                     && index.schema == definition.schema
                     && index.table == definition.name
                     && &index.columns[..index.n_cols] == columns
+                    && index.predicate.is_none()
+                    && index.expressions[..index.n_cols]
+                        .iter()
+                        .all(Option::is_none)
+                    && index.resolved_operator_classes[..index.n_cols]
+                        .iter()
+                        .all(|class| !matches!(class, Some(IndexOperatorClass::Catalog(_))))
+                    && columns.iter().enumerate().all(|(position, column)| {
+                        index.collations[position] == definition.columns[*column as usize].collation
+                    })
             })
     }
 
@@ -25897,6 +26125,7 @@ impl Storage {
         &mut self,
         table_index: usize,
         columns: &[u16],
+        index_created_at: Option<u64>,
         include_mask: u64,
         handle: Option<crate::store::ValueIndexHandle>,
     ) -> Result<(), SqlError> {
@@ -25905,7 +26134,9 @@ impl Storage {
             .iter_mut()
             .flatten()
             .find(|enforcer| {
-                enforcer.columns() == columns && enforcer.include_mask == include_mask
+                enforcer.columns() == columns
+                    && enforcer.index_created_at == index_created_at
+                    && enforcer.include_mask == include_mask
             })
         else {
             return Err(sql_err!(
@@ -25926,56 +26157,58 @@ impl Storage {
         rowid: u64,
         home: RowHome,
         output: &mut [u8],
-    ) -> Result<(usize, usize, u64), SqlError> {
-        let table = &self.tables[table_index];
-        let enforcer = table.enforcers[binding].expect("binding");
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        let n_columns = table.def.schema(&mut schema);
-        self.with_row_bytes(table_index, rowid, home, |bytes| {
-            let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            let mut key = [Datum::Null; MAX_INDEX_COLS];
-            for (at, column) in enforcer.columns().iter().enumerate() {
-                key[at] = values[*column as usize];
-            }
-            let key = &key[..enforcer.n_cols];
-            let key_len = rowenc::encoded_len(key);
-            let mut payload = [Datum::Null; MAX_COLUMNS];
-            let mut n_payload = 0usize;
-            for (column, value) in values[..n_columns].iter().enumerate() {
-                if enforcer.include_mask & (1u64 << column) != 0 {
-                    payload[n_payload] = *value;
-                    n_payload += 1;
+    ) -> Result<Option<(usize, usize, u64)>, SqlError> {
+        self.with_value_binding_key(
+            table_index,
+            binding,
+            rowid,
+            home,
+            |key, values, enforcer| {
+                let Some(key) = key else { return Ok(None) };
+                let key_len = rowenc::encoded_len(key);
+                let mut payload = [Datum::Null; MAX_COLUMNS];
+                let mut n_payload = 0usize;
+                for (column, value) in values.iter().enumerate() {
+                    if enforcer.include_mask & (1u64 << column) != 0 {
+                        payload[n_payload] = *value;
+                        n_payload += 1;
+                    }
                 }
-            }
-            let payload_len = if n_payload == 0 {
-                0
-            } else {
-                rowenc::encoded_len(&payload[..n_payload])
-            };
-            if key_len > crate::store::VALUE_INDEX_KEY_MAX
-                || (n_payload != 0
-                    && key_len.saturating_add(payload_len) > crate::store::VALUE_INDEX_TUPLE_MAX)
-                || key_len.saturating_add(payload_len) > output.len()
-            {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "index tuple exceeds the persistent block limit"
-                ));
-            }
-            rowenc::encode(key, &mut output[..key_len]);
-            if n_payload != 0 {
-                rowenc::encode(
-                    &payload[..n_payload],
-                    &mut output[key_len..key_len + payload_len],
-                );
-            }
-            Ok((
-                key_len,
-                payload_len,
-                hash_table_key(&table.def, &values, enforcer.columns()),
-            ))
-        })
+                let payload_len = if n_payload == 0 {
+                    0
+                } else {
+                    rowenc::encoded_len(&payload[..n_payload])
+                };
+                if key_len > crate::store::VALUE_INDEX_KEY_MAX
+                    || (n_payload != 0
+                        && key_len.saturating_add(payload_len)
+                            > crate::store::VALUE_INDEX_TUPLE_MAX)
+                    || key_len.saturating_add(payload_len) > output.len()
+                {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "index tuple exceeds the persistent block limit"
+                    ));
+                }
+                rowenc::encode(key, &mut output[..key_len]);
+                if n_payload != 0 {
+                    rowenc::encode(
+                        &payload[..n_payload],
+                        &mut output[key_len..key_len + payload_len],
+                    );
+                }
+                let compact = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
+                Ok(Some((
+                    key_len,
+                    payload_len,
+                    hash_key_collated(
+                        key,
+                        &compact[..enforcer.n_cols],
+                        &enforcer.collations[..enforcer.n_cols],
+                    ),
+                )))
+            },
+        )
     }
 
     /// Compares two encoded keys with the indexed columns' PostgreSQL types
@@ -25988,14 +26221,11 @@ impl Storage {
         left: &[u8],
         right: &[u8],
     ) -> Result<core::cmp::Ordering, SqlError> {
-        let table = &self.tables[table_index];
-        let enforcer = table.enforcers[binding].expect("binding");
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         let mut types = [ColType::Bool; MAX_INDEX_COLS];
         let mut collations = [crate::sql::ast::Collation::None; MAX_INDEX_COLS];
-        for (position, &column) in enforcer.columns()[..enforcer.n_cols].iter().enumerate() {
-            types[position] = table.def.columns[column as usize].ctype;
-            collations[position] = table.def.columns[column as usize].collation;
-        }
+        types[..enforcer.n_cols].copy_from_slice(&enforcer.key_types[..enforcer.n_cols]);
+        collations[..enforcer.n_cols].copy_from_slice(&enforcer.collations[..enforcer.n_cols]);
         let mut left_values = [Datum::Null; MAX_INDEX_COLS];
         let mut right_values = [Datum::Null; MAX_INDEX_COLS];
         rowenc::decode(
@@ -26108,19 +26338,38 @@ impl Storage {
     ) -> Result<(), SqlError> {
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
-        let mut published = [([0u16; MAX_INDEX_COLS], 0usize, 0u64, None); MAX_VALUE_ENFORCERS];
+        let mut published =
+            [([0u16; MAX_INDEX_COLS], 0usize, None, 0u64, None); MAX_VALUE_ENFORCERS];
         let n_published = self.tables[table_index].n_enforcers;
         for (index, entry) in published.iter_mut().enumerate().take(n_published) {
             let enforcer = self.tables[table_index].enforcers[index].expect("enforcer");
             *entry = (
                 enforcer.columns,
                 enforcer.n_cols,
+                enforcer.index_created_at,
                 enforcer.include_mask,
                 enforcer.durable,
             );
         }
         self.release_enforcers(table_index);
-        let mut want = [([0u16; MAX_INDEX_COLS], 0usize, 0u64); MAX_VALUE_ENFORCERS];
+        #[derive(Clone, Copy)]
+        struct WantedBinding {
+            columns: [u16; MAX_INDEX_COLS],
+            n_columns: usize,
+            index_created_at: Option<u64>,
+            key_types: [ColType; MAX_INDEX_COLS],
+            collations: [Collation; MAX_INDEX_COLS],
+            include_mask: u64,
+        }
+        const EMPTY_BINDING: WantedBinding = WantedBinding {
+            columns: [0; MAX_INDEX_COLS],
+            n_columns: 0,
+            index_created_at: None,
+            key_types: [ColType::Bool; MAX_INDEX_COLS],
+            collations: [Collation::None; MAX_INDEX_COLS],
+            include_mask: 0,
+        };
+        let mut want = [EMPTY_BINDING; MAX_VALUE_ENFORCERS];
         let mut n_want = 0usize;
         let too_many = || {
             sql_err!(
@@ -26136,8 +26385,10 @@ impl Storage {
                     if n_want == MAX_VALUE_ENFORCERS {
                         return Err(too_many());
                     }
-                    want[n_want].0[0] = i as u16;
-                    want[n_want].1 = 1;
+                    want[n_want].columns[0] = i as u16;
+                    want[n_want].n_columns = 1;
+                    want[n_want].key_types[0] = col.ctype;
+                    want[n_want].collations[0] = col.collation;
                     n_want += 1;
                 }
             }
@@ -26146,8 +26397,12 @@ impl Storage {
                     return Err(too_many());
                 }
                 let cols = uk.columns();
-                want[n_want].0[..cols.len()].copy_from_slice(cols);
-                want[n_want].1 = cols.len();
+                want[n_want].columns[..cols.len()].copy_from_slice(cols);
+                want[n_want].n_columns = cols.len();
+                for (position, column) in cols.iter().enumerate() {
+                    want[n_want].key_types[position] = def.columns[*column as usize].ctype;
+                    want[n_want].collations[position] = def.columns[*column as usize].collation;
+                }
                 n_want += 1;
             }
         }
@@ -26157,29 +26412,15 @@ impl Storage {
         // startup-reserved pool slot.
         let table_schema = self.tables[table_index].def.schema;
         let table_name = self.tables[table_index].def.name;
+        let table_database = self.tables[table_index].database;
         let table_definition = self.tables[table_index].def;
         for index in self.indexes.iter().filter(|index| {
             txid.map_or(index.ddl_state == CatalogDdlState::Present, |owner| {
                 index.visible_to(owner)
-            }) && index.schema == table_schema
+            }) && index.database == table_database
+                && index.schema == table_schema
                 && index.table == table_name
-                // A value enforcer represents every table row for its key.
-                // Partial membership is predicate-defined, so it has a
-                // separate authoritative enforcement path.
-                && index.predicate.is_none()
-                // Expression keys cannot be represented by a column-tuple
-                // cache without changing their SQL semantics.
-                && index.expressions[..index.n_cols].iter().all(Option::is_none)
-                // The shared value binding compares and hashes with the table
-                // columns' collations. An explicitly different index
-                // collation requires a distinct physical representation.
-                && index.columns[..index.n_cols]
-                    .iter()
-                    .enumerate()
-                    .all(|(position, column)| {
-                        index.collations[position]
-                            == table_definition.columns[*column as usize].collation
-                    })
+                && !index.mutable_for(txid.unwrap_or(0)).kind.is_partitioned()
         }) {
             let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
                 .iter()
@@ -26188,31 +26429,80 @@ impl Storage {
                 continue;
             }
             let columns = &index.columns[..index.n_cols];
+            let special = index.predicate.is_some()
+                || index.expressions[..index.n_cols]
+                    .iter()
+                    .any(Option::is_some)
+                || columns.iter().enumerate().any(|(position, column)| {
+                    index.collations[position]
+                        != table_definition.columns[*column as usize].collation
+                });
             let key_mask = columns
                 .iter()
-                .fold(0u64, |mask, column| mask | (1u64 << column));
+                .enumerate()
+                .fold(0u64, |mask, (position, column)| {
+                    if index.expressions[position].is_none() {
+                        mask | (1u64 << column)
+                    } else {
+                        mask
+                    }
+                });
             let include_mask = index.include_columns[..index.n_include_cols]
                 .iter()
                 .fold(0u64, |mask, column| mask | (1u64 << column))
                 & !key_mask;
-            if let Some((_, _, cached_include_mask)) = want[..n_want]
-                .iter_mut()
-                .find(|(cached, n, _)| &cached[..*n] == columns)
+            if !special
+                && let Some(cached) = want[..n_want].iter_mut().find(|cached| {
+                    cached.index_created_at.is_none()
+                        && &cached.columns[..cached.n_columns] == columns
+                })
             {
-                *cached_include_mask |= include_mask;
+                cached.include_mask |= include_mask;
                 continue;
             }
             if n_want == MAX_VALUE_ENFORCERS {
                 return Err(too_many());
             }
-            want[n_want].0[..columns.len()].copy_from_slice(columns);
-            want[n_want].1 = columns.len();
-            want[n_want].2 = include_mask;
+            want[n_want].columns[..columns.len()].copy_from_slice(columns);
+            want[n_want].n_columns = columns.len();
+            want[n_want].index_created_at = special.then_some(index.created_at);
+            want[n_want].collations[..columns.len()]
+                .copy_from_slice(&index.collations[..columns.len()]);
+            let mark = self.index_arena.mark();
+            let type_result = (|| {
+                for (position, expression) in index.expressions[..index.n_cols].iter().enumerate() {
+                    want[n_want].key_types[position] = match expression {
+                        None => table_definition.columns[columns[position] as usize].ctype,
+                        Some(source) => {
+                            let expression =
+                                crate::sql::parser::parse_expr(source.as_str(), &self.index_arena)?;
+                            let (type_oid, _) = crate::sql::exec::infer_type_catalog(
+                                expression,
+                                Some(&table_definition),
+                                self,
+                                txid.unwrap_or(0),
+                            )?;
+                            self.routine_result_for_oid(type_oid, txid.unwrap_or(0))
+                                .map(|result| result.ctype)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "index expression data type does not exist"
+                                    )
+                                })?
+                        }
+                    };
+                }
+                Ok(())
+            })();
+            // SAFETY: inferred expression metadata does not retain parser
+            // nodes or values allocated above this row-local mark.
+            unsafe { self.index_arena.rewind_to(mark) };
+            type_result?;
+            want[n_want].include_mask = include_mask;
             n_want += 1;
         }
-        for (w, (wanted_columns, wanted_count, wanted_include_mask)) in
-            want.iter().take(n_want).enumerate()
-        {
+        for (w, wanted) in want.iter().take(n_want).enumerate() {
             let slot = match self.value_indexes.as_mut().expect("pool present").acquire() {
                 Some(s) => s,
                 None => {
@@ -26226,17 +26516,22 @@ impl Storage {
             };
             self.tables[table_index].enforcers[w] = Some(Enforcer {
                 slot,
-                columns: *wanted_columns,
-                n_cols: *wanted_count,
-                include_mask: *wanted_include_mask,
+                columns: wanted.columns,
+                n_cols: wanted.n_columns,
+                index_created_at: wanted.index_created_at,
+                evaluation_txid: txid.unwrap_or(0),
+                key_types: wanted.key_types,
+                collations: wanted.collations,
+                include_mask: wanted.include_mask,
                 durable: published[..n_published]
                     .iter()
-                    .find(|(columns, n_columns, include_mask, _)| {
-                        *n_columns == *wanted_count
-                            && *include_mask == *wanted_include_mask
-                            && columns[..*n_columns] == wanted_columns[..*wanted_count]
+                    .find(|(columns, n_columns, index_created_at, include_mask, _)| {
+                        *n_columns == wanted.n_columns
+                            && *index_created_at == wanted.index_created_at
+                            && *include_mask == wanted.include_mask
+                            && columns[..*n_columns] == wanted.columns[..wanted.n_columns]
                     })
-                    .and_then(|(_, _, _, handle)| *handle),
+                    .and_then(|(_, _, _, _, handle)| *handle),
             });
             // Keep the installed prefix visible to `release_enforcers`, so an
             // acquire failure later in this loop returns every slot already

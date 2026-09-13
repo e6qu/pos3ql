@@ -559,6 +559,27 @@ impl ColTypeResolver for CatalogCols<'_> {
         .record_column_handle(qualifier, name)
     }
 
+    fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
+        if !self
+            .storage
+            .composite_slot_visible_to(usize::from(slot), self.txid)
+        {
+            return None;
+        }
+        let definition = self.storage.composite_for(usize::from(slot), self.txid);
+        let field = definition
+            .active_fields()
+            .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))?;
+        Some(StaticTypeMeta {
+            ctype: field.ctype,
+            type_oid: self
+                .storage
+                .routine_type_oid(field.ctype, field.user_type, self.txid)?,
+            type_mod: field.type_mod,
+            collation: field.collation,
+        })
+    }
+
     fn named_composite_field(
         &self,
         type_name: &str,
@@ -1251,6 +1272,12 @@ pub trait ColTypeResolver {
     /// record or has no shape.
     fn record_column_handle(&self, _qualifier: Option<&str>, _name: &str) -> Option<i32> {
         None
+    }
+
+    /// One field of a named composite already resolved to its catalog slot.
+    /// Catalog-free resolvers may still use the statement-scoped shape copy.
+    fn composite_field(&self, slot: u16, field: &str) -> Option<StaticTypeMeta> {
+        composite_slot_field_metadata(slot, field)
     }
 
     /// One durable named-composite field, copied out of the bounded catalog.
@@ -2263,7 +2290,7 @@ pub fn record_field_metadata(
             .record_column_handle(*qualifier, name)
             .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
             .or_else(|| match columns.resolve(*qualifier, name).ok()? {
-                ColType::Composite(slot) => composite_slot_field_metadata(slot, field),
+                ColType::Composite(slot) => columns.composite_field(slot, field),
                 _ => None,
             }),
         Expr::Field {
@@ -2273,7 +2300,7 @@ pub fn record_field_metadata(
             .and_then(|handle| record_shape_field_metadata(handle, field).map(|value| value.0))
             .or_else(
                 || match record_field_type(inner, inner_field, columns).ok()? {
-                    ColType::Composite(slot) => composite_slot_field_metadata(slot, field),
+                    ColType::Composite(slot) => columns.composite_field(slot, field),
                     _ => None,
                 },
             ),

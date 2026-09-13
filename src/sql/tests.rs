@@ -20301,6 +20301,54 @@ fn uncommitted_create_index_is_invisible_to_other_sessions() {
         reuse.contains("CREATE INDEX"),
         "name freed after rollback: {reuse}"
     );
+
+    // A pending expression/partial binding has its own identity. A committed
+    // plain index over the same base column must not make that binding
+    // checkpoint-eligible before its CREATE commits.
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut a,
+        "CREATE TABLE special_index_identity (email text, active boolean)",
+    );
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut a,
+        "CREATE INDEX committed_email ON special_index_identity (email)",
+    );
+    run_txn(&mut e, &mut b, &mut a, "BEGIN");
+    run_txn(
+        &mut e,
+        &mut b,
+        &mut a,
+        "CREATE INDEX pending_normalized_email ON special_index_identity \
+         (lower(email)) WHERE active",
+    );
+    let table = e
+        .storage
+        .find_visible("public", "special_index_identity", a.txid)
+        .unwrap();
+    let created_at = e
+        .storage
+        .indexes_for("public", "special_index_identity", a.txid)
+        .find(|index| index.name_for(a.txid).as_str() == "pending_normalized_email")
+        .unwrap()
+        .created_at;
+    let binding = e
+        .storage
+        .value_binding_for_index(table, created_at)
+        .unwrap();
+    assert!(!e.storage.value_binding_is_committed(table, binding));
+    run_txn(&mut e, &mut b, &mut a, "COMMIT");
+    let committed_binding = e
+        .storage
+        .value_binding_for_index(table, created_at)
+        .unwrap();
+    assert!(
+        e.storage
+            .value_binding_is_committed(table, committed_binding)
+    );
 }
 
 #[test]
@@ -47564,6 +47612,298 @@ fn unique_expression_indexes_are_transactional_and_durable() {
 }
 
 #[test]
+fn expression_and_partial_indexes_drive_queries_joins_dml_and_cold_ordering() {
+    let mut config = test_config("expression-partial-access");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 2 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.table_rows = 1024;
+    config.value_index_rows = 3072;
+    config.object_store_bucket = format!("expression-partial-access-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE indexed_documents (
+             id integer, email text, active boolean, score integer, payload text
+         );
+         CREATE INDEX normalized_email_lookup ON indexed_documents
+             (lower(email)) INCLUDE (id, payload);
+         CREATE INDEX active_score_lookup ON indexed_documents
+             (score DESC NULLS LAST) INCLUDE (id) WHERE active AND score > 0;
+         CREATE INDEX inactive_score_lookup ON indexed_documents
+             (score) INCLUDE (payload) WHERE NOT active;
+         INSERT INTO indexed_documents VALUES
+             (1, 'Alpha@Example.com', true, 30, 'alpha'),
+             (2, 'beta@example.com', false, 20, 'beta'),
+             (3, 'Gamma@Example.com', true, 10, 'gamma');
+         INSERT INTO indexed_documents
+             SELECT value + 10, 'filler-' || value::text || '@example.com',
+                    value % 2 = 0, value + 100, repeat('x', 128)
+             FROM generate_series(1, 100) AS filler(value);
+         CREATE TABLE normalized_needles (normalized text);
+         INSERT INTO normalized_needles VALUES ('alpha@example.com')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let resident = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT payload FROM indexed_documents
+             WHERE lower(email) = 'alpha@example.com';
+         SELECT payload FROM indexed_documents
+             WHERE lower(email) = 'alpha@example.com';
+         EXPLAIN SELECT payload FROM indexed_documents
+             WHERE active = true AND score = 30;
+         SELECT payload FROM indexed_documents WHERE active = true AND score = 30;
+         EXPLAIN SELECT payload FROM indexed_documents WHERE score = 20",
+    ));
+    assert!(
+        resident
+            .iter()
+            .any(|row| row.contains("Index Scan using normalized_email_lookup")),
+        "{resident:?}"
+    );
+    assert!(resident.iter().any(|row| row == "alpha"));
+    assert!(
+        resident
+            .iter()
+            .any(|row| row.contains("Index Scan using active_score_lookup")),
+        "{resident:?}"
+    );
+    assert!(
+        resident
+            .iter()
+            .any(|row| row.contains("Seq Scan on indexed_documents")),
+        "a query that does not imply the partial predicate must not use it: {resident:?}"
+    );
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut restart_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restart_budget).unwrap();
+    let cold = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "EXPLAIN SELECT id, lower(email) FROM indexed_documents
+             ORDER BY lower(email) LIMIT 3;
+         SELECT id, lower(email) FROM indexed_documents
+             ORDER BY lower(email) LIMIT 3;
+         EXPLAIN SELECT id, score FROM indexed_documents
+             WHERE active AND score > 100 ORDER BY score DESC NULLS LAST LIMIT 3;
+         SELECT id, score FROM indexed_documents
+             WHERE active AND score > 100 ORDER BY score DESC NULLS LAST LIMIT 3;
+         EXPLAIN SELECT d.id FROM normalized_needles n
+             JOIN indexed_documents d ON lower(d.email) = n.normalized;
+         SELECT d.id FROM normalized_needles n
+             JOIN indexed_documents d ON lower(d.email) = n.normalized;
+         EXPLAIN SELECT payload FROM indexed_documents
+             WHERE active = false AND score = 20;
+         SELECT payload FROM indexed_documents
+             WHERE active = false AND score = 20;
+         SELECT indexrelname, idx_scan > 0 FROM pg_stat_user_indexes
+             WHERE indexrelname IN
+                 ('normalized_email_lookup', 'active_score_lookup', 'inactive_score_lookup')
+             ORDER BY indexrelname",
+    ));
+    assert!(
+        cold.iter()
+            .filter(|row| row.contains("Index Scan using normalized_email_lookup"))
+            .count()
+            >= 2,
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Scan using active_score_lookup")),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Scan using inactive_score_lookup")),
+        "same-column partial generations must retain separate identities: {cold:?}"
+    );
+    assert_eq!(
+        cold.iter().filter(|row| row.contains("Sort")).count(),
+        0,
+        "both declared expression/partial orders should stream from their B-trees: {cold:?}"
+    );
+    assert!(cold.iter().any(|row| row == "1|alpha@example.com"));
+    assert!(cold.iter().any(|row| row == "1"));
+    assert!(cold.iter().any(|row| row == "beta"));
+    assert!(cold.iter().any(|row| row == "active_score_lookup|t"));
+    assert!(cold.iter().any(|row| row == "inactive_score_lookup|t"));
+    assert!(cold.iter().any(|row| row == "normalized_email_lookup|t"));
+
+    let changed = data_rows(&run_with(
+        &mut restarted,
+        &mut restart_budget,
+        "EXPLAIN UPDATE indexed_documents SET email = 'renamed@example.com'
+             WHERE lower(email) = 'alpha@example.com';
+         EXPLAIN DELETE FROM indexed_documents WHERE active AND score = 10;
+         UPDATE indexed_documents SET email = 'renamed@example.com'
+             WHERE lower(email) = 'alpha@example.com' RETURNING id;
+         DELETE FROM indexed_documents WHERE active AND score = 10 RETURNING id;
+         SELECT id FROM indexed_documents
+             WHERE lower(email) = 'renamed@example.com';
+         SELECT id FROM indexed_documents WHERE active AND score = 10",
+    ));
+    assert_eq!(
+        changed
+            .iter()
+            .filter(|row| row.contains("Index Scan using"))
+            .count(),
+        2,
+        "expression and partial bindings should drive both DML statements: {changed:?}"
+    );
+    assert!(changed.iter().any(|row| row == "1"));
+    assert!(changed.iter().any(|row| row == "3"));
+
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn catalog_dependent_expression_indexes_build_and_recover() {
+    let mut config = test_config("catalog-expression-index-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("catalog-expression-index-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA catalog_index; \
+             CREATE TYPE catalog_index.pair AS (left_value integer, label text); \
+             CREATE TEXT SEARCH PARSER catalog_index.default_copy ( \
+               START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, \
+               HEADLINE = prsd_headline, LEXTYPES = prsd_lextype); \
+             CREATE TEXT SEARCH TEMPLATE catalog_index.simple_copy ( \
+               INIT = dsimple_init, LEXIZE = dsimple_lexize); \
+             CREATE TEXT SEARCH DICTIONARY catalog_index.words ( \
+               TEMPLATE = catalog_index.simple_copy, ACCEPT = true); \
+             CREATE TEXT SEARCH CONFIGURATION catalog_index.documents ( \
+               PARSER = catalog_index.default_copy); \
+             ALTER TEXT SEARCH CONFIGURATION catalog_index.documents ADD MAPPING \
+               FOR asciiword, word, numword, uint WITH catalog_index.words; \
+             CREATE TABLE catalog_index.rows ( \
+               id integer PRIMARY KEY, value catalog_index.pair, body text NOT NULL); \
+             INSERT INTO catalog_index.rows VALUES \
+               (1, ROW(7, 'seven')::catalog_index.pair, 'Cats 42'), \
+               (2, ROW(8, 'eight')::catalog_index.pair, 'Dogs 7'); \
+             CREATE INDEX catalog_pair_field_idx ON catalog_index.rows (((value).left_value)); \
+             CREATE INDEX catalog_search_expression_idx ON catalog_index.rows \
+               ((to_tsvector('catalog_index.documents', body)))",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT id FROM catalog_index.rows WHERE (value).left_value = 7; \
+                 SELECT count(*) FROM catalog_index.rows \
+                  WHERE to_tsvector('catalog_index.documents', body) = \
+                        to_tsvector('catalog_index.documents', 'Cats 42')",
+            )),
+            ["1", "1"]
+        );
+        engine.commit_wal().unwrap();
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id FROM catalog_index.rows WHERE (value).left_value = 8; \
+             SELECT count(*) FROM catalog_index.rows \
+              WHERE to_tsvector('catalog_index.documents', body) = \
+                    to_tsvector('catalog_index.documents', 'Dogs 7')",
+        )),
+        ["2", "1"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn expression_index_tuple_limits_follow_partial_membership() {
+    let mut config = test_config("expression-index-tuple-limits");
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 4 << 20;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let width = crate::store::VALUE_INDEX_KEY_MAX / 2 + 64;
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "CREATE TABLE wide_expression_rows (raw text, active boolean);
+             INSERT INTO wide_expression_rows VALUES (repeat('x', {width}), false);
+             CREATE INDEX active_wide_expression ON wide_expression_rows
+                 ((raw || raw)) WHERE active"
+        ),
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "a non-member does not have an index tuple: {}",
+        String::from_utf8_lossy(&setup)
+    );
+    let member = run_with(
+        &mut engine,
+        &mut budget,
+        &format!("INSERT INTO wide_expression_rows VALUES (repeat('y', {width}), true)"),
+    );
+    assert!(
+        String::from_utf8_lossy(&member).contains("54000"),
+        "an oversized evaluated expression key must fail before commit: {}",
+        String::from_utf8_lossy(&member)
+    );
+    let build = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX full_wide_expression ON wide_expression_rows ((raw || raw))",
+    );
+    assert!(String::from_utf8_lossy(&build).contains("54000"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'full_wide_expression'",
+        )),
+        ["0"]
+    );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn unique_nulls_not_distinct_are_transactional_and_durable() {
     let mut config = test_config("unique-nulls-not-distinct");
     config.object_store_on = true;
@@ -48496,7 +48836,7 @@ fn catalog_joins_and_subqueries() {
 fn psql_catalog_listing_contracts() {
     // This catalog probe intentionally creates a fresh connection-sized arena
     // for each query instead of reusing a production connection's buffers.
-    let (mut engine, mut budget) = test_engine_with_budget(1 << 27);
+    let (mut engine, mut budget) = test_engine_with_budget(1 << 28);
     run_with(
         &mut engine,
         &mut budget,

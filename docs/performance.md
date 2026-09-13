@@ -116,14 +116,15 @@ reported rather than required to be linear.
 ## What the measurements decide next
 
 Representative long runs, not the single-binary label or the small CI smoke
-dataset, decide optimization order. Plain-column btree equality probes now use
+dataset, decide optimization order. Btree equality probes, including expression
+and implied partial-index keys, now use
 resident exact maps or filtered immutable blocks for queries and direct DML.
 Composite leading-prefix and range predicates seek across checkpoint-sorted
 immutable keys and skip disjoint object blocks; the harness records both warm
 and cold tail-range workloads alongside PostgreSQL 18. Compatible ordered
 queries sort only compact index keys, stream base reads through `LIMIT`, and
 avoid them entirely for key- and `INCLUDE`-covered projections. The known structural limits
-remain global query serialization, richer secondary-index planning, and small
+remain global query serialization, non-btree physical methods, and small
 startup-sized catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
 lock ordering, group publication order, and explicit backpressure. Writer
 fencing and promotion safety must exist before any failover benchmark or

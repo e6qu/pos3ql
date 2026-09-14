@@ -64,6 +64,17 @@ so this first physical GiST path is exact rather than lossy. PostgreSQL GiST
 tree-page layout, K-nearest-neighbor ordering, and custom native operator
 classes are not implemented and are never advertised as a fallback.
 
+GIN indexes physically execute array containment/overlap, full-text, JSONB
+containment/existence, and jsonpath predicates as bitmap plans. SP-GiST
+indexes execute network, range, planar-geometric, locale-independent text
+ordering, and prefix predicates as index plans. Their 11 PostgreSQL 18
+built-in operator classes, 11 families, 90 strategy rows, 56 support rows,
+method-specific DDL/options, DML maintenance, WAL, checkpoints, cloning,
+partitions, reindexing, and empty-cache recovery share the same bounded index
+lifecycle. This first path evaluates immutable encoded keys exactly; it does
+not claim PostgreSQL page layout, GIN posting lists, SP-GiST node navigation,
+K-nearest-neighbor ordering, or custom native callbacks.
+
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,
 and serial-sequence discovery. These read transaction-visible DDL and retain

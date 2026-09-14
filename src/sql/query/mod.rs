@@ -1166,6 +1166,10 @@ pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<C
             | super::ast::BinaryOp::LtEq
             | super::ast::BinaryOp::Gt
             | super::ast::BinaryOp::GtEq
+            | super::ast::BinaryOp::PatternLt
+            | super::ast::BinaryOp::PatternLtEq
+            | super::ast::BinaryOp::PatternGt
+            | super::ast::BinaryOp::PatternGtEq
             | super::ast::BinaryOp::Contains
             | super::ast::BinaryOp::ContainedBy
             | super::ast::BinaryOp::Overlaps
@@ -1177,6 +1181,7 @@ pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<C
             | super::ast::BinaryOp::JsonExists
             | super::ast::BinaryOp::JsonExistsAny
             | super::ast::BinaryOp::JsonExistsAll
+            | super::ast::BinaryOp::StartsWith
     ) {
         return Some(ColType::Bool);
     }

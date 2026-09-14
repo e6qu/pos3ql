@@ -11981,6 +11981,8 @@ pub(crate) fn operator_class_oid_visibility(
         || super::types::HashOperatorClass::from_oid(oid).is_some()
         || super::types::BrinOperatorClass::from_oid(oid).is_some()
         || super::types::GistOperatorClass::from_oid(oid).is_some()
+        || super::types::GinOperatorClass::from_oid(oid).is_some()
+        || super::types::SpGistOperatorClass::from_oid(oid).is_some()
     {
         return Some(true);
     }
@@ -12036,6 +12038,12 @@ pub(crate) fn operator_family_oid_visibility(
     if builtin
         || brin
         || super::gist_catalog::FAMILIES
+            .iter()
+            .any(|(family_oid, _)| *family_oid == oid)
+        || super::gin_catalog::FAMILIES
+            .iter()
+            .any(|(family_oid, _)| *family_oid == oid)
+        || super::spgist_catalog::FAMILIES
             .iter()
             .any(|(family_oid, _)| *family_oid == oid)
         || matches!(
@@ -15587,10 +15595,22 @@ fn write_index_key_metadata(
         {
             Some(class.name())
         }
+        Some(crate::storage::IndexOperatorClass::Gin(class))
+            if !class.is_default() || !options.is_empty() =>
+        {
+            Some(class.name())
+        }
+        Some(crate::storage::IndexOperatorClass::SpGist(class))
+            if !class.is_default() || !options.is_empty() =>
+        {
+            Some(class.name())
+        }
         Some(crate::storage::IndexOperatorClass::Btree(_))
         | Some(crate::storage::IndexOperatorClass::Hash(_))
         | Some(crate::storage::IndexOperatorClass::Brin(_))
-        | Some(crate::storage::IndexOperatorClass::Gist(_)) => None,
+        | Some(crate::storage::IndexOperatorClass::Gist(_))
+        | Some(crate::storage::IndexOperatorClass::Gin(_))
+        | Some(crate::storage::IndexOperatorClass::SpGist(_)) => None,
         Some(crate::storage::IndexOperatorClass::Catalog(_)) | None => None,
     };
     if let Some(name) = builtin_name {
@@ -15644,6 +15664,8 @@ fn write_index_storage_options(
         && definition.options.pages_per_range.is_none()
         && definition.options.autosummarize.is_none()
         && definition.options.buffering.is_none()
+        && definition.options.fastupdate.is_none()
+        && definition.options.gin_pending_list_limit.is_none()
     {
         return;
     }
@@ -15680,6 +15702,18 @@ fn write_index_storage_options(
             crate::sql::ast::GistBuffering::Off => "off",
         };
         let _ = write!(out, "{separator}buffering='{value}'");
+        separator = ", ";
+    }
+    if let Some(fastupdate) = definition.options.fastupdate {
+        let _ = write!(
+            out,
+            "{separator}fastupdate={}",
+            if fastupdate { "on" } else { "off" }
+        );
+        separator = ", ";
+    }
+    if let Some(limit) = definition.options.gin_pending_list_limit {
+        let _ = write!(out, "{separator}gin_pending_list_limit='{limit}'");
     }
     let _ = out.write_str(")");
 }
@@ -19060,18 +19094,15 @@ fn pg_class<'a>(
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Float8(0.0),
                 Datum::Int4(0), // relpages
-                Datum::Int4(
-                    if info.is_exclusion || info.method == crate::sql::ast::IndexAccessMethod::Gist
-                    {
-                        783
-                    } else if info.method == crate::sql::ast::IndexAccessMethod::Hash {
-                        405
-                    } else if info.method == crate::sql::ast::IndexAccessMethod::Brin {
-                        3580
-                    } else {
-                        403
-                    },
-                ),
+                Datum::Int4(match info.method {
+                    crate::sql::ast::IndexAccessMethod::Gist => 783,
+                    crate::sql::ast::IndexAccessMethod::Hash => 405,
+                    crate::sql::ast::IndexAccessMethod::Brin => 3580,
+                    crate::sql::ast::IndexAccessMethod::Gin => 2742,
+                    crate::sql::ast::IndexAccessMethod::SpGist => 4000,
+                    crate::sql::ast::IndexAccessMethod::Btree if info.is_exclusion => 783,
+                    crate::sql::ast::IndexAccessMethod::Btree => 403,
+                }),
                 Datum::Int4(owner_oid(
                     storage,
                     crate::storage::AccessClass::Table,
@@ -19597,6 +19628,24 @@ fn index_reloptions<'a>(
                 crate::sql::ast::GistBuffering::On => "buffering=on",
                 crate::sql::ast::GistBuffering::Off => "buffering=off",
             },
+            arena,
+        )?;
+        count += 1;
+    }
+    if let Some(fastupdate) = definition.options.fastupdate {
+        values[count] = text(
+            if fastupdate {
+                "fastupdate=on"
+            } else {
+                "fastupdate=off"
+            },
+            arena,
+        )?;
+        count += 1;
+    }
+    if let Some(limit) = definition.options.gin_pending_list_limit {
+        values[count] = text(
+            stack_format!(48, "gin_pending_list_limit={limit}").as_str(),
             arena,
         )?;
         count += 1;
@@ -23012,6 +23061,34 @@ fn pg_opfamily<'a>(
         )?;
         count += 1;
     }
+    for (oid, name) in super::gin_catalog::FAMILIES {
+        rows[count] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(2742),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, name) in super::spgist_catalog::FAMILIES {
+        rows[count] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(4000),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -23472,6 +23549,42 @@ fn pg_opclass<'a>(
                 Datum::Int4(2616),
                 Datum::Int4(class.oid()),
                 Datum::Int4(783),
+                text(class.name(), arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(class.family_oid()),
+                Datum::Int4(class.input_oid()),
+                Datum::Bool(class.is_default()),
+                Datum::Int4(class.storage_oid()),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for class in super::types::GinOperatorClass::ALL {
+        rows[count] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(class.oid()),
+                Datum::Int4(2742),
+                text(class.name(), arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(class.family_oid()),
+                Datum::Int4(class.input_oid()),
+                Datum::Bool(class.is_default()),
+                Datum::Int4(class.storage_oid()),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for class in super::types::SpGistOperatorClass::ALL {
+        rows[count] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(class.oid()),
+                Datum::Int4(4000),
                 text(class.name(), arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
@@ -24207,6 +24320,46 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         count += 1;
     }
+    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
+        super::gin_catalog::OPERATORS
+    {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(strategy),
+                Datum::Bpchar(purpose),
+                Datum::Int4(operator),
+                Datum::Int4(2742),
+                Datum::Int4(sort_family),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
+        super::spgist_catalog::OPERATORS
+    {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(strategy),
+                Datum::Bpchar(purpose),
+                Datum::Int4(operator),
+                Datum::Int4(4000),
+                Datum::Int4(sort_family),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -24814,6 +24967,36 @@ fn pg_amproc<'a>(
         count += 1;
     }
     for &(oid, family, left, right, number, procedure, name) in super::gist_catalog::PROCEDURES {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for &(oid, family, left, right, number, procedure, name) in super::gin_catalog::PROCEDURES {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for &(oid, family, left, right, number, procedure, name) in super::spgist_catalog::PROCEDURES {
         rows[count] = row(
             &[
                 Datum::Int4(2603),

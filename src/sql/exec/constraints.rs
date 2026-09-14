@@ -375,7 +375,9 @@ fn index_key_values_equal(
             crate::storage::IndexOperatorClass::Btree(_)
             | crate::storage::IndexOperatorClass::Hash(_)
             | crate::storage::IndexOperatorClass::Brin(_)
-            | crate::storage::IndexOperatorClass::Gist(_) => compare_datums_collated(
+            | crate::storage::IndexOperatorClass::Gist(_)
+            | crate::storage::IndexOperatorClass::Gin(_)
+            | crate::storage::IndexOperatorClass::SpGist(_) => compare_datums_collated(
                 equality.storage,
                 equality.collations[index],
                 value,

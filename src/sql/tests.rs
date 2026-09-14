@@ -46871,6 +46871,302 @@ fn hash_indexes_drive_exact_queries_joins_dml_and_cold_recovery() {
 }
 
 #[test]
+fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
+    let mut config = test_config("physical-brin-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.table_rows = 8192;
+    config.value_index_rows = 16384;
+    config.object_store_bucket = format!("physical-brin-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE brin_events (
+             sequence integer, category text, active boolean, payload text
+         );
+         CREATE INDEX brin_events_sequence ON brin_events USING brin (sequence)
+             WITH (pages_per_range=32, autosummarize=yes);
+         CREATE INDEX brin_events_active_category ON brin_events USING brin
+             (lower(category) text_bloom_ops, sequence int4_minmax_multi_ops)
+             WHERE active;
+         CREATE TABLE brin_needles (sequence integer);
+         INSERT INTO brin_needles VALUES (2000), (3999)",
+    );
+    for start in (1..=4000).step_by(500) {
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO brin_events
+                 SELECT value,
+                        CASE WHEN value % 10 = 0 THEN 'Priority' ELSE 'ordinary' END,
+                        value % 2 = 0,
+                        repeat('x', 256) || value::text
+                 FROM generate_series({start}, {}) AS source(value)",
+                start + 499
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&inserted).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let analyzed = run_with(&mut engine, &mut budget, "ANALYZE brin_events");
+    assert!(!String::from_utf8_lossy(&analyzed).contains("ERROR"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+
+    let catalog = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT indexdef FROM pg_indexes
+           WHERE indexname LIKE 'brin_events_%' ORDER BY indexname;
+         SELECT access_method.amname, index_catalog.indclass::text,
+                index_relation.reloptions::text
+           FROM pg_index index_catalog
+           JOIN pg_class index_relation ON index_relation.oid = index_catalog.indexrelid
+           JOIN pg_am access_method ON access_method.oid = index_relation.relam
+          WHERE index_relation.relname LIKE 'brin_events_%'
+          ORDER BY index_relation.relname;
+         SELECT count(*) FROM pg_opclass WHERE opcmethod = 3580;
+         SELECT count(*) FROM pg_opfamily WHERE opfmethod = 3580;
+         SELECT count(*) FROM pg_amop WHERE amopmethod = 3580",
+    ));
+    assert!(catalog.iter().any(|row| {
+        row == "CREATE INDEX brin_events_sequence ON public.brin_events USING brin (sequence) WITH (pages_per_range='32', autosummarize=on)"
+    }), "{catalog:?}");
+    assert!(
+        catalog.iter().any(|row| {
+            row.contains("lower(category) text_bloom_ops, sequence int4_minmax_multi_ops")
+        }),
+        "{catalog:?}"
+    );
+    for expected in ["72", "57", "422"] {
+        assert!(catalog.iter().any(|row| row == expected), "{catalog:?}");
+    }
+    let procedure_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_amproc WHERE oid BETWEEN 10332 AND 10713",
+    );
+    assert!(
+        !String::from_utf8_lossy(&procedure_output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&procedure_output)
+    );
+    assert_eq!(data_rows(&procedure_output), ["382"]);
+    assert!(
+        catalog
+            .iter()
+            .any(|row| row.starts_with("brin|10108 10105|")),
+        "{catalog:?}"
+    );
+    assert!(
+        catalog
+            .iter()
+            .any(|row| { row == "brin|10104|{pages_per_range=32,autosummarize=on}" }),
+        "{catalog:?}"
+    );
+
+    let indexed = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT sequence FROM brin_events
+             WHERE sequence BETWEEN 1990 AND 2010;
+         SELECT count(*), min(sequence), max(sequence) FROM brin_events
+             WHERE sequence BETWEEN 1990 AND 2010;
+         EXPLAIN SELECT payload FROM brin_events
+             WHERE active AND lower(category) = 'priority' AND sequence = 2000;
+         SELECT right(payload, 4) FROM brin_events
+             WHERE active AND lower(category) = 'priority' AND sequence = 2000;
+         PREPARE brin_lookup(integer) AS
+             SELECT sequence FROM brin_events WHERE sequence = $1;
+         EXECUTE brin_lookup(2000);
+         EXPLAIN SELECT event.sequence
+           FROM brin_needles AS needle
+           JOIN brin_events AS event ON event.sequence = needle.sequence
+          WHERE needle.sequence = 2000;
+         SELECT event.sequence
+           FROM brin_needles AS needle
+           JOIN brin_events AS event ON event.sequence = needle.sequence
+          WHERE needle.sequence = 2000;
+         EXPLAIN UPDATE brin_events SET category = 'changed' WHERE sequence = 2000;
+         UPDATE brin_events SET category = 'changed' WHERE sequence = 2000 RETURNING sequence;
+         EXPLAIN DELETE FROM brin_events WHERE sequence = 2001;
+         DELETE FROM brin_events WHERE sequence = 2001 RETURNING sequence",
+    ));
+    assert!(
+        indexed
+            .iter()
+            .any(|row| row.contains("Bitmap Heap Scan on brin_events")),
+        "{indexed:?}"
+    );
+    assert!(
+        indexed
+            .iter()
+            .any(|row| { row.contains("Bitmap Index Scan using brin_events_active_category") }),
+        "{indexed:?}"
+    );
+    assert!(
+        indexed
+            .iter()
+            .any(|row| { row.contains("Bitmap Index Scan using brin_events_sequence") }),
+        "{indexed:?}"
+    );
+    assert!(
+        indexed.iter().any(|row| row == "21|1990|2010"),
+        "{indexed:?}"
+    );
+    assert!(indexed.iter().any(|row| row == "2000"), "{indexed:?}");
+    assert!(indexed.iter().any(|row| row == "2001"), "{indexed:?}");
+
+    for (statement, message) in [
+        (
+            "CREATE UNIQUE INDEX bad_brin_unique ON brin_events USING brin (sequence)",
+            "does not support unique indexes",
+        ),
+        (
+            "CREATE INDEX bad_brin_order ON brin_events USING brin (sequence DESC)",
+            "does not support ASC/DESC options",
+        ),
+        (
+            "CREATE INDEX bad_brin_null_order ON brin_events USING brin (sequence NULLS FIRST)",
+            "does not support NULLS FIRST/LAST options",
+        ),
+        (
+            "CREATE INDEX bad_brin_include ON brin_events USING brin (sequence) INCLUDE (payload)",
+            "does not support included columns",
+        ),
+        (
+            "CREATE INDEX bad_brin_option ON brin_events USING brin (sequence) WITH (fillfactor=80)",
+            "unrecognized parameter \"fillfactor\"",
+        ),
+        (
+            "CREATE INDEX bad_brin_class ON brin_events USING brin (category int4_minmax_ops)",
+            "does not accept data type text",
+        ),
+    ] {
+        let unsupported =
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, statement)).to_string();
+        assert!(unsupported.contains(message), "{message}: {unsupported}");
+    }
+
+    let alter = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX brin_events_sequence SET (pages_per_range=64, autosummarize=0);
+         ALTER INDEX brin_events_sequence RESET (autosummarize)",
+    );
+    assert!(!String::from_utf8_lossy(&alter).contains("ERROR"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = data_rows(&run_with(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'brin_events_sequence';
+         EXPLAIN SELECT sequence FROM brin_events WHERE sequence = 3999;
+         SELECT count(*), min(sequence), max(sequence) FROM brin_events WHERE sequence = 3999;
+         SELECT count(*) FROM brin_events WHERE sequence IN (2000, 2001)",
+    ));
+    assert!(
+        cold.iter()
+            .any(|row| { row.ends_with("WITH (pages_per_range='64')") }),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| { row.contains("Bitmap Index Scan using brin_events_sequence") }),
+        "{cold:?}"
+    );
+    assert!(cold.iter().any(|row| row == "1|3999|3999"), "{cold:?}");
+    assert!(cold.iter().any(|row| row == "1"), "{cold:?}");
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn brin_without_a_range_reader_retains_the_authoritative_scan() {
+    let mut config = test_config("brin-authoritative-fallback");
+    config.temporary_spill_bytes = 4 << 20;
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE brin_fallback(
+             id integer, category text, active boolean, payload text
+         );
+         CREATE INDEX brin_fallback_id ON brin_fallback USING brin(id);
+         CREATE INDEX brin_fallback_category ON brin_fallback USING brin
+             (lower(category) text_bloom_ops, id int4_minmax_multi_ops)
+             WHERE active;
+         INSERT INTO brin_fallback VALUES
+             (1, 'Alpha', true, 'one'),
+             (2, 'Beta', false, 'two'),
+             (3, 'Gamma', true, 'three')",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let before = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT payload FROM brin_fallback WHERE id BETWEEN 2 AND 3 ORDER BY id",
+    ));
+    assert_eq!(before, ["two", "three"]);
+    let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+    assert!(!String::from_utf8_lossy(&checkpoint).contains("ERROR"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT payload FROM brin_fallback WHERE id = 3;
+         PREPARE brin_fallback_lookup(integer) AS
+             SELECT payload FROM brin_fallback WHERE id = $1;
+         EXECUTE brin_fallback_lookup(3);
+         UPDATE brin_fallback SET payload = 'two-updated' WHERE id = 2
+             RETURNING payload;
+         DELETE FROM brin_fallback WHERE id = 1 RETURNING id;
+         SELECT count(*), min(id), max(id) FROM brin_fallback",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    let rows = data_rows(&output);
+    for expected in ["three", "two-updated", "1", "2|2|3"] {
+        assert!(rows.iter().any(|row| row == expected), "{rows:?}");
+    }
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Seq Scan on brin_fallback")),
+        "{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Bitmap Index Scan")),
+        "{rows:?}"
+    );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     let mut config = test_config("composite-index-access");
     config.object_store_on = true;

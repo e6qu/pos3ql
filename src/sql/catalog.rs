@@ -10996,7 +10996,7 @@ pub(crate) fn value_index_identity(
     table_slot: usize,
     columns: &[u16],
     require_order: bool,
-) -> Option<(i32, StackStr<64>)> {
+) -> Option<(i32, StackStr<64>, crate::sql::ast::IndexAccessMethod)> {
     let definition = storage.table_def(table_slot, txid);
     let mut found = None;
     visit_indexes(storage, txid, |index| {
@@ -11019,7 +11019,7 @@ pub(crate) fn value_index_identity(
                 .iter()
                 .any(|class| matches!(class, Some(crate::storage::IndexOperatorClass::Catalog(_))))
         {
-            found = Some((index.oid, index.name));
+            found = Some((index.oid, index.name, index.method));
         }
     });
     found
@@ -11802,7 +11802,10 @@ pub(crate) fn operator_class_oid_visibility(
             | PG_LSN_HASH_OPERATOR_CLASS_OID
             | ACLITEM_HASH_OPERATOR_CLASS_OID
     );
-    if builtin || super::types::HashOperatorClass::from_oid(oid).is_some() {
+    if builtin
+        || super::types::HashOperatorClass::from_oid(oid).is_some()
+        || super::types::BrinOperatorClass::from_oid(oid).is_some()
+    {
         return Some(true);
     }
     let slot =
@@ -11841,7 +11844,21 @@ pub(crate) fn operator_family_oid_visibility(
             | PG_LSN_HASH_OPERATOR_FAMILY_OID
             | ACLITEM_HASH_OPERATOR_FAMILY_OID
     );
+    let brin = matches!(
+        oid,
+        4054..=4056
+            | 4058..=4059
+            | 4062
+            | 4064..=4065
+            | 4068..=4070
+            | 4074..=4082
+            | 4102..=4104
+            | 4109
+            | 4572..=4590
+            | 4602..=4615
+    );
     if builtin
+        || brin
         || matches!(
             oid,
             427 | 431
@@ -15380,6 +15397,12 @@ fn write_index_key_metadata(
         let _ = out.write_char(' ');
         write_identifier(out, class.name());
     }
+    if let Some(crate::storage::IndexOperatorClass::Brin(class)) = info.operator_classes[position]
+        && !class.is_default()
+    {
+        let _ = out.write_char(' ');
+        write_identifier(out, class.name());
+    }
 }
 
 fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &IdxInfo) {
@@ -15402,7 +15425,11 @@ fn write_index_storage_options(
     let Some(definition) = definition else {
         return;
     };
-    if definition.options.fillfactor.is_none() && definition.options.deduplicate_items.is_none() {
+    if definition.options.fillfactor.is_none()
+        && definition.options.deduplicate_items.is_none()
+        && definition.options.pages_per_range.is_none()
+        && definition.options.autosummarize.is_none()
+    {
         return;
     }
     let _ = out.write_str(" WITH (");
@@ -15416,6 +15443,18 @@ fn write_index_storage_options(
             out,
             "{separator}deduplicate_items={}",
             if deduplicate { "on" } else { "off" }
+        );
+        separator = ", ";
+    }
+    if let Some(pages_per_range) = definition.options.pages_per_range {
+        let _ = write!(out, "{separator}pages_per_range='{pages_per_range}'");
+        separator = ", ";
+    }
+    if let Some(autosummarize) = definition.options.autosummarize {
+        let _ = write!(
+            out,
+            "{separator}autosummarize={}",
+            if autosummarize { "on" } else { "off" }
         );
     }
     let _ = out.write_str(")");
@@ -18801,6 +18840,8 @@ fn pg_class<'a>(
                     783
                 } else if info.method == crate::sql::ast::IndexAccessMethod::Hash {
                     405
+                } else if info.method == crate::sql::ast::IndexAccessMethod::Brin {
+                    3580
                 } else {
                     403
                 }),
@@ -19287,7 +19328,7 @@ fn index_reloptions<'a>(
     let Some(definition) = definition else {
         return Ok(Datum::Null);
     };
-    let mut values = [Datum::Null; 2];
+    let mut values = [Datum::Null; 4];
     let mut count = 0;
     if let Some(fillfactor) = definition.options.fillfactor {
         values[count] = text(stack_format!(32, "fillfactor={fillfactor}").as_str(), arena)?;
@@ -19299,6 +19340,24 @@ fn index_reloptions<'a>(
                 "deduplicate_items=on"
             } else {
                 "deduplicate_items=off"
+            },
+            arena,
+        )?;
+        count += 1;
+    }
+    if let Some(pages_per_range) = definition.options.pages_per_range {
+        values[count] = text(
+            stack_format!(40, "pages_per_range={pages_per_range}").as_str(),
+            arena,
+        )?;
+        count += 1;
+    }
+    if let Some(autosummarize) = definition.options.autosummarize {
+        values[count] = text(
+            if autosummarize {
+                "autosummarize=on"
+            } else {
+                "autosummarize=off"
             },
             arena,
         )?;
@@ -22583,6 +22642,78 @@ fn pg_opfamily<'a>(
         )?;
         count += 1;
     }
+    for (oid, name) in [
+        (4054, "integer_minmax_ops"),
+        (4055, "numeric_minmax_ops"),
+        (4056, "text_minmax_ops"),
+        (4058, "timetz_minmax_ops"),
+        (4059, "datetime_minmax_ops"),
+        (4062, "char_minmax_ops"),
+        (4064, "bytea_minmax_ops"),
+        (4065, "name_minmax_ops"),
+        (4068, "oid_minmax_ops"),
+        (4069, "tid_minmax_ops"),
+        (4070, "float_minmax_ops"),
+        (4074, "macaddr_minmax_ops"),
+        (4075, "network_minmax_ops"),
+        (4076, "bpchar_minmax_ops"),
+        (4077, "time_minmax_ops"),
+        (4078, "interval_minmax_ops"),
+        (4079, "bit_minmax_ops"),
+        (4080, "varbit_minmax_ops"),
+        (4081, "uuid_minmax_ops"),
+        (4082, "pg_lsn_minmax_ops"),
+        (4102, "network_inclusion_ops"),
+        (4103, "range_inclusion_ops"),
+        (4104, "box_inclusion_ops"),
+        (4109, "macaddr8_minmax_ops"),
+        (4572, "integer_bloom_ops"),
+        (4573, "text_bloom_ops"),
+        (4574, "numeric_bloom_ops"),
+        (4575, "timetz_bloom_ops"),
+        (4576, "datetime_bloom_ops"),
+        (4577, "char_bloom_ops"),
+        (4578, "bytea_bloom_ops"),
+        (4579, "name_bloom_ops"),
+        (4580, "oid_bloom_ops"),
+        (4581, "tid_bloom_ops"),
+        (4582, "float_bloom_ops"),
+        (4583, "macaddr_bloom_ops"),
+        (4584, "macaddr8_bloom_ops"),
+        (4585, "network_bloom_ops"),
+        (4586, "bpchar_bloom_ops"),
+        (4587, "time_bloom_ops"),
+        (4588, "interval_bloom_ops"),
+        (4589, "uuid_bloom_ops"),
+        (4590, "pg_lsn_bloom_ops"),
+        (4602, "integer_minmax_multi_ops"),
+        (4603, "numeric_minmax_multi_ops"),
+        (4604, "timetz_minmax_multi_ops"),
+        (4605, "datetime_minmax_multi_ops"),
+        (4606, "oid_minmax_multi_ops"),
+        (4607, "tid_minmax_multi_ops"),
+        (4608, "float_minmax_multi_ops"),
+        (4609, "macaddr_minmax_multi_ops"),
+        (4610, "macaddr8_minmax_multi_ops"),
+        (4611, "network_minmax_multi_ops"),
+        (4612, "time_minmax_multi_ops"),
+        (4613, "interval_minmax_multi_ops"),
+        (4614, "uuid_minmax_multi_ops"),
+        (4615, "pg_lsn_minmax_multi_ops"),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(3580),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -23017,6 +23148,26 @@ fn pg_opclass<'a>(
         )?;
         count += 1;
     }
+    for code in 1..=super::types::BrinOperatorClass::COUNT {
+        let class = super::types::BrinOperatorClass::from_code(code)
+            .expect("bounded BRIN operator-class code");
+        rows[count] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(class.oid()),
+                Datum::Int4(3580),
+                text(class.name(), arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(class.family_oid()),
+                Datum::Int4(class.input_oid()),
+                Datum::Bool(class.is_default()),
+                Datum::Int4(class.input_oid()),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -23071,7 +23222,7 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("amopsortfamily", ColType::Oid),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let mut rows: [&[Datum]; 1024] = [&[]; 1024];
     const XID8_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
         (10050, 1, 5073),
         (10051, 2, 5075),
@@ -23702,6 +23853,24 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         count += 1;
     }
+    for (oid, family, left, right, strategy, operator) in super::brin_catalog::OPERATORS {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(strategy),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(3580),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -23753,7 +23922,7 @@ fn pg_amproc<'a>(
             ("amproc", ColType::Regproc),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let mut rows: [&[Datum]; 1024] = [&[]; 1024];
     rows[0] = row(
         &[
             Datum::Int4(2603),
@@ -24286,6 +24455,21 @@ fn pg_amproc<'a>(
                 Datum::Int4(family),
                 Datum::Int4(input),
                 Datum::Int4(input),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, family, left, right, number, procedure, name) in super::brin_catalog::PROCEDURES {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
                 Datum::Int2(number),
                 builtin_regproc(Some((procedure, name))),
             ],

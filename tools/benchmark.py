@@ -199,6 +199,8 @@ def workload_sql(workload, worker, operation, rows):
     key = (worker + operation * 17) % rows + 1
     if workload == "point-read" or (workload == "mixed" and operation % 5):
         return f"SELECT payload FROM benchmark_kv WHERE hash_key = {key}"
+    if workload == "brin-point":
+        return f"SELECT payload FROM benchmark_kv WHERE brin_key = {key}"
     if workload in ("update", "mixed"):
         return f"UPDATE benchmark_kv SET payload = payload + 1 WHERE hash_key = {key}"
     if workload == "scan":
@@ -222,8 +224,8 @@ def workload_sql(workload, worker, operation, rows):
     if workload == "insert":
         inserted_key = rows + worker * 1_000_000 + operation + 1
         return (
-            "INSERT INTO benchmark_kv(id, hash_key, payload) "
-            f"VALUES ({inserted_key}, {inserted_key}, 0)"
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, payload) "
+            f"VALUES ({inserted_key}, {inserted_key}, {inserted_key}, 0)"
         )
     raise ValueError(f"unknown workload {workload}")
 
@@ -240,11 +242,16 @@ def setup_database(connection, rows):
     # multi-block table scan instead of a degenerate one-block fixture.
     connection.query(
         "CREATE TABLE benchmark_kv("
-        "id integer PRIMARY KEY, hash_key integer NOT NULL, payload bigint NOT NULL, "
+        "id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL, "
+        "payload bigint NOT NULL, "
         "padding text NOT NULL DEFAULT repeat('x', 8192))"
     )
     connection.query(
         "CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key)"
+    )
+    connection.query(
+        "CREATE INDEX benchmark_brin_lookup ON benchmark_kv USING brin (brin_key) "
+        "WITH (pages_per_range=32, autosummarize=on)"
     )
     connection.query(
         "CREATE INDEX benchmark_covering "
@@ -255,8 +262,8 @@ def setup_database(connection, rows):
     for first in range(1, rows + 1, 1000):
         last = min(rows, first + 999)
         connection.query(
-            "INSERT INTO benchmark_kv(id, hash_key, payload) "
-            f"SELECT value, value, 0 FROM generate_series({first}, {last}) AS value"
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, payload) "
+            f"SELECT value, value, value, 0 FROM generate_series({first}, {last}) AS value"
         )
     connection.query("ANALYZE benchmark_kv")
     connection.query("CHECKPOINT")
@@ -509,6 +516,7 @@ def parse_args():
         "--workload",
         choices=(
             "point-read",
+            "brin-point",
             "tail-range",
             "ordered-limit",
             "join-probe",
@@ -551,11 +559,18 @@ def parse_args():
         parser.error("maintenance interval cannot be negative")
     if args.require_index and (
         args.workload
-        not in ("point-read", "tail-range", "ordered-limit", "join-probe", "update")
+        not in (
+            "point-read",
+            "brin-point",
+            "tail-range",
+            "ordered-limit",
+            "join-probe",
+            "update",
+        )
         or len(args.targets) > 1
     ):
         parser.error(
-            "--require-index requires a point-read, tail-range, ordered-limit, join-probe, or update workload against one target"
+            "--require-index requires a point-read, brin-point, tail-range, ordered-limit, join-probe, or update workload against one target"
         )
     return args
 

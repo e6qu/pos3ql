@@ -188,3 +188,24 @@ found and fixed JSONB equality against unknown literals, colliding generated
 names when `LIKE INCLUDING INDEXES` copied column and expression indexes, and
 an incorrect default hash-opclass claim for `refcursor`. No externally blocked
 defect remains from this review.
+
+The BRIN review found that the access method existed only as a static
+`pg_am` row and could not own an index definition or physical plan. BRIN now
+has a method-isolated typed operator-class boundary, exact PostgreSQL 18.6
+operator-class/family/strategy/support catalogs, validated relation options,
+bitmap query/join/DML plans, durable block-bound pruning, WAL/checkpoint state,
+and object-cold recovery. The review also found that user-defined B-tree
+default operator classes were eligible while resolving other access methods,
+that new index-definition fields could outrun the WAL size invariant, that
+two-sided range selectivity was costed as a one-sided bound, that bitmap paths
+inside DML and joins could be flattened into false ordinary index scans, and
+that BRIN could be mislabeled as an ordered or resident-hash scan. Oracle
+differential testing then found that a fresh, not-yet-checkpointed BRIN could
+select an unavailable durable range reader and falsely return no rows; all
+ordered-range plans now require a complete readable generation, and every
+candidate builder declines late incompleteness instead of converting it into
+an empty result. The same differential found incorrect zero `opckeytype`
+values for built-in BRIN classes. The shared index-option parser also accepted
+fewer PostgreSQL boolean spellings than the server. These bug classes are
+fixed at their typed choke points. No externally blocked defect remains from
+this review.

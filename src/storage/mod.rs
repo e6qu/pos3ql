@@ -8577,6 +8577,7 @@ pub(crate) const MAX_INDEX_COLS: usize = 8;
 pub(crate) enum IndexOperatorClass {
     Btree(crate::sql::types::BtreeOperatorClass),
     Hash(crate::sql::types::HashOperatorClass),
+    Brin(crate::sql::types::BrinOperatorClass),
     Catalog(OperatorClassOid),
 }
 
@@ -8585,6 +8586,7 @@ impl IndexOperatorClass {
         match self {
             Self::Btree(class) => class.oid(),
             Self::Hash(class) => class.oid(),
+            Self::Brin(class) => class.oid(),
             Self::Catalog(oid) => oid.get(),
         }
     }
@@ -8853,12 +8855,16 @@ impl TablespaceDef {
 pub struct IndexStorageOptions {
     pub fillfactor: Option<u8>,
     pub deduplicate_items: Option<bool>,
+    pub pages_per_range: Option<u32>,
+    pub autosummarize: Option<bool>,
 }
 
 impl IndexStorageOptions {
     pub const DEFAULT: Self = Self {
         fillfactor: None,
         deduplicate_items: None,
+        pages_per_range: None,
+        autosummarize: None,
     };
 }
 
@@ -25835,11 +25841,14 @@ impl Storage {
         table_index: usize,
         binding: usize,
     ) -> bool {
-        self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
-            enforcer
-                .durable
-                .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
-        })
+        self.spill
+            .as_ref()
+            .is_some_and(|spill| spill.blocks.is_some())
+            && self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
+                enforcer
+                    .durable
+                    .is_some_and(|handle| self.commit_snapshot >= handle.published_lsn)
+            })
     }
 
     pub(crate) fn value_binding_key_types(
@@ -36168,18 +36177,28 @@ impl Storage {
         self.require_schema_create(def.schema.as_str(), txid)?;
         match def.method {
             crate::sql::ast::IndexAccessMethod::Btree => {
-                if def.resolved_operator_classes[..def.n_cols]
-                    .iter()
-                    .any(|class| matches!(class, Some(IndexOperatorClass::Hash(_))))
+                if def.mutable.options.pages_per_range.is_some()
+                    || def.mutable.options.autosummarize.is_some()
+                    || def.resolved_operator_classes[..def.n_cols]
+                        .iter()
+                        .any(|class| {
+                            matches!(
+                                class,
+                                Some(IndexOperatorClass::Hash(_) | IndexOperatorClass::Brin(_))
+                            )
+                        })
                 {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
-                        "btree index has a hash operator class"
+                        "btree index has a non-btree operator class"
                     ));
                 }
             }
             crate::sql::ast::IndexAccessMethod::Hash => {
                 if def.unique
+                    || def.mutable.options.deduplicate_items.is_some()
+                    || def.mutable.options.pages_per_range.is_some()
+                    || def.mutable.options.autosummarize.is_some()
                     || def.n_cols != 1
                     || def.n_include_cols != 0
                     || def.descending[..def.n_cols].iter().any(|value| *value)
@@ -36191,6 +36210,28 @@ impl Storage {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
                         "hash index definition has unsupported key semantics"
+                    ));
+                }
+            }
+            crate::sql::ast::IndexAccessMethod::Brin => {
+                if def.unique
+                    || def.mutable.options.fillfactor.is_some()
+                    || def.mutable.options.deduplicate_items.is_some()
+                    || def
+                        .mutable
+                        .options
+                        .pages_per_range
+                        .is_some_and(|value| !(1..=131_072).contains(&value))
+                    || def.n_include_cols != 0
+                    || def.descending[..def.n_cols].iter().any(|value| *value)
+                    || def.nulls_first[..def.n_cols].iter().any(|value| *value)
+                    || def.resolved_operator_classes[..def.n_cols]
+                        .iter()
+                        .any(|class| !matches!(class, Some(IndexOperatorClass::Brin(_))))
+                {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "brin index definition has unsupported key semantics"
                     ));
                 }
             }
@@ -36290,8 +36331,36 @@ impl Storage {
         definition: IndexMutableDefinition,
         txid: u32,
     ) -> Result<Option<PendingIndexDefinition>, SqlError> {
+        let options_valid = match self.indexes[slot].method {
+            crate::sql::ast::IndexAccessMethod::Btree => {
+                definition.options.pages_per_range.is_none()
+                    && definition.options.autosummarize.is_none()
+            }
+            crate::sql::ast::IndexAccessMethod::Hash => {
+                definition.options.deduplicate_items.is_none()
+                    && definition.options.pages_per_range.is_none()
+                    && definition.options.autosummarize.is_none()
+            }
+            crate::sql::ast::IndexAccessMethod::Brin => {
+                definition.options.fillfactor.is_none()
+                    && definition.options.deduplicate_items.is_none()
+                    && definition
+                        .options
+                        .pages_per_range
+                        .is_none_or(|value| (1..=131_072).contains(&value))
+            }
+        };
+        if !options_valid {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "index definition has storage parameters for another access method"
+            ));
+        }
         if definition.clustered
-            && self.indexes[slot].method == crate::sql::ast::IndexAccessMethod::Hash
+            && matches!(
+                self.indexes[slot].method,
+                crate::sql::ast::IndexAccessMethod::Hash | crate::sql::ast::IndexAccessMethod::Brin
+            )
         {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
@@ -41221,7 +41290,9 @@ impl Storage {
             }
             return Ok(class);
         }
-        if let Some(slot) = self.default_operator_class_for_type(input, txid)? {
+        if method == crate::sql::ast::IndexAccessMethod::Btree
+            && let Some(slot) = self.default_operator_class_for_type(input, txid)?
+        {
             let oid = OperatorClassOid::parse(self.operator_class(slot).oid())
                 .expect("user operator-class OID is typed");
             return Ok(IndexOperatorClass::Catalog(oid));
@@ -41234,6 +41305,10 @@ impl Storage {
             crate::sql::ast::IndexAccessMethod::Hash => {
                 crate::sql::types::HashOperatorClass::for_type(input.ctype)
                     .map(IndexOperatorClass::Hash)
+            }
+            crate::sql::ast::IndexAccessMethod::Brin => {
+                crate::sql::types::BrinOperatorClass::for_type(input.ctype)
+                    .map(IndexOperatorClass::Brin)
             }
         };
         class.ok_or_else(|| {

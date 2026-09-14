@@ -33,8 +33,15 @@ logical-replication boundary is specified separately in
 - PostgreSQL heap layout, page identifiers, `ctid` semantics, HOT, vacuum's
   physical implementation, physical XLOG, physical streaming replication,
   hot standby, and binary-WAL tooling are not targets.
-- GiST, GIN, SP-GiST, and BRIN index execution are not implemented. Modeled
-  hash indexes physically execute their PostgreSQL equality-only single-key
+- GiST, GIN, and SP-GiST index execution are not implemented. Modeled BRIN
+  indexes physically execute lossy bitmap equality and range scans over
+  durable object-block summaries for plain, multicolumn, expression, partial,
+  prepared, join, and DML paths. PostgreSQL 18's built-in BRIN operator
+  classes, families, strategy operators, support procedures, and relation
+  options retain exact catalog and recovery identities. BRIN containment and
+  overlap strategies, operator-class parameters, and explicit summary
+  maintenance functions reject rather than implying physical support. Modeled hash indexes
+  physically execute their PostgreSQL equality-only single-key
   boundary for plain, expression, partial, prepared, query, join, and DML
   probes. Their method and built-in operator-class identities persist through
   catalogs, WAL, checkpoints, copied and partitioned indexes, reindexing, and

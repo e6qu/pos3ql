@@ -825,6 +825,7 @@ impl IndexConstraintSet<'_> {
 #[derive(Clone, Copy)]
 pub(crate) struct IndexAccessPlan<'a> {
     binding: usize,
+    method: crate::sql::ast::IndexAccessMethod,
     index_oid: i32,
     index_name: StackStr<64>,
     include_mask: u64,
@@ -873,6 +874,10 @@ impl<'a> OrderedIndexAccessPlan<'a> {
 }
 
 impl IndexAccessPlan<'_> {
+    pub(crate) const fn method(&self) -> crate::sql::ast::IndexAccessMethod {
+        self.method
+    }
+
     pub(crate) const fn is_exact(&self) -> bool {
         self.exact
     }
@@ -911,6 +916,12 @@ impl IndexAccessPlan<'_> {
                     (statistics.rows as f64 / distinct.max(1.0)).ceil().max(1.0) as u64;
                 expected_rows = expected_rows.min(if constraint.operator == BinaryOp::Eq {
                     equality_rows
+                } else if self.additional_constraints[position].is_some() {
+                    // PostgreSQL's default inequality selectivity is one
+                    // third. Independent lower and upper bounds narrow the
+                    // same key to roughly one ninth when no histogram is
+                    // available.
+                    statistics.rows.div_ceil(9).max(1)
                 } else {
                     statistics.rows.div_ceil(3).max(1)
                 });
@@ -1337,7 +1348,7 @@ fn index_access_plan_for_binding<'a>(
     {
         return None;
     }
-    let (index_oid, index_name) = crate::sql::catalog::value_index_identity(
+    let (index_oid, index_name, method) = crate::sql::catalog::value_index_identity(
         storage,
         txid,
         slot,
@@ -1348,6 +1359,7 @@ fn index_access_plan_for_binding<'a>(
     let (collations, _) = storage.value_binding_collations(slot, binding);
     Some(IndexAccessPlan {
         binding,
+        method,
         index_oid,
         index_name,
         include_mask: storage.value_binding_include_mask(slot, binding),
@@ -1452,14 +1464,35 @@ where
             break;
         }
         exact &= n_constraints == index.n_cols;
-        if index.method == crate::sql::ast::IndexAccessMethod::Hash
-            && (!exact || required_order.is_some())
-        {
-            continue;
+        match index.method {
+            crate::sql::ast::IndexAccessMethod::Hash if !exact || required_order.is_some() => {
+                continue;
+            }
+            crate::sql::ast::IndexAccessMethod::Brin if required_order.is_some() => continue,
+            crate::sql::ast::IndexAccessMethod::Brin
+                if !exact
+                    && index.resolved_operator_classes[..index.n_cols]
+                        .iter()
+                        .any(|class| {
+                            matches!(
+                                class,
+                                Some(crate::storage::IndexOperatorClass::Brin(class))
+                                    if class.kind()
+                                        == crate::sql::types::BrinOperatorClassKind::Bloom
+                            )
+                        }) =>
+            {
+                continue;
+            }
+            _ => {}
         }
+        let needs_ordered_range =
+            !exact || index.method == crate::sql::ast::IndexAccessMethod::Brin;
         if (!allow_unconstrained && n_constraints == 0)
-            || (exact && !storage.value_binding_probe_complete(slot, binding))
-            || (!exact && !storage.value_binding_durable_complete(slot, binding))
+            || (!needs_ordered_range
+                && exact
+                && !storage.value_binding_probe_complete(slot, binding))
+            || (needs_ordered_range && !storage.value_binding_durable_complete(slot, binding))
         {
             continue;
         }
@@ -1467,6 +1500,7 @@ where
         let (collations, _) = storage.value_binding_collations(slot, binding);
         let plan = IndexAccessPlan {
             binding,
+            method: index.method,
             index_oid: crate::sql::catalog::explicit_index_oid(&index),
             index_name: StackStr::<64>::from_str(index.name_for(txid).as_str()),
             include_mask: storage.value_binding_include_mask(slot, binding),
@@ -1794,7 +1828,13 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     let slot = scope.slots[table];
     let definition = scope.defs[table].expect("resolved");
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
-    if !(plan.exact && storage.value_binding_cache_complete(slot, plan.binding))
+    let resident_exact = plan.method != crate::sql::ast::IndexAccessMethod::Brin
+        && plan.exact
+        && storage.value_binding_cache_complete(slot, plan.binding);
+    let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
+        && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
+    if !resident_exact
+        && !selective_brin
         && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
     {
         return Ok(None);
@@ -2162,8 +2202,14 @@ fn indexed_candidates_for_plan<'a>(
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let index_oid = ordered_plan.map_or(plan.index_oid, |ordered| ordered.index_oid);
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
+    let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
+        && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
+    let resident_exact = plan.method != crate::sql::ast::IndexAccessMethod::Brin
+        && plan.exact
+        && storage.value_binding_cache_complete(slot, plan.binding);
     if ordered_plan.is_none()
-        && !(plan.exact && storage.value_binding_cache_complete(slot, plan.binding))
+        && !resident_exact
+        && !selective_brin
         && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
     {
         return Ok(None);
@@ -2273,7 +2319,7 @@ fn indexed_candidates_for_plan<'a>(
         Ok(Match)
     };
     let compact_columns = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
-    let hash = plan.exact.then(|| {
+    let hash = (plan.exact && plan.method != crate::sql::ast::IndexAccessMethod::Brin).then(|| {
         hash_key_collated(
             &values[0][..plan.n_columns],
             &compact_columns[..plan.n_columns],
@@ -2290,7 +2336,9 @@ fn indexed_candidates_for_plan<'a>(
             count += 1;
             Ok(())
         })?;
-        debug_assert!(complete, "completeness checked before probe");
+        if !complete {
+            return Ok(None);
+        }
     } else {
         let complete = storage.range_value_index_binding(
             slot,
@@ -2307,7 +2355,9 @@ fn indexed_candidates_for_plan<'a>(
                 Ok(())
             },
         )?;
-        debug_assert!(complete, "durable completeness checked before scan");
+        if !complete {
+            return Ok(None);
+        }
     }
     let Ok(rowids) = arena.alloc_slice_with(count, |_| 0u64) else {
         // Candidate materialization is an optimization. A broad range or a
@@ -2344,13 +2394,16 @@ fn indexed_candidates_for_plan<'a>(
     let mut fill = 0usize;
     let mut entry_at = 0usize;
     if let Some(hash) = probe_hash {
-        storage.probe_value_binding(slot, plan.binding, hash, |rowid, _| {
+        let complete = storage.probe_value_binding(slot, plan.binding, hash, |rowid, _| {
             rowids[fill] = rowid;
             fill += 1;
             Ok(())
         })?;
+        if !complete {
+            return Ok(None);
+        }
     } else {
-        storage.range_value_index_binding(
+        let complete = storage.range_value_index_binding(
             slot,
             plan.binding,
             key_position,
@@ -2376,6 +2429,9 @@ fn indexed_candidates_for_plan<'a>(
                 Ok(())
             },
         )?;
+        if !complete {
+            return Ok(None);
+        }
     }
     debug_assert_eq!(fill, count);
     debug_assert!(!retain_keys || entry_at == entry_bytes);

@@ -5316,6 +5316,8 @@ impl<'a> Parser<'a> {
                 IndexAccessMethod::Btree
             } else if method.eq_ignore_ascii_case("hash") {
                 IndexAccessMethod::Hash
+            } else if method.eq_ignore_ascii_case("brin") {
+                IndexAccessMethod::Brin
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -5517,13 +5519,45 @@ impl<'a> Parser<'a> {
                         self.err_here("parameter \"deduplicate_items\" specified more than once")
                     );
                 }
-                let value = match self.peeked {
-                    Tok::Ident("true" | "on") | Tok::Str("true" | "on" | "1") => true,
-                    Tok::Ident("false" | "off") | Tok::Str("false" | "off" | "0") => false,
-                    _ => return Err(self.err_here("parameter requires a boolean value")),
+                options.deduplicate_items = Some(self.index_storage_boolean()?);
+            } else if option.eq_ignore_ascii_case("pages_per_range") {
+                if options.pages_per_range.is_some() {
+                    return Err(
+                        self.err_here("parameter \"pages_per_range\" specified more than once")
+                    );
+                }
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.unexpected("pages_per_range must be an integer"));
                 };
+                let value = raw.parse::<u32>().map_err(|_| ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        96,
+                        "value {} out of bounds for option \"pages_per_range\"",
+                        raw
+                    ),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                })?;
                 self.advance()?;
-                options.deduplicate_items = Some(value);
+                if !(1..=131_072).contains(&value) {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "value {} out of bounds for option \"pages_per_range\"",
+                            value
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                }
+                options.pages_per_range = Some(value);
+            } else if option.eq_ignore_ascii_case("autosummarize") {
+                if options.autosummarize.is_some() {
+                    return Err(
+                        self.err_here("parameter \"autosummarize\" specified more than once")
+                    );
+                }
+                options.autosummarize = Some(self.index_storage_boolean()?);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -5538,6 +5572,30 @@ impl<'a> Parser<'a> {
         Ok(options)
     }
 
+    fn index_storage_boolean(&mut self) -> Result<bool, ParseError> {
+        let raw = match self.peeked {
+            Tok::Ident(raw) | Tok::Str(raw) | Tok::Num(raw) => raw,
+            _ => return Err(self.err_here("parameter requires a boolean value")),
+        };
+        let value = if ["1", "t", "tr", "tru", "true", "y", "ye", "yes", "on"]
+            .iter()
+            .any(|candidate| raw.eq_ignore_ascii_case(candidate))
+        {
+            true
+        } else if [
+            "0", "f", "fa", "fal", "fals", "false", "n", "no", "of", "off",
+        ]
+        .iter()
+        .any(|candidate| raw.eq_ignore_ascii_case(candidate))
+        {
+            false
+        } else {
+            return Err(self.err_here("parameter requires a boolean value"));
+        };
+        self.advance()?;
+        Ok(value)
+    }
+
     fn index_storage_option_names(&mut self) -> Result<IndexStorageOptionNames, ParseError> {
         let mut names = IndexStorageOptionNames::EMPTY;
         loop {
@@ -5546,6 +5604,10 @@ impl<'a> Parser<'a> {
                 &mut names.fillfactor
             } else if option.eq_ignore_ascii_case("deduplicate_items") {
                 &mut names.deduplicate_items
+            } else if option.eq_ignore_ascii_case("pages_per_range") {
+                &mut names.pages_per_range
+            } else if option.eq_ignore_ascii_case("autosummarize") {
+                &mut names.autosummarize
             } else {
                 return Err(ParseError {
                     at: self.peek_at,

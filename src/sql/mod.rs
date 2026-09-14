@@ -4,6 +4,7 @@
 pub mod acl;
 pub mod array;
 pub mod ast;
+mod brin_catalog;
 pub mod catalog;
 mod catalog_metadata;
 pub mod copy;

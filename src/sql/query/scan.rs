@@ -428,7 +428,90 @@ fn refresh_catalog_object_names<'a>(
 #[cfg(test)]
 mod tests {
     use super::{PaxColumnDemand, PaxReadDemand, SampleIdentity, TableSamplePlan};
-    use crate::sql::ast::TableSampleMethod;
+    use crate::sql::ast::{BinaryOp, TableSampleMethod};
+    use crate::sql::types::GistOperatorClass;
+
+    #[test]
+    fn gist_operator_matrix_matches_postgresql_18_search_strategies() {
+        use BinaryOp::*;
+        use GistOperatorClass::*;
+
+        for operator in [
+            Eq,
+            NotEq,
+            Lt,
+            LtEq,
+            Gt,
+            GtEq,
+            Overlaps,
+            Shl,
+            Shr,
+            NetContainedEq,
+            NetContainsEq,
+        ] {
+            assert!(super::gist_supports_operator(Inet, operator));
+        }
+        for operator in [
+            ContainedBy,
+            Shl,
+            Shr,
+            Same,
+            Below,
+            Above,
+            BelowPoint,
+            AbovePoint,
+        ] {
+            assert!(super::gist_supports_operator(Point, operator));
+        }
+        for class in [Box, Polygon, Circle] {
+            for operator in [
+                Shl,
+                Shr,
+                NotRightOf,
+                NotLeftOf,
+                Overlaps,
+                Same,
+                Contains,
+                ContainedBy,
+                Below,
+                Above,
+                NotAbove,
+                NotBelow,
+            ] {
+                assert!(super::gist_supports_operator(class, operator));
+            }
+        }
+        for class in [Range, Multirange] {
+            for operator in [
+                Shl,
+                Shr,
+                NotRightOf,
+                NotLeftOf,
+                Overlaps,
+                Adjacent,
+                Contains,
+                ContainedBy,
+                Eq,
+            ] {
+                assert!(super::gist_supports_operator(class, operator));
+            }
+        }
+        assert!(super::gist_supports_operator(TsVector, TextSearchMatch));
+        assert!(super::gist_supports_operator(TsQuery, Contains));
+        assert!(super::gist_supports_operator(TsQuery, ContainedBy));
+
+        for (class, operator) in [
+            (Range, Lt),
+            (Multirange, GtEq),
+            (Point, Overlaps),
+            (Box, Adjacent),
+            (Inet, Contains),
+            (TsVector, Eq),
+            (TsQuery, TextSearchMatch),
+        ] {
+            assert!(!super::gist_supports_operator(class, operator));
+        }
+    }
 
     #[test]
     fn selected_columns_require_a_proof() {
@@ -924,7 +1007,9 @@ impl IndexAccessPlan<'_> {
                     (statistics.rows as f64 / distinct.max(1.0)).ceil().max(1.0) as u64;
                 expected_rows = expected_rows.min(if constraint.operator == BinaryOp::Eq {
                     equality_rows
-                } else if is_brin_inclusion_operator(constraint.operator) {
+                } else if constraint.operator == BinaryOp::NotEq {
+                    statistics.rows.saturating_sub(equality_rows).max(1)
+                } else if is_inclusion_operator(constraint.operator) {
                     statistics.rows.div_ceil(16).max(1)
                 } else if self.additional_constraints[position].is_some() {
                     // PostgreSQL's default inequality selectivity is one
@@ -937,7 +1022,7 @@ impl IndexAccessPlan<'_> {
                 });
             } else if constraint.operator == BinaryOp::Eq {
                 expected_rows = 1;
-            } else if is_brin_inclusion_operator(constraint.operator) {
+            } else if is_inclusion_operator(constraint.operator) {
                 expected_rows = expected_rows.div_ceil(16).max(1);
             }
         }
@@ -959,11 +1044,17 @@ fn reverse_index_operator(operator: BinaryOp) -> BinaryOp {
         BinaryOp::Shr => BinaryOp::Shl,
         BinaryOp::NotRightOf => BinaryOp::NotLeftOf,
         BinaryOp::NotLeftOf => BinaryOp::NotRightOf,
+        BinaryOp::Below => BinaryOp::Above,
+        BinaryOp::Above => BinaryOp::Below,
+        BinaryOp::NotAbove => BinaryOp::NotBelow,
+        BinaryOp::NotBelow => BinaryOp::NotAbove,
+        BinaryOp::BelowPoint => BinaryOp::AbovePoint,
+        BinaryOp::AbovePoint => BinaryOp::BelowPoint,
         other => other,
     }
 }
 
-fn is_brin_inclusion_operator(operator: BinaryOp) -> bool {
+fn is_inclusion_operator(operator: BinaryOp) -> bool {
     matches!(
         operator,
         BinaryOp::Contains
@@ -976,7 +1067,83 @@ fn is_brin_inclusion_operator(operator: BinaryOp) -> bool {
             | BinaryOp::Adjacent
             | BinaryOp::NetContainedEq
             | BinaryOp::NetContainsEq
+            | BinaryOp::TextSearchMatch
+            | BinaryOp::Same
+            | BinaryOp::Below
+            | BinaryOp::Above
+            | BinaryOp::NotAbove
+            | BinaryOp::NotBelow
+            | BinaryOp::BelowPoint
+            | BinaryOp::AbovePoint
     )
+}
+
+fn is_nonmonotonic_index_operator(operator: BinaryOp) -> bool {
+    operator == BinaryOp::NotEq || is_inclusion_operator(operator)
+}
+
+fn gist_supports_operator(class: crate::sql::types::GistOperatorClass, operator: BinaryOp) -> bool {
+    use crate::sql::types::GistOperatorClass;
+    match class {
+        GistOperatorClass::TsVector => operator == BinaryOp::TextSearchMatch,
+        GistOperatorClass::TsQuery => {
+            matches!(operator, BinaryOp::Contains | BinaryOp::ContainedBy)
+        }
+        GistOperatorClass::Range | GistOperatorClass::Multirange => matches!(
+            operator,
+            BinaryOp::Contains
+                | BinaryOp::ContainedBy
+                | BinaryOp::Overlaps
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::NotRightOf
+                | BinaryOp::NotLeftOf
+                | BinaryOp::Adjacent
+                | BinaryOp::Eq
+        ),
+        GistOperatorClass::Inet => matches!(
+            operator,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+                | BinaryOp::Overlaps
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::NetContainedEq
+                | BinaryOp::NetContainsEq
+        ),
+        GistOperatorClass::Point => matches!(
+            operator,
+            BinaryOp::ContainedBy
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::Same
+                | BinaryOp::Below
+                | BinaryOp::Above
+                | BinaryOp::BelowPoint
+                | BinaryOp::AbovePoint
+        ),
+        GistOperatorClass::Box | GistOperatorClass::Polygon | GistOperatorClass::Circle => {
+            matches!(
+                operator,
+                BinaryOp::Shl
+                    | BinaryOp::Shr
+                    | BinaryOp::NotRightOf
+                    | BinaryOp::NotLeftOf
+                    | BinaryOp::Overlaps
+                    | BinaryOp::Same
+                    | BinaryOp::Contains
+                    | BinaryOp::ContainedBy
+                    | BinaryOp::Below
+                    | BinaryOp::Above
+                    | BinaryOp::NotAbove
+                    | BinaryOp::NotBelow
+            )
+        }
+    }
 }
 
 fn collect_index_constraints<'a, Resolve, Invariant>(
@@ -1008,8 +1175,13 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
     };
     if !matches!(
         operator,
-        BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
-    ) && !is_brin_inclusion_operator(*operator)
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    ) && !is_inclusion_operator(*operator)
     {
         return;
     }
@@ -1032,7 +1204,7 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
             BinaryOp::Lt | BinaryOp::LtEq => {
                 set.upper.get_or_insert(replacement);
             }
-            operator if is_brin_inclusion_operator(operator) => {
+            operator if is_nonmonotonic_index_operator(operator) => {
                 set.inclusion.get_or_insert(replacement);
             }
             _ => unreachable!("filtered index operator"),
@@ -1484,34 +1656,50 @@ where
         let mut additional_constraints = [None; MAX_INDEX_COLS];
         let mut n_constraints = 0usize;
         let brin = index.method == crate::sql::ast::IndexAccessMethod::Brin;
+        let gist = index.method == crate::sql::ast::IndexAccessMethod::Gist;
         let mut exact = true;
         for position in 0..index.n_cols {
             let set = by_key[position];
-            if let Some(equality) = set.equality {
+            let gist_supports = |constraint: IndexConstraint<'a>| {
+                !gist
+                    || matches!(
+                        index.resolved_operator_classes[position],
+                        Some(crate::storage::IndexOperatorClass::Gist(class))
+                            if gist_supports_operator(class, constraint.operator)
+                    )
+            };
+            if let Some(equality) = set.equality.filter(|constraint| gist_supports(*constraint)) {
                 constraints[position] = Some(equality);
                 n_constraints += 1;
                 continue;
             }
-            if let Some(range) = set.lower.or(set.upper) {
+            let lower = set.lower.filter(|constraint| gist_supports(*constraint));
+            let upper = set.upper.filter(|constraint| gist_supports(*constraint));
+            if let Some(range) = lower.or(upper) {
                 constraints[position] = Some(range);
-                additional_constraints[position] = match (set.lower, set.upper) {
+                additional_constraints[position] = match (lower, upper) {
                     (Some(_), Some(upper)) => Some(upper),
                     _ => None,
                 };
                 n_constraints += 1;
                 exact = false;
-                if !brin {
+                if !brin && !gist {
                     break;
                 }
                 continue;
             }
-            if brin
+            if (brin || gist)
                 && let Some(inclusion) = set.inclusion
-                && matches!(
+                && (matches!(
                     index.resolved_operator_classes[position],
                     Some(crate::storage::IndexOperatorClass::Brin(class))
                         if class.kind() == crate::sql::types::BrinOperatorClassKind::Inclusion
-                )
+                            && is_inclusion_operator(inclusion.operator)
+                ) || matches!(
+                    index.resolved_operator_classes[position],
+                    Some(crate::storage::IndexOperatorClass::Gist(class))
+                        if gist_supports_operator(class, inclusion.operator)
+                ))
             {
                 constraints[position] = Some(inclusion);
                 n_constraints += 1;
@@ -1519,7 +1707,7 @@ where
                 continue;
             }
             exact = false;
-            if !brin {
+            if !brin && !gist {
                 break;
             }
         }
@@ -1529,6 +1717,7 @@ where
                 continue;
             }
             crate::sql::ast::IndexAccessMethod::Brin if required_order.is_some() => continue,
+            crate::sql::ast::IndexAccessMethod::Gist if required_order.is_some() => continue,
             crate::sql::ast::IndexAccessMethod::Brin
                 if !exact
                     && index.resolved_operator_classes[..index.n_cols]
@@ -1546,8 +1735,11 @@ where
             }
             _ => {}
         }
-        let needs_ordered_range =
-            !exact || index.method == crate::sql::ast::IndexAccessMethod::Brin;
+        let needs_ordered_range = !exact
+            || matches!(
+                index.method,
+                crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gist
+            );
         if (!allow_unconstrained && n_constraints == 0)
             || (!needs_ordered_range
                 && exact
@@ -1578,7 +1770,7 @@ where
                     .index_slot(index.schema.as_str(), index.name_for(txid).as_str(), txid)
                     .is_none_or(|index_slot| storage.brin_maintenance_state(index_slot).count == 0)
             } else {
-                true
+                !gist
             },
         };
         if let Some((targets, order)) = required_order {
@@ -1898,13 +2090,18 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     let slot = scope.slots[table];
     let definition = scope.defs[table].expect("resolved");
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
-    let resident_exact = plan.method != crate::sql::ast::IndexAccessMethod::Brin
-        && plan.exact
+    let resident_exact = !matches!(
+        plan.method,
+        crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gist
+    ) && plan.exact
         && storage.value_binding_cache_complete(slot, plan.binding);
     let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
         && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
+    let selective_gist = plan.method == crate::sql::ast::IndexAccessMethod::Gist
+        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
     if !resident_exact
         && !selective_brin
+        && !selective_gist
         && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
     {
         return Ok(None);
@@ -2274,12 +2471,17 @@ fn indexed_candidates_for_plan<'a>(
     let expected_rows = plan.expected_rows(storage, slot, definition, txid);
     let selective_brin = plan.method == crate::sql::ast::IndexAccessMethod::Brin
         && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
-    let resident_exact = plan.method != crate::sql::ast::IndexAccessMethod::Brin
-        && plan.exact
+    let selective_gist = plan.method == crate::sql::ast::IndexAccessMethod::Gist
+        && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
+    let resident_exact = !matches!(
+        plan.method,
+        crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gist
+    ) && plan.exact
         && storage.value_binding_cache_complete(slot, plan.binding);
     if ordered_plan.is_none()
         && !resident_exact
         && !selective_brin
+        && !selective_gist
         && storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid)
     {
         return Ok(None);
@@ -2322,6 +2524,10 @@ fn indexed_candidates_for_plan<'a>(
                     encoded_keys: &[],
                 }));
             }
+            if is_inclusion_operator(constraint.operator) {
+                values[bound][position] = raw;
+                continue;
+            }
             let raw_type = ColType::from_oid(raw.type_oid());
             let integer = |column_type: ColType| {
                 matches!(column_type, ColType::Int2 | ColType::Int4 | ColType::Int8)
@@ -2349,7 +2555,7 @@ fn indexed_candidates_for_plan<'a>(
     types[..plan.n_columns].copy_from_slice(&plan.key_types[..plan.n_columns]);
     collations[..plan.n_columns].copy_from_slice(&plan.collations[..plan.n_columns]);
     let key_position = |key: &[u8]| -> Result<crate::store::ValueIndexPosition, SqlError> {
-        use crate::store::ValueIndexPosition::{After, Before, Match, Recheck};
+        use crate::store::ValueIndexPosition::{After, Before, Match, Recheck, Skip};
         let mut decoded = [Datum::Null; MAX_INDEX_COLS];
         rowenc::decode(
             key,
@@ -2361,9 +2567,11 @@ fn indexed_candidates_for_plan<'a>(
                 continue;
             }
             let special = plan.constraints[position]
-                .is_some_and(|constraint| is_brin_inclusion_operator(constraint.operator));
+                .is_some_and(|constraint| is_nonmonotonic_index_operator(constraint.operator));
             if decoded[position].is_null() {
-                return Ok(if special || !plan.prune_blocks {
+                return Ok(if plan.method == crate::sql::ast::IndexAccessMethod::Gist {
+                    Skip
+                } else if special || !plan.prune_blocks {
                     Recheck
                 } else {
                     Before
@@ -2379,7 +2587,7 @@ fn indexed_candidates_for_plan<'a>(
                 let Some(constraint) = constraint else {
                     continue;
                 };
-                if is_brin_inclusion_operator(constraint.operator) {
+                if is_nonmonotonic_index_operator(constraint.operator) {
                     match super::super::eval::binary(
                         constraint.operator,
                         decoded[position],
@@ -2389,11 +2597,19 @@ fn indexed_candidates_for_plan<'a>(
                         arena,
                     )? {
                         Datum::Bool(true) => continue,
-                        Datum::Bool(false) | Datum::Null => return Ok(Recheck),
+                        Datum::Bool(false) | Datum::Null => {
+                            return Ok(
+                                if plan.method == crate::sql::ast::IndexAccessMethod::Gist {
+                                    Skip
+                                } else {
+                                    Recheck
+                                },
+                            );
+                        }
                         _ => {
                             return Err(sql_err!(
                                 sqlstate::INTERNAL_ERROR,
-                                "BRIN inclusion operator did not return boolean"
+                                "index search operator did not return boolean"
                             ));
                         }
                     }

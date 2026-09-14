@@ -1805,29 +1805,40 @@ pub struct IndexStorageOptions {
     pub deduplicate_items: Option<bool>,
     pub pages_per_range: Option<u32>,
     pub autosummarize: Option<bool>,
+    pub buffering: Option<GistBuffering>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GistBuffering {
+    Auto,
+    On,
+    Off,
 }
 
 /// Options attached to one BRIN operator class invocation. These live on an
 /// index attribute (`pg_attribute.attoptions`), not on the index relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BrinOperatorClassOptions<'a> {
+pub struct IndexOperatorClassOptions<'a> {
     pub values_per_range: Option<u16>,
     pub n_distinct_per_range: Option<i32>,
     /// Retain PostgreSQL's decimal spelling for catalog deparse.
     pub false_positive_rate: Option<&'a str>,
+    pub siglen: Option<u16>,
 }
 
-impl BrinOperatorClassOptions<'_> {
+impl IndexOperatorClassOptions<'_> {
     pub const DEFAULT: Self = Self {
         values_per_range: None,
         n_distinct_per_range: None,
         false_positive_rate: None,
+        siglen: None,
     };
 
     pub const fn is_empty(self) -> bool {
         self.values_per_range.is_none()
             && self.n_distinct_per_range.is_none()
             && self.false_positive_rate.is_none()
+            && self.siglen.is_none()
     }
 }
 
@@ -1837,6 +1848,7 @@ impl IndexStorageOptions {
         deduplicate_items: None,
         pages_per_range: None,
         autosummarize: None,
+        buffering: None,
     };
 }
 
@@ -1847,6 +1859,7 @@ pub struct IndexStorageOptionNames {
     pub deduplicate_items: bool,
     pub pages_per_range: bool,
     pub autosummarize: bool,
+    pub buffering: bool,
 }
 
 impl IndexStorageOptionNames {
@@ -1855,6 +1868,7 @@ impl IndexStorageOptionNames {
         deduplicate_items: false,
         pages_per_range: false,
         autosummarize: false,
+        buffering: false,
     };
 }
 
@@ -2542,6 +2556,7 @@ pub enum IndexAccessMethod {
     Btree,
     Hash,
     Brin,
+    Gist,
 }
 
 impl IndexAccessMethod {
@@ -2550,6 +2565,7 @@ impl IndexAccessMethod {
             Self::Btree => 0,
             Self::Hash => 1,
             Self::Brin => 2,
+            Self::Gist => 3,
         }
     }
 
@@ -2558,6 +2574,7 @@ impl IndexAccessMethod {
             0 => Some(Self::Btree),
             1 => Some(Self::Hash),
             2 => Some(Self::Brin),
+            3 => Some(Self::Gist),
             _ => None,
         }
     }
@@ -2567,6 +2584,7 @@ impl IndexAccessMethod {
             Self::Btree => "btree",
             Self::Hash => "hash",
             Self::Brin => "brin",
+            Self::Gist => "gist",
         }
     }
 }
@@ -2740,7 +2758,7 @@ pub struct IndexColumn<'a> {
     pub expression_text: &'a str,
     pub collation: Option<ParsedCollation<'a>>,
     pub operator_class: Option<QualName<'a>>,
-    pub operator_class_options: BrinOperatorClassOptions<'a>,
+    pub operator_class_options: IndexOperatorClassOptions<'a>,
     pub descending: bool,
     pub ordering_specified: bool,
     pub nulls_first: bool,
@@ -6304,6 +6322,13 @@ pub enum BinaryOp {
     NotRightOf,
     NotLeftOf,
     Adjacent,
+    Same,
+    Below,
+    Above,
+    NotAbove,
+    NotBelow,
+    BelowPoint,
+    AbovePoint,
     /// `<<=` network "is contained within or equals", `>>=` network "contains
     /// or equals". (`<<`/`>>` reuse `Shl`/`Shr`, dispatched on network operands.)
     NetContainedEq,
@@ -6352,6 +6377,13 @@ impl BinaryOp {
             b"&<" => Self::NotRightOf,
             b"&>" => Self::NotLeftOf,
             b"-|-" => Self::Adjacent,
+            b"~=" => Self::Same,
+            b"<<|" => Self::Below,
+            b"|>>" => Self::Above,
+            b"&<|" => Self::NotAbove,
+            b"|&>" => Self::NotBelow,
+            b"<^" => Self::BelowPoint,
+            b">^" => Self::AbovePoint,
             b"<<=" => Self::NetContainedEq,
             b">>=" => Self::NetContainsEq,
             _ => return None,
@@ -6395,6 +6427,13 @@ impl BinaryOp {
             Self::NotRightOf => "&<",
             Self::NotLeftOf => "&>",
             Self::Adjacent => concat!("-", "|", "-"),
+            Self::Same => "~=",
+            Self::Below => "<<|",
+            Self::Above => "|>>",
+            Self::NotAbove => "&<|",
+            Self::NotBelow => "|&>",
+            Self::BelowPoint => "<^",
+            Self::AbovePoint => ">^",
             Self::NetContainedEq => "<<=",
             Self::NetContainsEq => ">>=",
             Self::And | Self::Or | Self::Like | Self::ILike => return None,
@@ -6412,6 +6451,13 @@ impl BinaryOp {
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
             Self::TextSearchMatch => 4,
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
+            Self::Same
+            | Self::Below
+            | Self::Above
+            | Self::NotAbove
+            | Self::NotBelow
+            | Self::BelowPoint
+            | Self::AbovePoint => 4,
             Self::NetContainedEq | Self::NetContainsEq => 4,
             Self::Like | Self::ILike => 4,
             Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll | Self::JsonPathExists => {

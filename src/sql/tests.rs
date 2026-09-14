@@ -15181,9 +15181,9 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
         &mut budget,
         "SELECT classid, objid, refclassid, refobjid, deptype FROM pg_depend \
          UNION ALL \
-         SELECT 'pg_opfamily'::regclass, amopfamily, refclassid, refobjid, deptype \
-         FROM pg_depend d, pg_amop o \
-         WHERE classid = 'pg_amop'::regclass AND objid = o.oid",
+         SELECT 'pg_opfamily'::regclass, amopfamily, 'pg_operator'::regclass, \
+                amopopr, 'n'::character \
+         FROM pg_amop WHERE oid = 10299",
     );
     assert!(
         !message_types(&output).contains(&b'E'),
@@ -47190,6 +47190,278 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
+    let mut config = test_config("physical-gist-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.table_rows = 8192;
+    config.txn_rows = 8192;
+    config.value_index_rows = 16384;
+    config.object_store_bucket = format!("physical-gist-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE gist_documents (
+             id integer, span int4range, location point,
+             document tsvector, payload text
+         );
+         CREATE INDEX gist_documents_span ON gist_documents USING gist (span)
+             INCLUDE (payload) WITH (fillfactor=80, buffering=on);
+         CREATE INDEX gist_documents_location ON gist_documents USING gist (location);
+         CREATE INDEX gist_documents_search ON gist_documents USING gist
+             (document tsvector_ops(siglen=64));
+         INSERT INTO gist_documents VALUES
+             (1, '[1,5)'::int4range, '(1,1)'::point,
+                 to_tsvector('english', 'quick brown fox'), 'one'),
+             (2, '[8,14)'::int4range, '(2,2)'::point,
+                 to_tsvector('english', 'slow green turtle'), 'two'),
+             (3, '[20,30)'::int4range, '(20,20)'::point,
+                 to_tsvector('english', 'quick database'), 'three');
+         ANALYZE gist_documents",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for start in (1..=3000).step_by(500) {
+        let filler = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO gist_documents
+                   SELECT value + 10,
+                          int4range(10000 + value * 2, 10001 + value * 2),
+                          point(10000 + value, 10000 + value), NULL::tsvector, repeat('x', 128)
+                     FROM generate_series({start}, {}) AS source(value)",
+                start + 499
+            ),
+        );
+        assert!(!String::from_utf8_lossy(&filler).contains("ERROR"));
+    }
+    let analyzed = run_with(&mut engine, &mut budget, "ANALYZE gist_documents");
+    assert!(!String::from_utf8_lossy(&analyzed).contains("ERROR"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+
+    let output = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_opclass WHERE opcmethod = 783;
+         SELECT count(*) FROM pg_opfamily WHERE opfmethod = 783;
+         SELECT count(*) FROM pg_amop WHERE amopmethod = 783;
+         SELECT count(*) FROM pg_amproc
+          WHERE amprocfamily IN (1029,2593,2594,2595,3550,3655,3702,3919,6158);
+         SELECT indexdef FROM pg_indexes
+          WHERE indexname IN ('gist_documents_search', 'gist_documents_span')
+          ORDER BY indexname;
+         SELECT attribute.attoptions::text
+           FROM pg_attribute attribute JOIN pg_class relation
+             ON relation.oid = attribute.attrelid
+          WHERE relation.relname = 'gist_documents_search' AND attribute.attnum = 1;
+         EXPLAIN SELECT id FROM gist_documents WHERE span && '[4,10)'::int4range;
+         SELECT string_agg(id::text, ',' ORDER BY id)
+           FROM gist_documents WHERE span && '[4,10)'::int4range;
+         EXPLAIN SELECT id FROM gist_documents
+           WHERE location <@ '((0,0),(3,3))'::box;
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM gist_documents
+           WHERE location <@ '((0,0),(3,3))'::box;
+         EXPLAIN SELECT id FROM gist_documents
+           WHERE location <<| '(3,3)'::point;
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM gist_documents
+           WHERE location <<| '(3,3)'::point;
+         EXPLAIN SELECT id FROM gist_documents
+           WHERE document @@ 'quick'::tsquery;
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM gist_documents
+           WHERE document @@ 'quick'::tsquery;
+         EXPLAIN DELETE FROM gist_documents WHERE location ~= '(20,20)'::point;
+         DELETE FROM gist_documents WHERE location ~= '(20,20)'::point RETURNING id;
+         EXPLAIN UPDATE gist_documents SET payload = 'matched' WHERE span @> 9;
+         UPDATE gist_documents SET payload = 'matched' WHERE span @> 9 RETURNING id",
+    ));
+    for expected in [
+        "9",
+        "9",
+        "100",
+        "68",
+        "{siglen=64}",
+        "1,2",
+        "1,2",
+        "1,3",
+        "2",
+        "3",
+    ] {
+        assert!(
+            output.iter().any(|row| row == expected),
+            "{expected}: {output:?}"
+        );
+    }
+    for index in [
+        "gist_documents_span",
+        "gist_documents_location",
+        "gist_documents_search",
+    ] {
+        assert!(
+            output
+                .iter()
+                .any(|row| row.contains(&format!("Index Scan using {index}"))),
+            "{index}: {output:?}"
+        );
+    }
+    assert_eq!(
+        output
+            .iter()
+            .filter(|row| row.contains("Index Scan using gist_documents_location"))
+            .count(),
+        3,
+        "{output:?}"
+    );
+    assert!(
+        output.iter().any(|row| {
+            row.contains(
+                "USING gist (span) INCLUDE (payload) WITH (fillfactor='80', buffering='on')",
+            )
+        }),
+        "{output:?}"
+    );
+    assert!(
+        output
+            .iter()
+            .any(|row| { row.contains("USING gist (document tsvector_ops (siglen='64'))") }),
+        "{output:?}"
+    );
+    let unsupported = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT id FROM gist_documents WHERE span < '[4,10)'::int4range",
+    ));
+    assert!(
+        unsupported.iter().any(|row| row.contains("Seq Scan"))
+            && unsupported
+                .iter()
+                .all(|row| !row.contains("gist_documents_span")),
+        "{unsupported:?}"
+    );
+
+    for (statement, message) in [
+        (
+            "CREATE UNIQUE INDEX bad_gist_unique ON gist_documents USING gist (span)",
+            "does not support unique indexes",
+        ),
+        (
+            "CREATE INDEX bad_gist_order ON gist_documents USING gist (span DESC)",
+            "does not support ASC/DESC options",
+        ),
+        (
+            "CREATE INDEX bad_gist_nulls ON gist_documents USING gist (span NULLS FIRST)",
+            "does not support NULLS FIRST/LAST options",
+        ),
+        (
+            "CREATE INDEX bad_gist_option ON gist_documents USING gist (span) WITH (pages_per_range=1)",
+            "unrecognized parameter \"pages_per_range\"",
+        ),
+        (
+            "CREATE INDEX bad_gist_class_option ON gist_documents USING gist (span range_ops(siglen=64))",
+            "operator class range_ops has no options",
+        ),
+        (
+            "CREATE INDEX bad_gist_class ON gist_documents USING gist (span point_ops)",
+            "does not accept data type int4range",
+        ),
+    ] {
+        let error =
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, statement)).to_string();
+        assert!(error.contains(message), "{message}: {error}");
+    }
+
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX gist_documents_span SET (buffering=auto, fillfactor=75);
+         ALTER INDEX gist_documents_span RESET (buffering)",
+    );
+    assert!(!String::from_utf8_lossy(&altered).contains("ERROR"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = data_rows(&run_with(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'gist_documents_span';
+         EXPLAIN SELECT id FROM gist_documents WHERE span && '[4,10)'::int4range;
+         SELECT string_agg(id::text, ',' ORDER BY id)
+           FROM gist_documents WHERE span && '[4,10)'::int4range;
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM gist_documents
+           WHERE document @@ 'quick'::tsquery",
+    ));
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("fillfactor='75'") && !row.contains("buffering")),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Scan using gist_documents_span")),
+        "{cold:?}"
+    );
+    assert!(cold.iter().any(|row| row == "1,2"), "{cold:?}");
+    assert!(cold.iter().any(|row| row == "1"), "{cold:?}");
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn like_including_indexes_uses_the_configured_catalog_capacity() {
+    let mut config = test_config("like-many-indexes");
+    config.max_tables = 32;
+    config.max_value_indexes = 32;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE many_indexes (
+             c1 integer, c2 integer, c3 integer, c4 integer, c5 integer,
+             c6 integer, c7 integer, c8 integer, c9 integer
+         );
+         CREATE INDEX many_indexes_1 ON many_indexes (c1);
+         CREATE INDEX many_indexes_2 ON many_indexes (c2);
+         CREATE INDEX many_indexes_3 ON many_indexes (c3);
+         CREATE INDEX many_indexes_4 ON many_indexes (c4);
+         CREATE INDEX many_indexes_5 ON many_indexes (c5);
+         CREATE INDEX many_indexes_6 ON many_indexes (c6);
+         CREATE INDEX many_indexes_7 ON many_indexes (c7);
+         CREATE INDEX many_indexes_8 ON many_indexes (c8);
+         CREATE INDEX many_indexes_9 ON many_indexes (c9);
+         CREATE TABLE many_indexes_copy (LIKE many_indexes INCLUDING INDEXES);
+         SELECT count(*) FROM pg_index
+          WHERE indrelid = 'many_indexes_copy'::regclass",
+        1 << 20,
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["9"]);
 }
 
 #[test]

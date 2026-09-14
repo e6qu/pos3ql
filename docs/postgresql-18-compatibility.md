@@ -33,8 +33,8 @@ logical-replication boundary is specified separately in
 - PostgreSQL heap layout, page identifiers, `ctid` semantics, HOT, vacuum's
   physical implementation, physical XLOG, physical streaming replication,
   hot standby, and binary-WAL tooling are not targets.
-- GiST, GIN, and SP-GiST index execution are not implemented. Modeled BRIN
-  indexes physically execute bitmap equality/range scans and every built-in range/network inclusion strategy over
+- GIN and SP-GiST index execution are not implemented. Modeled BRIN indexes
+  physically execute bitmap equality/range scans and every built-in range/network inclusion strategy over
   durable object-block indexes for plain, multicolumn, expression, partial,
   prepared, join, and DML paths. PostgreSQL 18's built-in BRIN operator
   classes, families, strategy operators, support procedures, and relation
@@ -64,6 +64,16 @@ logical-replication boundary is specified separately in
   stored predicate; expression and partial keys also support compatible
   ordered traversal. Expression-key results themselves are recomputed from a
   fetched row rather than projected directly from an index tuple.
+- Modeled GiST indexes physically scan bounded immutable encoded-key
+  generations for supported network containment, planar-geometric
+  relationships, range/multirange relationships, and `tsvector`/`tsquery`
+  predicates. Each key is evaluated exactly before its row identity becomes a
+  candidate. The nine PostgreSQL 18 built-in classes, nine families, 100
+  strategy rows, 68 support rows, `tsvector` `siglen`, relation
+  `fillfactor`/`buffering`, included columns, DML maintenance, WAL,
+  checkpoints, and object-cold recovery share one typed boundary. PostgreSQL
+  GiST tree pages, K-nearest-neighbor ordering, and native/custom operator
+  classes are not implemented.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

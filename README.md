@@ -23,7 +23,7 @@ With object storage enabled, the server groups transactions completed in one rea
 
 The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, full transaction IDs and snapshots, views, materialized views, modeled indexes, sequences, domains, enums, PostgreSQL large objects, full-text search, SQL functions (scalar, `SETOF`, and `TABLE`, including mutable and nested calls), CTEs, joins, windows, COPY, PostgreSQL 18 SQL/JSON and SQL/XML, PostgreSQL 18-interoperable logical-replication publishing and bounded subscription bootstrap/apply, and PostgreSQL catalog introspection used by common clients and dump/restore tools. [The PostgreSQL 18 matrix](docs/postgresql-18-compatibility.md) distinguishes implemented behavior, explicit architecture boundaries, and extension support.
 
-Modeled btree, hash, and BRIN indexes are physical access paths. Hash indexes execute
+Modeled btree, hash, BRIN, and GiST indexes are physical access paths. Hash indexes execute
 exact single-key probes across plain, expression, partial, prepared, query,
 join, and direct UPDATE/DELETE paths; their equality-only contract excludes
 ordering, ranges, uniqueness, included columns, and clustering exactly where
@@ -52,6 +52,17 @@ membership-filtered bindings and are selected only when a conservative typed
 implication proof establishes that the query entails their predicate. Access
 method and operator-class identity survive WAL, checkpoints, copied and
 partitioned indexes, reindexing, and object-cold recovery.
+
+GiST indexes physically select exact candidate row identities for supported
+network containment, planar-geometric relationships, range and multirange
+relationships, and `tsvector`/`tsquery` predicates. The nine PostgreSQL 18
+built-in classes, their nine families, 100 strategy rows, 68 support rows,
+`tsvector` `siglen`, relation `fillfactor`/`buffering`, included columns, DML
+maintenance, WAL, checkpoints, and empty-cache recovery share the same bounded
+index state. SQL predicates are evaluated against each immutable encoded key,
+so this first physical GiST path is exact rather than lossy. PostgreSQL GiST
+tree-page layout, K-nearest-neighbor ordering, and custom native operator
+classes are not implemented and are never advertised as a fallback.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

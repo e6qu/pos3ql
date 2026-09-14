@@ -863,7 +863,7 @@ pub(crate) enum WalOp<'a> {
         explicit_collations: [bool; MAX_INDEX_COLS],
         operator_classes: [Option<crate::storage::IndexOperatorClass>; MAX_INDEX_COLS],
         resolved_operator_classes: [Option<crate::storage::IndexOperatorClass>; MAX_INDEX_COLS],
-        operator_class_options: [crate::storage::BrinOperatorClassOptions; MAX_INDEX_COLS],
+        operator_class_options: [crate::storage::IndexOperatorClassOptions; MAX_INDEX_COLS],
         descending: [bool; MAX_INDEX_COLS],
         nulls_first: [bool; MAX_INDEX_COLS],
         n_cols: usize,
@@ -2741,7 +2741,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .iter()
                     .take(*n_cols)
                     .map(|options| {
-                        1 + 2 + 4 + 1 + options.false_positive_rate.map_or(0, |value| value.len())
+                        1 + 2
+                            + 4
+                            + 1
+                            + options.false_positive_rate.map_or(0, |value| value.len())
+                            + usize::from(options.siglen.is_some()) * 2
                     })
                     .sum::<usize>()
                 + 3
@@ -2754,11 +2758,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + 1
-                + 6
+                + 8
         }
         WalOp::BrinMaintenance { range_count, .. } => 8 + 4 + 8 + 1 + usize::from(*range_count) * 8,
         WalOp::AlterIndexDefinition { schema, name, .. } => {
-            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 3 + 6
+            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 3 + 8
         }
         WalOp::CreateTablespace { name, location, .. } => {
             8 + 1 + name.len() + 2 + location.len() + 24 + 2
@@ -3597,6 +3601,15 @@ fn append_index_definition(
                 .to_le_bytes(),
         )
         && buffer.append(&[autosummarize])
+        && buffer.append(&[
+            0xad,
+            match definition.options.buffering {
+                None => 0,
+                Some(crate::sql::ast::GistBuffering::Auto) => 1,
+                Some(crate::sql::ast::GistBuffering::On) => 2,
+                Some(crate::sql::ast::GistBuffering::Off) => 3,
+            },
+        ])
 }
 
 fn append_tablespace_options(
@@ -4605,6 +4618,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     Some(crate::storage::IndexOperatorClass::Brin(class)) => {
                         buffer.append(&[4, class.code(), 0, 0, 0])
                     }
+                    Some(crate::storage::IndexOperatorClass::Gist(class)) => {
+                        buffer.append(&[5, class.code(), 0, 0, 0])
+                    }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
                     }
@@ -4622,6 +4638,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     Some(crate::storage::IndexOperatorClass::Brin(class)) => {
                         buffer.append(&[4, class.code(), 0, 0, 0])
                     }
+                    Some(crate::storage::IndexOperatorClass::Gist(class)) => {
+                        buffer.append(&[5, class.code(), 0, 0, 0])
+                    }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
                     }
@@ -4637,11 +4656,14 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= rate.len() <= u8::MAX as usize
                     && buffer.append(&[u8::from(options.values_per_range.is_some())
                         | (u8::from(options.n_distinct_per_range.is_some()) << 1)
-                        | (u8::from(options.false_positive_rate.is_some()) << 2)])
+                        | (u8::from(options.false_positive_rate.is_some()) << 2)
+                        | (u8::from(options.siglen.is_some()) << 3)])
                     && buffer.append(&options.values_per_range.unwrap_or(0).to_le_bytes())
                     && buffer.append(&options.n_distinct_per_range.unwrap_or(0).to_le_bytes())
                     && buffer.append(&[rate.len() as u8])
-                    && buffer.append(rate.as_bytes());
+                    && buffer.append(rate.as_bytes())
+                    && (options.siglen.is_none()
+                        || buffer.append(&options.siglen.unwrap_or(0).to_le_bytes()));
             }
             ok &= buffer.append(&[0xaa, method.code()]);
             ok &= buffer.append(&[0xa8]);
@@ -6105,6 +6127,20 @@ fn decode_index_definition(
         };
         *at += 1;
     }
+    let buffering = if payload.get(*at) == Some(&0xad) {
+        *at += 1;
+        let value = match *payload.get(*at)? {
+            0 => None,
+            1 => Some(crate::sql::ast::GistBuffering::Auto),
+            2 => Some(crate::sql::ast::GistBuffering::On),
+            3 => Some(crate::sql::ast::GistBuffering::Off),
+            _ => return None,
+        };
+        *at += 1;
+        value
+    } else {
+        None
+    };
     if clustered && !matches!(kind, crate::storage::IndexKind::Ordinary) {
         return None;
     }
@@ -6115,6 +6151,7 @@ fn decode_index_definition(
             deduplicate_items,
             pages_per_range,
             autosummarize,
+            buffering,
         },
         statistics,
         parent: (parent != u16::MAX).then_some(parent),
@@ -8094,6 +8131,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     4 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Brin(
                         crate::sql::types::BrinOperatorClass::from_code(value[0])?,
                     )),
+                    5 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Gist(
+                        crate::sql::types::GistOperatorClass::from_code(value[0])?,
+                    )),
                     _ => return None,
                 };
             }
@@ -8123,17 +8163,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     4 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Brin(
                         crate::sql::types::BrinOperatorClass::from_code(value[0])?,
                     )),
+                    5 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Gist(
+                        crate::sql::types::GistOperatorClass::from_code(value[0])?,
+                    )),
                     _ => return None,
                 };
             }
             let mut operator_class_options =
-                [crate::storage::BrinOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
+                [crate::storage::IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
             if payload.get(at) == Some(&0xac) {
                 at += 1;
                 for options in operator_class_options.iter_mut().take(n_cols) {
                     let flags = *payload.get(at)?;
                     at += 1;
-                    if flags & !0b111 != 0 {
+                    if flags & !0b1111 != 0 {
                         return None;
                     }
                     let values_per_range =
@@ -8146,6 +8189,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     at += 1;
                     let rate = core::str::from_utf8(payload.get(at..at + rate_len)?).ok()?;
                     at += rate_len;
+                    let siglen = if flags & 8 != 0 {
+                        let value = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                        at += 2;
+                        Some((1..=2024).contains(&value).then_some(value)?)
+                    } else {
+                        None
+                    };
                     let false_positive_rate = if flags & 4 != 0 {
                         let parsed = rate.parse::<f64>().ok()?;
                         if !parsed.is_finite() || !(0.000_1..=0.25).contains(&parsed) {
@@ -8161,7 +8211,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     } else {
                         return None;
                     };
-                    *options = crate::storage::BrinOperatorClassOptions {
+                    *options = crate::storage::IndexOperatorClassOptions {
                         values_per_range: if flags & 1 != 0 {
                             Some(
                                 (8..=256)
@@ -8181,6 +8231,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                             return None;
                         },
                         false_positive_rate,
+                        siglen,
                     };
                 }
             }
@@ -13027,7 +13078,7 @@ mod tests {
             resolved_operator_classes: [Some(crate::storage::IndexOperatorClass::Btree(
                 BtreeOperatorClass::Text,
             )); MAX_INDEX_COLS],
-            operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+            operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
                 MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],
@@ -13102,7 +13153,7 @@ mod tests {
             explicit_collations: [false; MAX_INDEX_COLS],
             operator_classes: [Some(hash_class); MAX_INDEX_COLS],
             resolved_operator_classes: [Some(hash_class); MAX_INDEX_COLS],
-            operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+            operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
                 MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],
@@ -13127,6 +13178,66 @@ mod tests {
         assert_eq!(method, crate::sql::ast::IndexAccessMethod::Hash);
         assert_eq!(operator_classes[0], Some(hash_class));
         assert_eq!(resolved_operator_classes[0], Some(hash_class));
+    }
+
+    #[test]
+    fn gist_index_payload_round_trips_class_options_and_buffering() {
+        let gist_class = crate::storage::IndexOperatorClass::Gist(
+            crate::sql::types::GistOperatorClass::TsVector,
+        );
+        let mut operator_class_options =
+            [crate::storage::IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
+        operator_class_options[0].siglen = Some(64);
+        let operation = WalOp::CreateIndex {
+            created_at: 44,
+            schema: "public",
+            name: "gist_documents_search",
+            table: "documents",
+            method: crate::sql::ast::IndexAccessMethod::Gist,
+            columns: [0; MAX_INDEX_COLS],
+            expressions: [None; MAX_INDEX_COLS],
+            include_columns: [0; MAX_INDEX_COLS],
+            collations: [crate::sql::ast::Collation::None; MAX_INDEX_COLS],
+            explicit_collations: [false; MAX_INDEX_COLS],
+            operator_classes: [Some(gist_class); MAX_INDEX_COLS],
+            resolved_operator_classes: [Some(gist_class); MAX_INDEX_COLS],
+            operator_class_options,
+            descending: [false; MAX_INDEX_COLS],
+            nulls_first: [false; MAX_INDEX_COLS],
+            n_cols: 1,
+            n_include_cols: 0,
+            nulls_not_distinct: false,
+            predicate: None,
+            unique: false,
+            definition: crate::storage::IndexMutableDefinition {
+                options: crate::storage::IndexStorageOptions {
+                    buffering: Some(crate::sql::ast::GistBuffering::On),
+                    ..crate::storage::IndexStorageOptions::DEFAULT
+                },
+                ..crate::storage::IndexMutableDefinition::DEFAULT
+            },
+        };
+        let mut bytes = [0; 4096];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        let Some(WalOp::CreateIndex {
+            method,
+            operator_classes,
+            resolved_operator_classes,
+            operator_class_options,
+            definition,
+            ..
+        }) = decode_op(KIND_CREATE_INDEX, payload)
+        else {
+            panic!("GiST index WAL payload must decode");
+        };
+        assert_eq!(method, crate::sql::ast::IndexAccessMethod::Gist);
+        assert_eq!(operator_classes[0], Some(gist_class));
+        assert_eq!(resolved_operator_classes[0], Some(gist_class));
+        assert_eq!(operator_class_options[0].siglen, Some(64));
+        assert_eq!(
+            definition.options.buffering,
+            Some(crate::sql::ast::GistBuffering::On)
+        );
     }
 
     #[test]

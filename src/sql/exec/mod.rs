@@ -3499,7 +3499,7 @@ struct CopiedIndex {
     resolved_operator_classes:
         [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
     operator_class_options:
-        [crate::storage::BrinOperatorClassOptions; crate::storage::MAX_INDEX_COLS],
+        [crate::storage::IndexOperatorClassOptions; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
@@ -3511,6 +3511,32 @@ struct CopiedIndex {
     unique: bool,
     source_schema: SqlName,
     source_name: SqlName,
+}
+
+impl CopiedIndex {
+    const EMPTY: Self = Self {
+        method: crate::sql::ast::IndexAccessMethod::Btree,
+        columns: [0; crate::storage::MAX_INDEX_COLS],
+        expressions: [None; crate::storage::MAX_INDEX_COLS],
+        include_columns: [0; crate::storage::MAX_INDEX_COLS],
+        collations: [crate::sql::ast::Collation::Default; crate::storage::MAX_INDEX_COLS],
+        explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
+        operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+        resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+        operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
+            crate::storage::MAX_INDEX_COLS],
+        descending: [false; crate::storage::MAX_INDEX_COLS],
+        nulls_first: [false; crate::storage::MAX_INDEX_COLS],
+        n_cols: 0,
+        n_include_cols: 0,
+        nulls_not_distinct: false,
+        predicate: None,
+        options: crate::storage::IndexStorageOptions::DEFAULT,
+        tablespace: 0,
+        unique: false,
+        source_schema: SqlName::EMPTY,
+        source_name: SqlName::EMPTY,
+    };
 }
 
 /// Recreates each `LIKE` source's secondary indexes on the new table. It has no
@@ -3526,47 +3552,31 @@ fn copy_like_indexes(
     use crate::storage::IndexDef;
     for like in statement.likes.iter().filter(|l| l.indexes) {
         // Collected up front: creating one needs `storage` mutably.
-        let mut copied = [CopiedIndex {
-            method: crate::sql::ast::IndexAccessMethod::Btree,
-            columns: [0; crate::storage::MAX_INDEX_COLS],
-            expressions: [None; crate::storage::MAX_INDEX_COLS],
-            include_columns: [0; crate::storage::MAX_INDEX_COLS],
-            collations: [crate::sql::ast::Collation::Default; crate::storage::MAX_INDEX_COLS],
-            explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
-            operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-            resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-            operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
-                crate::storage::MAX_INDEX_COLS],
-            descending: [false; crate::storage::MAX_INDEX_COLS],
-            nulls_first: [false; crate::storage::MAX_INDEX_COLS],
-            n_cols: 0,
-            n_include_cols: 0,
-            nulls_not_distinct: false,
-            predicate: None,
-            options: crate::storage::IndexStorageOptions::DEFAULT,
-            tablespace: 0,
-            unique: false,
-            source_schema: SqlName::EMPTY,
-            source_name: SqlName::EMPTY,
-        }; MAX_LIKE_INDEXES];
-        let mut n_copied = 0;
         let source_def = *storage.table_def(
             resolve_dml_table(storage, &like.source, txn.txid)?,
             txn.txid,
         );
-        for index in storage.indexes_for(
+        let source_index_count = storage
+            .indexes_for(
+                source_def.schema.as_str(),
+                source_def.name.as_str(),
+                txn.txid,
+            )
+            .count();
+        let copied = arena
+            .alloc_slice_with(source_index_count, |_| CopiedIndex::EMPTY)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "LIKE indexes exceed the statement arena"
+                )
+            })?;
+        for (copy, index) in copied.iter_mut().zip(storage.indexes_for(
             source_def.schema.as_str(),
             source_def.name.as_str(),
             txn.txid,
-        ) {
-            if n_copied == MAX_LIKE_INDEXES {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "cannot copy more than {} indexes",
-                    MAX_LIKE_INDEXES
-                ));
-            }
-            copied[n_copied] = CopiedIndex {
+        )) {
+            *copy = CopiedIndex {
                 method: index.method,
                 columns: index.columns,
                 expressions: index.expressions,
@@ -3588,10 +3598,9 @@ fn copy_like_indexes(
                 source_schema: index.schema,
                 source_name: index.name_for(txn.txid),
             };
-            n_copied += 1;
         }
         let source = source_def;
-        for index in &copied[..n_copied] {
+        for index in copied {
             let columns = remap_columns(def, &source, &index.columns[..index.n_cols])?;
             let include_columns =
                 remap_columns(def, &source, &index.include_columns[..index.n_include_cols])?;
@@ -3951,8 +3960,6 @@ fn copy_comment_if_present(
 }
 
 /// Upper bound on the secondary indexes one `LIKE ... INCLUDING INDEXES` copies.
-const MAX_LIKE_INDEXES: usize = 8;
-
 /// The next value of a serial/identity column: a real sequence, as PostgreSQL
 /// has it. Explicit inserts do not advance it, deletes and TRUNCATE do not
 /// rewind it, and the advance survives a rollback (a consumed number stays
@@ -37147,6 +37154,12 @@ pub fn comment(
                         "comments on brin operator families are not supported"
                     ));
                 }
+                crate::sql::ast::IndexAccessMethod::Gist => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on gist operator families are not supported"
+                    ));
+                }
             }
             let Some(slot) =
                 storage.operator_family_slot_on_path(family_name.schema, family_name.name, txid)
@@ -37186,6 +37199,12 @@ pub fn comment(
                     return sql_fail(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "comments on brin operator classes are not supported"
+                    ));
+                }
+                crate::sql::ast::IndexAccessMethod::Gist => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on gist operator classes are not supported"
                     ));
                 }
             }
@@ -46619,16 +46638,24 @@ fn validate_index_storage_options(
         crate::sql::ast::IndexAccessMethod::Btree => options
             .pages_per_range
             .map(|_| "pages_per_range")
-            .or_else(|| options.autosummarize.map(|_| "autosummarize")),
+            .or_else(|| options.autosummarize.map(|_| "autosummarize"))
+            .or_else(|| options.buffering.map(|_| "buffering")),
         crate::sql::ast::IndexAccessMethod::Hash => options
             .deduplicate_items
             .map(|_| "deduplicate_items")
             .or_else(|| options.pages_per_range.map(|_| "pages_per_range"))
-            .or_else(|| options.autosummarize.map(|_| "autosummarize")),
+            .or_else(|| options.autosummarize.map(|_| "autosummarize"))
+            .or_else(|| options.buffering.map(|_| "buffering")),
         crate::sql::ast::IndexAccessMethod::Brin => options
             .fillfactor
             .map(|_| "fillfactor")
-            .or_else(|| options.deduplicate_items.map(|_| "deduplicate_items")),
+            .or_else(|| options.deduplicate_items.map(|_| "deduplicate_items"))
+            .or_else(|| options.buffering.map(|_| "buffering")),
+        crate::sql::ast::IndexAccessMethod::Gist => options
+            .deduplicate_items
+            .map(|_| "deduplicate_items")
+            .or_else(|| options.pages_per_range.map(|_| "pages_per_range"))
+            .or_else(|| options.autosummarize.map(|_| "autosummarize")),
     };
     match unsupported {
         Some(name) => Err(sql_err!(
@@ -46791,6 +46818,34 @@ pub fn create_index(
             ));
         }
     }
+    if command.method == crate::sql::ast::IndexAccessMethod::Gist {
+        if command.unique {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"gist\" does not support unique indexes"
+            ));
+        }
+        if command
+            .columns
+            .iter()
+            .any(|column| column.ordering_specified)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"gist\" does not support ASC/DESC options"
+            ));
+        }
+        if command
+            .columns
+            .iter()
+            .any(|column| column.nulls_order_specified)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"gist\" does not support NULLS FIRST/LAST options"
+            ));
+        }
+    }
     let mut columns = [0u16; MAX_INDEX_COLS];
     let mut expressions = [None; MAX_INDEX_COLS];
     let mut include_columns = [0u16; MAX_INDEX_COLS];
@@ -46800,7 +46855,7 @@ pub fn create_index(
     let mut operator_classes = [None; MAX_INDEX_COLS];
     let mut resolved_operator_classes = [None; MAX_INDEX_COLS];
     let mut operator_class_options =
-        [crate::storage::BrinOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
+        [crate::storage::IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
     for (i, index_column) in command.columns.iter().enumerate() {
         let (input, type_oid) = if let Some(column_name) = index_column.column {
             let Some(column_index) = tdef.column_index(column_name) else {
@@ -46920,6 +46975,12 @@ pub fn create_index(
                 }
                 use crate::sql::types::BrinOperatorClassKind;
                 let supplied = index_column.operator_class_options;
+                if supplied.siglen.is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "unrecognized parameter \"siglen\""
+                    ));
+                }
                 let rejected = match parsed.kind() {
                     BrinOperatorClassKind::MinmaxMulti => supplied
                         .n_distinct_per_range
@@ -46954,12 +47015,72 @@ pub fn create_index(
                         "BRIN option value is too long"
                     ));
                 }
-                operator_class_options[i] = crate::storage::BrinOperatorClassOptions {
+                operator_class_options[i] = crate::storage::IndexOperatorClassOptions {
                     values_per_range: supplied.values_per_range,
                     n_distinct_per_range: supplied.n_distinct_per_range,
                     false_positive_rate,
+                    siglen: None,
                 };
                 let class = crate::storage::IndexOperatorClass::Brin(parsed);
+                operator_classes[i] = Some(class);
+                resolved_operator_classes[i] = Some(class);
+                continue;
+            }
+            if command.method == crate::sql::ast::IndexAccessMethod::Gist {
+                if operator_class
+                    .schema
+                    .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"gist\"",
+                        operator_class.name
+                    ));
+                }
+                let Some(parsed) = crate::sql::types::GistOperatorClass::parse(operator_class.name)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"gist\"",
+                        operator_class.name
+                    ));
+                };
+                if !parsed.accepts(input.ctype) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "operator class \"{}\" does not accept data type {}",
+                        operator_class.name,
+                        input.ctype.name()
+                    ));
+                }
+                let supplied = index_column.operator_class_options;
+                if parsed != crate::sql::types::GistOperatorClass::TsVector && !supplied.is_empty()
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "operator class {} has no options",
+                        operator_class.name
+                    ));
+                }
+                if supplied.values_per_range.is_some()
+                    || supplied.n_distinct_per_range.is_some()
+                    || supplied.false_positive_rate.is_some()
+                {
+                    let parameter = if supplied.values_per_range.is_some() {
+                        "values_per_range"
+                    } else if supplied.n_distinct_per_range.is_some() {
+                        "n_distinct_per_range"
+                    } else {
+                        "false_positive_rate"
+                    };
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "unrecognized parameter \"{}\"",
+                        parameter
+                    ));
+                }
+                operator_class_options[i].siglen = supplied.siglen;
+                let class = crate::storage::IndexOperatorClass::Gist(parsed);
                 operator_classes[i] = Some(class);
                 resolved_operator_classes[i] = Some(class);
                 continue;
@@ -47214,6 +47335,7 @@ pub fn create_index(
                 deduplicate_items: command.options.deduplicate_items,
                 pages_per_range: command.options.pages_per_range,
                 autosummarize: command.options.autosummarize,
+                buffering: command.options.buffering,
             },
             kind: if tdef.partition.is_partitioned() {
                 crate::storage::IndexKind::Partitioned {
@@ -47733,6 +47855,9 @@ pub fn alter_index(
             if let Some(autosummarize) = options.autosummarize {
                 definition.options.autosummarize = Some(autosummarize);
             }
+            if let Some(buffering) = options.buffering {
+                definition.options.buffering = Some(buffering);
+            }
             if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition) {
                 return sql_fail(error);
             }
@@ -47742,16 +47867,24 @@ pub fn alter_index(
                 crate::sql::ast::IndexAccessMethod::Btree => options
                     .pages_per_range
                     .then_some("pages_per_range")
-                    .or(options.autosummarize.then_some("autosummarize")),
+                    .or(options.autosummarize.then_some("autosummarize"))
+                    .or(options.buffering.then_some("buffering")),
                 crate::sql::ast::IndexAccessMethod::Hash => options
                     .deduplicate_items
                     .then_some("deduplicate_items")
                     .or(options.pages_per_range.then_some("pages_per_range"))
-                    .or(options.autosummarize.then_some("autosummarize")),
+                    .or(options.autosummarize.then_some("autosummarize"))
+                    .or(options.buffering.then_some("buffering")),
                 crate::sql::ast::IndexAccessMethod::Brin => options
                     .fillfactor
                     .then_some("fillfactor")
-                    .or(options.deduplicate_items.then_some("deduplicate_items")),
+                    .or(options.deduplicate_items.then_some("deduplicate_items"))
+                    .or(options.buffering.then_some("buffering")),
+                crate::sql::ast::IndexAccessMethod::Gist => options
+                    .deduplicate_items
+                    .then_some("deduplicate_items")
+                    .or(options.pages_per_range.then_some("pages_per_range"))
+                    .or(options.autosummarize.then_some("autosummarize")),
             };
             if let Some(name) = invalid {
                 return sql_fail(sql_err!(
@@ -47775,6 +47908,9 @@ pub fn alter_index(
             }
             if options.autosummarize {
                 definition.options.autosummarize = None;
+            }
+            if options.buffering {
+                definition.options.buffering = None;
             }
             if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition) {
                 return sql_fail(error);

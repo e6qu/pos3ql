@@ -722,10 +722,15 @@ fn scan_node<'a>(
         plan.method() == crate::sql::ast::IndexAccessMethod::Brin
             && index_rows.saturating_mul(8) <= rows
     });
+    let selective_gist = index_identity.is_some_and(|(plan, _)| {
+        plan.method() == crate::sql::ast::IndexAccessMethod::Gist
+            && index_rows.saturating_mul(4) <= rows
+    });
     let use_index = ordered.is_some()
         || index_identity.is_some()
             && (resident_index
                 || selective_brin
+                || selective_gist
                 || (generations != 0
                     && !storage.sequential_spill_scan_is_cheaper(slot, index_rows, txid)));
     let blocks = if use_index {
@@ -1499,13 +1504,19 @@ pub(super) fn plan_modification(
             let index = index.filter(|(plan, _)| {
                 let expected_rows =
                     plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid);
-                let resident_exact = plan.method() != crate::sql::ast::IndexAccessMethod::Brin
-                    && plan.is_exact()
+                let resident_exact = !matches!(
+                    plan.method(),
+                    crate::sql::ast::IndexAccessMethod::Brin
+                        | crate::sql::ast::IndexAccessMethod::Gist
+                ) && plan.is_exact()
                     && storage.value_binding_cache_complete(slot, plan.binding());
                 let selective_brin = plan.method() == crate::sql::ast::IndexAccessMethod::Brin
                     && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
+                let selective_gist = plan.method() == crate::sql::ast::IndexAccessMethod::Gist
+                    && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
                 resident_exact
                     || selective_brin
+                    || selective_gist
                     || (storage.spill_generation_count(slot) != 0
                         && !storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid))
             });

@@ -91,6 +91,18 @@ counters for reads and synchronized updates, and a synchronized worker failure
 aborts its peer barrier instead of hanging the run. No
 externally blocked defect remains from this review.
 
+The GiST review found no externally blocked defect. The nine PostgreSQL 18
+built-in operator classes now own exact immutable-key predicate scans,
+catalog identities, class/relation options, DML maintenance, WAL, checkpoints,
+object-cold recovery, and warm/cold performance gates. The expanded catalog
+also exposed a quadratic Cartesian catalog test and default-class option
+deparsing that omitted the required operator-class name. A second planner
+audit found an overbroad class/operator gate and a missing GiST DML `EXPLAIN`
+cost path. The exact PostgreSQL 18 search-strategy matrix, physical-plan
+regressions, and differential corpus now cover both fixes. GIN, SP-GiST, GiST
+K-nearest-neighbor ordering, PostgreSQL page layout, and native callbacks
+remain explicit architecture limits rather than deferred defects.
+
 The ordered-index review found that prefix and range plans advertised physical
 index access but read every immutable value-index data block, and that
 checkpoint insertion order could not support a real seek. Durable generations

@@ -160,6 +160,146 @@ macro_rules! intrinsic {
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
+    // PostgreSQL 18.6 GiST support routines, exposed so pg_amproc joins to
+    // pg_proc with the same built-in identities as a vanilla server.
+    intrinsic!(1030, "gist_point_compress", 2281, "2281", 1, "i"),
+    intrinsic!(
+        2179,
+        "gist_point_consistent",
+        16,
+        "2281 600 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(
+        2578,
+        "gist_box_consistent",
+        16,
+        "2281 603 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(2581, "gist_box_penalty", 2281, "2281 2281 2281", 3, "i"),
+    intrinsic!(2582, "gist_box_picksplit", 2281, "2281 2281", 2, "i"),
+    intrinsic!(2583, "gist_box_union", 603, "2281 2281", 2, "i"),
+    intrinsic!(2584, "gist_box_same", 2281, "603 603 2281", 3, "i"),
+    intrinsic!(
+        2585,
+        "gist_poly_consistent",
+        16,
+        "2281 604 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(2586, "gist_poly_compress", 2281, "2281", 1, "i"),
+    intrinsic!(
+        2591,
+        "gist_circle_consistent",
+        16,
+        "2281 718 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(2592, "gist_circle_compress", 2281, "2281", 1, "i"),
+    intrinsic!(
+        3064,
+        "gist_point_distance",
+        701,
+        "2281 600 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(
+        3280,
+        "gist_circle_distance",
+        701,
+        "2281 718 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(3282, "gist_point_fetch", 2281, "2281", 1, "i"),
+    intrinsic!(
+        3288,
+        "gist_poly_distance",
+        701,
+        "2281 604 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(3434, "gtsvector_options", 2278, "2281", 1, "i"),
+    intrinsic!(3435, "gist_point_sortsupport", 2278, "2281", 1, "i"),
+    intrinsic!(
+        3553,
+        "inet_gist_consistent",
+        16,
+        "2281 869 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(3554, "inet_gist_union", 869, "2281 2281", 2, "i"),
+    intrinsic!(3555, "inet_gist_compress", 2281, "2281", 1, "i"),
+    intrinsic!(3557, "inet_gist_penalty", 2281, "2281 2281 2281", 3, "i"),
+    intrinsic!(3558, "inet_gist_picksplit", 2281, "2281 2281", 2, "i"),
+    intrinsic!(3559, "inet_gist_same", 2281, "869 869 2281", 3, "i"),
+    intrinsic!(3573, "inet_gist_fetch", 2281, "2281", 1, "i"),
+    intrinsic!(3648, "gtsvector_compress", 2281, "2281", 1, "i"),
+    intrinsic!(3649, "gtsvector_decompress", 2281, "2281", 1, "i"),
+    intrinsic!(3650, "gtsvector_picksplit", 2281, "2281 2281", 2, "i"),
+    intrinsic!(3651, "gtsvector_union", 3642, "2281 2281", 2, "i"),
+    intrinsic!(3652, "gtsvector_same", 2281, "3642 3642 2281", 3, "i"),
+    intrinsic!(3653, "gtsvector_penalty", 2281, "2281 2281 2281", 3, "i"),
+    intrinsic!(
+        3654,
+        "gtsvector_consistent",
+        16,
+        "2281 3614 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(3695, "gtsquery_compress", 2281, "2281", 1, "i"),
+    intrinsic!(3697, "gtsquery_picksplit", 2281, "2281 2281", 2, "i"),
+    intrinsic!(3698, "gtsquery_union", 20, "2281 2281", 2, "i"),
+    intrinsic!(3699, "gtsquery_same", 2281, "20 20 2281", 3, "i"),
+    intrinsic!(3700, "gtsquery_penalty", 2281, "2281 2281 2281", 3, "i"),
+    intrinsic!(
+        3701,
+        "gtsquery_consistent",
+        16,
+        "2281 3615 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(
+        3875,
+        "range_gist_consistent",
+        16,
+        "2281 3831 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(3876, "range_gist_union", 3831, "2281 2281", 2, "i"),
+    intrinsic!(3879, "range_gist_penalty", 2281, "2281 2281 2281", 3, "i"),
+    intrinsic!(3880, "range_gist_picksplit", 2281, "2281 2281", 2, "i"),
+    intrinsic!(3881, "range_gist_same", 2281, "3831 3831 2281", 3, "i"),
+    intrinsic!(
+        3998,
+        "gist_box_distance",
+        701,
+        "2281 603 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(
+        6154,
+        "multirange_gist_consistent",
+        16,
+        "2281 4537 21 26 2281",
+        5,
+        "i"
+    ),
+    intrinsic!(6156, "multirange_gist_compress", 2281, "2281", 1, "i"),
+    intrinsic!(6347, "gist_translate_cmptype_common", 21, "23", 1, "i"),
+    intrinsic!(6391, "range_sortsupport", 2278, "2281", 1, "i"),
     IntrinsicRoutine {
         oid: 2895,
         name: "xmlcomment",
@@ -3610,6 +3750,7 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
             | 6232
             | 2943
             | 3348
+            | 3434
             | 2944
             | 2945
             | 2946
@@ -10747,7 +10888,7 @@ struct IdxInfo {
     resolved_operator_classes:
         [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
     operator_class_options:
-        [crate::storage::BrinOperatorClassOptions; crate::storage::MAX_INDEX_COLS],
+        [crate::storage::IndexOperatorClassOptions; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
@@ -10862,7 +11003,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
                 operator_classes: [None; crate::storage::MAX_INDEX_COLS],
                 resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-                operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+                operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
                     crate::storage::MAX_INDEX_COLS],
                 descending,
                 nulls_first,
@@ -11196,7 +11337,7 @@ fn empty_index() -> IdxInfo {
         explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
         operator_classes: [None; crate::storage::MAX_INDEX_COLS],
         resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
-        operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+        operator_class_options: [crate::storage::IndexOperatorClassOptions::DEFAULT;
             crate::storage::MAX_INDEX_COLS],
         descending: [false; crate::storage::MAX_INDEX_COLS],
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
@@ -11839,6 +11980,7 @@ pub(crate) fn operator_class_oid_visibility(
     if builtin
         || super::types::HashOperatorClass::from_oid(oid).is_some()
         || super::types::BrinOperatorClass::from_oid(oid).is_some()
+        || super::types::GistOperatorClass::from_oid(oid).is_some()
     {
         return Some(true);
     }
@@ -11893,6 +12035,9 @@ pub(crate) fn operator_family_oid_visibility(
     );
     if builtin
         || brin
+        || super::gist_catalog::FAMILIES
+            .iter()
+            .any(|(family_oid, _)| *family_oid == oid)
         || matches!(
             oid,
             427 | 431
@@ -15425,19 +15570,33 @@ fn write_index_key_metadata(
         }
         write_identifier(out, definition.name.as_str());
     }
-    if let Some(crate::storage::IndexOperatorClass::Hash(class)) = info.operator_classes[position]
-        && !class.is_default()
-    {
-        let _ = out.write_char(' ');
-        write_identifier(out, class.name());
-    }
-    if let Some(crate::storage::IndexOperatorClass::Brin(class)) = info.operator_classes[position]
-        && !class.is_default()
-    {
-        let _ = out.write_char(' ');
-        write_identifier(out, class.name());
-    }
     let options = info.operator_class_options[position];
+    let builtin_name = match info.operator_classes[position] {
+        Some(crate::storage::IndexOperatorClass::Hash(class))
+            if !class.is_default() || !options.is_empty() =>
+        {
+            Some(class.name())
+        }
+        Some(crate::storage::IndexOperatorClass::Brin(class))
+            if !class.is_default() || !options.is_empty() =>
+        {
+            Some(class.name())
+        }
+        Some(crate::storage::IndexOperatorClass::Gist(class))
+            if !class.is_default() || !options.is_empty() =>
+        {
+            Some(class.name())
+        }
+        Some(crate::storage::IndexOperatorClass::Btree(_))
+        | Some(crate::storage::IndexOperatorClass::Hash(_))
+        | Some(crate::storage::IndexOperatorClass::Brin(_))
+        | Some(crate::storage::IndexOperatorClass::Gist(_)) => None,
+        Some(crate::storage::IndexOperatorClass::Catalog(_)) | None => None,
+    };
+    if let Some(name) = builtin_name {
+        let _ = out.write_char(' ');
+        write_identifier(out, name);
+    }
     if !options.is_empty() {
         let _ = out.write_str(" (");
         let mut separator = "";
@@ -15451,6 +15610,10 @@ fn write_index_key_metadata(
         }
         if let Some(value) = options.false_positive_rate {
             let _ = write!(out, "{separator}false_positive_rate='{}'", value.as_str());
+            separator = ", ";
+        }
+        if let Some(value) = options.siglen {
+            let _ = write!(out, "{separator}siglen='{value}'");
         }
         let _ = out.write_char(')');
     }
@@ -15480,6 +15643,7 @@ fn write_index_storage_options(
         && definition.options.deduplicate_items.is_none()
         && definition.options.pages_per_range.is_none()
         && definition.options.autosummarize.is_none()
+        && definition.options.buffering.is_none()
     {
         return;
     }
@@ -15507,6 +15671,15 @@ fn write_index_storage_options(
             "{separator}autosummarize={}",
             if autosummarize { "on" } else { "off" }
         );
+        separator = ", ";
+    }
+    if let Some(buffering) = definition.options.buffering {
+        let value = match buffering {
+            crate::sql::ast::GistBuffering::Auto => "auto",
+            crate::sql::ast::GistBuffering::On => "on",
+            crate::sql::ast::GistBuffering::Off => "off",
+        };
+        let _ = write!(out, "{separator}buffering='{value}'");
     }
     let _ = out.write_str(")");
 }
@@ -15926,7 +16099,7 @@ fn extended_statistics_kinds<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut values = [Datum::Null; 4];
+    let mut values = [Datum::Null; 5];
     let mut count = 0usize;
     for (enabled, code) in [
         (statistics.kinds.ndistinct(), "d"),
@@ -18887,15 +19060,18 @@ fn pg_class<'a>(
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Float8(0.0),
                 Datum::Int4(0), // relpages
-                Datum::Int4(if info.is_exclusion {
-                    783
-                } else if info.method == crate::sql::ast::IndexAccessMethod::Hash {
-                    405
-                } else if info.method == crate::sql::ast::IndexAccessMethod::Brin {
-                    3580
-                } else {
-                    403
-                }),
+                Datum::Int4(
+                    if info.is_exclusion || info.method == crate::sql::ast::IndexAccessMethod::Gist
+                    {
+                        783
+                    } else if info.method == crate::sql::ast::IndexAccessMethod::Hash {
+                        405
+                    } else if info.method == crate::sql::ast::IndexAccessMethod::Brin {
+                        3580
+                    } else {
+                        403
+                    },
+                ),
                 Datum::Int4(owner_oid(
                     storage,
                     crate::storage::AccessClass::Table,
@@ -19409,6 +19585,17 @@ fn index_reloptions<'a>(
                 "autosummarize=on"
             } else {
                 "autosummarize=off"
+            },
+            arena,
+        )?;
+        count += 1;
+    }
+    if let Some(buffering) = definition.options.buffering {
+        values[count] = text(
+            match buffering {
+                crate::sql::ast::GistBuffering::Auto => "buffering=auto",
+                crate::sql::ast::GistBuffering::On => "buffering=on",
+                crate::sql::ast::GistBuffering::Off => "buffering=off",
             },
             arena,
         )?;
@@ -21258,7 +21445,7 @@ fn index_attribute_options<'a>(
         return Ok(Datum::Null);
     }
     let options = info.operator_class_options[attribute];
-    let mut values = [Datum::Null; 3];
+    let mut values = [Datum::Null; 4];
     let mut count = 0;
     if let Some(value) = options.values_per_range {
         values[count] = text(
@@ -21279,6 +21466,10 @@ fn index_attribute_options<'a>(
             stack_format!(80, "false_positive_rate={}", value.as_str()).as_str(),
             arena,
         )?;
+        count += 1;
+    }
+    if let Some(value) = options.siglen {
+        values[count] = text(stack_format!(32, "siglen={value}").as_str(), arena)?;
         count += 1;
     }
     if count == 0 {
@@ -22807,6 +22998,20 @@ fn pg_opfamily<'a>(
         )?;
         count += 1;
     }
+    for (oid, name) in super::gist_catalog::FAMILIES {
+        rows[count] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(783),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -23256,6 +23461,24 @@ fn pg_opclass<'a>(
                 Datum::Int4(class.input_oid()),
                 Datum::Bool(class.is_default()),
                 Datum::Int4(class.input_oid()),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for class in super::types::GistOperatorClass::ALL {
+        rows[count] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(class.oid()),
+                Datum::Int4(783),
+                text(class.name(), arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(class.family_oid()),
+                Datum::Int4(class.input_oid()),
+                Datum::Bool(class.is_default()),
+                Datum::Int4(class.storage_oid()),
             ],
             arena,
         )?;
@@ -23964,6 +24187,26 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         count += 1;
     }
+    for &(oid, family, left, right, strategy, purpose, operator, sort_family) in
+        super::gist_catalog::OPERATORS
+    {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(strategy),
+                Datum::Bpchar(purpose),
+                Datum::Int4(operator),
+                Datum::Int4(783),
+                Datum::Int4(sort_family),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -24556,6 +24799,21 @@ fn pg_amproc<'a>(
         count += 1;
     }
     for (oid, family, left, right, number, procedure, name) in super::brin_catalog::PROCEDURES {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for &(oid, family, left, right, number, procedure, name) in super::gist_catalog::PROCEDURES {
         rows[count] = row(
             &[
                 Datum::Int4(2603),

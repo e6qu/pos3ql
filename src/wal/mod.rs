@@ -99,6 +99,7 @@ const KIND_RESET_UNLOGGED_RELATIONS: u8 = 130;
 /// User-defined logical decoding message. It is durable engine WAL but has no
 /// storage replay effect; pgoutput consumes it in command order.
 const KIND_LOGICAL_MESSAGE: u8 = 131;
+const KIND_BRIN_MAINTENANCE: u8 = 132;
 const KIND_SET_PUBLICATION_OWNER: u8 = 43;
 const KIND_RENAME_PUBLICATION: u8 = 44;
 const KIND_CREATE_ROUTINE: u8 = 45;
@@ -862,6 +863,7 @@ pub(crate) enum WalOp<'a> {
         explicit_collations: [bool; MAX_INDEX_COLS],
         operator_classes: [Option<crate::storage::IndexOperatorClass>; MAX_INDEX_COLS],
         resolved_operator_classes: [Option<crate::storage::IndexOperatorClass>; MAX_INDEX_COLS],
+        operator_class_options: [crate::storage::BrinOperatorClassOptions; MAX_INDEX_COLS],
         descending: [bool; MAX_INDEX_COLS],
         nulls_first: [bool; MAX_INDEX_COLS],
         n_cols: usize,
@@ -872,6 +874,16 @@ pub(crate) enum WalOp<'a> {
         predicate: Option<&'a str>,
         unique: bool,
         definition: crate::storage::IndexMutableDefinition,
+    },
+    /// Absolute unsummarized-range state for one BRIN index. Maintenance is
+    /// nontransactional, so a later commit can durably publish work left by a
+    /// rolled-back transaction without replaying a delta twice.
+    BrinMaintenance {
+        index_created_at: u64,
+        pages_per_range: u32,
+        summarized_until_page: u64,
+        unsummarized_ranges: [u64; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES],
+        range_count: u8,
     },
     AlterIndexDefinition {
         schema: &'a str,
@@ -2109,6 +2121,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
         WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
         WalOp::CreateIndex { .. } => KIND_CREATE_INDEX,
+        WalOp::BrinMaintenance { .. } => KIND_BRIN_MAINTENANCE,
         WalOp::AlterIndexDefinition { .. } => KIND_ALTER_INDEX_DEFINITION,
         WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
         WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
@@ -2692,6 +2705,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             predicate,
             n_include_cols,
             expressions,
+            operator_class_options,
             ..
         } => {
             8 + 1
@@ -2722,6 +2736,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + n_cols * 5
                 + 1
                 + n_cols * 5
+                + 1
+                + operator_class_options
+                    .iter()
+                    .take(*n_cols)
+                    .map(|options| {
+                        1 + 2 + 4 + 1 + options.false_positive_rate.map_or(0, |value| value.len())
+                    })
+                    .sum::<usize>()
                 + 3
                 + 2
                 + 2
@@ -2734,6 +2756,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 6
         }
+        WalOp::BrinMaintenance { range_count, .. } => 8 + 4 + 8 + 1 + usize::from(*range_count) * 8,
         WalOp::AlterIndexDefinition { schema, name, .. } => {
             1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 3 + 6
         }
@@ -4513,6 +4536,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             explicit_collations,
             operator_classes,
             resolved_operator_classes,
+            operator_class_options,
             descending,
             nulls_first,
             n_cols,
@@ -4604,9 +4628,44 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     None => false,
                 };
             }
+            ok &= buffer.append(&[0xac]);
+            for options in &operator_class_options[..*n_cols] {
+                let rate = options
+                    .false_positive_rate
+                    .as_ref()
+                    .map_or("", |value| value.as_str());
+                ok &= rate.len() <= u8::MAX as usize
+                    && buffer.append(&[u8::from(options.values_per_range.is_some())
+                        | (u8::from(options.n_distinct_per_range.is_some()) << 1)
+                        | (u8::from(options.false_positive_rate.is_some()) << 2)])
+                    && buffer.append(&options.values_per_range.unwrap_or(0).to_le_bytes())
+                    && buffer.append(&options.n_distinct_per_range.unwrap_or(0).to_le_bytes())
+                    && buffer.append(&[rate.len() as u8])
+                    && buffer.append(rate.as_bytes());
+            }
             ok &= buffer.append(&[0xaa, method.code()]);
             ok &= buffer.append(&[0xa8]);
             ok && append_index_definition(buffer, *definition)
+        }
+        WalOp::BrinMaintenance {
+            index_created_at,
+            pages_per_range,
+            summarized_until_page,
+            unsummarized_ranges,
+            range_count,
+        } => {
+            let count = usize::from(*range_count);
+            if count > crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES {
+                return false;
+            }
+            let mut ok = buffer.append(&index_created_at.to_le_bytes())
+                && buffer.append(&pages_per_range.to_le_bytes())
+                && buffer.append(&summarized_until_page.to_le_bytes())
+                && buffer.append(&[*range_count]);
+            for range in &unsummarized_ranges[..count] {
+                ok &= buffer.append(&range.to_le_bytes());
+            }
+            ok
         }
         WalOp::AlterIndexDefinition {
             schema,
@@ -8067,6 +8126,64 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     _ => return None,
                 };
             }
+            let mut operator_class_options =
+                [crate::storage::BrinOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
+            if payload.get(at) == Some(&0xac) {
+                at += 1;
+                for options in operator_class_options.iter_mut().take(n_cols) {
+                    let flags = *payload.get(at)?;
+                    at += 1;
+                    if flags & !0b111 != 0 {
+                        return None;
+                    }
+                    let values_per_range =
+                        u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    let n_distinct_per_range =
+                        i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                    at += 4;
+                    let rate_len = *payload.get(at)? as usize;
+                    at += 1;
+                    let rate = core::str::from_utf8(payload.get(at..at + rate_len)?).ok()?;
+                    at += rate_len;
+                    let false_positive_rate = if flags & 4 != 0 {
+                        let parsed = rate.parse::<f64>().ok()?;
+                        if !parsed.is_finite() || !(0.000_1..=0.25).contains(&parsed) {
+                            return None;
+                        }
+                        let stored = crate::util::StackStr::from_str(rate);
+                        if stored.is_truncated() {
+                            return None;
+                        }
+                        Some(stored)
+                    } else if rate_len == 0 {
+                        None
+                    } else {
+                        return None;
+                    };
+                    *options = crate::storage::BrinOperatorClassOptions {
+                        values_per_range: if flags & 1 != 0 {
+                            Some(
+                                (8..=256)
+                                    .contains(&values_per_range)
+                                    .then_some(values_per_range)?,
+                            )
+                        } else if values_per_range == 0 {
+                            None
+                        } else {
+                            return None;
+                        },
+                        n_distinct_per_range: if flags & 2 != 0 {
+                            Some((n_distinct_per_range >= -1).then_some(n_distinct_per_range)?)
+                        } else if n_distinct_per_range == 0 {
+                            None
+                        } else {
+                            return None;
+                        },
+                        false_positive_rate,
+                    };
+                }
+            }
             let method = if *payload.get(at)? == 0xaa {
                 at += 1;
                 let method = crate::sql::ast::IndexAccessMethod::from_code(*payload.get(at)?)?;
@@ -8093,6 +8210,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 explicit_collations,
                 operator_classes,
                 resolved_operator_classes,
+                operator_class_options,
                 descending,
                 nulls_first,
                 n_cols,
@@ -8101,6 +8219,35 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 predicate,
                 unique,
                 definition,
+            })
+        }
+        KIND_BRIN_MAINTENANCE => {
+            let index_created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let pages_per_range = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if !(1..=131_072).contains(&pages_per_range) {
+                return None;
+            }
+            let summarized_until_page =
+                u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            if count > crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES {
+                return None;
+            }
+            let mut unsummarized_ranges = [0; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES];
+            for range in unsummarized_ranges.iter_mut().take(count) {
+                *range = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+            }
+            (at == payload.len()).then_some(WalOp::BrinMaintenance {
+                index_created_at,
+                pages_per_range,
+                summarized_until_page,
+                unsummarized_ranges,
+                range_count: count as u8,
             })
         }
         KIND_ALTER_INDEX_DEFINITION => {
@@ -12880,6 +13027,8 @@ mod tests {
             resolved_operator_classes: [Some(crate::storage::IndexOperatorClass::Btree(
                 BtreeOperatorClass::Text,
             )); MAX_INDEX_COLS],
+            operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+                MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],
             n_cols: 1,
@@ -12953,6 +13102,8 @@ mod tests {
             explicit_collations: [false; MAX_INDEX_COLS],
             operator_classes: [Some(hash_class); MAX_INDEX_COLS],
             resolved_operator_classes: [Some(hash_class); MAX_INDEX_COLS],
+            operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+                MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],
             n_cols: 1,
@@ -12976,6 +13127,42 @@ mod tests {
         assert_eq!(method, crate::sql::ast::IndexAccessMethod::Hash);
         assert_eq!(operator_classes[0], Some(hash_class));
         assert_eq!(resolved_operator_classes[0], Some(hash_class));
+    }
+
+    #[test]
+    fn brin_maintenance_payload_round_trips_absolute_bounded_state() {
+        let mut ranges = [0; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES];
+        ranges[0] = 32;
+        ranges[1] = 96;
+        let operation = WalOp::BrinMaintenance {
+            index_created_at: 44,
+            pages_per_range: 32,
+            summarized_until_page: 128,
+            unsummarized_ranges: ranges,
+            range_count: 2,
+        };
+        let mut bytes = [0; 4096];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        let Some(WalOp::BrinMaintenance {
+            index_created_at,
+            pages_per_range,
+            summarized_until_page,
+            unsummarized_ranges,
+            range_count,
+        }) = decode_op(KIND_BRIN_MAINTENANCE, payload)
+        else {
+            panic!("BRIN maintenance WAL payload must decode");
+        };
+        assert_eq!(index_created_at, 44);
+        assert_eq!(pages_per_range, 32);
+        assert_eq!(summarized_until_page, 128);
+        assert_eq!(range_count, 2);
+        assert_eq!(&unsummarized_ranges[..2], &[32, 96]);
+
+        let mut corrupt = [0; 1024];
+        corrupt[..payload.len()].copy_from_slice(payload);
+        corrupt[20] = (crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES + 1) as u8;
+        assert!(decode_op(KIND_BRIN_MAINTENANCE, &corrupt[..payload.len()]).is_none());
     }
 
     #[test]

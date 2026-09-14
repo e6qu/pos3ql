@@ -8565,6 +8565,32 @@ impl SequenceDef {
 
 /// Maximum columns in an index key.
 pub(crate) const MAX_INDEX_COLS: usize = 8;
+pub(crate) const MAX_BRIN_UNSUMMARIZED_RANGES: usize = 64;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BrinMaintenanceState {
+    pub(crate) index_created_at: u64,
+    /// Physical range geometry captured when the index was built. ALTERing
+    /// the reloption affects a future rebuild, not existing summary tuples.
+    pub(crate) pages_per_range: u32,
+    /// Exclusive logical page boundary covered when the index was built or
+    /// new ranges were last discovered. It is rounded to pages_per_range.
+    pub(crate) summarized_until_page: u64,
+    pub(crate) ranges: [u64; MAX_BRIN_UNSUMMARIZED_RANGES],
+    pub(crate) count: u8,
+    pub(crate) wal_dirty: bool,
+}
+
+impl BrinMaintenanceState {
+    const EMPTY: Self = Self {
+        index_created_at: 0,
+        pages_per_range: 0,
+        summarized_until_page: 0,
+        ranges: [0; MAX_BRIN_UNSUMMARIZED_RANGES],
+        count: 0,
+        wal_dirty: false,
+    };
+}
 
 /// Comparison contract selected for one explicit btree index key.
 ///
@@ -8859,6 +8885,29 @@ pub struct IndexStorageOptions {
     pub autosummarize: Option<bool>,
 }
 
+/// Durable options for one BRIN operator class. PostgreSQL stores these on
+/// the index attribute, so they remain immutable with the key definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BrinOperatorClassOptions {
+    pub values_per_range: Option<u16>,
+    pub n_distinct_per_range: Option<i32>,
+    pub false_positive_rate: Option<StackStr<32>>,
+}
+
+impl BrinOperatorClassOptions {
+    pub(crate) const DEFAULT: Self = Self {
+        values_per_range: None,
+        n_distinct_per_range: None,
+        false_positive_rate: None,
+    };
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.values_per_range.is_none()
+            && self.n_distinct_per_range.is_none()
+            && self.false_positive_rate.is_none()
+    }
+}
+
 impl IndexStorageOptions {
     pub const DEFAULT: Self = Self {
         fillfactor: None,
@@ -8944,6 +8993,7 @@ pub struct IndexDef {
     pub explicit_collations: [bool; MAX_INDEX_COLS],
     pub(crate) operator_classes: [Option<IndexOperatorClass>; MAX_INDEX_COLS],
     pub(crate) resolved_operator_classes: [Option<IndexOperatorClass>; MAX_INDEX_COLS],
+    pub(crate) operator_class_options: [BrinOperatorClassOptions; MAX_INDEX_COLS],
     pub descending: [bool; MAX_INDEX_COLS],
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -11001,6 +11051,7 @@ pub struct Storage {
     enums: FixedVec<EnumDef>,
     composites: FixedVec<CompositeDef>,
     indexes: FixedVec<IndexDef>,
+    brin_maintenance: std::cell::RefCell<FixedVec<BrinMaintenanceState>>,
     databases: FixedVec<DatabaseDef>,
     current_database: DatabaseOid,
     current_connection_id: Cell<i32>,
@@ -14697,6 +14748,7 @@ impl Storage {
         let parameter_acl_entries =
             FixedVec::new(budget, "parameter_acl_entries", MAX_PARAMETER_ACL_ENTRIES)?;
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
+        let mut brin_maintenance = FixedVec::new(budget, "brin_maintenance", config.max_tables)?;
         for _ in 0..config.max_tables {
             indexes
                 .push(IndexDef {
@@ -14715,6 +14767,7 @@ impl Storage {
                     explicit_collations: [false; MAX_INDEX_COLS],
                     operator_classes: [None; MAX_INDEX_COLS],
                     resolved_operator_classes: [None; MAX_INDEX_COLS],
+                    operator_class_options: [BrinOperatorClassOptions::DEFAULT; MAX_INDEX_COLS],
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
@@ -14726,6 +14779,9 @@ impl Storage {
                     pending_definition: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
+                .expect("sized to max_tables");
+            brin_maintenance
+                .push(BrinMaintenanceState::EMPTY)
                 .expect("sized to max_tables");
         }
         let mut databases = FixedVec::new(budget, "databases", MAX_DATABASES)?;
@@ -14922,6 +14978,7 @@ impl Storage {
             enums,
             composites,
             indexes,
+            brin_maintenance: std::cell::RefCell::new(brin_maintenance),
             databases,
             current_database: DatabaseOid::POSTGRES,
             current_connection_id: Cell::new(0),
@@ -25813,6 +25870,236 @@ impl Storage {
         })
     }
 
+    fn brin_logical_page_count(&self, index_slot: usize, txid: u32) -> Result<u64, SqlError> {
+        let index = self
+            .index_visible_to(index_slot, txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+        if index.method != crate::sql::ast::IndexAccessMethod::Brin
+            || !matches!(index.mutable_for(txid).kind, IndexKind::Ordinary)
+        {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a BRIN index",
+                index.name_for(txid).as_str()
+            ));
+        }
+        let table = self
+            .index_table_slot_to(index_slot, txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index table does not exist"))?;
+        let rows = self.visible_row_count(table, txid)?;
+        Ok((rows as u64).div_ceil(128))
+    }
+
+    fn brin_range_start(
+        &self,
+        index_slot: usize,
+        block: u64,
+        txid: u32,
+    ) -> Result<Option<u64>, SqlError> {
+        let pages = self.brin_logical_page_count(index_slot, txid)?;
+        if block >= pages {
+            return Ok(None);
+        }
+        let pages_per_range = u64::from(self.brin_maintenance.borrow()[index_slot].pages_per_range);
+        debug_assert_ne!(pages_per_range, 0, "visible BRIN has build geometry");
+        Ok(Some(block / pages_per_range * pages_per_range))
+    }
+
+    fn brin_discover_new_ranges(&self, index_slot: usize, txid: u32) -> Result<(), SqlError> {
+        let pages = self.brin_logical_page_count(index_slot, txid)?;
+        let index = self
+            .index_visible_to(index_slot, txid)
+            .expect("BRIN page count validated the index");
+        let created_at = index.created_at;
+        let configured_pages_per_range = index
+            .mutable_for(txid)
+            .options
+            .pages_per_range
+            .unwrap_or(128);
+        let mut states = self.brin_maintenance.borrow_mut();
+        let state = &mut states[index_slot];
+        if state.index_created_at != created_at {
+            let pages_per_range = u64::from(configured_pages_per_range);
+            let covered_end = pages.max(1).div_ceil(pages_per_range) * pages_per_range;
+            *state = BrinMaintenanceState {
+                index_created_at: created_at,
+                pages_per_range: configured_pages_per_range,
+                summarized_until_page: covered_end,
+                ..BrinMaintenanceState::EMPTY
+            };
+            return Ok(());
+        }
+        let pages_per_range = u64::from(state.pages_per_range);
+        debug_assert_ne!(pages_per_range, 0, "visible BRIN has build geometry");
+        let covered_end = pages.max(1).div_ceil(pages_per_range) * pages_per_range;
+        if covered_end <= state.summarized_until_page {
+            return Ok(());
+        }
+        let additional = ((covered_end - state.summarized_until_page) / pages_per_range) as usize;
+        if usize::from(state.count) + additional > state.ranges.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "BRIN unsummarized ranges exceed the startup-bound limit ({})",
+                state.ranges.len()
+            ));
+        }
+        let mut range = state.summarized_until_page;
+        while range < covered_end {
+            state.ranges[usize::from(state.count)] = range;
+            state.count += 1;
+            range += pages_per_range;
+        }
+        state.summarized_until_page = covered_end;
+        state.wal_dirty = true;
+        Ok(())
+    }
+
+    pub(crate) fn brin_desummarize_range(
+        &self,
+        index_slot: usize,
+        block: u64,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        self.brin_discover_new_ranges(index_slot, txid)?;
+        let Some(range) = self.brin_range_start(index_slot, block, txid)? else {
+            return Ok(());
+        };
+        let created_at = self.indexes[index_slot].created_at;
+        let mut states = self.brin_maintenance.borrow_mut();
+        let state = &mut states[index_slot];
+        if state.index_created_at != created_at {
+            *state = BrinMaintenanceState {
+                index_created_at: created_at,
+                ..BrinMaintenanceState::EMPTY
+            };
+        }
+        if state.ranges[..usize::from(state.count)].contains(&range) {
+            return Ok(());
+        }
+        if usize::from(state.count) == state.ranges.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "BRIN unsummarized ranges exceed the startup-bound limit ({})",
+                state.ranges.len()
+            ));
+        }
+        state.ranges[usize::from(state.count)] = range;
+        state.count += 1;
+        state.wal_dirty = true;
+        Ok(())
+    }
+
+    pub(crate) fn brin_summarize_range(
+        &self,
+        index_slot: usize,
+        block: u64,
+        txid: u32,
+    ) -> Result<i32, SqlError> {
+        self.brin_discover_new_ranges(index_slot, txid)?;
+        let Some(range) = self.brin_range_start(index_slot, block, txid)? else {
+            return Ok(0);
+        };
+        let mut states = self.brin_maintenance.borrow_mut();
+        let state = &mut states[index_slot];
+        let Some(position) = state.ranges[..usize::from(state.count)]
+            .iter()
+            .position(|candidate| *candidate == range)
+        else {
+            return Ok(0);
+        };
+        let last = usize::from(state.count) - 1;
+        state.ranges[position] = state.ranges[last];
+        state.ranges[last] = 0;
+        state.count -= 1;
+        state.wal_dirty = true;
+        Ok(1)
+    }
+
+    pub(crate) fn brin_summarize_new_values(
+        &self,
+        index_slot: usize,
+        txid: u32,
+    ) -> Result<i32, SqlError> {
+        self.brin_discover_new_ranges(index_slot, txid)?;
+        let mut states = self.brin_maintenance.borrow_mut();
+        let state = &mut states[index_slot];
+        let count = i32::from(state.count);
+        if count != 0 {
+            state.ranges.fill(0);
+            state.count = 0;
+            state.wal_dirty = true;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn brin_maintenance_state(&self, index_slot: usize) -> BrinMaintenanceState {
+        self.brin_maintenance.borrow()[index_slot]
+    }
+
+    pub(crate) fn rebuild_brin_maintenance(
+        &self,
+        index_slot: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let pages = self.brin_logical_page_count(index_slot, txid)?.max(1);
+        let index = self
+            .index_visible_to(index_slot, txid)
+            .expect("BRIN page count validated the index");
+        let pages_per_range = index
+            .mutable_for(txid)
+            .options
+            .pages_per_range
+            .unwrap_or(128);
+        self.brin_maintenance.borrow_mut()[index_slot] = BrinMaintenanceState {
+            index_created_at: index.created_at,
+            pages_per_range,
+            summarized_until_page: pages.div_ceil(u64::from(pages_per_range))
+                * u64::from(pages_per_range),
+            wal_dirty: true,
+            ..BrinMaintenanceState::EMPTY
+        };
+        Ok(())
+    }
+
+    pub(crate) fn clear_brin_maintenance_dirty(&self, index_slot: usize) {
+        self.brin_maintenance.borrow_mut()[index_slot].wal_dirty = false;
+    }
+
+    pub(crate) fn restore_brin_maintenance(
+        &self,
+        index_slot: usize,
+        pages_per_range: u32,
+        summarized_until_page: u64,
+        ranges: &[u64],
+    ) -> Result<(), SqlError> {
+        if self.indexes[index_slot].method != crate::sql::ast::IndexAccessMethod::Brin
+            || !(1..=131_072).contains(&pages_per_range)
+            || summarized_until_page == 0
+            || !summarized_until_page.is_multiple_of(u64::from(pages_per_range))
+            || ranges.len() > MAX_BRIN_UNSUMMARIZED_RANGES
+            || ranges.iter().enumerate().any(|(position, range)| {
+                *range >= summarized_until_page
+                    || !range.is_multiple_of(u64::from(pages_per_range))
+                    || ranges[..position].contains(range)
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "invalid BRIN maintenance state"
+            ));
+        }
+        let mut states = self.brin_maintenance.borrow_mut();
+        let state = &mut states[index_slot];
+        state.index_created_at = self.indexes[index_slot].created_at;
+        state.pages_per_range = pages_per_range;
+        state.summarized_until_page = summarized_until_page;
+        state.ranges.fill(0);
+        state.ranges[..ranges.len()].copy_from_slice(ranges);
+        state.count = ranges.len() as u8;
+        state.wal_dirty = false;
+        Ok(())
+    }
+
     pub(crate) fn value_binding_cache_complete(&self, table_index: usize, binding: usize) -> bool {
         self.tables[table_index].enforcers[binding].is_some_and(|enforcer| {
             self.value_indexes
@@ -26442,7 +26729,11 @@ impl Storage {
                 continue;
             }
             let columns = &index.columns[..index.n_cols];
-            let special = index.predicate.is_some()
+            // BRIN must retain its concrete catalog identity even for plain
+            // columns: inclusion operator classes and summary maintenance
+            // have semantics a generic equality/range binding cannot infer.
+            let special = index.method == crate::sql::ast::IndexAccessMethod::Brin
+                || index.predicate.is_some()
                 || index.expressions[..index.n_cols]
                     .iter()
                     .any(Option::is_some)
@@ -36179,6 +36470,9 @@ impl Storage {
             crate::sql::ast::IndexAccessMethod::Btree => {
                 if def.mutable.options.pages_per_range.is_some()
                     || def.mutable.options.autosummarize.is_some()
+                    || def.operator_class_options[..def.n_cols]
+                        .iter()
+                        .any(|options| !options.is_empty())
                     || def.resolved_operator_classes[..def.n_cols]
                         .iter()
                         .any(|class| {
@@ -36203,6 +36497,9 @@ impl Storage {
                     || def.n_include_cols != 0
                     || def.descending[..def.n_cols].iter().any(|value| *value)
                     || def.nulls_first[..def.n_cols].iter().any(|value| *value)
+                    || def.operator_class_options[..def.n_cols]
+                        .iter()
+                        .any(|options| !options.is_empty())
                     || def.resolved_operator_classes[..def.n_cols]
                         .iter()
                         .any(|class| !matches!(class, Some(IndexOperatorClass::Hash(_))))
@@ -36228,6 +36525,25 @@ impl Storage {
                     || def.resolved_operator_classes[..def.n_cols]
                         .iter()
                         .any(|class| !matches!(class, Some(IndexOperatorClass::Brin(_))))
+                    || def.resolved_operator_classes[..def.n_cols]
+                        .iter()
+                        .zip(&def.operator_class_options[..def.n_cols])
+                        .any(|(class, options)| match class {
+                            Some(IndexOperatorClass::Brin(class)) => match class.kind() {
+                                crate::sql::types::BrinOperatorClassKind::MinmaxMulti => {
+                                    options.n_distinct_per_range.is_some()
+                                        || options.false_positive_rate.is_some()
+                                }
+                                crate::sql::types::BrinOperatorClassKind::Bloom => {
+                                    options.values_per_range.is_some()
+                                }
+                                crate::sql::types::BrinOperatorClassKind::Minmax
+                                | crate::sql::types::BrinOperatorClassKind::Inclusion => {
+                                    !options.is_empty()
+                                }
+                            },
+                            _ => true,
+                        })
                 {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
@@ -36292,6 +36608,27 @@ impl Storage {
                 def.name.as_str()
             ));
         }
+        let brin_summarized_until_page = if def.method == crate::sql::ast::IndexAccessMethod::Brin {
+            let table = self
+                .find_visible(def.schema.as_str(), def.table.as_str(), txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "relation \"{}\" does not exist",
+                        def.table.as_str()
+                    )
+                })?;
+            // PostgreSQL's freshly built empty BRIN index already owns the
+            // first heap range; inserts into that range update its summary
+            // rather than making it a newly unsummarized range.
+            let pages = (self.visible_row_count(table, txid)? as u64)
+                .div_ceil(128)
+                .max(1);
+            let pages_per_range = u64::from(def.mutable.options.pages_per_range.unwrap_or(128));
+            pages.div_ceil(pages_per_range) * pages_per_range
+        } else {
+            0
+        };
         let Some(i) = self
             .indexes
             .iter()
@@ -36321,6 +36658,12 @@ impl Storage {
             pending_definition: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
             ..def
+        };
+        self.brin_maintenance.borrow_mut()[i] = BrinMaintenanceState {
+            index_created_at: created_at,
+            pages_per_range: def.mutable.options.pages_per_range.unwrap_or(128),
+            summarized_until_page: brin_summarized_until_page,
+            ..BrinMaintenanceState::EMPTY
         };
         Ok(i)
     }

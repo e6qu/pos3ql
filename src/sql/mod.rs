@@ -4692,6 +4692,42 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        // BRIN summarize/desummarize operations are deliberately
+        // nontransactional. Publish their absolute state on this or any later
+        // successful commit, just like sequence advances.
+        for slot in 0..self.storage.index_count() {
+            let Some(index) = self.storage.index_visible_to(slot, txn.txid) else {
+                continue;
+            };
+            let state = self.storage.brin_maintenance_state(slot);
+            if !state.wal_dirty || state.index_created_at != index.created_at {
+                continue;
+            }
+            let Some(table) = self.storage.index_table_slot_to(slot, txn.txid) else {
+                continue;
+            };
+            if self.storage.table_def(table, txn.txid).persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                continue;
+            }
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::BrinMaintenance {
+                    index_created_at: state.index_created_at,
+                    pages_per_range: state.pages_per_range,
+                    summarized_until_page: state.summarized_until_page,
+                    unsummarized_ranges: state.ranges,
+                    range_count: state.count,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         // pg_statistic column rows are transactional, but PostgreSQL updates
         // pg_class reltuples/relpages in place. A later commit therefore also
         // journals relation statistics left dirty by a rolled-back ANALYZE.
@@ -5367,6 +5403,17 @@ impl Engine {
             let sequence = self.storage.sequence(i);
             if sequence.visible_to(txn.txid) {
                 self.storage.clear_sequence_value_dirty(i, txn.txid);
+            }
+        }
+        for slot in 0..self.storage.index_count() {
+            if self
+                .storage
+                .index_visible_to(slot, txn.txid)
+                .is_some_and(|index| {
+                    self.storage.brin_maintenance_state(slot).index_created_at == index.created_at
+                })
+            {
+                self.storage.clear_brin_maintenance_dirty(slot);
             }
         }
         for slot in 0..self.storage.table_count() {
@@ -20174,6 +20221,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             explicit_collations,
             operator_classes,
             resolved_operator_classes,
+            operator_class_options,
             descending,
             nulls_first,
             n_cols,
@@ -20207,6 +20255,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     explicit_collations,
                     operator_classes,
                     resolved_operator_classes,
+                    operator_class_options,
                     descending,
                     nulls_first,
                     n_cols,
@@ -20223,6 +20272,33 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 0,
             )?;
             storage.commit_index_create(slot);
+        }
+        WalOp::BrinMaintenance {
+            index_created_at,
+            pages_per_range,
+            summarized_until_page,
+            unsummarized_ranges,
+            range_count,
+        } => {
+            let slot = (0..storage.index_count())
+                .find(|slot| {
+                    storage
+                        .index_visible_to(*slot, 0)
+                        .is_some_and(|index| index.created_at == index_created_at)
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "journal references unknown BRIN index {}",
+                        index_created_at
+                    )
+                })?;
+            storage.restore_brin_maintenance(
+                slot,
+                pages_per_range,
+                summarized_until_page,
+                &unsummarized_ranges[..usize::from(range_count)],
+            )?;
         }
         WalOp::AlterIndexDefinition {
             schema,

@@ -812,6 +812,7 @@ struct IndexConstraintSet<'a> {
     equality: Option<IndexConstraint<'a>>,
     lower: Option<IndexConstraint<'a>>,
     upper: Option<IndexConstraint<'a>>,
+    inclusion: Option<IndexConstraint<'a>>,
 }
 
 impl IndexConstraintSet<'_> {
@@ -819,6 +820,7 @@ impl IndexConstraintSet<'_> {
         equality: None,
         lower: None,
         upper: None,
+        inclusion: None,
     };
 }
 
@@ -838,6 +840,10 @@ pub(crate) struct IndexAccessPlan<'a> {
     n_columns: usize,
     n_constraints: usize,
     exact: bool,
+    /// False when BRIN has any desummarized range. The compact physical key
+    /// remains usable for exact entry filtering, but no immutable block may
+    /// be skipped from its extrema until maintenance restores every summary.
+    prune_blocks: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -899,9 +905,11 @@ impl IndexAccessPlan<'_> {
     ) -> u64 {
         let statistics = storage.table_statistics(slot, txid);
         let mut expected_rows = storage.planning_row_estimate(slot).max(1);
-        for position in 0..self.n_constraints {
+        for position in 0..self.n_columns {
             let column = self.columns[position] as usize;
-            let constraint = self.constraints[position].expect("counted constraint");
+            let Some(constraint) = self.constraints[position] else {
+                continue;
+            };
             if self.expression_mask & (1 << position) == 0
                 && statistics.valid
                 && statistics.columns[column].valid
@@ -916,6 +924,8 @@ impl IndexAccessPlan<'_> {
                     (statistics.rows as f64 / distinct.max(1.0)).ceil().max(1.0) as u64;
                 expected_rows = expected_rows.min(if constraint.operator == BinaryOp::Eq {
                     equality_rows
+                } else if is_brin_inclusion_operator(constraint.operator) {
+                    statistics.rows.div_ceil(16).max(1)
                 } else if self.additional_constraints[position].is_some() {
                     // PostgreSQL's default inequality selectivity is one
                     // third. Independent lower and upper bounds narrow the
@@ -927,6 +937,8 @@ impl IndexAccessPlan<'_> {
                 });
             } else if constraint.operator == BinaryOp::Eq {
                 expected_rows = 1;
+            } else if is_brin_inclusion_operator(constraint.operator) {
+                expected_rows = expected_rows.div_ceil(16).max(1);
             }
         }
         expected_rows
@@ -939,8 +951,32 @@ fn reverse_index_operator(operator: BinaryOp) -> BinaryOp {
         BinaryOp::LtEq => BinaryOp::GtEq,
         BinaryOp::Gt => BinaryOp::Lt,
         BinaryOp::GtEq => BinaryOp::LtEq,
+        BinaryOp::Contains => BinaryOp::ContainedBy,
+        BinaryOp::ContainedBy => BinaryOp::Contains,
+        BinaryOp::NetContainedEq => BinaryOp::NetContainsEq,
+        BinaryOp::NetContainsEq => BinaryOp::NetContainedEq,
+        BinaryOp::Shl => BinaryOp::Shr,
+        BinaryOp::Shr => BinaryOp::Shl,
+        BinaryOp::NotRightOf => BinaryOp::NotLeftOf,
+        BinaryOp::NotLeftOf => BinaryOp::NotRightOf,
         other => other,
     }
+}
+
+fn is_brin_inclusion_operator(operator: BinaryOp) -> bool {
+    matches!(
+        operator,
+        BinaryOp::Contains
+            | BinaryOp::ContainedBy
+            | BinaryOp::Overlaps
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::NotRightOf
+            | BinaryOp::NotLeftOf
+            | BinaryOp::Adjacent
+            | BinaryOp::NetContainedEq
+            | BinaryOp::NetContainsEq
+    )
 }
 
 fn collect_index_constraints<'a, Resolve, Invariant>(
@@ -973,7 +1009,8 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
     if !matches!(
         operator,
         BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
-    ) {
+    ) && !is_brin_inclusion_operator(*operator)
+    {
         return;
     }
     let mut bind = |column: &'a Expr<'a>, operand: &'a Expr<'a>, operator: BinaryOp| {
@@ -994,6 +1031,9 @@ fn collect_index_constraints<'a, Resolve, Invariant>(
             }
             BinaryOp::Lt | BinaryOp::LtEq => {
                 set.upper.get_or_insert(replacement);
+            }
+            operator if is_brin_inclusion_operator(operator) => {
+                set.inclusion.get_or_insert(replacement);
             }
             _ => unreachable!("filtered index operator"),
         }
@@ -1372,6 +1412,7 @@ fn index_access_plan_for_binding<'a>(
         n_columns,
         n_constraints,
         exact,
+        prune_blocks: true,
     })
 }
 
@@ -1442,6 +1483,7 @@ where
         let mut constraints = [None; MAX_INDEX_COLS];
         let mut additional_constraints = [None; MAX_INDEX_COLS];
         let mut n_constraints = 0usize;
+        let brin = index.method == crate::sql::ast::IndexAccessMethod::Brin;
         let mut exact = true;
         for position in 0..index.n_cols {
             let set = by_key[position];
@@ -1450,18 +1492,36 @@ where
                 n_constraints += 1;
                 continue;
             }
-            let Some(range) = set.lower.or(set.upper) else {
+            if let Some(range) = set.lower.or(set.upper) {
+                constraints[position] = Some(range);
+                additional_constraints[position] = match (set.lower, set.upper) {
+                    (Some(_), Some(upper)) => Some(upper),
+                    _ => None,
+                };
+                n_constraints += 1;
                 exact = false;
-                break;
-            };
-            constraints[position] = Some(range);
-            additional_constraints[position] = match (set.lower, set.upper) {
-                (Some(_), Some(upper)) => Some(upper),
-                _ => None,
-            };
-            n_constraints += 1;
+                if !brin {
+                    break;
+                }
+                continue;
+            }
+            if brin
+                && let Some(inclusion) = set.inclusion
+                && matches!(
+                    index.resolved_operator_classes[position],
+                    Some(crate::storage::IndexOperatorClass::Brin(class))
+                        if class.kind() == crate::sql::types::BrinOperatorClassKind::Inclusion
+                )
+            {
+                constraints[position] = Some(inclusion);
+                n_constraints += 1;
+                exact = false;
+                continue;
+            }
             exact = false;
-            break;
+            if !brin {
+                break;
+            }
         }
         exact &= n_constraints == index.n_cols;
         match index.method {
@@ -1513,6 +1573,13 @@ where
             n_columns: index.n_cols,
             n_constraints,
             exact,
+            prune_blocks: if brin {
+                storage
+                    .index_slot(index.schema.as_str(), index.name_for(txid).as_str(), txid)
+                    .is_none_or(|index_slot| storage.brin_maintenance_state(index_slot).count == 0)
+            } else {
+                true
+            },
         };
         if let Some((targets, order)) = required_order {
             let equality_prefix = plan.constraints[..plan.n_constraints]
@@ -1785,9 +1852,9 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     // A statement-invariant key belongs to a once-per-statement scan, not a
     // probe repeated for every outer row. Leaving that shape to the hash or
     // ordinary plan avoids rereading the same cold index blocks N times.
-    let uses_bound_row = plan.constraints[..plan.n_constraints]
+    let uses_bound_row = plan.constraints[..plan.n_columns]
         .iter()
-        .chain(plan.additional_constraints[..plan.n_constraints].iter())
+        .chain(plan.additional_constraints[..plan.n_columns].iter())
         .flatten()
         .any(|constraint| {
             operand_bindings(constraint.operand)
@@ -1796,7 +1863,10 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     if !uses_bound_row {
         return Ok(None);
     }
-    for position in 0..plan.n_constraints {
+    for position in 0..plan.n_columns {
+        if plan.constraints[position].is_none() {
+            continue;
+        }
         let target_collation = plan.collations[position];
         if !plan.key_types[position].is_collatable() {
             continue;
@@ -2218,7 +2288,10 @@ fn indexed_candidates_for_plan<'a>(
     let mut values = [[Datum::Null; MAX_INDEX_COLS]; 2];
     let mut types = [ColType::Bool; MAX_INDEX_COLS];
     let mut collations = [Collation::None; MAX_INDEX_COLS];
-    for position in 0..plan.n_constraints {
+    for position in 0..plan.n_columns {
+        if plan.constraints[position].is_none() {
+            continue;
+        }
         let target_type = plan.key_types[position];
         for (bound, constraint) in [
             plan.constraints[position],
@@ -2276,16 +2349,25 @@ fn indexed_candidates_for_plan<'a>(
     types[..plan.n_columns].copy_from_slice(&plan.key_types[..plan.n_columns]);
     collations[..plan.n_columns].copy_from_slice(&plan.collations[..plan.n_columns]);
     let key_position = |key: &[u8]| -> Result<crate::store::ValueIndexPosition, SqlError> {
-        use crate::store::ValueIndexPosition::{After, Before, Match};
+        use crate::store::ValueIndexPosition::{After, Before, Match, Recheck};
         let mut decoded = [Datum::Null; MAX_INDEX_COLS];
         rowenc::decode(
             key,
             &types[..plan.n_columns],
             &mut decoded[..plan.n_columns],
         )?;
-        for position in 0..plan.n_constraints {
+        for position in 0..plan.n_columns {
+            if plan.constraints[position].is_none() {
+                continue;
+            }
+            let special = plan.constraints[position]
+                .is_some_and(|constraint| is_brin_inclusion_operator(constraint.operator));
             if decoded[position].is_null() {
-                return Ok(Before);
+                return Ok(if special || !plan.prune_blocks {
+                    Recheck
+                } else {
+                    Before
+                });
             }
             for (bound, constraint) in [
                 plan.constraints[position],
@@ -2297,6 +2379,25 @@ fn indexed_candidates_for_plan<'a>(
                 let Some(constraint) = constraint else {
                     continue;
                 };
+                if is_brin_inclusion_operator(constraint.operator) {
+                    match super::super::eval::binary(
+                        constraint.operator,
+                        decoded[position],
+                        values[bound][position],
+                        false,
+                        false,
+                        arena,
+                    )? {
+                        Datum::Bool(true) => continue,
+                        Datum::Bool(false) | Datum::Null => return Ok(Recheck),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "BRIN inclusion operator did not return boolean"
+                            ));
+                        }
+                    }
+                }
                 let ordering = compare_datums_collated(
                     storage,
                     collations[position],
@@ -2304,13 +2405,25 @@ fn indexed_candidates_for_plan<'a>(
                     &values[bound][position],
                 )?;
                 match constraint.operator {
-                    BinaryOp::Eq if ordering.is_lt() => return Ok(Before),
-                    BinaryOp::Eq if ordering.is_gt() => return Ok(After),
+                    BinaryOp::Eq if ordering.is_lt() => {
+                        return Ok(if plan.prune_blocks { Before } else { Recheck });
+                    }
+                    BinaryOp::Eq if ordering.is_gt() => {
+                        return Ok(if plan.prune_blocks { After } else { Recheck });
+                    }
                     BinaryOp::Eq => {}
-                    BinaryOp::Lt if !ordering.is_lt() => return Ok(After),
-                    BinaryOp::LtEq if !ordering.is_le() => return Ok(After),
-                    BinaryOp::Gt if !ordering.is_gt() => return Ok(Before),
-                    BinaryOp::GtEq if !ordering.is_ge() => return Ok(Before),
+                    BinaryOp::Lt if !ordering.is_lt() => {
+                        return Ok(if plan.prune_blocks { After } else { Recheck });
+                    }
+                    BinaryOp::LtEq if !ordering.is_le() => {
+                        return Ok(if plan.prune_blocks { After } else { Recheck });
+                    }
+                    BinaryOp::Gt if !ordering.is_gt() => {
+                        return Ok(if plan.prune_blocks { Before } else { Recheck });
+                    }
+                    BinaryOp::GtEq if !ordering.is_ge() => {
+                        return Ok(if plan.prune_blocks { Before } else { Recheck });
+                    }
                     BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {}
                     _ => unreachable!("filtered comparison"),
                 }

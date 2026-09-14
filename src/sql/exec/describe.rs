@@ -3592,6 +3592,8 @@ pub fn infer_type_res(
             "pg_visible_in_snapshot" | "txid_visible_in_snapshot" => of(ColType::Bool),
             "pg_xact_status" | "txid_status" => of(ColType::Text),
             "pg_backend_pid" => of(ColType::Int4),
+            "brin_summarize_new_values" | "brin_summarize_range" => of(ColType::Int4),
+            "brin_desummarize_range" => of(ColType::Void),
             "pg_cancel_backend" | "pg_terminate_backend" => of(ColType::Bool),
             "pg_listening_channels" => of(ColType::Text),
             "pg_notification_queue_usage" => of(ColType::Float8),

@@ -1807,6 +1807,30 @@ pub struct IndexStorageOptions {
     pub autosummarize: Option<bool>,
 }
 
+/// Options attached to one BRIN operator class invocation. These live on an
+/// index attribute (`pg_attribute.attoptions`), not on the index relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrinOperatorClassOptions<'a> {
+    pub values_per_range: Option<u16>,
+    pub n_distinct_per_range: Option<i32>,
+    /// Retain PostgreSQL's decimal spelling for catalog deparse.
+    pub false_positive_rate: Option<&'a str>,
+}
+
+impl BrinOperatorClassOptions<'_> {
+    pub const DEFAULT: Self = Self {
+        values_per_range: None,
+        n_distinct_per_range: None,
+        false_positive_rate: None,
+    };
+
+    pub const fn is_empty(self) -> bool {
+        self.values_per_range.is_none()
+            && self.n_distinct_per_range.is_none()
+            && self.false_positive_rate.is_none()
+    }
+}
+
 impl IndexStorageOptions {
     pub const DEFAULT: Self = Self {
         fillfactor: None,
@@ -2716,6 +2740,7 @@ pub struct IndexColumn<'a> {
     pub expression_text: &'a str,
     pub collation: Option<ParsedCollation<'a>>,
     pub operator_class: Option<QualName<'a>>,
+    pub operator_class_options: BrinOperatorClassOptions<'a>,
     pub descending: bool,
     pub ordering_specified: bool,
     pub nulls_first: bool,

@@ -46896,7 +46896,9 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
          CREATE INDEX brin_events_sequence ON brin_events USING brin (sequence)
              WITH (pages_per_range=32, autosummarize=yes);
          CREATE INDEX brin_events_active_category ON brin_events USING brin
-             (lower(category) text_bloom_ops, sequence int4_minmax_multi_ops)
+             (lower(category) text_bloom_ops
+                 (n_distinct_per_range='128', false_positive_rate=0.05),
+              sequence int4_minmax_multi_ops (values_per_range=8))
              WHERE active;
          CREATE TABLE brin_needles (sequence integer);
          INSERT INTO brin_needles VALUES (2000), (3999)",
@@ -46945,14 +46947,20 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
           ORDER BY index_relation.relname;
          SELECT count(*) FROM pg_opclass WHERE opcmethod = 3580;
          SELECT count(*) FROM pg_opfamily WHERE opfmethod = 3580;
-         SELECT count(*) FROM pg_amop WHERE amopmethod = 3580",
+         SELECT count(*) FROM pg_amop WHERE amopmethod = 3580;
+         SELECT attribute.attname, attribute.attoptions::text
+           FROM pg_attribute AS attribute
+           JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+          WHERE relation.relname = 'brin_events_active_category'
+            AND attribute.attnum > 0
+          ORDER BY attribute.attnum",
     ));
     assert!(catalog.iter().any(|row| {
         row == "CREATE INDEX brin_events_sequence ON public.brin_events USING brin (sequence) WITH (pages_per_range='32', autosummarize=on)"
     }), "{catalog:?}");
     assert!(
         catalog.iter().any(|row| {
-            row.contains("lower(category) text_bloom_ops, sequence int4_minmax_multi_ops")
+            row.contains("lower(category) text_bloom_ops (n_distinct_per_range='128', false_positive_rate='0.05'), sequence int4_minmax_multi_ops (values_per_range='8')")
         }),
         "{catalog:?}"
     );
@@ -46968,6 +46976,18 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
         !String::from_utf8_lossy(&procedure_output).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&procedure_output)
+    );
+    assert!(
+        catalog
+            .iter()
+            .any(|row| { row == "lower|{n_distinct_per_range=128,false_positive_rate=0.05}" }),
+        "{catalog:?}"
+    );
+    assert!(
+        catalog
+            .iter()
+            .any(|row| row == "sequence|{values_per_range=8}"),
+        "{catalog:?}"
     );
     assert_eq!(data_rows(&procedure_output), ["382"]);
     assert!(
@@ -47035,6 +47055,28 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     assert!(indexed.iter().any(|row| row == "2000"), "{indexed:?}");
     assert!(indexed.iter().any(|row| row == "2001"), "{indexed:?}");
 
+    let maintenance = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT brin_summarize_new_values('brin_events_sequence'::regclass);
+         SELECT brin_desummarize_range('brin_events_sequence'::regclass, 0);
+         SELECT brin_summarize_range('brin_events_sequence'::regclass, 0);
+         SELECT brin_summarize_range('brin_events_sequence'::regclass, 0);
+         BEGIN;
+         SELECT brin_desummarize_range('brin_events_sequence'::regclass, 0);
+         ROLLBACK;
+         SELECT brin_summarize_range('brin_events_sequence'::regclass, 0);
+         SELECT brin_desummarize_range('brin_events_sequence'::regclass, 0)",
+    ));
+    assert_eq!(
+        maintenance.iter().filter(|row| row.as_str() == "0").count(),
+        2
+    );
+    assert_eq!(
+        maintenance.iter().filter(|row| row.as_str() == "1").count(),
+        2
+    );
+
     for (statement, message) in [
         (
             "CREATE UNIQUE INDEX bad_brin_unique ON brin_events USING brin (sequence)",
@@ -47073,6 +47115,33 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
          ALTER INDEX brin_events_sequence RESET (autosummarize)",
     );
     assert!(!String::from_utf8_lossy(&alter).contains("ERROR"));
+    let brin_slot = engine
+        .storage
+        .index_slot("public", "brin_events_sequence", 0)
+        .unwrap();
+    assert_eq!(engine.storage.brin_maintenance_state(brin_slot).count, 1);
+    assert_eq!(
+        engine
+            .storage
+            .brin_maintenance_state(brin_slot)
+            .pages_per_range,
+        32
+    );
+    let rebuilt = run_with(
+        &mut engine,
+        &mut budget,
+        "REINDEX INDEX brin_events_sequence;
+         SELECT brin_desummarize_range('brin_events_sequence'::regclass, 0)",
+    );
+    assert!(!String::from_utf8_lossy(&rebuilt).contains("ERROR"));
+    assert_eq!(
+        engine
+            .storage
+            .brin_maintenance_state(brin_slot)
+            .pages_per_range,
+        64
+    );
+    assert_eq!(engine.storage.brin_maintenance_state(brin_slot).count, 1);
     engine.commit_wal().unwrap();
     assert!(engine.checkpoint().unwrap());
     drop(engine);
@@ -47080,13 +47149,25 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
 
     let mut recovery_budget = Budget::new(1 << 29);
     let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let recovered_brin_slot = recovered
+        .storage
+        .index_slot("public", "brin_events_sequence", 0)
+        .unwrap();
+    assert_eq!(
+        recovered
+            .storage
+            .brin_maintenance_state(recovered_brin_slot)
+            .count,
+        1
+    );
     let cold = data_rows(&run_with(
         &mut recovered,
         &mut recovery_budget,
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'brin_events_sequence';
          EXPLAIN SELECT sequence FROM brin_events WHERE sequence = 3999;
          SELECT count(*), min(sequence), max(sequence) FROM brin_events WHERE sequence = 3999;
-         SELECT count(*) FROM brin_events WHERE sequence IN (2000, 2001)",
+         SELECT count(*) FROM brin_events WHERE sequence IN (2000, 2001);
+         SELECT brin_summarize_range('brin_events_sequence'::regclass, 0)",
     ));
     assert!(
         cold.iter()
@@ -47100,6 +47181,11 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     );
     assert!(cold.iter().any(|row| row == "1|3999|3999"), "{cold:?}");
     assert!(cold.iter().any(|row| row == "1"), "{cold:?}");
+    assert_eq!(
+        cold.iter().filter(|row| row.as_str() == "1").count(),
+        2,
+        "{cold:?}"
+    );
 
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -47163,6 +47249,168 @@ fn brin_without_a_range_reader_retains_the_authoritative_scan() {
         !rows.iter().any(|row| row.contains("Bitmap Index Scan")),
         "{rows:?}"
     );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn brin_inclusion_indexes_execute_range_and_network_predicates() {
+    let mut config = test_config("brin-inclusion-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.table_rows = 8192;
+    config.txn_rows = 8192;
+    config.value_index_rows = 16384;
+    config.object_store_bucket = format!("brin-inclusion-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE brin_areas (
+             id integer, span int4range, network inet, payload text
+         );
+         CREATE INDEX brin_areas_inclusion ON brin_areas USING brin
+             (span range_inclusion_ops, network inet_inclusion_ops)
+             WITH (pages_per_range=1);
+         INSERT INTO brin_areas VALUES
+             (1, '[1,5)'::int4range, '10.0.0.0/8'::inet, 'broad'),
+             (2, '[8,14)'::int4range, '10.1.0.0/16'::inet, 'middle'),
+             (3, '[20,30)'::int4range, '10.1.2.0/24'::inet, 'narrow'),
+             (4, 'empty'::int4range, '192.0.2.1'::inet, 'outside')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for start in (1..=4000).step_by(500) {
+        let filler = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO brin_areas
+                   SELECT value + 10,
+                          int4range(1000 + value * 2, 1001 + value * 2),
+                          '172.16.0.0/16'::inet, 'filler'
+                     FROM generate_series({start}, {}) AS source(value)",
+                start + 499
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&filler).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&filler)
+        );
+    }
+    let prepared = run_with(&mut engine, &mut budget, "ANALYZE brin_areas");
+    assert!(!String::from_utf8_lossy(&prepared).contains("ERROR"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+
+    let indexed = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT id FROM brin_areas
+            WHERE span && '[4,10)'::int4range;
+         SELECT id FROM brin_areas
+            WHERE span && '[4,10)'::int4range ORDER BY id;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE network >>= '10.1.2.0/24'::inet;
+         SELECT id FROM brin_areas
+            WHERE network >>= '10.1.2.0/24'::inet ORDER BY id;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE network <<= '10.0.0.0/8'::inet;
+         SELECT id FROM brin_areas
+            WHERE network <<= '10.0.0.0/8'::inet ORDER BY id;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE network >> '10.1.2.0/24'::inet;
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM brin_areas
+            WHERE network >> '10.1.2.0/24'::inet;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE span -|- '[5,8)'::int4range;
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM brin_areas
+            WHERE span -|- '[5,8)'::int4range;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE span << '[20,30)'::int4range;
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM brin_areas
+            WHERE span << '[20,30)'::int4range;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE span &< '[6,7)'::int4range AND id <= 4;
+         SELECT 'overleft=' || string_agg(id::text, ',' ORDER BY id) FROM brin_areas
+            WHERE span &< '[6,7)'::int4range AND id <= 4;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE span &> '[15,16)'::int4range AND id <= 4;
+         SELECT 'overright=' || string_agg(id::text, ',' ORDER BY id) FROM brin_areas
+            WHERE span &> '[15,16)'::int4range AND id <= 4;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE span >> '[1,5)'::int4range AND id <= 4;
+         SELECT 'right=' || string_agg(id::text, ',' ORDER BY id) FROM brin_areas
+            WHERE span >> '[1,5)'::int4range AND id <= 4;
+         EXPLAIN SELECT id FROM brin_areas
+            WHERE network && '10.1.0.0/16'::inet;
+         SELECT 'netoverlap=' || string_agg(id::text, ',' ORDER BY id) FROM brin_areas
+            WHERE network && '10.1.0.0/16'::inet;
+         PREPARE brin_overlap(int4range) AS
+            SELECT id FROM brin_areas WHERE span && $1 ORDER BY id;
+         EXECUTE brin_overlap('[25,26)'::int4range);
+         UPDATE brin_areas SET payload = 'matched'
+           WHERE span @> 9 RETURNING id;
+         DELETE FROM brin_areas
+           WHERE network <<= '192.0.2.0/24'::inet RETURNING id",
+    ));
+    assert!(
+        indexed
+            .iter()
+            .filter(|row| row.contains("Bitmap Index Scan using brin_areas_inclusion"))
+            .count()
+            >= 10,
+        "{indexed:?}"
+    );
+    for expected in ["1", "2", "3", "4"] {
+        assert!(indexed.iter().any(|row| row == expected), "{indexed:?}");
+    }
+    assert_eq!(
+        indexed.iter().filter(|row| row.as_str() == "1,2").count(),
+        3,
+        "{indexed:?}"
+    );
+    for expected in ["overleft=1", "overright=3", "right=2,3", "netoverlap=1,2,3"] {
+        assert!(indexed.iter().any(|row| row == expected), "{indexed:?}");
+    }
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = data_rows(&run_with(
+        &mut recovered,
+        &mut recovery_budget,
+        "EXPLAIN SELECT payload FROM brin_areas
+            WHERE span && '[8,9)'::int4range;
+         SELECT id, payload FROM brin_areas
+            WHERE span && '[8,9)'::int4range ORDER BY id;
+         SELECT count(*) FROM brin_areas",
+    ));
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Bitmap Index Scan using brin_areas_inclusion")),
+        "{cold:?}"
+    );
+    assert!(cold.iter().any(|row| row == "2|matched"), "{cold:?}");
+    assert!(cold.iter().any(|row| row == "4003"), "{cold:?}");
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 

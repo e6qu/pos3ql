@@ -5718,6 +5718,112 @@ impl Checkpointer {
                         } else {
                             None
                         };
+                    let mut operator_class_options =
+                        [crate::storage::BrinOperatorClassOptions::DEFAULT;
+                            crate::storage::MAX_INDEX_COLS];
+                    if words.clone().next() == Some("bo") {
+                        let _ = words.next();
+                        for options in operator_class_options.iter_mut().take(n_cols) {
+                            let encoded = words.next().ok_or(CheckpointSetupError::Corrupt(
+                                "idx operator class options missing",
+                            ))?;
+                            let mut fields = encoded.split(',');
+                            let values = fields
+                                .next()
+                                .and_then(|field| field.strip_prefix('v'))
+                                .ok_or(CheckpointSetupError::Corrupt("bad idx values per range"))?;
+                            let distinct = fields
+                                .next()
+                                .and_then(|field| field.strip_prefix('n'))
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "bad idx distinct per range",
+                                ))?;
+                            let rate = fields
+                                .next()
+                                .and_then(|field| field.strip_prefix('f'))
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "bad idx false positive rate",
+                                ))?;
+                            if fields.next().is_some() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "bad idx operator class options",
+                                ));
+                            }
+                            options.values_per_range = if values == "-" {
+                                None
+                            } else {
+                                let value = values.parse::<u16>().map_err(|_| {
+                                    CheckpointSetupError::Corrupt("bad idx values per range")
+                                })?;
+                                Some(value).filter(|value| (8..=256).contains(value))
+                            };
+                            if values != "-" && options.values_per_range.is_none() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "bad idx values per range",
+                                ));
+                            }
+                            options.n_distinct_per_range = if distinct == "-" {
+                                None
+                            } else {
+                                let value = distinct.parse::<i32>().map_err(|_| {
+                                    CheckpointSetupError::Corrupt("bad idx distinct per range")
+                                })?;
+                                (value >= -1).then_some(value)
+                            };
+                            if distinct != "-" && options.n_distinct_per_range.is_none() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "bad idx distinct per range",
+                                ));
+                            }
+                            options.false_positive_rate = if rate == "-" {
+                                None
+                            } else {
+                                let value = rate.parse::<f64>().map_err(|_| {
+                                    CheckpointSetupError::Corrupt("bad idx false positive rate")
+                                })?;
+                                if !value.is_finite() || !(0.000_1..=0.25).contains(&value) {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "bad idx false positive rate",
+                                    ));
+                                }
+                                let stored = StackStr::from_str(rate);
+                                if stored.is_truncated() {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "idx false positive rate is too long",
+                                    ));
+                                }
+                                Some(stored)
+                            };
+                        }
+                    }
+                    let mut unsummarized_ranges =
+                        [0u64; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES];
+                    let mut unsummarized_count = 0usize;
+                    let mut built_pages_per_range = 0u32;
+                    let mut summarized_until_page = 0u64;
+                    let has_brin_maintenance = words.clone().next() == Some("bu");
+                    if has_brin_maintenance {
+                        let _ = words.next();
+                        built_pages_per_range =
+                            parse_field(words.next(), "idx built pages per range")?;
+                        if !(1..=131_072).contains(&built_pages_per_range) {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad idx built pages per range",
+                            ));
+                        }
+                        summarized_until_page =
+                            parse_field(words.next(), "idx summarized page boundary")?;
+                        unsummarized_count =
+                            parse_field(words.next(), "idx unsummarized range count")?;
+                        if unsummarized_count > unsummarized_ranges.len() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "too many idx unsummarized ranges",
+                            ));
+                        }
+                        for range in unsummarized_ranges.iter_mut().take(unsummarized_count) {
+                            *range = parse_field(words.next(), "idx unsummarized range")?;
+                        }
+                    }
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -5769,6 +5875,7 @@ impl Checkpointer {
                                 explicit_collations,
                                 operator_classes,
                                 resolved_operator_classes,
+                                operator_class_options,
                                 descending,
                                 nulls_first,
                                 n_cols,
@@ -5803,6 +5910,21 @@ impl Checkpointer {
                         })?;
                     // Checkpoint load reconstructs committed state.
                     storage.commit_index_create(slot);
+                    if has_brin_maintenance {
+                        storage
+                            .restore_brin_maintenance(
+                                slot,
+                                built_pages_per_range,
+                                summarized_until_page,
+                                &unsummarized_ranges[..unsummarized_count],
+                            )
+                            .map_err(|error| {
+                                CheckpointSetupError::ObjectStore(format!(
+                                    "manifest BRIN maintenance state rejected: {}",
+                                    error.message.as_str()
+                                ))
+                            })?;
+                    }
                 }
                 Some("end") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -8953,7 +9075,7 @@ impl Checkpointer {
             )?;
         }
         // Index definitions are complete catalog state, not a cache rebuild hint.
-        for (_, index) in storage.checkpoint_indexes() {
+        for (index_slot, index) in storage.checkpoint_indexes() {
             write_database_context(
                 &mut self.manifest_buf,
                 &mut database_context,
@@ -9014,7 +9136,24 @@ impl Checkpointer {
             let mut collations = StackStr::<128>::new();
             let mut operator_classes = StackStr::<128>::new();
             let mut resolved_operator_classes = StackStr::<128>::new();
+            let mut operator_class_options = StackStr::<512>::new();
             let mut statistics = StackStr::<128>::new();
+            let maintenance = storage.brin_maintenance_state(index_slot);
+            let mut unsummarized_ranges = StackStr::<1400>::new();
+            for range in &maintenance.ranges[..usize::from(maintenance.count)] {
+                let _ = write!(unsummarized_ranges, " {range}");
+            }
+            let mut maintenance_suffix = StackStr::<1500>::new();
+            if index.method == crate::sql::ast::IndexAccessMethod::Brin {
+                let _ = write!(
+                    maintenance_suffix,
+                    " bu {} {} {}{}",
+                    maintenance.pages_per_range,
+                    maintenance.summarized_until_page,
+                    maintenance.count,
+                    unsummarized_ranges.as_str()
+                );
+            }
             for position in 0..index.n_cols {
                 let _ = write!(
                     collations,
@@ -9056,6 +9195,33 @@ impl Checkpointer {
                     }
                 }
                 let _ = write!(statistics, " {}", index.mutable.statistics[position]);
+                let options = index.operator_class_options[position];
+                let _ = write!(
+                    operator_class_options,
+                    " v{},n{},f{}",
+                    options
+                        .values_per_range
+                        .map_or_else(
+                            || StackStr::<16>::from_str("-"),
+                            |value| {
+                                StackStr::<16>::from_str(stack_format!(16, "{value}").as_str())
+                            }
+                        )
+                        .as_str(),
+                    options
+                        .n_distinct_per_range
+                        .map_or_else(
+                            || StackStr::<16>::from_str("-"),
+                            |value| {
+                                StackStr::<16>::from_str(stack_format!(16, "{value}").as_str())
+                            }
+                        )
+                        .as_str(),
+                    options
+                        .false_positive_rate
+                        .as_ref()
+                        .map_or("-", |value| value.as_str()),
+                );
             }
             let mutable = index.mutable;
             let fillfactor = mutable.options.fillfactor.unwrap_or(0);
@@ -9078,7 +9244,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} bo{}{}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -9109,6 +9275,8 @@ impl Checkpointer {
                     u8::from(mutable.replica_identity),
                     pages_per_range,
                     autosummarize,
+                    operator_class_options.as_str(),
+                    maintenance_suffix.as_str(),
                 ),
             )?;
         }

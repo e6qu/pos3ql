@@ -5562,6 +5562,15 @@ impl Checkpointer {
                                     CheckpointSetupError::Corrupt("bad hash index operator class"),
                                 )?,
                             ))
+                        } else if let Some(code) = encoded.strip_prefix('r') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad brin index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Brin(
+                                crate::sql::types::BrinOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt("bad brin index operator class"),
+                                )?,
+                            ))
                         } else {
                             return Err(CheckpointSetupError::Corrupt(
                                 "bad index operator class encoding",
@@ -5609,6 +5618,19 @@ impl Checkpointer {
                                 crate::sql::types::HashOperatorClass::from_code(code).ok_or(
                                     CheckpointSetupError::Corrupt(
                                         "bad hash resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else if let Some(code) = encoded.strip_prefix('r') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad brin resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Brin(
+                                crate::sql::types::BrinOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad brin resolved index operator class",
                                     ),
                                 )?,
                             ))
@@ -5669,6 +5691,33 @@ impl Checkpointer {
                             ));
                         }
                     };
+                    let pages_per_range = match words.next() {
+                        None => None,
+                        Some(value) => match parse_field(Some(value), "idx pages per range")? {
+                            0 => None,
+                            value @ 1..=131_072 => Some(value),
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "bad index pages per range",
+                                ));
+                            }
+                        },
+                    };
+                    let autosummarize =
+                        if pages_per_range.is_some() || words.clone().next().is_some() {
+                            match parse_field(words.next(), "idx autosummarize")? {
+                                0 => None,
+                                1 => Some(false),
+                                2 => Some(true),
+                                _ => {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "bad index autosummarize",
+                                    ));
+                                }
+                            }
+                        } else {
+                            None
+                        };
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -5685,6 +5734,10 @@ impl Checkpointer {
                         matches!(class, Some(crate::storage::IndexOperatorClass::Hash(_)))
                     }) {
                         crate::sql::ast::IndexAccessMethod::Hash
+                    } else if resolved_operator_classes[..n_cols].iter().all(|class| {
+                        matches!(class, Some(crate::storage::IndexOperatorClass::Brin(_)))
+                    }) {
+                        crate::sql::ast::IndexAccessMethod::Brin
                     } else if resolved_operator_classes[..n_cols].iter().all(|class| {
                         matches!(
                             class,
@@ -5728,6 +5781,8 @@ impl Checkpointer {
                                     options: crate::storage::IndexStorageOptions {
                                         fillfactor,
                                         deduplicate_items,
+                                        pages_per_range,
+                                        autosummarize,
                                     },
                                     statistics,
                                     parent: (parent != u16::MAX).then_some(parent),
@@ -8977,6 +9032,9 @@ impl Checkpointer {
                     Some(crate::storage::IndexOperatorClass::Hash(class)) => {
                         let _ = write!(operator_classes, " h{}", class.code());
                     }
+                    Some(crate::storage::IndexOperatorClass::Brin(class)) => {
+                        let _ = write!(operator_classes, " r{}", class.code());
+                    }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         let _ = write!(operator_classes, " c{}", oid.get());
                     }
@@ -8989,6 +9047,9 @@ impl Checkpointer {
                     }
                     crate::storage::IndexOperatorClass::Hash(class) => {
                         let _ = write!(resolved_operator_classes, " h{}", class.code());
+                    }
+                    crate::storage::IndexOperatorClass::Brin(class) => {
+                        let _ = write!(resolved_operator_classes, " r{}", class.code());
                     }
                     crate::storage::IndexOperatorClass::Catalog(oid) => {
                         let _ = write!(resolved_operator_classes, " c{}", oid.get());
@@ -9008,10 +9069,16 @@ impl Checkpointer {
                 crate::storage::IndexKind::Partitioned { valid: false } => 1,
                 crate::storage::IndexKind::Partitioned { valid: true } => 2,
             };
+            let pages_per_range = mutable.options.pages_per_range.unwrap_or(0);
+            let autosummarize = match mutable.options.autosummarize {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            };
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -9040,6 +9107,8 @@ impl Checkpointer {
                     kind,
                     u8::from(mutable.clustered),
                     u8::from(mutable.replica_identity),
+                    pages_per_range,
+                    autosummarize,
                 ),
             )?;
         }

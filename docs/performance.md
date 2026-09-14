@@ -68,6 +68,7 @@ the comparison does not pretend PostgreSQL itself has an S3 cache profile.
 | Scenario | Boundary measured |
 |---|---|
 | warm memory | Repeated hash-index point reads in the process that created and checkpointed the data |
+| BRIN point pruning | Repeated warm and object-cold equality probes through a dedicated BRIN key and bitmap plan |
 | indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
 | ordered limit | Repeated descending key-only `ORDER BY ... LIMIT` scans that must fetch no base tuples, warm and object-cold |
 | parameterized join | Repeated 32-key nested-loop probes whose inner table must use its B-tree, warm and after a dedicated empty-local-cache restart |
@@ -93,7 +94,7 @@ branch.
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no
 more than 125% of the fixed plan, the stable object-operation metric schema,
-at least one index scan per hash point-read, btree tail-range, btree ordered-limit, parameterized-btree-join, or hash-targeted synchronized-update operation and
+at least one index scan per hash point-read, BRIN point probe, btree tail-range, btree ordered-limit, parameterized-btree-join, or hash-targeted synchronized-update operation and
 zero sequential scans in the complete resident warm-memory paths, actual
 shared-object reads during empty-local-cache recovery, and concurrent commit
 PUT amplification below 1.75 PUTs per transaction. Ordered-limit runs also
@@ -124,7 +125,7 @@ immutable keys and skip disjoint object blocks; the harness records both warm
 and cold tail-range workloads alongside PostgreSQL 18. Compatible ordered
 queries sort only compact index keys, stream base reads through `LIMIT`, and
 avoid them entirely for key- and `INCLUDE`-covered projections. The known structural limits
-remain global query serialization, GiST/GIN/SP-GiST/BRIN physical methods, and
+remain global query serialization, GiST/GIN/SP-GiST physical methods, and
 small startup-sized catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
 lock ordering, group publication order, and explicit backpressure. Writer
 fencing and promotion safety must exist before any failover benchmark or

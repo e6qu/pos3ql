@@ -1183,6 +1183,756 @@ impl HashOperatorClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrinOperatorClassKind {
+    Minmax,
+    MinmaxMulti,
+    Bloom,
+    Inclusion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrinOperatorClassSpec {
+    name: &'static str,
+    oid: i32,
+    family_oid: i32,
+    input_oid: i32,
+    default: bool,
+    kind: BrinOperatorClassKind,
+}
+
+const fn brin_spec(
+    name: &'static str,
+    oid: i32,
+    family_oid: i32,
+    input_oid: i32,
+    default: bool,
+    kind: BrinOperatorClassKind,
+) -> BrinOperatorClassSpec {
+    BrinOperatorClassSpec {
+        name,
+        oid,
+        family_oid,
+        input_oid,
+        default,
+        kind,
+    }
+}
+
+const BRIN_OPERATOR_CLASS_SPECS: [BrinOperatorClassSpec; 72] = [
+    brin_spec(
+        "bytea_minmax_ops",
+        10092,
+        4064,
+        17,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "bytea_bloom_ops",
+        10093,
+        4578,
+        17,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "char_minmax_ops",
+        10094,
+        4062,
+        18,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "char_bloom_ops",
+        10095,
+        4577,
+        18,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "name_minmax_ops",
+        10096,
+        4065,
+        19,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "name_bloom_ops",
+        10097,
+        4579,
+        19,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "int8_minmax_ops",
+        10098,
+        4054,
+        20,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "int8_minmax_multi_ops",
+        10099,
+        4602,
+        20,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "int8_bloom_ops",
+        10100,
+        4572,
+        20,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "int2_minmax_ops",
+        10101,
+        4054,
+        21,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "int2_minmax_multi_ops",
+        10102,
+        4602,
+        21,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "int2_bloom_ops",
+        10103,
+        4572,
+        21,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "int4_minmax_ops",
+        10104,
+        4054,
+        23,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "int4_minmax_multi_ops",
+        10105,
+        4602,
+        23,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "int4_bloom_ops",
+        10106,
+        4572,
+        23,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "text_minmax_ops",
+        10107,
+        4056,
+        25,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "text_bloom_ops",
+        10108,
+        4573,
+        25,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "oid_minmax_ops",
+        10109,
+        4068,
+        26,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "oid_minmax_multi_ops",
+        10110,
+        4606,
+        26,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "oid_bloom_ops",
+        10111,
+        4580,
+        26,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "tid_minmax_ops",
+        10112,
+        4069,
+        27,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "tid_bloom_ops",
+        10113,
+        4581,
+        27,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "tid_minmax_multi_ops",
+        10114,
+        4607,
+        27,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "float4_minmax_ops",
+        10115,
+        4070,
+        700,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "float4_minmax_multi_ops",
+        10116,
+        4608,
+        700,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "float4_bloom_ops",
+        10117,
+        4582,
+        700,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "float8_minmax_ops",
+        10118,
+        4070,
+        701,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "float8_minmax_multi_ops",
+        10119,
+        4608,
+        701,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "float8_bloom_ops",
+        10120,
+        4582,
+        701,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "macaddr_minmax_ops",
+        10121,
+        4074,
+        829,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "macaddr_minmax_multi_ops",
+        10122,
+        4609,
+        829,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "macaddr_bloom_ops",
+        10123,
+        4583,
+        829,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "macaddr8_minmax_ops",
+        10124,
+        4109,
+        774,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "macaddr8_minmax_multi_ops",
+        10125,
+        4610,
+        774,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "macaddr8_bloom_ops",
+        10126,
+        4584,
+        774,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "inet_minmax_ops",
+        10127,
+        4075,
+        869,
+        false,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "inet_minmax_multi_ops",
+        10128,
+        4611,
+        869,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "inet_bloom_ops",
+        10129,
+        4585,
+        869,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "inet_inclusion_ops",
+        10130,
+        4102,
+        869,
+        true,
+        BrinOperatorClassKind::Inclusion,
+    ),
+    brin_spec(
+        "bpchar_minmax_ops",
+        10131,
+        4076,
+        1042,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "bpchar_bloom_ops",
+        10132,
+        4586,
+        1042,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "time_minmax_ops",
+        10133,
+        4077,
+        1083,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "time_minmax_multi_ops",
+        10134,
+        4612,
+        1083,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "time_bloom_ops",
+        10135,
+        4587,
+        1083,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "date_minmax_ops",
+        10136,
+        4059,
+        1082,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "date_minmax_multi_ops",
+        10137,
+        4605,
+        1082,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "date_bloom_ops",
+        10138,
+        4576,
+        1082,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "timestamp_minmax_ops",
+        10139,
+        4059,
+        1114,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "timestamp_minmax_multi_ops",
+        10140,
+        4605,
+        1114,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "timestamp_bloom_ops",
+        10141,
+        4576,
+        1114,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "timestamptz_minmax_ops",
+        10142,
+        4059,
+        1184,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "timestamptz_minmax_multi_ops",
+        10143,
+        4605,
+        1184,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "timestamptz_bloom_ops",
+        10144,
+        4576,
+        1184,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "interval_minmax_ops",
+        10145,
+        4078,
+        1186,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "interval_minmax_multi_ops",
+        10146,
+        4613,
+        1186,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "interval_bloom_ops",
+        10147,
+        4588,
+        1186,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "timetz_minmax_ops",
+        10148,
+        4058,
+        1266,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "timetz_minmax_multi_ops",
+        10149,
+        4604,
+        1266,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "timetz_bloom_ops",
+        10150,
+        4575,
+        1266,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "bit_minmax_ops",
+        10151,
+        4079,
+        1560,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "varbit_minmax_ops",
+        10152,
+        4080,
+        1562,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "numeric_minmax_ops",
+        10153,
+        4055,
+        1700,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "numeric_minmax_multi_ops",
+        10154,
+        4603,
+        1700,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "numeric_bloom_ops",
+        10155,
+        4574,
+        1700,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "uuid_minmax_ops",
+        10156,
+        4081,
+        2950,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "uuid_minmax_multi_ops",
+        10157,
+        4614,
+        2950,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "uuid_bloom_ops",
+        10158,
+        4589,
+        2950,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "range_inclusion_ops",
+        10159,
+        4103,
+        3831,
+        true,
+        BrinOperatorClassKind::Inclusion,
+    ),
+    brin_spec(
+        "pg_lsn_minmax_ops",
+        10160,
+        4082,
+        3220,
+        true,
+        BrinOperatorClassKind::Minmax,
+    ),
+    brin_spec(
+        "pg_lsn_minmax_multi_ops",
+        10161,
+        4615,
+        3220,
+        false,
+        BrinOperatorClassKind::MinmaxMulti,
+    ),
+    brin_spec(
+        "pg_lsn_bloom_ops",
+        10162,
+        4590,
+        3220,
+        false,
+        BrinOperatorClassKind::Bloom,
+    ),
+    brin_spec(
+        "box_inclusion_ops",
+        10163,
+        4104,
+        603,
+        true,
+        BrinOperatorClassKind::Inclusion,
+    ),
+];
+
+/// PostgreSQL 18's complete built-in BRIN operator-class inventory. The
+/// private nonzero one-based code keeps durable metadata compact without
+/// admitting an identity that is absent from the bootstrap catalogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrinOperatorClass(u8);
+
+impl BrinOperatorClass {
+    pub const COUNT: u8 = BRIN_OPERATOR_CLASS_SPECS.len() as u8;
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        if code > 0 && code <= Self::COUNT {
+            Some(Self(code))
+        } else {
+            None
+        }
+    }
+
+    const fn spec(self) -> BrinOperatorClassSpec {
+        BRIN_OPERATOR_CLASS_SPECS[(self.0 - 1) as usize]
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        BRIN_OPERATOR_CLASS_SPECS
+            .iter()
+            .position(|spec| spec.name == name)
+            .and_then(|position| Self::from_code(position as u8 + 1))
+    }
+
+    pub const fn for_type(ctype: ColType) -> Option<Self> {
+        let code = match ctype {
+            ColType::Bytea => 1,
+            ColType::Char => 3,
+            ColType::Name => 5,
+            ColType::Int8 => 7,
+            ColType::Int2 => 10,
+            ColType::Int4 => 13,
+            ColType::Text | ColType::Varchar => 16,
+            ColType::Oid
+            | ColType::Regtype
+            | ColType::Regproc
+            | ColType::Regprocedure
+            | ColType::Regoper
+            | ColType::Regoperator
+            | ColType::Regclass
+            | ColType::Regnamespace
+            | ColType::Regrole
+            | ColType::Regconfig
+            | ColType::Regdictionary
+            | ColType::Regcollation => 18,
+            ColType::Tid => 21,
+            ColType::Float4 => 24,
+            ColType::Float8 => 27,
+            ColType::Macaddr => 30,
+            ColType::Macaddr8 => 33,
+            ColType::Inet | ColType::Cidr => 39,
+            ColType::Bpchar => 40,
+            ColType::Time => 42,
+            ColType::Date => 45,
+            ColType::Timestamp => 48,
+            ColType::Timestamptz => 51,
+            ColType::Interval => 54,
+            ColType::Timetz => 57,
+            ColType::Bit { varying: false } => 60,
+            ColType::Bit { varying: true } => 61,
+            ColType::Numeric => 62,
+            ColType::Uuid => 65,
+            ColType::Range(_) => 68,
+            ColType::PgLsn => 69,
+            ColType::Geometry(GeometryKind::Box) => 72,
+            _ => return None,
+        };
+        Self::from_code(code)
+    }
+
+    pub fn accepts(self, ctype: ColType) -> bool {
+        match self.input_oid() {
+            oid::TEXT => matches!(ctype, ColType::Text | ColType::Varchar),
+            oid::OID => matches!(
+                ctype,
+                ColType::Oid
+                    | ColType::Regtype
+                    | ColType::Regproc
+                    | ColType::Regprocedure
+                    | ColType::Regoper
+                    | ColType::Regoperator
+                    | ColType::Regclass
+                    | ColType::Regnamespace
+                    | ColType::Regrole
+                    | ColType::Regconfig
+                    | ColType::Regdictionary
+                    | ColType::Regcollation
+            ),
+            oid::INET => matches!(ctype, ColType::Inet | ColType::Cidr),
+            oid::ANYRANGE => matches!(ctype, ColType::Range(_)),
+            oid::BOX => matches!(ctype, ColType::Geometry(GeometryKind::Box)),
+            input => ctype.oid() == input,
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        self.0
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.spec().name
+    }
+
+    pub const fn oid(self) -> i32 {
+        self.spec().oid
+    }
+
+    pub const fn family_oid(self) -> i32 {
+        self.spec().family_oid
+    }
+
+    pub const fn input_oid(self) -> i32 {
+        self.spec().input_oid
+    }
+
+    pub const fn is_default(self) -> bool {
+        self.spec().default
+    }
+
+    pub const fn kind(self) -> BrinOperatorClassKind {
+        self.spec().kind
+    }
+
+    pub fn from_oid(oid: i32) -> Option<Self> {
+        BRIN_OPERATOR_CLASS_SPECS
+            .iter()
+            .position(|spec| spec.oid == oid)
+            .and_then(|position| Self::from_code(position as u8 + 1))
+    }
+}
+
 /// Base storage codes for the parameterized type families. They must stay far
 /// enough apart that no two families can produce the same code: `Multirange`
 /// once began at 28 and `Array` at 32, which made `bool[]` and `int4[]`
@@ -4443,6 +5193,63 @@ mod tests {
         assert!(HashOperatorClass::Cidr.accepts(ColType::Inet));
         assert!(HashOperatorClass::VarcharPattern.accepts(ColType::Text));
         assert!(!HashOperatorClass::Int4.accepts(ColType::Int8));
+    }
+
+    #[test]
+    fn brin_operator_classes_are_closed_and_match_postgres_catalogs() {
+        let mut oids = Vec::new();
+        let mut families = Vec::new();
+        let mut defaults = 0;
+        for code in 1..=BrinOperatorClass::COUNT {
+            let operator_class =
+                BrinOperatorClass::from_code(code).expect("every durable BRIN class code exists");
+            assert_eq!(operator_class.code(), code);
+            assert_eq!(
+                BrinOperatorClass::parse(operator_class.name()),
+                Some(operator_class)
+            );
+            assert_eq!(
+                BrinOperatorClass::from_oid(operator_class.oid()),
+                Some(operator_class)
+            );
+            assert!(
+                !oids.contains(&operator_class.oid()),
+                "duplicate BRIN operator-class OID {}",
+                operator_class.oid()
+            );
+            oids.push(operator_class.oid());
+            if !families.contains(&operator_class.family_oid()) {
+                families.push(operator_class.family_oid());
+            }
+            defaults += usize::from(operator_class.is_default());
+        }
+        assert_eq!(oids.len(), 72);
+        assert_eq!(families.len(), 57);
+        assert_eq!(defaults, 28);
+        assert_eq!(BrinOperatorClass::from_code(0), None);
+        assert_eq!(BrinOperatorClass::from_code(73), None);
+        assert_eq!(BrinOperatorClass::from_oid(0), None);
+        assert_eq!(BrinOperatorClass::parse("not_an_operator_class"), None);
+
+        assert_eq!(
+            BrinOperatorClass::for_type(ColType::Cidr),
+            BrinOperatorClass::parse("inet_inclusion_ops")
+        );
+        assert_eq!(
+            BrinOperatorClass::for_type(ColType::Varchar),
+            BrinOperatorClass::parse("text_minmax_ops")
+        );
+        assert_eq!(BrinOperatorClass::for_type(ColType::Jsonb), None);
+        assert!(
+            BrinOperatorClass::parse("inet_inclusion_ops")
+                .expect("built-in inclusion class")
+                .accepts(ColType::Cidr)
+        );
+        assert!(
+            !BrinOperatorClass::parse("int4_bloom_ops")
+                .expect("built-in Bloom class")
+                .accepts(ColType::Int8)
+        );
     }
 
     #[test]

@@ -28,6 +28,7 @@ const MAX_PLAN_NODES: usize = 32;
 #[derive(Clone, Copy)]
 struct PlanNode {
     name: StackStr<96>,
+    bitmap_index: StackStr<64>,
     relation: StackStr<96>,
     output: StackStr<256>,
     depth: u8,
@@ -43,6 +44,7 @@ struct PlanNode {
 impl PlanNode {
     const EMPTY: Self = Self {
         name: StackStr::new(),
+        bitmap_index: StackStr::new(),
         relation: StackStr::new(),
         output: StackStr::new(),
         depth: 0,
@@ -94,6 +96,26 @@ impl Plan {
         self.count += 1;
         Ok(())
     }
+}
+
+fn push_scan(plan: &mut Plan, scan: PlanNode) -> Result<(), SqlError> {
+    let bitmap_index = scan.bitmap_index;
+    let bitmap_depth = scan.depth.saturating_add(1);
+    let bitmap_rows = scan.rows;
+    let bitmap_cost = scan.total_cost * 0.4;
+    plan.push(scan)?;
+    if !bitmap_index.as_str().is_empty() {
+        let mut name = StackStr::new();
+        let _ = write!(name, "Bitmap Index Scan using {}", bitmap_index.as_str());
+        plan.push(PlanNode {
+            name,
+            depth: bitmap_depth,
+            total_cost: bitmap_cost,
+            rows: bitmap_rows,
+            ..PlanNode::EMPTY
+        })?;
+    }
+    Ok(())
 }
 
 fn projected_shape<'a>(
@@ -692,11 +714,18 @@ fn scan_node<'a>(
         .map(|ordered| (ordered.access(), ordered.index_name()))
         .or_else(|| index_plan.map(|plan| (plan, plan.index_name())));
     let resident_index = index_identity.is_some_and(|(plan, _)| {
-        plan.is_exact() && storage.value_binding_cache_complete(slot, plan.binding())
+        plan.method() != crate::sql::ast::IndexAccessMethod::Brin
+            && plan.is_exact()
+            && storage.value_binding_cache_complete(slot, plan.binding())
+    });
+    let selective_brin = index_identity.is_some_and(|(plan, _)| {
+        plan.method() == crate::sql::ast::IndexAccessMethod::Brin
+            && index_rows.saturating_mul(8) <= rows
     });
     let use_index = ordered.is_some()
         || index_identity.is_some()
             && (resident_index
+                || selective_brin
                 || (generations != 0
                     && !storage.sequential_spill_scan_is_cheaper(slot, index_rows, txid)));
     let blocks = if use_index {
@@ -723,20 +752,27 @@ fn scan_node<'a>(
     let cpu_cost = cpu_rows as f64 * 0.01;
     let mut relation = StackStr::new();
     let _ = write!(relation, "{}", scope.names[table]);
-    let name = if let Some((_, index)) = index_identity.filter(|_| use_index) {
-        let mut name = StackStr::new();
-        let kind = if index_only && ordered.is_some() {
-            "Index Only Scan"
+    let mut bitmap_index = StackStr::new();
+    let name = if let Some((access, index)) = index_identity.filter(|_| use_index) {
+        if access.method() == crate::sql::ast::IndexAccessMethod::Brin {
+            bitmap_index = index;
+            StackStr::from_str("Bitmap Heap Scan")
         } else {
-            "Index Scan"
-        };
-        let _ = write!(name, "{kind} using {}", index.as_str());
-        name
+            let mut name = StackStr::new();
+            let kind = if index_only && ordered.is_some() {
+                "Index Only Scan"
+            } else {
+                "Index Scan"
+            };
+            let _ = write!(name, "{kind} using {}", index.as_str());
+            name
+        }
     } else {
         StackStr::from_str(if derived { "Subquery Scan" } else { "Seq Scan" })
     };
     Ok(PlanNode {
         name,
+        bitmap_index,
         relation,
         output: StackStr::new(),
         depth,
@@ -1061,7 +1097,7 @@ pub(super) fn plan_select(
                 ordered_index_only,
             )?;
             scan.output = output;
-            plan.push(scan)?;
+            push_scan(&mut plan, scan)?;
         }
     }
     plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1082,12 +1118,12 @@ fn physical_scan_node(
     filtered: bool,
     txid: u32,
     depth: u8,
-    index: Option<(&str, u64)>,
+    index: Option<(&str, u64, crate::sql::ast::IndexAccessMethod)>,
 ) -> PlanNode {
     let rows = storage.planning_row_estimate(slot);
     let output_rows = index.map_or_else(
         || if filtered { rows.div_ceil(10) } else { rows },
-        |(_, expected_rows)| expected_rows,
+        |(_, expected_rows, _)| expected_rows,
     );
     let statistics = storage.table_statistics(slot, txid);
     let width = if statistics.valid {
@@ -1119,9 +1155,14 @@ fn physical_scan_node(
     let total_cost = object_requests as f64 * object_request_cost(storage.block_io_stats())
         + cache_blocks as f64 * (ram_probability * 0.01 + disk_probability * 0.1)
         + if index.is_some() { output_rows } else { rows } as f64 * 0.01;
+    let mut bitmap_index = StackStr::new();
     let name = index.map_or_else(
         || StackStr::from_str("Seq Scan"),
-        |(index_name, _)| {
+        |(index_name, _, method)| {
+            if method == crate::sql::ast::IndexAccessMethod::Brin {
+                bitmap_index = StackStr::from_str(index_name);
+                return StackStr::from_str("Bitmap Heap Scan");
+            }
             let mut name = StackStr::new();
             let _ = write!(name, "Index Scan using {index_name}");
             name
@@ -1129,6 +1170,7 @@ fn physical_scan_node(
     );
     PlanNode {
         name,
+        bitmap_index,
         relation: StackStr::from_str(relation_name),
         output: StackStr::new(),
         depth,
@@ -1187,6 +1229,7 @@ fn push_set_tree(
             };
             let node = PlanNode {
                 name: StackStr::from_str(name),
+                bitmap_index: StackStr::new(),
                 relation: StackStr::new(),
                 output: left.output,
                 depth,
@@ -1329,6 +1372,7 @@ pub(super) fn plan_modification(
     let _ = write!(name, "{verb}");
     let target_node = PlanNode {
         name,
+        bitmap_index: StackStr::new(),
         relation: StackStr::from_str(target.name),
         output: StackStr::new(),
         depth: 0,
@@ -1406,9 +1450,9 @@ pub(super) fn plan_modification(
             ..PlanNode::EMPTY
         };
         plan.push(join)?;
-        plan.push(target_scan)?;
+        push_scan(&mut plan, target_scan)?;
         for &table in &order[..scope.n] {
-            plan.push(source_nodes[table])?;
+            push_scan(&mut plan, source_nodes[table])?;
         }
         plan.nodes[0].total_cost = join.total_cost;
         plan.nodes[0].object_requests = join.object_requests;
@@ -1453,23 +1497,28 @@ pub(super) fn plan_modification(
                 .flatten()
                 .map(|plan| (plan, plan.index_name()));
             let index = index.filter(|(plan, _)| {
-                plan.is_exact() && storage.value_binding_cache_complete(slot, plan.binding())
+                let expected_rows =
+                    plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid);
+                let resident_exact = plan.method() != crate::sql::ast::IndexAccessMethod::Brin
+                    && plan.is_exact()
+                    && storage.value_binding_cache_complete(slot, plan.binding());
+                let selective_brin = plan.method() == crate::sql::ast::IndexAccessMethod::Brin
+                    && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
+                resident_exact
+                    || selective_brin
                     || (storage.spill_generation_count(slot) != 0
-                        && !storage.sequential_spill_scan_is_cheaper(
-                            slot,
-                            plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid),
-                            txid,
-                        ))
+                        && !storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid))
             });
             let index_name = index.as_ref().map(|(plan, name)| {
                 (
                     name.as_str(),
                     plan.expected_rows(storage, slot, storage.table_def(slot, txid), txid),
+                    plan.method(),
                 )
             });
             physical_scan_node(storage, slot, target.name, filtered, txid, 1, index_name)
         };
-        plan.push(child)?;
+        push_scan(&mut plan, child)?;
         child
     } else {
         let child = PlanNode {

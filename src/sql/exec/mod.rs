@@ -37134,6 +37134,12 @@ pub fn comment(
                         "comments on hash operator families are not supported"
                     ));
                 }
+                crate::sql::ast::IndexAccessMethod::Brin => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on brin operator families are not supported"
+                    ));
+                }
             }
             let Some(slot) =
                 storage.operator_family_slot_on_path(family_name.schema, family_name.name, txid)
@@ -37167,6 +37173,12 @@ pub fn comment(
                     return sql_fail(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "comments on hash operator classes are not supported"
+                    ));
+                }
+                crate::sql::ast::IndexAccessMethod::Brin => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on brin operator classes are not supported"
                     ));
                 }
             }
@@ -46591,6 +46603,35 @@ pub struct CreateIndexCommand<'a> {
     pub unique: bool,
 }
 
+fn validate_index_storage_options(
+    method: crate::sql::ast::IndexAccessMethod,
+    options: crate::sql::ast::IndexStorageOptions,
+) -> Result<(), SqlError> {
+    let unsupported = match method {
+        crate::sql::ast::IndexAccessMethod::Btree => options
+            .pages_per_range
+            .map(|_| "pages_per_range")
+            .or_else(|| options.autosummarize.map(|_| "autosummarize")),
+        crate::sql::ast::IndexAccessMethod::Hash => options
+            .deduplicate_items
+            .map(|_| "deduplicate_items")
+            .or_else(|| options.pages_per_range.map(|_| "pages_per_range"))
+            .or_else(|| options.autosummarize.map(|_| "autosummarize")),
+        crate::sql::ast::IndexAccessMethod::Brin => options
+            .fillfactor
+            .map(|_| "fillfactor")
+            .or_else(|| options.deduplicate_items.map(|_| "deduplicate_items")),
+    };
+    match unsupported {
+        Some(name) => Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "unrecognized parameter \"{}\"",
+            name
+        )),
+        None => Ok(()),
+    }
+}
+
 /// CREATE INDEX publishes one typed catalog definition and validates every
 /// existing row before the definition can become visible.
 pub fn create_index(
@@ -46655,6 +46696,9 @@ pub fn create_index(
             MAX_INDEX_COLS
         ));
     }
+    if let Err(error) = validate_index_storage_options(command.method, command.options) {
+        return sql_fail(error);
+    }
     if command.method == crate::sql::ast::IndexAccessMethod::Hash {
         if command.unique {
             return sql_fail(sql_err!(
@@ -46684,6 +46728,52 @@ pub fn create_index(
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "access method \"hash\" does not support included columns"
+            ));
+        }
+        if command.options.deduplicate_items.is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized parameter \"deduplicate_items\""
+            ));
+        }
+    }
+    if command.method == crate::sql::ast::IndexAccessMethod::Brin {
+        if command.unique {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"brin\" does not support unique indexes"
+            ));
+        }
+        if command
+            .columns
+            .iter()
+            .any(|column| column.ordering_specified)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"brin\" does not support ASC/DESC options"
+            ));
+        }
+        if command
+            .columns
+            .iter()
+            .any(|column| column.nulls_order_specified)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"brin\" does not support NULLS FIRST/LAST options"
+            ));
+        }
+        if !command.include_columns.is_empty() {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"brin\" does not support included columns"
+            ));
+        }
+        if command.options.fillfactor.is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized parameter \"fillfactor\""
             ));
         }
         if command.options.deduplicate_items.is_some() {
@@ -46780,6 +46870,38 @@ pub fn create_index(
                     ));
                 }
                 let class = crate::storage::IndexOperatorClass::Hash(parsed);
+                operator_classes[i] = Some(class);
+                resolved_operator_classes[i] = Some(class);
+                continue;
+            }
+            if command.method == crate::sql::ast::IndexAccessMethod::Brin {
+                if operator_class
+                    .schema
+                    .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"brin\"",
+                        operator_class.name
+                    ));
+                }
+                let Some(parsed) = crate::sql::types::BrinOperatorClass::parse(operator_class.name)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"brin\"",
+                        operator_class.name
+                    ));
+                };
+                if !parsed.accepts(input.ctype) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "operator class \"{}\" does not accept data type {}",
+                        operator_class.name,
+                        input.ctype.name()
+                    ));
+                }
+                let class = crate::storage::IndexOperatorClass::Brin(parsed);
                 operator_classes[i] = Some(class);
                 resolved_operator_classes[i] = Some(class);
                 continue;
@@ -47017,6 +47139,8 @@ pub fn create_index(
             options: crate::storage::IndexStorageOptions {
                 fillfactor: command.options.fillfactor,
                 deduplicate_items: command.options.deduplicate_items,
+                pages_per_range: command.options.pages_per_range,
+                autosummarize: command.options.autosummarize,
             },
             kind: if tdef.partition.is_partitioned() {
                 crate::storage::IndexKind::Partitioned {
@@ -47484,6 +47608,10 @@ pub fn alter_index(
     ) {
         return sql_fail(error);
     }
+    let method = storage
+        .index_visible_to(slot, txn.txid)
+        .expect("resolved index is visible")
+        .method;
     match action {
         crate::sql::ast::AlterIndexAction::Rename(new_name) => {
             let new_name = match SqlName::parse(new_name) {
@@ -47511,6 +47639,9 @@ pub fn alter_index(
             }
         }
         crate::sql::ast::AlterIndexAction::SetOptions(options) => {
+            if let Err(error) = validate_index_storage_options(method, options) {
+                return sql_fail(error);
+            }
             let mut definition = storage
                 .index_visible_to(slot, txn.txid)
                 .expect("resolved index is visible")
@@ -47521,11 +47652,39 @@ pub fn alter_index(
             if let Some(deduplicate_items) = options.deduplicate_items {
                 definition.options.deduplicate_items = Some(deduplicate_items);
             }
+            if let Some(pages_per_range) = options.pages_per_range {
+                definition.options.pages_per_range = Some(pages_per_range);
+            }
+            if let Some(autosummarize) = options.autosummarize {
+                definition.options.autosummarize = Some(autosummarize);
+            }
             if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition) {
                 return sql_fail(error);
             }
         }
         crate::sql::ast::AlterIndexAction::ResetOptions(options) => {
+            let invalid = match method {
+                crate::sql::ast::IndexAccessMethod::Btree => options
+                    .pages_per_range
+                    .then_some("pages_per_range")
+                    .or(options.autosummarize.then_some("autosummarize")),
+                crate::sql::ast::IndexAccessMethod::Hash => options
+                    .deduplicate_items
+                    .then_some("deduplicate_items")
+                    .or(options.pages_per_range.then_some("pages_per_range"))
+                    .or(options.autosummarize.then_some("autosummarize")),
+                crate::sql::ast::IndexAccessMethod::Brin => options
+                    .fillfactor
+                    .then_some("fillfactor")
+                    .or(options.deduplicate_items.then_some("deduplicate_items")),
+            };
+            if let Some(name) = invalid {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized parameter \"{}\"",
+                    name
+                ));
+            }
             let mut definition = storage
                 .index_visible_to(slot, txn.txid)
                 .expect("resolved index is visible")
@@ -47535,6 +47694,12 @@ pub fn alter_index(
             }
             if options.deduplicate_items {
                 definition.options.deduplicate_items = None;
+            }
+            if options.pages_per_range {
+                definition.options.pages_per_range = None;
+            }
+            if options.autosummarize {
+                definition.options.autosummarize = None;
             }
             if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition) {
                 return sql_fail(error);

@@ -2732,9 +2732,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + 1
+                + 6
         }
         WalOp::AlterIndexDefinition { schema, name, .. } => {
-            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 3
+            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 3 + 6
         }
         WalOp::CreateTablespace { name, location, .. } => {
             8 + 1 + name.len() + 2 + location.len() + 24 + 2
@@ -3554,11 +3555,25 @@ fn append_index_definition(
         ok &= buffer.append(&statistic.to_le_bytes());
     }
     ok &= buffer.append(&definition.parent.unwrap_or(u16::MAX).to_le_bytes());
-    ok && buffer.append(&[
+    ok &= buffer.append(&[
         kind,
         u8::from(definition.clustered),
         u8::from(definition.replica_identity),
-    ])
+    ]);
+    let autosummarize = match definition.options.autosummarize {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    ok && buffer.append(&[0xab])
+        && buffer.append(
+            &definition
+                .options
+                .pages_per_range
+                .unwrap_or(0)
+                .to_le_bytes(),
+        )
+        && buffer.append(&[autosummarize])
 }
 
 fn append_tablespace_options(
@@ -4563,6 +4578,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     Some(crate::storage::IndexOperatorClass::Hash(class)) => {
                         buffer.append(&[3, class.code(), 0, 0, 0])
                     }
+                    Some(crate::storage::IndexOperatorClass::Brin(class)) => {
+                        buffer.append(&[4, class.code(), 0, 0, 0])
+                    }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
                     }
@@ -4576,6 +4594,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     }
                     Some(crate::storage::IndexOperatorClass::Hash(class)) => {
                         buffer.append(&[3, class.code(), 0, 0, 0])
+                    }
+                    Some(crate::storage::IndexOperatorClass::Brin(class)) => {
+                        buffer.append(&[4, class.code(), 0, 0, 0])
                     }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
@@ -6007,6 +6028,24 @@ fn decode_index_definition(
         _ => return None,
     };
     *at += 1;
+    let mut pages_per_range = None;
+    let mut autosummarize = None;
+    if payload.get(*at) == Some(&0xab) {
+        *at += 1;
+        pages_per_range = match u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?) {
+            0 => None,
+            value @ 1..=131_072 => Some(value),
+            _ => return None,
+        };
+        *at += 4;
+        autosummarize = match *payload.get(*at)? {
+            0 => None,
+            1 => Some(false),
+            2 => Some(true),
+            _ => return None,
+        };
+        *at += 1;
+    }
     if clustered && !matches!(kind, crate::storage::IndexKind::Ordinary) {
         return None;
     }
@@ -6015,6 +6054,8 @@ fn decode_index_definition(
         options: crate::storage::IndexStorageOptions {
             fillfactor,
             deduplicate_items,
+            pages_per_range,
+            autosummarize,
         },
         statistics,
         parent: (parent != u16::MAX).then_some(parent),
@@ -7991,6 +8032,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     3 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Hash(
                         crate::sql::types::HashOperatorClass::from_code(value[0])?,
                     )),
+                    4 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Brin(
+                        crate::sql::types::BrinOperatorClass::from_code(value[0])?,
+                    )),
                     _ => return None,
                 };
             }
@@ -8016,6 +8060,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     )),
                     3 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Hash(
                         crate::sql::types::HashOperatorClass::from_code(value[0])?,
+                    )),
+                    4 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Brin(
+                        crate::sql::types::BrinOperatorClass::from_code(value[0])?,
                     )),
                     _ => return None,
                 };

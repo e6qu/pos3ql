@@ -1803,12 +1803,16 @@ pub enum IndexTargetScope {
 pub struct IndexStorageOptions {
     pub fillfactor: Option<u8>,
     pub deduplicate_items: Option<bool>,
+    pub pages_per_range: Option<u32>,
+    pub autosummarize: Option<bool>,
 }
 
 impl IndexStorageOptions {
     pub const DEFAULT: Self = Self {
         fillfactor: None,
         deduplicate_items: None,
+        pages_per_range: None,
+        autosummarize: None,
     };
 }
 
@@ -1817,12 +1821,16 @@ impl IndexStorageOptions {
 pub struct IndexStorageOptionNames {
     pub fillfactor: bool,
     pub deduplicate_items: bool,
+    pub pages_per_range: bool,
+    pub autosummarize: bool,
 }
 
 impl IndexStorageOptionNames {
     pub const EMPTY: Self = Self {
         fillfactor: false,
         deduplicate_items: false,
+        pages_per_range: false,
+        autosummarize: false,
     };
 }
 
@@ -2509,6 +2517,7 @@ pub struct DropTransform<'a> {
 pub enum IndexAccessMethod {
     Btree,
     Hash,
+    Brin,
 }
 
 impl IndexAccessMethod {
@@ -2516,6 +2525,7 @@ impl IndexAccessMethod {
         match self {
             Self::Btree => 0,
             Self::Hash => 1,
+            Self::Brin => 2,
         }
     }
 
@@ -2523,6 +2533,7 @@ impl IndexAccessMethod {
         match code {
             0 => Some(Self::Btree),
             1 => Some(Self::Hash),
+            2 => Some(Self::Brin),
             _ => None,
         }
     }
@@ -2531,6 +2542,7 @@ impl IndexAccessMethod {
         match self {
             Self::Btree => "btree",
             Self::Hash => "hash",
+            Self::Brin => "brin",
         }
     }
 }

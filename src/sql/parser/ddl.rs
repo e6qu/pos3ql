@@ -5340,6 +5340,7 @@ impl<'a> Parser<'a> {
             expression_text: "",
             collation: None,
             operator_class: None,
+            operator_class_options: crate::sql::ast::BrinOperatorClassOptions::DEFAULT,
             descending: false,
             ordering_specified: false,
             nulls_first: false,
@@ -5376,13 +5377,13 @@ impl<'a> Parser<'a> {
                 }
                 _ => None,
             };
-            if operator_class.is_some() && self.peeked == Tok::Op("(") {
-                return Err(ParseError {
-                    at: self.peek_at,
-                    message: stack_format!(96, "operator class parameters are not supported"),
-                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                });
-            }
+            let operator_class_options = if operator_class.is_some() && self.eat_op("(")? {
+                let options = self.brin_operator_class_options()?;
+                self.expect_op(")")?;
+                options
+            } else {
+                crate::sql::ast::BrinOperatorClassOptions::DEFAULT
+            };
             let (descending, ordering_specified) = if self.eat_ident("asc")? {
                 (false, true)
             } else if self.eat_ident("desc")? {
@@ -5407,6 +5408,7 @@ impl<'a> Parser<'a> {
                 expression_text,
                 collation,
                 operator_class,
+                operator_class_options,
                 descending,
                 ordering_specified,
                 nulls_first,
@@ -5484,6 +5486,117 @@ impl<'a> Parser<'a> {
             tablespace,
             unique,
         })
+    }
+
+    fn brin_operator_class_options(
+        &mut self,
+    ) -> Result<crate::sql::ast::BrinOperatorClassOptions<'a>, ParseError> {
+        let mut options = crate::sql::ast::BrinOperatorClassOptions::DEFAULT;
+        if self.peeked == Tok::Op(")") {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: crate::util::StackStr::from_str("syntax error at or near \")\""),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+            });
+        }
+        loop {
+            let option = self.any_ident("operator class parameter")?;
+            let _ = self.eat_op("=")?;
+            if option.eq_ignore_ascii_case("values_per_range") {
+                if options.values_per_range.is_some() {
+                    return Err(
+                        self.err_here("parameter \"values_per_range\" specified more than once")
+                    );
+                }
+                let raw = match self.peeked {
+                    Tok::Num(raw) | Tok::Str(raw) => raw,
+                    _ => return Err(self.err_here("expected an integer")),
+                };
+                let value = raw
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|value| (8..=256).contains(value));
+                self.advance()?;
+                options.values_per_range = Some(value.ok_or_else(|| ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        96,
+                        "value {} out of bounds for option \"values_per_range\"",
+                        raw
+                    ),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                })?);
+            } else if option.eq_ignore_ascii_case("n_distinct_per_range") {
+                if options.n_distinct_per_range.is_some() {
+                    return Err(self
+                        .err_here("parameter \"n_distinct_per_range\" specified more than once"));
+                }
+                let value = if let Tok::Str(raw) = self.peeked {
+                    let value = raw.parse::<i64>().map_err(|_| {
+                        self.err_here("invalid value for integer option \"n_distinct_per_range\"")
+                    })?;
+                    self.advance()?;
+                    value
+                } else {
+                    self.seq_int()?
+                };
+                options.n_distinct_per_range = Some(
+                    i32::try_from(value)
+                        .ok()
+                        .filter(|value| *value >= -1)
+                        .ok_or_else(|| ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "value {} out of bounds for option \"n_distinct_per_range\"",
+                                value
+                            ),
+                            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                        })?,
+                );
+            } else if option.eq_ignore_ascii_case("false_positive_rate") {
+                if options.false_positive_rate.is_some() {
+                    return Err(
+                        self.err_here("parameter \"false_positive_rate\" specified more than once")
+                    );
+                }
+                let raw = match self.peeked {
+                    Tok::Num(raw) | Tok::Str(raw) => raw,
+                    _ => {
+                        return Err(self.err_here(
+                            "invalid value for floating point option \"false_positive_rate\"",
+                        ));
+                    }
+                };
+                let value = raw
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && (0.000_1..=0.25).contains(value));
+                self.advance()?;
+                if value.is_none() {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "value {} out of bounds for option \"false_positive_rate\"",
+                            raw
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                }
+                options.false_positive_rate = Some(raw);
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(options)
     }
 
     fn index_storage_options(&mut self) -> Result<IndexStorageOptions, ParseError> {

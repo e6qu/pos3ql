@@ -10,7 +10,9 @@ CREATE TABLE brin_index_rows (
 CREATE INDEX brin_index_rows_id ON brin_index_rows USING brin (id)
     WITH (pages_per_range = 32, autosummarize = yes);
 CREATE INDEX brin_index_rows_category ON brin_index_rows USING brin
-    (lower(category) text_bloom_ops, id int4_minmax_multi_ops)
+    (lower(category) text_bloom_ops
+        (n_distinct_per_range='128', false_positive_rate=0.05),
+     id int4_minmax_multi_ops (values_per_range=8))
     WHERE active;
 
 INSERT INTO brin_index_rows VALUES
@@ -46,6 +48,21 @@ SELECT index_relation.relname, access_method.amname,
   JOIN pg_am AS access_method ON access_method.oid = index_relation.relam
  WHERE index_relation.relname LIKE 'brin_index_rows_%'
  ORDER BY index_relation.relname;
+SELECT relation.relname, attribute.attname, attribute.attoptions::text
+  FROM pg_attribute AS attribute
+  JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+ WHERE relation.relname = 'brin_index_rows_category'
+   AND attribute.attnum > 0
+ ORDER BY attribute.attnum;
+
+SELECT brin_summarize_new_values('brin_index_rows_id'::regclass);
+SELECT brin_desummarize_range('brin_index_rows_id'::regclass, 0);
+SELECT brin_summarize_range('brin_index_rows_id'::regclass, 0);
+SELECT brin_summarize_range('brin_index_rows_id'::regclass, 0);
+BEGIN;
+SELECT brin_desummarize_range('brin_index_rows_id'::regclass, 0);
+ROLLBACK;
+SELECT brin_summarize_range('brin_index_rows_id'::regclass, 0);
 
 CREATE TABLE brin_index_clone
     (LIKE brin_index_rows INCLUDING INDEXES);
@@ -80,6 +97,49 @@ SELECT parent.relname, parent_method.amname, child.relname, child_method.amname
 REINDEX TABLE brin_index_rows;
 SELECT payload FROM brin_index_rows WHERE id = 2;
 
+CREATE TABLE brin_inclusion_rows (
+    id integer, span int4range, network inet, payload text
+);
+CREATE INDEX brin_inclusion_rows_values ON brin_inclusion_rows USING brin
+    (span range_inclusion_ops, network inet_inclusion_ops)
+    WITH (pages_per_range = 1);
+INSERT INTO brin_inclusion_rows VALUES
+    (1, '[1,5)'::int4range, '10.0.0.0/8'::inet, 'broad'),
+    (2, '[8,14)'::int4range, '10.1.0.0/16'::inet, 'middle'),
+    (3, '[20,30)'::int4range, '10.1.2.0/24'::inet, 'narrow'),
+    (4, 'empty'::int4range, '192.0.2.1'::inet, 'outside');
+SELECT id FROM brin_inclusion_rows
+ WHERE span && '[4,10)'::int4range ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE network >>= '10.1.2.0/24'::inet ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE network <<= '10.0.0.0/8'::inet ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE network >> '10.1.2.0/24'::inet ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE network << '10.0.0.0/8'::inet ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE span -|- '[5,8)'::int4range ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE span << '[20,30)'::int4range ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE span &< '[6,7)'::int4range ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE span &> '[15,16)'::int4range ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE span >> '[1,5)'::int4range ORDER BY id;
+SELECT id FROM brin_inclusion_rows
+ WHERE network && '10.1.0.0/16'::inet ORDER BY id;
+PREPARE brin_inclusion_lookup(int4range) AS
+    SELECT id FROM brin_inclusion_rows WHERE span && $1 ORDER BY id;
+EXECUTE brin_inclusion_lookup('[25,26)'::int4range);
+DEALLOCATE brin_inclusion_lookup;
+UPDATE brin_inclusion_rows SET payload = 'matched'
+ WHERE span @> 9 RETURNING id, payload;
+DELETE FROM brin_inclusion_rows
+ WHERE network <<= '192.0.2.0/24'::inet RETURNING id;
+SELECT id, payload FROM brin_inclusion_rows ORDER BY id;
+
 SELECT (SELECT count(*) FROM pg_opclass WHERE opcmethod = 3580),
        (SELECT count(*) FROM pg_opfamily WHERE opfmethod = 3580),
        (SELECT count(*) FROM pg_amop WHERE amopmethod = 3580),
@@ -101,5 +161,6 @@ SELECT procedure.oid, procedure.amprocfamily, procedure.amproclefttype,
  ORDER BY procedure.oid;
 
 DROP TABLE brin_index_partitioned CASCADE;
+DROP TABLE brin_inclusion_rows;
 DROP TABLE brin_index_clone;
 DROP TABLE brin_index_rows;

@@ -35,6 +35,9 @@ pub(crate) enum ValueIndexPosition {
     Before,
     Match,
     After,
+    /// The key is not a match, but the predicate is not monotonic in index
+    /// order, so the enclosing block cannot be pruned from this observation.
+    Recheck,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

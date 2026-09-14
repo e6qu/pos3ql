@@ -1732,6 +1732,30 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "v",
     },
+    intrinsic!(
+        3952,
+        "brin_summarize_new_values",
+        super::types::oid::INT4,
+        "2205",
+        1,
+        "v"
+    ),
+    intrinsic!(
+        3999,
+        "brin_summarize_range",
+        super::types::oid::INT4,
+        "2205 20",
+        2,
+        "v"
+    ),
+    intrinsic!(
+        4014,
+        "brin_desummarize_range",
+        super::types::oid::VOID,
+        "2205 20",
+        2,
+        "v"
+    ),
     // PostgreSQL 18 pg_lsn input/output, comparison, arithmetic, hash, cast,
     // and ordered aggregate support.
     intrinsic!(
@@ -3717,6 +3741,9 @@ fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
         | 3566
         | 4568
         | 6212
+        | 3952
+        | 3999
+        | 4014
         | 6339
         | 6340
         | 6341 => "r",
@@ -10719,6 +10746,8 @@ struct IdxInfo {
     operator_classes: [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
     resolved_operator_classes:
         [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
+    operator_class_options:
+        [crate::storage::BrinOperatorClassOptions; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
@@ -10833,6 +10862,8 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
                 operator_classes: [None; crate::storage::MAX_INDEX_COLS],
                 resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+                operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+                    crate::storage::MAX_INDEX_COLS],
                 descending,
                 nulls_first,
                 n_cols: columns.len(),
@@ -10981,6 +11012,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
             info.explicit_collations = index.explicit_collations;
             info.operator_classes = index.operator_classes;
             info.resolved_operator_classes = index.resolved_operator_classes;
+            info.operator_class_options = index.operator_class_options;
             info.explicit_definition = Some(index.mutable_for(txid));
             visit(info);
         }
@@ -11164,6 +11196,8 @@ fn empty_index() -> IdxInfo {
         explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
         operator_classes: [None; crate::storage::MAX_INDEX_COLS],
         resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+        operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+            crate::storage::MAX_INDEX_COLS],
         descending: [false; crate::storage::MAX_INDEX_COLS],
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
         n_cols: 0,
@@ -15402,6 +15436,23 @@ fn write_index_key_metadata(
     {
         let _ = out.write_char(' ');
         write_identifier(out, class.name());
+    }
+    let options = info.operator_class_options[position];
+    if !options.is_empty() {
+        let _ = out.write_str(" (");
+        let mut separator = "";
+        if let Some(value) = options.values_per_range {
+            let _ = write!(out, "values_per_range='{value}'");
+            separator = ", ";
+        }
+        if let Some(value) = options.n_distinct_per_range {
+            let _ = write!(out, "{separator}n_distinct_per_range='{value}'");
+            separator = ", ";
+        }
+        if let Some(value) = options.false_positive_rate {
+            let _ = write!(out, "{separator}false_positive_rate='{}'", value.as_str());
+        }
+        let _ = out.write_char(')');
     }
 }
 
@@ -21198,6 +21249,48 @@ fn type_storage(ctype: ColType) -> &'static str {
     }
 }
 
+fn index_attribute_options<'a>(
+    info: &IdxInfo,
+    attribute: usize,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if attribute >= info.n_cols {
+        return Ok(Datum::Null);
+    }
+    let options = info.operator_class_options[attribute];
+    let mut values = [Datum::Null; 3];
+    let mut count = 0;
+    if let Some(value) = options.values_per_range {
+        values[count] = text(
+            stack_format!(64, "values_per_range={value}").as_str(),
+            arena,
+        )?;
+        count += 1;
+    }
+    if let Some(value) = options.n_distinct_per_range {
+        values[count] = text(
+            stack_format!(64, "n_distinct_per_range={value}").as_str(),
+            arena,
+        )?;
+        count += 1;
+    }
+    if let Some(value) = options.false_positive_rate {
+        values[count] = text(
+            stack_format!(80, "false_positive_rate={}", value.as_str()).as_str(),
+            arena,
+        )?;
+        count += 1;
+    }
+    if count == 0 {
+        Ok(Datum::Null)
+    } else {
+        Ok(Datum::Array {
+            element: super::types::ArrElem::Text,
+            raw: super::array::build(&values[..count], arena)?,
+        })
+    }
+}
+
 fn pg_attribute<'a>(
     storage: &Storage,
     txid: u32,
@@ -21587,7 +21680,7 @@ fn pg_attribute<'a>(
                         Datum::Int4(attribute as i32 + 1),
                         text("i", arena)?,
                         Datum::Bool(true),
-                        Datum::Null,
+                        index_attribute_options(info, attribute, arena)?,
                         Datum::Null,
                         Datum::Bool(false),
                         Datum::Null,

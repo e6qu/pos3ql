@@ -227,6 +227,8 @@ bench_pos3ql warm-memory-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-brin-point --workload brin-point --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-brin-inclusion --workload brin-inclusion --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-tail-range --workload tail-range --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-ordered-limit --workload ordered-limit --clients "$CLIENTS" \
@@ -263,6 +265,8 @@ bench_pos3ql cold-object-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS"
 bench_pos3ql cold-object-brin-point --workload brin-point --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-brin-inclusion --workload brin-inclusion --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 stop_pos3ql
 
 DATA_COLD_JOIN="$WORK/data-cold-join"
@@ -280,7 +284,7 @@ if [ "$MODE" = full ]; then
     replica_port=$(choose_free_port $((19800 + replica * 10)) $((19809 + replica * 10)))
     launch_replica "replica-$replica" "$replica_port"
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" \
-      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key); CREATE INDEX benchmark_brin_lookup ON benchmark_kv USING brin (brin_key) WITH (pages_per_range=32, autosummarize=on); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
+      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL, brin_span int4range NOT NULL, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key); CREATE INDEX benchmark_brin_lookup ON benchmark_kv USING brin (brin_key) WITH (pages_per_range=32, autosummarize=on); CREATE INDEX benchmark_brin_inclusion ON benchmark_kv USING brin (brin_span range_inclusion_ops) WITH (pages_per_range=32); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" --expect "$SCALE_ROWS" \
       --timeout 30 "SELECT count(*) FROM benchmark_kv" >/dev/null
     REPLICA_TARGETS="$REPLICA_TARGETS --target 127.0.0.1:$replica_port"

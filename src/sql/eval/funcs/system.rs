@@ -844,6 +844,9 @@ pub(crate) fn dispatch<'a>(
             | "pg_my_temp_schema"
             | "pg_is_other_temp_schema"
             | "pg_get_indexdef"
+            | "brin_summarize_new_values"
+            | "brin_summarize_range"
+            | "brin_desummarize_range"
             | "pg_get_constraintdef"
             | "pg_get_partkeydef"
             | "pg_get_functiondef"
@@ -915,6 +918,53 @@ pub(crate) fn dispatch<'a>(
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
         match name {
+            "brin_summarize_new_values" => {
+                arity(1)?;
+                let Some(oid) = CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "BRIN maintenance access is unavailable"
+                    )
+                })?;
+                Ok(Datum::Int4(catalog.brin_summarize_new_values(oid.0)?))
+            }
+            "brin_summarize_range" | "brin_desummarize_range" => {
+                arity(2)?;
+                let Some(oid) = CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)?
+                else {
+                    return Ok(Datum::Null);
+                };
+                let block = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Int2(value) => i64::from(value),
+                    Datum::Int4(value) => i64::from(value),
+                    Datum::Int8(value) => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch(name, &other)),
+                };
+                let block = u64::try_from(block).map_err(|_| {
+                    sql_err!(
+                        sqlstate::NUMERIC_OUT_OF_RANGE,
+                        "block number out of range: {}",
+                        block
+                    )
+                })?;
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "BRIN maintenance access is unavailable"
+                    )
+                })?;
+                if name == "brin_summarize_range" {
+                    Ok(Datum::Int4(catalog.brin_summarize_range(oid.0, block)?))
+                } else {
+                    catalog.brin_desummarize_range(oid.0, block)?;
+                    Ok(Datum::Text(""))
+                }
+            }
             "pg_backend_pid" => {
                 arity(0)?;
                 Ok(Datum::Int4(

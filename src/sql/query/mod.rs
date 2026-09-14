@@ -1659,6 +1659,57 @@ impl StorageCatalog<'_, '_, '_, '_> {
     }
 }
 
+fn brin_index_slot(storage: &Storage, txid: u32, oid: i32) -> Result<usize, SqlError> {
+    if let Some((schema, name)) = super::catalog::index_identity_by_oid(storage, txid, oid) {
+        let Some(slot) = storage.index_slot(schema.as_str(), name.as_str(), txid) else {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a BRIN index",
+                name.as_str()
+            ));
+        };
+        let index = storage
+            .index_visible_to(slot, txid)
+            .expect("resolved index slot remains visible");
+        if index.method != crate::sql::ast::IndexAccessMethod::Brin
+            || !matches!(
+                index.mutable_for(txid).kind,
+                crate::storage::IndexKind::Ordinary
+            )
+        {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a BRIN index",
+                name.as_str()
+            ));
+        }
+        storage.require_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Index,
+                slot: slot as u16,
+            },
+            txid,
+            "index",
+        )?;
+        return Ok(slot);
+    }
+    for slot in 0..storage.table_count() {
+        if storage.table_slot_visible_to(slot, txid) && super::catalog::user_table_oid(slot) == oid
+        {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not an index",
+                storage.table_def(slot, txid).name.as_str()
+            ));
+        }
+    }
+    Err(sql_err!(
+        sqlstate::UNDEFINED_TABLE,
+        "relation with OID {} does not exist",
+        oid
+    ))
+}
+
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn current_backend_pid(&self) -> Result<i32, SqlError> {
         let pid = self.storage.current_connection_id();
@@ -1759,6 +1810,21 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         } else {
             self.storage.assigned_transaction_identity(self.txid)
         })
+    }
+
+    fn brin_summarize_new_values(&self, index_oid: i32) -> Result<i32, SqlError> {
+        let slot = brin_index_slot(self.storage, self.txid, index_oid)?;
+        self.storage.brin_summarize_new_values(slot, self.txid)
+    }
+
+    fn brin_summarize_range(&self, index_oid: i32, block: u64) -> Result<i32, SqlError> {
+        let slot = brin_index_slot(self.storage, self.txid, index_oid)?;
+        self.storage.brin_summarize_range(slot, block, self.txid)
+    }
+
+    fn brin_desummarize_range(&self, index_oid: i32, block: u64) -> Result<(), SqlError> {
+        let slot = brin_index_slot(self.storage, self.txid, index_oid)?;
+        self.storage.brin_desummarize_range(slot, block, self.txid)
     }
 
     fn current_transaction_snapshot<'a>(

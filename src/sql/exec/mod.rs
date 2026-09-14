@@ -3498,6 +3498,8 @@ struct CopiedIndex {
     operator_classes: [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
     resolved_operator_classes:
         [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
+    operator_class_options:
+        [crate::storage::BrinOperatorClassOptions; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
@@ -3533,6 +3535,8 @@ fn copy_like_indexes(
             explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
             operator_classes: [None; crate::storage::MAX_INDEX_COLS],
             resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+            operator_class_options: [crate::storage::BrinOperatorClassOptions::DEFAULT;
+                crate::storage::MAX_INDEX_COLS],
             descending: [false; crate::storage::MAX_INDEX_COLS],
             nulls_first: [false; crate::storage::MAX_INDEX_COLS],
             n_cols: 0,
@@ -3571,6 +3575,7 @@ fn copy_like_indexes(
                 explicit_collations: index.explicit_collations,
                 operator_classes: index.operator_classes,
                 resolved_operator_classes: index.resolved_operator_classes,
+                operator_class_options: index.operator_class_options,
                 descending: index.descending,
                 nulls_first: index.nulls_first,
                 n_cols: index.n_cols,
@@ -3618,6 +3623,7 @@ fn copy_like_indexes(
                     explicit_collations: index.explicit_collations,
                     operator_classes: index.operator_classes,
                     resolved_operator_classes: index.resolved_operator_classes,
+                    operator_class_options: index.operator_class_options,
                     descending: index.descending,
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
@@ -3658,6 +3664,7 @@ fn copy_like_indexes(
                     explicit_collations: index.explicit_collations,
                     operator_classes: index.operator_classes,
                     resolved_operator_classes: index.resolved_operator_classes,
+                    operator_class_options: index.operator_class_options,
                     descending: index.descending,
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
@@ -45077,6 +45084,7 @@ fn rewrite_composite_dependent_indexes(
                 explicit_collations: altered.explicit_collations,
                 operator_classes: altered.operator_classes,
                 resolved_operator_classes: altered.resolved_operator_classes,
+                operator_class_options: altered.operator_class_options,
                 descending: altered.descending,
                 nulls_first: altered.nulls_first,
                 n_cols: altered.n_cols,
@@ -46791,6 +46799,8 @@ pub fn create_index(
     let mut expression_refs = [None; MAX_INDEX_COLS];
     let mut operator_classes = [None; MAX_INDEX_COLS];
     let mut resolved_operator_classes = [None; MAX_INDEX_COLS];
+    let mut operator_class_options =
+        [crate::storage::BrinOperatorClassOptions::DEFAULT; MAX_INDEX_COLS];
     for (i, index_column) in command.columns.iter().enumerate() {
         let (input, type_oid) = if let Some(column_name) = index_column.column {
             let Some(column_index) = tdef.column_index(column_name) else {
@@ -46843,6 +46853,13 @@ pub fn create_index(
         };
         if let Some(operator_class) = index_column.operator_class {
             if command.method == crate::sql::ast::IndexAccessMethod::Hash {
+                if !index_column.operator_class_options.is_empty() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "operator class {} has no options",
+                        operator_class.name
+                    ));
+                }
                 if operator_class
                     .schema
                     .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
@@ -46901,6 +46918,47 @@ pub fn create_index(
                         input.ctype.name()
                     ));
                 }
+                use crate::sql::types::BrinOperatorClassKind;
+                let supplied = index_column.operator_class_options;
+                let rejected = match parsed.kind() {
+                    BrinOperatorClassKind::MinmaxMulti => supplied
+                        .n_distinct_per_range
+                        .map(|_| "n_distinct_per_range")
+                        .or_else(|| supplied.false_positive_rate.map(|_| "false_positive_rate")),
+                    BrinOperatorClassKind::Bloom => {
+                        supplied.values_per_range.map(|_| "values_per_range")
+                    }
+                    BrinOperatorClassKind::Minmax | BrinOperatorClassKind::Inclusion => {
+                        if supplied.is_empty() {
+                            None
+                        } else {
+                            return sql_fail(sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "operator class {} has no options",
+                                operator_class.name
+                            ));
+                        }
+                    }
+                };
+                if let Some(parameter) = rejected {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "unrecognized parameter \"{}\"",
+                        parameter
+                    ));
+                }
+                let false_positive_rate = supplied.false_positive_rate.map(StackStr::from_str);
+                if false_positive_rate.is_some_and(|value| value.is_truncated()) {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "BRIN option value is too long"
+                    ));
+                }
+                operator_class_options[i] = crate::storage::BrinOperatorClassOptions {
+                    values_per_range: supplied.values_per_range,
+                    n_distinct_per_range: supplied.n_distinct_per_range,
+                    false_positive_rate,
+                };
                 let class = crate::storage::IndexOperatorClass::Brin(parsed);
                 operator_classes[i] = Some(class);
                 resolved_operator_classes[i] = Some(class);
@@ -46911,6 +46969,13 @@ pub fn create_index(
                 operator_class.name,
                 txn.txid,
             ) {
+                if !index_column.operator_class_options.is_empty() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "operator class {} has no options",
+                        operator_class.name
+                    ));
+                }
                 let definition = storage.operator_class_for(slot, txn.txid);
                 let input_oid = storage
                     .routine_type_oid(definition.input.ctype, definition.input.user_type, txn.txid)
@@ -46947,6 +47012,13 @@ pub fn create_index(
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "operator class \"{}\" does not exist for access method \"btree\"",
+                    operator_class.name
+                ));
+            }
+            if !index_column.operator_class_options.is_empty() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "operator class {} has no options",
                     operator_class.name
                 ));
             }
@@ -47127,6 +47199,7 @@ pub fn create_index(
         explicit_collations,
         operator_classes,
         resolved_operator_classes,
+        operator_class_options,
         descending,
         nulls_first,
         n_cols,
@@ -47229,6 +47302,7 @@ pub fn create_index(
                 explicit_collations,
                 operator_classes,
                 resolved_operator_classes,
+                operator_class_options,
                 descending,
                 nulls_first,
                 n_cols,
@@ -47481,6 +47555,7 @@ fn create_partition_index_children(
                     explicit_collations: index.explicit_collations,
                     operator_classes: index.operator_classes,
                     resolved_operator_classes: index.resolved_operator_classes,
+                    operator_class_options: index.operator_class_options,
                     descending: index.descending,
                     nulls_first: index.nulls_first,
                     n_cols: index.n_cols,
@@ -49531,6 +49606,22 @@ pub fn reindex(
     }
     for &table in &tables[..table_count] {
         if let Err(error) = storage.refresh_enforcers(table) {
+            return sql_fail(error);
+        }
+    }
+    for index_slot in 0..storage.index_count() {
+        let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
+            continue;
+        };
+        if index.method != crate::sql::ast::IndexAccessMethod::Brin
+            || selected_index.is_some_and(|selected| selected != index_slot)
+            || storage
+                .index_table_slot_to(index_slot, txn.txid)
+                .is_none_or(|table| !tables[..table_count].contains(&table))
+        {
+            continue;
+        }
+        if let Err(error) = storage.rebuild_brin_maintenance(index_slot, txn.txid) {
             return sql_fail(error);
         }
     }

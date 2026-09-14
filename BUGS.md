@@ -209,3 +209,19 @@ values for built-in BRIN classes. The shared index-option parser also accepted
 fewer PostgreSQL boolean spellings than the server. These bug classes are
 fixed at their typed choke points. No externally blocked defect remains from
 this review.
+
+The BRIN completion review found that inclusion operator classes were catalog
+identities without executable containment/overlap plans, plain-column BRIN
+bindings discarded the concrete index identity needed to select those
+strategies, and operator-class parameters were rejected before validation.
+One typed bitmap plan now handles range and network inclusion strategies,
+including non-leading constrained keys, while complete predicate and MVCC
+rechecks remain authoritative. PostgreSQL's bounded minmax-multi and Bloom
+options survive deparse, attribute catalogs, WAL, checkpoints, cloning, and
+cold recovery. Maintenance now retains absolute, startup-bounded,
+nontransactional state across rollback and recovery, and a desummarized range
+conservatively disables immutable-block pruning. Cold testing also exposed
+maintenance page counts consulting only the resident map, which made
+object-resident tables appear empty after restart; the count now uses the
+merged authoritative row seam. No externally blocked defect remains from this
+review.

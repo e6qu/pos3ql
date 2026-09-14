@@ -27,12 +27,12 @@ Modeled btree, hash, and BRIN indexes are physical access paths. Hash indexes ex
 exact single-key probes across plain, expression, partial, prepared, query,
 join, and direct UPDATE/DELETE paths; their equality-only contract excludes
 ordering, ranges, uniqueness, included columns, and clustering exactly where
-PostgreSQL does. BRIN indexes execute equality and range predicates through
-lossy bitmap plans over the immutable object-block roster, including
+PostgreSQL does. BRIN indexes execute equality/range and the built-in
+range/network inclusion strategies through bitmap plans over the immutable object-block roster, including
 multicolumn, expression, partial, prepared, join, and direct UPDATE/DELETE
-paths. Their minmax, minmax-multi, Bloom, and inclusion operator-class
-identities and relation options retain PostgreSQL 18 catalog, WAL, checkpoint,
-ALTER, and cold-recovery behavior. Btree indexes additionally execute composite keys and
+paths. Their minmax-multi and Bloom parameters, explicit summarize/desummarize
+state, operator-class identities, and relation options retain PostgreSQL 18
+catalog, rollback, WAL, checkpoint, ALTER, and cold-recovery behavior. Btree indexes additionally execute composite keys and
 equality-leading prefixes with lower, upper, or two-sided bounds on the
 following column. Nested loops use those same exact and range probes
 when their keys depend on already-bound rows, including multiway joins,

@@ -843,6 +843,24 @@ pub trait CatalogAccess {
             "transaction identity access is unavailable"
         ))
     }
+    fn brin_summarize_new_values(&self, _index_oid: i32) -> Result<i32, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "BRIN maintenance access is unavailable"
+        ))
+    }
+    fn brin_summarize_range(&self, _index_oid: i32, _block: u64) -> Result<i32, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "BRIN maintenance access is unavailable"
+        ))
+    }
+    fn brin_desummarize_range(&self, _index_oid: i32, _block: u64) -> Result<(), SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "BRIN maintenance access is unavailable"
+        ))
+    }
     fn current_transaction_snapshot<'a>(
         &self,
         _arena: &'a Arena,

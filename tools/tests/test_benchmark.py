@@ -78,6 +78,10 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT payload FROM benchmark_kv WHERE brin_key = 331",
         )
         self.assertEqual(
+            benchmark.workload_sql("brin-inclusion", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE brin_span && '[662,663)'::int4range",
+        )
+        self.assertEqual(
             benchmark.workload_sql("tail-range", 0, 0, 8),
             "SELECT sum(payload), count(*) FROM benchmark_kv WHERE id >= 1",
         )
@@ -105,7 +109,7 @@ class BenchmarkTest(unittest.TestCase):
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),
-            "INSERT INTO benchmark_kv(id, hash_key, brin_key, payload) VALUES (2001008, 2001008, 2001008, 0)",
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, payload) VALUES (2001008, 2001008, 2001008, '[4002016,4002018)'::int4range, 0)",
         )
 
     def test_point_reads_and_updates_exercise_the_hash_key(self):

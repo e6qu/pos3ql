@@ -46675,6 +46675,202 @@ fn create_index_and_unique() {
 }
 
 #[test]
+fn hash_indexes_drive_exact_queries_joins_dml_and_cold_recovery() {
+    let mut config = test_config("physical-hash-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.table_rows = 4096;
+    config.value_index_rows = 8192;
+    config.object_store_bucket = format!("physical-hash-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE hash_documents (
+             id integer, email text, active boolean, payload text
+         );
+         CREATE INDEX hash_documents_id ON hash_documents USING hash (id)
+             NULLS NOT DISTINCT WITH (fillfactor=80);
+         CREATE INDEX hash_documents_active_email ON hash_documents USING hash
+             (lower(email) text_pattern_ops) WHERE active;
+         INSERT INTO hash_documents VALUES
+             (1, 'Alpha@example.com', true, 'alpha'),
+             (2, 'Beta@example.com', false, 'beta'),
+             (3, 'Gamma@example.com', true, 'gamma');
+         INSERT INTO hash_documents
+             SELECT value + 10, 'filler-' || value::text || '@example.com',
+                    value % 2 = 0, repeat('x', 64)
+             FROM generate_series(1, 500) AS source(value);
+         CREATE TABLE hash_needles (id integer);
+         INSERT INTO hash_needles VALUES (2), (3)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let catalog = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT indexdef FROM pg_indexes
+           WHERE indexname LIKE 'hash_documents_%' ORDER BY indexname;
+         SELECT access_method.amname, index_catalog.indclass::text
+           FROM pg_index index_catalog
+           JOIN pg_class index_relation ON index_relation.oid = index_catalog.indexrelid
+           JOIN pg_am access_method ON access_method.oid = index_relation.relam
+          WHERE index_relation.relname IN
+                ('hash_documents_id', 'hash_documents_active_email')
+          ORDER BY index_relation.relname;
+         SELECT (SELECT count(*) FROM pg_opclass WHERE opcmethod = 405),
+                (SELECT count(*) FROM pg_opfamily WHERE opfmethod = 405),
+                (SELECT count(*) FROM pg_amop WHERE amopmethod = 405),
+                (SELECT count(*) FROM pg_amproc procedure
+                   JOIN pg_opfamily family ON family.oid = procedure.amprocfamily
+                  WHERE family.opfmethod = 405)",
+    ));
+    assert_eq!(
+        catalog,
+        [
+            "CREATE INDEX hash_documents_active_email ON public.hash_documents USING hash (lower(email) text_pattern_ops) WHERE active",
+            "CREATE INDEX hash_documents_id ON public.hash_documents USING hash (id) NULLS NOT DISTINCT WITH (fillfactor='80')",
+            "hash|10056",
+            "hash|10020",
+            "41|34|48|76",
+        ]
+    );
+
+    let resident = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT payload FROM hash_documents WHERE id = 2;
+         SELECT payload FROM hash_documents WHERE id = 2;
+         PREPARE hash_lookup(integer) AS
+             SELECT payload FROM hash_documents WHERE id = $1;
+         EXECUTE hash_lookup(3);
+         EXPLAIN (GENERIC_PLAN) EXECUTE hash_lookup(3);
+         EXPLAIN SELECT document.payload FROM hash_needles needle
+             JOIN hash_documents document ON document.id = needle.id;
+         SELECT document.payload FROM hash_needles needle
+             JOIN hash_documents document ON document.id = needle.id ORDER BY document.id;
+         EXPLAIN SELECT payload FROM hash_documents
+             WHERE active AND lower(email) = 'alpha@example.com';
+         SELECT payload FROM hash_documents
+             WHERE active AND lower(email) = 'alpha@example.com';
+         EXPLAIN UPDATE hash_documents SET payload = 'beta-updated' WHERE id = 2;
+         UPDATE hash_documents SET payload = 'beta-updated' WHERE id = 2 RETURNING payload;
+         SELECT payload FROM hash_documents WHERE id = 2",
+    ));
+    assert!(
+        resident
+            .iter()
+            .any(|row| row.contains("Index Scan using hash_documents_id")),
+        "{resident:?}"
+    );
+    assert!(
+        resident
+            .iter()
+            .any(|row| row.contains("Index Scan using hash_documents_active_email")),
+        "{resident:?}"
+    );
+    assert!(resident.iter().any(|row| row == "alpha"));
+    assert!(resident.iter().any(|row| row == "gamma"));
+    assert!(resident.iter().any(|row| row == "beta-updated"));
+
+    for (statement, message) in [
+        (
+            "CREATE UNIQUE INDEX bad_hash_unique ON hash_documents USING hash (id)",
+            "does not support unique indexes",
+        ),
+        (
+            "CREATE INDEX bad_hash_multi ON hash_documents USING hash (id, active)",
+            "does not support multicolumn indexes",
+        ),
+        (
+            "CREATE INDEX bad_hash_order ON hash_documents USING hash (id ASC)",
+            "does not support ASC/DESC options",
+        ),
+        (
+            "CREATE INDEX bad_hash_null_order ON hash_documents USING hash (id NULLS LAST)",
+            "does not support NULLS FIRST/LAST options",
+        ),
+        (
+            "CREATE INDEX bad_hash_include ON hash_documents USING hash (id) INCLUDE (payload)",
+            "does not support included columns",
+        ),
+        (
+            "CREATE INDEX bad_hash_option ON hash_documents USING hash (id) WITH (deduplicate_items=off)",
+            "unrecognized parameter \"deduplicate_items\"",
+        ),
+    ] {
+        let unsupported =
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, statement)).to_string();
+        assert!(unsupported.contains(message), "{message}: {unsupported}");
+    }
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = data_rows(&run_with(
+        &mut recovered,
+        &mut recovery_budget,
+        "EXPLAIN SELECT payload FROM hash_documents WHERE id = 3;
+         SELECT payload FROM hash_documents WHERE id = 3;
+         EXPLAIN SELECT id FROM hash_documents WHERE id >= 498 ORDER BY id;
+         SELECT id FROM hash_documents WHERE id >= 508 ORDER BY id;
+         EXPLAIN SELECT payload FROM hash_documents
+             WHERE active AND lower(email) = 'gamma@example.com';
+         SELECT payload FROM hash_documents
+             WHERE active AND lower(email) = 'gamma@example.com';
+         DELETE FROM hash_documents WHERE id = 3 RETURNING payload;
+         SELECT payload FROM hash_documents WHERE id = 3;
+         SELECT indexrelname, idx_scan > 0
+           FROM pg_stat_user_indexes
+          WHERE indexrelname LIKE 'hash_documents_%' ORDER BY indexrelname",
+    ));
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Scan using hash_documents_id")),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Scan using hash_documents_active_email")),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Seq Scan on hash_documents"))
+    );
+    assert!(cold.iter().any(|row| row.contains("Sort")));
+    assert!(cold.iter().any(|row| row == "gamma"));
+    assert!(cold.iter().any(|row| row == "508"));
+    assert!(cold.iter().any(|row| row == "509"));
+    assert!(cold.iter().any(|row| row == "510"));
+    assert!(
+        cold.iter()
+            .any(|row| row == "hash_documents_active_email|t")
+    );
+    assert!(cold.iter().any(|row| row == "hash_documents_id|t"));
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     let mut config = test_config("composite-index-access");
     config.object_store_on = true;

@@ -883,7 +883,7 @@ fn create_table_kind(
         return sql_fail(e);
     }
     if foreign.is_none()
-        && let Err(e) = copy_like_indexes(storage, wal, txn, statement, &def)
+        && let Err(e) = copy_like_indexes(storage, wal, txn, statement, &def, arena)
     {
         return sql_fail(e);
     }
@@ -3488,6 +3488,7 @@ fn remap_columns(
 /// One source index, captured before the mutable borrow that creates its copy.
 #[derive(Clone, Copy)]
 struct CopiedIndex {
+    method: crate::sql::ast::IndexAccessMethod,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expressions: [Option<crate::util::StackStr<{ crate::storage::INDEX_EXPRESSION_MAX }>>;
         crate::storage::MAX_INDEX_COLS],
@@ -3518,11 +3519,13 @@ fn copy_like_indexes(
     txn: &mut TxnState,
     statement: &CreateTable,
     def: &TableDef,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     use crate::storage::IndexDef;
     for like in statement.likes.iter().filter(|l| l.indexes) {
         // Collected up front: creating one needs `storage` mutably.
         let mut copied = [CopiedIndex {
+            method: crate::sql::ast::IndexAccessMethod::Btree,
             columns: [0; crate::storage::MAX_INDEX_COLS],
             expressions: [None; crate::storage::MAX_INDEX_COLS],
             include_columns: [0; crate::storage::MAX_INDEX_COLS],
@@ -3560,6 +3563,7 @@ fn copy_like_indexes(
                 ));
             }
             copied[n_copied] = CopiedIndex {
+                method: index.method,
                 columns: index.columns,
                 expressions: index.expressions,
                 include_columns: index.include_columns,
@@ -3586,7 +3590,17 @@ fn copy_like_indexes(
             let columns = remap_columns(def, &source, &index.columns[..index.n_cols])?;
             let include_columns =
                 remap_columns(def, &source, &index.include_columns[..index.n_include_cols])?;
-            let name = auto_key_name(def, &columns[..index.n_cols], "idx", true)?;
+            let name = if let Some(expression) = index.expressions[0] {
+                let parsed = crate::sql::parser::parse_expr(expression.as_str(), arena)?;
+                generated_index_name_for_key(storage, def, index_name_key(parsed), txn.txid)?
+            } else {
+                generated_index_name_for_key(
+                    storage,
+                    def,
+                    def.columns()[columns[0] as usize].name.as_str(),
+                    txn.txid,
+                )?
+            };
             let slot = storage.create_index(
                 IndexDef {
                     database: storage.current_database_oid(),
@@ -3595,6 +3609,7 @@ fn copy_like_indexes(
                     name,
                     pending_name: None,
                     table: def.name,
+                    method: index.method,
                     ownership: crate::storage::Ownership::BOOTSTRAP,
                     columns,
                     expressions: index.expressions,
@@ -3632,6 +3647,7 @@ fn copy_like_indexes(
                     schema: def.schema.as_str(),
                     name: name.as_str(),
                     table: def.name.as_str(),
+                    method: index.method,
                     columns,
                     expressions: index
                         .expressions
@@ -21642,6 +21658,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     build,
                     scope,
                     if_not_exists,
+                    method,
                     columns,
                     include_columns,
                     nulls_not_distinct,
@@ -21662,6 +21679,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                             build: *build,
                             scope: *scope,
                             if_not_exists: *if_not_exists,
+                            method: *method,
                             columns,
                             include_columns,
                             nulls_not_distinct: *nulls_not_distinct,
@@ -37110,6 +37128,12 @@ pub fn comment(
         } => {
             match method {
                 crate::sql::ast::IndexAccessMethod::Btree => {}
+                crate::sql::ast::IndexAccessMethod::Hash => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on hash operator families are not supported"
+                    ));
+                }
             }
             let Some(slot) =
                 storage.operator_family_slot_on_path(family_name.schema, family_name.name, txid)
@@ -37139,6 +37163,12 @@ pub fn comment(
         } => {
             match method {
                 crate::sql::ast::IndexAccessMethod::Btree => {}
+                crate::sql::ast::IndexAccessMethod::Hash => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on hash operator classes are not supported"
+                    ));
+                }
             }
             let Some(slot) =
                 storage.operator_class_slot_on_path(class_name.schema, class_name.name, txid)
@@ -45024,6 +45054,7 @@ fn rewrite_composite_dependent_indexes(
                 schema: altered.schema.as_str(),
                 name: altered.name.as_str(),
                 table: altered.table.as_str(),
+                method: altered.method,
                 columns: altered.columns,
                 expressions: altered
                     .expressions
@@ -45695,14 +45726,25 @@ fn generated_index_name(
     columns: &[crate::sql::ast::IndexColumn<'_>],
     txid: u32,
 ) -> Result<SqlName, SqlError> {
-    use core::fmt::Write as _;
-    let key = match columns.first().map(|column| column.expression) {
-        Some(Expr::Column { name, .. }) => *name,
-        Some(Expr::Call { name, .. }) if crate::sql::ast::catalog_operator_call(name).is_none() => {
-            *name
-        }
+    let key = index_name_key(columns[0].expression);
+    generated_index_name_for_key(storage, table, key, txid)
+}
+
+fn index_name_key<'a>(expression: &Expr<'a>) -> &'a str {
+    match expression {
+        Expr::Column { name, .. } => name,
+        Expr::Call { name, .. } if crate::sql::ast::catalog_operator_call(name).is_none() => name,
         _ => "expr",
-    };
+    }
+}
+
+fn generated_index_name_for_key(
+    storage: &Storage,
+    table: &TableDef,
+    key: &str,
+    txid: u32,
+) -> Result<SqlName, SqlError> {
+    use core::fmt::Write as _;
     for ordinal in 0..=storage.index_count() {
         let mut name = StackStr::<64>::new();
         let _ = write!(name, "{}_{}_idx", table.name.as_str(), key);
@@ -46538,6 +46580,7 @@ pub struct CreateIndexCommand<'a> {
     pub build: crate::sql::ast::IndexBuildMode,
     pub scope: crate::sql::ast::IndexTargetScope,
     pub if_not_exists: bool,
+    pub method: crate::sql::ast::IndexAccessMethod,
     pub columns: &'a [crate::sql::ast::IndexColumn<'a>],
     pub include_columns: &'a [&'a str],
     pub nulls_not_distinct: bool,
@@ -46612,6 +46655,44 @@ pub fn create_index(
             MAX_INDEX_COLS
         ));
     }
+    if command.method == crate::sql::ast::IndexAccessMethod::Hash {
+        if command.unique {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"hash\" does not support unique indexes"
+            ));
+        }
+        if command.columns.len() != 1 {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"hash\" does not support multicolumn indexes"
+            ));
+        }
+        if command.columns[0].ordering_specified {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"hash\" does not support ASC/DESC options"
+            ));
+        }
+        if command.columns[0].nulls_order_specified {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"hash\" does not support NULLS FIRST/LAST options"
+            ));
+        }
+        if !command.include_columns.is_empty() {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"hash\" does not support included columns"
+            ));
+        }
+        if command.options.deduplicate_items.is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unrecognized parameter \"deduplicate_items\""
+            ));
+        }
+    }
     let mut columns = [0u16; MAX_INDEX_COLS];
     let mut expressions = [None; MAX_INDEX_COLS];
     let mut include_columns = [0u16; MAX_INDEX_COLS];
@@ -46664,12 +46745,45 @@ pub fn create_index(
                 None => {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
-                        "data type unknown has no default operator class for access method \"btree\""
+                        "data type unknown has no default operator class for access method \"{}\"",
+                        command.method.name()
                     ));
                 }
             }
         };
         if let Some(operator_class) = index_column.operator_class {
+            if command.method == crate::sql::ast::IndexAccessMethod::Hash {
+                if operator_class
+                    .schema
+                    .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"hash\"",
+                        operator_class.name
+                    ));
+                }
+                let Some(parsed) = crate::sql::types::HashOperatorClass::parse(operator_class.name)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"hash\"",
+                        operator_class.name
+                    ));
+                };
+                if !parsed.accepts(input.ctype) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "operator class \"{}\" does not accept data type {}",
+                        operator_class.name,
+                        input.ctype.name()
+                    ));
+                }
+                let class = crate::storage::IndexOperatorClass::Hash(parsed);
+                operator_classes[i] = Some(class);
+                resolved_operator_classes[i] = Some(class);
+                continue;
+            }
             if let Some(slot) = storage.operator_class_slot_on_path(
                 operator_class.schema,
                 operator_class.name,
@@ -46730,14 +46844,15 @@ pub fn create_index(
                     input.ctype.name()
                 ));
             }
-            let class = crate::storage::IndexOperatorClass::Builtin(parsed);
+            let class = crate::storage::IndexOperatorClass::Btree(parsed);
             operator_classes[i] = Some(class);
             resolved_operator_classes[i] = Some(class);
         } else {
-            let resolved = match storage.resolve_index_operator_class(None, input, txn.txid) {
-                Ok(class) => class,
-                Err(error) => return sql_fail(error),
-            };
+            let resolved =
+                match storage.resolve_index_operator_class(None, input, command.method, txn.txid) {
+                    Ok(class) => class,
+                    Err(error) => return sql_fail(error),
+                };
             if let crate::storage::IndexOperatorClass::Catalog(oid) = resolved {
                 let slot = storage
                     .operator_class_slot_by_oid(oid, txn.txid)
@@ -46881,6 +46996,7 @@ pub fn create_index(
         name: sqlname,
         pending_name: None,
         table: tdef.name,
+        method: command.method,
         ownership: crate::storage::Ownership::BOOTSTRAP,
         columns,
         expressions,
@@ -46979,6 +47095,7 @@ pub fn create_index(
                 schema: tdef.schema.as_str(),
                 name: sqlname.as_str(),
                 table: tdef.name.as_str(),
+                method: command.method,
                 columns,
                 expressions: expressions
                     .each_ref()
@@ -47038,7 +47155,8 @@ fn index_definitions_compatible(
     left: &crate::storage::IndexDef,
     right: &crate::storage::IndexDef,
 ) -> bool {
-    left.unique == right.unique
+    left.method == right.method
+        && left.unique == right.unique
         && left.n_cols == right.n_cols
         && left.n_include_cols == right.n_include_cols
         && left.columns[..left.n_cols] == right.columns[..right.n_cols]
@@ -47228,6 +47346,7 @@ fn create_partition_index_children(
                     schema: index.schema.as_str(),
                     name: index.name.as_str(),
                     table: index.table.as_str(),
+                    method: index.method,
                     columns: index.columns,
                     expressions: index
                         .expressions
@@ -49336,7 +49455,7 @@ fn set_clustered_index(
     storage.refresh_enforcers(table)
 }
 
-/// Records the btree CLUSTER choice in the same typed index definition that
+/// Records the ordered-index CLUSTER choice in the same typed definition that
 /// owns tablespace, build state, WAL, checkpoints, and rollback. Physical
 /// block placement is cache-local in the object-native store, so its durable
 /// counterpart is PostgreSQL's catalog-visible selected ordering.

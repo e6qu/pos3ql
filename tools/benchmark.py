@@ -198,9 +198,9 @@ def percentile(sorted_values, percent):
 def workload_sql(workload, worker, operation, rows):
     key = (worker + operation * 17) % rows + 1
     if workload == "point-read" or (workload == "mixed" and operation % 5):
-        return f"SELECT payload FROM benchmark_kv WHERE id = {key}"
+        return f"SELECT payload FROM benchmark_kv WHERE hash_key = {key}"
     if workload in ("update", "mixed"):
-        return f"UPDATE benchmark_kv SET payload = payload + 1 WHERE id = {key}"
+        return f"UPDATE benchmark_kv SET payload = payload + 1 WHERE hash_key = {key}"
     if workload == "scan":
         return "SELECT sum(payload), count(*) FROM benchmark_kv"
     if workload == "tail-range":
@@ -221,7 +221,10 @@ def workload_sql(workload, worker, operation, rows):
         )
     if workload == "insert":
         inserted_key = rows + worker * 1_000_000 + operation + 1
-        return f"INSERT INTO benchmark_kv(id, payload) VALUES ({inserted_key}, 0)"
+        return (
+            "INSERT INTO benchmark_kv(id, hash_key, payload) "
+            f"VALUES ({inserted_key}, {inserted_key}, 0)"
+        )
     raise ValueError(f"unknown workload {workload}")
 
 
@@ -237,8 +240,11 @@ def setup_database(connection, rows):
     # multi-block table scan instead of a degenerate one-block fixture.
     connection.query(
         "CREATE TABLE benchmark_kv("
-        "id integer PRIMARY KEY, payload bigint NOT NULL, "
+        "id integer PRIMARY KEY, hash_key integer NOT NULL, payload bigint NOT NULL, "
         "padding text NOT NULL DEFAULT repeat('x', 8192))"
+    )
+    connection.query(
+        "CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key)"
     )
     connection.query(
         "CREATE INDEX benchmark_covering "
@@ -249,8 +255,8 @@ def setup_database(connection, rows):
     for first in range(1, rows + 1, 1000):
         last = min(rows, first + 999)
         connection.query(
-            "INSERT INTO benchmark_kv(id, payload) "
-            f"SELECT value, 0 FROM generate_series({first}, {last}) AS value"
+            "INSERT INTO benchmark_kv(id, hash_key, payload) "
+            f"SELECT value, value, 0 FROM generate_series({first}, {last}) AS value"
         )
     connection.query("ANALYZE benchmark_kv")
     connection.query("CHECKPOINT")

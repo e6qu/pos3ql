@@ -1337,8 +1337,13 @@ fn index_access_plan_for_binding<'a>(
     {
         return None;
     }
-    let (index_oid, index_name) =
-        crate::sql::catalog::value_index_identity(storage, txid, slot, &columns[..n_columns])?;
+    let (index_oid, index_name) = crate::sql::catalog::value_index_identity(
+        storage,
+        txid,
+        slot,
+        &columns[..n_columns],
+        !exact,
+    )?;
     let (key_types, _) = storage.value_binding_key_types(slot, binding);
     let (collations, _) = storage.value_binding_collations(slot, binding);
     Some(IndexAccessPlan {
@@ -1447,6 +1452,11 @@ where
             break;
         }
         exact &= n_constraints == index.n_cols;
+        if index.method == crate::sql::ast::IndexAccessMethod::Hash
+            && (!exact || required_order.is_some())
+        {
+            continue;
+        }
         if (!allow_unconstrained && n_constraints == 0)
             || (exact && !storage.value_binding_probe_complete(slot, binding))
             || (!exact && !storage.value_binding_durable_complete(slot, binding))

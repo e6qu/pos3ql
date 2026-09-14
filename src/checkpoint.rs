@@ -5535,7 +5535,7 @@ impl Checkpointer {
                             let code = code.parse().map_err(|_| {
                                 CheckpointSetupError::Corrupt("bad builtin index operator class")
                             })?;
-                            Some(crate::storage::IndexOperatorClass::Builtin(
+                            Some(crate::storage::IndexOperatorClass::Btree(
                                 crate::sql::types::BtreeOperatorClass::from_code(code).ok_or(
                                     CheckpointSetupError::Corrupt(
                                         "bad builtin index operator class",
@@ -5551,6 +5551,15 @@ impl Checkpointer {
                                     CheckpointSetupError::Corrupt(
                                         "bad catalog index operator class",
                                     ),
+                                )?,
+                            ))
+                        } else if let Some(code) = encoded.strip_prefix('h') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad hash index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Hash(
+                                crate::sql::types::HashOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt("bad hash index operator class"),
                                 )?,
                             ))
                         } else {
@@ -5570,7 +5579,7 @@ impl Checkpointer {
                                     "bad builtin resolved index operator class",
                                 )
                             })?;
-                            Some(crate::storage::IndexOperatorClass::Builtin(
+                            Some(crate::storage::IndexOperatorClass::Btree(
                                 crate::sql::types::BtreeOperatorClass::from_code(code).ok_or(
                                     CheckpointSetupError::Corrupt(
                                         "bad builtin resolved index operator class",
@@ -5587,6 +5596,19 @@ impl Checkpointer {
                                 crate::storage::OperatorClassOid::parse(oid).ok_or(
                                     CheckpointSetupError::Corrupt(
                                         "bad catalog resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else if let Some(code) = encoded.strip_prefix('h') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad hash resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Hash(
+                                crate::sql::types::HashOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad hash resolved index operator class",
                                     ),
                                 )?,
                             ))
@@ -5659,6 +5681,23 @@ impl Checkpointer {
                         descending[i] = descending_mask & (1 << i) != 0;
                         nulls_first[i] = nulls_first_mask & (1 << i) != 0;
                     }
+                    let method = if resolved_operator_classes[..n_cols].iter().all(|class| {
+                        matches!(class, Some(crate::storage::IndexOperatorClass::Hash(_)))
+                    }) {
+                        crate::sql::ast::IndexAccessMethod::Hash
+                    } else if resolved_operator_classes[..n_cols].iter().all(|class| {
+                        matches!(
+                            class,
+                            Some(crate::storage::IndexOperatorClass::Btree(_))
+                                | Some(crate::storage::IndexOperatorClass::Catalog(_))
+                        )
+                    }) {
+                        crate::sql::ast::IndexAccessMethod::Btree
+                    } else {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "mixed index access-method operator classes",
+                        ));
+                    };
                     let slot = storage
                         .create_index(
                             crate::storage::IndexDef {
@@ -5668,6 +5707,7 @@ impl Checkpointer {
                                 name: sql_name(&name)?,
                                 pending_name: None,
                                 table: sql_name(&table)?,
+                                method,
                                 ownership: crate::storage::Ownership::BOOTSTRAP,
                                 columns,
                                 expressions,
@@ -8931,8 +8971,11 @@ impl Checkpointer {
                     None => {
                         let _ = operator_classes.write_str(" 0");
                     }
-                    Some(crate::storage::IndexOperatorClass::Builtin(class)) => {
+                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
                         let _ = write!(operator_classes, " b{}", class.code());
+                    }
+                    Some(crate::storage::IndexOperatorClass::Hash(class)) => {
+                        let _ = write!(operator_classes, " h{}", class.code());
                     }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         let _ = write!(operator_classes, " c{}", oid.get());
@@ -8941,8 +8984,11 @@ impl Checkpointer {
                 match index.resolved_operator_classes[position]
                     .expect("live index key has a resolved operator class")
                 {
-                    crate::storage::IndexOperatorClass::Builtin(class) => {
+                    crate::storage::IndexOperatorClass::Btree(class) => {
                         let _ = write!(resolved_operator_classes, " b{}", class.code());
+                    }
+                    crate::storage::IndexOperatorClass::Hash(class) => {
+                        let _ = write!(resolved_operator_classes, " h{}", class.code());
                     }
                     crate::storage::IndexOperatorClass::Catalog(oid) => {
                         let _ = write!(resolved_operator_classes, " c{}", oid.get());

@@ -852,6 +852,7 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         table: &'a str,
+        method: crate::sql::ast::IndexAccessMethod,
         columns: [u16; MAX_INDEX_COLS],
         /// Canonical source for expression keys; `None` denotes the matching
         /// physical table column in `columns`.
@@ -2723,6 +2724,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + n_cols * 5
                 + 3
                 + 2
+                + 2
                 + 1
                 + 1
                 + MAX_INDEX_COLS * 2
@@ -4488,6 +4490,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             schema,
             name,
             table,
+            method,
             columns,
             expressions,
             include_columns,
@@ -4554,8 +4557,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for operator_class in &operator_classes[..*n_cols] {
                 ok &= match operator_class {
                     None => buffer.append(&[0, 0, 0, 0, 0]),
-                    Some(crate::storage::IndexOperatorClass::Builtin(class)) => {
+                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
                         buffer.append(&[1, class.code(), 0, 0, 0])
+                    }
+                    Some(crate::storage::IndexOperatorClass::Hash(class)) => {
+                        buffer.append(&[3, class.code(), 0, 0, 0])
                     }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
@@ -4565,8 +4571,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[0xa9]);
             for operator_class in &resolved_operator_classes[..*n_cols] {
                 ok &= match operator_class {
-                    Some(crate::storage::IndexOperatorClass::Builtin(class)) => {
+                    Some(crate::storage::IndexOperatorClass::Btree(class)) => {
                         buffer.append(&[1, class.code(), 0, 0, 0])
+                    }
+                    Some(crate::storage::IndexOperatorClass::Hash(class)) => {
+                        buffer.append(&[3, class.code(), 0, 0, 0])
                     }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
@@ -4574,6 +4583,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     None => false,
                 };
             }
+            ok &= buffer.append(&[0xaa, method.code()]);
             ok &= buffer.append(&[0xa8]);
             ok && append_index_definition(buffer, *definition)
         }
@@ -7969,7 +7979,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *operator_class = match tag {
                     0 if value == [0, 0, 0, 0] => None,
                     1 if value[1..] == [0, 0, 0] => {
-                        Some(crate::storage::IndexOperatorClass::Builtin(
+                        Some(crate::storage::IndexOperatorClass::Btree(
                             BtreeOperatorClass::from_code(value[0])?,
                         ))
                     }
@@ -7977,6 +7987,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                         crate::storage::OperatorClassOid::parse(i32::from_le_bytes(
                             value.try_into().ok()?,
                         ))?,
+                    )),
+                    3 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Hash(
+                        crate::sql::types::HashOperatorClass::from_code(value[0])?,
                     )),
                     _ => return None,
                 };
@@ -7992,7 +8005,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 5;
                 *operator_class = match tag {
                     1 if value[1..] == [0, 0, 0] => {
-                        Some(crate::storage::IndexOperatorClass::Builtin(
+                        Some(crate::storage::IndexOperatorClass::Btree(
                             BtreeOperatorClass::from_code(value[0])?,
                         ))
                     }
@@ -8001,9 +8014,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                             value.try_into().ok()?,
                         ))?,
                     )),
+                    3 if value[1..] == [0, 0, 0] => Some(crate::storage::IndexOperatorClass::Hash(
+                        crate::sql::types::HashOperatorClass::from_code(value[0])?,
+                    )),
                     _ => return None,
                 };
             }
+            let method = if *payload.get(at)? == 0xaa {
+                at += 1;
+                let method = crate::sql::ast::IndexAccessMethod::from_code(*payload.get(at)?)?;
+                at += 1;
+                method
+            } else {
+                crate::sql::ast::IndexAccessMethod::Btree
+            };
             if *payload.get(at)? != 0xa8 {
                 return None;
             }
@@ -8014,6 +8038,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 name,
                 table,
+                method,
                 columns,
                 expressions,
                 include_columns,
@@ -12789,6 +12814,7 @@ mod tests {
             schema: "public",
             name: "active_values",
             table: "rows",
+            method: crate::sql::ast::IndexAccessMethod::Btree,
             columns: [1; MAX_INDEX_COLS],
             expressions: [
                 Some("lower(value)"),
@@ -12804,7 +12830,7 @@ mod tests {
             collations: [crate::sql::ast::Collation::Default; MAX_INDEX_COLS],
             explicit_collations: [false; MAX_INDEX_COLS],
             operator_classes: [None; MAX_INDEX_COLS],
-            resolved_operator_classes: [Some(crate::storage::IndexOperatorClass::Builtin(
+            resolved_operator_classes: [Some(crate::storage::IndexOperatorClass::Btree(
                 BtreeOperatorClass::Text,
             )); MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
@@ -12844,6 +12870,65 @@ mod tests {
         assert!(nulls_not_distinct);
         assert!(definition.clustered);
         assert_eq!(predicate, Some("active AND value IS NOT NULL"));
+
+        // WAL written before access methods became durable metadata has no
+        // 0xaa method field. Its only executable index method was btree.
+        let current = payload.readable();
+        let method_at = current
+            .windows(3)
+            .rposition(|window| window == [0xaa, 0, 0xa8])
+            .expect("encoded btree method marker");
+        let mut legacy = [0u8; 4096];
+        legacy[..method_at].copy_from_slice(&current[..method_at]);
+        legacy[method_at..current.len() - 2].copy_from_slice(&current[method_at + 2..]);
+        let Some(WalOp::CreateIndex { method, .. }) =
+            decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - 2])
+        else {
+            panic!("legacy btree index WAL payload must decode");
+        };
+        assert_eq!(method, crate::sql::ast::IndexAccessMethod::Btree);
+    }
+
+    #[test]
+    fn hash_index_payload_round_trips_typed_method_and_operator_class() {
+        let hash_class =
+            crate::storage::IndexOperatorClass::Hash(crate::sql::types::HashOperatorClass::Int4);
+        let operation = WalOp::CreateIndex {
+            created_at: 43,
+            schema: "public",
+            name: "hash_values",
+            table: "rows",
+            method: crate::sql::ast::IndexAccessMethod::Hash,
+            columns: [0; MAX_INDEX_COLS],
+            expressions: [None; MAX_INDEX_COLS],
+            include_columns: [0; MAX_INDEX_COLS],
+            collations: [crate::sql::ast::Collation::Default; MAX_INDEX_COLS],
+            explicit_collations: [false; MAX_INDEX_COLS],
+            operator_classes: [Some(hash_class); MAX_INDEX_COLS],
+            resolved_operator_classes: [Some(hash_class); MAX_INDEX_COLS],
+            descending: [false; MAX_INDEX_COLS],
+            nulls_first: [false; MAX_INDEX_COLS],
+            n_cols: 1,
+            n_include_cols: 0,
+            nulls_not_distinct: false,
+            predicate: None,
+            unique: false,
+            definition: crate::storage::IndexMutableDefinition::DEFAULT,
+        };
+        let mut bytes = [0; 4096];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        let Some(WalOp::CreateIndex {
+            method,
+            operator_classes,
+            resolved_operator_classes,
+            ..
+        }) = decode_op(KIND_CREATE_INDEX, payload)
+        else {
+            panic!("hash index WAL payload must decode");
+        };
+        assert_eq!(method, crate::sql::ast::IndexAccessMethod::Hash);
+        assert_eq!(operator_classes[0], Some(hash_class));
+        assert_eq!(resolved_operator_classes[0], Some(hash_class));
     }
 
     #[test]

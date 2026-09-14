@@ -372,7 +372,8 @@ fn index_key_values_equal(
             return Ok(false);
         }
         let equal = match equality.operator_classes[index] {
-            crate::storage::IndexOperatorClass::Builtin(_) => compare_datums_collated(
+            crate::storage::IndexOperatorClass::Btree(_)
+            | crate::storage::IndexOperatorClass::Hash(_) => compare_datums_collated(
                 equality.storage,
                 equality.collations[index],
                 value,
@@ -1224,7 +1225,7 @@ pub fn check_unique_indexes(
                     crate::sql::parser::parse_expr(source, arena)
                 })
                 .transpose()?;
-            let mut classes = [crate::storage::IndexOperatorClass::Builtin(
+            let mut classes = [crate::storage::IndexOperatorClass::Btree(
                 crate::sql::types::BtreeOperatorClass::Int4,
             ); crate::storage::MAX_INDEX_COLS];
             for position in 0..index.n_cols {

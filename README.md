@@ -23,10 +23,13 @@ With object storage enabled, the server groups transactions completed in one rea
 
 The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, full transaction IDs and snapshots, views, materialized views, modeled indexes, sequences, domains, enums, PostgreSQL large objects, full-text search, SQL functions (scalar, `SETOF`, and `TABLE`, including mutable and nested calls), CTEs, joins, windows, COPY, PostgreSQL 18 SQL/JSON and SQL/XML, PostgreSQL 18-interoperable logical-replication publishing and bounded subscription bootstrap/apply, and PostgreSQL catalog introspection used by common clients and dump/restore tools. [The PostgreSQL 18 matrix](docs/postgresql-18-compatibility.md) distinguishes implemented behavior, explicit architecture boundaries, and extension support.
 
-Modeled btree indexes are physical access paths for exact single and
-composite keys, expressions, prepared parameters, and equality-leading prefixes with lower,
-upper, or two-sided bounds on the following column in queries and direct
-UPDATE/DELETE target scans. Nested loops use those same exact and range probes
+Modeled btree and hash indexes are physical access paths. Hash indexes execute
+exact single-key probes across plain, expression, partial, prepared, query,
+join, and direct UPDATE/DELETE paths; their equality-only contract excludes
+ordering, ranges, uniqueness, included columns, and clustering exactly where
+PostgreSQL does. Btree indexes additionally execute composite keys and
+equality-leading prefixes with lower, upper, or two-sided bounds on the
+following column. Nested loops use those same exact and range probes
 when their keys depend on already-bound rows, including multiway joins,
 prepared expressions, `UPDATE ... FROM`, and `DELETE ... USING`.
 Complete resident equality maps avoid table walks;
@@ -41,7 +44,9 @@ wide rows. Immutable generations carry versioned `INCLUDE` payloads, so
 key-and-payload-covered ordered queries execute as index-only scans after a
 cold start and across post-checkpoint updates. Partial indexes own physical
 membership-filtered bindings and are selected only when a conservative typed
-implication proof establishes that the query entails their predicate.
+implication proof establishes that the query entails their predicate. Access
+method and operator-class identity survive WAL, checkpoints, copied and
+partitioned indexes, reindexing, and object-cold recovery.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

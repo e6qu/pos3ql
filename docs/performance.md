@@ -67,13 +67,13 @@ the comparison does not pretend PostgreSQL itself has an S3 cache profile.
 
 | Scenario | Boundary measured |
 |---|---|
-| warm memory | Repeated point reads in the process that created and checkpointed the data |
+| warm memory | Repeated hash-index point reads in the process that created and checkpointed the data |
 | indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
 | ordered limit | Repeated descending key-only `ORDER BY ... LIMIT` scans that must fetch no base tuples, warm and object-cold |
 | parameterized join | Repeated 32-key nested-loop probes whose inner table must use its B-tree, warm and after a dedicated empty-local-cache restart |
 | warm disk | Graceful restart with the same disposable local data directory |
 | empty local caches | Restart from a new local directory against the unchanged durable object prefix |
-| concurrent updates | Synchronized clients, commit latency, and immutable-batch/commit-head PUT amplification |
+| concurrent updates | Synchronized hash-index target probes, commit latency, and immutable-batch/commit-head PUT amplification |
 | checkpoint interference | Mixed reads and updates with and without overlapping explicit checkpoints |
 | PostgreSQL 18 | Single/concurrent point reads, inserts, scans, and mixed-workload throughput through the same wire client |
 | logical replicas | Aggregate reads across one through N durable subscribers, plus observed catch-up time |
@@ -93,7 +93,7 @@ branch.
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no
 more than 125% of the fixed plan, the stable object-operation metric schema,
-at least one index scan per point-read, tail-range, ordered-limit, parameterized-join, or synchronized-update operation and
+at least one index scan per hash point-read, btree tail-range, btree ordered-limit, parameterized-btree-join, or hash-targeted synchronized-update operation and
 zero sequential scans in the complete resident warm-memory paths, actual
 shared-object reads during empty-local-cache recovery, and concurrent commit
 PUT amplification below 1.75 PUTs per transaction. Ordered-limit runs also
@@ -116,16 +116,16 @@ reported rather than required to be linear.
 ## What the measurements decide next
 
 Representative long runs, not the single-binary label or the small CI smoke
-dataset, decide optimization order. Btree equality probes, including expression
-and implied partial-index keys, now use
+dataset, decide optimization order. Hash equality probes and btree equality
+probes, including expression and implied partial-index keys, now use
 resident exact maps or filtered immutable blocks for queries and direct DML.
 Composite leading-prefix and range predicates seek across checkpoint-sorted
 immutable keys and skip disjoint object blocks; the harness records both warm
 and cold tail-range workloads alongside PostgreSQL 18. Compatible ordered
 queries sort only compact index keys, stream base reads through `LIMIT`, and
 avoid them entirely for key- and `INCLUDE`-covered projections. The known structural limits
-remain global query serialization, non-btree physical methods, and small
-startup-sized catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
+remain global query serialization, GiST/GIN/SP-GiST/BRIN physical methods, and
+small startup-sized catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
 lock ordering, group publication order, and explicit backpressure. Writer
 fencing and promotion safety must exist before any failover benchmark or
 active-active claim is meaningful.

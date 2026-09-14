@@ -8575,14 +8575,16 @@ pub(crate) const MAX_INDEX_COLS: usize = 8;
 /// executable class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndexOperatorClass {
-    Builtin(crate::sql::types::BtreeOperatorClass),
+    Btree(crate::sql::types::BtreeOperatorClass),
+    Hash(crate::sql::types::HashOperatorClass),
     Catalog(OperatorClassOid),
 }
 
 impl IndexOperatorClass {
     pub(crate) const fn oid(self) -> i32 {
         match self {
-            Self::Builtin(class) => class.oid(),
+            Self::Btree(class) => class.oid(),
+            Self::Hash(class) => class.oid(),
             Self::Catalog(oid) => oid.get(),
         }
     }
@@ -8912,7 +8914,7 @@ pub(crate) struct PendingIndexDefinition {
     pub definition: IndexMutableDefinition,
 }
 
-/// A named btree index over a table's columns.
+/// A named executable index over a table's columns.
 #[derive(Clone, Copy)]
 pub struct IndexDef {
     pub(crate) database: DatabaseOid,
@@ -8923,6 +8925,7 @@ pub struct IndexDef {
     pub name: SqlName,
     pub(crate) pending_name: Option<PendingIndexName>,
     pub table: SqlName,
+    pub method: crate::sql::ast::IndexAccessMethod,
     pub ownership: Ownership,
     pub columns: [u16; MAX_INDEX_COLS],
     /// `Some` is a canonical expression key; `None` uses the resolved table
@@ -14697,6 +14700,7 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     pending_name: None,
                     table: SqlName::parse("").expect("empty name fits"),
+                    method: crate::sql::ast::IndexAccessMethod::Btree,
                     ownership: Ownership::BOOTSTRAP,
                     columns: [0; MAX_INDEX_COLS],
                     expressions: [None; MAX_INDEX_COLS],
@@ -36162,6 +36166,35 @@ impl Storage {
     pub fn create_index(&mut self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
         def.database = self.current_database;
         self.require_schema_create(def.schema.as_str(), txid)?;
+        match def.method {
+            crate::sql::ast::IndexAccessMethod::Btree => {
+                if def.resolved_operator_classes[..def.n_cols]
+                    .iter()
+                    .any(|class| matches!(class, Some(IndexOperatorClass::Hash(_))))
+                {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "btree index has a hash operator class"
+                    ));
+                }
+            }
+            crate::sql::ast::IndexAccessMethod::Hash => {
+                if def.unique
+                    || def.n_cols != 1
+                    || def.n_include_cols != 0
+                    || def.descending[..def.n_cols].iter().any(|value| *value)
+                    || def.nulls_first[..def.n_cols].iter().any(|value| *value)
+                    || def.resolved_operator_classes[..def.n_cols]
+                        .iter()
+                        .any(|class| !matches!(class, Some(IndexOperatorClass::Hash(_))))
+                {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "hash index definition has unsupported key semantics"
+                    ));
+                }
+            }
+        }
         if def.mutable.clustered && !matches!(def.mutable.kind, IndexKind::Ordinary) {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
@@ -36257,6 +36290,15 @@ impl Storage {
         definition: IndexMutableDefinition,
         txid: u32,
     ) -> Result<Option<PendingIndexDefinition>, SqlError> {
+        if definition.clustered
+            && self.indexes[slot].method == crate::sql::ast::IndexAccessMethod::Hash
+        {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot cluster on index \"{}\" because access method does not support clustering",
+                self.indexes[slot].name.as_str()
+            ));
+        }
         if definition.clustered && !matches!(definition.kind, IndexKind::Ordinary) {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
@@ -41162,6 +41204,7 @@ impl Storage {
         &self,
         explicit: Option<IndexOperatorClass>,
         input: RoutineResult,
+        method: crate::sql::ast::IndexAccessMethod,
         txid: u32,
     ) -> Result<IndexOperatorClass, SqlError> {
         if let Some(class) = explicit {
@@ -41183,15 +41226,24 @@ impl Storage {
                 .expect("user operator-class OID is typed");
             return Ok(IndexOperatorClass::Catalog(oid));
         }
-        crate::sql::types::BtreeOperatorClass::for_type(input.ctype)
-            .map(IndexOperatorClass::Builtin)
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "data type {} has no default operator class for access method \"btree\"",
-                    input.ctype.name()
-                )
-            })
+        let class = match method {
+            crate::sql::ast::IndexAccessMethod::Btree => {
+                crate::sql::types::BtreeOperatorClass::for_type(input.ctype)
+                    .map(IndexOperatorClass::Btree)
+            }
+            crate::sql::ast::IndexAccessMethod::Hash => {
+                crate::sql::types::HashOperatorClass::for_type(input.ctype)
+                    .map(IndexOperatorClass::Hash)
+            }
+        };
+        class.ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "data type {} has no default operator class for access method \"{}\"",
+                input.ctype.name(),
+                method.name()
+            )
+        })
     }
 
     fn validate_operator_class_definition(

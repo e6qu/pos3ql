@@ -10710,6 +10710,7 @@ struct IdxInfo {
     table_oid: i32,
     table_slot: usize,
     name: StackStr<64>,
+    method: crate::sql::ast::IndexAccessMethod,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
     include_columns: [u16; crate::storage::MAX_INDEX_COLS],
@@ -10824,6 +10825,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 table_oid: toid,
                 table_slot: slot,
                 name,
+                method: crate::sql::ast::IndexAccessMethod::Btree,
                 columns: c,
                 expression_keys,
                 include_columns: included,
@@ -10974,6 +10976,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 stack_str_64(index.name_for(txid).as_str()),
             );
             info.oid = explicit_index_oid(&index);
+            info.method = index.method;
             info.collations = index.collations;
             info.explicit_collations = index.explicit_collations;
             info.operator_classes = index.operator_classes;
@@ -10992,6 +10995,7 @@ pub(crate) fn value_index_identity(
     txid: u32,
     table_slot: usize,
     columns: &[u16],
+    require_order: bool,
 ) -> Option<(i32, StackStr<64>)> {
     let definition = storage.table_def(table_slot, txid);
     let mut found = None;
@@ -11002,6 +11006,7 @@ pub(crate) fn value_index_identity(
             && &index.columns[..index.n_cols] == columns
             && !index.expression_keys[..index.n_cols].iter().any(|key| *key)
             && index.predicate.is_none()
+            && (!require_order || index.method == crate::sql::ast::IndexAccessMethod::Btree)
             && index.columns[..index.n_cols]
                 .iter()
                 .enumerate()
@@ -11040,6 +11045,7 @@ pub(crate) fn ordered_value_index_identity(
     let mut found = None;
     visit_indexes(storage, txid, |index| {
         if index.table_slot != table_slot
+            || index.method != crate::sql::ast::IndexAccessMethod::Btree
             || index.n_cols != columns.len()
             || &index.columns[..index.n_cols] != columns
             || index.expression_keys[..index.n_cols].iter().any(|key| *key)
@@ -11150,6 +11156,7 @@ fn empty_index() -> IdxInfo {
         table_oid: 0,
         table_slot: 0,
         name: StackStr::new(),
+        method: crate::sql::ast::IndexAccessMethod::Btree,
         columns: [0; crate::storage::MAX_INDEX_COLS],
         expression_keys: [false; crate::storage::MAX_INDEX_COLS],
         include_columns: [0; crate::storage::MAX_INDEX_COLS],
@@ -11795,7 +11802,7 @@ pub(crate) fn operator_class_oid_visibility(
             | PG_LSN_HASH_OPERATOR_CLASS_OID
             | ACLITEM_HASH_OPERATOR_CLASS_OID
     );
-    if builtin {
+    if builtin || super::types::HashOperatorClass::from_oid(oid).is_some() {
         return Some(true);
     }
     let slot =
@@ -11834,7 +11841,34 @@ pub(crate) fn operator_family_oid_visibility(
             | PG_LSN_HASH_OPERATOR_FAMILY_OID
             | ACLITEM_HASH_OPERATOR_FAMILY_OID
     );
-    if builtin {
+    if builtin
+        || matches!(
+            oid,
+            427 | 431
+                | 435
+                | 627
+                | 1971
+                | 1977
+                | 1983
+                | 1990
+                | 1992
+                | 1995
+                | 1997
+                | 1998
+                | 1999
+                | 2001
+                | 2040
+                | 2222
+                | 2225
+                | 2229
+                | 2231
+                | 2969
+                | 3523
+                | 4034
+                | 5032
+                | 6194
+        )
+    {
         return Some(true);
     }
     let slot = storage.operator_family_slot_by_oid(oid, txid)?;
@@ -15340,6 +15374,12 @@ fn write_index_key_metadata(
         }
         write_identifier(out, definition.name.as_str());
     }
+    if let Some(crate::storage::IndexOperatorClass::Hash(class)) = info.operator_classes[position]
+        && !class.is_default()
+    {
+        let _ = out.write_char(' ');
+        write_identifier(out, class.name());
+    }
 }
 
 fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &IdxInfo) {
@@ -15416,11 +15456,15 @@ pub fn index_def_text<'a>(
         );
         write_identifier(&mut s, info.name.as_str());
         write_index_target(&mut s, def, info);
-        let _ = s.write_str(if info.is_exclusion {
-            " USING gist ("
-        } else {
-            " USING btree ("
-        });
+        let _ = write!(
+            s,
+            " USING {} (",
+            if info.is_exclusion {
+                "gist"
+            } else {
+                info.method.name()
+            }
+        );
         for k in 0..info.n_cols {
             if k > 0 {
                 let _ = s.write_str(", ");
@@ -18753,7 +18797,13 @@ fn pg_class<'a>(
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Float8(0.0),
                 Datum::Int4(0), // relpages
-                Datum::Int4(if info.is_exclusion { 783 } else { 403 }),
+                Datum::Int4(if info.is_exclusion {
+                    783
+                } else if info.method == crate::sql::ast::IndexAccessMethod::Hash {
+                    405
+                } else {
+                    403
+                }),
                 Datum::Int4(owner_oid(
                     storage,
                     crate::storage::AccessClass::Table,
@@ -22494,6 +22544,45 @@ fn pg_opfamily<'a>(
         arena,
     )?;
     let mut count = 22usize;
+    for (oid, name) in [
+        (427, "bpchar_ops"),
+        (431, "char_ops"),
+        (435, "date_ops"),
+        (627, "array_ops"),
+        (1971, "float_ops"),
+        (1977, "integer_ops"),
+        (1983, "interval_ops"),
+        (1990, "oid_ops"),
+        (1992, "oidvector_ops"),
+        (1995, "text_ops"),
+        (1997, "time_ops"),
+        (1998, "numeric_ops"),
+        (1999, "timestamptz_ops"),
+        (2001, "timetz_ops"),
+        (2040, "timestamp_ops"),
+        (2222, "bool_ops"),
+        (2225, "xid_ops"),
+        (2229, "text_pattern_ops"),
+        (2231, "bpchar_pattern_ops"),
+        (2969, "uuid_ops"),
+        (3523, "enum_ops"),
+        (4034, "jsonb_ops"),
+        (5032, "xid8_ops"),
+        (6194, "record_ops"),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2753),
+                Datum::Int4(oid),
+                Datum::Int4(405),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (slot, family) in storage.operator_families_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opfamily"));
@@ -22837,6 +22926,97 @@ fn pg_opclass<'a>(
         arena,
     )?;
     let mut count = 24usize;
+    for (oid, name, family, input, default) in [
+        (10001, "array_ops", 627, super::types::oid::ANYARRAY, true),
+        (10005, "bpchar_ops", 427, super::types::oid::BPCHAR, true),
+        (10008, "char_ops", 431, super::types::oid::CHAR, true),
+        (10011, "date_ops", 435, super::types::oid::DATE, true),
+        (10013, "float4_ops", 1971, super::types::oid::FLOAT4, true),
+        (10014, "float8_ops", 1971, super::types::oid::FLOAT8, true),
+        (10019, "int2_ops", 1977, super::types::oid::INT2, true),
+        (10020, "int4_ops", 1977, super::types::oid::INT4, true),
+        (10021, "int8_ops", 1977, super::types::oid::INT8, true),
+        (
+            10023,
+            "interval_ops",
+            1983,
+            super::types::oid::INTERVAL,
+            true,
+        ),
+        (10029, "name_ops", 1995, super::types::oid::NAME, true),
+        (10030, "numeric_ops", 1998, super::types::oid::NUMERIC, true),
+        (10031, "oid_ops", 1990, super::types::oid::OID, true),
+        (
+            10033,
+            "oidvector_ops",
+            1992,
+            super::types::oid::OIDVECTOR,
+            true,
+        ),
+        (10035, "record_ops", 6194, super::types::oid::RECORD, true),
+        (10037, "text_ops", 1995, super::types::oid::TEXT, true),
+        (10039, "time_ops", 1997, super::types::oid::TIME, true),
+        (
+            10040,
+            "timestamptz_ops",
+            1999,
+            super::types::oid::TIMESTAMPTZ,
+            true,
+        ),
+        (10042, "timetz_ops", 2001, super::types::oid::TIMETZ, true),
+        (10045, "varchar_ops", 1995, super::types::oid::TEXT, false),
+        (
+            10046,
+            "timestamp_ops",
+            2040,
+            super::types::oid::TIMESTAMP,
+            true,
+        ),
+        (10048, "bool_ops", 2222, super::types::oid::BOOL, true),
+        (10051, "xid_ops", 2225, super::types::oid::XID, true),
+        (10052, "xid8_ops", 5032, super::types::oid::XID8, true),
+        (
+            10056,
+            "text_pattern_ops",
+            2229,
+            super::types::oid::TEXT,
+            false,
+        ),
+        (
+            10057,
+            "varchar_pattern_ops",
+            2229,
+            super::types::oid::TEXT,
+            false,
+        ),
+        (
+            10058,
+            "bpchar_pattern_ops",
+            2231,
+            super::types::oid::BPCHAR,
+            false,
+        ),
+        (10066, "uuid_ops", 2969, super::types::oid::UUID, true),
+        (10070, "enum_ops", 3523, super::types::oid::ANYENUM, true),
+        (10089, "jsonb_ops", 4034, super::types::oid::JSONB, true),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2616),
+                Datum::Int4(oid),
+                Datum::Int4(405),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                Datum::Int4(10),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Bool(default),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (slot, class) in storage.operator_classes_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_opclass"));
@@ -23465,6 +23645,63 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         arena,
     )?;
     count += 1;
+    for (oid, family, left, right, operator) in [
+        (10255, 427, 1042, 1042, 1054),
+        (10256, 431, 18, 18, 92),
+        (10257, 435, 1082, 1082, 1093),
+        (10258, 1971, 700, 700, 620),
+        (10259, 1971, 701, 701, 670),
+        (10260, 1971, 700, 701, 1120),
+        (10261, 1971, 701, 700, 1130),
+        (10263, 1977, 21, 21, 94),
+        (10264, 1977, 23, 23, 96),
+        (10265, 1977, 20, 20, 410),
+        (10266, 1977, 21, 23, 532),
+        (10267, 1977, 21, 20, 1862),
+        (10268, 1977, 23, 21, 533),
+        (10269, 1977, 23, 20, 15),
+        (10270, 1977, 20, 21, 1868),
+        (10271, 1977, 20, 23, 416),
+        (10272, 1983, 1186, 1186, 1330),
+        (10275, 1990, 26, 26, 607),
+        (10276, 1992, 30, 30, 649),
+        (10277, 6194, 2249, 2249, 2988),
+        (10278, 1995, 25, 25, 98),
+        (10279, 1995, 19, 19, 93),
+        (10280, 1995, 19, 25, 254),
+        (10281, 1995, 25, 19, 260),
+        (10282, 1997, 1083, 1083, 1108),
+        (10283, 1999, 1184, 1184, 1320),
+        (10284, 2001, 1266, 1266, 1550),
+        (10285, 2040, 1114, 1114, 2060),
+        (10286, 2222, 16, 16, 91),
+        (10288, 2225, 28, 28, 352),
+        (10289, 5032, 5069, 5069, 5068),
+        (10292, 2229, 25, 25, 98),
+        (10293, 2231, 1042, 1042, 1054),
+        (10295, 2969, 2950, 2950, 2972),
+        (10297, 1998, 1700, 1700, 1752),
+        (10298, 627, 2277, 2277, 1070),
+        (10358, 3523, 3500, 3500, 3516),
+        (10455, 4034, 3802, 3802, 3240),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2602),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(left),
+                Datum::Int4(right),
+                Datum::Int2(1),
+                Datum::Bpchar("s"),
+                Datum::Int4(operator),
+                Datum::Int4(405),
+                Datum::Int4(0),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
     for (family_slot, family) in storage.operator_families_visible_to(txid) {
         for (member_index, member) in family
             .operators
@@ -23977,6 +24214,78 @@ fn pg_amproc<'a>(
                 Datum::Int4(ACLITEM_HASH_OPERATOR_FAMILY_OID),
                 Datum::Int4(super::types::oid::ACLITEM),
                 Datum::Int4(super::types::oid::ACLITEM),
+                Datum::Int2(number),
+                builtin_regproc(Some((procedure, name))),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    for (oid, family, input, number, procedure, name) in [
+        (10132, 427, 1042, 1, 1080, "hashbpchar"),
+        (10133, 427, 1042, 2, 972, "hashbpcharextended"),
+        (10134, 431, 18, 1, 454, "hashchar"),
+        (10135, 431, 18, 2, 446, "hashcharextended"),
+        (10136, 435, 1082, 1, 6415, "hashdate"),
+        (10137, 435, 1082, 2, 6416, "hashdateextended"),
+        (10138, 627, 2277, 1, 626, "hash_array"),
+        (10139, 627, 2277, 2, 782, "hash_array_extended"),
+        (10140, 1971, 700, 1, 451, "hashfloat4"),
+        (10141, 1971, 700, 2, 443, "hashfloat4extended"),
+        (10142, 1971, 701, 1, 452, "hashfloat8"),
+        (10143, 1971, 701, 2, 444, "hashfloat8extended"),
+        (10146, 1977, 21, 1, 449, "hashint2"),
+        (10147, 1977, 21, 2, 441, "hashint2extended"),
+        (10148, 1977, 23, 1, 450, "hashint4"),
+        (10149, 1977, 23, 2, 425, "hashint4extended"),
+        (10150, 1977, 20, 1, 949, "hashint8"),
+        (10151, 1977, 20, 2, 442, "hashint8extended"),
+        (10152, 1983, 1186, 1, 1697, "interval_hash"),
+        (10153, 1983, 1186, 2, 3418, "interval_hash_extended"),
+        (10156, 1990, 26, 1, 453, "hashoid"),
+        (10157, 1990, 26, 2, 445, "hashoidextended"),
+        (10158, 1992, 30, 1, 457, "hashoidvector"),
+        (10159, 1992, 30, 2, 776, "hashoidvectorextended"),
+        (10160, 1995, 25, 1, 400, "hashtext"),
+        (10161, 1995, 25, 2, 448, "hashtextextended"),
+        (10162, 1995, 19, 1, 455, "hashname"),
+        (10163, 1995, 19, 2, 447, "hashnameextended"),
+        (10164, 1997, 1083, 1, 1688, "time_hash"),
+        (10165, 1997, 1083, 2, 3409, "time_hash_extended"),
+        (10166, 1998, 1700, 1, 432, "hash_numeric"),
+        (10167, 1998, 1700, 2, 780, "hash_numeric_extended"),
+        (10168, 1999, 1184, 1, 6425, "timestamptz_hash"),
+        (10169, 1999, 1184, 2, 6426, "timestamptz_hash_extended"),
+        (10170, 2001, 1266, 1, 1696, "timetz_hash"),
+        (10171, 2001, 1266, 2, 3410, "timetz_hash_extended"),
+        (10172, 2040, 1114, 1, 2039, "timestamp_hash"),
+        (10173, 2040, 1114, 2, 3411, "timestamp_hash_extended"),
+        (10174, 2222, 16, 1, 6417, "hashbool"),
+        (10175, 2222, 16, 2, 6418, "hashboolextended"),
+        (10178, 2225, 28, 1, 6419, "hashxid"),
+        (10179, 2225, 28, 2, 6420, "hashxidextended"),
+        (10180, 5032, 5069, 1, 6421, "hashxid8"),
+        (10181, 5032, 5069, 2, 6422, "hashxid8extended"),
+        (10186, 2229, 25, 1, 400, "hashtext"),
+        (10187, 2229, 25, 2, 448, "hashtextextended"),
+        (10188, 2231, 1042, 1, 1080, "hashbpchar"),
+        (10189, 2231, 1042, 2, 972, "hashbpcharextended"),
+        (10192, 2969, 2950, 1, 2963, "uuid_hash"),
+        (10193, 2969, 2950, 2, 3412, "uuid_hash_extended"),
+        (10194, 6194, 2249, 1, 6192, "hash_record"),
+        (10195, 6194, 2249, 2, 6193, "hash_record_extended"),
+        (10200, 3523, 3500, 1, 3515, "hashenum"),
+        (10201, 3523, 3500, 2, 3414, "hashenumextended"),
+        (10206, 4034, 3802, 1, 4045, "jsonb_hash"),
+        (10207, 4034, 3802, 2, 3416, "jsonb_hash_extended"),
+    ] {
+        rows[count] = row(
+            &[
+                Datum::Int4(2603),
+                Datum::Int4(oid),
+                Datum::Int4(family),
+                Datum::Int4(input),
+                Datum::Int4(input),
                 Datum::Int2(number),
                 builtin_regproc(Some((procedure, name))),
             ],
@@ -28637,11 +28946,15 @@ fn pg_indexes<'a>(
             );
             write_identifier(&mut indexdef, info.name.as_str());
             write_index_target(&mut indexdef, table_def, info);
-            let _ = indexdef.write_str(if info.is_exclusion {
-                " USING gist ("
-            } else {
-                " USING btree ("
-            });
+            let _ = write!(
+                indexdef,
+                " USING {} (",
+                if info.is_exclusion {
+                    "gist"
+                } else {
+                    info.method.name()
+                }
+            );
             for k in 0..info.n_cols {
                 if k > 0 {
                     let _ = indexdef.write_str(", ");

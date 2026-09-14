@@ -99,7 +99,17 @@ class BenchmarkTest(unittest.TestCase):
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),
-            "INSERT INTO benchmark_kv(id, payload) VALUES (2001008, 0)",
+            "INSERT INTO benchmark_kv(id, hash_key, payload) VALUES (2001008, 2001008, 0)",
+        )
+
+    def test_point_reads_and_updates_exercise_the_hash_key(self):
+        self.assertEqual(
+            benchmark.workload_sql("point-read", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE hash_key = 331",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("update", 7, 19, 1000),
+            "UPDATE benchmark_kv SET payload = payload + 1 WHERE hash_key = 331",
         )
 
     def test_validation_enforces_required_index_access(self):

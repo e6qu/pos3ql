@@ -33,9 +33,14 @@ logical-replication boundary is specified separately in
 - PostgreSQL heap layout, page identifiers, `ctid` semantics, HOT, vacuum's
   physical implementation, physical XLOG, physical streaming replication,
   hot standby, and binary-WAL tooling are not targets.
-- Hash, GiST, GIN, SP-GiST, and BRIN index execution are not implemented.
-  Modeled btree indexes physically execute complete single/composite and
-  expression equality probes (including prepared parameters) and equality-leading
+- GiST, GIN, SP-GiST, and BRIN index execution are not implemented. Modeled
+  hash indexes physically execute their PostgreSQL equality-only single-key
+  boundary for plain, expression, partial, prepared, query, join, and DML
+  probes. Their method and built-in operator-class identities persist through
+  catalogs, WAL, checkpoints, copied and partitioned indexes, reindexing, and
+  object-cold recovery. Modeled btree indexes physically execute complete
+  single/composite and expression equality probes (including prepared
+  parameters) and equality-leading
   prefixes with lower, upper, or two-sided bounds on the following column for queries and direct
   UPDATE/DELETE target scans. Exact resident probes use the
   complete startup-bounded hash map; durable equality probes use per-block

@@ -276,7 +276,7 @@ if [ "$MODE" = full ]; then
     replica_port=$(choose_free_port $((19800 + replica * 10)) $((19809 + replica * 10)))
     launch_replica "replica-$replica" "$replica_port"
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" \
-      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
+      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, hash_key integer NOT NULL, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" --expect "$SCALE_ROWS" \
       --timeout 30 "SELECT count(*) FROM benchmark_kv" >/dev/null
     REPLICA_TARGETS="$REPLICA_TARGETS --target 127.0.0.1:$replica_port"

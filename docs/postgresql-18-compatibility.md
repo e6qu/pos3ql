@@ -70,9 +70,12 @@ logical-replication boundary is specified separately in
   candidate. The nine PostgreSQL 18 built-in classes, nine families, 100
   strategy rows, 68 support rows, `tsvector` `siglen`, relation
   `fillfactor`/`buffering`, included columns, DML maintenance, WAL,
-  checkpoints, and object-cold recovery share one typed boundary. PostgreSQL
-  GiST tree pages, K-nearest-neighbor ordering, and native/custom operator
-  classes are not implemented.
+  checkpoints, and object-cold recovery share one typed boundary. Built-in
+  point, box, polygon, and circle classes execute `<-> point`
+  K-nearest-neighbor ordering over compact immutable keys, including prepared
+  origins, filters, `LIMIT`, covering scans, overlays, and cold recovery.
+  PostgreSQL GiST tree pages and native/custom operator classes are not
+  implemented.
 - Modeled GIN indexes physically execute array containment/overlap,
   `tsvector` search, JSONB containment/existence, and jsonpath predicates as
   bitmap plans. Modeled SP-GiST indexes physically execute network, range,
@@ -80,9 +83,10 @@ logical-replication boundary is specified separately in
   PostgreSQL 18.6's four GIN and seven SP-GiST classes, 11 families, 90
   strategy rows, 56 support rows, method-specific DDL/options, cloning,
   partition children, reindexing, DML, WAL, checkpoints, and object-cold
-  recovery share one typed boundary. GIN posting-list extraction, SP-GiST
-  node navigation, PostgreSQL page layout, K-nearest-neighbor ordering, and
-  native/custom callbacks are not implemented.
+  recovery share one typed boundary. Built-in point, box, and polygon SP-GiST
+  classes execute the same `<-> point` K-nearest-neighbor boundary. GIN
+  posting-list extraction, SP-GiST node navigation, PostgreSQL page layout,
+  and native/custom callbacks are not implemented.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

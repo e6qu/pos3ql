@@ -73,6 +73,9 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
+    /// Fixed number of named index catalog slots. Physical acceleration
+    /// bindings draw separately from `max_value_indexes`.
+    pub max_indexes: usize,
     /// Fixed number of large-object identities in the cluster catalog.
     pub max_large_objects: usize,
     /// Sparse 2 KiB large-object pages that may be resident in the page map.
@@ -233,6 +236,7 @@ impl Config {
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
             max_tables: 32,
+            max_indexes: 32,
             max_large_objects: 1024,
             large_object_pages: 8192,
             max_large_object_descriptors: 64,
@@ -455,6 +459,10 @@ impl Config {
                     config.max_tables =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "max_indexes" => {
+                    config.max_indexes =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
                 "max_large_objects" => {
                     config.max_large_objects =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -644,6 +652,14 @@ impl Config {
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
+        // Preserve the historical one-index-slot-per-table sizing for existing
+        // configurations. Naming `max_indexes` opts into an independent pool.
+        if seen.iter().any(|setting| setting == "max_tables")
+            && !seen.iter().any(|setting| setting == "max_indexes")
+        {
+            config.max_indexes = config.max_tables;
+        }
+
         // With object storage enabled it is the durable authority, not an
         // asynchronous backup of local disk. Every acknowledged WAL batch
         // must therefore be present there; RAM and disk remain caches.
@@ -728,6 +744,12 @@ impl Config {
                 "max_rules must be greater than zero".to_string(),
             ));
         }
+        if config.max_tables == 0 || config.max_indexes == 0 {
+            return Err(ConfigError::at(
+                0,
+                "max_tables and max_indexes must be greater than zero".to_string(),
+            ));
+        }
         if config.max_locks_per_transaction == 0 {
             return Err(ConfigError::at(
                 0,
@@ -755,6 +777,7 @@ impl Config {
         }
         for (name, capacity) in [
             ("max_tables", config.max_tables),
+            ("max_indexes", config.max_indexes),
             (
                 "max_foreign_data_wrappers",
                 config.max_foreign_data_wrappers,
@@ -1061,6 +1084,8 @@ sql_arena_bytes = 4096
         assert!(Config::parse("memtable_bytes = lots\n").is_err());
         assert!(Config::parse("max_connections = -1\n").is_err());
         assert!(Config::parse("max_rules = 0\n").is_err());
+        assert!(Config::parse("max_tables = 0\n").is_err());
+        assert!(Config::parse("max_indexes = 0\n").is_err());
         assert!(Config::parse("just some words\n").is_err());
         assert!(Config::parse("database_collation_locale = \n").is_err());
         assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
@@ -1079,6 +1104,7 @@ sql_arena_bytes = 4096
     fn typed_catalog_capacities_reject_unrepresentable_slots() {
         for name in [
             "max_tables",
+            "max_indexes",
             "max_foreign_data_wrappers",
             "max_foreign_servers",
             "max_user_mappings",
@@ -1087,6 +1113,17 @@ sql_arena_bytes = 4096
             assert!(error.message.contains("65535-slot"), "{name}: {error}");
             Config::parse(&format!("{name} = 65535\n")).unwrap();
         }
+    }
+
+    #[test]
+    fn named_index_capacity_is_independent_with_compatible_defaulting() {
+        let inherited = Config::parse("max_tables = 7\n").unwrap();
+        assert_eq!(inherited.max_tables, 7);
+        assert_eq!(inherited.max_indexes, 7);
+
+        let independent = Config::parse("max_tables = 7\nmax_indexes = 19\n").unwrap();
+        assert_eq!(independent.max_tables, 7);
+        assert_eq!(independent.max_indexes, 19);
     }
 
     #[test]

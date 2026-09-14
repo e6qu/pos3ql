@@ -86,12 +86,22 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT payload FROM benchmark_kv WHERE gist_span && '[993,994)'::int4range",
         )
         self.assertEqual(
+            benchmark.workload_sql("gist-knn", 7, 19, 1000),
+            "SELECT id, payload FROM benchmark_kv "
+            "ORDER BY gist_location <-> point '(331,331)' LIMIT 8",
+        )
+        self.assertEqual(
             benchmark.workload_sql("gin-array", 7, 19, 1000),
             "SELECT payload FROM benchmark_kv WHERE gin_tags @> ARRAY[331]",
         )
         self.assertEqual(
             benchmark.workload_sql("spgist-prefix", 7, 19, 1000),
             "SELECT payload FROM benchmark_kv WHERE spgist_label ^@ 'key-331'",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("spgist-knn", 7, 19, 1000),
+            "SELECT id, payload FROM benchmark_kv "
+            "ORDER BY spgist_location <-> point '(331,-331)' LIMIT 8",
         )
         self.assertEqual(
             benchmark.workload_sql("tail-range", 0, 0, 8),
@@ -121,7 +131,7 @@ class BenchmarkTest(unittest.TestCase):
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),
-            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gin_tags, spgist_label, payload) VALUES (2001008, 2001008, 2001008, '[4002016,4002018)'::int4range, '[6003024,6003027)'::int4range, ARRAY[2001008], 'key-2001008', 0)",
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, spgist_label, spgist_location, payload) VALUES (2001008, 2001008, 2001008, '[4002016,4002018)'::int4range, '[6003024,6003027)'::int4range, point(2001008, 2001008), ARRAY[2001008], 'key-2001008', point(2001008, -2001008), 0)",
         )
 
     def test_point_reads_and_updates_exercise_the_hash_key(self):
@@ -186,9 +196,14 @@ class BenchmarkTest(unittest.TestCase):
                 },
             },
         }
-        self.assertIn(
-            "ordered-limit workload fetched base tuples", benchmark.validate(result)
-        )
+        self.assertIn("covering ordered workload fetched base tuples", benchmark.validate(result))
+
+        for workload in ("gist-knn", "spgist-knn"):
+            result["workload"]["name"] = workload
+            self.assertIn(
+                "covering ordered workload fetched base tuples",
+                benchmark.validate(result),
+            )
 
     def test_validation_rejects_missing_work_and_unordered_latency(self):
         result = {

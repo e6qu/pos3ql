@@ -14077,8 +14077,8 @@ impl Storage {
                     + MAX_EXTENDED_STATISTICS_PER_TABLE * size_of::<ExtendedStatisticsDef>()
                     + size_of::<PublicationDef>()
                     + size_of::<MatviewDef>()
-                    + size_of::<StoredQueryDependencies>()
-                    + size_of::<IndexDef>())
+                    + size_of::<StoredQueryDependencies>())
+            + config.max_indexes * (size_of::<IndexDef>() + size_of::<BrinMaintenanceState>())
             + FixedMap::<u64, RowState>::budget_bytes(config.large_object_pages)
                 .saturating_sub(FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + config.max_rules * size_of::<RuleDef>()
@@ -14765,9 +14765,9 @@ impl Storage {
             FixedVec::new(budget, "column_acl_entries", MAX_COLUMN_ACL_ENTRIES)?;
         let parameter_acl_entries =
             FixedVec::new(budget, "parameter_acl_entries", MAX_PARAMETER_ACL_ENTRIES)?;
-        let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
-        let mut brin_maintenance = FixedVec::new(budget, "brin_maintenance", config.max_tables)?;
-        for _ in 0..config.max_tables {
+        let mut indexes = FixedVec::new(budget, "indexes", config.max_indexes)?;
+        let mut brin_maintenance = FixedVec::new(budget, "brin_maintenance", config.max_indexes)?;
+        for _ in 0..config.max_indexes {
             indexes
                 .push(IndexDef {
                     database: DatabaseOid::POSTGRES,
@@ -14797,10 +14797,10 @@ impl Storage {
                     pending_definition: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
-                .expect("sized to max_tables");
+                .expect("sized to max_indexes");
             brin_maintenance
                 .push(BrinMaintenanceState::EMPTY)
-                .expect("sized to max_tables");
+                .expect("sized to max_indexes");
         }
         let mut databases = FixedVec::new(budget, "databases", MAX_DATABASES)?;
         databases

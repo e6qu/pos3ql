@@ -71,8 +71,10 @@ the comparison does not pretend PostgreSQL itself has an S3 cache profile.
 | BRIN point pruning | Repeated warm and object-cold equality probes through a dedicated BRIN key and bitmap plan |
 | BRIN inclusion filtering | Repeated warm and object-cold range-overlap probes through `range_inclusion_ops` and a bitmap plan |
 | GiST inclusion filtering | Repeated warm and object-cold range-overlap probes through a dedicated GiST key generation |
+| GiST K-nearest-neighbor | Repeated warm and object-cold `<-> point` ordered limits through a covering geometric GiST generation |
 | GIN array filtering | Repeated warm and object-cold array-containment probes through a GIN bitmap plan |
 | SP-GiST prefix filtering | Repeated warm and object-cold text-prefix probes through an SP-GiST plan |
+| SP-GiST K-nearest-neighbor | Repeated warm and object-cold `<-> point` ordered limits through a covering k-d point generation |
 | indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
 | ordered limit | Repeated descending key-only `ORDER BY ... LIMIT` scans that must fetch no base tuples, warm and object-cold |
 | parameterized join | Repeated 32-key nested-loop probes whose inner table must use its B-tree, warm and after a dedicated empty-local-cache restart |
@@ -98,7 +100,7 @@ branch.
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no
 more than 125% of the fixed plan, the stable object-operation metric schema,
-at least one index scan per hash point-read, BRIN point or inclusion probe, GiST inclusion probe, GIN array probe, SP-GiST prefix probe, btree tail-range, btree ordered-limit, parameterized-btree-join, or hash-targeted synchronized-update operation and
+at least one index scan per hash point-read, BRIN point or inclusion probe, GiST inclusion or K-nearest-neighbor probe, GIN array probe, SP-GiST prefix or K-nearest-neighbor probe, btree tail-range, btree ordered-limit, parameterized-btree-join, or hash-targeted synchronized-update operation and
 zero sequential scans in the complete resident warm-memory paths, actual
 shared-object reads during empty-local-cache recovery, and concurrent commit
 PUT amplification below 1.75 PUTs per transaction. Ordered-limit runs also
@@ -109,7 +111,10 @@ small smoke dataset spans enough immutable table blocks for a selective cold
 index probe to remain a meaningful costed physical choice. The ordered-limit
 fixture uses a descending btree with `INCLUDE (payload)` and projects both key
 and payload, so its zero-fetch gate exercises durable covering-index behavior
-rather than only key decoding. The
+rather than only key decoding. The GiST and SP-GiST K-nearest-neighbor fixtures
+likewise carry their projected identifier and payload in the immutable index
+generation; their warm and cold gates reject both an added Sort and any base
+tuple fetch. The
 ungrouped durable shape is two PUTs per transaction: an immutable journal
 object and a compare-and-swap commit-head update.
 
@@ -131,9 +136,11 @@ queries sort only compact index keys, stream base reads through `LIMIT`, and
 avoid them entirely for key- and `INCLUDE`-covered projections. GiST range
 overlap probes now use exact immutable-key predicate scans in warm and
 empty-cache measurements. GIN array containment and SP-GiST text-prefix probes
-now have the same warm and empty-cache access-path gates. The known structural
-limits remain global query serialization, specialized posting/tree navigation,
-GiST/SP-GiST K-nearest-neighbor ordering, and
+have the same warm and empty-cache access-path gates. Built-in geometric GiST
+and SP-GiST classes now provide PostgreSQL-compatible `<-> point` ordering over
+compact immutable keys, including covering scans; navigable tree nodes remain
+the next step for avoiding a complete key-generation walk. The known structural
+limits remain global query serialization, specialized posting/tree navigation, and
 small startup-sized catalog/table ceilings. Multi-core execution must preserve fixed memory, MVCC,
 lock ordering, group publication order, and explicit backpressure. Writer
 fencing and promotion safety must exist before any failover benchmark or

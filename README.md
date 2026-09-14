@@ -60,9 +60,12 @@ built-in classes, their nine families, 100 strategy rows, 68 support rows,
 `tsvector` `siglen`, relation `fillfactor`/`buffering`, included columns, DML
 maintenance, WAL, checkpoints, and empty-cache recovery share the same bounded
 index state. SQL predicates are evaluated against each immutable encoded key,
-so this first physical GiST path is exact rather than lossy. PostgreSQL GiST
-tree-page layout, K-nearest-neighbor ordering, and custom native operator
-classes are not implemented and are never advertised as a fallback.
+so this physical GiST path is exact rather than lossy. Built-in point, box,
+polygon, and circle classes also order compact candidates by PostgreSQL's
+`<-> point` operator, including parameterized origins, filters, `LIMIT`,
+included-column index-only scans, committed overlays, and empty-cache recovery.
+PostgreSQL GiST tree-page layout and custom native operator classes are not
+implemented and are never advertised as a fallback.
 
 GIN indexes physically execute array containment/overlap, full-text, JSONB
 containment/existence, and jsonpath predicates as bitmap plans. SP-GiST
@@ -71,9 +74,10 @@ ordering, and prefix predicates as index plans. Their 11 PostgreSQL 18
 built-in operator classes, 11 families, 90 strategy rows, 56 support rows,
 method-specific DDL/options, DML maintenance, WAL, checkpoints, cloning,
 partitions, reindexing, and empty-cache recovery share the same bounded index
-lifecycle. This first path evaluates immutable encoded keys exactly; it does
-not claim PostgreSQL page layout, GIN posting lists, SP-GiST node navigation,
-K-nearest-neighbor ordering, or custom native callbacks.
+lifecycle. Built-in point, box, and polygon SP-GiST classes provide the same
+`<-> point` K-nearest-neighbor boundary. These paths evaluate immutable encoded
+keys exactly; they do not claim PostgreSQL page layout, GIN posting lists,
+SP-GiST node navigation, or custom native callbacks.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

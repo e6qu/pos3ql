@@ -47429,6 +47429,229 @@ fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
 }
 
 #[test]
+fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recovery() {
+    let mut config = test_config("physical-knn-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.table_rows = 8192;
+    config.txn_rows = 8192;
+    config.max_indexes = 16;
+    config.value_index_rows = 16384;
+    config.max_value_indexes = 16;
+    config.object_store_bucket = format!("physical-knn-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE knn_gist (
+             id integer, location point, bounds box, shape polygon, radius circle, payload text
+         );
+         CREATE INDEX knn_gist_point ON knn_gist USING gist (location) INCLUDE (id, payload);
+         CREATE INDEX knn_gist_box ON knn_gist USING gist (bounds);
+         CREATE INDEX knn_gist_polygon ON knn_gist USING gist (shape);
+         CREATE INDEX knn_gist_circle ON knn_gist USING gist (radius);
+         CREATE INDEX knn_gist_shifted ON knn_gist USING gist
+             ((location + point '(1,0)')) WHERE id > 0;
+         CREATE INDEX knn_gist_bounds_location ON knn_gist USING gist (bounds, location);
+         CREATE TABLE knn_spgist (
+             id integer, quad point, kd point, bounds box, shape polygon, payload text
+         );
+         CREATE INDEX knn_spgist_quad ON knn_spgist USING spgist (quad) INCLUDE (id, payload);
+         CREATE INDEX knn_spgist_kd ON knn_spgist USING spgist (kd kd_point_ops);
+         CREATE INDEX knn_spgist_box ON knn_spgist USING spgist (bounds);
+         CREATE INDEX knn_spgist_polygon ON knn_spgist USING spgist (shape);
+         INSERT INTO knn_gist VALUES
+             (1, '(1,0)', '(1,1),(0,0)', '((1,0),(2,0),(1,1))', '<(1,0),0.25>', 'one'),
+             (2, '(4,0)', '(5,1),(4,0)', '((4,0),(5,0),(4,1))', '<(4,0),0.25>', 'two'),
+             (3, '(-2,0)', '(-1,1),(-2,0)', '((-2,0),(-1,0),(-2,1))', '<(-2,0),0.25>', 'three'),
+             (4, NULL, NULL, NULL, NULL, 'null');
+         INSERT INTO knn_spgist VALUES
+             (1, '(1,0)', '(1,0)', '(1,1),(0,0)', '((1,0),(2,0),(1,1))', 'one'),
+             (2, '(4,0)', '(4,0)', '(5,1),(4,0)', '((4,0),(5,0),(4,1))', 'two'),
+             (3, '(-2,0)', '(-2,0)', '(-1,1),(-2,0)', '((-2,0),(-1,0),(-2,1))', 'three'),
+             (4, NULL, NULL, NULL, NULL, 'null');
+         ANALYZE knn_gist;
+         ANALYZE knn_spgist",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+
+    let warm = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT id FROM knn_gist ORDER BY location <-> point '(0,0)' LIMIT 3;
+         SELECT id FROM knn_gist ORDER BY location <-> '(0,0)' LIMIT 4;
+         PREPARE nearest_gist(point) AS
+             SELECT id FROM knn_gist ORDER BY location <-> $1 LIMIT 2;
+         EXECUTE nearest_gist(point '(3,0)');
+         EXPLAIN SELECT id FROM knn_gist ORDER BY bounds <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_gist ORDER BY bounds <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_gist ORDER BY shape <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_gist ORDER BY shape <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_gist ORDER BY radius <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_gist ORDER BY radius <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_gist WHERE id > 1
+           ORDER BY (location + point '(1,0)') <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_gist WHERE id > 1
+           ORDER BY (location + point '(1,0)') <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_gist
+          WHERE bounds && box '(0.5,2),(-3,-1)'
+          ORDER BY location <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_gist
+          WHERE bounds && box '(0.5,2),(-3,-1)'
+          ORDER BY location <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_spgist ORDER BY quad <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_spgist ORDER BY quad <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_spgist ORDER BY kd <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_spgist ORDER BY kd <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_spgist ORDER BY bounds <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_spgist ORDER BY bounds <-> point '(0,0)' LIMIT 2;
+         EXPLAIN SELECT id FROM knn_spgist ORDER BY shape <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_spgist ORDER BY shape <-> point '(0,0)' LIMIT 2",
+    ));
+    for index in [
+        "knn_gist_point",
+        "knn_gist_box",
+        "knn_gist_polygon",
+        "knn_gist_circle",
+        "knn_gist_shifted",
+        "knn_gist_bounds_location",
+        "knn_spgist_quad",
+        "knn_spgist_kd",
+        "knn_spgist_box",
+        "knn_spgist_polygon",
+    ] {
+        assert!(
+            warm.iter()
+                .any(|row| row.contains(&format!("Scan using {index}"))),
+            "{index}: {warm:?}"
+        );
+    }
+    assert!(
+        warm.windows(4).any(|rows| rows == ["1", "3", "2", "4"]),
+        "NULL must follow every finite distance: {warm:?}"
+    );
+    assert!(
+        warm.windows(2).filter(|rows| *rows == ["1", "3"]).count() >= 7,
+        "each geometric operator class must produce nearest-first rows: {warm:?}"
+    );
+    assert!(
+        warm.windows(2).any(|rows| rows == ["2", "1"]),
+        "prepared point origin must be evaluated once per execution: {warm:?}"
+    );
+    assert!(
+        warm.windows(2).any(|rows| rows == ["3", "2"]),
+        "a partial expression index must own its KNN key: {warm:?}"
+    );
+
+    let fallback = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT id FROM knn_gist
+             ORDER BY location <-> point '(0,0)' DESC LIMIT 2;
+         EXPLAIN SELECT id FROM knn_gist
+             ORDER BY location <-> circle '<(0,0),1>' LIMIT 2",
+    ));
+    assert_eq!(
+        fallback.iter().filter(|row| row.contains("Sort")).count(),
+        2,
+        "unsupported ordering directions and right types retain the exact Sort path: {fallback:?}"
+    );
+
+    let overlay = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO knn_gist VALUES
+             (5, '(0.25,0)', '(0.5,0.5),(0.25,0)',
+              '((0.25,0),(0.5,0),(0.25,0.5))', '<(0.25,0),0.1>', 'five');
+         INSERT INTO knn_spgist VALUES
+             (5, '(0.25,0)', '(0.25,0)', '(0.5,0.5),(0.25,0)',
+              '((0.25,0),(0.5,0),(0.25,0.5))', 'five');
+         SELECT id FROM knn_gist ORDER BY location <-> point '(0,0)' LIMIT 3;
+         SELECT id FROM knn_spgist ORDER BY kd <-> point '(0,0)' LIMIT 3;
+         BEGIN;
+         UPDATE knn_gist SET location = '(20,0)' WHERE id = 5;
+         EXPLAIN SELECT id FROM knn_gist ORDER BY location <-> point '(0,0)' LIMIT 2;
+         SELECT id FROM knn_gist ORDER BY location <-> point '(0,0)' LIMIT 2;
+         ROLLBACK",
+    ));
+    assert_eq!(
+        overlay
+            .windows(3)
+            .filter(|rows| *rows == ["5", "1", "3"])
+            .count(),
+        2,
+        "committed overlays must participate in both index generations: {overlay:?}"
+    );
+    assert!(
+        overlay
+            .iter()
+            .any(|row| row.contains("Seq Scan on knn_gist")),
+        "a transaction with its own unindexed key image must use authoritative MVCC rows: {overlay:?}"
+    );
+    assert!(
+        overlay.windows(2).any(|rows| rows == ["1", "3"]),
+        "the same transaction must see the moved key: {overlay:?}"
+    );
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = data_rows(&run_with(
+        &mut recovered,
+        &mut recovery_budget,
+        "EXPLAIN SELECT id, payload FROM knn_gist
+             ORDER BY location <-> point '(0,0)' LIMIT 3;
+         SELECT id, payload FROM knn_gist
+             ORDER BY location <-> point '(0,0)' LIMIT 3;
+         EXPLAIN SELECT id FROM knn_spgist
+             ORDER BY kd <-> point '(0,0)' LIMIT 3;
+         SELECT id FROM knn_spgist
+             ORDER BY kd <-> point '(0,0)' LIMIT 3",
+    ));
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Only Scan using knn_gist_point")),
+        "the KNN generation must retain INCLUDE payloads across cold recovery: {cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Scan using knn_spgist_kd")),
+        "{cold:?}"
+    );
+    assert!(
+        cold.windows(3)
+            .any(|rows| rows == ["5|five", "1|one", "3|three"]),
+        "{cold:?}"
+    );
+    assert!(
+        cold.windows(3).any(|rows| rows == ["5", "1", "3"]),
+        "{cold:?}"
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
     let mut config = test_config("physical-gin-spgist-indexes");
     config.object_store_on = true;

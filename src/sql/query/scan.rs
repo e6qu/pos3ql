@@ -574,6 +574,11 @@ struct IndexKeyCandidate {
     key_len: usize,
     payload_at: usize,
     payload_len: usize,
+    /// Precomputed ordering distance for a K-nearest-neighbor scan. Keeping
+    /// it beside the compact key avoids evaluating the distance comparator
+    /// O(n log n) times and preserves the fixed statement-memory bound.
+    knn_distance: f64,
+    knn_null: bool,
 }
 
 pub(crate) struct IndexedCandidates<'a> {
@@ -938,6 +943,14 @@ pub(crate) struct OrderedIndexAccessPlan<'a> {
     covering_ready: bool,
     order_positions: [u8; MAX_INDEX_COLS],
     order: &'a [OrderBy<'a>],
+    knn: Option<KnnOrder<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct KnnOrder<'a> {
+    key_position: usize,
+    origin: &'a Expr<'a>,
+    origin_unknown: bool,
 }
 
 impl<'a> OrderedIndexAccessPlan<'a> {
@@ -1249,6 +1262,83 @@ fn spgist_supports_operator(
                 | BinaryOp::StartsWith
         ),
     }
+}
+
+fn operator_class_supports_knn(class: Option<crate::storage::IndexOperatorClass>) -> bool {
+    use crate::sql::types::{GistOperatorClass, SpGistOperatorClass};
+    matches!(
+        class,
+        Some(crate::storage::IndexOperatorClass::Gist(
+            GistOperatorClass::Point
+                | GistOperatorClass::Box
+                | GistOperatorClass::Polygon
+                | GistOperatorClass::Circle
+        )) | Some(crate::storage::IndexOperatorClass::SpGist(
+            SpGistOperatorClass::QuadPoint
+                | SpGistOperatorClass::KdPoint
+                | SpGistOperatorClass::Box
+                | SpGistOperatorClass::Polygon
+        ))
+    )
+}
+
+/// Recognizes the ordering-operator shape exposed by PostgreSQL's built-in
+/// geometric GiST and SP-GiST families. Those catalog rows all order an
+/// indexed geometry on the left by its `<-> point` distance. Descending and
+/// NULLS FIRST are not index orderings in PostgreSQL and retain the Sort path.
+fn knn_order_for_index<'a, Resolve, Invariant>(
+    index: &crate::storage::IndexDef,
+    target: &'a Expr<'a>,
+    requested: &OrderBy<'a>,
+    expressions: &[Option<&'a Expr<'a>>; MAX_INDEX_COLS],
+    definition: &TableDef,
+    resolve_candidate: &mut Resolve,
+    operand_is_invariant: &Invariant,
+) -> Option<KnnOrder<'a>>
+where
+    Resolve: FnMut(&Expr<'a>) -> Option<usize>,
+    Invariant: Fn(&Expr<'a>) -> bool,
+{
+    if requested.descending || requested.nulls_first {
+        return None;
+    }
+    let Expr::Binary {
+        operator: BinaryOp::TextSearchPhrase,
+        left,
+        right,
+    } = target
+    else {
+        return None;
+    };
+    if !operand_is_invariant(right) {
+        return None;
+    }
+    let origin_oid = crate::sql::exec::infer_type_res(right, &crate::sql::exec::NoCols)
+        .ok()?
+        .0;
+    if !matches!(
+        origin_oid,
+        crate::sql::types::oid::UNKNOWN | crate::sql::types::oid::POINT
+    ) {
+        return None;
+    }
+    for (position, expression) in expressions.iter().enumerate().take(index.n_cols) {
+        if !operator_class_supports_knn(index.resolved_operator_classes[position]) {
+            continue;
+        }
+        let key_matches = match expression {
+            Some(stored) => index_expression_matches(stored, left, definition, resolve_candidate),
+            None => resolve_candidate(left) == Some(index.columns[position] as usize),
+        };
+        if key_matches {
+            return Some(KnnOrder {
+                key_position: position,
+                origin: right,
+                origin_unknown: origin_oid == crate::sql::types::oid::UNKNOWN,
+            });
+        }
+    }
+    None
 }
 
 fn collect_index_constraints<'a, Resolve, Invariant>(
@@ -1849,14 +1939,31 @@ where
             }
         }
         exact &= n_constraints == index.n_cols;
+        let knn_required = required_order.and_then(|(targets, order)| {
+            (targets.len() == 1).then(|| {
+                knn_order_for_index(
+                    &index,
+                    targets[0],
+                    &order[0],
+                    &expressions,
+                    definition,
+                    resolve_candidate,
+                    operand_is_invariant,
+                )
+            })?
+        });
         match index.method {
             crate::sql::ast::IndexAccessMethod::Hash if !exact || required_order.is_some() => {
                 continue;
             }
             crate::sql::ast::IndexAccessMethod::Brin if required_order.is_some() => continue,
-            crate::sql::ast::IndexAccessMethod::Gist if required_order.is_some() => continue,
             crate::sql::ast::IndexAccessMethod::Gin if required_order.is_some() => continue,
-            crate::sql::ast::IndexAccessMethod::SpGist if required_order.is_some() => continue,
+            crate::sql::ast::IndexAccessMethod::Gist
+            | crate::sql::ast::IndexAccessMethod::SpGist
+                if required_order.is_some() && knn_required.is_none() =>
+            {
+                continue;
+            }
             crate::sql::ast::IndexAccessMethod::Brin
                 if !exact
                     && index.resolved_operator_classes[..index.n_cols]
@@ -1916,6 +2023,13 @@ where
             },
         };
         if let Some((targets, order)) = required_order {
+            if knn_required.is_some() {
+                let score = index_plan_score(plan);
+                if selected.is_none_or(|(best, _)| score > best) {
+                    selected = Some((score, plan));
+                }
+                continue;
+            }
             let equality_prefix = plan.constraints[..plan.n_constraints]
                 .iter()
                 .take_while(|constraint| {
@@ -2374,6 +2488,7 @@ pub(crate) fn ordered_index_access_plan<'a>(
             covering_ready: storage.value_binding_durable_complete(slot, access.binding),
             order_positions,
             order,
+            knn: None,
         };
         if selected.is_none_or(|(best, _)| score > best) {
             selected = Some((score, plan));
@@ -2406,21 +2521,42 @@ pub(crate) fn ordered_index_access_plan<'a>(
                 expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
             }
         }
-        let mut key_matches = |position: usize, target: &Expr<'a>| match expressions[position] {
-            Some(stored) => {
-                index_expression_matches(stored, target, definition, &mut resolve_column)
-            }
-            None => resolve_column(target) == Some(index.columns[position] as usize),
-        };
+        let knn = (order.len() == 1)
+            .then(|| {
+                knn_order_for_index(
+                    &index,
+                    order_targets[0],
+                    &order[0],
+                    &expressions,
+                    definition,
+                    &mut resolve_column,
+                    &operand_is_invariant,
+                )
+            })
+            .flatten();
         let equality_prefix = access.constraints[..access.n_constraints]
             .iter()
             .take_while(|constraint| {
                 constraint.is_some_and(|constraint| constraint.operator == BinaryOp::Eq)
             })
             .count();
-        let start = (0..index.n_cols)
-            .find(|position| key_matches(*position, order_targets[0]))
-            .expect("ordered special index was filtered before selection");
+        let start = if let Some(knn) = knn {
+            knn.key_position
+        } else {
+            (0..index.n_cols)
+                .find(|position| match expressions[*position] {
+                    Some(stored) => index_expression_matches(
+                        stored,
+                        order_targets[0],
+                        definition,
+                        &mut resolve_column,
+                    ),
+                    None => {
+                        resolve_column(order_targets[0]) == Some(index.columns[*position] as usize)
+                    }
+                })
+                .expect("ordered special index was filtered before selection")
+        };
         let mut order_positions = [0u8; MAX_INDEX_COLS];
         for (offset, position) in order_positions.iter_mut().enumerate().take(order.len()) {
             *position = (start + offset) as u8;
@@ -2434,8 +2570,11 @@ pub(crate) fn ordered_index_access_plan<'a>(
             covering_ready: storage.value_binding_durable_complete(slot, access.binding),
             order_positions,
             order,
+            knn,
         };
-        if start <= equality_prefix && selected.is_none_or(|(best, _)| score > best) {
+        if (knn.is_some() || start <= equality_prefix)
+            && selected.is_none_or(|(best, _)| score > best)
+        {
             selected = Some((score, plan));
         }
     }
@@ -2855,6 +2994,21 @@ fn indexed_candidates_for_plan<'a>(
     });
     let retain_keys =
         ordered_plan.is_some() && storage.value_binding_durable_complete(slot, plan.binding);
+    let knn_origin = if let Some(knn) = ordered_plan.and_then(|ordered| ordered.knn) {
+        let raw = eval_full(knn.origin, arena, params, columns, hooks)?;
+        let origin = if knn.origin_unknown {
+            cast_to(
+                raw,
+                ColType::Geometry(crate::sql::types::GeometryKind::Point),
+                arena,
+            )?
+        } else {
+            raw
+        };
+        Some((knn, origin))
+    } else {
+        None
+    };
     let probe_hash = hash.filter(|_| !retain_keys);
     let mut count = 0usize;
     let mut entry_bytes = 0usize;
@@ -2912,6 +3066,8 @@ fn indexed_candidates_for_plan<'a>(
                     key_len: 0,
                     payload_at: 0,
                     payload_len: 0,
+                    knn_distance: 0.0,
+                    knn_null: false,
                 })
                 .map_err(|_| arena_full())?,
         )
@@ -2949,6 +3105,8 @@ fn indexed_candidates_for_plan<'a>(
                         key_len: key.len(),
                         payload_at,
                         payload_len: payload.len(),
+                        knn_distance: 0.0,
+                        knn_null: false,
                     };
                     entry_at = payload_at + payload.len();
                 }
@@ -2988,21 +3146,62 @@ fn indexed_candidates_for_plan<'a>(
             live += 1;
         }
         let mut comparison_error = None;
-        candidates[..live].sort_unstable_by(|left, right| {
-            if comparison_error.is_some() {
-                return core::cmp::Ordering::Equal;
-            }
-            let left_key = &encoded[left.key_at..left.key_at + left.key_len];
-            let right_key = &encoded[right.key_at..right.key_at + right.key_len];
-            match compare_ordered_index_keys(storage, &plan, &ordered, left_key, right_key) {
-                Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
-                Ok(ordering) => ordering,
-                Err(error) => {
-                    comparison_error = Some(error);
-                    core::cmp::Ordering::Equal
+        if let Some((knn, origin)) = knn_origin {
+            for candidate in &mut candidates[..live] {
+                let key = &encoded[candidate.key_at..candidate.key_at + candidate.key_len];
+                let mut decoded = [Datum::Null; MAX_INDEX_COLS];
+                rowenc::decode(
+                    key,
+                    &plan.key_types[..plan.n_columns],
+                    &mut decoded[..plan.n_columns],
+                )?;
+                let value = decoded[knn.key_position];
+                match crate::sql::eval::binary(
+                    BinaryOp::TextSearchPhrase,
+                    value,
+                    origin,
+                    false,
+                    false,
+                    arena,
+                )? {
+                    Datum::Float8(distance) => candidate.knn_distance = distance,
+                    Datum::Null => candidate.knn_null = true,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "index ordering operator did not return double precision"
+                        ));
+                    }
                 }
             }
-        });
+            candidates[..live].sort_unstable_by(|left, right| {
+                match (left.knn_null, right.knn_null) {
+                    (true, true) => left.rowid.cmp(&right.rowid),
+                    (true, false) => core::cmp::Ordering::Greater,
+                    (false, true) => core::cmp::Ordering::Less,
+                    (false, false) => left
+                        .knn_distance
+                        .total_cmp(&right.knn_distance)
+                        .then_with(|| left.rowid.cmp(&right.rowid)),
+                }
+            });
+        } else {
+            candidates[..live].sort_unstable_by(|left, right| {
+                if comparison_error.is_some() {
+                    return core::cmp::Ordering::Equal;
+                }
+                let left_key = &encoded[left.key_at..left.key_at + left.key_len];
+                let right_key = &encoded[right.key_at..right.key_at + right.key_len];
+                match compare_ordered_index_keys(storage, &plan, &ordered, left_key, right_key) {
+                    Ok(core::cmp::Ordering::Equal) => left.rowid.cmp(&right.rowid),
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        comparison_error = Some(error);
+                        core::cmp::Ordering::Equal
+                    }
+                }
+            });
+        }
         if let Some(error) = comparison_error {
             return Err(error);
         }

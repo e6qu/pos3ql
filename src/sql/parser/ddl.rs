@@ -5318,6 +5318,8 @@ impl<'a> Parser<'a> {
                 IndexAccessMethod::Hash
             } else if method.eq_ignore_ascii_case("brin") {
                 IndexAccessMethod::Brin
+            } else if method.eq_ignore_ascii_case("gist") {
+                IndexAccessMethod::Gist
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -5340,7 +5342,7 @@ impl<'a> Parser<'a> {
             expression_text: "",
             collation: None,
             operator_class: None,
-            operator_class_options: crate::sql::ast::BrinOperatorClassOptions::DEFAULT,
+            operator_class_options: crate::sql::ast::IndexOperatorClassOptions::DEFAULT,
             descending: false,
             ordering_specified: false,
             nulls_first: false,
@@ -5378,11 +5380,11 @@ impl<'a> Parser<'a> {
                 _ => None,
             };
             let operator_class_options = if operator_class.is_some() && self.eat_op("(")? {
-                let options = self.brin_operator_class_options()?;
+                let options = self.index_operator_class_options()?;
                 self.expect_op(")")?;
                 options
             } else {
-                crate::sql::ast::BrinOperatorClassOptions::DEFAULT
+                crate::sql::ast::IndexOperatorClassOptions::DEFAULT
             };
             let (descending, ordering_specified) = if self.eat_ident("asc")? {
                 (false, true)
@@ -5488,10 +5490,10 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn brin_operator_class_options(
+    fn index_operator_class_options(
         &mut self,
-    ) -> Result<crate::sql::ast::BrinOperatorClassOptions<'a>, ParseError> {
-        let mut options = crate::sql::ast::BrinOperatorClassOptions::DEFAULT;
+    ) -> Result<crate::sql::ast::IndexOperatorClassOptions<'a>, ParseError> {
+        let mut options = crate::sql::ast::IndexOperatorClassOptions::DEFAULT;
         if self.peeked == Tok::Op(")") {
             return Err(ParseError {
                 at: self.peek_at,
@@ -5585,6 +5587,24 @@ impl<'a> Parser<'a> {
                     });
                 }
                 options.false_positive_rate = Some(raw);
+            } else if option.eq_ignore_ascii_case("siglen") {
+                if options.siglen.is_some() {
+                    return Err(self.err_here("parameter \"siglen\" specified more than once"));
+                }
+                let raw = match self.peeked {
+                    Tok::Num(raw) | Tok::Str(raw) => raw,
+                    _ => return Err(self.err_here("expected an integer")),
+                };
+                let value = raw
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|value| (1..=2024).contains(value));
+                self.advance()?;
+                options.siglen = Some(value.ok_or_else(|| ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "value {} out of bounds for option \"siglen\"", raw),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                })?);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -5671,6 +5691,32 @@ impl<'a> Parser<'a> {
                     );
                 }
                 options.autosummarize = Some(self.index_storage_boolean()?);
+            } else if option.eq_ignore_ascii_case("buffering") {
+                if options.buffering.is_some() {
+                    return Err(self.err_here("parameter \"buffering\" specified more than once"));
+                }
+                let raw = match self.peeked {
+                    Tok::Ident(raw) | Tok::Str(raw) => raw,
+                    _ => return Err(self.err_here("invalid value for enum option \"buffering\"")),
+                };
+                options.buffering = Some(if raw.eq_ignore_ascii_case("auto") {
+                    crate::sql::ast::GistBuffering::Auto
+                } else if raw.eq_ignore_ascii_case("on") {
+                    crate::sql::ast::GistBuffering::On
+                } else if raw.eq_ignore_ascii_case("off") {
+                    crate::sql::ast::GistBuffering::Off
+                } else {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "invalid value for enum option \"buffering\": {}",
+                            raw
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                });
+                self.advance()?;
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -5721,6 +5767,8 @@ impl<'a> Parser<'a> {
                 &mut names.pages_per_range
             } else if option.eq_ignore_ascii_case("autosummarize") {
                 &mut names.autosummarize
+            } else if option.eq_ignore_ascii_case("buffering") {
+                &mut names.buffering
             } else {
                 return Err(ParseError {
                     at: self.peek_at,

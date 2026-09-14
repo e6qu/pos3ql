@@ -1933,6 +1933,171 @@ impl BrinOperatorClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GistOperatorClass {
+    Inet = 1,
+    Box,
+    Point,
+    Polygon,
+    Circle,
+    TsVector,
+    TsQuery,
+    Range,
+    Multirange,
+}
+
+impl GistOperatorClass {
+    pub const ALL: [Self; 9] = [
+        Self::Inet,
+        Self::Box,
+        Self::Point,
+        Self::Polygon,
+        Self::Circle,
+        Self::TsVector,
+        Self::TsQuery,
+        Self::Range,
+        Self::Multirange,
+    ];
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Inet,
+            2 => Self::Box,
+            3 => Self::Point,
+            4 => Self::Polygon,
+            5 => Self::Circle,
+            6 => Self::TsVector,
+            7 => Self::TsQuery,
+            8 => Self::Range,
+            9 => Self::Multirange,
+            _ => return None,
+        })
+    }
+
+    pub const fn for_type(ctype: ColType) -> Option<Self> {
+        Some(match ctype {
+            ColType::Inet | ColType::Cidr => Self::Inet,
+            ColType::Geometry(GeometryKind::Box) => Self::Box,
+            ColType::Geometry(GeometryKind::Point) => Self::Point,
+            ColType::Geometry(GeometryKind::Polygon) => Self::Polygon,
+            ColType::Geometry(GeometryKind::Circle) => Self::Circle,
+            ColType::TsVector => Self::TsVector,
+            ColType::TsQuery => Self::TsQuery,
+            ColType::Range(_) => Self::Range,
+            ColType::Multirange(_) => Self::Multirange,
+            _ => return None,
+        })
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "inet_ops" => Self::Inet,
+            "box_ops" => Self::Box,
+            "point_ops" => Self::Point,
+            "poly_ops" => Self::Polygon,
+            "circle_ops" => Self::Circle,
+            "tsvector_ops" => Self::TsVector,
+            "tsquery_ops" => Self::TsQuery,
+            "range_ops" => Self::Range,
+            "multirange_ops" => Self::Multirange,
+            _ => return None,
+        })
+    }
+
+    pub const fn accepts(self, ctype: ColType) -> bool {
+        match self {
+            Self::Inet => matches!(ctype, ColType::Inet | ColType::Cidr),
+            Self::Box => matches!(ctype, ColType::Geometry(GeometryKind::Box)),
+            Self::Point => matches!(ctype, ColType::Geometry(GeometryKind::Point)),
+            Self::Polygon => matches!(ctype, ColType::Geometry(GeometryKind::Polygon)),
+            Self::Circle => matches!(ctype, ColType::Geometry(GeometryKind::Circle)),
+            Self::TsVector => matches!(ctype, ColType::TsVector),
+            Self::TsQuery => matches!(ctype, ColType::TsQuery),
+            Self::Range => matches!(ctype, ColType::Range(_)),
+            Self::Multirange => matches!(ctype, ColType::Multirange(_)),
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Inet => "inet_ops",
+            Self::Box => "box_ops",
+            Self::Point => "point_ops",
+            Self::Polygon => "poly_ops",
+            Self::Circle => "circle_ops",
+            Self::TsVector => "tsvector_ops",
+            Self::TsQuery => "tsquery_ops",
+            Self::Range => "range_ops",
+            Self::Multirange => "multirange_ops",
+        }
+    }
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Inet => 10017,
+            Self::Box => 10060,
+            Self::Point => 10061,
+            Self::Polygon => 10062,
+            Self::Circle => 10063,
+            Self::TsVector => 10072,
+            Self::TsQuery => 10075,
+            Self::Range => 10078,
+            Self::Multirange => 10082,
+        }
+    }
+
+    pub const fn family_oid(self) -> i32 {
+        match self {
+            Self::Inet => 3550,
+            Self::Box => 2593,
+            Self::Point => 1029,
+            Self::Polygon => 2594,
+            Self::Circle => 2595,
+            Self::TsVector => 3655,
+            Self::TsQuery => 3702,
+            Self::Range => 3919,
+            Self::Multirange => 6158,
+        }
+    }
+
+    pub const fn is_default(self) -> bool {
+        !matches!(self, Self::Inet)
+    }
+
+    pub const fn input_oid(self) -> i32 {
+        match self {
+            Self::Inet => oid::INET,
+            Self::Box => oid::BOX,
+            Self::Point => oid::POINT,
+            Self::Polygon => oid::POLYGON,
+            Self::Circle => oid::CIRCLE,
+            Self::TsVector => oid::TSVECTOR,
+            Self::TsQuery => oid::TSQUERY,
+            Self::Range => oid::ANYRANGE,
+            Self::Multirange => oid::ANYMULTIRANGE,
+        }
+    }
+
+    pub const fn storage_oid(self) -> i32 {
+        match self {
+            Self::Point | Self::Polygon | Self::Circle => oid::BOX,
+            Self::TsVector => 3642,
+            Self::TsQuery => oid::INT8,
+            Self::Multirange => oid::ANYRANGE,
+            _ => 0,
+        }
+    }
+
+    pub fn from_oid(oid: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.oid() == oid)
+    }
+}
+
 /// Base storage codes for the parameterized type families. They must stay far
 /// enough apart that no two families can produce the same code: `Multirange`
 /// once began at 28 and `Array` at 32, which made `bool[]` and `int4[]`

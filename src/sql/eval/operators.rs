@@ -2691,6 +2691,13 @@ pub(crate) fn binary<'a>(
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => {
             range_op(operator, l, r, arena)
         }
+        Same | Below | Above | NotAbove | NotBelow | BelowPoint | AbovePoint => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: {} {} {}",
+            type_name_of(&l),
+            operator.operator_name().unwrap_or("?"),
+            type_name_of(&r)
+        )),
         // Only reached as the per-element operator of a quantified `LIKE ANY/ALL`.
         Like | ILike => {
             if l.is_null() || r.is_null() {

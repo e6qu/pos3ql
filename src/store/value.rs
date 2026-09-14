@@ -38,6 +38,9 @@ pub(crate) enum ValueIndexPosition {
     /// The key is not a match, but the predicate is not monotonic in index
     /// order, so the enclosing block cannot be pruned from this observation.
     Recheck,
+    /// This exact key cannot satisfy a non-monotonic predicate. It carries
+    /// no ordering implication for neighboring keys or blocks.
+    Skip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

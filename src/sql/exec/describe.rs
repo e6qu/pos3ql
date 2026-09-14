@@ -3011,6 +3011,9 @@ pub fn infer_type_res(
                 Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
                     of(ColType::Bool)
                 }
+                Same | Below | Above | NotAbove | NotBelow | BelowPoint | AbovePoint => {
+                    of(ColType::Bool)
+                }
                 // Network containment predicates.
                 NetContainedEq | NetContainsEq => of(ColType::Bool),
                 Shl | Shr if is_network_oid(lo) || is_network_oid(ro) => of(ColType::Bool),

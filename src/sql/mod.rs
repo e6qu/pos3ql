@@ -19,6 +19,7 @@ pub(crate) mod external;
 pub(crate) mod foreign;
 pub mod full_text;
 pub mod geometry;
+mod gist_catalog;
 pub mod guc;
 pub mod identity;
 pub mod json;

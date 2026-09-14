@@ -3432,6 +3432,9 @@ pub(crate) struct Enforcer {
     evaluation_txid: u32,
     key_types: [ColType; MAX_INDEX_COLS],
     collations: [Collation; MAX_INDEX_COLS],
+    /// Whether immutable generations use PostgreSQL key order. Non-orderable
+    /// access methods use encoded-byte order solely for deterministic layout.
+    ordered: bool,
     /// Union of included columns for compatible named indexes sharing this
     /// physical key binding. Key columns are never repeated in this mask.
     include_mask: u64,
@@ -8604,6 +8607,7 @@ pub(crate) enum IndexOperatorClass {
     Btree(crate::sql::types::BtreeOperatorClass),
     Hash(crate::sql::types::HashOperatorClass),
     Brin(crate::sql::types::BrinOperatorClass),
+    Gist(crate::sql::types::GistOperatorClass),
     Catalog(OperatorClassOid),
 }
 
@@ -8613,6 +8617,7 @@ impl IndexOperatorClass {
             Self::Btree(class) => class.oid(),
             Self::Hash(class) => class.oid(),
             Self::Brin(class) => class.oid(),
+            Self::Gist(class) => class.oid(),
             Self::Catalog(oid) => oid.get(),
         }
     }
@@ -8883,28 +8888,32 @@ pub struct IndexStorageOptions {
     pub deduplicate_items: Option<bool>,
     pub pages_per_range: Option<u32>,
     pub autosummarize: Option<bool>,
+    pub buffering: Option<crate::sql::ast::GistBuffering>,
 }
 
 /// Durable options for one BRIN operator class. PostgreSQL stores these on
 /// the index attribute, so they remain immutable with the key definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BrinOperatorClassOptions {
+pub(crate) struct IndexOperatorClassOptions {
     pub values_per_range: Option<u16>,
     pub n_distinct_per_range: Option<i32>,
     pub false_positive_rate: Option<StackStr<32>>,
+    pub siglen: Option<u16>,
 }
 
-impl BrinOperatorClassOptions {
+impl IndexOperatorClassOptions {
     pub(crate) const DEFAULT: Self = Self {
         values_per_range: None,
         n_distinct_per_range: None,
         false_positive_rate: None,
+        siglen: None,
     };
 
     pub(crate) const fn is_empty(self) -> bool {
         self.values_per_range.is_none()
             && self.n_distinct_per_range.is_none()
             && self.false_positive_rate.is_none()
+            && self.siglen.is_none()
     }
 }
 
@@ -8914,6 +8923,7 @@ impl IndexStorageOptions {
         deduplicate_items: None,
         pages_per_range: None,
         autosummarize: None,
+        buffering: None,
     };
 }
 
@@ -8993,7 +9003,7 @@ pub struct IndexDef {
     pub explicit_collations: [bool; MAX_INDEX_COLS],
     pub(crate) operator_classes: [Option<IndexOperatorClass>; MAX_INDEX_COLS],
     pub(crate) resolved_operator_classes: [Option<IndexOperatorClass>; MAX_INDEX_COLS],
-    pub(crate) operator_class_options: [BrinOperatorClassOptions; MAX_INDEX_COLS],
+    pub(crate) operator_class_options: [IndexOperatorClassOptions; MAX_INDEX_COLS],
     pub descending: [bool; MAX_INDEX_COLS],
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -14767,7 +14777,7 @@ impl Storage {
                     explicit_collations: [false; MAX_INDEX_COLS],
                     operator_classes: [None; MAX_INDEX_COLS],
                     resolved_operator_classes: [None; MAX_INDEX_COLS],
-                    operator_class_options: [BrinOperatorClassOptions::DEFAULT; MAX_INDEX_COLS],
+                    operator_class_options: [IndexOperatorClassOptions::DEFAULT; MAX_INDEX_COLS],
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
@@ -26522,6 +26532,9 @@ impl Storage {
         right: &[u8],
     ) -> Result<core::cmp::Ordering, SqlError> {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        if !enforcer.ordered {
+            return Ok(left.cmp(right));
+        }
         let mut types = [ColType::Bool; MAX_INDEX_COLS];
         let mut collations = [crate::sql::ast::Collation::None; MAX_INDEX_COLS];
         types[..enforcer.n_cols].copy_from_slice(&enforcer.key_types[..enforcer.n_cols]);
@@ -26659,6 +26672,7 @@ impl Storage {
             index_created_at: Option<u64>,
             key_types: [ColType; MAX_INDEX_COLS],
             collations: [Collation; MAX_INDEX_COLS],
+            ordered: bool,
             include_mask: u64,
         }
         const EMPTY_BINDING: WantedBinding = WantedBinding {
@@ -26667,6 +26681,7 @@ impl Storage {
             index_created_at: None,
             key_types: [ColType::Bool; MAX_INDEX_COLS],
             collations: [Collation::None; MAX_INDEX_COLS],
+            ordered: true,
             include_mask: 0,
         };
         let mut want = [EMPTY_BINDING; MAX_VALUE_ENFORCERS];
@@ -26732,8 +26747,10 @@ impl Storage {
             // BRIN must retain its concrete catalog identity even for plain
             // columns: inclusion operator classes and summary maintenance
             // have semantics a generic equality/range binding cannot infer.
-            let special = index.method == crate::sql::ast::IndexAccessMethod::Brin
-                || index.predicate.is_some()
+            let special = matches!(
+                index.method,
+                crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gist
+            ) || index.predicate.is_some()
                 || index.expressions[..index.n_cols]
                     .iter()
                     .any(Option::is_some)
@@ -26770,6 +26787,7 @@ impl Storage {
             want[n_want].columns[..columns.len()].copy_from_slice(columns);
             want[n_want].n_columns = columns.len();
             want[n_want].index_created_at = special.then_some(index.created_at);
+            want[n_want].ordered = index.method != crate::sql::ast::IndexAccessMethod::Gist;
             want[n_want].collations[..columns.len()]
                 .copy_from_slice(&index.collations[..columns.len()]);
             let mark = self.index_arena.mark();
@@ -26826,6 +26844,7 @@ impl Storage {
                 evaluation_txid: txid.unwrap_or(0),
                 key_types: wanted.key_types,
                 collations: wanted.collations,
+                ordered: wanted.ordered,
                 include_mask: wanted.include_mask,
                 durable: published[..n_published]
                     .iter()
@@ -36470,6 +36489,7 @@ impl Storage {
             crate::sql::ast::IndexAccessMethod::Btree => {
                 if def.mutable.options.pages_per_range.is_some()
                     || def.mutable.options.autosummarize.is_some()
+                    || def.mutable.options.buffering.is_some()
                     || def.operator_class_options[..def.n_cols]
                         .iter()
                         .any(|options| !options.is_empty())
@@ -36478,7 +36498,11 @@ impl Storage {
                         .any(|class| {
                             matches!(
                                 class,
-                                Some(IndexOperatorClass::Hash(_) | IndexOperatorClass::Brin(_))
+                                Some(
+                                    IndexOperatorClass::Hash(_)
+                                        | IndexOperatorClass::Brin(_)
+                                        | IndexOperatorClass::Gist(_)
+                                )
                             )
                         })
                 {
@@ -36493,6 +36517,7 @@ impl Storage {
                     || def.mutable.options.deduplicate_items.is_some()
                     || def.mutable.options.pages_per_range.is_some()
                     || def.mutable.options.autosummarize.is_some()
+                    || def.mutable.options.buffering.is_some()
                     || def.n_cols != 1
                     || def.n_include_cols != 0
                     || def.descending[..def.n_cols].iter().any(|value| *value)
@@ -36514,6 +36539,7 @@ impl Storage {
                 if def.unique
                     || def.mutable.options.fillfactor.is_some()
                     || def.mutable.options.deduplicate_items.is_some()
+                    || def.mutable.options.buffering.is_some()
                     || def
                         .mutable
                         .options
@@ -36548,6 +36574,37 @@ impl Storage {
                     return Err(sql_err!(
                         sqlstate::INVALID_OBJECT_DEFINITION,
                         "brin index definition has unsupported key semantics"
+                    ));
+                }
+            }
+            crate::sql::ast::IndexAccessMethod::Gist => {
+                if def.unique
+                    || def.mutable.options.deduplicate_items.is_some()
+                    || def.mutable.options.pages_per_range.is_some()
+                    || def.mutable.options.autosummarize.is_some()
+                    || def.descending[..def.n_cols].iter().any(|value| *value)
+                    || def.nulls_first[..def.n_cols].iter().any(|value| *value)
+                    || def.resolved_operator_classes[..def.n_cols]
+                        .iter()
+                        .any(|class| !matches!(class, Some(IndexOperatorClass::Gist(_))))
+                    || def.resolved_operator_classes[..def.n_cols]
+                        .iter()
+                        .zip(&def.operator_class_options[..def.n_cols])
+                        .any(|(class, options)| match class {
+                            Some(IndexOperatorClass::Gist(
+                                crate::sql::types::GistOperatorClass::TsVector,
+                            )) => {
+                                options.values_per_range.is_some()
+                                    || options.n_distinct_per_range.is_some()
+                                    || options.false_positive_rate.is_some()
+                            }
+                            Some(IndexOperatorClass::Gist(_)) => !options.is_empty(),
+                            _ => true,
+                        })
+                {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "gist index definition has unsupported key semantics"
                     ));
                 }
             }
@@ -36678,19 +36735,27 @@ impl Storage {
             crate::sql::ast::IndexAccessMethod::Btree => {
                 definition.options.pages_per_range.is_none()
                     && definition.options.autosummarize.is_none()
+                    && definition.options.buffering.is_none()
             }
             crate::sql::ast::IndexAccessMethod::Hash => {
                 definition.options.deduplicate_items.is_none()
                     && definition.options.pages_per_range.is_none()
                     && definition.options.autosummarize.is_none()
+                    && definition.options.buffering.is_none()
             }
             crate::sql::ast::IndexAccessMethod::Brin => {
                 definition.options.fillfactor.is_none()
                     && definition.options.deduplicate_items.is_none()
+                    && definition.options.buffering.is_none()
                     && definition
                         .options
                         .pages_per_range
                         .is_none_or(|value| (1..=131_072).contains(&value))
+            }
+            crate::sql::ast::IndexAccessMethod::Gist => {
+                definition.options.deduplicate_items.is_none()
+                    && definition.options.pages_per_range.is_none()
+                    && definition.options.autosummarize.is_none()
             }
         };
         if !options_valid {
@@ -36702,7 +36767,9 @@ impl Storage {
         if definition.clustered
             && matches!(
                 self.indexes[slot].method,
-                crate::sql::ast::IndexAccessMethod::Hash | crate::sql::ast::IndexAccessMethod::Brin
+                crate::sql::ast::IndexAccessMethod::Hash
+                    | crate::sql::ast::IndexAccessMethod::Brin
+                    | crate::sql::ast::IndexAccessMethod::Gist
             )
         {
             return Err(sql_err!(
@@ -41652,6 +41719,10 @@ impl Storage {
             crate::sql::ast::IndexAccessMethod::Brin => {
                 crate::sql::types::BrinOperatorClass::for_type(input.ctype)
                     .map(IndexOperatorClass::Brin)
+            }
+            crate::sql::ast::IndexAccessMethod::Gist => {
+                crate::sql::types::GistOperatorClass::for_type(input.ctype)
+                    .map(IndexOperatorClass::Gist)
             }
         };
         class.ok_or_else(|| {

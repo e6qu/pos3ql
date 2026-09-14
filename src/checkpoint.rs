@@ -5571,6 +5571,15 @@ impl Checkpointer {
                                     CheckpointSetupError::Corrupt("bad brin index operator class"),
                                 )?,
                             ))
+                        } else if let Some(code) = encoded.strip_prefix('g') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad gist index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Gist(
+                                crate::sql::types::GistOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt("bad gist index operator class"),
+                                )?,
+                            ))
                         } else {
                             return Err(CheckpointSetupError::Corrupt(
                                 "bad index operator class encoding",
@@ -5631,6 +5640,19 @@ impl Checkpointer {
                                 crate::sql::types::BrinOperatorClass::from_code(code).ok_or(
                                     CheckpointSetupError::Corrupt(
                                         "bad brin resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else if let Some(code) = encoded.strip_prefix('g') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad gist resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Gist(
+                                crate::sql::types::GistOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad gist resolved index operator class",
                                     ),
                                 )?,
                             ))
@@ -5718,8 +5740,23 @@ impl Checkpointer {
                         } else {
                             None
                         };
+                    let buffering = if words
+                        .clone()
+                        .next()
+                        .is_some_and(|word| word.starts_with("gb"))
+                    {
+                        match words.next().and_then(|word| word.strip_prefix("gb")) {
+                            Some("0") => None,
+                            Some("1") => Some(crate::sql::ast::GistBuffering::Auto),
+                            Some("2") => Some(crate::sql::ast::GistBuffering::On),
+                            Some("3") => Some(crate::sql::ast::GistBuffering::Off),
+                            _ => return Err(CheckpointSetupError::Corrupt("bad gist buffering")),
+                        }
+                    } else {
+                        None
+                    };
                     let mut operator_class_options =
-                        [crate::storage::BrinOperatorClassOptions::DEFAULT;
+                        [crate::storage::IndexOperatorClassOptions::DEFAULT;
                             crate::storage::MAX_INDEX_COLS];
                     if words.clone().next() == Some("bo") {
                         let _ = words.next();
@@ -5744,6 +5781,12 @@ impl Checkpointer {
                                 .ok_or(CheckpointSetupError::Corrupt(
                                     "bad idx false positive rate",
                                 ))?;
+                            let siglen = match fields.next() {
+                                None => None,
+                                Some(field) => Some(field.strip_prefix('s').ok_or(
+                                    CheckpointSetupError::Corrupt("bad idx gist signature length"),
+                                )?),
+                            };
                             if fields.next().is_some() {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "bad idx operator class options",
@@ -5794,6 +5837,20 @@ impl Checkpointer {
                                 }
                                 Some(stored)
                             };
+                            options.siglen = match siglen {
+                                None | Some("-") => None,
+                                Some(value) => Some(value.parse::<u16>().map_err(|_| {
+                                    CheckpointSetupError::Corrupt("bad idx gist signature length")
+                                })?),
+                            };
+                            if options
+                                .siglen
+                                .is_some_and(|value| !(1..=2024).contains(&value))
+                            {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "bad idx gist signature length",
+                                ));
+                            }
                         }
                     }
                     let mut unsummarized_ranges =
@@ -5845,6 +5902,10 @@ impl Checkpointer {
                     }) {
                         crate::sql::ast::IndexAccessMethod::Brin
                     } else if resolved_operator_classes[..n_cols].iter().all(|class| {
+                        matches!(class, Some(crate::storage::IndexOperatorClass::Gist(_)))
+                    }) {
+                        crate::sql::ast::IndexAccessMethod::Gist
+                    } else if resolved_operator_classes[..n_cols].iter().all(|class| {
                         matches!(
                             class,
                             Some(crate::storage::IndexOperatorClass::Btree(_))
@@ -5890,6 +5951,7 @@ impl Checkpointer {
                                         deduplicate_items,
                                         pages_per_range,
                                         autosummarize,
+                                        buffering,
                                     },
                                     statistics,
                                     parent: (parent != u16::MAX).then_some(parent),
@@ -9174,6 +9236,9 @@ impl Checkpointer {
                     Some(crate::storage::IndexOperatorClass::Brin(class)) => {
                         let _ = write!(operator_classes, " r{}", class.code());
                     }
+                    Some(crate::storage::IndexOperatorClass::Gist(class)) => {
+                        let _ = write!(operator_classes, " g{}", class.code());
+                    }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         let _ = write!(operator_classes, " c{}", oid.get());
                     }
@@ -9190,6 +9255,9 @@ impl Checkpointer {
                     crate::storage::IndexOperatorClass::Brin(class) => {
                         let _ = write!(resolved_operator_classes, " r{}", class.code());
                     }
+                    crate::storage::IndexOperatorClass::Gist(class) => {
+                        let _ = write!(resolved_operator_classes, " g{}", class.code());
+                    }
                     crate::storage::IndexOperatorClass::Catalog(oid) => {
                         let _ = write!(resolved_operator_classes, " c{}", oid.get());
                     }
@@ -9198,7 +9266,7 @@ impl Checkpointer {
                 let options = index.operator_class_options[position];
                 let _ = write!(
                     operator_class_options,
-                    " v{},n{},f{}",
+                    " v{},n{},f{},s{}",
                     options
                         .values_per_range
                         .map_or_else(
@@ -9221,6 +9289,13 @@ impl Checkpointer {
                         .false_positive_rate
                         .as_ref()
                         .map_or("-", |value| value.as_str()),
+                    options
+                        .siglen
+                        .map_or_else(
+                            || StackStr::<16>::from_str("-"),
+                            |value| StackStr::<16>::from_str(stack_format!(16, "{value}").as_str()),
+                        )
+                        .as_str(),
                 );
             }
             let mutable = index.mutable;
@@ -9241,10 +9316,16 @@ impl Checkpointer {
                 Some(false) => 1,
                 Some(true) => 2,
             };
+            let buffering = match mutable.options.buffering {
+                None => 0,
+                Some(crate::sql::ast::GistBuffering::Auto) => 1,
+                Some(crate::sql::ast::GistBuffering::On) => 2,
+                Some(crate::sql::ast::GistBuffering::Off) => 3,
+            };
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} bo{}{}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{}{}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -9275,6 +9356,7 @@ impl Checkpointer {
                     u8::from(mutable.replica_identity),
                     pages_per_range,
                     autosummarize,
+                    buffering,
                     operator_class_options.as_str(),
                     maintenance_suffix.as_str(),
                 ),

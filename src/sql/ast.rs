@@ -341,6 +341,7 @@ pub enum CreateSchemaElement<'a> {
         build: IndexBuildMode,
         scope: IndexTargetScope,
         if_not_exists: bool,
+        method: IndexAccessMethod,
         columns: &'a [IndexColumn<'a>],
         include_columns: &'a [&'a str],
         nulls_not_distinct: bool,
@@ -956,6 +957,7 @@ pub enum Stmt<'a> {
         build: IndexBuildMode,
         scope: IndexTargetScope,
         if_not_exists: bool,
+        method: IndexAccessMethod,
         columns: &'a [IndexColumn<'a>],
         /// Non-key covering columns. A distinct AST field makes it impossible
         /// for execution to accidentally use them for ordering or uniqueness.
@@ -2501,11 +2503,36 @@ pub struct DropTransform<'a> {
     pub cascade: bool,
 }
 
-/// PostgreSQL exposes only the btree access method in pos3ql's modeled index
-/// runtime. Parsing produces this closed value before catalog mutation.
+/// Executable index access methods. Parsing produces this closed value before
+/// catalog mutation, so unsupported handlers cannot become inert metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexAccessMethod {
     Btree,
+    Hash,
+}
+
+impl IndexAccessMethod {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Btree => 0,
+            Self::Hash => 1,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Btree),
+            1 => Some(Self::Hash),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Btree => "btree",
+            Self::Hash => "hash",
+        }
+    }
 }
 
 /// The PostgreSQL relation class implemented by an access-method handler.
@@ -2667,8 +2694,8 @@ pub enum AlterOperatorClassAction<'a> {
     SetSchema(&'a str),
 }
 
-/// One btree index key. A plain column retains its resolved name; every other
-/// key is an expression with durable canonical source. PostgreSQL's defaults
+/// One executable index key. A plain column retains its resolved name; every
+/// other key is an expression with durable canonical source. Btree defaults
 /// depend on direction: ascending keys put NULLs last, descending keys first.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IndexColumn<'a> {
@@ -2678,7 +2705,9 @@ pub struct IndexColumn<'a> {
     pub collation: Option<ParsedCollation<'a>>,
     pub operator_class: Option<QualName<'a>>,
     pub descending: bool,
+    pub ordering_specified: bool,
     pub nulls_first: bool,
+    pub nulls_order_specified: bool,
 }
 
 /// The relation class selected by REINDEX. Other PostgreSQL forms require

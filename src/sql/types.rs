@@ -759,6 +759,430 @@ impl BtreeOperatorClass {
     }
 }
 
+/// Hash operator classes whose equality semantics the executor implements.
+///
+/// PostgreSQL assigns stable bootstrap OIDs to these classes. Keeping the
+/// concrete class in durable index metadata preserves explicit non-default
+/// classes and makes catalog reconstruction exact after recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HashOperatorClass {
+    Array = 1,
+    Bpchar,
+    Char,
+    Cidr,
+    Date,
+    Float4,
+    Float8,
+    Inet,
+    Int2,
+    Int4,
+    Int8,
+    Interval,
+    Macaddr,
+    Macaddr8,
+    Name,
+    Numeric,
+    Oid,
+    OidVector,
+    Record,
+    Text,
+    Time,
+    Timestamptz,
+    Timetz,
+    Varchar,
+    Timestamp,
+    Bool,
+    Bytea,
+    Xid,
+    Xid8,
+    Cid,
+    Tid,
+    TextPattern,
+    VarcharPattern,
+    BpcharPattern,
+    AclItem,
+    Uuid,
+    PgLsn,
+    Enum,
+    Range,
+    Multirange,
+    Jsonb,
+}
+
+impl HashOperatorClass {
+    pub const fn for_type(ctype: ColType) -> Option<Self> {
+        use ColType::*;
+        Some(match ctype {
+            Array(_) => Self::Array,
+            Bpchar => Self::Bpchar,
+            Char => Self::Char,
+            Cidr | Inet => Self::Inet,
+            Date => Self::Date,
+            Float4 => Self::Float4,
+            Float8 => Self::Float8,
+            Int2 => Self::Int2,
+            Int4 => Self::Int4,
+            Int8 => Self::Int8,
+            Interval => Self::Interval,
+            Macaddr => Self::Macaddr,
+            Macaddr8 => Self::Macaddr8,
+            Name => Self::Name,
+            Numeric => Self::Numeric,
+            Oid | Regtype | Regproc | Regprocedure | Regoper | Regoperator | Regclass
+            | Regnamespace | Regrole | Regconfig | Regdictionary | Regcollation => Self::Oid,
+            OidVector => Self::OidVector,
+            Record | Composite(_) => Self::Record,
+            Text | Varchar => Self::Text,
+            Time => Self::Time,
+            Timestamptz => Self::Timestamptz,
+            Timetz => Self::Timetz,
+            Timestamp => Self::Timestamp,
+            Bool => Self::Bool,
+            Bytea => Self::Bytea,
+            Xid => Self::Xid,
+            Xid8 => Self::Xid8,
+            Cid => Self::Cid,
+            Tid => Self::Tid,
+            AclItem => Self::AclItem,
+            Uuid => Self::Uuid,
+            PgLsn => Self::PgLsn,
+            Enum(_) => Self::Enum,
+            Range(_) => Self::Range,
+            Multirange(_) => Self::Multirange,
+            Jsonb => Self::Jsonb,
+            Bit { .. }
+            | Refcursor
+            | Money
+            | PgSnapshot
+            | TxidSnapshot
+            | Json
+            | Xml
+            | Jsonpath
+            | TsVector
+            | TsQuery
+            | Geometry(_)
+            | Void
+            | Internal
+            | PgDdlCommand
+            | AnyArray
+            | Int2Vector
+            | PgNodeTree
+            | PgNdistinct
+            | PgDependencies
+            | PgMcvList
+            | PgStatisticArray => {
+                return None;
+            }
+        })
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "array_ops" => Self::Array,
+            "bpchar_ops" => Self::Bpchar,
+            "char_ops" => Self::Char,
+            "cidr_ops" => Self::Cidr,
+            "date_ops" => Self::Date,
+            "float4_ops" => Self::Float4,
+            "float8_ops" => Self::Float8,
+            "inet_ops" => Self::Inet,
+            "int2_ops" => Self::Int2,
+            "int4_ops" => Self::Int4,
+            "int8_ops" => Self::Int8,
+            "interval_ops" => Self::Interval,
+            "macaddr_ops" => Self::Macaddr,
+            "macaddr8_ops" => Self::Macaddr8,
+            "name_ops" => Self::Name,
+            "numeric_ops" => Self::Numeric,
+            "oid_ops" => Self::Oid,
+            "oidvector_ops" => Self::OidVector,
+            "record_ops" => Self::Record,
+            "text_ops" => Self::Text,
+            "time_ops" => Self::Time,
+            "timestamptz_ops" => Self::Timestamptz,
+            "timetz_ops" => Self::Timetz,
+            "varchar_ops" => Self::Varchar,
+            "timestamp_ops" => Self::Timestamp,
+            "bool_ops" => Self::Bool,
+            "bytea_ops" => Self::Bytea,
+            "xid_ops" => Self::Xid,
+            "xid8_ops" => Self::Xid8,
+            "cid_ops" => Self::Cid,
+            "tid_ops" => Self::Tid,
+            "text_pattern_ops" => Self::TextPattern,
+            "varchar_pattern_ops" => Self::VarcharPattern,
+            "bpchar_pattern_ops" => Self::BpcharPattern,
+            "aclitem_ops" => Self::AclItem,
+            "uuid_ops" => Self::Uuid,
+            "pg_lsn_ops" => Self::PgLsn,
+            "enum_ops" => Self::Enum,
+            "range_ops" => Self::Range,
+            "multirange_ops" => Self::Multirange,
+            "jsonb_ops" => Self::Jsonb,
+            _ => return None,
+        })
+    }
+
+    pub const fn accepts(self, ctype: ColType) -> bool {
+        use ColType::*;
+        match self {
+            Self::Array => matches!(ctype, Array(_)),
+            Self::Bpchar | Self::BpcharPattern => matches!(ctype, Bpchar),
+            Self::Char => matches!(ctype, Char),
+            Self::Cidr | Self::Inet => matches!(ctype, Cidr | Inet),
+            Self::Date => matches!(ctype, Date),
+            Self::Float4 => matches!(ctype, Float4),
+            Self::Float8 => matches!(ctype, Float8),
+            Self::Int2 => matches!(ctype, Int2),
+            Self::Int4 => matches!(ctype, Int4),
+            Self::Int8 => matches!(ctype, Int8),
+            Self::Interval => matches!(ctype, Interval),
+            Self::Macaddr => matches!(ctype, Macaddr),
+            Self::Macaddr8 => matches!(ctype, Macaddr8),
+            Self::Name => matches!(ctype, Name),
+            Self::Numeric => matches!(ctype, Numeric),
+            Self::Oid => matches!(
+                ctype,
+                Oid | Regtype
+                    | Regproc
+                    | Regprocedure
+                    | Regoper
+                    | Regoperator
+                    | Regclass
+                    | Regnamespace
+                    | Regrole
+                    | Regconfig
+                    | Regdictionary
+                    | Regcollation
+            ),
+            Self::OidVector => matches!(ctype, OidVector),
+            Self::Record => matches!(ctype, Record | Composite(_)),
+            Self::Text | Self::Varchar | Self::TextPattern | Self::VarcharPattern => {
+                matches!(ctype, Text | Varchar)
+            }
+            Self::Time => matches!(ctype, Time),
+            Self::Timestamptz => matches!(ctype, Timestamptz),
+            Self::Timetz => matches!(ctype, Timetz),
+            Self::Timestamp => matches!(ctype, Timestamp),
+            Self::Bool => matches!(ctype, Bool),
+            Self::Bytea => matches!(ctype, Bytea),
+            Self::Xid => matches!(ctype, Xid),
+            Self::Xid8 => matches!(ctype, Xid8),
+            Self::Cid => matches!(ctype, Cid),
+            Self::Tid => matches!(ctype, Tid),
+            Self::AclItem => matches!(ctype, AclItem),
+            Self::Uuid => matches!(ctype, Uuid),
+            Self::PgLsn => matches!(ctype, PgLsn),
+            Self::Enum => matches!(ctype, Enum(_)),
+            Self::Range => matches!(ctype, Range(_)),
+            Self::Multirange => matches!(ctype, Multirange(_)),
+            Self::Jsonb => matches!(ctype, Jsonb),
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Array,
+            2 => Self::Bpchar,
+            3 => Self::Char,
+            4 => Self::Cidr,
+            5 => Self::Date,
+            6 => Self::Float4,
+            7 => Self::Float8,
+            8 => Self::Inet,
+            9 => Self::Int2,
+            10 => Self::Int4,
+            11 => Self::Int8,
+            12 => Self::Interval,
+            13 => Self::Macaddr,
+            14 => Self::Macaddr8,
+            15 => Self::Name,
+            16 => Self::Numeric,
+            17 => Self::Oid,
+            18 => Self::OidVector,
+            19 => Self::Record,
+            20 => Self::Text,
+            21 => Self::Time,
+            22 => Self::Timestamptz,
+            23 => Self::Timetz,
+            24 => Self::Varchar,
+            25 => Self::Timestamp,
+            26 => Self::Bool,
+            27 => Self::Bytea,
+            28 => Self::Xid,
+            29 => Self::Xid8,
+            30 => Self::Cid,
+            31 => Self::Tid,
+            32 => Self::TextPattern,
+            33 => Self::VarcharPattern,
+            34 => Self::BpcharPattern,
+            35 => Self::AclItem,
+            36 => Self::Uuid,
+            37 => Self::PgLsn,
+            38 => Self::Enum,
+            39 => Self::Range,
+            40 => Self::Multirange,
+            41 => Self::Jsonb,
+            _ => return None,
+        })
+    }
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Array => "array_ops",
+            Self::Bpchar => "bpchar_ops",
+            Self::Char => "char_ops",
+            Self::Cidr => "cidr_ops",
+            Self::Date => "date_ops",
+            Self::Float4 => "float4_ops",
+            Self::Float8 => "float8_ops",
+            Self::Inet => "inet_ops",
+            Self::Int2 => "int2_ops",
+            Self::Int4 => "int4_ops",
+            Self::Int8 => "int8_ops",
+            Self::Interval => "interval_ops",
+            Self::Macaddr => "macaddr_ops",
+            Self::Macaddr8 => "macaddr8_ops",
+            Self::Name => "name_ops",
+            Self::Numeric => "numeric_ops",
+            Self::Oid => "oid_ops",
+            Self::OidVector => "oidvector_ops",
+            Self::Record => "record_ops",
+            Self::Text => "text_ops",
+            Self::Time => "time_ops",
+            Self::Timestamptz => "timestamptz_ops",
+            Self::Timetz => "timetz_ops",
+            Self::Varchar => "varchar_ops",
+            Self::Timestamp => "timestamp_ops",
+            Self::Bool => "bool_ops",
+            Self::Bytea => "bytea_ops",
+            Self::Xid => "xid_ops",
+            Self::Xid8 => "xid8_ops",
+            Self::Cid => "cid_ops",
+            Self::Tid => "tid_ops",
+            Self::TextPattern => "text_pattern_ops",
+            Self::VarcharPattern => "varchar_pattern_ops",
+            Self::BpcharPattern => "bpchar_pattern_ops",
+            Self::AclItem => "aclitem_ops",
+            Self::Uuid => "uuid_ops",
+            Self::PgLsn => "pg_lsn_ops",
+            Self::Enum => "enum_ops",
+            Self::Range => "range_ops",
+            Self::Multirange => "multirange_ops",
+            Self::Jsonb => "jsonb_ops",
+        }
+    }
+
+    pub const fn is_default(self) -> bool {
+        !matches!(
+            self,
+            Self::Cidr
+                | Self::Varchar
+                | Self::TextPattern
+                | Self::VarcharPattern
+                | Self::BpcharPattern
+        )
+    }
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Array => 10001,
+            Self::Bpchar => 10005,
+            Self::Char => 10008,
+            Self::Cidr => 10010,
+            Self::Date => 10011,
+            Self::Float4 => 10013,
+            Self::Float8 => 10014,
+            Self::Inet => 10016,
+            Self::Int2 => 10019,
+            Self::Int4 => 10020,
+            Self::Int8 => 10021,
+            Self::Interval => 10023,
+            Self::Macaddr => 10025,
+            Self::Macaddr8 => 10027,
+            Self::Name => 10029,
+            Self::Numeric => 10030,
+            Self::Oid => 10031,
+            Self::OidVector => 10033,
+            Self::Record => 10035,
+            Self::Text => 10037,
+            Self::Time => 10039,
+            Self::Timestamptz => 10040,
+            Self::Timetz => 10042,
+            Self::Varchar => 10045,
+            Self::Timestamp => 10046,
+            Self::Bool => 10048,
+            Self::Bytea => 10049,
+            Self::Xid => 10051,
+            Self::Xid8 => 10052,
+            Self::Cid => 10054,
+            Self::Tid => 10055,
+            Self::TextPattern => 10056,
+            Self::VarcharPattern => 10057,
+            Self::BpcharPattern => 10058,
+            Self::AclItem => 10059,
+            Self::Uuid => 10066,
+            Self::PgLsn => 10068,
+            Self::Enum => 10070,
+            Self::Range => 10077,
+            Self::Multirange => 10081,
+            Self::Jsonb => 10089,
+        }
+    }
+
+    pub const fn from_oid(oid: i32) -> Option<Self> {
+        Some(match oid {
+            10001 => Self::Array,
+            10005 => Self::Bpchar,
+            10008 => Self::Char,
+            10010 => Self::Cidr,
+            10011 => Self::Date,
+            10013 => Self::Float4,
+            10014 => Self::Float8,
+            10016 => Self::Inet,
+            10019 => Self::Int2,
+            10020 => Self::Int4,
+            10021 => Self::Int8,
+            10023 => Self::Interval,
+            10025 => Self::Macaddr,
+            10027 => Self::Macaddr8,
+            10029 => Self::Name,
+            10030 => Self::Numeric,
+            10031 => Self::Oid,
+            10033 => Self::OidVector,
+            10035 => Self::Record,
+            10037 => Self::Text,
+            10039 => Self::Time,
+            10040 => Self::Timestamptz,
+            10042 => Self::Timetz,
+            10045 => Self::Varchar,
+            10046 => Self::Timestamp,
+            10048 => Self::Bool,
+            10049 => Self::Bytea,
+            10051 => Self::Xid,
+            10052 => Self::Xid8,
+            10054 => Self::Cid,
+            10055 => Self::Tid,
+            10056 => Self::TextPattern,
+            10057 => Self::VarcharPattern,
+            10058 => Self::BpcharPattern,
+            10059 => Self::AclItem,
+            10066 => Self::Uuid,
+            10068 => Self::PgLsn,
+            10070 => Self::Enum,
+            10077 => Self::Range,
+            10081 => Self::Multirange,
+            10089 => Self::Jsonb,
+            _ => return None,
+        })
+    }
+}
+
 /// Base storage codes for the parameterized type families. They must stay far
 /// enough apart that no two families can produce the same code: `Multirange`
 /// once began at 28 and `Array` at 32, which made `bool[]` and `int4[]`
@@ -3972,6 +4396,53 @@ mod tests {
         assert_eq!(BtreeOperatorClass::for_type(ColType::Json), None);
         assert_eq!(BtreeOperatorClass::parse("not_an_operator_class"), None);
         assert_eq!(BtreeOperatorClass::from_code(0), None);
+    }
+
+    #[test]
+    fn hash_operator_classes_are_closed_and_match_postgres_catalogs() {
+        let mut oids = Vec::new();
+        for code in 1..=41 {
+            let operator_class =
+                HashOperatorClass::from_code(code).expect("every durable hash class code exists");
+            assert_eq!(operator_class.code(), code);
+            assert_eq!(
+                HashOperatorClass::parse(operator_class.name()),
+                Some(operator_class)
+            );
+            assert_eq!(
+                HashOperatorClass::from_oid(operator_class.oid()),
+                Some(operator_class)
+            );
+            assert!(
+                !oids.contains(&operator_class.oid()),
+                "duplicate hash operator-class OID {}",
+                operator_class.oid()
+            );
+            oids.push(operator_class.oid());
+        }
+        assert_eq!(oids.len(), 41);
+        assert_eq!(HashOperatorClass::from_code(0), None);
+        assert_eq!(HashOperatorClass::from_code(42), None);
+        assert_eq!(HashOperatorClass::from_oid(0), None);
+        assert_eq!(HashOperatorClass::parse("not_an_operator_class"), None);
+
+        assert_eq!(
+            HashOperatorClass::for_type(ColType::Cidr),
+            Some(HashOperatorClass::Inet)
+        );
+        assert_eq!(
+            HashOperatorClass::for_type(ColType::Varchar),
+            Some(HashOperatorClass::Text)
+        );
+        assert_eq!(
+            HashOperatorClass::for_type(ColType::Jsonb),
+            Some(HashOperatorClass::Jsonb)
+        );
+        assert_eq!(HashOperatorClass::for_type(ColType::Refcursor), None);
+        assert_eq!(HashOperatorClass::for_type(ColType::Json), None);
+        assert!(HashOperatorClass::Cidr.accepts(ColType::Inet));
+        assert!(HashOperatorClass::VarcharPattern.accepts(ColType::Text));
+        assert!(!HashOperatorClass::Int4.accepts(ColType::Int8));
     }
 
     #[test]

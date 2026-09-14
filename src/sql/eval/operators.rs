@@ -2549,6 +2549,22 @@ pub(crate) fn binary<'a>(
             let r = coerce_unknown_array(r, &l, arena)?;
             compare(operator, l, r, false, false)
         }
+        Eq | NotEq | Lt | LtEq | Gt | GtEq
+            if (l_unknown && matches!(r, Datum::Json { jsonb: true, .. }))
+                || (r_unknown && matches!(l, Datum::Json { jsonb: true, .. })) =>
+        {
+            let l = if l_unknown {
+                cast_to(l, ColType::Jsonb, arena)?
+            } else {
+                l
+            };
+            let r = if r_unknown {
+                cast_to(r, ColType::Jsonb, arena)?
+            } else {
+                r
+            };
+            compare(operator, l, r, false, false)
+        }
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),

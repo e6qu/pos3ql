@@ -1590,7 +1590,7 @@ impl<'a> Parser<'a> {
                 at: self.peek_at,
                 message: stack_format!(
                     96,
-                    "access method \"{}\" is not supported; pos3ql models btree",
+                    "access method \"{}\" is not supported for user-defined operator objects",
                     method
                 ),
                 sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5200,6 +5200,7 @@ impl<'a> Parser<'a> {
                         build,
                         scope,
                         if_not_exists,
+                        method,
                         columns,
                         include_columns,
                         nulls_not_distinct,
@@ -5214,6 +5215,7 @@ impl<'a> Parser<'a> {
                         build,
                         scope,
                         if_not_exists,
+                        method,
                         columns,
                         include_columns,
                         nulls_not_distinct,
@@ -5308,9 +5310,13 @@ impl<'a> Parser<'a> {
             IndexTargetScope::Recurse
         };
         let table = self.qual_name("table name")?;
-        if self.eat_ident("using")? {
+        let method = if self.eat_ident("using")? {
             let method = self.any_ident("index access method")?;
-            if !method.eq_ignore_ascii_case("btree") {
+            if method.eq_ignore_ascii_case("btree") {
+                IndexAccessMethod::Btree
+            } else if method.eq_ignore_ascii_case("hash") {
+                IndexAccessMethod::Hash
+            } else {
                 return Err(ParseError {
                     at: self.peek_at,
                     message: stack_format!(
@@ -5321,7 +5327,9 @@ impl<'a> Parser<'a> {
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 });
             }
-        }
+        } else {
+            IndexAccessMethod::Btree
+        };
         self.expect_op("(")?;
         let null_expression = self.arena_expr(Expr::Null)?;
         let mut columns = [crate::sql::ast::IndexColumn {
@@ -5331,7 +5339,9 @@ impl<'a> Parser<'a> {
             collation: None,
             operator_class: None,
             descending: false,
+            ordering_specified: false,
             nulls_first: false,
+            nulls_order_specified: false,
         }; MAX_LIST];
         let mut n = 0;
         loop {
@@ -5371,12 +5381,15 @@ impl<'a> Parser<'a> {
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 });
             }
-            let descending = if self.eat_ident("asc")? {
-                false
+            let (descending, ordering_specified) = if self.eat_ident("asc")? {
+                (false, true)
+            } else if self.eat_ident("desc")? {
+                (true, true)
             } else {
-                self.eat_ident("desc")?
+                (false, false)
             };
-            let nulls_first = if self.eat_ident("nulls")? {
+            let nulls_order_specified = self.eat_ident("nulls")?;
+            let nulls_first = if nulls_order_specified {
                 if self.eat_ident("first")? {
                     true
                 } else {
@@ -5393,7 +5406,9 @@ impl<'a> Parser<'a> {
                 collation,
                 operator_class,
                 descending,
+                ordering_specified,
                 nulls_first,
+                nulls_order_specified,
             };
             n += 1;
             if !self.eat_op(",")? {
@@ -5457,6 +5472,7 @@ impl<'a> Parser<'a> {
             build,
             scope,
             if_not_exists,
+            method,
             columns,
             include_columns,
             nulls_not_distinct,

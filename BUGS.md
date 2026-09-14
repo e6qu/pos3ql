@@ -63,8 +63,8 @@ Record only a genuinely intractable or externally blocked defect here. A row mus
 The PostgreSQL 18.6 vendored regression expansion found no externally blocked
 defect. Float4 enum-order exhaustion, uncommitted enum-value safety, aliasless
 derived tables, bit/character/type-input edges, and truncated enum diagnostics
-from `pg_input_error_info` were fixed in the same change. Unsupported hash-index execution,
-physical planner parity, and native server extensions are architecture limits
+from `pg_input_error_info` were fixed in the same change. Remaining physical
+index methods, planner parity, and native server extensions are architecture limits
 recorded in the compatibility and performance plans, not deferred bugs.
 
 The performance and scaling review found that each readable connection owned
@@ -178,3 +178,13 @@ durable payloads are rejected by commit LSN before decoding. Full physical
 tuple limits are enforced before row and CREATE INDEX commit, including the
 union used by redundant compatible indexes. No externally blocked defect
 remains from this review.
+
+The hash-index review completed PostgreSQL 18's equality-only physical hash
+boundary across DDL, catalogs, planning, execution, DML, joins, WAL,
+checkpoints, copied and partitioned indexes, reindexing, statistics, and
+object-cold recovery. Full PostgreSQL 18 catalog differentials cover all hash
+operator classes, families, operators, and support procedures. The review also
+found and fixed JSONB equality against unknown literals, colliding generated
+names when `LIKE INCLUDING INDEXES` copied column and expression indexes, and
+an incorrect default hash-opclass claim for `refcursor`. No externally blocked
+defect remains from this review.

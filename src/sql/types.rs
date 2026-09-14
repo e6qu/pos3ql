@@ -2098,6 +2098,252 @@ impl GistOperatorClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GinOperatorClass {
+    Array = 1,
+    TsVector,
+    Jsonb,
+    JsonbPath,
+}
+
+impl GinOperatorClass {
+    pub const ALL: [Self; 4] = [Self::Array, Self::TsVector, Self::Jsonb, Self::JsonbPath];
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Array,
+            2 => Self::TsVector,
+            3 => Self::Jsonb,
+            4 => Self::JsonbPath,
+            _ => return None,
+        })
+    }
+
+    pub const fn for_type(ctype: ColType) -> Option<Self> {
+        Some(match ctype {
+            ColType::Array(_) => Self::Array,
+            ColType::TsVector => Self::TsVector,
+            ColType::Jsonb => Self::Jsonb,
+            _ => return None,
+        })
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "array_ops" => Self::Array,
+            "tsvector_ops" => Self::TsVector,
+            "jsonb_ops" => Self::Jsonb,
+            "jsonb_path_ops" => Self::JsonbPath,
+            _ => return None,
+        })
+    }
+
+    pub const fn accepts(self, ctype: ColType) -> bool {
+        match self {
+            Self::Array => matches!(ctype, ColType::Array(_)),
+            Self::TsVector => matches!(ctype, ColType::TsVector),
+            Self::Jsonb | Self::JsonbPath => matches!(ctype, ColType::Jsonb),
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Array => "array_ops",
+            Self::TsVector => "tsvector_ops",
+            Self::Jsonb => "jsonb_ops",
+            Self::JsonbPath => "jsonb_path_ops",
+        }
+    }
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Array => 10064,
+            Self::TsVector => 10073,
+            Self::Jsonb => 10090,
+            Self::JsonbPath => 10091,
+        }
+    }
+
+    pub const fn family_oid(self) -> i32 {
+        match self {
+            Self::Array => 2745,
+            Self::TsVector => 3659,
+            Self::Jsonb => 4036,
+            Self::JsonbPath => 4037,
+        }
+    }
+
+    pub const fn input_oid(self) -> i32 {
+        match self {
+            Self::Array => oid::ANYARRAY,
+            Self::TsVector => oid::TSVECTOR,
+            Self::Jsonb | Self::JsonbPath => oid::JSONB,
+        }
+    }
+
+    pub const fn storage_oid(self) -> i32 {
+        match self {
+            Self::Array => oid::ANYELEMENT,
+            Self::TsVector | Self::Jsonb => oid::TEXT,
+            Self::JsonbPath => oid::INT4,
+        }
+    }
+
+    pub const fn is_default(self) -> bool {
+        !matches!(self, Self::JsonbPath)
+    }
+
+    pub fn from_oid(oid: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.oid() == oid)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SpGistOperatorClass {
+    Inet = 1,
+    Range,
+    Box,
+    QuadPoint,
+    KdPoint,
+    Text,
+    Polygon,
+}
+
+impl SpGistOperatorClass {
+    pub const ALL: [Self; 7] = [
+        Self::Inet,
+        Self::Range,
+        Self::Box,
+        Self::QuadPoint,
+        Self::KdPoint,
+        Self::Text,
+        Self::Polygon,
+    ];
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            1 => Self::Inet,
+            2 => Self::Range,
+            3 => Self::Box,
+            4 => Self::QuadPoint,
+            5 => Self::KdPoint,
+            6 => Self::Text,
+            7 => Self::Polygon,
+            _ => return None,
+        })
+    }
+
+    pub const fn for_type(ctype: ColType) -> Option<Self> {
+        Some(match ctype {
+            ColType::Inet | ColType::Cidr => Self::Inet,
+            ColType::Range(_) => Self::Range,
+            ColType::Geometry(GeometryKind::Box) => Self::Box,
+            ColType::Geometry(GeometryKind::Point) => Self::QuadPoint,
+            ColType::Text | ColType::Varchar => Self::Text,
+            ColType::Geometry(GeometryKind::Polygon) => Self::Polygon,
+            _ => return None,
+        })
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "inet_ops" => Self::Inet,
+            "range_ops" => Self::Range,
+            "box_ops" => Self::Box,
+            "quad_point_ops" => Self::QuadPoint,
+            "kd_point_ops" => Self::KdPoint,
+            "text_ops" => Self::Text,
+            "poly_ops" => Self::Polygon,
+            _ => return None,
+        })
+    }
+
+    pub const fn accepts(self, ctype: ColType) -> bool {
+        match self {
+            Self::Inet => matches!(ctype, ColType::Inet | ColType::Cidr),
+            Self::Range => matches!(ctype, ColType::Range(_)),
+            Self::Box => matches!(ctype, ColType::Geometry(GeometryKind::Box)),
+            Self::QuadPoint | Self::KdPoint => {
+                matches!(ctype, ColType::Geometry(GeometryKind::Point))
+            }
+            Self::Text => matches!(ctype, ColType::Text | ColType::Varchar),
+            Self::Polygon => matches!(ctype, ColType::Geometry(GeometryKind::Polygon)),
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Inet => "inet_ops",
+            Self::Range => "range_ops",
+            Self::Box => "box_ops",
+            Self::QuadPoint => "quad_point_ops",
+            Self::KdPoint => "kd_point_ops",
+            Self::Text => "text_ops",
+            Self::Polygon => "poly_ops",
+        }
+    }
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Inet => 10018,
+            Self::Range => 10079,
+            Self::Box => 10083,
+            Self::QuadPoint => 10084,
+            Self::KdPoint => 10085,
+            Self::Text => 10086,
+            Self::Polygon => 10087,
+        }
+    }
+
+    pub const fn family_oid(self) -> i32 {
+        match self {
+            Self::Inet => 3794,
+            Self::Range => 3474,
+            Self::Box => 5000,
+            Self::QuadPoint => 4015,
+            Self::KdPoint => 4016,
+            Self::Text => 4017,
+            Self::Polygon => 5008,
+        }
+    }
+
+    pub const fn input_oid(self) -> i32 {
+        match self {
+            Self::Inet => oid::INET,
+            Self::Range => oid::ANYRANGE,
+            Self::Box => oid::BOX,
+            Self::QuadPoint | Self::KdPoint => oid::POINT,
+            Self::Text => oid::TEXT,
+            Self::Polygon => oid::POLYGON,
+        }
+    }
+
+    pub const fn storage_oid(self) -> i32 {
+        match self {
+            Self::Polygon => oid::BOX,
+            _ => 0,
+        }
+    }
+
+    pub const fn is_default(self) -> bool {
+        !matches!(self, Self::KdPoint)
+    }
+
+    pub fn from_oid(oid: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.oid() == oid)
+    }
+}
+
 /// Base storage codes for the parameterized type families. They must stay far
 /// enough apart that no two families can produce the same code: `Multirange`
 /// once began at 28 and `Array` at 32, which made `bool[]` and `int4[]`

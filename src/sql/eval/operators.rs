@@ -2565,6 +2565,24 @@ pub(crate) fn binary<'a>(
             };
             compare(operator, l, r, false, false)
         }
+        PatternLt | PatternLtEq | PatternGt | PatternGtEq => {
+            let comparison = match operator {
+                PatternLt => Lt,
+                PatternLtEq => LtEq,
+                PatternGt => Gt,
+                PatternGtEq => GtEq,
+                _ => unreachable!(),
+            };
+            compare(comparison, l, r, l_unknown, r_unknown)
+        }
+        StartsWith => {
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let left = cast_to_text(l, arena)?;
+            let right = cast_to_text(r, arena)?;
+            Ok(Datum::Bool(left.starts_with(right)))
+        }
         Eq | NotEq | Lt | LtEq | Gt | GtEq => match (l, r) {
             (Datum::Range { .. }, _) | (_, Datum::Range { .. }) => compare_ranges(operator, l, r),
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => compare_bits(operator, l, r),

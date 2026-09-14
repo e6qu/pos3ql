@@ -714,8 +714,13 @@ fn scan_node<'a>(
         .map(|ordered| (ordered.access(), ordered.index_name()))
         .or_else(|| index_plan.map(|plan| (plan, plan.index_name())));
     let resident_index = index_identity.is_some_and(|(plan, _)| {
-        plan.method() != crate::sql::ast::IndexAccessMethod::Brin
-            && plan.is_exact()
+        !matches!(
+            plan.method(),
+            crate::sql::ast::IndexAccessMethod::Brin
+                | crate::sql::ast::IndexAccessMethod::Gist
+                | crate::sql::ast::IndexAccessMethod::Gin
+                | crate::sql::ast::IndexAccessMethod::SpGist
+        ) && plan.is_exact()
             && storage.value_binding_cache_complete(slot, plan.binding())
     });
     let selective_brin = index_identity.is_some_and(|(plan, _)| {
@@ -726,11 +731,21 @@ fn scan_node<'a>(
         plan.method() == crate::sql::ast::IndexAccessMethod::Gist
             && index_rows.saturating_mul(4) <= rows
     });
+    let selective_gin = index_identity.is_some_and(|(plan, _)| {
+        plan.method() == crate::sql::ast::IndexAccessMethod::Gin
+            && index_rows.saturating_mul(4) <= rows
+    });
+    let selective_spgist = index_identity.is_some_and(|(plan, _)| {
+        plan.method() == crate::sql::ast::IndexAccessMethod::SpGist
+            && index_rows.saturating_mul(4) <= rows
+    });
     let use_index = ordered.is_some()
         || index_identity.is_some()
             && (resident_index
                 || selective_brin
                 || selective_gist
+                || selective_gin
+                || selective_spgist
                 || (generations != 0
                     && !storage.sequential_spill_scan_is_cheaper(slot, index_rows, txid)));
     let blocks = if use_index {
@@ -759,7 +774,10 @@ fn scan_node<'a>(
     let _ = write!(relation, "{}", scope.names[table]);
     let mut bitmap_index = StackStr::new();
     let name = if let Some((access, index)) = index_identity.filter(|_| use_index) {
-        if access.method() == crate::sql::ast::IndexAccessMethod::Brin {
+        if matches!(
+            access.method(),
+            crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gin
+        ) {
             bitmap_index = index;
             StackStr::from_str("Bitmap Heap Scan")
         } else {
@@ -1164,7 +1182,10 @@ fn physical_scan_node(
     let name = index.map_or_else(
         || StackStr::from_str("Seq Scan"),
         |(index_name, _, method)| {
-            if method == crate::sql::ast::IndexAccessMethod::Brin {
+            if matches!(
+                method,
+                crate::sql::ast::IndexAccessMethod::Brin | crate::sql::ast::IndexAccessMethod::Gin
+            ) {
                 bitmap_index = StackStr::from_str(index_name);
                 return StackStr::from_str("Bitmap Heap Scan");
             }
@@ -1508,15 +1529,23 @@ pub(super) fn plan_modification(
                     plan.method(),
                     crate::sql::ast::IndexAccessMethod::Brin
                         | crate::sql::ast::IndexAccessMethod::Gist
+                        | crate::sql::ast::IndexAccessMethod::Gin
+                        | crate::sql::ast::IndexAccessMethod::SpGist
                 ) && plan.is_exact()
                     && storage.value_binding_cache_complete(slot, plan.binding());
                 let selective_brin = plan.method() == crate::sql::ast::IndexAccessMethod::Brin
                     && expected_rows.saturating_mul(8) <= storage.planning_row_estimate(slot);
                 let selective_gist = plan.method() == crate::sql::ast::IndexAccessMethod::Gist
                     && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
+                let selective_gin = plan.method() == crate::sql::ast::IndexAccessMethod::Gin
+                    && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
+                let selective_spgist = plan.method() == crate::sql::ast::IndexAccessMethod::SpGist
+                    && expected_rows.saturating_mul(4) <= storage.planning_row_estimate(slot);
                 resident_exact
                     || selective_brin
                     || selective_gist
+                    || selective_gin
+                    || selective_spgist
                     || (storage.spill_generation_count(slot) != 0
                         && !storage.sequential_spill_scan_is_cheaper(slot, expected_rows, txid))
             });

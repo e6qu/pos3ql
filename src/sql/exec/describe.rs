@@ -3004,6 +3004,19 @@ pub fn infer_type_res(
                     }
                     of(ColType::Bool)
                 }
+                PatternLt | PatternLtEq | PatternGt | PatternGtEq | StartsWith => {
+                    let text_like = |oid| matches!(oid, oid::UNKNOWN | oid::TEXT | oid::VARCHAR);
+                    if !text_like(lo) || !text_like(ro) {
+                        let left = coltype_of_oid(lo).unwrap_or(ColType::Text);
+                        let right = coltype_of_oid(ro).unwrap_or(ColType::Text);
+                        return Err(operator_undefined(
+                            left,
+                            operator.operator_name().unwrap(),
+                            right,
+                        ));
+                    }
+                    of(ColType::Bool)
+                }
                 And | Or | Like | ILike => of(ColType::Bool),
                 TextSearchMatch => of(ColType::Bool),
                 TextSearchPhrase => of(ColType::TsQuery),

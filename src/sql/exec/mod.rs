@@ -37160,6 +37160,18 @@ pub fn comment(
                         "comments on gist operator families are not supported"
                     ));
                 }
+                crate::sql::ast::IndexAccessMethod::Gin => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on gin operator families are not supported"
+                    ));
+                }
+                crate::sql::ast::IndexAccessMethod::SpGist => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on spgist operator families are not supported"
+                    ));
+                }
             }
             let Some(slot) =
                 storage.operator_family_slot_on_path(family_name.schema, family_name.name, txid)
@@ -37205,6 +37217,18 @@ pub fn comment(
                     return sql_fail(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
                         "comments on gist operator classes are not supported"
+                    ));
+                }
+                crate::sql::ast::IndexAccessMethod::Gin => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on gin operator classes are not supported"
+                    ));
+                }
+                crate::sql::ast::IndexAccessMethod::SpGist => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "comments on spgist operator classes are not supported"
                     ));
                 }
             }
@@ -46639,23 +46663,66 @@ fn validate_index_storage_options(
             .pages_per_range
             .map(|_| "pages_per_range")
             .or_else(|| options.autosummarize.map(|_| "autosummarize"))
-            .or_else(|| options.buffering.map(|_| "buffering")),
+            .or_else(|| options.buffering.map(|_| "buffering"))
+            .or_else(|| options.fastupdate.map(|_| "fastupdate"))
+            .or_else(|| {
+                options
+                    .gin_pending_list_limit
+                    .map(|_| "gin_pending_list_limit")
+            }),
         crate::sql::ast::IndexAccessMethod::Hash => options
             .deduplicate_items
             .map(|_| "deduplicate_items")
             .or_else(|| options.pages_per_range.map(|_| "pages_per_range"))
             .or_else(|| options.autosummarize.map(|_| "autosummarize"))
-            .or_else(|| options.buffering.map(|_| "buffering")),
+            .or_else(|| options.buffering.map(|_| "buffering"))
+            .or_else(|| options.fastupdate.map(|_| "fastupdate"))
+            .or_else(|| {
+                options
+                    .gin_pending_list_limit
+                    .map(|_| "gin_pending_list_limit")
+            }),
         crate::sql::ast::IndexAccessMethod::Brin => options
             .fillfactor
             .map(|_| "fillfactor")
             .or_else(|| options.deduplicate_items.map(|_| "deduplicate_items"))
-            .or_else(|| options.buffering.map(|_| "buffering")),
+            .or_else(|| options.buffering.map(|_| "buffering"))
+            .or_else(|| options.fastupdate.map(|_| "fastupdate"))
+            .or_else(|| {
+                options
+                    .gin_pending_list_limit
+                    .map(|_| "gin_pending_list_limit")
+            }),
         crate::sql::ast::IndexAccessMethod::Gist => options
             .deduplicate_items
             .map(|_| "deduplicate_items")
             .or_else(|| options.pages_per_range.map(|_| "pages_per_range"))
-            .or_else(|| options.autosummarize.map(|_| "autosummarize")),
+            .or_else(|| options.autosummarize.map(|_| "autosummarize"))
+            .or_else(|| options.fastupdate.map(|_| "fastupdate"))
+            .or_else(|| {
+                options
+                    .gin_pending_list_limit
+                    .map(|_| "gin_pending_list_limit")
+            }),
+        crate::sql::ast::IndexAccessMethod::Gin => options
+            .fillfactor
+            .map(|_| "fillfactor")
+            .or_else(|| options.deduplicate_items.map(|_| "deduplicate_items"))
+            .or_else(|| options.pages_per_range.map(|_| "pages_per_range"))
+            .or_else(|| options.autosummarize.map(|_| "autosummarize"))
+            .or_else(|| options.buffering.map(|_| "buffering")),
+        crate::sql::ast::IndexAccessMethod::SpGist => options
+            .deduplicate_items
+            .map(|_| "deduplicate_items")
+            .or_else(|| options.pages_per_range.map(|_| "pages_per_range"))
+            .or_else(|| options.autosummarize.map(|_| "autosummarize"))
+            .or_else(|| options.buffering.map(|_| "buffering"))
+            .or_else(|| options.fastupdate.map(|_| "fastupdate"))
+            .or_else(|| {
+                options
+                    .gin_pending_list_limit
+                    .map(|_| "gin_pending_list_limit")
+            }),
     };
     match unsupported {
         Some(name) => Err(sql_err!(
@@ -46843,6 +46910,66 @@ pub fn create_index(
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "access method \"gist\" does not support NULLS FIRST/LAST options"
+            ));
+        }
+    }
+    if command.method == crate::sql::ast::IndexAccessMethod::Gin {
+        if command.unique {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"gin\" does not support unique indexes"
+            ));
+        }
+        if command
+            .columns
+            .iter()
+            .any(|column| column.ordering_specified)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"gin\" does not support ASC/DESC options"
+            ));
+        }
+        if command
+            .columns
+            .iter()
+            .any(|column| column.nulls_order_specified)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"gin\" does not support NULLS FIRST/LAST options"
+            ));
+        }
+        if !command.include_columns.is_empty() {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"gin\" does not support included columns"
+            ));
+        }
+    }
+    if command.method == crate::sql::ast::IndexAccessMethod::SpGist {
+        if command.unique {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"spgist\" does not support unique indexes"
+            ));
+        }
+        if command.columns.len() != 1 {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"spgist\" does not support multicolumn indexes"
+            ));
+        }
+        if command.columns[0].ordering_specified {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"spgist\" does not support ASC/DESC options"
+            ));
+        }
+        if command.columns[0].nulls_order_specified {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "access method \"spgist\" does not support NULLS FIRST/LAST options"
             ));
         }
     }
@@ -47081,6 +47208,85 @@ pub fn create_index(
                 }
                 operator_class_options[i].siglen = supplied.siglen;
                 let class = crate::storage::IndexOperatorClass::Gist(parsed);
+                operator_classes[i] = Some(class);
+                resolved_operator_classes[i] = Some(class);
+                continue;
+            }
+            if command.method == crate::sql::ast::IndexAccessMethod::Gin {
+                if operator_class
+                    .schema
+                    .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"gin\"",
+                        operator_class.name
+                    ));
+                }
+                if !index_column.operator_class_options.is_empty() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "operator class {} has no options",
+                        operator_class.name
+                    ));
+                }
+                let Some(parsed) = crate::sql::types::GinOperatorClass::parse(operator_class.name)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"gin\"",
+                        operator_class.name
+                    ));
+                };
+                if !parsed.accepts(input.ctype) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "operator class \"{}\" does not accept data type {}",
+                        operator_class.name,
+                        input.ctype.name()
+                    ));
+                }
+                let class = crate::storage::IndexOperatorClass::Gin(parsed);
+                operator_classes[i] = Some(class);
+                resolved_operator_classes[i] = Some(class);
+                continue;
+            }
+            if command.method == crate::sql::ast::IndexAccessMethod::SpGist {
+                if operator_class
+                    .schema
+                    .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"spgist\"",
+                        operator_class.name
+                    ));
+                }
+                if !index_column.operator_class_options.is_empty() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "operator class {} has no options",
+                        operator_class.name
+                    ));
+                }
+                let Some(parsed) =
+                    crate::sql::types::SpGistOperatorClass::parse(operator_class.name)
+                else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "operator class \"{}\" does not exist for access method \"spgist\"",
+                        operator_class.name
+                    ));
+                };
+                if !parsed.accepts(input.ctype) {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "operator class \"{}\" does not accept data type {}",
+                        operator_class.name,
+                        input.ctype.name()
+                    ));
+                }
+                let class = crate::storage::IndexOperatorClass::SpGist(parsed);
                 operator_classes[i] = Some(class);
                 resolved_operator_classes[i] = Some(class);
                 continue;
@@ -47336,6 +47542,8 @@ pub fn create_index(
                 pages_per_range: command.options.pages_per_range,
                 autosummarize: command.options.autosummarize,
                 buffering: command.options.buffering,
+                fastupdate: command.options.fastupdate,
+                gin_pending_list_limit: command.options.gin_pending_list_limit,
             },
             kind: if tdef.partition.is_partitioned() {
                 crate::storage::IndexKind::Partitioned {
@@ -47858,6 +48066,12 @@ pub fn alter_index(
             if let Some(buffering) = options.buffering {
                 definition.options.buffering = Some(buffering);
             }
+            if let Some(fastupdate) = options.fastupdate {
+                definition.options.fastupdate = Some(fastupdate);
+            }
+            if let Some(limit) = options.gin_pending_list_limit {
+                definition.options.gin_pending_list_limit = Some(limit);
+            }
             if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition) {
                 return sql_fail(error);
             }
@@ -47868,23 +48082,56 @@ pub fn alter_index(
                     .pages_per_range
                     .then_some("pages_per_range")
                     .or(options.autosummarize.then_some("autosummarize"))
-                    .or(options.buffering.then_some("buffering")),
+                    .or(options.buffering.then_some("buffering"))
+                    .or(options.fastupdate.then_some("fastupdate"))
+                    .or(options
+                        .gin_pending_list_limit
+                        .then_some("gin_pending_list_limit")),
                 crate::sql::ast::IndexAccessMethod::Hash => options
                     .deduplicate_items
                     .then_some("deduplicate_items")
                     .or(options.pages_per_range.then_some("pages_per_range"))
                     .or(options.autosummarize.then_some("autosummarize"))
-                    .or(options.buffering.then_some("buffering")),
+                    .or(options.buffering.then_some("buffering"))
+                    .or(options.fastupdate.then_some("fastupdate"))
+                    .or(options
+                        .gin_pending_list_limit
+                        .then_some("gin_pending_list_limit")),
                 crate::sql::ast::IndexAccessMethod::Brin => options
                     .fillfactor
                     .then_some("fillfactor")
                     .or(options.deduplicate_items.then_some("deduplicate_items"))
-                    .or(options.buffering.then_some("buffering")),
+                    .or(options.buffering.then_some("buffering"))
+                    .or(options.fastupdate.then_some("fastupdate"))
+                    .or(options
+                        .gin_pending_list_limit
+                        .then_some("gin_pending_list_limit")),
                 crate::sql::ast::IndexAccessMethod::Gist => options
                     .deduplicate_items
                     .then_some("deduplicate_items")
                     .or(options.pages_per_range.then_some("pages_per_range"))
-                    .or(options.autosummarize.then_some("autosummarize")),
+                    .or(options.autosummarize.then_some("autosummarize"))
+                    .or(options.fastupdate.then_some("fastupdate"))
+                    .or(options
+                        .gin_pending_list_limit
+                        .then_some("gin_pending_list_limit")),
+                crate::sql::ast::IndexAccessMethod::Gin => options
+                    .fillfactor
+                    .then_some("fillfactor")
+                    .or(options.deduplicate_items.then_some("deduplicate_items"))
+                    .or(options.pages_per_range.then_some("pages_per_range"))
+                    .or(options.autosummarize.then_some("autosummarize"))
+                    .or(options.buffering.then_some("buffering")),
+                crate::sql::ast::IndexAccessMethod::SpGist => options
+                    .deduplicate_items
+                    .then_some("deduplicate_items")
+                    .or(options.pages_per_range.then_some("pages_per_range"))
+                    .or(options.autosummarize.then_some("autosummarize"))
+                    .or(options.buffering.then_some("buffering"))
+                    .or(options.fastupdate.then_some("fastupdate"))
+                    .or(options
+                        .gin_pending_list_limit
+                        .then_some("gin_pending_list_limit")),
             };
             if let Some(name) = invalid {
                 return sql_fail(sql_err!(
@@ -47911,6 +48158,12 @@ pub fn alter_index(
             }
             if options.buffering {
                 definition.options.buffering = None;
+            }
+            if options.fastupdate {
+                definition.options.fastupdate = None;
+            }
+            if options.gin_pending_list_limit {
+                definition.options.gin_pending_list_limit = None;
             }
             if let Err(error) = stage_index_definition(storage, wal, txn, slot, definition) {
                 return sql_fail(error);

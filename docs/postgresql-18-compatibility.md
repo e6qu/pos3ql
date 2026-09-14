@@ -33,8 +33,7 @@ logical-replication boundary is specified separately in
 - PostgreSQL heap layout, page identifiers, `ctid` semantics, HOT, vacuum's
   physical implementation, physical XLOG, physical streaming replication,
   hot standby, and binary-WAL tooling are not targets.
-- GIN and SP-GiST index execution are not implemented. Modeled BRIN indexes
-  physically execute bitmap equality/range scans and every built-in range/network inclusion strategy over
+- Modeled BRIN indexes physically execute bitmap equality/range scans and every built-in range/network inclusion strategy over
   durable object-block indexes for plain, multicolumn, expression, partial,
   prepared, join, and DML paths. PostgreSQL 18's built-in BRIN operator
   classes, families, strategy operators, support procedures, and relation
@@ -74,6 +73,16 @@ logical-replication boundary is specified separately in
   checkpoints, and object-cold recovery share one typed boundary. PostgreSQL
   GiST tree pages, K-nearest-neighbor ordering, and native/custom operator
   classes are not implemented.
+- Modeled GIN indexes physically execute array containment/overlap,
+  `tsvector` search, JSONB containment/existence, and jsonpath predicates as
+  bitmap plans. Modeled SP-GiST indexes physically execute network, range,
+  box, point, polygon, locale-independent text-order, and prefix predicates.
+  PostgreSQL 18.6's four GIN and seven SP-GiST classes, 11 families, 90
+  strategy rows, 56 support rows, method-specific DDL/options, cloning,
+  partition children, reindexing, DML, WAL, checkpoints, and object-cold
+  recovery share one typed boundary. GIN posting-list extraction, SP-GiST
+  node navigation, PostgreSQL page layout, K-nearest-neighbor ordering, and
+  native/custom callbacks are not implemented.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

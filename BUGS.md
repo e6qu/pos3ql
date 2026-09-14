@@ -99,9 +99,21 @@ also exposed a quadratic Cartesian catalog test and default-class option
 deparsing that omitted the required operator-class name. A second planner
 audit found an overbroad class/operator gate and a missing GiST DML `EXPLAIN`
 cost path. The exact PostgreSQL 18 search-strategy matrix, physical-plan
-regressions, and differential corpus now cover both fixes. GIN, SP-GiST, GiST
+regressions, and differential corpus now cover both fixes. GiST
 K-nearest-neighbor ordering, PostgreSQL page layout, and native callbacks
 remain explicit architecture limits rather than deferred defects.
+
+The GIN/SP-GiST review found no externally blocked defect. PostgreSQL 18.6's
+four GIN and seven SP-GiST built-in classes now own physical query and DML
+plans, exact catalog identities, method-specific DDL and reloptions, WAL,
+checkpoints, cloning, partition children, reindexing, object-cold recovery,
+differential coverage, and warm/cold performance gates. The review also found
+and fixed constant array constructors missing from invariant-expression
+planning, GIN/SP-GiST omissions in `EXPLAIN` cost selection, incomplete GIN
+reloption deparsing, and missing text pattern-order and prefix operators.
+Specialized posting/tree navigation, K-nearest-neighbor ordering, PostgreSQL
+page layout, and native callbacks remain architecture limits rather than
+deferred defects.
 
 The ordered-index review found that prefix and range plans advertised physical
 index access but read every immutable value-index data block, and that

@@ -27,7 +27,9 @@ pub(super) const MAX_CONJUNCTS: usize = 128;
 pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> {
     use Expr::*;
     match expression {
-        Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | Param(_) => Some(0),
+        Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | BitLit(_) | Param(_) => {
+            Some(0)
+        }
         Column { qualifier, name } => match scope.find_column(*qualifier, name).ok()? {
             ResolvedColumn::Table(t, _) => Some(1 << t),
             // Merged USING/NATURAL column: reads every contributing table.
@@ -62,6 +64,23 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
                 m |= expr_tables(e, scope)?;
             }
             Some(m)
+        }
+        Array(elements) => {
+            let mut mask = 0;
+            for element in *elements {
+                mask |= expr_tables(element, scope)?;
+            }
+            Some(mask)
+        }
+        Subscript { base, index } => Some(expr_tables(base, scope)? | expr_tables(index, scope)?),
+        Slice { base, lower, upper } => Some(
+            expr_tables(base, scope)?
+                | lower.map_or(Some(0), |bound| expr_tables(bound, scope))?
+                | upper.map_or(Some(0), |bound| expr_tables(bound, scope))?,
+        ),
+        Field { base, .. } | RecordFieldIndex { base, .. } => expr_tables(base, scope),
+        AnyAll { operand, array, .. } => {
+            Some(expr_tables(operand, scope)? | expr_tables(array, scope)?)
         }
         Call {
             args, over: None, ..

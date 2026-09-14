@@ -47429,6 +47429,276 @@ fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
 }
 
 #[test]
+fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
+    let mut config = test_config("physical-gin-spgist-indexes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 8 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.table_rows = 8192;
+    config.txn_rows = 8192;
+    config.value_index_rows = 32768;
+    config.object_store_bucket = format!("physical-gin-spgist-indexes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE search_rows (
+             id integer, tags integer[], document tsvector, payload jsonb,
+             network inet, span int4range, label text, location point,
+             covered text
+         );
+         CREATE INDEX search_rows_tags ON search_rows USING gin (tags)
+             WITH (fastupdate=off, gin_pending_list_limit=128);
+         CREATE INDEX search_rows_document ON search_rows USING gin (document);
+         CREATE INDEX search_rows_payload ON search_rows USING gin (payload jsonb_path_ops);
+         CREATE INDEX search_rows_network ON search_rows USING spgist (network)
+             INCLUDE (covered) WITH (fillfactor=75);
+         CREATE INDEX search_rows_span ON search_rows USING spgist (span);
+         CREATE INDEX search_rows_label ON search_rows USING spgist (label);
+         CREATE INDEX search_rows_location ON search_rows USING spgist (location kd_point_ops);
+         INSERT INTO search_rows VALUES
+             (1, ARRAY[1,2], to_tsvector('english', 'quick brown fox'),
+              '{\"kind\":\"book\",\"rank\":1}'::jsonb, '10.0.0.0/8'::inet,
+              '[1,5)'::int4range, 'alpha', '(1,1)'::point, 'one'),
+             (2, ARRAY[2,3], to_tsvector('english', 'slow green turtle'),
+              '{\"kind\":\"film\",\"rank\":2}'::jsonb, '10.1.0.0/16'::inet,
+              '[8,14)'::int4range, 'beta', '(2,2)'::point, 'two'),
+             (3, ARRAY[8,9], to_tsvector('english', 'quick database'),
+              '{\"kind\":\"book\",\"rank\":3}'::jsonb, '192.0.2.1'::inet,
+              '[20,30)'::int4range, 'omega', '(20,20)'::point, 'three');
+         ANALYZE search_rows",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for start in (1..=3000).step_by(500) {
+        let filler = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO search_rows
+                   SELECT value + 10, ARRAY[10000 + value], NULL::tsvector,
+                          jsonb_build_object('filler', value), '198.51.100.1'::inet,
+                          int4range(10000 + value * 2, 10001 + value * 2),
+                          'filler-' || value::text, point(10000 + value, 10000 + value),
+                          repeat('x', 64)
+                     FROM generate_series({start}, {}) AS source(value)",
+                start + 499
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&filler).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&filler)
+        );
+    }
+    let analyzed = run_with(&mut engine, &mut budget, "ANALYZE search_rows");
+    assert!(!String::from_utf8_lossy(&analyzed).contains("ERROR"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+
+    let output = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_opclass WHERE opcmethod = 2742;
+         SELECT count(*) FROM pg_opclass WHERE opcmethod = 4000;
+         SELECT count(*) FROM pg_opfamily WHERE opfmethod = 2742;
+         SELECT count(*) FROM pg_opfamily WHERE opfmethod = 4000;
+         SELECT count(*) FROM pg_amop WHERE amopmethod = 2742;
+         SELECT count(*) FROM pg_amop WHERE amopmethod = 4000;
+         SELECT count(*) FROM pg_amproc WHERE amprocfamily IN (2745,3659,4036,4037);
+         SELECT count(*) FROM pg_amproc
+          WHERE amprocfamily IN (3474,3794,4015,4016,4017,5000,5008);
+         SELECT indexdef FROM pg_indexes
+          WHERE indexname IN ('search_rows_tags', 'search_rows_network')
+          ORDER BY indexname;
+         EXPLAIN SELECT id FROM search_rows WHERE tags @> ARRAY[1];
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM search_rows WHERE tags @> ARRAY[1];
+         EXPLAIN SELECT id FROM search_rows WHERE document @@ 'quick'::tsquery;
+         SELECT string_agg(id::text, ',' ORDER BY id)
+           FROM search_rows WHERE document @@ 'quick'::tsquery;
+         EXPLAIN SELECT id FROM search_rows WHERE payload @> '{\"kind\":\"book\"}'::jsonb;
+         SELECT string_agg(id::text, ',' ORDER BY id)
+           FROM search_rows WHERE payload @> '{\"kind\":\"book\"}'::jsonb;
+         EXPLAIN SELECT id FROM search_rows WHERE network <<= '10.0.0.0/8'::inet;
+         SELECT string_agg(id::text, ',' ORDER BY id)
+           FROM search_rows WHERE network <<= '10.0.0.0/8'::inet;
+         EXPLAIN SELECT id FROM search_rows WHERE span && '[4,10)'::int4range;
+         SELECT string_agg(id::text, ',' ORDER BY id)
+           FROM search_rows WHERE span && '[4,10)'::int4range;
+         EXPLAIN SELECT id FROM search_rows WHERE label = 'beta';
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM search_rows WHERE label = 'beta';
+         EXPLAIN SELECT id FROM search_rows WHERE label ^@ 'be';
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM search_rows WHERE label ^@ 'be';
+         EXPLAIN SELECT id FROM search_rows
+           WHERE label ~>=~ 'beta' AND label ~<~ 'omega';
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM search_rows
+           WHERE label ~>=~ 'beta' AND label ~<~ 'omega';
+         EXPLAIN DELETE FROM search_rows WHERE location ~= '(20,20)'::point;
+         DELETE FROM search_rows WHERE location ~= '(20,20)'::point RETURNING id;
+         EXPLAIN UPDATE search_rows SET covered = 'matched' WHERE tags && ARRAY[3];
+         UPDATE search_rows SET covered = 'matched' WHERE tags && ARRAY[3] RETURNING id",
+    ));
+    for expected in [
+        "4", "7", "4", "7", "15", "75", "20", "36", "1", "1,3", "1,3", "1,2", "1,2", "2", "3", "2",
+    ] {
+        assert!(
+            output.iter().any(|row| row == expected),
+            "{expected}: {output:?}"
+        );
+    }
+    for index in [
+        "search_rows_tags",
+        "search_rows_document",
+        "search_rows_payload",
+    ] {
+        assert!(
+            output
+                .iter()
+                .any(|row| row.contains(&format!("Bitmap Index Scan using {index}"))),
+            "{index}: {output:?}"
+        );
+    }
+    for index in [
+        "search_rows_network",
+        "search_rows_span",
+        "search_rows_location",
+    ] {
+        assert!(
+            output
+                .iter()
+                .any(|row| row.contains(&format!("Index Scan using {index}"))),
+            "{index}: {output:?}"
+        );
+    }
+    assert_eq!(
+        output
+            .iter()
+            .filter(|row| row.contains("Index Scan using search_rows_label"))
+            .count(),
+        3,
+        "equality, prefix, and pattern-range predicates must each use SP-GiST: {output:?}"
+    );
+    assert!(
+        output.iter().any(|row| row
+            .contains("USING gin (tags) WITH (fastupdate=off, gin_pending_list_limit='128')")),
+        "{output:?}"
+    );
+    assert!(
+        output
+            .iter()
+            .any(|row| row
+                .contains("USING spgist (network) INCLUDE (covered) WITH (fillfactor='75')")),
+        "{output:?}"
+    );
+
+    for (statement, message) in [
+        (
+            "CREATE UNIQUE INDEX bad_gin_unique ON search_rows USING gin (tags)",
+            "does not support unique indexes",
+        ),
+        (
+            "CREATE INDEX bad_gin_include ON search_rows USING gin (tags) INCLUDE (covered)",
+            "does not support included columns",
+        ),
+        (
+            "CREATE INDEX bad_gin_order ON search_rows USING gin (tags DESC)",
+            "does not support ASC/DESC options",
+        ),
+        (
+            "CREATE INDEX bad_gin_class ON search_rows USING gin (tags jsonb_ops)",
+            "does not accept data type array",
+        ),
+        (
+            "CREATE UNIQUE INDEX bad_spgist_unique ON search_rows USING spgist (network)",
+            "does not support unique indexes",
+        ),
+        (
+            "CREATE INDEX bad_spgist_multi ON search_rows USING spgist (network, label)",
+            "does not support multicolumn indexes",
+        ),
+        (
+            "CREATE INDEX bad_spgist_order ON search_rows USING spgist (network NULLS FIRST)",
+            "does not support NULLS FIRST/LAST options",
+        ),
+        (
+            "CREATE INDEX bad_spgist_option ON search_rows USING spgist (network) WITH (fastupdate=on)",
+            "unrecognized parameter \"fastupdate\"",
+        ),
+    ] {
+        let error =
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, statement)).to_string();
+        assert!(error.contains(message), "{message}: {error}");
+    }
+
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER INDEX search_rows_tags SET (fastupdate=on, gin_pending_list_limit=256);
+         ALTER INDEX search_rows_tags RESET (fastupdate);
+         ALTER INDEX search_rows_network SET (fillfactor=70)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&altered).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = data_rows(&run_with(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT indexdef FROM pg_indexes
+          WHERE indexname IN ('search_rows_tags', 'search_rows_network') ORDER BY indexname;
+         EXPLAIN SELECT id FROM search_rows WHERE tags @> ARRAY[1];
+         SELECT string_agg(id::text, ',' ORDER BY id) FROM search_rows WHERE tags @> ARRAY[1];
+         EXPLAIN SELECT id FROM search_rows WHERE span && '[4,10)'::int4range;
+         SELECT string_agg(id::text, ',' ORDER BY id)
+           FROM search_rows WHERE span && '[4,10)'::int4range",
+    ));
+    assert!(
+        cold.iter().any(|row| {
+            row.contains("gin_pending_list_limit='256'") && !row.contains("fastupdate")
+        }),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter().any(|row| row.contains("fillfactor='70'")),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Bitmap Index Scan using search_rows_tags")),
+        "{cold:?}"
+    );
+    assert!(
+        cold.iter()
+            .any(|row| row.contains("Index Scan using search_rows_span")),
+        "{cold:?}"
+    );
+    assert!(cold.iter().any(|row| row == "1"), "{cold:?}");
+    assert!(cold.iter().any(|row| row == "1,2"), "{cold:?}");
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn like_including_indexes_uses_the_configured_catalog_capacity() {
     let mut config = test_config("like-many-indexes");
     config.max_tables = 32;

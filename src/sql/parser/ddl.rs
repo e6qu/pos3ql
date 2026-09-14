@@ -5320,6 +5320,10 @@ impl<'a> Parser<'a> {
                 IndexAccessMethod::Brin
             } else if method.eq_ignore_ascii_case("gist") {
                 IndexAccessMethod::Gist
+            } else if method.eq_ignore_ascii_case("gin") {
+                IndexAccessMethod::Gin
+            } else if method.eq_ignore_ascii_case("spgist") {
+                IndexAccessMethod::SpGist
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -5717,6 +5721,42 @@ impl<'a> Parser<'a> {
                     });
                 });
                 self.advance()?;
+            } else if option.eq_ignore_ascii_case("fastupdate") {
+                if options.fastupdate.is_some() {
+                    return Err(self.err_here("parameter \"fastupdate\" specified more than once"));
+                }
+                options.fastupdate = Some(self.index_storage_boolean()?);
+            } else if option.eq_ignore_ascii_case("gin_pending_list_limit") {
+                if options.gin_pending_list_limit.is_some() {
+                    return Err(self.err_here(
+                        "parameter \"gin_pending_list_limit\" specified more than once",
+                    ));
+                }
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.unexpected("gin_pending_list_limit must be an integer"));
+                };
+                let value = raw.parse::<u32>().map_err(|_| ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        96,
+                        "invalid value for integer option \"gin_pending_list_limit\": {}",
+                        raw
+                    ),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                })?;
+                self.advance()?;
+                if !(64..=i32::MAX as u32).contains(&value) {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "value {} out of bounds for option \"gin_pending_list_limit\"",
+                            value
+                        ),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                }
+                options.gin_pending_list_limit = Some(value);
             } else {
                 return Err(ParseError {
                     at: self.peek_at,
@@ -5769,6 +5809,10 @@ impl<'a> Parser<'a> {
                 &mut names.autosummarize
             } else if option.eq_ignore_ascii_case("buffering") {
                 &mut names.buffering
+            } else if option.eq_ignore_ascii_case("fastupdate") {
+                &mut names.fastupdate
+            } else if option.eq_ignore_ascii_case("gin_pending_list_limit") {
+                &mut names.gin_pending_list_limit
             } else {
                 return Err(ParseError {
                     at: self.peek_at,

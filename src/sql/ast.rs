@@ -1806,6 +1806,8 @@ pub struct IndexStorageOptions {
     pub pages_per_range: Option<u32>,
     pub autosummarize: Option<bool>,
     pub buffering: Option<GistBuffering>,
+    pub fastupdate: Option<bool>,
+    pub gin_pending_list_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1849,6 +1851,8 @@ impl IndexStorageOptions {
         pages_per_range: None,
         autosummarize: None,
         buffering: None,
+        fastupdate: None,
+        gin_pending_list_limit: None,
     };
 }
 
@@ -1860,6 +1864,8 @@ pub struct IndexStorageOptionNames {
     pub pages_per_range: bool,
     pub autosummarize: bool,
     pub buffering: bool,
+    pub fastupdate: bool,
+    pub gin_pending_list_limit: bool,
 }
 
 impl IndexStorageOptionNames {
@@ -1869,6 +1875,8 @@ impl IndexStorageOptionNames {
         pages_per_range: false,
         autosummarize: false,
         buffering: false,
+        fastupdate: false,
+        gin_pending_list_limit: false,
     };
 }
 
@@ -2557,6 +2565,8 @@ pub enum IndexAccessMethod {
     Hash,
     Brin,
     Gist,
+    Gin,
+    SpGist,
 }
 
 impl IndexAccessMethod {
@@ -2566,6 +2576,8 @@ impl IndexAccessMethod {
             Self::Hash => 1,
             Self::Brin => 2,
             Self::Gist => 3,
+            Self::Gin => 4,
+            Self::SpGist => 5,
         }
     }
 
@@ -2575,6 +2587,8 @@ impl IndexAccessMethod {
             1 => Some(Self::Hash),
             2 => Some(Self::Brin),
             3 => Some(Self::Gist),
+            4 => Some(Self::Gin),
+            5 => Some(Self::SpGist),
             _ => None,
         }
     }
@@ -2585,6 +2599,8 @@ impl IndexAccessMethod {
             Self::Hash => "hash",
             Self::Brin => "brin",
             Self::Gist => "gist",
+            Self::Gin => "gin",
+            Self::SpGist => "spgist",
         }
     }
 }
@@ -6279,6 +6295,12 @@ pub enum BinaryOp {
     LtEq,
     Gt,
     GtEq,
+    /// Locale-independent text ordering operators used by pattern operator
+    /// classes (`~<~`, `~<=~`, `~>~`, and `~>=~`).
+    PatternLt,
+    PatternLtEq,
+    PatternGt,
+    PatternGtEq,
     And,
     Or,
     Concat,
@@ -6304,6 +6326,8 @@ pub enum BinaryOp {
     JsonExistsAll,
     /// `jsonb @? jsonpath` — does the path produce any item?
     JsonPathExists,
+    /// PostgreSQL's text prefix predicate (`^@`, implemented by starts_with).
+    StartsWith,
     /// Integer bitwise operators.
     BitAnd,
     BitOr,
@@ -6353,6 +6377,10 @@ impl BinaryOp {
             b"<=" => Self::LtEq,
             b">" => Self::Gt,
             b">=" => Self::GtEq,
+            b"~<~" => Self::PatternLt,
+            b"~<=~" => Self::PatternLtEq,
+            b"~>~" => Self::PatternGt,
+            b"~>=~" => Self::PatternGtEq,
             b"||" => Self::Concat,
             b"@@" | b"@@@" => Self::TextSearchMatch,
             b"<->" => Self::TextSearchPhrase,
@@ -6365,6 +6393,7 @@ impl BinaryOp {
             b"?|" => Self::JsonExistsAny,
             b"?&" => Self::JsonExistsAll,
             b"@?" => Self::JsonPathExists,
+            b"^@" => Self::StartsWith,
             b"&" => Self::BitAnd,
             b"|" => Self::BitOr,
             b"#" => Self::BitXor,
@@ -6403,6 +6432,10 @@ impl BinaryOp {
             Self::LtEq => "<=",
             Self::Gt => ">",
             Self::GtEq => ">=",
+            Self::PatternLt => "~<~",
+            Self::PatternLtEq => "~<=~",
+            Self::PatternGt => "~>~",
+            Self::PatternGtEq => "~>=~",
             Self::Concat => "||",
             Self::TextSearchMatch => "@@",
             Self::TextSearchPhrase => "<->",
@@ -6415,6 +6448,7 @@ impl BinaryOp {
             Self::JsonExistsAny => "?|",
             Self::JsonExistsAll => "?&",
             Self::JsonPathExists => "@?",
+            Self::StartsWith => "^@",
             Self::BitAnd => "&",
             Self::BitOr => "|",
             Self::BitXor => "#",
@@ -6446,7 +6480,16 @@ impl BinaryOp {
         match self {
             Self::Or => 1,
             Self::And => 2,
-            Self::Eq | Self::NotEq | Self::Lt | Self::LtEq | Self::Gt | Self::GtEq => 4,
+            Self::Eq
+            | Self::NotEq
+            | Self::Lt
+            | Self::LtEq
+            | Self::Gt
+            | Self::GtEq
+            | Self::PatternLt
+            | Self::PatternLtEq
+            | Self::PatternGt
+            | Self::PatternGtEq => 4,
             // Containment/overlap/adjacency operators bind like comparisons.
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
             Self::TextSearchMatch => 4,
@@ -6463,6 +6506,7 @@ impl BinaryOp {
             Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll | Self::JsonPathExists => {
                 4
             }
+            Self::StartsWith => 4,
             Self::Concat => 5,
             Self::TextSearchPhrase => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,

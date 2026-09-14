@@ -5580,6 +5580,26 @@ impl Checkpointer {
                                     CheckpointSetupError::Corrupt("bad gist index operator class"),
                                 )?,
                             ))
+                        } else if let Some(code) = encoded.strip_prefix('n') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad gin index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Gin(
+                                crate::sql::types::GinOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt("bad gin index operator class"),
+                                )?,
+                            ))
+                        } else if let Some(code) = encoded.strip_prefix('s') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad spgist index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::SpGist(
+                                crate::sql::types::SpGistOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad spgist index operator class",
+                                    ),
+                                )?,
+                            ))
                         } else {
                             return Err(CheckpointSetupError::Corrupt(
                                 "bad index operator class encoding",
@@ -5653,6 +5673,32 @@ impl Checkpointer {
                                 crate::sql::types::GistOperatorClass::from_code(code).ok_or(
                                     CheckpointSetupError::Corrupt(
                                         "bad gist resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else if let Some(code) = encoded.strip_prefix('n') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad gin resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Gin(
+                                crate::sql::types::GinOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad gin resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else if let Some(code) = encoded.strip_prefix('s') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad spgist resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::SpGist(
+                                crate::sql::types::SpGistOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad spgist resolved index operator class",
                                     ),
                                 )?,
                             ))
@@ -5853,6 +5899,42 @@ impl Checkpointer {
                             }
                         }
                     }
+                    let (fastupdate, gin_pending_list_limit) = if words
+                        .clone()
+                        .next()
+                        .is_some_and(|word| word.starts_with("gi"))
+                    {
+                        let encoded = words
+                            .next()
+                            .and_then(|word| word.strip_prefix("gi"))
+                            .ok_or(CheckpointSetupError::Corrupt("bad gin options"))?;
+                        let (fast, limit) = encoded
+                            .split_once(',')
+                            .ok_or(CheckpointSetupError::Corrupt("bad gin options"))?;
+                        let fastupdate = match fast {
+                            "0" => None,
+                            "1" => Some(false),
+                            "2" => Some(true),
+                            _ => return Err(CheckpointSetupError::Corrupt("bad gin fastupdate")),
+                        };
+                        let gin_pending_list_limit = match limit {
+                            "-" => None,
+                            value => {
+                                let value = value.parse::<u32>().map_err(|_| {
+                                    CheckpointSetupError::Corrupt("bad gin pending list limit")
+                                })?;
+                                if !(64..=i32::MAX as u32).contains(&value) {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "bad gin pending list limit",
+                                    ));
+                                }
+                                Some(value)
+                            }
+                        };
+                        (fastupdate, gin_pending_list_limit)
+                    } else {
+                        (None, None)
+                    };
                     let mut unsummarized_ranges =
                         [0u64; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES];
                     let mut unsummarized_count = 0usize;
@@ -5906,6 +5988,14 @@ impl Checkpointer {
                     }) {
                         crate::sql::ast::IndexAccessMethod::Gist
                     } else if resolved_operator_classes[..n_cols].iter().all(|class| {
+                        matches!(class, Some(crate::storage::IndexOperatorClass::Gin(_)))
+                    }) {
+                        crate::sql::ast::IndexAccessMethod::Gin
+                    } else if resolved_operator_classes[..n_cols].iter().all(|class| {
+                        matches!(class, Some(crate::storage::IndexOperatorClass::SpGist(_)))
+                    }) {
+                        crate::sql::ast::IndexAccessMethod::SpGist
+                    } else if resolved_operator_classes[..n_cols].iter().all(|class| {
                         matches!(
                             class,
                             Some(crate::storage::IndexOperatorClass::Btree(_))
@@ -5952,6 +6042,8 @@ impl Checkpointer {
                                         pages_per_range,
                                         autosummarize,
                                         buffering,
+                                        fastupdate,
+                                        gin_pending_list_limit,
                                     },
                                     statistics,
                                     parent: (parent != u16::MAX).then_some(parent),
@@ -9239,6 +9331,12 @@ impl Checkpointer {
                     Some(crate::storage::IndexOperatorClass::Gist(class)) => {
                         let _ = write!(operator_classes, " g{}", class.code());
                     }
+                    Some(crate::storage::IndexOperatorClass::Gin(class)) => {
+                        let _ = write!(operator_classes, " n{}", class.code());
+                    }
+                    Some(crate::storage::IndexOperatorClass::SpGist(class)) => {
+                        let _ = write!(operator_classes, " s{}", class.code());
+                    }
                     Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
                         let _ = write!(operator_classes, " c{}", oid.get());
                     }
@@ -9257,6 +9355,12 @@ impl Checkpointer {
                     }
                     crate::storage::IndexOperatorClass::Gist(class) => {
                         let _ = write!(resolved_operator_classes, " g{}", class.code());
+                    }
+                    crate::storage::IndexOperatorClass::Gin(class) => {
+                        let _ = write!(resolved_operator_classes, " n{}", class.code());
+                    }
+                    crate::storage::IndexOperatorClass::SpGist(class) => {
+                        let _ = write!(resolved_operator_classes, " s{}", class.code());
                     }
                     crate::storage::IndexOperatorClass::Catalog(oid) => {
                         let _ = write!(resolved_operator_classes, " c{}", oid.get());
@@ -9322,10 +9426,19 @@ impl Checkpointer {
                 Some(crate::sql::ast::GistBuffering::On) => 2,
                 Some(crate::sql::ast::GistBuffering::Off) => 3,
             };
+            let fastupdate = match mutable.options.fastupdate {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            };
+            let gin_pending_list_limit = mutable.options.gin_pending_list_limit.map_or_else(
+                || StackStr::<16>::from_str("-"),
+                |value| StackStr::<16>::from_str(stack_format!(16, "{value}").as_str()),
+            );
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{}{}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {} {} {} gb{} bo{} gi{},{}{}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -9358,6 +9471,8 @@ impl Checkpointer {
                     autosummarize,
                     buffering,
                     operator_class_options.as_str(),
+                    fastupdate,
+                    gin_pending_list_limit.as_str(),
                     maintenance_suffix.as_str(),
                 ),
             )?;

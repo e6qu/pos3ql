@@ -1563,7 +1563,7 @@ impl Checkpointer {
                         let slot = u16::try_from(membership).map_err(|_| {
                             CheckpointSetupError::Corrupt("invalid typed-table membership")
                         })?;
-                        if usize::from(slot) >= crate::storage::MAX_COMPOSITES {
+                        if usize::from(slot) >= storage.composite_count() {
                             return Err(CheckpointSetupError::Corrupt(
                                 "typed-table membership out of range",
                             ));

@@ -2767,6 +2767,7 @@ impl Engine {
     /// Bytes drawn beyond the row heap, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
+            + exec::record_shape_pool_bytes(config.max_composites)
             + 2 * config.table_rows * size_of::<exec::PhysicalRow>()
             + (1 + crate::storage::MAX_PENDING_ROW_VERSIONS
                 + crate::storage::MAX_COMMITTED_ROW_VERSIONS)
@@ -2811,6 +2812,11 @@ impl Engine {
     /// (when enabled), and replays the journal tail on top. Startup only.
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, EngineSetupError> {
         crate::sql::tzif::init_catalog();
+        budget.draw(
+            exec::record_shape_pool_bytes(config.max_composites),
+            "record_shapes",
+        )?;
+        exec::init_record_shapes(config.max_composites);
         let mut clean_shutdown_path = std::path::PathBuf::from(&config.data_dir);
         clean_shutdown_path.push("clean.shutdown");
         let clean_shutdown_lsn = std::fs::read(&clean_shutdown_path)

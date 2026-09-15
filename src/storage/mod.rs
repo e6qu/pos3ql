@@ -5388,11 +5388,18 @@ impl MatviewDef {
     }
 }
 
-/// How many domain types may exist at once, and how many CHECK constraints a
-/// single domain may carry. Bounded conservatively: a `DomainDef` inlines its
-/// CHECK predicate text, so the catalog's static footprint is
-/// `MAX_DOMAINS * MAX_DOMAIN_CHECKS * CHECK_SQL_MAX`.
-pub(crate) const MAX_DOMAINS: usize = 32;
+/// Domain slots fit between the synthesized domain and enum OID bands. The
+/// configured catalog may use any prefix of this representable range.
+pub(crate) const MAX_DOMAIN_CATALOG_SLOTS: usize =
+    (crate::sql::types::oid::FIRST_ENUM - crate::sql::types::oid::FIRST_DOMAIN) as usize;
+/// Physical table row types occupy the band before view row types.
+pub(crate) const MAX_TABLE_TYPE_OID_SLOTS: usize = (crate::sql::types::oid::FIRST_VIEW_COMPOSITE
+    - crate::sql::types::oid::FIRST_TABLE_COMPOSITE)
+    as usize;
+/// View row types occupy the band before synthesized domain arrays.
+pub(crate) const MAX_VIEW_TYPE_OID_SLOTS: usize = (crate::sql::types::oid::FIRST_DOMAIN_ARRAY
+    - crate::sql::types::oid::FIRST_VIEW_COMPOSITE)
+    as usize;
 
 /// Stored SQL routines share the table-sized catalog budget.  They are not
 /// executable closures: every durable definition is a bounded, replayable SQL
@@ -5683,13 +5690,17 @@ fn compatible_type_oid(left: i32, right: i32) -> Option<i32> {
 
 fn array_oid_for_element(element_oid: i32) -> Option<i32> {
     use crate::sql::types::{ArrElem, oid};
-    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAINS as i32).contains(&element_oid) {
+    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAIN_CATALOG_SLOTS as i32)
+        .contains(&element_oid)
+    {
         return Some(oid::FIRST_DOMAIN_ARRAY + element_oid - oid::FIRST_DOMAIN);
     }
-    if (oid::FIRST_ENUM..oid::FIRST_ENUM + MAX_ENUMS as i32).contains(&element_oid) {
+    if (oid::FIRST_ENUM..oid::FIRST_ENUM + MAX_ENUM_CATALOG_SLOTS as i32).contains(&element_oid) {
         return Some(oid::FIRST_ENUM_ARRAY + element_oid - oid::FIRST_ENUM);
     }
-    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + MAX_COMPOSITES as i32).contains(&element_oid) {
+    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + MAX_COMPOSITE_CATALOG_SLOTS as i32)
+        .contains(&element_oid)
+    {
         return Some(oid::FIRST_COMPOSITE_ARRAY + element_oid - oid::FIRST_COMPOSITE);
     }
     ArrElem::from_coltype(ColType::from_oid(element_oid)?).map(ArrElem::array_oid)
@@ -5729,7 +5740,7 @@ fn polymorphic_element_oid(kind: PolymorphicType, actual_oid: i32) -> Option<i32
                 .then_some(actual_oid)
         }
         PolymorphicType::Array | PolymorphicType::CompatibleArray => {
-            if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + MAX_DOMAINS as i32)
+            if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + MAX_DOMAIN_CATALOG_SLOTS as i32)
                 .contains(&actual_oid)
             {
                 Some(oid::FIRST_DOMAIN + actual_oid - oid::FIRST_DOMAIN_ARRAY)
@@ -7966,14 +7977,16 @@ pub struct DomainSpec {
     pub n_checks: usize,
 }
 
-/// How many enum types may exist at once, and how many labels a single enum
-/// may carry. Bounded conservatively: an `EnumDef` inlines its label array, so
-/// the catalog's static footprint is `MAX_ENUMS * MAX_ENUM_LABELS * size_of::<EnumMember>()`.
-pub(crate) const MAX_ENUMS: usize = 32;
+/// Enum scalar slots fit before table row types; their array OIDs have a
+/// wider band, so the scalar identity is the limiting representation.
+pub(crate) const MAX_ENUM_CATALOG_SLOTS: usize =
+    (crate::sql::types::oid::FIRST_TABLE_COMPOSITE - crate::sql::types::oid::FIRST_ENUM) as usize;
 pub(crate) const MAX_ENUM_LABELS: usize = 64;
-/// Named composite types and their attributes are fixed at startup along with
-/// every other catalog registry. A composite cannot be partially defined.
-pub(crate) const MAX_COMPOSITES: usize = 32;
+/// Composite slots fit between their synthesized scalar and array OID bands.
+pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = (crate::sql::types::oid::FIRST_COMPOSITE_ARRAY
+    - crate::sql::types::oid::FIRST_COMPOSITE)
+    as usize;
+/// A named composite cannot be partially defined.
 pub(crate) const MAX_COMPOSITE_FIELDS: usize = 16;
 
 /// One member of an enum type: a label plus its sort key. Ordering among enum
@@ -11062,6 +11075,7 @@ pub struct Storage {
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
     composites: FixedVec<CompositeDef>,
+    domain_graph_scratch: std::cell::RefCell<FixedVec<u8>>,
     indexes: FixedVec<IndexDef>,
     brin_maintenance: std::cell::RefCell<FixedVec<BrinMaintenanceState>>,
     databases: FixedVec<DatabaseDef>,
@@ -14118,9 +14132,10 @@ impl Storage {
             + config.max_default_acl_entries * size_of::<DefaultAclEntry>()
             + config.max_parameter_acl_entries * size_of::<ParameterAclEntry>()
             + config.max_sequences * size_of::<SequenceDef>()
-            + MAX_DOMAINS * size_of::<DomainDef>()
-            + MAX_ENUMS * size_of::<EnumDef>()
-            + MAX_COMPOSITES * size_of::<CompositeDef>()
+            + config.max_domains * size_of::<DomainDef>()
+            + config.max_enums * size_of::<EnumDef>()
+            + config.max_composites * size_of::<CompositeDef>()
+            + config.max_domains * size_of::<u8>()
             + MAX_ACCESS_METHODS * size_of::<AccessMethodDef>()
             + config.max_databases * size_of::<DatabaseDef>()
             + config.max_tablespaces * size_of::<TablespaceDef>()
@@ -14644,21 +14659,26 @@ impl Storage {
                 })
                 .expect("sized to max_sequences");
         }
-        let mut domains = FixedVec::new(budget, "domains", MAX_DOMAINS)?;
-        for _ in 0..MAX_DOMAINS {
+        let mut domains = FixedVec::new(budget, "domains", config.max_domains)?;
+        for _ in 0..config.max_domains {
             domains
                 .push(DomainDef::EMPTY)
-                .expect("sized to MAX_DOMAINS");
+                .expect("sized to max_domains");
         }
-        let mut enums = FixedVec::new(budget, "enums", MAX_ENUMS)?;
-        for _ in 0..MAX_ENUMS {
-            enums.push(EnumDef::EMPTY).expect("sized to MAX_ENUMS");
+        let mut enums = FixedVec::new(budget, "enums", config.max_enums)?;
+        for _ in 0..config.max_enums {
+            enums.push(EnumDef::EMPTY).expect("sized to max_enums");
         }
-        let mut composites = FixedVec::new(budget, "composites", MAX_COMPOSITES)?;
-        for _ in 0..MAX_COMPOSITES {
+        let mut composites = FixedVec::new(budget, "composites", config.max_composites)?;
+        for _ in 0..config.max_composites {
             composites
                 .push(CompositeDef::EMPTY)
-                .expect("sized to MAX_COMPOSITES");
+                .expect("sized to max_composites");
+        }
+        let mut domain_graph_scratch =
+            FixedVec::new(budget, "domain_graph_scratch", config.max_domains)?;
+        for _ in 0..config.max_domains {
+            domain_graph_scratch.push(0).expect("sized to max_domains");
         }
         let mut schemas = FixedVec::new(budget, "schemas", config.max_schemas)?;
         for i in 0..config.max_schemas {
@@ -15037,6 +15057,7 @@ impl Storage {
             domains,
             enums,
             composites,
+            domain_graph_scratch: std::cell::RefCell::new(domain_graph_scratch),
             indexes,
             brin_maintenance: std::cell::RefCell::new(brin_maintenance),
             databases,
@@ -15846,7 +15867,7 @@ impl Storage {
             + (0..self.enum_count())
                 .filter(|&slot| self.enum_for(slot, txid).visible_to(txid))
                 .count()
-            + (0..MAX_COMPOSITES)
+            + (0..self.composite_count())
                 .filter(|&slot| self.composite_for(slot, txid).visible_to(txid))
                 .count()
             + self.operators_visible_to(txid).count()
@@ -30725,81 +30746,111 @@ impl Storage {
     }
 
     fn rebind_domain_base_types_to(&mut self, txid: u32) -> Result<(), SqlError> {
-        fn bind(
-            storage: &mut Storage,
-            slot: usize,
-            txid: u32,
-            state: &mut [u8; MAX_DOMAINS],
-        ) -> Result<(), SqlError> {
-            match state[slot] {
-                2 => return Ok(()),
-                1 => {
-                    return Err(sql_err!(
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "recovered domain base chain contains a cycle"
-                    ));
-                }
-                _ => state[slot] = 1,
+        let current_database = self.current_database;
+        let domains = &mut self.domains;
+        let enums = &self.enums;
+        let composites = &self.composites;
+        let mut state = self.domain_graph_scratch.borrow_mut();
+        let mut remaining = 0usize;
+        for (slot, marker) in state.iter_mut().enumerate() {
+            let domain = domains[slot];
+            if domain.database == current_database && domain.visible_to(txid) {
+                *marker = 0;
+                remaining += 1;
+            } else {
+                *marker = 2;
             }
-            let domain = storage.domains[slot];
-            if let Some(parent) = domain.base_domain {
-                let parent_slot = storage
-                    .domain_slot(parent.schema.as_str(), parent.name.as_str(), txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "domain base \"{}.{}\" does not exist",
-                            parent.schema.as_str(),
-                            parent.name.as_str()
-                        )
-                    })?;
-                bind(storage, parent_slot, txid, state)?;
-                storage.domains[slot].base = storage.domains[parent_slot].base;
-            } else if let Some(identity) = domain.base_user_type {
-                storage.domains[slot].base = match domain.base {
-                    ColType::Enum(_) => ColType::Enum(
-                        storage
-                            .enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "domain base enum \"{}.{}\" does not exist",
-                                    identity.schema.as_str(),
-                                    identity.name.as_str()
-                                )
-                            })? as u16,
-                    ),
-                    ColType::Composite(_) => ColType::Composite(
-                        storage
-                            .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
-                            .ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::UNDEFINED_OBJECT,
-                                    "domain base composite \"{}.{}\" does not exist",
-                                    identity.schema.as_str(),
-                                    identity.name.as_str()
-                                )
-                            })? as u16,
-                    ),
-                    _ => {
-                        return Err(sql_err!(
-                            sqlstate::PROTOCOL_VIOLATION,
-                            "domain base identity names a non-user-defined type"
-                        ));
-                    }
-                };
-            }
-            state[slot] = 2;
-            Ok(())
         }
 
-        let mut state = [0u8; MAX_DOMAINS];
-        for slot in 0..self.domains.len() {
-            let domain = self.domains[slot];
-            if domain.database != self.current_database || !domain.visible_to(txid) {
-                continue;
+        while remaining != 0 {
+            let before = remaining;
+            for slot in 0..domains.len() {
+                if state[slot] != 0 {
+                    continue;
+                }
+                let domain = domains[slot].definition_for(txid);
+                let rebound = if let Some(parent) = domain.base_domain {
+                    let parent_slot = domains
+                        .iter()
+                        .position(|candidate| {
+                            let candidate = candidate.definition_for(txid);
+                            candidate.database == current_database
+                                && candidate.visible_to(txid)
+                                && candidate.schema == parent.schema
+                                && candidate.name == parent.name
+                        })
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "domain base \"{}.{}\" does not exist",
+                                parent.schema.as_str(),
+                                parent.name.as_str()
+                            )
+                        })?;
+                    if state[parent_slot] == 0 {
+                        continue;
+                    }
+                    domains[parent_slot].definition_for(txid).base
+                } else if let Some(identity) = domain.base_user_type {
+                    match domain.base {
+                        ColType::Enum(_) => ColType::Enum(
+                            enums
+                                .iter()
+                                .position(|candidate| {
+                                    let candidate = candidate.definition_for(txid);
+                                    candidate.database == current_database
+                                        && candidate.visible_to(txid)
+                                        && candidate.schema == identity.schema
+                                        && candidate.name == identity.name
+                                })
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "domain base enum \"{}.{}\" does not exist",
+                                        identity.schema.as_str(),
+                                        identity.name.as_str()
+                                    )
+                                })? as u16,
+                        ),
+                        ColType::Composite(_) => ColType::Composite(
+                            composites
+                                .iter()
+                                .position(|candidate| {
+                                    let candidate = candidate.definition_for(txid);
+                                    candidate.database == current_database
+                                        && candidate.visible_to(txid)
+                                        && candidate.schema == identity.schema
+                                        && candidate.name == identity.name
+                                })
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_OBJECT,
+                                        "domain base composite \"{}.{}\" does not exist",
+                                        identity.schema.as_str(),
+                                        identity.name.as_str()
+                                    )
+                                })? as u16,
+                        ),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::PROTOCOL_VIOLATION,
+                                "domain base identity names a non-user-defined type"
+                            ));
+                        }
+                    }
+                } else {
+                    domain.base
+                };
+                domains[slot].base = rebound;
+                state[slot] = 2;
+                remaining -= 1;
             }
-            bind(self, slot, txid, &mut state)?;
+            if remaining == before {
+                return Err(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "recovered domain base chain contains a cycle"
+                ));
+            }
         }
         Ok(())
     }
@@ -31873,6 +31924,10 @@ impl Storage {
                 definition.database == self.current_database
                     && definition.ddl_state == CatalogDdlState::Present
             })
+    }
+
+    pub(crate) fn composite_count(&self) -> usize {
+        self.composites.len()
     }
 
     pub(crate) fn composites_with_slots_visible_to(
@@ -34358,7 +34413,7 @@ impl Storage {
         use crate::sql::types::{ArrElem, ColType, oid};
 
         let identity = |schema: SqlName, name: SqlName| Some(UserTypeName { schema, name });
-        if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAINS as i32).contains(&type_oid) {
+        if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + self.domain_count() as i32).contains(&type_oid) {
             let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN).ok()?;
             let domain = self.domain_for(slot, txid);
             return (domain.database == self.current_database && domain.visible_to(txid))
@@ -34367,7 +34422,7 @@ impl Storage {
                     user_type: identity(domain.schema, domain.name),
                 });
         }
-        if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + MAX_DOMAINS as i32)
+        if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + self.domain_count() as i32)
             .contains(&type_oid)
         {
             let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN_ARRAY).ok()?;
@@ -34378,7 +34433,7 @@ impl Storage {
                     user_type: identity(domain.schema, domain.name),
                 });
         }
-        if (oid::FIRST_ENUM..oid::FIRST_ENUM + MAX_ENUMS as i32).contains(&type_oid) {
+        if (oid::FIRST_ENUM..oid::FIRST_ENUM + self.enum_count() as i32).contains(&type_oid) {
             let slot = usize::try_from(type_oid - oid::FIRST_ENUM).ok()?;
             let enumeration = self.enum_for(slot, txid);
             return (enumeration.database == self.current_database && enumeration.visible_to(txid))
@@ -34387,7 +34442,9 @@ impl Storage {
                     user_type: identity(enumeration.schema, enumeration.name),
                 });
         }
-        if (oid::FIRST_ENUM_ARRAY..oid::FIRST_ENUM_ARRAY + MAX_ENUMS as i32).contains(&type_oid) {
+        if (oid::FIRST_ENUM_ARRAY..oid::FIRST_ENUM_ARRAY + self.enum_count() as i32)
+            .contains(&type_oid)
+        {
             let slot = usize::try_from(type_oid - oid::FIRST_ENUM_ARRAY).ok()?;
             let enumeration = self.enum_for(slot, txid);
             return (enumeration.database == self.current_database && enumeration.visible_to(txid))
@@ -34396,7 +34453,8 @@ impl Storage {
                     user_type: identity(enumeration.schema, enumeration.name),
                 });
         }
-        if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + MAX_COMPOSITES as i32).contains(&type_oid)
+        if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + self.composite_count() as i32)
+            .contains(&type_oid)
         {
             let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE).ok()?;
             let composite = self.composite_for(slot, txid);
@@ -34406,7 +34464,7 @@ impl Storage {
                     user_type: identity(composite.schema, composite.name),
                 });
         }
-        if (oid::FIRST_COMPOSITE_ARRAY..oid::FIRST_COMPOSITE_ARRAY + MAX_COMPOSITES as i32)
+        if (oid::FIRST_COMPOSITE_ARRAY..oid::FIRST_COMPOSITE_ARRAY + self.composite_count() as i32)
             .contains(&type_oid)
         {
             let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE_ARRAY).ok()?;
@@ -34439,8 +34497,9 @@ impl Storage {
         // A domain is implicitly treated as its base type when passed out of
         // the domain, but PostgreSQL does not implicitly manufacture a value
         // of a different domain at routine lookup.
-        let expected_is_domain =
-            (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAINS as i32).contains(&expected_oid);
+        let expected_is_domain = (oid::FIRST_DOMAIN
+            ..oid::FIRST_DOMAIN + self.domain_count() as i32)
+            .contains(&expected_oid);
         if expected_is_domain {
             return false;
         }
@@ -42475,6 +42534,9 @@ mod tests {
         config.max_databases = 6;
         config.max_schemas = 17;
         config.max_sequences = 18;
+        config.max_domains = 26;
+        config.max_enums = 28;
+        config.max_composites = 29;
         config.max_roles = 19;
         config.max_role_memberships = 20;
         config.max_role_settings = 21;
@@ -42507,6 +42569,10 @@ mod tests {
         assert_eq!(storage.database_cumulative_statistics.borrow().len(), 6);
         assert_eq!(storage.schemas.len(), 17);
         assert_eq!(storage.sequences.len(), 18);
+        assert_eq!(storage.domains.len(), 26);
+        assert_eq!(storage.domain_graph_scratch.borrow().len(), 26);
+        assert_eq!(storage.enums.len(), 28);
+        assert_eq!(storage.composites.len(), 29);
         assert_eq!(storage.roles.len(), 19);
         assert_eq!(storage.role_memberships.len(), 20);
         assert_eq!(storage.role_settings.len(), 21);

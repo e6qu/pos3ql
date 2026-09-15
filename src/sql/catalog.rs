@@ -10679,10 +10679,12 @@ pub(crate) fn domain_oid(slot: usize) -> i32 {
 
 /// Tables/materialized views and plain views have distinct composite-type OID
 /// bands. PostgreSQL gives every row-bearing relation a separate pg_type row.
-pub(crate) const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = 130_000;
-pub(crate) const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
-pub(crate) const FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID: i32 = 1_300_000;
-pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 = 1_400_000;
+pub(crate) const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = super::types::oid::FIRST_TABLE_COMPOSITE;
+pub(crate) const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = super::types::oid::FIRST_VIEW_COMPOSITE;
+pub(crate) const FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID: i32 =
+    super::types::oid::FIRST_TABLE_COMPOSITE_ARRAY;
+pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 =
+    super::types::oid::FIRST_VIEW_COMPOSITE_ARRAY;
 pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 1_500_000;
 pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 1_600_000;
 pub(crate) const FIRST_FOREIGN_KEY_TRIGGER_OID: i32 = 1_700_000;
@@ -11756,7 +11758,7 @@ fn catalog_relation_oid_by_oid(oid: i32) -> bool {
 }
 
 pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
-    if super::types::ColType::from_oid(oid).is_some()
+    if (oid < super::types::oid::FIRST_DOMAIN && super::types::ColType::from_oid(oid).is_some())
         || matches!(
             oid,
             26 | 2249 | 2202 | 2203 | 2204 | 2205 | 2206 | 3115 | 4096 | 4097
@@ -11773,29 +11775,28 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
     let composite_visible = |slot| storage.composite_slot_visible_to(slot, txid);
     visible_slot(
         type_oid::FIRST_DOMAIN,
-        crate::storage::MAX_DOMAINS,
+        storage.domain_count(),
         &domain_visible,
     ) || visible_slot(
         type_oid::FIRST_DOMAIN_ARRAY,
-        crate::storage::MAX_DOMAINS,
+        storage.domain_count(),
         &domain_visible,
-    ) || visible_slot(
-        type_oid::FIRST_ENUM,
-        crate::storage::MAX_ENUMS,
-        &enum_visible,
-    ) || visible_slot(
-        type_oid::FIRST_ENUM_ARRAY,
-        crate::storage::MAX_ENUMS,
-        &enum_visible,
-    ) || visible_slot(
-        type_oid::FIRST_COMPOSITE,
-        crate::storage::MAX_COMPOSITES,
-        &composite_visible,
-    ) || visible_slot(
-        type_oid::FIRST_COMPOSITE_ARRAY,
-        crate::storage::MAX_COMPOSITES,
-        &composite_visible,
-    )
+    ) || visible_slot(type_oid::FIRST_ENUM, storage.enum_count(), &enum_visible)
+        || visible_slot(
+            type_oid::FIRST_ENUM_ARRAY,
+            storage.enum_count(),
+            &enum_visible,
+        )
+        || visible_slot(
+            type_oid::FIRST_COMPOSITE,
+            storage.composite_count(),
+            &composite_visible,
+        )
+        || visible_slot(
+            type_oid::FIRST_COMPOSITE_ARRAY,
+            storage.composite_count(),
+            &composite_visible,
+        )
 }
 
 pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Option<bool> {
@@ -14363,7 +14364,7 @@ pub fn user_type_name_text<'a>(
 ) -> Result<Option<&'a str>, SqlError> {
     use crate::sql::types::oid as type_oid;
     let (schema, name, visible, array, enumeration) = if (type_oid::FIRST_DOMAIN
-        ..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+        ..type_oid::FIRST_DOMAIN + storage.domain_count() as i32)
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_DOMAIN) as usize;
@@ -14376,7 +14377,7 @@ pub fn user_type_name_text<'a>(
             false,
         )
     } else if (type_oid::FIRST_DOMAIN_ARRAY
-        ..type_oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+        ..type_oid::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_DOMAIN_ARRAY) as usize;
@@ -14388,7 +14389,7 @@ pub fn user_type_name_text<'a>(
             true,
             false,
         )
-    } else if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
+    } else if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + storage.enum_count() as i32)
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_ENUM) as usize;
@@ -14400,8 +14401,7 @@ pub fn user_type_name_text<'a>(
             false,
             true,
         )
-    } else if (type_oid::FIRST_ENUM_ARRAY
-        ..type_oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32)
+    } else if (type_oid::FIRST_ENUM_ARRAY..type_oid::FIRST_ENUM_ARRAY + storage.enum_count() as i32)
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_ENUM_ARRAY) as usize;
@@ -14414,7 +14414,7 @@ pub fn user_type_name_text<'a>(
             true,
         )
     } else if (type_oid::FIRST_COMPOSITE
-        ..type_oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+        ..type_oid::FIRST_COMPOSITE + storage.composite_count() as i32)
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_COMPOSITE) as usize;
@@ -14427,7 +14427,7 @@ pub fn user_type_name_text<'a>(
             false,
         )
     } else if (type_oid::FIRST_COMPOSITE_ARRAY
-        ..type_oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+        ..type_oid::FIRST_COMPOSITE_ARRAY + storage.composite_count() as i32)
         .contains(&oid)
     {
         let slot = (oid - type_oid::FIRST_COMPOSITE_ARRAY) as usize;
@@ -14453,7 +14453,7 @@ pub fn user_type_name_text<'a>(
                 (oid - type_oid::FIRST_ENUM) as usize
             })
     } else if (type_oid::FIRST_COMPOSITE
-        ..type_oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+        ..type_oid::FIRST_COMPOSITE_ARRAY + storage.composite_count() as i32)
         .contains(&oid)
     {
         storage.resolve_composite_slot(name.as_str(), txid)
@@ -27445,8 +27445,14 @@ fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("enumlabel", ColType::Text),
         ],
     );
-    const MAX_ROWS: usize = crate::storage::MAX_ENUMS * crate::storage::MAX_ENUM_LABELS;
-    let mut out: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let capacity = (0..storage.enum_count())
+        .filter(|&slot| storage.enum_slot_visible_to(slot, txid))
+        .map(|slot| storage.enum_for(slot, txid).members().len())
+        .try_fold(0usize, |count, members| count.checked_add(members))
+        .ok_or_else(|| catalog_capacity_exceeded("pg_enum"))?;
+    let out = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for slot in 0..storage.enum_count() {
         let e = storage.enum_for(slot, txid);
@@ -29079,13 +29085,32 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Geometry(_) => "G",
         _ => "S",
     };
-    let mut out: [&[Datum];
-        512 + crate::storage::MAX_DOMAINS * 2
-            + crate::storage::MAX_ENUMS * 2
-            + crate::storage::MAX_COMPOSITES * 2] = [&[]; 512
-        + crate::storage::MAX_DOMAINS * 2
-        + crate::storage::MAX_ENUMS * 2
-        + crate::storage::MAX_COMPOSITES * 2];
+    let visible_domains = (0..storage.domain_count())
+        .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
+        .count();
+    let visible_enums = (0..storage.enum_count())
+        .filter(|&slot| storage.enum_slot_visible_to(slot, txid))
+        .count();
+    let visible_composites = storage.composites_with_slots_visible_to(txid).count();
+    let user_types = visible_domains
+        .checked_add(visible_enums)
+        .and_then(|count| count.checked_add(visible_composites))
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
+    let visible_tables = (0..storage.table_count())
+        .filter(|&slot| storage.table_slot_visible_to(slot, txid))
+        .count();
+    let relation_types = visible_tables
+        .checked_add(storage.views_visible_to(txid).count())
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
+    let capacity = 512usize
+        .checked_add(user_types)
+        .and_then(|count| count.checked_add(relation_types))
+        .ok_or_else(|| catalog_capacity_exceeded("pg_type"))?;
+    let out = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     for (i, t) in types.iter().enumerate() {
         out[i] = row(
             &[
@@ -32673,7 +32698,7 @@ fn info_column_row<'a>(
         updatable,
     } = source;
     let declared_oid = catalog_column_type_oid(storage, column, txid)?;
-    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + storage.domain_count() as i32)
         .contains(&declared_oid);
     let domain =
         is_domain.then(|| storage.domain_for((declared_oid - oid::FIRST_DOMAIN) as usize, txid));
@@ -32901,7 +32926,7 @@ fn information_schema_data_type(
     oid: i32,
 ) -> Result<StackStr<64>, SqlError> {
     use crate::sql::types::oid as type_oid;
-    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+    if (type_oid::FIRST_DOMAIN..type_oid::FIRST_DOMAIN + storage.domain_count() as i32)
         .contains(&oid)
     {
         return Ok(StackStr::from_str(
@@ -32911,22 +32936,18 @@ fn information_schema_data_type(
                 .name(),
         ));
     }
-    if (type_oid::FIRST_DOMAIN_ARRAY
-        ..type_oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+    if (type_oid::FIRST_DOMAIN_ARRAY..type_oid::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
         .contains(&oid)
-        || (type_oid::FIRST_ENUM_ARRAY
-            ..type_oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32)
+        || (type_oid::FIRST_ENUM_ARRAY..type_oid::FIRST_ENUM_ARRAY + storage.enum_count() as i32)
             .contains(&oid)
         || (type_oid::FIRST_COMPOSITE_ARRAY
-            ..type_oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+            ..type_oid::FIRST_COMPOSITE_ARRAY + storage.composite_count() as i32)
             .contains(&oid)
     {
         return Ok(StackStr::from_str("ARRAY"));
     }
-    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32)
-        .contains(&oid)
-        || (type_oid::FIRST_COMPOSITE
-            ..type_oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+    if (type_oid::FIRST_ENUM..type_oid::FIRST_ENUM + storage.enum_count() as i32).contains(&oid)
+        || (type_oid::FIRST_COMPOSITE..type_oid::FIRST_COMPOSITE + storage.composite_count() as i32)
             .contains(&oid)
     {
         return Ok(StackStr::from_str("USER-DEFINED"));
@@ -34221,7 +34242,12 @@ fn info_domains<'a>(
             ("dtd_identifier", ColType::Text),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_DOMAINS] = [&[]; crate::storage::MAX_DOMAINS];
+    let visible_domains = (0..storage.domain_count())
+        .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
+        .count();
+    let output = arena
+        .alloc_slice_with(visible_domains, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for slot in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);
@@ -34306,8 +34332,17 @@ fn info_domain_constraints<'a>(
             ("initially_deferred", ColType::Text),
         ],
     );
-    const MAX_ROWS: usize = crate::storage::MAX_DOMAINS * (crate::storage::MAX_DOMAIN_CHECKS + 1);
-    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let capacity = (0..storage.domain_count())
+        .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
+        .map(|slot| {
+            let domain = storage.domain_for(slot, txid);
+            domain.checks().len() + usize::from(domain.not_null)
+        })
+        .try_fold(0usize, |count, constraints| count.checked_add(constraints))
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema.domain_constraints"))?;
+    let output = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for slot in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);
@@ -34365,10 +34400,33 @@ fn info_check_constraints<'a>(
             ("check_clause", ColType::Text),
         ],
     );
-    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
-        * (crate::storage::MAX_CHECKS + MAX_COLUMNS)
-        + crate::storage::MAX_DOMAINS * (crate::storage::MAX_DOMAIN_CHECKS + 1);
-    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let table_capacity = (0..storage.table_count())
+        .filter(|&slot| storage.table_slot_visible_to(slot, txid))
+        .map(|slot| {
+            let table = storage.table_def(slot, txid);
+            table.checks().len()
+                + table
+                    .columns()
+                    .iter()
+                    .filter(|column| column.not_null.is_required())
+                    .count()
+        })
+        .try_fold(0usize, |count, constraints| count.checked_add(constraints))
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema.check_constraints"))?;
+    let domain_capacity = (0..storage.domain_count())
+        .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
+        .map(|slot| {
+            let domain = storage.domain_for(slot, txid);
+            domain.checks().len() + usize::from(domain.not_null)
+        })
+        .try_fold(0usize, |count, constraints| count.checked_add(constraints))
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema.check_constraints"))?;
+    let capacity = table_capacity
+        .checked_add(domain_capacity)
+        .ok_or_else(|| catalog_capacity_exceeded("information_schema.check_constraints"))?;
+    let output = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     let mut append = |schema: &str, name: &str, clause: &str| -> Result<(), SqlError> {
         if count == output.len() {
@@ -34584,7 +34642,7 @@ fn information_schema_usage_type(
     usage: InformationSchemaTypeUsage,
 ) -> Result<Option<(SqlName, StackStr<64>)>, SqlError> {
     use crate::sql::types::oid;
-    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
+    let is_domain = (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + storage.domain_count() as i32)
         .contains(&declared_oid);
     match usage {
         InformationSchemaTypeUsage::Domain => Ok(is_domain.then(|| {
@@ -34636,7 +34694,12 @@ fn info_domain_udt_usage<'a>(
             ("domain_name", ColType::Text),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_DOMAINS] = [&[]; crate::storage::MAX_DOMAINS];
+    let visible_domains = (0..storage.domain_count())
+        .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
+        .count();
+    let output = arena
+        .alloc_slice_with(visible_domains, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for slot in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);

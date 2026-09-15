@@ -2421,32 +2421,32 @@ fn type_object_ref(storage: &Storage, txid: u32, object_id: i32) -> Option<Event
             .contains(&object_id)
             .then_some((object_id - first) as usize)
     };
-    if let Some(slot) = slot_in(oid::FIRST_DOMAIN, crate::storage::MAX_DOMAINS)
+    if let Some(slot) = slot_in(oid::FIRST_DOMAIN, storage.domain_count())
         && storage.domain_slot_visible_to(slot, txid)
     {
         return Some(EventObjectRef::Primary(ObjectRef::Domain(slot)));
     }
-    if let Some(slot) = slot_in(oid::FIRST_DOMAIN_ARRAY, crate::storage::MAX_DOMAINS)
+    if let Some(slot) = slot_in(oid::FIRST_DOMAIN_ARRAY, storage.domain_count())
         && storage.domain_slot_visible_to(slot, txid)
     {
         return Some(EventObjectRef::DomainArray(slot as u16));
     }
-    if let Some(slot) = slot_in(oid::FIRST_ENUM, crate::storage::MAX_ENUMS)
+    if let Some(slot) = slot_in(oid::FIRST_ENUM, storage.enum_count())
         && storage.enum_slot_visible_to(slot, txid)
     {
         return Some(EventObjectRef::Primary(ObjectRef::Enum(slot)));
     }
-    if let Some(slot) = slot_in(oid::FIRST_ENUM_ARRAY, crate::storage::MAX_ENUMS)
+    if let Some(slot) = slot_in(oid::FIRST_ENUM_ARRAY, storage.enum_count())
         && storage.enum_slot_visible_to(slot, txid)
     {
         return Some(EventObjectRef::EnumArray(slot as u16));
     }
-    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE, crate::storage::MAX_COMPOSITES)
+    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE, storage.composite_count())
         && storage.composite_slot_visible_to(slot, txid)
     {
         return Some(EventObjectRef::Primary(ObjectRef::Composite(slot)));
     }
-    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE_ARRAY, crate::storage::MAX_COMPOSITES)
+    if let Some(slot) = slot_in(oid::FIRST_COMPOSITE_ARRAY, storage.composite_count())
         && storage.composite_slot_visible_to(slot, txid)
     {
         return Some(EventObjectRef::CompositeArray(slot as u16));

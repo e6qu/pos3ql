@@ -7963,7 +7963,7 @@ fn array_subquery_field_type<'q>(
     }
     let oid = element[0].type_oid;
     if !(super::types::oid::FIRST_COMPOSITE
-        ..super::types::oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+        ..super::types::oid::FIRST_COMPOSITE + storage.composite_count() as i32)
         .contains(&oid)
     {
         return Ok(None);

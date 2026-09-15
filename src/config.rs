@@ -82,6 +82,12 @@ pub struct Config {
     pub max_schemas: usize,
     /// Fixed number of sequence catalog slots across all databases.
     pub max_sequences: usize,
+    /// Fixed number of domain type catalog slots across all databases.
+    pub max_domains: usize,
+    /// Fixed number of enum type catalog slots across all databases.
+    pub max_enums: usize,
+    /// Fixed number of named composite type catalog slots across all databases.
+    pub max_composites: usize,
     /// Fixed number of cluster-wide role catalog slots, including `postgres`.
     pub max_roles: usize,
     /// Fixed number of cluster-wide role-membership catalog slots.
@@ -312,6 +318,9 @@ impl Config {
             max_databases: 32,
             max_schemas: 32,
             max_sequences: 64,
+            max_domains: 32,
+            max_enums: 32,
+            max_composites: 32,
             max_roles: 64,
             max_role_memberships: 256,
             max_role_settings: 128,
@@ -581,6 +590,18 @@ impl Config {
                 }
                 "max_sequences" => {
                     config.max_sequences =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_domains" => {
+                    config.max_domains =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_enums" => {
+                    config.max_enums =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_composites" => {
+                    config.max_composites =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_roles" => {
@@ -985,6 +1006,9 @@ impl Config {
             config.max_tables,
             config.max_schemas,
             config.max_sequences,
+            config.max_domains,
+            config.max_enums,
+            config.max_composites,
             config.max_roles,
             config.max_role_memberships,
             config.max_role_settings,
@@ -1085,6 +1109,9 @@ impl Config {
             ("max_tables", config.max_tables),
             ("max_databases", config.max_databases),
             ("max_sequences", config.max_sequences),
+            ("max_domains", config.max_domains),
+            ("max_enums", config.max_enums),
+            ("max_composites", config.max_composites),
             ("max_indexes", config.max_indexes),
             ("max_views", config.max_views),
             ("max_materialized_views", config.max_materialized_views),
@@ -1137,6 +1164,49 @@ impl Config {
                     crate::storage::MAX_SEQUENCE_CATALOG_SLOTS
                 ),
             ));
+        }
+        for (name, capacity, maximum) in [
+            (
+                "max_tables",
+                config.max_tables,
+                crate::storage::MAX_TABLE_TYPE_OID_SLOTS,
+            ),
+            (
+                "max_views",
+                config.max_views,
+                crate::storage::MAX_VIEW_TYPE_OID_SLOTS,
+            ),
+        ] {
+            if capacity > maximum {
+                return Err(ConfigError::at(
+                    0,
+                    format!("{name} exceeds the {maximum}-slot row-type OID range"),
+                ));
+            }
+        }
+        for (name, capacity, maximum) in [
+            (
+                "max_domains",
+                config.max_domains,
+                crate::storage::MAX_DOMAIN_CATALOG_SLOTS,
+            ),
+            (
+                "max_enums",
+                config.max_enums,
+                crate::storage::MAX_ENUM_CATALOG_SLOTS,
+            ),
+            (
+                "max_composites",
+                config.max_composites,
+                crate::storage::MAX_COMPOSITE_CATALOG_SLOTS,
+            ),
+        ] {
+            if capacity > maximum {
+                return Err(ConfigError::at(
+                    0,
+                    format!("{name} exceeds the {maximum}-slot type OID range"),
+                ));
+            }
         }
         for (name, capacity, maximum) in [
             (
@@ -1355,6 +1425,9 @@ max_rules = 19
 max_databases = 48
 max_schemas = 200
 max_sequences = 300
+max_domains = 301
+max_enums = 302
+max_composites = 303
 max_roles = 400
 max_role_memberships = 900
 max_role_settings = 700
@@ -1379,6 +1452,9 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_databases, 48);
         assert_eq!(c.max_schemas, 200);
         assert_eq!(c.max_sequences, 300);
+        assert_eq!(c.max_domains, 301);
+        assert_eq!(c.max_enums, 302);
+        assert_eq!(c.max_composites, 303);
         assert_eq!(c.max_roles, 400);
         assert_eq!(c.max_role_memberships, 900);
         assert_eq!(c.max_role_settings, 700);
@@ -1516,6 +1592,9 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_databases = 2\n").is_err());
         assert!(Config::parse("max_schemas = 2\n").is_err());
         assert!(Config::parse("max_sequences = 0\n").is_err());
+        assert!(Config::parse("max_domains = 0\n").is_err());
+        assert!(Config::parse("max_enums = 0\n").is_err());
+        assert!(Config::parse("max_composites = 0\n").is_err());
         assert!(Config::parse("max_roles = 0\n").is_err());
         assert!(Config::parse("max_role_memberships = 0\n").is_err());
         assert!(Config::parse("max_role_settings = 0\n").is_err());
@@ -1562,10 +1641,8 @@ sql_arena_bytes = 4096
     #[test]
     fn typed_catalog_capacities_reject_unrepresentable_slots() {
         for name in [
-            "max_tables",
             "max_databases",
             "max_indexes",
-            "max_views",
             "max_materialized_views",
             "max_routines",
             "max_casts",
@@ -1583,6 +1660,19 @@ sql_arena_bytes = 4096
             assert!(error.message.contains("65535-slot"), "{name}: {error}");
             Config::parse(&format!("{name} = 65535\n")).unwrap();
         }
+        for (name, maximum) in [
+            ("max_tables", crate::storage::MAX_TABLE_TYPE_OID_SLOTS),
+            ("max_views", crate::storage::MAX_VIEW_TYPE_OID_SLOTS),
+        ] {
+            let error = Config::parse(&format!("{name} = {}\n", maximum + 1)).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains(&format!("{maximum}-slot row-type OID range")),
+                "{name}: {error}"
+            );
+            Config::parse(&format!("{name} = {maximum}\n")).unwrap();
+        }
         for name in [
             "max_schemas",
             "max_collations",
@@ -1599,6 +1689,23 @@ sql_arena_bytes = 4096
         let error = Config::parse("max_sequences = 5001\n").unwrap_err();
         assert!(error.message.contains("5000-slot sequence OID range"));
         Config::parse("max_sequences = 5000\n").unwrap();
+        for (name, maximum) in [
+            ("max_domains", crate::storage::MAX_DOMAIN_CATALOG_SLOTS),
+            ("max_enums", crate::storage::MAX_ENUM_CATALOG_SLOTS),
+            (
+                "max_composites",
+                crate::storage::MAX_COMPOSITE_CATALOG_SLOTS,
+            ),
+        ] {
+            let error = Config::parse(&format!("{name} = {}\n", maximum + 1)).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains(&format!("{maximum}-slot type OID range")),
+                "{name}: {error}"
+            );
+            Config::parse(&format!("{name} = {maximum}\n")).unwrap();
+        }
         for name in [
             "max_roles",
             "max_role_memberships",

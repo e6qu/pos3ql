@@ -1398,16 +1398,37 @@ impl RecordShapeField {
 }
 
 const MAX_SHAPE_FIELDS: usize = 16;
-const MAX_SHAPES: usize = 32;
+const MAX_TRANSIENT_SHAPES: usize = 32;
+
+const EMPTY_RECORD_SHAPE_FIELD: RecordShapeField = RecordShapeField {
+    name: crate::util::StackStr::new(),
+    ctype: ColType::Record,
+    type_oid: oid::RECORD,
+    type_mod: -1,
+    collation: crate::sql::ast::Collation::None,
+    nested: -1,
+};
+
+#[derive(Clone, Copy)]
+struct NamedRecordShape {
+    fields: [RecordShapeField; MAX_SHAPE_FIELDS],
+    name: crate::util::StackStr<64>,
+    len: u8,
+    slot: u16,
+}
+
+const EMPTY_NAMED_RECORD_SHAPE: NamedRecordShape = NamedRecordShape {
+    fields: [EMPTY_RECORD_SHAPE_FIELD; MAX_SHAPE_FIELDS],
+    name: crate::util::StackStr::new(),
+    len: 0,
+    slot: u16::MAX,
+};
 
 struct ShapePool {
-    fields: [[RecordShapeField; MAX_SHAPE_FIELDS]; MAX_SHAPES],
-    lens: [u8; MAX_SHAPES],
+    fields: [[RecordShapeField; MAX_SHAPE_FIELDS]; MAX_TRANSIENT_SHAPES],
+    lens: [u8; MAX_TRANSIENT_SHAPES],
     n: usize,
-    named: [[RecordShapeField; MAX_SHAPE_FIELDS]; MAX_SHAPES],
-    named_names: [crate::util::StackStr<64>; MAX_SHAPES],
-    named_lens: [u8; MAX_SHAPES],
-    named_slots: [u16; MAX_SHAPES],
+    named: Box<[NamedRecordShape]>,
     named_n: usize,
 }
 
@@ -1424,41 +1445,31 @@ std::thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
-fn empty_shape_pool() -> Box<ShapePool> {
+fn empty_shape_pool(named_capacity: usize) -> Box<ShapePool> {
     Box::new(ShapePool {
-        fields: [[RecordShapeField {
-            name: crate::util::StackStr::new(),
-            ctype: ColType::Record,
-            type_oid: oid::RECORD,
-            type_mod: -1,
-            collation: crate::sql::ast::Collation::None,
-            nested: -1,
-        }; MAX_SHAPE_FIELDS]; MAX_SHAPES],
-        lens: [0; MAX_SHAPES],
+        fields: [[EMPTY_RECORD_SHAPE_FIELD; MAX_SHAPE_FIELDS]; MAX_TRANSIENT_SHAPES],
+        lens: [0; MAX_TRANSIENT_SHAPES],
         n: 0,
-        named: [[RecordShapeField {
-            name: crate::util::StackStr::new(),
-            ctype: ColType::Record,
-            type_oid: oid::RECORD,
-            type_mod: -1,
-            collation: crate::sql::ast::Collation::None,
-            nested: -1,
-        }; MAX_SHAPE_FIELDS]; MAX_SHAPES],
-        named_names: [crate::util::StackStr::new(); MAX_SHAPES],
-        named_lens: [0; MAX_SHAPES],
-        named_slots: [u16::MAX; MAX_SHAPES],
+        named: vec![EMPTY_NAMED_RECORD_SHAPE; named_capacity].into_boxed_slice(),
         named_n: 0,
     })
+}
+
+/// Heap bytes reserved by the statement-local record-shape registry.
+pub(crate) const fn record_shape_pool_bytes(named_capacity: usize) -> usize {
+    core::mem::size_of::<ShapePool>() + named_capacity * core::mem::size_of::<NamedRecordShape>()
 }
 
 /// Allocates the shape pool; the server calls this at startup, before the
 /// allocator freezes. (Tests allocate lazily on first registration instead —
 /// their allocator never freezes.)
-pub fn init_record_shapes() {
+pub fn init_record_shapes(named_capacity: usize) {
     RECORD_SHAPES.with(|p| {
         let mut p = p.borrow_mut();
-        if p.is_none() {
-            *p = Some(empty_shape_pool());
+        if p.as_ref()
+            .is_none_or(|pool| pool.named.len() != named_capacity)
+        {
+            *p = Some(empty_shape_pool(named_capacity));
         }
     });
 }
@@ -1485,18 +1496,18 @@ pub fn register_named_composite_shape(
 ) -> Result<(), SqlError> {
     RECORD_SHAPES.with(|p| -> Result<(), SqlError> {
         let mut p = p.borrow_mut();
-        let pool = p.get_or_insert_with(empty_shape_pool);
-        if pool.named_n == MAX_SHAPES || fields.len() > MAX_SHAPE_FIELDS {
+        let pool = p.get_or_insert_with(|| empty_shape_pool(32));
+        if pool.named_n == pool.named.len() || fields.len() > MAX_SHAPE_FIELDS {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "record shape capacity exceeded"
             ));
         }
         let at = pool.named_n;
-        pool.named_names[at] = crate::util::StackStr::from_str(name);
-        pool.named_slots[at] = slot;
-        pool.named_lens[at] = fields.len() as u8;
-        for (out, field) in pool.named[at].iter_mut().zip(fields) {
+        pool.named[at].name = crate::util::StackStr::from_str(name);
+        pool.named[at].slot = slot;
+        pool.named[at].len = fields.len() as u8;
+        for (out, field) in pool.named[at].fields.iter_mut().zip(fields) {
             out.name = crate::util::StackStr::from_str(field.name.as_str());
             out.ctype = field.ctype;
             out.type_oid = storage
@@ -1523,11 +1534,11 @@ fn visit_composite_slot_shape_metadata(
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
-        let at = pool.named_slots[..pool.named_n]
+        let at = pool.named[..pool.named_n]
             .iter()
-            .position(|candidate| *candidate == slot)?;
-        let len = pool.named_lens[at] as usize;
-        for field in &pool.named[at][..len] {
+            .position(|candidate| candidate.slot == slot)?;
+        let len = pool.named[at].len as usize;
+        for field in &pool.named[at].fields[..len] {
             visit(field.name.as_str(), field.metadata());
         }
         Some(len)
@@ -1538,10 +1549,10 @@ fn composite_slot_field_metadata(slot: u16, field: &str) -> Option<StaticTypeMet
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
-        let at = pool.named_slots[..pool.named_n]
+        let at = pool.named[..pool.named_n]
             .iter()
-            .position(|candidate| *candidate == slot)?;
-        pool.named[at][..pool.named_lens[at] as usize]
+            .position(|candidate| candidate.slot == slot)?;
+        pool.named[at].fields[..pool.named[at].len as usize]
             .iter()
             .find(|candidate| candidate.name.as_str().eq_ignore_ascii_case(field))
             .map(|candidate| candidate.metadata())
@@ -1554,8 +1565,8 @@ fn composite_slot_field_metadata(slot: u16, field: &str) -> Option<StaticTypeMet
 pub(crate) fn register_record_shape(fields: &[RecordShapeField]) -> Option<i32> {
     RECORD_SHAPES.with(|p| {
         let mut p = p.borrow_mut();
-        let pool = p.get_or_insert_with(empty_shape_pool);
-        if pool.n == MAX_SHAPES || fields.len() > MAX_SHAPE_FIELDS {
+        let pool = p.get_or_insert_with(|| empty_shape_pool(32));
+        if pool.n == MAX_TRANSIENT_SHAPES || fields.len() > MAX_SHAPE_FIELDS {
             return None;
         }
         let at = pool.n;

@@ -48793,6 +48793,207 @@ fn large_independent_catalogs_survive_object_cold_recovery() {
 }
 
 #[test]
+fn configured_user_type_capacities_cover_ddl_catalogs_spill_and_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    const DOMAINS: usize = 80;
+    const ENUMS: usize = 40;
+    const COMPOSITES: usize = 40;
+
+    let mut config = test_config("user-type-catalog-capacities");
+    config.max_domains = DOMAINS;
+    config.max_enums = ENUMS;
+    config.max_composites = COMPOSITES;
+    config.max_tables = 4;
+    config.max_routines = 4;
+    config.max_views = 4;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("user-type-capacities-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    let mut domain_sql = String::new();
+    for slot in 0..40 {
+        writeln!(
+            domain_sql,
+            "CREATE DOMAIN capacity_disposable_domain_{slot} AS integer CHECK (VALUE >= 0);"
+        )
+        .unwrap();
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &domain_sql, 8 << 20);
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    // Selection and dependency-order scratch must address a slot beyond the
+    // former 32-domain ceiling too.
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP DOMAIN capacity_disposable_domain_39",
+    );
+    assert!(
+        !message_types(&dropped).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    domain_sql.clear();
+    domain_sql
+        .push_str("CREATE DOMAIN capacity_replacement_domain_39 AS integer CHECK (VALUE >= 0);");
+    let replaced = run_with_arena_bytes(&mut engine, &mut budget, &domain_sql, 8 << 20);
+    assert!(
+        !message_types(&replaced).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&replaced)
+    );
+
+    let mut type_sql = String::new();
+    for slot in 0..40 {
+        if slot == 0 {
+            writeln!(
+                type_sql,
+                "CREATE DOMAIN capacity_chain_domain_0 AS integer CHECK (VALUE >= 0);"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                type_sql,
+                "CREATE DOMAIN capacity_chain_domain_{slot} AS capacity_chain_domain_{};",
+                slot - 1
+            )
+            .unwrap();
+        }
+        writeln!(
+            type_sql,
+            "CREATE TYPE capacity_enum_{slot} AS ENUM ('ready', 'done');"
+        )
+        .unwrap();
+        writeln!(
+            type_sql,
+            "CREATE TYPE capacity_composite_{slot} AS (value integer, state capacity_enum_{slot});"
+        )
+        .unwrap();
+        if slot % 20 == 19 {
+            let created = run_with_arena_bytes(&mut engine, &mut budget, &type_sql, 16 << 20);
+            assert!(
+                !message_types(&created).contains(&b'E'),
+                "slot {slot}: {}",
+                String::from_utf8_lossy(&created)
+            );
+            type_sql.clear();
+        }
+    }
+    assert!(type_sql.is_empty());
+
+    for overflow in [
+        "CREATE DOMAIN capacity_domain_overflow AS integer",
+        "CREATE TYPE capacity_enum_overflow AS ENUM ('value')",
+        "CREATE TYPE capacity_composite_overflow AS (value integer)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, overflow);
+        assert!(
+            String::from_utf8_lossy(&output).contains("54000"),
+            "{overflow}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    let exercised = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE capacity_type_rows (\
+             domain_value capacity_chain_domain_39 DEFAULT 7,\
+             domain_values capacity_chain_domain_39[] \
+               DEFAULT ARRAY[8, 9]::capacity_chain_domain_39[],\
+             enum_value capacity_enum_39 DEFAULT 'ready',\
+             enum_values capacity_enum_39[] \
+               DEFAULT ARRAY['ready', 'done']::capacity_enum_39[],\
+             composite_value capacity_composite_39,\
+             composite_values capacity_composite_39[]);\
+         CREATE FUNCTION capacity_type_states(input capacity_composite_39) \
+           RETURNS capacity_enum_39[] LANGUAGE sql IMMUTABLE \
+           RETURN ARRAY[(input).state]::capacity_enum_39[];\
+         INSERT INTO capacity_type_rows (composite_value, composite_values) VALUES (\
+           ROW(11, 'done')::capacity_composite_39,\
+           ARRAY[ROW(12, 'ready')::capacity_composite_39]::capacity_composite_39[]);\
+         CREATE VIEW capacity_type_view AS \
+           SELECT domain_values, enum_values, composite_values,\
+                  capacity_type_states(composite_value) AS states \
+             FROM capacity_type_rows;\
+         SELECT DISTINCT domain_values, enum_values, composite_values, states \
+           FROM capacity_type_view;\
+         SELECT count(*) FROM information_schema.domains \
+          WHERE domain_name LIKE 'capacity_%domain_%';\
+         SELECT count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid \
+          WHERE t.typname LIKE 'capacity_enum_%';\
+         SELECT count(*) FROM pg_type \
+          WHERE typtype IN ('d', 'e', 'c') AND typname LIKE 'capacity_%';\
+         SELECT pg_type_is_visible('capacity_chain_domain_39'::regtype),\
+                pg_type_is_visible('capacity_enum_39'::regtype),\
+                pg_type_is_visible('capacity_composite_39'::regtype)",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&exercised),
+        [
+            "{8,9}|{ready,done}|{\"(12,ready)\"}|{done}",
+            "80",
+            "80",
+            "162",
+            "t|t|t",
+        ],
+        "{}",
+        String::from_utf8_lossy(&exercised)
+    );
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = run_with_arena_bytes(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT domain_value, domain_values, enum_value, enum_values,\
+                composite_value, composite_values, capacity_type_states(composite_value)\
+           FROM capacity_type_rows;\
+         SELECT count(*) FROM information_schema.domains \
+          WHERE domain_name LIKE 'capacity_%domain_%';\
+         SELECT count(*) FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid \
+          WHERE t.typname LIKE 'capacity_enum_%';\
+         SELECT pg_typeof(domain_values), pg_typeof(enum_values),\
+                pg_typeof(composite_values) FROM capacity_type_rows",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&cold),
+        [
+            "7|{8,9}|ready|{ready,done}|(11,done)|{\"(12,ready)\"}|{done}",
+            "80",
+            "80",
+            "capacity_chain_domain_39[]|capacity_enum_39[]|capacity_composite_39[]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&cold)
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn configured_database_and_schema_capacities_survive_publication_and_object_cold_recovery() {
     use core::fmt::Write as _;
 

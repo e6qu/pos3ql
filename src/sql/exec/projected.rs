@@ -158,7 +158,8 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::JsonPath(text) => 4 + text.len(),
         Datum::Snapshot { value, .. } => 5 + value.raw().len(),
-        Datum::Array { raw, .. } => 8 + raw.len(),
+        // element code + user-type slot + domain base code/slot + byte length
+        Datum::Array { raw, .. } => 10 + raw.len(),
         Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
         Datum::Numeric(nm) => 7 + nm.digits.len(),
@@ -400,19 +401,29 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         Datum::Array { element, raw } => {
             out[0] = 15;
             out[1] = element.code();
-            let (base_code, base_user_slot) = match element {
+            let (element_slot, base_code, base_user_slot) = match element {
+                crate::sql::types::ArrElem::Enum(slot)
+                | crate::sql::types::ArrElem::Composite(slot) => {
+                    (*slot, 0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED)
+                }
                 crate::sql::types::ArrElem::Domain {
+                    slot,
                     base_code,
                     base_user_slot,
                     ..
-                } => (*base_code, *base_user_slot),
-                _ => (0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED),
+                } => (*slot, *base_code, *base_user_slot),
+                _ => (
+                    crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED,
+                    0,
+                    crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED,
+                ),
             };
-            out[2] = base_code;
-            out[3..5].copy_from_slice(&base_user_slot.to_le_bytes());
-            out[5..9].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-            out[9..9 + raw.len()].copy_from_slice(raw);
-            9 + raw.len()
+            out[2..4].copy_from_slice(&element_slot.to_le_bytes());
+            out[4] = base_code;
+            out[5..7].copy_from_slice(&base_user_slot.to_le_bytes());
+            out[7..11].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            out[11..11 + raw.len()].copy_from_slice(raw);
+            11 + raw.len()
         }
         Datum::Int2Vector(raw) => {
             out[0] = 29;
@@ -764,20 +775,26 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         15 => {
             let mut element = crate::sql::types::ArrElem::from_code(bytes[at])
                 .expect("projected array carries a valid element code");
-            if let crate::sql::types::ArrElem::Domain { slot, .. } = element {
-                element = crate::sql::types::ArrElem::Domain {
+            let slot = u16::from_le_bytes(bytes[at + 1..at + 3].try_into().unwrap());
+            element = match element {
+                crate::sql::types::ArrElem::Enum(_) => crate::sql::types::ArrElem::Enum(slot),
+                crate::sql::types::ArrElem::Composite(_) => {
+                    crate::sql::types::ArrElem::Composite(slot)
+                }
+                crate::sql::types::ArrElem::Domain { .. } => crate::sql::types::ArrElem::Domain {
                     slot,
-                    base_code: bytes[at + 1],
-                    base_user_slot: u16::from_le_bytes(bytes[at + 2..at + 4].try_into().unwrap()),
-                };
-            }
-            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+                    base_code: bytes[at + 3],
+                    base_user_slot: u16::from_le_bytes(bytes[at + 4..at + 6].try_into().unwrap()),
+                },
+                builtin => builtin,
+            };
+            let len = u32::from_le_bytes(bytes[at + 6..at + 10].try_into().unwrap()) as usize;
             (
                 Datum::Array {
                     element,
-                    raw: &bytes[at + 8..at + 8 + len],
+                    raw: &bytes[at + 10..at + 10 + len],
                 },
-                8 + len,
+                10 + len,
             )
         }
         16 => {
@@ -1153,6 +1170,36 @@ mod tests {
         assert_eq!(projected_row_width(encoded), 2);
         assert_eq!(decode_projected_pub(encoded, 0), values[0]);
         assert_eq!(decode_projected_pub(encoded, 1), values[1]);
+    }
+
+    #[test]
+    fn user_type_array_slots_round_trip_through_schema_less_spill_rows() {
+        use crate::sql::types::{ArrElem, ColType};
+
+        let mut budget = Budget::new(4096);
+        let arena = Arena::new(&mut budget, "user array projected row", 2048).unwrap();
+        let values = [
+            Datum::Array {
+                element: ArrElem::Enum(513),
+                raw: b"enum",
+            },
+            Datum::Array {
+                element: ArrElem::Domain {
+                    slot: 769,
+                    base_code: ColType::Composite(1025).code(),
+                    base_user_slot: 1025,
+                },
+                raw: b"domain",
+            },
+            Datum::Array {
+                element: ArrElem::Composite(1281),
+                raw: b"composite",
+            },
+        ];
+        let encoded = encode_projected_pub(&values, &arena).unwrap();
+        for (column, expected) in values.iter().enumerate() {
+            assert_eq!(decode_projected_pub(encoded, column), *expected);
+        }
     }
 
     #[test]

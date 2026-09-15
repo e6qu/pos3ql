@@ -77,6 +77,15 @@ storage. RAM and local disk are bounded, disposable caches.
   subscription apply, commit scratch, and logical decoding together, so atomic
   catalog operations above the former 64-change boundary remain usable and
   exactly charged before serving.
+- Domain, enum, and named-composite catalogs are independently startup-sized
+  through `max_domains`, `max_enums`, and `max_composites`. DDL dependency
+  selection, domain-chain recovery, planner record shapes, PostgreSQL and
+  information-schema catalogs, routines, views, WAL, checkpoints, and
+  empty-cache recovery follow those declared bounds. Schema-less spill and
+  constant-default records carry user-array kind separately from its 16-bit
+  runtime slot, so identities above the former 32-entry ceiling survive sort,
+  replay, and recovery. Accepted domain, enum, composite, table, and view
+  capacities are checked against disjoint `pg_type` OID bands before serving.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those
@@ -93,7 +102,7 @@ storage. RAM and local disk are bounded, disposable caches.
 
 ### Remaining bounded scale limits
 
-Replace the compile-time type, partition-key, constraint, and per-object inline
+Replace the compile-time partition-key, constraint, and per-object inline
 ceilings with startup-sized pools or bounded chunked
 structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,

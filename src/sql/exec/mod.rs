@@ -434,7 +434,8 @@ pub use describe::{
 };
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
-    infer_type_catalog, intrinsic_record_field_meta, routine_result_metadata, unify_numeric_tower,
+    infer_type_catalog, intrinsic_record_field_meta, record_shape_pool_bytes,
+    routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 
@@ -8766,9 +8767,7 @@ pub fn drop_owned(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
-    use crate::storage::{
-        AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS, MAX_PUBLICATION_SCHEMAS,
-    };
+    use crate::storage::{AccessClass, AccessObject, DependencyClass, MAX_PUBLICATION_SCHEMAS};
     let mut owned_roles = [0u16; crate::sql::parser::MAX_LIST];
     let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
         Ok(count) => count,
@@ -8798,9 +8797,18 @@ pub fn drop_owned(
         Ok(values) => values,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    let mut domains = [false; MAX_DOMAINS];
-    let mut enums = [false; MAX_ENUMS];
-    let mut composites = [false; crate::storage::MAX_COMPOSITES];
+    let domains = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let enums = match arena.alloc_slice_with(storage.enum_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let composites = match arena.alloc_slice_with(storage.composite_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut operators = [false; MAX_DEPENDENT_STORED_QUERIES];
     let collations = match arena.alloc_slice_with(storage.collation_capacity(), |_| false) {
@@ -8936,9 +8944,9 @@ pub fn drop_owned(
                     &tables,
                     &views,
                     sequences,
-                    &domains,
-                    &enums,
-                    &composites,
+                    domains,
+                    enums,
+                    composites,
                     &routines,
                     &operators,
                     text_search_objects,
@@ -8979,9 +8987,9 @@ pub fn drop_owned(
                         &tables,
                         &views,
                         sequences,
-                        &domains,
-                        &enums,
-                        &composites,
+                        domains,
+                        enums,
+                        composites,
                         &routines,
                         &operators,
                         text_search_objects,
@@ -11272,7 +11280,10 @@ pub fn drop_schema(
             return sql_fail(e);
         }
     }
-    let mut schema_domains = [false; crate::storage::MAX_DOMAINS];
+    let schema_domains = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(arena_full()),
+    };
     for (domain, selected) in schema_domains
         .iter_mut()
         .enumerate()
@@ -11298,7 +11309,7 @@ pub fn drop_schema(
             return sql_fail(e);
         }
     }
-    for composite in 0..crate::storage::MAX_COMPOSITES {
+    for composite in 0..storage.composite_count() {
         let definition = storage.composite_for(composite, txn.txid);
         if definition.visible_to(txn.txid)
             && in_listed(storage, definition.schema.as_str())
@@ -29946,7 +29957,7 @@ pub fn drop_collation(
                 return sql_fail(error);
             }
         }
-        for composite_slot in 0..crate::storage::MAX_COMPOSITES {
+        for composite_slot in 0..storage.composite_count() {
             if !storage.composite_slot_visible_to(composite_slot, txn.txid) {
                 continue;
             }
@@ -38142,9 +38153,7 @@ pub(crate) fn catalog_column_type(
     type_oid: i32,
 ) -> Option<(ColType, Option<crate::storage::UserTypeName>)> {
     use crate::sql::types::{ArrElem, oid};
-    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
-        .contains(&type_oid)
-    {
+    if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + storage.domain_count() as i32).contains(&type_oid) {
         let domain = storage.domain_for((type_oid - oid::FIRST_DOMAIN) as usize, txid);
         return domain.visible_to(txid).then_some((
             domain.base,
@@ -38154,7 +38163,7 @@ pub(crate) fn catalog_column_type(
             }),
         ));
     }
-    if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+    if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
         .contains(&type_oid)
     {
         let slot = (type_oid - oid::FIRST_DOMAIN_ARRAY) as usize;
@@ -38168,7 +38177,7 @@ pub(crate) fn catalog_column_type(
             }),
         ));
     }
-    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32)
+    if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + storage.composite_count() as i32)
         .contains(&type_oid)
     {
         let slot = (type_oid - oid::FIRST_COMPOSITE) as usize;
@@ -38181,8 +38190,7 @@ pub(crate) fn catalog_column_type(
             }),
         ));
     }
-    if (oid::FIRST_COMPOSITE_ARRAY
-        ..oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32)
+    if (oid::FIRST_COMPOSITE_ARRAY..oid::FIRST_COMPOSITE_ARRAY + storage.composite_count() as i32)
         .contains(&type_oid)
     {
         let slot = (type_oid - oid::FIRST_COMPOSITE_ARRAY) as usize;
@@ -39777,7 +39785,7 @@ fn routine_result_uses_selected_type(
     storage: &Storage,
     txid: u32,
     result: crate::storage::RoutineResult,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
 ) -> bool {
@@ -39818,7 +39826,7 @@ fn routine_uses_selected_type(
     storage: &Storage,
     txid: u32,
     routine: crate::storage::RoutineDef,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
 ) -> bool {
@@ -39877,7 +39885,7 @@ fn drop_type_dependent_routines(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
     cascade: bool,
@@ -40146,7 +40154,10 @@ pub fn drop_domain(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
-    let mut selected = [false; crate::storage::MAX_DOMAINS];
+    let selected = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(arena_full()),
+    };
     for name in names {
         let slot = match name.schema {
             Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
@@ -40222,7 +40233,7 @@ pub fn drop_domain(
         wal,
         txn,
         scratch,
-        &selected,
+        selected,
         None,
         cascade,
         0,
@@ -40242,7 +40253,7 @@ fn drop_domain_selection(
     wal: &mut Wal,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
-    selected: &[bool; crate::storage::MAX_DOMAINS],
+    selected: &[bool],
     selected_enum: Option<usize>,
     cascade: bool,
     reserved_undo: usize,
@@ -40338,7 +40349,9 @@ fn drop_domain_selection(
     }
 
     // Produce child-before-parent order while every definition is visible.
-    let mut ordered = [usize::MAX; crate::storage::MAX_DOMAINS];
+    let ordered = arena
+        .alloc_slice_with(selected_count, |_| usize::MAX)
+        .map_err(|_| arena_full())?;
     let mut ordered_count = 0;
     while ordered_count < selected_count {
         let Some(leaf) = (0..storage.domain_count()).find(|candidate| {
@@ -40950,7 +40963,7 @@ fn validate_stored_domain_value(
 }
 
 fn domain_depends_on(storage: &Storage, mut slot: usize, target: usize, txid: u32) -> bool {
-    for _ in 0..crate::storage::MAX_DOMAINS {
+    for _ in 0..storage.domain_count() {
         if slot == target {
             return true;
         }
@@ -41400,7 +41413,10 @@ pub fn drop_type(
                 return sql_fail(error);
             }
         }
-        let mut dependent_domains = [false; crate::storage::MAX_DOMAINS];
+        let dependent_domains = match arena.alloc_slice_with(storage.domain_count(), |_| false) {
+            Ok(values) => values,
+            Err(_) => return sql_fail(arena_full()),
+        };
         for (domain_slot, is_dependent) in dependent_domains
             .iter_mut()
             .enumerate()
@@ -41431,7 +41447,7 @@ pub fn drop_type(
             wal,
             txn,
             scratch,
-            &dependent_domains,
+            dependent_domains,
             Some(slot),
             cascade,
             1,
@@ -41467,7 +41483,7 @@ pub fn drop_type(
 }
 
 fn composite_field_uses_enum(storage: &Storage, enum_slot: usize, txid: u32) -> Option<usize> {
-    (0..crate::storage::MAX_COMPOSITES).find(|&composite_slot| {
+    (0..storage.composite_count()).find(|&composite_slot| {
         storage.composite(composite_slot).visible_to(txid)
             && storage
                 .composite_for(composite_slot, txid)
@@ -41489,7 +41505,7 @@ fn composite_field_uses_domain(storage: &Storage, domain_slot: usize, txid: u32)
         schema: domain.schema,
         name: domain.name,
     };
-    (0..crate::storage::MAX_COMPOSITES).find(|&composite_slot| {
+    (0..storage.composite_count()).find(|&composite_slot| {
         storage.composite(composite_slot).visible_to(txid)
             && storage
                 .composite_for(composite_slot, txid)
@@ -41519,15 +41535,7 @@ fn drop_composite_type(
         txn.txid,
         "type",
     )?;
-    drop_type_dependent_routines(
-        storage,
-        wal,
-        txn,
-        &[false; crate::storage::MAX_DOMAINS],
-        None,
-        Some(slot),
-        cascade,
-    )?;
+    drop_type_dependent_routines(storage, wal, txn, &[], None, Some(slot), cascade)?;
 
     let StoredDependencyClosure {
         views: dependent_views,
@@ -41574,7 +41582,9 @@ fn drop_composite_type(
         ));
     }
 
-    let mut dependent_domains = [false; crate::storage::MAX_DOMAINS];
+    let dependent_domains = arena
+        .alloc_slice_with(storage.domain_count(), |_| false)
+        .map_err(|_| arena_full())?;
     for (domain_slot, selected) in dependent_domains
         .iter_mut()
         .enumerate()
@@ -41716,7 +41726,7 @@ fn drop_composite_type(
             wal,
             txn,
             scratch,
-            &dependent_domains,
+            dependent_domains,
             None,
             true,
             1,
@@ -42075,7 +42085,7 @@ fn apply_type_drop_to_stored_queries(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
     cascade: bool,
@@ -42161,7 +42171,7 @@ fn policy_depends_on_type_selection(
     storage: &Storage,
     txid: u32,
     policy: &crate::storage::PolicyDef,
-    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
@@ -42408,9 +42418,9 @@ fn policy_depends_on_owned_selection(
     tables: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     sequences: &[bool],
-    domains: &[bool; crate::storage::MAX_DOMAINS],
-    enums: &[bool; crate::storage::MAX_ENUMS],
-    composites: &[bool; crate::storage::MAX_COMPOSITES],
+    domains: &[bool],
+    enums: &[bool],
+    composites: &[bool],
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     operators: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     text_search_objects: &[bool],
@@ -45325,7 +45335,7 @@ fn rewrite_composite_dependent_indexes(
 }
 
 fn domain_composite_base(storage: &Storage, mut slot: usize, txid: u32) -> Option<u16> {
-    for _ in 0..crate::storage::MAX_DOMAINS {
+    for _ in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);
         let Some(parent) = domain.base_domain else {
             return match domain.base {
@@ -52458,8 +52468,7 @@ pub(crate) fn resolve_parameter_input_type(
         return Ok(ParameterInputType::Builtin(ColType::Text));
     }
     let domain_slot = (oid - oids::FIRST_DOMAIN) as usize;
-    if (oids::FIRST_DOMAIN..oids::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32).contains(&oid)
-    {
+    if (oids::FIRST_DOMAIN..oids::FIRST_DOMAIN + storage.domain_count() as i32).contains(&oid) {
         let domain = storage.domain_for(domain_slot, txid);
         if !domain.visible_to(txid) {
             return Err(unknown_type());
@@ -52470,7 +52479,7 @@ pub(crate) fn resolve_parameter_input_type(
         });
     }
     let domain_array_slot = (oid - oids::FIRST_DOMAIN_ARRAY) as usize;
-    if (oids::FIRST_DOMAIN_ARRAY..oids::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
+    if (oids::FIRST_DOMAIN_ARRAY..oids::FIRST_DOMAIN_ARRAY + storage.domain_count() as i32)
         .contains(&oid)
     {
         let domain = storage.domain_for(domain_array_slot, txid);
@@ -52501,7 +52510,7 @@ pub(crate) fn resolve_parameter_input_type(
             Err(unknown_type())
         }
         ColType::Composite(slot) | ColType::Array(crate::sql::types::ArrElem::Composite(slot))
-            if slot as usize >= crate::storage::MAX_COMPOSITES
+            if slot as usize >= storage.composite_count()
                 || !storage.composite_for(slot as usize, txid).visible_to(txid) =>
         {
             Err(unknown_type())

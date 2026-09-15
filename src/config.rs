@@ -95,6 +95,20 @@ pub struct Config {
     pub max_triggers: usize,
     /// Fixed number of publication catalog slots.
     pub max_publications: usize,
+    /// Fixed number of user-defined collation catalog slots.
+    pub max_collations: usize,
+    /// Fixed number of user-defined conversion catalog slots.
+    pub max_conversions: usize,
+    /// Fixed number of text-search parser, template, dictionary, and
+    /// configuration catalog slots.
+    pub max_text_search_objects: usize,
+    /// Fixed number of event-trigger catalog slots.
+    pub max_event_triggers: usize,
+    /// Fixed number of cluster-wide tablespace catalog slots, including the
+    /// two built-in tablespaces.
+    pub max_tablespaces: usize,
+    /// Fixed number of object-comment catalog slots.
+    pub max_comments: usize,
     /// Fixed number of large-object identities in the cluster catalog.
     pub max_large_objects: usize,
     /// Sparse 2 KiB large-object pages that may be resident in the page map.
@@ -265,6 +279,12 @@ impl Config {
             max_operator_classes: 32,
             max_triggers: 32,
             max_publications: 32,
+            max_collations: 128,
+            max_conversions: 128,
+            max_text_search_objects: 512,
+            max_event_triggers: 64,
+            max_tablespaces: 64,
+            max_comments: 64,
             max_large_objects: 1024,
             large_object_pages: 8192,
             max_large_object_descriptors: 64,
@@ -525,6 +545,30 @@ impl Config {
                 }
                 "max_publications" => {
                     config.max_publications =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_collations" => {
+                    config.max_collations =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_conversions" => {
+                    config.max_conversions =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_text_search_objects" => {
+                    config.max_text_search_objects =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_event_triggers" => {
+                    config.max_event_triggers =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_tablespaces" => {
+                    config.max_tablespaces =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_comments" => {
+                    config.max_comments =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_large_objects" => {
@@ -835,12 +879,29 @@ impl Config {
             config.max_operator_classes,
             config.max_triggers,
             config.max_publications,
+            config.max_collations,
+            config.max_conversions,
+            config.max_text_search_objects,
+            config.max_event_triggers,
+            config.max_comments,
         ]
         .contains(&0)
         {
             return Err(ConfigError::at(
                 0,
                 "catalog capacities must be greater than zero".to_string(),
+            ));
+        }
+        if config.max_tablespaces < 2 {
+            return Err(ConfigError::at(
+                0,
+                "max_tablespaces must reserve the two built-in tablespaces".to_string(),
+            ));
+        }
+        if config.max_text_search_objects < 21 {
+            return Err(ConfigError::at(
+                0,
+                "max_text_search_objects must reserve the 21 built-in objects".to_string(),
             ));
         }
         if config.max_locks_per_transaction == 0 {
@@ -880,6 +941,7 @@ impl Config {
             ("max_operator_classes", config.max_operator_classes),
             ("max_triggers", config.max_triggers),
             ("max_publications", config.max_publications),
+            ("max_text_search_objects", config.max_text_search_objects),
             (
                 "max_foreign_data_wrappers",
                 config.max_foreign_data_wrappers,
@@ -893,6 +955,24 @@ impl Config {
                     format!("{name} exceeds the 65535-slot catalog representation"),
                 ));
             }
+        }
+        for (name, capacity) in [
+            ("max_collations", config.max_collations),
+            ("max_conversions", config.max_conversions),
+            ("max_event_triggers", config.max_event_triggers),
+        ] {
+            if capacity > usize::from(u8::MAX) {
+                return Err(ConfigError::at(
+                    0,
+                    format!("{name} exceeds the 255-slot catalog representation"),
+                ));
+            }
+        }
+        if config.max_tablespaces > usize::from(u16::MAX) - 1 {
+            return Err(ConfigError::at(
+                0,
+                "max_tablespaces exceeds the 65534-slot tablespace representation".to_string(),
+            ));
         }
         if config.foreign_receive_bytes == 0 || config.foreign_send_bytes == 0 {
             return Err(ConfigError::at(
@@ -1198,10 +1278,17 @@ sql_arena_bytes = 4096
             "max_operator_classes",
             "max_triggers",
             "max_publications",
+            "max_collations",
+            "max_conversions",
+            "max_text_search_objects",
+            "max_event_triggers",
+            "max_comments",
         ] {
             assert!(Config::parse(&format!("{name} = 0\n")).is_err(), "{name}");
         }
         assert!(Config::parse("just some words\n").is_err());
+        assert!(Config::parse("max_tablespaces = 1\n").is_err());
+        assert!(Config::parse("max_text_search_objects = 20\n").is_err());
         assert!(Config::parse("database_collation_locale = \n").is_err());
         assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
         assert!(Config::parse("auth = unknown\n").is_err());
@@ -1229,6 +1316,7 @@ sql_arena_bytes = 4096
             "max_operator_classes",
             "max_triggers",
             "max_publications",
+            "max_text_search_objects",
             "max_foreign_data_wrappers",
             "max_foreign_servers",
             "max_user_mappings",
@@ -1237,6 +1325,14 @@ sql_arena_bytes = 4096
             assert!(error.message.contains("65535-slot"), "{name}: {error}");
             Config::parse(&format!("{name} = 65535\n")).unwrap();
         }
+        for name in ["max_collations", "max_conversions", "max_event_triggers"] {
+            let error = Config::parse(&format!("{name} = 256\n")).unwrap_err();
+            assert!(error.message.contains("255-slot"), "{name}: {error}");
+            Config::parse(&format!("{name} = 255\n")).unwrap();
+        }
+        let error = Config::parse("max_tablespaces = 65535\n").unwrap_err();
+        assert!(error.message.contains("65534-slot"), "{error}");
+        Config::parse("max_tablespaces = 65534\n").unwrap();
     }
 
     #[test]

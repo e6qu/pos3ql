@@ -91,11 +91,12 @@ logical-replication boundary is specified separately in
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.
 - Tables, indexes, ordinary and materialized views, routines, casts, operators,
-  operator families/classes, triggers, and publications use independent
+  operator families/classes, triggers, publications, collations, conversions,
+  text-search objects, event triggers, tablespaces, and comments use independent
   startup-sized pools. Their configured exhaustion is a loud program-limit
-  error; object-cold recovery preserves catalogs larger than the table pool.
-  Schema, role, type, sequence, database, tablespace, ACL, and several inline
-  per-object bounds remain compile-time limits.
+  error; object-cold recovery preserves catalogs larger than their former
+  fixed or table-derived limits. Schema, role, type, sequence, database, ACL,
+  extension, and several inline per-object bounds remain compile-time limits.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

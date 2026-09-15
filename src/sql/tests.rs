@@ -48085,6 +48085,191 @@ fn large_independent_catalogs_survive_object_cold_recovery() {
 }
 
 #[test]
+fn configured_database_and_schema_capacities_survive_publication_and_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    const USER_DATABASES: usize = 33;
+    const USER_SCHEMAS: usize = 44;
+
+    let mut config = test_config("database-schema-capacities");
+    config.max_databases = 3 + USER_DATABASES;
+    config.max_schemas = 3 + USER_DATABASES + USER_SCHEMAS;
+    config.max_text_search_objects = 21 + 7 * USER_DATABASES;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("database-schema-capacities-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for slot in 0..USER_DATABASES {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("CREATE DATABASE capacity_database_{slot}"),
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "database {slot}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let overflow = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DATABASE capacity_database_overflow",
+    );
+    assert!(String::from_utf8_lossy(&overflow).contains("54000"));
+
+    // Exercise the connection registry at a database slot beyond the former
+    // 32-entry ceiling, including FORCE termination and safe slot reuse.
+    let dropped = engine.database_login("capacity_database_32").unwrap();
+    assert!(usize::from(dropped.slot) > 31);
+    assert!(engine.reserve_database_connection(dropped, false));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP DATABASE capacity_database_32 WITH (FORCE)",
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+    assert!(engine.database_connection_must_terminate(dropped.slot as usize));
+    engine.release_database_connection(dropped.slot);
+    assert!(!engine.database_connection_must_terminate(dropped.slot as usize));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DATABASE capacity_database_reused",
+    );
+    assert!(!message_types(&output).contains(&b'E'));
+
+    let mut schema_sql = String::new();
+    for slot in 0..USER_SCHEMAS {
+        writeln!(schema_sql, "CREATE SCHEMA capacity_schema_{slot};").unwrap();
+    }
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &schema_sql, 4 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let overflow = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA capacity_schema_overflow",
+    );
+    assert!(String::from_utf8_lossy(&overflow).contains("54000"));
+
+    let mut drop_schemas = String::from("DROP SCHEMA ");
+    for slot in 27..USER_SCHEMAS {
+        if slot != 27 {
+            drop_schemas.push_str(", ");
+        }
+        write!(drop_schemas, "capacity_schema_{slot}").unwrap();
+    }
+    let dropped_schemas = run_with(&mut engine, &mut budget, &drop_schemas);
+    assert!(
+        !message_types(&dropped_schemas).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&dropped_schemas)
+    );
+    let mut replace_schemas = String::new();
+    for slot in 27..USER_SCHEMAS {
+        writeln!(
+            replace_schemas,
+            "CREATE SCHEMA capacity_schema_reused_{slot};"
+        )
+        .unwrap();
+    }
+    let replaced = run_with(&mut engine, &mut budget, &replace_schemas);
+    assert!(
+        !message_types(&replaced).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&replaced)
+    );
+
+    let mut publication =
+        String::from("CREATE PUBLICATION capacity_schema_publication FOR TABLES IN SCHEMA ");
+    for slot in 0..USER_SCHEMAS {
+        if slot != 0 {
+            publication.push_str(", ");
+        }
+        if slot >= 27 {
+            write!(publication, "capacity_schema_reused_{slot}").unwrap();
+        } else {
+            write!(publication, "capacity_schema_{slot}").unwrap();
+        }
+    }
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &publication, 4 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let warm = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_database WHERE datname LIKE 'capacity_database_%';
+         SELECT count(*) FROM pg_stat_database WHERE datname LIKE 'capacity_database_%';
+         SELECT count(*) FROM pg_stat_database_conflicts
+          WHERE datname LIKE 'capacity_database_%';
+         SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'capacity_schema_%';
+         SELECT count(*) FROM information_schema.schemata
+          WHERE schema_name LIKE 'capacity_schema_%';
+         SELECT count(*) FROM pg_publication_namespace",
+        16 << 20,
+    );
+    assert_eq!(
+        data_rows(&warm),
+        ["33", "33", "33", "44", "44", "44"],
+        "{}",
+        String::from_utf8_lossy(&warm)
+    );
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = run_with_arena_bytes(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT count(*) FROM pg_database WHERE datname LIKE 'capacity_database_%';
+         SELECT to_regnamespace('capacity_schema_30') IS NULL,
+                to_regnamespace('capacity_schema_43') IS NULL,
+                to_regnamespace('capacity_schema_reused_30') IS NOT NULL,
+                to_regnamespace('capacity_schema_reused_43') IS NOT NULL;
+         SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'capacity_schema_%';
+         SELECT count(*) FROM information_schema.schemata
+          WHERE schema_name LIKE 'capacity_schema_%';
+         SELECT count(*) FROM pg_publication_namespace",
+        16 << 20,
+    );
+    assert_eq!(
+        data_rows(&cold),
+        ["33", "t|t|t|t", "44", "44", "44"],
+        "{}",
+        String::from_utf8_lossy(&cold)
+    );
+    assert!(recovered.database_login("capacity_database_32").is_none());
+    assert!(
+        recovered
+            .database_login("capacity_database_reused")
+            .is_some()
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn checkpoint_manifest_capacity_exhausts_loudly() {
     let mut config = test_config("checkpoint-manifest-capacity");
     config.checkpoint_manifest_bytes = 64;
@@ -54420,10 +54605,10 @@ fn drop_database_force_marks_every_live_backend_for_administrative_termination()
         String::from_utf8_lossy(&output)
     );
     assert!(engine.database_login("force_target").is_none());
-    assert!(engine.dropped_database_connections()[database.slot as usize]);
+    assert!(engine.database_connection_must_terminate(database.slot as usize));
     engine.release_database_connection(database.slot);
     engine.release_database_connection(database.slot);
-    assert!(!engine.dropped_database_connections()[database.slot as usize]);
+    assert!(!engine.database_connection_must_terminate(database.slot as usize));
 }
 
 #[test]

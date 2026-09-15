@@ -1036,9 +1036,8 @@ impl Server {
     }
 
     fn terminate_dropped_database_connections(&mut self) {
-        let dropped = self.engine.dropped_database_connections();
-        for (database, &must_terminate) in dropped.iter().enumerate() {
-            if !must_terminate {
+        for database in 0..self.engine.database_connection_capacity() {
+            if !self.engine.database_connection_must_terminate(database) {
                 continue;
             }
             for index in 0..self.slots.len() {

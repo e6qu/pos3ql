@@ -73,6 +73,11 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
+    /// Fixed number of databases, including template1, template0, and postgres.
+    pub max_databases: usize,
+    /// Fixed number of database-local schemas, including one public schema for
+    /// each built-in database.
+    pub max_schemas: usize,
     /// Fixed number of named index catalog slots. Physical acceleration
     /// bindings draw separately from `max_value_indexes`.
     pub max_indexes: usize,
@@ -272,6 +277,8 @@ impl Config {
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
             max_tables: 32,
+            max_databases: 32,
+            max_schemas: 32,
             max_indexes: 32,
             max_views: 32,
             max_materialized_views: 32,
@@ -509,6 +516,14 @@ impl Config {
                 }
                 "max_tables" => {
                     config.max_tables =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_databases" => {
+                    config.max_databases =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_schemas" => {
+                    config.max_schemas =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_indexes" => {
@@ -883,6 +898,7 @@ impl Config {
         }
         if [
             config.max_tables,
+            config.max_schemas,
             config.max_indexes,
             config.max_views,
             config.max_materialized_views,
@@ -904,6 +920,18 @@ impl Config {
             return Err(ConfigError::at(
                 0,
                 "catalog capacities must be greater than zero".to_string(),
+            ));
+        }
+        if config.max_databases < 3 {
+            return Err(ConfigError::at(
+                0,
+                "max_databases must reserve template1, template0, and postgres".to_string(),
+            ));
+        }
+        if config.max_schemas < 3 {
+            return Err(ConfigError::at(
+                0,
+                "max_schemas must reserve the three built-in public schemas".to_string(),
             ));
         }
         if config.max_tablespaces < 2 {
@@ -945,6 +973,7 @@ impl Config {
         }
         for (name, capacity) in [
             ("max_tables", config.max_tables),
+            ("max_databases", config.max_databases),
             ("max_indexes", config.max_indexes),
             ("max_views", config.max_views),
             ("max_materialized_views", config.max_materialized_views),
@@ -971,6 +1000,7 @@ impl Config {
             }
         }
         for (name, capacity) in [
+            ("max_schemas", config.max_schemas),
             ("max_collations", config.max_collations),
             ("max_conversions", config.max_conversions),
             ("max_event_triggers", config.max_event_triggers),
@@ -1155,6 +1185,8 @@ max_locks_per_transaction = 96
 max_replication_slots = 12
 max_subscriptions = 7
 max_rules = 19
+max_databases = 48
+max_schemas = 200
 memtable_bytes = 16MiB   # small for tests
 temporary_spill_bytes = 32MiB
 checkpoint_manifest_bytes = 2MiB
@@ -1168,6 +1200,8 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_replication_slots, 12);
         assert_eq!(c.max_subscriptions, 7);
         assert_eq!(c.max_rules, 19);
+        assert_eq!(c.max_databases, 48);
+        assert_eq!(c.max_schemas, 200);
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.temporary_spill_bytes, 32 * MIB);
         assert_eq!(c.checkpoint_manifest_bytes, 2 * MIB);
@@ -1293,6 +1327,8 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_connections = -1\n").is_err());
         assert!(Config::parse("max_rules = 0\n").is_err());
         assert!(Config::parse("max_tables = 0\n").is_err());
+        assert!(Config::parse("max_databases = 2\n").is_err());
+        assert!(Config::parse("max_schemas = 2\n").is_err());
         assert!(Config::parse("max_indexes = 0\n").is_err());
         for name in [
             "max_views",
@@ -1332,6 +1368,7 @@ sql_arena_bytes = 4096
     fn typed_catalog_capacities_reject_unrepresentable_slots() {
         for name in [
             "max_tables",
+            "max_databases",
             "max_indexes",
             "max_views",
             "max_materialized_views",
@@ -1351,7 +1388,12 @@ sql_arena_bytes = 4096
             assert!(error.message.contains("65535-slot"), "{name}: {error}");
             Config::parse(&format!("{name} = 65535\n")).unwrap();
         }
-        for name in ["max_collations", "max_conversions", "max_event_triggers"] {
+        for name in [
+            "max_schemas",
+            "max_collations",
+            "max_conversions",
+            "max_event_triggers",
+        ] {
             let error = Config::parse(&format!("{name} = 256\n")).unwrap_err();
             assert!(error.message.contains("255-slot"), "{name}: {error}");
             Config::parse(&format!("{name} = 255\n")).unwrap();

@@ -141,10 +141,11 @@ and SP-GiST classes now provide PostgreSQL-compatible `<-> point` ordering over
 compact immutable keys, including covering scans; navigable tree nodes remain
 the next step for avoiding a complete key-generation walk. The known structural
 limits remain global query serialization, specialized posting/tree navigation,
-and compile-time schema, role, type, sequence, database, ACL, and
-per-object inline ceilings. Major SQL-object and metadata catalogs now have
-independent startup-sized pools; checkpoint row bookkeeping and the named
-`checkpoint_manifest_bytes` reservation are charged at startup as well.
+and compile-time role, type, sequence, ACL, and per-object inline ceilings.
+Major SQL-object, metadata, database, and schema catalogs now have independent
+startup-sized pools; database connection and statistics registries, checkpoint
+row bookkeeping, and the named `checkpoint_manifest_bytes` reservation are
+charged at startup as well.
 Multi-core execution must preserve fixed memory, MVCC, lock ordering, group
 publication order, and explicit backpressure. Writer fencing and promotion
 safety must exist before any failover benchmark or active-active claim is

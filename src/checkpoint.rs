@@ -11203,7 +11203,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
             "pub table count exceeds limit",
         ));
     }
-    if schema_count > crate::storage::MAX_SCHEMAS {
+    if schema_count > crate::storage::MAX_PUBLICATION_SCHEMAS {
         return Err(CheckpointSetupError::Corrupt(
             "pub schema count exceeds limit",
         ));
@@ -11235,7 +11235,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
             }
         }
     }
-    let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
+    let mut schemas = [u8::MAX; crate::storage::MAX_PUBLICATION_SCHEMAS];
     for schema in &mut schemas[..schema_count] {
         *schema = parse_field(words.next(), "pub schema")?;
     }

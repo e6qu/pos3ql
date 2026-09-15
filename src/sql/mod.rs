@@ -267,7 +267,7 @@ pub struct Engine {
     /// Authenticated sessions per fixed role slot, used to enforce
     /// `CONNECTION LIMIT` without allocating in the server loop.
     role_connections: [u16; crate::storage::MAX_ROLES],
-    database_connections: [u16; crate::storage::MAX_DATABASES],
+    database_connections: FixedVec<u16>,
     active_system_settings: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS],
     system_settings_reloaded: bool,
     discard_protocol_state: bool,
@@ -2725,11 +2725,13 @@ impl Engine {
         core::mem::take(&mut self.discard_protocol_state)
     }
 
-    pub(crate) fn dropped_database_connections(&self) -> [bool; crate::storage::MAX_DATABASES] {
-        core::array::from_fn(|slot| {
-            self.database_connections[slot] != 0
-                && self.storage.database(slot).ddl_state == crate::storage::CatalogDdlState::Absent
-        })
+    pub(crate) fn database_connection_capacity(&self) -> usize {
+        self.database_connections.len()
+    }
+
+    pub(crate) fn database_connection_must_terminate(&self, slot: usize) -> bool {
+        self.database_connections[slot] != 0
+            && self.storage.database(slot).ddl_state == crate::storage::CatalogDdlState::Absent
     }
 
     fn database_connection_count(&self, name: &str, txid: u32) -> u16 {
@@ -2762,6 +2764,7 @@ impl Engine {
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_connections as usize * size_of::<(i32, u64)>()
+            + config.max_databases * size_of::<u16>()
             + two_phase::PreparedTransactions::budget_bytes(config)
             + crate::pg::replication_client::ReplicationClient::budget_bytes(
                 1,
@@ -2908,14 +2911,11 @@ impl Engine {
         // WAL carries catalog identities as names where runtime slots are not
         // durable. Rebind each recovered database only after every replayed
         // definition exists.
-        let mut recovered_databases =
-            [crate::storage::DatabaseOid::POSTGRES; crate::storage::MAX_DATABASES];
-        let mut recovered_database_count = 0usize;
+        let mut recovered_databases = Vec::with_capacity(config.max_databases);
         for (_, database) in storage.databases_visible_to(0) {
-            recovered_databases[recovered_database_count] = database.oid;
-            recovered_database_count += 1;
+            recovered_databases.push(database.oid);
         }
-        for database in &recovered_databases[..recovered_database_count] {
+        for database in &recovered_databases {
             storage.select_database(*database)?;
             wal.select_database(*database);
             storage.rebind_domain_base_types()?;
@@ -2994,6 +2994,13 @@ impl Engine {
         storage.install_foreign_client(foreign_client);
         // The upload buffer must hold at least one full WAL batch.
         let upload_buf = config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes);
+        let mut database_connections =
+            FixedVec::new(budget, "database_connections", config.max_databases)?;
+        for _ in 0..config.max_databases {
+            database_connections
+                .push(0)
+                .expect("sized to max_databases");
+        }
         Ok(Self {
             storage,
             wal,
@@ -3037,7 +3044,7 @@ impl Engine {
             )?,
             replication_system_id: crate::object_store::writer_id(config),
             role_connections: [0; crate::storage::MAX_ROLES],
-            database_connections: [0; crate::storage::MAX_DATABASES],
+            database_connections,
             active_system_settings,
             system_settings_reloaded: false,
             discard_protocol_state: false,
@@ -15022,6 +15029,7 @@ impl Engine {
                     target,
                     nowait: *nowait,
                 },
+                arena,
                 responder,
             ),
             Stmt::DropIndex {
@@ -15049,9 +15057,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                *target,
-                *name,
-                *options,
+                exec::ReindexCommand {
+                    target: *target,
+                    name: *name,
+                    options: *options,
+                },
+                arena,
                 responder,
             ),
             Stmt::Cluster { target, verbose } => exec::cluster(
@@ -15060,6 +15071,7 @@ impl Engine {
                 txn,
                 *target,
                 *verbose,
+                arena,
                 responder,
             ),
             Stmt::CreateTablespace {

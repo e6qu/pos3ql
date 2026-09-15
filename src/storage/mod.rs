@@ -4524,7 +4524,7 @@ pub struct PublicationDef {
     pub table_include_descendants: [bool; MAX_PUBLICATION_TABLES],
     pub table_filters: PublicationFilters,
     pub table_count: usize,
-    pub schemas: [u8; MAX_SCHEMAS],
+    pub schemas: [u8; MAX_PUBLICATION_SCHEMAS],
     pub schema_count: usize,
     pub publish_insert: bool,
     pub publish_update: bool,
@@ -4548,7 +4548,7 @@ pub(crate) struct PublicationDefinition {
     pub table_include_descendants: [bool; MAX_PUBLICATION_TABLES],
     pub table_filters: PublicationFilters,
     pub table_count: usize,
-    pub schemas: [u8; MAX_SCHEMAS],
+    pub schemas: [u8; MAX_PUBLICATION_SCHEMAS],
     pub schema_count: usize,
     pub publish_insert: bool,
     pub publish_update: bool,
@@ -8664,7 +8664,6 @@ pub(crate) fn index_expression_stackstr(
     Ok(value)
 }
 
-pub(crate) const MAX_DATABASES: usize = 32;
 pub(crate) const USER_DATABASE_OID_BASE: i32 = 16_383;
 pub(crate) const TABLESPACE_LOCATION_MAX: usize = 256;
 
@@ -9049,8 +9048,9 @@ pub(crate) struct PendingIndexName {
     pub name: SqlName,
 }
 
-/// How many schemas may exist at once, including the built-in "public".
-pub(crate) const MAX_SCHEMAS: usize = 32;
+/// Publication schema slots use `u8::MAX` as their absent sentinel. The schema
+/// catalog has an independently configured capacity within this representation.
+pub(crate) const MAX_PUBLICATION_SCHEMAS: usize = u8::MAX as usize;
 
 pub(crate) const MAX_EXTENSIONS: usize = 64;
 pub(crate) const MAX_EXTENSION_DEPENDENCIES: usize = 512;
@@ -14097,7 +14097,7 @@ impl Storage {
             + config.max_large_objects * size_of::<LargeObjectDef>()
             + pending_extended_statistics_capacity(config)
                 * size_of::<PendingExtendedStatisticsDataSlot>()
-            + MAX_SCHEMAS * size_of::<SchemaDef>()
+            + config.max_schemas * size_of::<SchemaDef>()
             + MAX_EXTENSIONS * size_of::<ExtensionDef>()
             + MAX_EXTENSION_DEPENDENCIES * size_of::<ExtensionDependency>()
             + MAX_EXTENSION_CONFIG_RELATIONS * size_of::<ExtensionConfig>()
@@ -14118,7 +14118,7 @@ impl Storage {
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMPOSITES * size_of::<CompositeDef>()
             + MAX_ACCESS_METHODS * size_of::<AccessMethodDef>()
-            + MAX_DATABASES * size_of::<DatabaseDef>()
+            + config.max_databases * size_of::<DatabaseDef>()
             + config.max_tablespaces * size_of::<TablespaceDef>()
             + config.max_comments * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<BackendActivity>()
@@ -14132,7 +14132,7 @@ impl Storage {
             + (table_slot_capacity(config) * (MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS)
                 + config.max_value_indexes)
                 * size_of::<IndexCumulativeStatistics>()
-            + MAX_DATABASES * size_of::<DatabaseCumulativeStatistics>()
+            + config.max_databases * size_of::<DatabaseCumulativeStatistics>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<(u32, u64)>()
             + (config.max_connections as usize + config.max_prepared_transactions)
@@ -14502,7 +14502,7 @@ impl Storage {
                     table_include_descendants: [false; MAX_PUBLICATION_TABLES],
                     table_filters: PublicationFilters::EMPTY,
                     table_count: 0,
-                    schemas: [u8::MAX; MAX_SCHEMAS],
+                    schemas: [u8::MAX; MAX_PUBLICATION_SCHEMAS],
                     schema_count: 0,
                     publish_insert: true,
                     publish_update: true,
@@ -14656,8 +14656,8 @@ impl Storage {
                 .push(CompositeDef::EMPTY)
                 .expect("sized to MAX_COMPOSITES");
         }
-        let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
-        for i in 0..MAX_SCHEMAS {
+        let mut schemas = FixedVec::new(budget, "schemas", config.max_schemas)?;
+        for i in 0..config.max_schemas {
             let database = match i {
                 0 => DatabaseOid::TEMPLATE1,
                 1 => DatabaseOid::TEMPLATE0,
@@ -14678,7 +14678,7 @@ impl Storage {
                         CatalogDdlState::Absent
                     },
                 })
-                .expect("sized to MAX_SCHEMAS");
+                .expect("sized to max_schemas");
         }
         let mut extensions = FixedVec::new(budget, "extensions", MAX_EXTENSIONS)?;
         for _ in 0..MAX_EXTENSIONS {
@@ -14823,7 +14823,7 @@ impl Storage {
                 .push(BrinMaintenanceState::EMPTY)
                 .expect("sized to max_indexes");
         }
-        let mut databases = FixedVec::new(budget, "databases", MAX_DATABASES)?;
+        let mut databases = FixedVec::new(budget, "databases", config.max_databases)?;
         databases
             .push(DatabaseDef::builtin(
                 DatabaseOid::TEMPLATE1,
@@ -14851,7 +14851,7 @@ impl Storage {
                 config.database_collation_locale.as_str(),
             ))
             .expect("database catalog has postgres slot");
-        while databases.len() < MAX_DATABASES {
+        while databases.len() < config.max_databases {
             databases
                 .push(DatabaseDef {
                     oid: DatabaseOid::POSTGRES,
@@ -14860,7 +14860,7 @@ impl Storage {
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
                 })
-                .expect("sized to MAX_DATABASES");
+                .expect("sized to max_databases");
         }
         let mut tablespaces = FixedVec::new(budget, "tablespaces", config.max_tablespaces)?;
         for slot in 0..config.max_tablespaces {
@@ -14941,8 +14941,11 @@ impl Storage {
             table_capacity * (MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS)
                 + config.max_value_indexes,
         )?;
-        let mut database_cumulative_statistics =
-            FixedVec::new(budget, "database_cumulative_statistics", MAX_DATABASES)?;
+        let mut database_cumulative_statistics = FixedVec::new(
+            budget,
+            "database_cumulative_statistics",
+            config.max_databases,
+        )?;
         for database in databases.iter() {
             database_cumulative_statistics
                 .push(DatabaseCumulativeStatistics::empty(database.oid))
@@ -15802,6 +15805,43 @@ impl Storage {
         self.schemas.len()
     }
 
+    pub(crate) fn schema_drop_object_count(&self, txid: u32) -> usize {
+        let visible_tables =
+            (0..self.table_count()).filter(|&slot| self.table(slot).visible_to(txid));
+        let table_count = visible_tables.clone().count();
+        let foreign_key_count = visible_tables
+            .map(|slot| self.table_def(slot, txid).n_fkeys)
+            .sum::<usize>();
+        table_count
+            + foreign_key_count
+            + self.views_visible_to(txid).count()
+            + (0..self.routine_count())
+                .filter(|&slot| self.routine_for(slot, txid).visible_to(txid))
+                .count()
+            + self.collations_visible_to(txid).count()
+            + self.conversions_visible_to(txid).count()
+            + self.text_search_objects_visible_to(txid).count()
+            + (0..self.sequence_count())
+                .filter(|&slot| self.sequence_for(slot, txid).visible_to(txid))
+                .count()
+            + (0..self.domain_count())
+                .filter(|&slot| self.domain(slot).visible_to(txid))
+                .count()
+            + (0..self.enum_count())
+                .filter(|&slot| self.enum_for(slot, txid).visible_to(txid))
+                .count()
+            + (0..MAX_COMPOSITES)
+                .filter(|&slot| self.composite_for(slot, txid).visible_to(txid))
+                .count()
+            + self.operators_visible_to(txid).count()
+            + self.operator_families_visible_to(txid).count()
+            + self.operator_classes_visible_to(txid).count()
+            + self.extended_statistics_visible(txid).count()
+            + (0..self.policy_count())
+                .filter(|&slot| self.policy(slot).visible_to(txid))
+                .count()
+    }
+
     pub fn role_count(&self) -> usize {
         self.roles.len()
     }
@@ -15814,6 +15854,10 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, database)| database.visible_to(txid))
+    }
+
+    pub(crate) fn database_count(&self) -> usize {
+        self.databases.len()
     }
 
     pub(crate) fn database_slot(&self, name: &str, txid: u32) -> Option<usize> {
@@ -15951,7 +15995,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "database catalog capacity exhausted (limit {})",
-                    MAX_DATABASES
+                    self.databases.len()
                 )
             })?;
         self.databases[slot] = DatabaseDef {
@@ -15988,7 +16032,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "database catalog capacity exhausted (limit {})",
-                    MAX_DATABASES
+                    self.databases.len()
                 )
             })?;
         self.databases[slot] = DatabaseDef {
@@ -29071,11 +29115,11 @@ impl Storage {
                 "publication row filters do not match publication members"
             ));
         }
-        if spec.schemas.len() > MAX_SCHEMAS {
+        if spec.schemas.len() > MAX_PUBLICATION_SCHEMAS {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many schemas in publication (limit {})",
-                MAX_SCHEMAS
+                MAX_PUBLICATION_SCHEMAS
             ));
         }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
@@ -29126,7 +29170,7 @@ impl Storage {
         table_include_descendants[..spec.table_include_descendants.len()]
             .copy_from_slice(spec.table_include_descendants);
         let table_filters = PublicationFilters::from_sql(spec.table_filter_sql)?;
-        let mut schemas = [u8::MAX; MAX_SCHEMAS];
+        let mut schemas = [u8::MAX; MAX_PUBLICATION_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
         self.catalog_seq += 1;
         self.publications[slot] = PublicationDef {
@@ -42413,6 +42457,8 @@ mod tests {
     fn catalog_object_pools_follow_their_independent_startup_capacities() {
         let mut config = test_config();
         config.max_tables = 2;
+        config.max_databases = 6;
+        config.max_schemas = 17;
         config.max_views = 3;
         config.max_materialized_views = 4;
         config.max_routines = 5;
@@ -42434,6 +42480,9 @@ mod tests {
         storage.configure_collation(&config, &mut budget).unwrap();
 
         assert_eq!(storage.tables.len(), 3); // two relations plus large-object pages
+        assert_eq!(storage.databases.len(), 6);
+        assert_eq!(storage.database_cumulative_statistics.borrow().len(), 6);
+        assert_eq!(storage.schemas.len(), 17);
         assert_eq!(storage.views.len(), 3);
         assert_eq!(storage.matviews.len(), 4);
         assert_eq!(storage.matview_dependencies.len(), 4);

@@ -28355,7 +28355,7 @@ fn pg_stat_database<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of("pg_stat_database", PG_STAT_DATABASE_COLUMNS);
     let rows = arena
-        .alloc_slice_with(crate::storage::MAX_DATABASES + 1, |_| &[] as &[Datum])
+        .alloc_slice_with(storage.database_count() + 1, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
     let mut append = |datid: Datum<'a>,
@@ -28436,10 +28436,10 @@ fn pg_stat_database_conflicts<'a>(
         PG_STAT_DATABASE_CONFLICTS_COLUMNS,
     );
     let rows = arena
-        .alloc_slice_with(crate::storage::MAX_DATABASES, |_| &[] as &[Datum])
+        .alloc_slice_with(storage.database_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
-    for slot in 0..crate::storage::MAX_DATABASES {
+    for slot in 0..storage.database_count() {
         let database = storage.database(slot);
         if !database.visible_to(txid) {
             continue;
@@ -29835,8 +29835,7 @@ fn pg_namespace<'a>(
             ("nspacl", ColType::Array(super::types::ArrElem::AclItem)),
         ],
     );
-    let capacity =
-        4 + crate::storage::MAX_SCHEMAS + storage.table_count() + storage.sequence_count();
+    let capacity = 4 + storage.schema_count() + storage.table_count() + storage.sequence_count();
     let out = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -30707,7 +30706,7 @@ fn pg_database<'a>(
         ],
     );
     let output = arena
-        .alloc_slice_with(crate::storage::MAX_DATABASES, |_| &[] as &[Datum])
+        .alloc_slice_with(storage.database_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (slot, database) in storage.databases_visible_to(txid) {
@@ -34673,8 +34672,9 @@ fn info_schemata<'a>(
             ("sql_path", ColType::Text),
         ],
     );
-    let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
-        [&[]; 2 + crate::storage::MAX_SCHEMAS];
+    let out = arena
+        .alloc_slice_with(storage.schema_count() + 2, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for (slot, schema) in storage.visible_schemas(txid) {
         out[n] = row(

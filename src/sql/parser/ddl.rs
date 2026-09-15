@@ -7224,7 +7224,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let mut names: [&'a str; 16] = [""; 16];
+        let mut names: [&'a str; super::MAX_LIST] = [""; super::MAX_LIST];
         let mut n = 0usize;
         loop {
             if n == names.len() {

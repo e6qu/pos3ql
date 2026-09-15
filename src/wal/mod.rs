@@ -644,7 +644,7 @@ pub(crate) enum WalOp<'a> {
         table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
             crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
-        schemas: [u8; crate::storage::MAX_SCHEMAS],
+        schemas: [u8; crate::storage::MAX_PUBLICATION_SCHEMAS],
         schema_count: usize,
         publish_insert: bool,
         publish_update: bool,
@@ -667,7 +667,7 @@ pub(crate) enum WalOp<'a> {
         table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
             crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
-        schemas: [u8; crate::storage::MAX_SCHEMAS],
+        schemas: [u8; crate::storage::MAX_PUBLICATION_SCHEMAS],
         schema_count: usize,
         publish_insert: bool,
         publish_update: bool,
@@ -7366,7 +7366,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if count > crate::storage::MAX_PUBLICATION_TABLES {
                 return None;
             }
-            if schema_count > crate::storage::MAX_SCHEMAS {
+            if schema_count > crate::storage::MAX_PUBLICATION_SCHEMAS {
                 return None;
             }
             let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
@@ -7402,7 +7402,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }
                 at += len;
             }
-            let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
+            let mut schemas = [u8::MAX; crate::storage::MAX_PUBLICATION_SCHEMAS];
             schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
             at += schema_count;
             (at == payload.len()).then_some(WalOp::CreatePublication {
@@ -7443,7 +7443,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if count > crate::storage::MAX_PUBLICATION_TABLES {
                 return None;
             }
-            if schema_count > crate::storage::MAX_SCHEMAS {
+            if schema_count > crate::storage::MAX_PUBLICATION_SCHEMAS {
                 return None;
             }
             let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
@@ -7479,7 +7479,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }
                 at += len;
             }
-            let mut schemas = [u8::MAX; crate::storage::MAX_SCHEMAS];
+            let mut schemas = [u8::MAX; crate::storage::MAX_PUBLICATION_SCHEMAS];
             schemas[..schema_count].copy_from_slice(payload.get(at..at + schema_count)?);
             at += schema_count;
             (at == payload.len()).then_some(WalOp::AlterPublication {
@@ -12800,7 +12800,7 @@ mod tests {
                     table_include_descendants: [false; crate::storage::MAX_PUBLICATION_TABLES],
                     table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
-                    schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
+                    schemas: [u8::MAX; crate::storage::MAX_PUBLICATION_SCHEMAS],
                     schema_count: 0,
                     publish_insert: true,
                     publish_update: true,
@@ -12821,7 +12821,7 @@ mod tests {
                     table_include_descendants: [false; crate::storage::MAX_PUBLICATION_TABLES],
                     table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
-                    schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
+                    schemas: [u8::MAX; crate::storage::MAX_PUBLICATION_SCHEMAS],
                     schema_count: 0,
                     publish_insert: true,
                     publish_update: false,

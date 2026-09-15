@@ -99,10 +99,12 @@ logical-replication boundary is specified separately in
   physical-table slot, including the internal large-object table. The complete
   checkpoint catalog image has a named startup-reserved
   `checkpoint_manifest_bytes` bound and fails before publication if it is full.
-  Catalog builders for startup-sized objects allocate row references from the
-  fixed statement arena according to transaction-visible cardinality. Schema,
-  role, type, sequence, database, ACL, and several inline per-object bounds
-  remain compile-time limits.
+  Database and schema catalogs, connection counters, statistics, cloning, and
+  publication membership are also startup-sized and survive object-cold
+  recovery above their former 32-slot limits. Catalog builders for
+  startup-sized objects allocate row references from the fixed statement arena
+  according to transaction-visible cardinality. Role, type, sequence, ACL, and
+  several inline per-object bounds remain compile-time limits.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

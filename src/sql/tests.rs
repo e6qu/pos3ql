@@ -9405,6 +9405,34 @@ fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8>
     run_with_guc(engine, budget, sql_text, 1 << 18, &mut guc)
 }
 
+fn run_with_ddl_capacity(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    sql_text: &str,
+    ddl_capacity: usize,
+    arena_bytes: usize,
+) -> Vec<u8> {
+    let mut buffer = crate::mem::FixedBuf::new(budget, "ddl capacity send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "ddl capacity sql", arena_bytes).unwrap();
+    let mut txn = TxnState::new_with_ddl_capacity(budget, 1024, ddl_capacity).unwrap();
+    let mut pool = test_pool(budget);
+    let mut guc = GucState::new();
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple(
+            sql_text,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut test_cursors(budget),
+            &mut guc,
+            &mut responder,
+            1,
+        )
+        .unwrap();
+    buffer.readable().to_vec()
+}
+
 fn copy_line(
     engine: &mut Engine,
     budget: &mut Budget,
@@ -9758,6 +9786,425 @@ fn role_catalog_is_transactional_and_attribute_complete() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn configured_role_authorization_capacity_survives_object_cold_recovery() {
+    use core::fmt::Write;
+
+    const USER_ROLES: usize = 95;
+    let mut config = test_config("configured-role-authorization-capacity");
+    config.max_roles = USER_ROLES + 1;
+    config.max_role_memberships = USER_ROLES - 1;
+    config.max_role_settings = USER_ROLES;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("role-capacity-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut run_batches = |sql: &str| {
+        let mut batch = String::new();
+        for (index, statement) in sql.lines().enumerate() {
+            batch.push_str(statement);
+            batch.push('\n');
+            if (index + 1) % 32 == 0 {
+                let output = run_with(&mut engine, &mut budget, &batch);
+                assert!(
+                    !String::from_utf8_lossy(&output).contains("ERROR"),
+                    "{}",
+                    String::from_utf8_lossy(&output)
+                );
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            let output = run_with(&mut engine, &mut budget, &batch);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    };
+    let mut create_roles = String::new();
+    for role in 1..=USER_ROLES {
+        if role == USER_ROLES {
+            writeln!(
+                create_roles,
+                "CREATE ROLE scaled_role_{role:03} LOGIN CONNECTION LIMIT 1;"
+            )
+            .unwrap();
+        } else {
+            writeln!(create_roles, "CREATE ROLE scaled_role_{role:03};").unwrap();
+        }
+    }
+    run_batches(&create_roles);
+
+    let mut memberships = String::new();
+    for child in 2..=USER_ROLES {
+        writeln!(
+            memberships,
+            "GRANT scaled_role_{:03} TO scaled_role_{child:03};",
+            child - 1
+        )
+        .unwrap();
+    }
+    run_batches(&memberships);
+
+    let mut settings = String::new();
+    for role in 1..=USER_ROLES {
+        writeln!(
+            settings,
+            "ALTER ROLE scaled_role_{role:03} SET application_name TO 'scaled-{role:03}';"
+        )
+        .unwrap();
+    }
+    run_batches(&settings);
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE scaled_role_data (value text); \
+         INSERT INTO scaled_role_data VALUES ('visible through a 95-role graph'); \
+         GRANT SELECT ON scaled_role_data TO scaled_role_001; \
+         SELECT count(*) FROM pg_roles WHERE rolname LIKE 'scaled_role_%'; \
+         SELECT count(*) FROM pg_group WHERE groname LIKE 'scaled_role_%'; \
+         SELECT count(*) FROM pg_auth_members; \
+         SELECT count(*) FROM pg_db_role_setting WHERE setrole <> 0; \
+         SELECT count(*) FROM information_schema.enabled_roles \
+          WHERE role_name LIKE 'scaled_role_%'; \
+         SELECT has_table_privilege('scaled_role_095', 'scaled_role_data', 'SELECT'); \
+         SET SESSION AUTHORIZATION scaled_role_095; \
+         SET ROLE scaled_role_001; \
+         SELECT current_user, value FROM scaled_role_data; \
+         RESET SESSION AUTHORIZATION;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "95",
+            "94",
+            "94",
+            "95",
+            "95",
+            "t",
+            "scaled_role_001|visible through a 95-role graph",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let login = engine.role_login("scaled_role_095").unwrap();
+    assert!(login.slot as usize > 64);
+    assert!(engine.reserve_role_connection(login));
+    assert!(!engine.reserve_role_connection(login));
+    engine.release_role_connection(login.slot);
+    let guc = GucState::new();
+    engine.apply_role_settings(login.slot, &guc).unwrap();
+    assert_eq!(
+        guc.get_owned("application_name").unwrap().as_str(),
+        "scaled-095"
+    );
+
+    for (statement, expected) in [
+        ("CREATE ROLE scaled_role_096", "too many roles (limit 96)"),
+        (
+            "GRANT scaled_role_001 TO scaled_role_095",
+            "too many role memberships (limit 94)",
+        ),
+        (
+            "ALTER ROLE scaled_role_001 SET search_path TO public",
+            "too many role settings (limit 95)",
+        ),
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains(expected),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'scaled_role_%'; \
+         SELECT count(*) FROM pg_auth_members; \
+         SELECT count(*) FROM pg_db_role_setting WHERE setrole <> 0; \
+         SELECT has_table_privilege('scaled_role_095', 'scaled_role_data', 'SELECT'); \
+         SET SESSION AUTHORIZATION scaled_role_095; \
+         SET ROLE scaled_role_001; \
+         SELECT value FROM scaled_role_data;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["95", "94", "95", "t", "visible through a 95-role graph",],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn configured_acl_capacities_exceed_legacy_limits_and_survive_object_cold_recovery() {
+    use core::fmt::Write;
+
+    const USER_ROLES: usize = 75;
+    const OBJECT_TABLES: usize = 9;
+    const OBJECT_GRANTEES: usize = 60;
+    const OBJECT_ACLS: usize = 3 + 1 + OBJECT_TABLES * (OBJECT_GRANTEES + 1);
+    const COLUMN_ACLS: usize = USER_ROLES * 14;
+    const DEFAULT_ACLS: usize = 5 * 60 - 4;
+    const PARAMETER_ACLS: usize = 3 * (60 + 1);
+
+    let mut config = test_config("configured-acl-capacities");
+    config.max_tables = OBJECT_TABLES + 2;
+    config.max_ddl_per_transaction = 256;
+    config.max_roles = USER_ROLES + 1;
+    config.max_acl_entries = OBJECT_ACLS;
+    config.max_column_acl_entries = COLUMN_ACLS;
+    config.max_default_acl_entries = DEFAULT_ACLS;
+    config.max_parameter_acl_entries = PARAMETER_ACLS;
+    config.wal_buffer_bytes = 8 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("acl-capacities-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut run_batches = |sql: &str, statements_per_batch: usize| {
+        let mut batch = String::new();
+        for (index, statement) in sql.lines().enumerate() {
+            batch.push_str(statement);
+            batch.push('\n');
+            if (index + 1) % statements_per_batch == 0 {
+                let output = run_with_ddl_capacity(
+                    &mut engine,
+                    &mut budget,
+                    &batch,
+                    config.max_ddl_per_transaction,
+                    16 << 20,
+                );
+                assert!(
+                    !message_types(&output).contains(&b'E'),
+                    "{}",
+                    String::from_utf8_lossy(&output)
+                );
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            let output = run_with_ddl_capacity(
+                &mut engine,
+                &mut budget,
+                &batch,
+                config.max_ddl_per_transaction,
+                16 << 20,
+            );
+            assert!(
+                !message_types(&output).contains(&b'E'),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    };
+
+    let mut roles = String::new();
+    for role in 1..=USER_ROLES {
+        writeln!(roles, "CREATE ROLE scaled_acl_role_{role:03};").unwrap();
+    }
+    run_batches(&roles, 32);
+
+    let mut definitions = String::new();
+    for table in 0..OBJECT_TABLES {
+        writeln!(
+            definitions,
+            "CREATE TABLE scaled_acl_object_{table}(value integer);"
+        )
+        .unwrap();
+    }
+    definitions.push_str("CREATE TABLE scaled_acl_columns (");
+    for column in 1..=15 {
+        if column != 1 {
+            definitions.push(',');
+        }
+        write!(definitions, "c{column:02} integer").unwrap();
+    }
+    definitions.push_str(");\nCREATE TABLE scaled_acl_overflow(value integer);\n");
+    run_batches(&definitions, 32);
+
+    let role_list = |last: usize| {
+        let mut names = String::new();
+        for role in 1..=last {
+            if role != 1 {
+                names.push(',');
+            }
+            write!(names, "scaled_acl_role_{role:03}").unwrap();
+        }
+        names
+    };
+    let object_roles = role_list(OBJECT_GRANTEES);
+    let sixty_roles = role_list(60);
+
+    let mut column_grants = String::new();
+    for role in 1..=USER_ROLES {
+        write!(column_grants, "GRANT SELECT (").unwrap();
+        for column in 1..=14 {
+            if column != 1 {
+                column_grants.push(',');
+            }
+            write!(column_grants, "c{column:02}").unwrap();
+        }
+        writeln!(
+            column_grants,
+            ") ON scaled_acl_columns TO scaled_acl_role_{role:03};"
+        )
+        .unwrap();
+    }
+    run_batches(&column_grants, 16);
+
+    let mut object_grants = String::new();
+    for table in 0..OBJECT_TABLES {
+        writeln!(
+            object_grants,
+            "GRANT SELECT ON scaled_acl_object_{table} TO {object_roles};"
+        )
+        .unwrap();
+    }
+    run_batches(&object_grants, 3);
+
+    let mut default_grants = String::new();
+    for owner in 1..=5 {
+        writeln!(
+            default_grants,
+            "ALTER DEFAULT PRIVILEGES FOR ROLE scaled_acl_role_{owner:03} \
+             GRANT SELECT ON TABLES TO {sixty_roles};"
+        )
+        .unwrap();
+    }
+    run_batches(&default_grants, 4);
+
+    let parameters = run_with_ddl_capacity(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "GRANT SET ON PARAMETER event_triggers, search_path, application_name TO {sixty_roles}"
+        ),
+        config.max_ddl_per_transaction,
+        16 << 20,
+    );
+    assert!(
+        !message_types(&parameters).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&parameters)
+    );
+    assert_eq!(engine.storage.acl_entry_count(), OBJECT_ACLS);
+    assert_eq!(engine.storage.column_acl_entry_count(), COLUMN_ACLS);
+    assert_eq!(engine.storage.default_acl_entry_count(), DEFAULT_ACLS);
+    assert_eq!(engine.storage.parameter_acl_entry_count(), PARAMETER_ACLS);
+
+    let catalog = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "SELECT sum(cardinality(relacl)) FROM pg_class
+           WHERE relname LIKE 'scaled_acl_object_%';
+         SELECT sum(cardinality(attacl)) FROM pg_attribute
+           WHERE attrelid = 'scaled_acl_columns'::regclass AND attnum > 0;
+         SELECT count(*), sum(cardinality(defaclacl)) FROM pg_default_acl;
+         SELECT count(*), sum(cardinality(paracl)) FROM pg_parameter_acl;
+         SELECT count(*) FROM information_schema.column_privileges
+           WHERE table_name = 'scaled_acl_columns'
+             AND grantee LIKE 'scaled_acl_role_%';",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&catalog),
+        ["549", "1050", "5|300", "3|183", "1050"],
+        "{}",
+        String::from_utf8_lossy(&catalog)
+    );
+
+    for (statement, expected) in [
+        (
+            "GRANT SELECT ON scaled_acl_overflow TO scaled_acl_role_001",
+            "too many object privilege entries (limit 553)",
+        ),
+        (
+            "GRANT SELECT (c15) ON scaled_acl_columns TO scaled_acl_role_001",
+            "too many column privilege entries (limit 1050)",
+        ),
+        (
+            "ALTER DEFAULT PRIVILEGES FOR ROLE scaled_acl_role_006 \
+             GRANT SELECT ON TABLES TO scaled_acl_role_001, scaled_acl_role_002, \
+             scaled_acl_role_003, scaled_acl_role_004, scaled_acl_role_005",
+            "too many default privilege entries (limit 296)",
+        ),
+        (
+            "GRANT SET ON PARAMETER statement_timeout TO scaled_acl_role_001",
+            "too many parameter privilege entries (limit 183)",
+        ),
+    ] {
+        let output = run_with_ddl_capacity(
+            &mut engine,
+            &mut budget,
+            statement,
+            config.max_ddl_per_transaction,
+            1 << 20,
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains(expected),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let cold = run_with_arena_bytes(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT sum(cardinality(relacl)) FROM pg_class
+           WHERE relname LIKE 'scaled_acl_object_%';
+         SELECT sum(cardinality(attacl)) FROM pg_attribute
+           WHERE attrelid = 'scaled_acl_columns'::regclass AND attnum > 0;
+         SELECT count(*), sum(cardinality(defaclacl)) FROM pg_default_acl;
+         SELECT count(*), sum(cardinality(paracl)) FROM pg_parameter_acl;
+         SELECT has_table_privilege(
+           'scaled_acl_role_060', 'scaled_acl_object_8', 'SELECT'),
+         has_column_privilege(
+           'scaled_acl_role_075', 'scaled_acl_columns', 'c14', 'SELECT'),
+         has_parameter_privilege(
+           'scaled_acl_role_060', 'application_name', 'SET');",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&cold),
+        ["549", "1050", "5|300", "3|183", "t|t|t"],
+        "{}",
+        String::from_utf8_lossy(&cold)
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

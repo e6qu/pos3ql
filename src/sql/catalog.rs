@@ -9861,7 +9861,9 @@ fn acl<'a>(
     if !has_entries {
         return Ok(Datum::Null);
     }
-    let mut values = [Datum::Null; crate::storage::MAX_ACL_ENTRIES + 1];
+    let values = arena
+        .alloc_slice_with(storage.acl_entry_count() + 1, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     let owner_name = catalog_owner_name(storage, catalog_owner(storage, object, txid), txid);
     let all = match object.class {
         crate::storage::AccessClass::Table
@@ -10138,7 +10140,9 @@ fn column_acl<'a>(
     if !has_entries {
         return Ok(Datum::Null);
     }
-    let mut values = [Datum::Null; crate::storage::MAX_COLUMN_ACL_ENTRIES];
+    let values = arena
+        .alloc_slice_with(storage.column_acl_entry_count(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for (slot, entry) in storage.column_acl_entries() {
         if entry.target != target {
@@ -10203,8 +10207,9 @@ fn pg_parameter_acl<'a>(
             ("paracl", ColType::Array(super::types::ArrElem::AclItem)),
         ],
     );
-    let mut rows: [&[Datum]; crate::storage::MAX_PARAMETER_ACL_ENTRIES] =
-        [&[]; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+    let rows = arena
+        .alloc_slice_with(storage.parameter_acl_entry_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut row_count = 0usize;
     for (slot, entry) in storage.parameter_acl_entries_visible(txid) {
         let parameter = entry.parameter;
@@ -10215,7 +10220,13 @@ fn pg_parameter_acl<'a>(
         {
             continue;
         }
-        let mut values = [Datum::Null; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+        let value_capacity = storage
+            .parameter_acl_entries_visible(txid)
+            .filter(|(_, candidate)| candidate.parameter == parameter)
+            .count();
+        let values = arena
+            .alloc_slice_with(value_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let mut count = 0usize;
         for (candidate_slot, candidate) in storage.parameter_acl_entries_visible(txid) {
             if candidate.parameter != parameter {
@@ -10281,8 +10292,7 @@ fn pg_default_acl<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     use crate::storage::{
-        DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, MAX_DEFAULT_ACL_ENTRIES, MAX_ROLES,
-        PUBLIC_ROLE, PrivilegeSet,
+        DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, PUBLIC_ROLE, PrivilegeSet,
     };
     use core::fmt::Write;
 
@@ -10297,7 +10307,9 @@ fn pg_default_acl<'a>(
             ("defaclacl", ColType::Array(super::types::ArrElem::AclItem)),
         ],
     );
-    let mut rows: [&[Datum]; MAX_DEFAULT_ACL_ENTRIES] = [&[]; MAX_DEFAULT_ACL_ENTRIES];
+    let rows = arena
+        .alloc_slice_with(storage.default_acl_entry_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut row_count = 0usize;
 
     for (entry_slot, entry) in storage.default_acl_entries() {
@@ -10323,10 +10335,12 @@ fn pg_default_acl<'a>(
         {
             continue;
         }
-        let mut acl_values = [Datum::Null; MAX_ROLES + 1];
+        let acl_values = arena
+            .alloc_slice_with(storage.role_count() + 1, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let mut acl_count = 0usize;
-        for role_index in 0..=MAX_ROLES {
-            let grantee = if role_index == MAX_ROLES {
+        for role_index in 0..=storage.role_count() {
+            let grantee = if role_index == storage.role_count() {
                 PUBLIC_ROLE
             } else {
                 if !storage.role(role_index).visible_to(txid) {
@@ -30195,11 +30209,24 @@ fn pg_group<'a>(
             ("grolist", ColType::Array(super::types::ArrElem::Oid)),
         ],
     );
-    let mut rows: [&[Datum]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()] =
-        [&[]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()];
+    let rows = arena
+        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     let mut append = |oid: i32, name: &str, slot: Option<usize>| -> Result<(), SqlError> {
-        let mut members = [Datum::Null; crate::storage::MAX_ROLE_MEMBERSHIPS];
+        let member_capacity = slot.map_or(0, |slot| {
+            (0..storage.role_membership_count())
+                .filter(|&membership_slot| {
+                    let membership = storage.role_membership(membership_slot);
+                    membership.visible_to(txid) && usize::from(membership.role) == slot
+                })
+                .count()
+        });
+        let members = arena
+            .alloc_slice_with(member_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let mut member_count = 0usize;
         if let Some(slot) = slot {
             for membership_slot in 0..storage.role_membership_count() {
@@ -30281,7 +30308,19 @@ fn pg_shadow<'a>(
             _ => return Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid role OID")),
         };
         let role_slot = (0..storage.role_count()).find(|slot| Storage::role_oid(*slot) == role_oid);
-        let mut configs = [Datum::Null; crate::storage::MAX_ROLE_SETTINGS];
+        let config_capacity = role_slot.map_or(0, |role_slot| {
+            use crate::storage::RoleSettingScope;
+            storage
+                .role_settings()
+                .filter(|(_, setting)| {
+                    setting.visible_to(txid)
+                        && setting.scope == RoleSettingScope::RoleAllDatabases(role_slot as u16)
+                })
+                .count()
+        });
+        let configs = arena
+            .alloc_slice_with(config_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let mut config_count = 0usize;
         if let Some(role_slot) = role_slot {
             use crate::storage::RoleSettingScope;
@@ -30352,8 +30391,11 @@ fn pg_roles<'a>(
             ("rolbypassrls", ColType::Bool),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()] =
-        [&[]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()];
+    let output = arena
+        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for &(oid, name) in PREDEFINED_ROLES {
         output[count] = row(
@@ -30475,8 +30517,11 @@ fn pg_authid<'a>(
             ("rolvaliduntil", ColType::Timestamptz),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()] =
-        [&[]; crate::storage::MAX_ROLES + PREDEFINED_ROLES.len()];
+    let output = arena
+        .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for &(oid, name) in PREDEFINED_ROLES {
         output[count] = row(
@@ -30583,8 +30628,9 @@ fn pg_auth_members<'a>(
             ("set_option", ColType::Bool),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLE_MEMBERSHIPS] =
-        [&[]; crate::storage::MAX_ROLE_MEMBERSHIPS];
+    let output = arena
+        .alloc_slice_with(storage.role_membership_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for slot in 0..storage.role_membership_count() {
         let membership = storage.role_membership(slot);
@@ -30614,7 +30660,7 @@ fn pg_db_role_setting<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    use crate::storage::{MAX_ROLE_SETTINGS, RoleSettingScope};
+    use crate::storage::RoleSettingScope;
     use core::fmt::Write;
     let definition = def_of(
         "pg_db_role_setting",
@@ -30625,16 +30671,24 @@ fn pg_db_role_setting<'a>(
         ],
     );
     let output = arena
-        .alloc_slice_with(MAX_ROLE_SETTINGS, |_| &[] as &[Datum])
+        .alloc_slice_with(storage.role_setting_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    let mut processed = [false; MAX_ROLE_SETTINGS];
+    let processed = arena
+        .alloc_slice_with(storage.role_setting_count(), |_| false)
+        .map_err(|_| arena_full())?;
     let mut output_count = 0usize;
     for (slot, setting) in storage.role_settings() {
         if processed[slot] || !setting.visible_to(txid) {
             continue;
         }
         let scope = setting.scope;
-        let mut values = [Datum::Null; MAX_ROLE_SETTINGS];
+        let value_capacity = storage
+            .role_settings()
+            .filter(|(_, candidate)| candidate.visible_to(txid) && candidate.scope == scope)
+            .count();
+        let values = arena
+            .alloc_slice_with(value_capacity, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         let mut value_count = 0usize;
         for (candidate_slot, candidate) in storage.role_settings() {
             if candidate.visible_to(txid) && candidate.scope == scope {
@@ -31982,7 +32036,7 @@ fn info_routine_privileges<'a>(
             ("is_grantable", ColType::Text),
         ],
     );
-    let capacity = storage.routine_count() + crate::storage::MAX_ACL_ENTRIES;
+    let capacity = storage.routine_count() + storage.acl_entry_count();
     let output = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -33443,8 +33497,13 @@ fn info_usage_privileges<'a>(
             ("is_grantable", ColType::Text),
         ],
     );
-    const MAX_ROWS: usize = 512 + crate::storage::MAX_ACL_ENTRIES;
-    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let capacity = storage
+        .sequence_count()
+        .saturating_add(storage.domain_count().saturating_mul(2))
+        .saturating_add(storage.acl_entry_count());
+    let output = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     let mut append = |object: crate::storage::AccessObject,
                       object_type: &str,
@@ -33458,7 +33517,7 @@ fn info_usage_privileges<'a>(
         if count == output.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "usage_privileges exceeds static capacity"
+                "usage_privileges exceeds its catalog-derived capacity"
             ));
         }
         let (schema, name) = storage.access_object_name_to(object, txid);
@@ -33574,8 +33633,15 @@ fn info_relation_privileges<'a>(
             ("with_hierarchy", ColType::Text),
         ],
     );
-    const MAX_ROWS: usize = 8 * (512 + crate::storage::MAX_ACL_ENTRIES);
-    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let capacity = 8usize.saturating_mul(
+        storage
+            .table_count()
+            .saturating_add(storage.view_count())
+            .saturating_add(storage.acl_entry_count()),
+    );
+    let output = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     let mut append = |object: crate::storage::AccessObject,
                       grantor: u16,
@@ -33606,7 +33672,7 @@ fn info_relation_privileges<'a>(
             if count == output.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "table_privileges exceeds static capacity"
+                    "table_privileges exceeds its catalog-derived capacity"
                 ));
             }
             let grantor_name = storage.role_name(grantor as usize, txid);
@@ -34854,7 +34920,9 @@ fn info_enabled_roles<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of("enabled_roles", &[("role_name", ColType::Text)]);
-    let mut output: [&[Datum]; crate::storage::MAX_ROLES] = [&[]; crate::storage::MAX_ROLES];
+    let output = arena
+        .alloc_slice_with(storage.role_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for slot in 0..storage.role_count() {
         if !storage.role(slot).visible_to(txid) || !storage.role_is_enabled(slot as u16, txid) {
@@ -34887,8 +34955,9 @@ fn info_applicable_roles<'a>(
             ("is_grantable", ColType::Text),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_ROLE_MEMBERSHIPS + 1] =
-        [&[]; crate::storage::MAX_ROLE_MEMBERSHIPS + 1];
+    let output = arena
+        .alloc_slice_with(storage.role_membership_count() + 1, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     let mut append = |grantee: &str, role: &str, admin: bool| -> Result<(), SqlError> {
         if administrators_only && !admin {

@@ -77,6 +77,13 @@ storage. RAM and local disk are bounded, disposable caches.
   subscription apply, commit scratch, and logical decoding together, so atomic
   catalog operations above the former 64-change boundary remain usable and
   exactly charged before serving.
+- Cluster authorization is startup-sized through independent role,
+  membership, role-setting, object-, column-, default-, and parameter-ACL
+  capacities. Role-reachability and privilege-cascade scratch use those
+  declared bounds without recursion or runtime heap growth. Connection
+  counters, PostgreSQL catalogs and information-schema views, WAL,
+  checkpoints, loud exhaustion, and empty-cache recovery are qualified above
+  the former 64/128/256/512/1,024-entry ceilings.
 - Test qualification now owns and removes engine, object-fixture, and
   performance scratch directories. Storage fault injection corrupts only its
   selected preallocated bytes in place, so repeated full and VOPR runs do not
@@ -86,12 +93,12 @@ storage. RAM and local disk are bounded, disposable caches.
 
 ### Remaining bounded scale limits
 
-Replace the compile-time role, type, ACL, partition-key, constraint,
-and per-object inline ceilings with startup-sized pools or bounded chunked
+Replace the compile-time type, partition-key, constraint, and per-object inline
+ceilings with startup-sized pools or bounded chunked
 structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
 catalog construction, compaction, and garbage collection. Exercise maximum-
-capacity role graphs, partitions, transactions, spill, compaction, garbage
+capacity partitions, transactions, spill, compaction, garbage
 collection, checkpoint retry, and object-cold recovery while checking exact
 startup memory accounting and loud exhaustion.
 

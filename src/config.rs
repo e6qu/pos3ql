@@ -82,6 +82,20 @@ pub struct Config {
     pub max_schemas: usize,
     /// Fixed number of sequence catalog slots across all databases.
     pub max_sequences: usize,
+    /// Fixed number of cluster-wide role catalog slots, including `postgres`.
+    pub max_roles: usize,
+    /// Fixed number of cluster-wide role-membership catalog slots.
+    pub max_role_memberships: usize,
+    /// Fixed number of per-role and per-database setting catalog slots.
+    pub max_role_settings: usize,
+    /// Fixed number of object-level privilege rows.
+    pub max_acl_entries: usize,
+    /// Fixed number of column-level privilege rows.
+    pub max_column_acl_entries: usize,
+    /// Fixed number of altered-default-privilege rows.
+    pub max_default_acl_entries: usize,
+    /// Fixed number of server-parameter privilege rows.
+    pub max_parameter_acl_entries: usize,
     /// Fixed number of named index catalog slots. Physical acceleration
     /// bindings draw separately from `max_value_indexes`.
     pub max_indexes: usize,
@@ -298,6 +312,13 @@ impl Config {
             max_databases: 32,
             max_schemas: 32,
             max_sequences: 64,
+            max_roles: 64,
+            max_role_memberships: 256,
+            max_role_settings: 128,
+            max_acl_entries: 512,
+            max_column_acl_entries: 1024,
+            max_default_acl_entries: 256,
+            max_parameter_acl_entries: 128,
             max_indexes: 32,
             max_views: 32,
             max_materialized_views: 32,
@@ -560,6 +581,34 @@ impl Config {
                 }
                 "max_sequences" => {
                     config.max_sequences =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_roles" => {
+                    config.max_roles =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_role_memberships" => {
+                    config.max_role_memberships =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_role_settings" => {
+                    config.max_role_settings =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_acl_entries" => {
+                    config.max_acl_entries =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_column_acl_entries" => {
+                    config.max_column_acl_entries =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_default_acl_entries" => {
+                    config.max_default_acl_entries =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_parameter_acl_entries" => {
+                    config.max_parameter_acl_entries =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_indexes" => {
@@ -936,6 +985,13 @@ impl Config {
             config.max_tables,
             config.max_schemas,
             config.max_sequences,
+            config.max_roles,
+            config.max_role_memberships,
+            config.max_role_settings,
+            config.max_acl_entries,
+            config.max_column_acl_entries,
+            config.max_default_acl_entries,
+            config.max_parameter_acl_entries,
             config.max_indexes,
             config.max_views,
             config.max_materialized_views,
@@ -969,6 +1025,12 @@ impl Config {
             return Err(ConfigError::at(
                 0,
                 "max_schemas must reserve the three built-in public schemas".to_string(),
+            ));
+        }
+        if config.max_acl_entries < 3 {
+            return Err(ConfigError::at(
+                0,
+                "max_acl_entries must reserve the three built-in public-schema grants".to_string(),
             ));
         }
         if config.max_tablespaces < 2 {
@@ -1075,6 +1137,50 @@ impl Config {
                     crate::storage::MAX_SEQUENCE_CATALOG_SLOTS
                 ),
             ));
+        }
+        for (name, capacity, maximum) in [
+            (
+                "max_roles",
+                config.max_roles,
+                crate::storage::MAX_ROLE_CATALOG_SLOTS,
+            ),
+            (
+                "max_role_memberships",
+                config.max_role_memberships,
+                crate::storage::MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS,
+            ),
+            (
+                "max_role_settings",
+                config.max_role_settings,
+                crate::storage::MAX_ROLE_SETTING_CATALOG_SLOTS,
+            ),
+            (
+                "max_acl_entries",
+                config.max_acl_entries,
+                crate::storage::MAX_ACL_CATALOG_SLOTS,
+            ),
+            (
+                "max_column_acl_entries",
+                config.max_column_acl_entries,
+                crate::storage::MAX_COLUMN_ACL_CATALOG_SLOTS,
+            ),
+            (
+                "max_default_acl_entries",
+                config.max_default_acl_entries,
+                crate::storage::MAX_DEFAULT_ACL_CATALOG_SLOTS,
+            ),
+            (
+                "max_parameter_acl_entries",
+                config.max_parameter_acl_entries,
+                crate::storage::MAX_PARAMETER_ACL_CATALOG_SLOTS,
+            ),
+        ] {
+            if capacity > maximum {
+                return Err(ConfigError::at(
+                    0,
+                    format!("{name} exceeds the {maximum}-slot catalog representation"),
+                ));
+            }
         }
         if config.foreign_receive_bytes == 0 || config.foreign_send_bytes == 0 {
             return Err(ConfigError::at(
@@ -1249,6 +1355,13 @@ max_rules = 19
 max_databases = 48
 max_schemas = 200
 max_sequences = 300
+max_roles = 400
+max_role_memberships = 900
+max_role_settings = 700
+max_acl_entries = 800
+max_column_acl_entries = 1200
+max_default_acl_entries = 500
+max_parameter_acl_entries = 300
 memtable_bytes = 16MiB   # small for tests
 temporary_spill_bytes = 32MiB
 checkpoint_manifest_bytes = 2MiB
@@ -1266,6 +1379,13 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_databases, 48);
         assert_eq!(c.max_schemas, 200);
         assert_eq!(c.max_sequences, 300);
+        assert_eq!(c.max_roles, 400);
+        assert_eq!(c.max_role_memberships, 900);
+        assert_eq!(c.max_role_settings, 700);
+        assert_eq!(c.max_acl_entries, 800);
+        assert_eq!(c.max_column_acl_entries, 1200);
+        assert_eq!(c.max_default_acl_entries, 500);
+        assert_eq!(c.max_parameter_acl_entries, 300);
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.temporary_spill_bytes, 32 * MIB);
         assert_eq!(c.checkpoint_manifest_bytes, 2 * MIB);
@@ -1396,6 +1516,14 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_databases = 2\n").is_err());
         assert!(Config::parse("max_schemas = 2\n").is_err());
         assert!(Config::parse("max_sequences = 0\n").is_err());
+        assert!(Config::parse("max_roles = 0\n").is_err());
+        assert!(Config::parse("max_role_memberships = 0\n").is_err());
+        assert!(Config::parse("max_role_settings = 0\n").is_err());
+        assert!(Config::parse("max_acl_entries = 0\n").is_err());
+        assert!(Config::parse("max_acl_entries = 2\n").is_err());
+        assert!(Config::parse("max_column_acl_entries = 0\n").is_err());
+        assert!(Config::parse("max_default_acl_entries = 0\n").is_err());
+        assert!(Config::parse("max_parameter_acl_entries = 0\n").is_err());
         assert!(Config::parse("max_indexes = 0\n").is_err());
         for name in [
             "max_views",
@@ -1471,6 +1599,19 @@ sql_arena_bytes = 4096
         let error = Config::parse("max_sequences = 5001\n").unwrap_err();
         assert!(error.message.contains("5000-slot sequence OID range"));
         Config::parse("max_sequences = 5000\n").unwrap();
+        for name in [
+            "max_roles",
+            "max_role_memberships",
+            "max_role_settings",
+            "max_acl_entries",
+            "max_column_acl_entries",
+            "max_default_acl_entries",
+            "max_parameter_acl_entries",
+        ] {
+            let error = Config::parse(&format!("{name} = 65536\n")).unwrap_err();
+            assert!(error.message.contains("65535-slot"), "{name}: {error}");
+            Config::parse(&format!("{name} = 65535\n")).unwrap();
+        }
     }
 
     #[test]

@@ -6898,32 +6898,22 @@ pub fn alter_role_setting(
             stage_role_setting(storage, wal, txn, scope, name, value)
         }
         crate::sql::ast::RoleSettingAction::Reset(name) => {
-            let mut slots = [usize::MAX; crate::storage::MAX_ROLE_SETTINGS];
-            let mut count = 0usize;
-            for (slot, setting) in storage.role_settings() {
-                if setting.visible_to(txn.txid)
-                    && setting.scope == scope
-                    && name.is_none_or(|name| setting.name.as_str().eq_ignore_ascii_case(name))
+            let mut result = Ok(());
+            loop {
+                let next = storage.role_settings().find_map(|(slot, setting)| {
+                    (setting.visible_to(txn.txid)
+                        && setting.scope == scope
+                        && name.is_none_or(|name| setting.name.as_str().eq_ignore_ascii_case(name)))
+                    .then_some((slot, *setting))
+                });
+                let Some((_, setting)) = next else { break };
+                if let Err(error) = stage_role_setting(storage, wal, txn, scope, setting.name, None)
                 {
-                    slots[count] = slot;
-                    count += 1;
+                    result = Err(error);
+                    break;
                 }
             }
-            if name.is_some() && count == 0 {
-                Ok(())
-            } else {
-                let mut result = Ok(());
-                for &slot in &slots[..count] {
-                    let setting = *storage.role_setting(slot);
-                    if let Err(error) =
-                        stage_role_setting(storage, wal, txn, scope, setting.name, None)
-                    {
-                        result = Err(error);
-                        break;
-                    }
-                }
-                result
-            }
+            result
         }
     };
     if let Err(error) = result {
@@ -7273,21 +7263,16 @@ pub fn drop_role(
                 return sql_fail(error);
             }
         }
-        let mut setting_slots = [usize::MAX; crate::storage::MAX_ROLE_SETTINGS];
-        let mut setting_count = 0usize;
-        for (setting_slot, setting) in storage.role_settings() {
-            if setting.visible_to(txn.txid)
-                && setting
-                    .scope
-                    .role()
-                    .is_some_and(|role| role as usize == slot)
-            {
-                setting_slots[setting_count] = setting_slot;
-                setting_count += 1;
-            }
-        }
-        for &setting_slot in &setting_slots[..setting_count] {
-            let setting = *storage.role_setting(setting_slot);
+        loop {
+            let setting = storage.role_settings().find_map(|(_, setting)| {
+                (setting.visible_to(txn.txid)
+                    && setting
+                        .scope
+                        .role()
+                        .is_some_and(|role| role as usize == slot))
+                .then_some(*setting)
+            });
+            let Some(setting) = setting else { break };
             if let Err(error) =
                 stage_role_setting(storage, wal, txn, setting.scope, setting.name, None)
             {
@@ -7485,8 +7470,8 @@ pub fn grant_role(
         current_slot
     };
     let grantor_superuser = storage.role(grantor).attributes_to(txn.txid).superuser;
-    let mut role_slots = [0usize; crate::storage::MAX_ROLES];
-    let mut member_slots = [0usize; crate::storage::MAX_ROLES];
+    let mut role_slots = [0usize; crate::sql::parser::MAX_LIST];
+    let mut member_slots = [0usize; crate::sql::parser::MAX_LIST];
     for (index, written) in roles.iter().enumerate() {
         let resolved = resolve_role_name(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
@@ -7592,6 +7577,7 @@ pub fn revoke_role(
     wal: &mut Wal,
     txn: &mut TxnState,
     request: RevokeRoleRequest<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let RevokeRoleRequest {
@@ -7761,7 +7747,8 @@ pub fn revoke_role(
             }
             if loses_admin
                 && cascade
-                && let Err(error) = cascade_role_membership_grants(storage, wal, txn, role, member)
+                && let Err(error) =
+                    cascade_role_membership_grants(storage, wal, txn, role, member, arena)
             {
                 return sql_fail(error);
             }
@@ -7777,9 +7764,17 @@ fn cascade_role_membership_grants(
     txn: &mut TxnState,
     role: usize,
     first_grantor: usize,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
-    let mut queue = [0u16; crate::storage::MAX_ROLES];
-    let mut queued = [false; crate::storage::MAX_ROLES];
+    let queue = arena
+        .alloc_slice_with(storage.role_count(), |_| 0u16)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let queued = arena
+        .alloc_slice_with(storage.role_count(), |_| false)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let dependent = arena
+        .alloc_slice_with(storage.role_membership_count(), |_| usize::MAX)
+        .map_err(|_| super::query::arena_full_pub())?;
     queue[0] = first_grantor as u16;
     queued[first_grantor] = true;
     let mut at = 0usize;
@@ -7787,7 +7782,6 @@ fn cascade_role_membership_grants(
     while at < count {
         let lost_grantor = queue[at] as usize;
         at += 1;
-        let mut dependent = [usize::MAX; crate::storage::MAX_ROLE_MEMBERSHIPS];
         let mut dependent_count = 0usize;
         for slot in 0..storage.role_membership_count() {
             let membership = storage.role_membership(slot);
@@ -7998,7 +7992,7 @@ pub fn alter_default_privileges(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::{DefaultPrivilegeAction, DefaultPrivilegeObjectKind};
-    use crate::storage::{DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, MAX_ROLES, PUBLIC_ROLE};
+    use crate::storage::{DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, PUBLIC_ROLE};
 
     let (privileges, kind, grantees, grant, grant_option_only, grant_option) = match action {
         DefaultPrivilegeAction::Grant {
@@ -8037,7 +8031,7 @@ pub fn alter_default_privileges(
     };
     let current_superuser = storage.role(current).attributes_to(txn.txid).superuser;
 
-    let mut owner_slots = [0u16; MAX_ROLES];
+    let mut owner_slots = [0u16; crate::sql::parser::MAX_LIST];
     let owner_count = if roles.is_empty() {
         owner_slots[0] = current as u16;
         1
@@ -8161,8 +8155,7 @@ fn apply_default_privileges_to_new_object(
     object: crate::storage::AccessObject,
 ) -> Result<(), SqlError> {
     use crate::storage::{
-        AccessClass, DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, MAX_ROLES, PUBLIC_ROLE,
-        PrivilegeSet,
+        AccessClass, DEFAULT_ACL_ALL_SCHEMAS, DefaultPrivilegeClass, PUBLIC_ROLE, PrivilegeSet,
     };
     let class = match object.class {
         AccessClass::Table | AccessClass::View | AccessClass::MaterializedView => {
@@ -8212,7 +8205,7 @@ fn apply_default_privileges_to_new_object(
     // PostgreSQL places a customized PUBLIC default before the owner entry,
     // followed by named grantees. Preserve that construction order because
     // aclitem arrays expose it, unlike grants made after object creation.
-    for role_index in 0..MAX_ROLES + 2 {
+    for role_index in 0..storage.role_count() + 2 {
         let grantee = match role_index {
             0 => PUBLIC_ROLE,
             1 => owner,
@@ -8262,7 +8255,7 @@ fn resolve_owned_roles(
     storage: &Storage,
     txid: u32,
     names: &[&str],
-    output: &mut [u16; crate::storage::MAX_ROLES],
+    output: &mut [u16],
 ) -> Result<usize, SqlError> {
     let current_name = super::eval::funcs::system::current_user_owned();
     let current = storage
@@ -8310,8 +8303,8 @@ pub fn reassign_owned(
     new_owner: &str,
     responder: &mut Responder,
 ) -> Outcome {
-    use crate::storage::{AccessClass, AccessObject, MAX_ROLES};
-    let mut source_roles = [0u16; MAX_ROLES];
+    use crate::storage::{AccessClass, AccessObject};
+    let mut source_roles = [0u16; crate::sql::parser::MAX_LIST];
     let source_count = match resolve_owned_roles(storage, txn.txid, roles, &mut source_roles) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
@@ -8592,14 +8585,40 @@ fn drop_owned_privileges(
     storage: &mut Storage,
     txn: &mut TxnState,
     roles: &[u16],
+    arena: &Arena,
 ) -> Result<(), SqlError> {
-    use crate::storage::{MAX_ACL_ENTRIES, PUBLIC_ROLE, PrivilegeSet};
-    let mut queue_objects = [crate::storage::AccessObject {
-        class: crate::storage::AccessClass::Table,
-        slot: 0,
-    }; MAX_ACL_ENTRIES];
-    let mut queue_roles = [0u16; MAX_ACL_ENTRIES];
-    let mut queue_privileges = [PrivilegeSet::NONE; MAX_ACL_ENTRIES];
+    use crate::storage::{PUBLIC_ROLE, PrivilegeSet};
+    let graph_capacity = storage.acl_entry_count().max(1);
+    let queue_objects = arena
+        .alloc_slice_with(graph_capacity, |_| crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Table,
+            slot: 0,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let queue_roles = arena
+        .alloc_slice_with(graph_capacity, |_| 0u16)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let queue_privileges = arena
+        .alloc_slice_with(graph_capacity, |_| PrivilegeSet::NONE)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let dependent = arena
+        .alloc_slice_with(graph_capacity, |_| 0usize)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let column_capacity = storage.column_acl_entry_count().max(1);
+    let column_dependent = arena
+        .alloc_slice_with(column_capacity, |_| 0usize)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let column_queue_roles = arena
+        .alloc_slice_with(column_capacity, |_| 0u16)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let column_queue_privileges = arena
+        .alloc_slice_with(column_capacity, |_| PrivilegeSet::NONE)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let mut column_scratch = ColumnAclCascadeScratch {
+        dependent: column_dependent,
+        roles: column_queue_roles,
+        privileges: column_queue_privileges,
+    };
     let mut queue_count = 0usize;
 
     for slot in 0..storage.acl_entry_count() {
@@ -8614,11 +8633,11 @@ fn drop_owned_privileges(
         }
         let lost_options = record_acl_removal(storage, txn, slot)?;
         if grantee != PUBLIC_ROLE && lost_options.0 != 0 {
-            if queue_count == MAX_ACL_ENTRIES {
+            if queue_count == queue_objects.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "privilege dependency graph exceeds {} entries",
-                    MAX_ACL_ENTRIES
+                    queue_objects.len()
                 ));
             }
             queue_objects[queue_count] = entry.object;
@@ -8628,14 +8647,13 @@ fn drop_owned_privileges(
         }
     }
     let mut at = 0usize;
-    let mut dependent = [0usize; MAX_ACL_ENTRIES];
     while at < queue_count {
         let object = queue_objects[at];
         let grantor = queue_roles[at];
         let lost = queue_privileges[at];
         at += 1;
         let dependent_count =
-            storage.dependent_acl_slots(object, grantor, lost, txn.txid, &mut dependent);
+            storage.dependent_acl_slots(object, grantor, lost, txn.txid, &mut *dependent);
         for slot in dependent[..dependent_count].iter().copied() {
             let entry = *storage.acl_entry(slot);
             let (grantee, _) = storage.acl_identity(slot, txn.txid);
@@ -8645,11 +8663,11 @@ fn drop_owned_privileges(
             }
             let recursively_lost = record_acl_removal(storage, txn, slot)?;
             if grantee != PUBLIC_ROLE && recursively_lost.0 != 0 {
-                if queue_count == MAX_ACL_ENTRIES {
+                if queue_count == queue_objects.len() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "privilege dependency graph exceeds {} entries",
-                        MAX_ACL_ENTRIES
+                        queue_objects.len()
                     ));
                 }
                 queue_objects[queue_count] = entry.object;
@@ -8678,6 +8696,7 @@ fn drop_owned_privileges(
             grantee,
             grant_options,
             true,
+            &mut column_scratch,
         )?;
         let (changed, prior) = storage.change_column_acl(
             entry.target,
@@ -8748,16 +8767,15 @@ pub fn drop_owned(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{
-        AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS,
-        MAX_PUBLICATION_SCHEMAS, MAX_ROLES,
+        AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS, MAX_PUBLICATION_SCHEMAS,
     };
-    let mut owned_roles = [0u16; MAX_ROLES];
+    let mut owned_roles = [0u16; crate::sql::parser::MAX_LIST];
     let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
     let owned_roles = &owned_roles[..owned_role_count];
-    if let Err(error) = drop_owned_privileges(storage, txn, owned_roles) {
+    if let Err(error) = drop_owned_privileges(storage, txn, owned_roles, arena) {
         return sql_fail(error);
     }
 
@@ -9518,7 +9536,7 @@ pub fn drop_owned(
 }
 
 fn add_privilege_object(
-    objects: &mut [crate::storage::AccessObject; crate::storage::MAX_ACL_ENTRIES],
+    objects: &mut [crate::storage::AccessObject],
     count: &mut usize,
     object: crate::storage::AccessObject,
 ) -> Result<(), SqlError> {
@@ -9537,11 +9555,33 @@ fn add_privilege_object(
     Ok(())
 }
 
+fn privilege_object_capacity(
+    storage: &Storage,
+    target: crate::sql::ast::PrivilegeTarget<'_>,
+) -> usize {
+    use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget};
+    match target {
+        PrivilegeTarget::Parameters(_) => 0,
+        PrivilegeTarget::LargeObjects(oids) => oids.len(),
+        PrivilegeTarget::Routines { identities, .. } => identities.len(),
+        PrivilegeTarget::Objects { kind, names } => match kind {
+            PrivilegeObjectKind::AllTablesInSchema => {
+                storage.table_count().saturating_add(storage.view_count())
+            }
+            PrivilegeObjectKind::AllSequencesInSchema => storage.sequence_count(),
+            PrivilegeObjectKind::AllFunctionsInSchema
+            | PrivilegeObjectKind::AllProceduresInSchema
+            | PrivilegeObjectKind::AllRoutinesInSchema => storage.routine_count(),
+            _ => names.len(),
+        },
+    }
+}
+
 fn resolve_privilege_objects(
     storage: &Storage,
     target: crate::sql::ast::PrivilegeTarget<'_>,
     txid: u32,
-    objects: &mut [crate::storage::AccessObject; crate::storage::MAX_ACL_ENTRIES],
+    objects: &mut [crate::storage::AccessObject],
 ) -> Result<usize, SqlError> {
     use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind};
     use crate::storage::{AccessClass, AccessObject};
@@ -10033,6 +10073,12 @@ fn materialize_public_acl_default(
     Ok(())
 }
 
+struct ColumnAclCascadeScratch<'a> {
+    dependent: &'a mut [usize],
+    roles: &'a mut [u16],
+    privileges: &'a mut [crate::storage::PrivilegeSet],
+}
+
 fn revoke_dependent_column_privileges(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -10040,13 +10086,18 @@ fn revoke_dependent_column_privileges(
     grantor: u16,
     lost_options: crate::storage::PrivilegeSet,
     cascade: bool,
+    scratch: &mut ColumnAclCascadeScratch<'_>,
 ) -> Result<(), SqlError> {
     if lost_options.0 == 0 || grantor == crate::storage::PUBLIC_ROLE {
         return Ok(());
     }
-    let mut dependent = [0usize; crate::storage::MAX_COLUMN_ACL_ENTRIES];
-    let dependent_count =
-        storage.dependent_column_acl_slots(target, grantor, lost_options, txn.txid, &mut dependent);
+    let dependent_count = storage.dependent_column_acl_slots(
+        target,
+        grantor,
+        lost_options,
+        txn.txid,
+        &mut *scratch.dependent,
+    );
     if dependent_count != 0 && !cascade {
         return Err(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -10056,25 +10107,22 @@ fn revoke_dependent_column_privileges(
     if !cascade {
         return Ok(());
     }
-    let mut queue_roles = [0u16; crate::storage::MAX_COLUMN_ACL_ENTRIES];
-    let mut queue_privileges =
-        [crate::storage::PrivilegeSet::NONE; crate::storage::MAX_COLUMN_ACL_ENTRIES];
-    queue_roles[0] = grantor;
-    queue_privileges[0] = lost_options;
+    scratch.roles[0] = grantor;
+    scratch.privileges[0] = lost_options;
     let mut queue_len = 1usize;
     let mut queue_at = 0usize;
     while queue_at < queue_len {
-        let downstream_grantor = queue_roles[queue_at];
-        let lost = queue_privileges[queue_at];
+        let downstream_grantor = scratch.roles[queue_at];
+        let lost = scratch.privileges[queue_at];
         queue_at += 1;
         let dependent_count = storage.dependent_column_acl_slots(
             target,
             downstream_grantor,
             lost,
             txn.txid,
-            &mut dependent,
+            &mut *scratch.dependent,
         );
-        for dependent_slot in &dependent[..dependent_count] {
+        for dependent_slot in &scratch.dependent[..dependent_count] {
             let entry = *storage.column_acl_entry(*dependent_slot);
             let (dependent_grantee, dependent_grantor) =
                 storage.column_acl_identity(*dependent_slot, txn.txid);
@@ -10097,15 +10145,15 @@ fn revoke_dependent_column_privileges(
                 return Err(error);
             }
             if dependent_grantee != crate::storage::PUBLIC_ROLE && recursively_lost.0 != 0 {
-                if queue_len == queue_roles.len() {
+                if queue_len == scratch.roles.len() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "column privilege dependency graph exceeds {} entries",
-                        queue_roles.len()
+                        scratch.roles.len()
                     ));
                 }
-                queue_roles[queue_len] = dependent_grantee;
-                queue_privileges[queue_len] = recursively_lost;
+                scratch.roles[queue_len] = dependent_grantee;
+                scratch.privileges[queue_len] = recursively_lost;
                 queue_len += 1;
             }
         }
@@ -10126,11 +10174,17 @@ pub fn grant_privileges(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{AccessClass, AccessObject, PUBLIC_ROLE};
-    let mut objects = [AccessObject {
-        class: AccessClass::Table,
-        slot: 0,
-    }; crate::storage::MAX_ACL_ENTRIES];
-    let object_count = match resolve_privilege_objects(storage, target, txn.txid, &mut objects) {
+    let objects =
+        match arena.alloc_slice_with(privilege_object_capacity(storage, target).max(1), |_| {
+            AccessObject {
+                class: AccessClass::Table,
+                slot: 0,
+            }
+        }) {
+            Ok(objects) => objects,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
+    let object_count = match resolve_privilege_objects(storage, target, txn.txid, objects) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
@@ -10289,13 +10343,70 @@ pub fn revoke_privileges(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{AccessClass, AccessObject, PUBLIC_ROLE};
-    let mut objects = [AccessObject {
-        class: AccessClass::Table,
-        slot: 0,
-    }; crate::storage::MAX_ACL_ENTRIES];
-    let object_count = match resolve_privilege_objects(storage, target, txn.txid, &mut objects) {
+    let objects =
+        match arena.alloc_slice_with(privilege_object_capacity(storage, target).max(1), |_| {
+            AccessObject {
+                class: AccessClass::Table,
+                slot: 0,
+            }
+        }) {
+            Ok(objects) => objects,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
+    let object_count = match resolve_privilege_objects(storage, target, txn.txid, objects) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
+    };
+    let object_graph_capacity = storage
+        .acl_entry_count()
+        .saturating_add(object_count.saturating_mul(2))
+        .max(1);
+    let dependent = match arena.alloc_slice_with(object_graph_capacity, |_| 0usize) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let queue_roles = match arena.alloc_slice_with(object_graph_capacity, |_| 0u16) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let queue_privileges = match arena.alloc_slice_with(object_graph_capacity, |_| {
+        crate::storage::PrivilegeSet::NONE
+    }) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let column_graph_capacity = storage.column_acl_entry_count().max(1);
+    let targets = match arena.alloc_slice_with(column_graph_capacity, |_| {
+        crate::storage::ColumnPrivilegeTarget::new(
+            AccessObject {
+                class: AccessClass::Table,
+                slot: 0,
+            },
+            0,
+        )
+        .expect("table access objects accept column privileges")
+    }) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let column_dependent = match arena.alloc_slice_with(column_graph_capacity, |_| 0usize) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let column_queue_roles = match arena.alloc_slice_with(column_graph_capacity, |_| 0u16) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let column_queue_privileges = match arena.alloc_slice_with(column_graph_capacity, |_| {
+        crate::storage::PrivilegeSet::NONE
+    }) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let mut column_scratch = ColumnAclCascadeScratch {
+        dependent: column_dependent,
+        roles: column_queue_roles,
+        privileges: column_queue_privileges,
     };
     let current = super::eval::funcs::system::current_user_owned();
     let Some(grantor) = storage.find_role_visible(current.as_str(), txn.txid) else {
@@ -10374,10 +10485,7 @@ pub fn revoke_privileges(
                         | crate::storage::AccessClass::MaterializedView
                 )
             {
-                let mut targets = [crate::storage::ColumnPrivilegeTarget::new(*object, 0)
-                    .expect("table-like access objects accept column privileges");
-                    crate::storage::MAX_COLUMN_ACL_ENTRIES];
-                let target_count = storage.column_acl_targets(*object, txn.txid, &mut targets);
+                let target_count = storage.column_acl_targets(*object, txn.txid, targets);
                 for target in &targets[..target_count] {
                     if let Err(error) = revoke_dependent_column_privileges(
                         storage,
@@ -10386,19 +10494,19 @@ pub fn revoke_privileges(
                         grantee,
                         removed_column_options,
                         cascade,
+                        &mut column_scratch,
                     ) {
                         return sql_fail(error);
                     }
                 }
             }
             if grantee != PUBLIC_ROLE && removed_options.0 != 0 {
-                let mut dependent = [0usize; crate::storage::MAX_ACL_ENTRIES];
                 let dependent_count = storage.dependent_acl_slots(
                     *object,
                     grantee,
                     removed_options,
                     txn.txid,
-                    &mut dependent,
+                    dependent,
                 );
                 if dependent_count != 0 && !cascade {
                     return sql_fail(sql_err!(
@@ -10407,9 +10515,6 @@ pub fn revoke_privileges(
                     ));
                 }
                 if cascade {
-                    let mut queue_roles = [0u16; crate::storage::MAX_ACL_ENTRIES];
-                    let mut queue_privileges =
-                        [crate::storage::PrivilegeSet::NONE; crate::storage::MAX_ACL_ENTRIES];
                     queue_roles[0] = grantee;
                     queue_privileges[0] = removed_options;
                     let mut queue_len = 1usize;
@@ -10423,7 +10528,7 @@ pub fn revoke_privileges(
                             downstream_grantor,
                             lost_options,
                             txn.txid,
-                            &mut dependent,
+                            &mut *dependent,
                         );
                         for dependent_slot in &dependent[..dependent_count] {
                             let entry = *storage.acl_entry(*dependent_slot);
@@ -10531,6 +10636,7 @@ pub fn revoke_privileges(
                         grantee,
                         removed_options,
                         cascade,
+                        &mut column_scratch,
                     ) {
                         return sql_fail(error);
                     }
@@ -10751,6 +10857,12 @@ pub fn grant_parameter_privileges(
     sql_ok()
 }
 
+struct ParameterAclCascadeScratch<'a> {
+    roles: &'a mut [u16],
+    privileges: &'a mut [crate::sql::ast::ParameterPrivileges],
+    dependent: &'a mut [usize],
+}
+
 fn cascade_parameter_acl_grants(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -10758,25 +10870,22 @@ fn cascade_parameter_acl_grants(
     source_role: u16,
     lost: crate::sql::ast::ParameterPrivileges,
     cascade: bool,
+    scratch: &mut ParameterAclCascadeScratch<'_>,
 ) -> Result<(), SqlError> {
-    let mut roles = [0u16; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
-    let mut privileges =
-        [crate::sql::ast::ParameterPrivileges::NONE; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
     let mut count = 1usize;
     let mut at = 0usize;
-    roles[0] = source_role;
-    privileges[0] = lost;
+    scratch.roles[0] = source_role;
+    scratch.privileges[0] = lost;
     while at < count {
-        let grantor = roles[at];
-        let lost = privileges[at];
+        let grantor = scratch.roles[at];
+        let lost = scratch.privileges[at];
         at += 1;
-        let mut dependent = [usize::MAX; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
         let dependent_count = storage.dependent_parameter_acl_slots(
             parameter,
             grantor,
             lost,
             txn.txid,
-            &mut dependent,
+            &mut *scratch.dependent,
         );
         if dependent_count != 0 && !cascade {
             return Err(sql_err!(
@@ -10784,7 +10893,7 @@ fn cascade_parameter_acl_grants(
                 "dependent parameter privileges exist"
             ));
         }
-        for slot in &dependent[..dependent_count] {
+        for slot in &scratch.dependent[..dependent_count] {
             let entry = *storage.parameter_acl_entry(*slot);
             let (grantee, grantor) = storage.parameter_acl_identity(*slot, txn.txid);
             let (old_privileges, old_options) = storage.parameter_acl_state(*slot, txn.txid);
@@ -10815,15 +10924,15 @@ fn cascade_parameter_acl_grants(
                     txn.txid,
                 )
             {
-                if count == roles.len() {
+                if count == scratch.roles.len() {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "parameter privilege dependency graph exceeds {} entries",
-                        roles.len()
+                        scratch.roles.len()
                     ));
                 }
-                roles[count] = grantee;
-                privileges[count] = removed;
+                scratch.roles[count] = grantee;
+                scratch.privileges[count] = removed;
                 count += 1;
             }
         }
@@ -10834,9 +10943,33 @@ fn cascade_parameter_acl_grants(
 pub fn revoke_parameter_privileges(
     storage: &mut Storage,
     txn: &mut TxnState,
+    arena: &Arena,
     command: ParameterRevokeCommand<'_>,
     responder: &mut Responder,
 ) -> Outcome {
+    let graph_capacity = storage
+        .parameter_acl_entry_count()
+        .saturating_add(command.target.names.len())
+        .max(1);
+    let roles = match arena.alloc_slice_with(graph_capacity, |_| 0u16) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let privileges = match arena.alloc_slice_with(graph_capacity, |_| {
+        crate::sql::ast::ParameterPrivileges::NONE
+    }) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let dependent = match arena.alloc_slice_with(graph_capacity, |_| usize::MAX) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let mut scratch = ParameterAclCascadeScratch {
+        roles,
+        privileges,
+        dependent,
+    };
     let grantor = match parameter_acl_grantor(storage, txn, command.target.grantor) {
         Ok(grantor) => grantor,
         Err(error) => return sql_fail(error),
@@ -10920,6 +11053,7 @@ pub fn revoke_parameter_privileges(
                     grantee,
                     removed_options,
                     command.cascade,
+                    &mut scratch,
                 )
             {
                 storage.restore_parameter_acl_pending(slot, prior);
@@ -20969,6 +21103,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         grantor: *grantor,
                         cascade: *cascade,
                     },
+                    context.arena,
                     responder,
                 ),
                 Stmt::GrantPrivileges {
@@ -21037,6 +21172,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 } => super::exec::revoke_parameter_privileges(
                     &mut engine.storage,
                     txn,
+                    context.arena,
                     super::exec::ParameterRevokeCommand {
                         target: super::exec::ParameterPrivilegeTarget {
                             privileges: *privileges,
@@ -49033,20 +49169,15 @@ pub fn alter_database(
         }
         crate::sql::ast::AlterDatabaseAction::Reset(name) => {
             let database = storage.database(slot).oid;
-            let mut targets = [usize::MAX; crate::storage::MAX_ROLE_SETTINGS];
-            let mut count = 0;
-            for (setting_slot, setting) in storage.role_settings() {
-                if setting.visible_to(txn.txid)
-                    && setting.scope
-                        == crate::storage::RoleSettingScope::AllRolesInDatabase(database)
-                    && name.is_none_or(|name| setting.name.as_str().eq_ignore_ascii_case(name))
-                {
-                    targets[count] = setting_slot;
-                    count += 1;
-                }
-            }
-            for target in &targets[..count] {
-                let setting = *storage.role_setting(*target);
+            loop {
+                let setting = storage.role_settings().find_map(|(_, setting)| {
+                    (setting.visible_to(txn.txid)
+                        && setting.scope
+                            == crate::storage::RoleSettingScope::AllRolesInDatabase(database)
+                        && name.is_none_or(|name| setting.name.as_str().eq_ignore_ascii_case(name)))
+                    .then_some(*setting)
+                });
+                let Some(setting) = setting else { break };
                 if let Err(error) =
                     stage_role_setting(storage, wal, txn, setting.scope, setting.name, None)
                 {

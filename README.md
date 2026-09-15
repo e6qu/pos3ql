@@ -21,7 +21,7 @@ With object storage enabled, the server groups transactions completed in one rea
 
 ## Status
 
-The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, full transaction IDs and snapshots, views, materialized views, modeled indexes, sequences, domains, enums, PostgreSQL large objects, full-text search, SQL functions (scalar, `SETOF`, and `TABLE`, including mutable and nested calls), CTEs, joins, windows, COPY, PostgreSQL 18 SQL/JSON and SQL/XML, PostgreSQL 18-interoperable logical-replication publishing and bounded subscription bootstrap/apply, and PostgreSQL catalog introspection used by common clients and dump/restore tools. [The PostgreSQL 18 matrix](docs/postgresql-18-compatibility.md) distinguishes implemented behavior, explicit architecture boundaries, and extension support.
+The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, full transaction IDs and snapshots, views, materialized views, modeled indexes, sequences, domains, enums, PostgreSQL large objects, full-text search, SQL functions (scalar, `SETOF`, and `TABLE`, including mutable and nested calls), CTEs, joins, windows, COPY, PostgreSQL 18 SQL/JSON and SQL/XML, PostgreSQL 18-interoperable logical-replication publishing and bounded subscription bootstrap/apply, and PostgreSQL catalog introspection used by common clients and dump/restore tools. [The PostgreSQL 18 matrix](docs/postgresql-18-compatibility.md) distinguishes implemented behavior, explicit architecture boundaries, and non-goals.
 
 Modeled btree, hash, BRIN, and GiST indexes are physical access paths. Hash indexes execute
 exact single-key probes across plain, expression, partial, prepared, query,
@@ -89,14 +89,26 @@ Major SQL-object catalogs are independently bounded at startup. `max_tables`
 no longer silently sizes indexes, views, materialized views, routines, casts,
 operators, operator families/classes, triggers, or publications; each pool has
 its own configuration and memory-plan charge.
+
 Legacy configurations that specify only `max_tables` keep the historical
 one-slot-per-table defaults. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.
+
 Collations, conversions, text-search objects, event triggers, tablespaces, and
 object comments likewise have independent startup capacities. Their catalog
 queries allocate from the fixed statement arena according to the actual pool,
 and text-search WAL uses a backward-readable 16-bit slot record so identities
 above 255 survive journal and object-cold recovery without truncation.
+
+Checkpoint and temporary-spill bookkeeping is sized from `max_tables`, including
+the internal large-object relation. Checkpoint publication, compare-and-swap
+retry, and empty-cache recovery therefore cover every configured physical table
+slot instead of silently stopping at 1,024. `checkpoint_manifest_bytes` reserves
+the complete serialized catalog image at startup and reports named exhaustion
+before publication. Table, constraint, default, statistics, publication,
+replication, subscription, dependency, trigger, sequence, and information-schema
+catalog builders use their transaction-visible cardinality rather than hidden
+256/512/1,024-row arrays.
 
 SQL/JSON includes first-class `jsonpath`/`jsonpath[]`, strict and lax path execution, path operators and functions, SQL-standard query and construction functions, `JSON_TABLE`, record conversion, SQL/JSON aggregates, and JSONB read/write subscripting. These types and expressions cross text/binary wire, COPY, stored-query, PL/pgSQL, WAL, checkpoint, and object-cold recovery boundaries. [SQL/JSON compatibility and limits](docs/sql-json.md).
 
@@ -255,7 +267,7 @@ psql -h 127.0.0.1 -p 5433 -U you
 - [BUGS.md](BUGS.md) — unresolved, genuinely blocked bugs only
 - [docs/terminology.md](docs/terminology.md) — naming and glossary
 - [docs/object-storage.md](docs/object-storage.md) — direct S3-compatible durability boundary
-- [docs/postgresql-18-compatibility.md](docs/postgresql-18-compatibility.md) — implemented PostgreSQL 18 and extension boundary
+- [docs/postgresql-18-compatibility.md](docs/postgresql-18-compatibility.md) — implemented PostgreSQL 18 and explicit non-goals
 - [docs/performance.md](docs/performance.md) — current single-process and replica scaling boundary
 - [docs/logical-replication.md](docs/logical-replication.md) — PostgreSQL 18 protocol, SQL, monitoring, and architecture boundary
 - [docs/sql-json.md](docs/sql-json.md) — PostgreSQL 18 SQL/JSON, jsonpath, wire, and durability boundary

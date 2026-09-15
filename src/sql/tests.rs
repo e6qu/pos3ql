@@ -48085,6 +48085,221 @@ fn large_independent_catalogs_survive_object_cold_recovery() {
 }
 
 #[test]
+fn checkpoint_manifest_capacity_exhausts_loudly() {
+    let mut config = test_config("checkpoint-manifest-capacity");
+    config.checkpoint_manifest_bytes = 64;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("checkpoint-manifest-capacity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE checkpoint_manifest_row(value integer)",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    let error = engine.checkpoint().unwrap_err();
+    assert!(
+        error
+            .message
+            .as_str()
+            .contains("checkpoint manifest is full; raise checkpoint_manifest_bytes"),
+        "{:?}",
+        error
+    );
+
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn configured_table_capacity_survives_checkpoint_retry_and_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    const TABLES: usize = 1025;
+
+    let mut config = test_config("checkpoint-table-capacity");
+    config.max_connections = 1;
+    // Two spare catalog slots let the dropped identities remain transactionally
+    // observable while their replacements take fresh slots above the old cap.
+    config.max_tables = TABLES + 2;
+    config.table_rows = 1;
+    config.txn_rows = 8;
+    config.memtable_bytes = 16 << 20;
+    config.work_arena_bytes = 256 << 20;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 8 << 20;
+    config.checkpoint_manifest_bytes = 8 << 20;
+    config.object_store_response_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("checkpoint-table-capacity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 41);
+
+    let mut budget = Budget::new(3usize << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for first in (0..TABLES).step_by(32) {
+        let mut create_sql = String::new();
+        for slot in first..(first + 32).min(TABLES) {
+            writeln!(
+                create_sql,
+                "CREATE TABLE checkpoint_slot_{slot}(\
+                    value integer DEFAULT 0 NOT NULL CHECK (value >= 0));"
+            )
+            .unwrap();
+        }
+        let created = run_with_arena_bytes(&mut engine, &mut budget, &create_sql, 2 << 20);
+        assert!(
+            !message_types(&created).contains(&b'E'),
+            "slots {first}..: {}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    for first in (0..TABLES).step_by(config.txn_rows) {
+        let mut insert_sql = String::new();
+        for slot in first..(first + config.txn_rows).min(TABLES) {
+            writeln!(
+                insert_sql,
+                "INSERT INTO checkpoint_slot_{slot} VALUES ({slot});"
+            )
+            .unwrap();
+        }
+        let inserted = run_with(&mut engine, &mut budget, &insert_sql);
+        assert!(
+            !message_types(&inserted).contains(&b'E'),
+            "slots {first}..: {}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+
+    // Replace both relations around the former 1,024-slot checkpoint boundary.
+    // A stale per-slot SST list must not resurrect either dropped relation.
+    let reused = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE checkpoint_slot_1023;
+         DROP TABLE checkpoint_slot_1024;
+         CREATE TABLE checkpoint_reused_1023(
+             value integer DEFAULT 0 NOT NULL CHECK (value >= 0));
+         CREATE TABLE checkpoint_reused_1024(
+             value integer DEFAULT 0 NOT NULL CHECK (value >= 0));
+         INSERT INTO checkpoint_reused_1023 VALUES (1023);
+         INSERT INTO checkpoint_reused_1024 VALUES (1024)",
+    );
+    assert!(
+        !message_types(&reused).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&reused)
+    );
+    for first in (0..TABLES).step_by(32) {
+        let mut analyze_sql = String::from("ANALYZE ");
+        for slot in first..(first + 32).min(TABLES) {
+            if slot != first {
+                analyze_sql.push_str(", ");
+            }
+            if slot == 1023 || slot == 1024 {
+                write!(analyze_sql, "checkpoint_reused_{slot}").unwrap();
+            } else {
+                write!(analyze_sql, "checkpoint_slot_{slot}").unwrap();
+            }
+        }
+        let analyzed = run_with(&mut engine, &mut budget, &analyze_sql);
+        assert!(
+            !message_types(&analyzed).contains(&b'E'),
+            "slots {first}..: {}",
+            String::from_utf8_lossy(&analyzed)
+        );
+    }
+    assert!(engine.checkpoint().unwrap());
+
+    // Drive one sliced beat, then lose the response to the manifest PUT. The
+    // retry must adopt its own landed manifest and publish the same complete
+    // above-boundary table state without reallocating checkpoint scratch.
+    let updated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE checkpoint_reused_1024 SET value = 2048",
+    );
+    assert!(!message_types(&updated).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+    assert!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .is_err()
+    );
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    assert!(engine.checkpoint().unwrap());
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(3usize << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = run_with_arena_bytes(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT count(*) FROM pg_class
+           WHERE relkind = 'r' AND relname LIKE 'checkpoint_%';
+         SELECT count(*) FROM pg_tables
+          WHERE tablename LIKE 'checkpoint_%';
+         SELECT count(*) FROM information_schema.tables
+          WHERE table_name LIKE 'checkpoint_%';
+         SELECT count(*) FROM information_schema.columns
+          WHERE table_name LIKE 'checkpoint_%';
+         SELECT count(*) FROM pg_attrdef AS d
+           JOIN pg_class AS c ON c.oid = d.adrelid
+          WHERE c.relname LIKE 'checkpoint_%';
+         SELECT count(*) FROM pg_constraint AS k
+           JOIN pg_class AS c ON c.oid = k.conrelid
+          WHERE c.relname LIKE 'checkpoint_%';
+         SELECT count(*) FROM pg_stats
+          WHERE tablename LIKE 'checkpoint_%';
+         SELECT value FROM checkpoint_slot_0;
+         SELECT value FROM checkpoint_slot_1022;
+         SELECT value FROM checkpoint_reused_1023;
+         SELECT value FROM checkpoint_reused_1024;
+         SELECT to_regclass('checkpoint_slot_1023') IS NULL,
+                to_regclass('checkpoint_slot_1024') IS NULL",
+        8 << 20,
+    );
+    assert_eq!(
+        data_rows(&cold),
+        [
+            "1025", "1025", "1025", "1025", "1025", "2050", "1025", "0", "1022", "1023", "2048",
+            "t|t"
+        ],
+        "{}",
+        String::from_utf8_lossy(&cold)
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn startup_sized_metadata_catalogs_exhaust_and_survive_object_cold_recovery() {
     use core::fmt::Write as _;
 
@@ -48127,91 +48342,92 @@ fn startup_sized_metadata_catalogs_exhaust_and_survive_object_cold_recovery() {
         );
     }
 
-    let mut sql = String::from("BEGIN;");
-    let mut batch_statements = 0usize;
-    let mut execute_batch = |sql: &mut String| {
-        sql.push_str("COMMIT;");
-        let output = run_with_arena_bytes(&mut engine, &mut budget, sql, 2 << 20);
-        assert!(
-            !message_types(&output).contains(&b'E'),
-            "{}",
-            String::from_utf8_lossy(&output)
-        );
-        sql.clear();
-        sql.push_str("BEGIN;");
-    };
-    for slot in 0..TABLESPACES {
-        write!(
-            sql,
-            "COMMENT ON TABLESPACE capacity_space_{slot} IS 'capacity comment {slot}';"
-        )
-        .unwrap();
-        batch_statements += 1;
-        if batch_statements == 60 {
-            execute_batch(&mut sql);
-            batch_statements = 0;
+    {
+        let mut sql = String::from("BEGIN;");
+        let mut batch_statements = 0usize;
+        let mut execute_batch = |sql: &mut String| {
+            sql.push_str("COMMIT;");
+            let output = run_with_arena_bytes(&mut engine, &mut budget, sql, 2 << 20);
+            assert!(
+                !message_types(&output).contains(&b'E'),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            sql.clear();
+            sql.push_str("BEGIN;");
+        };
+        for slot in 0..TABLESPACES {
+            write!(
+                sql,
+                "COMMENT ON TABLESPACE capacity_space_{slot} IS 'capacity comment {slot}';"
+            )
+            .unwrap();
+            batch_statements += 1;
+            if batch_statements == 60 {
+                execute_batch(&mut sql);
+                batch_statements = 0;
+            }
         }
-    }
-    for slot in 0..COLLATIONS {
-        write!(
-            sql,
-            "CREATE COLLATION capacity_collation_{slot} (PROVIDER = libc, LOCALE = 'C');"
-        )
-        .unwrap();
-        batch_statements += 1;
-        if batch_statements == 60 {
-            execute_batch(&mut sql);
-            batch_statements = 0;
+        for slot in 0..COLLATIONS {
+            write!(
+                sql,
+                "CREATE COLLATION capacity_collation_{slot} (PROVIDER = libc, LOCALE = 'C');"
+            )
+            .unwrap();
+            batch_statements += 1;
+            if batch_statements == 60 {
+                execute_batch(&mut sql);
+                batch_statements = 0;
+            }
         }
-    }
-    for slot in 0..CONVERSIONS {
-        write!(
-            sql,
-            "CREATE CONVERSION capacity_conversion_{slot} FOR 'LATIN1' TO 'UTF8' \
+        for slot in 0..CONVERSIONS {
+            write!(
+                sql,
+                "CREATE CONVERSION capacity_conversion_{slot} FOR 'LATIN1' TO 'UTF8' \
              FROM pg_catalog.iso8859_1_to_utf8;"
-        )
-        .unwrap();
-        batch_statements += 1;
-        if batch_statements == 60 {
-            execute_batch(&mut sql);
-            batch_statements = 0;
+            )
+            .unwrap();
+            batch_statements += 1;
+            if batch_statements == 60 {
+                execute_batch(&mut sql);
+                batch_statements = 0;
+            }
         }
-    }
-    for slot in 0..TEXT_DICTIONARIES {
-        write!(
-            sql,
-            "CREATE TEXT SEARCH DICTIONARY capacity_dictionary_{slot} \
+        for slot in 0..TEXT_DICTIONARIES {
+            write!(
+                sql,
+                "CREATE TEXT SEARCH DICTIONARY capacity_dictionary_{slot} \
              (TEMPLATE = simple, ACCEPT = true);"
-        )
-        .unwrap();
-        batch_statements += 1;
-        if batch_statements == 60 {
-            execute_batch(&mut sql);
-            batch_statements = 0;
+            )
+            .unwrap();
+            batch_statements += 1;
+            if batch_statements == 60 {
+                execute_batch(&mut sql);
+                batch_statements = 0;
+            }
         }
-    }
-    sql.push_str(
-        "CREATE FUNCTION capacity_event_function() RETURNS event_trigger LANGUAGE plpgsql \
+        sql.push_str(
+            "CREATE FUNCTION capacity_event_function() RETURNS event_trigger LANGUAGE plpgsql \
          AS 'BEGIN RETURN; END';",
-    );
-    batch_statements += 1;
-    for slot in 0..EVENT_TRIGGERS {
-        write!(
-            sql,
-            "CREATE EVENT TRIGGER capacity_event_{slot} ON ddl_command_end \
-             EXECUTE FUNCTION capacity_event_function();"
-        )
-        .unwrap();
+        );
         batch_statements += 1;
-        if batch_statements == 60 {
+        for slot in 0..EVENT_TRIGGERS {
+            write!(
+                sql,
+                "CREATE EVENT TRIGGER capacity_event_{slot} ON ddl_command_end \
+             EXECUTE FUNCTION capacity_event_function();"
+            )
+            .unwrap();
+            batch_statements += 1;
+            if batch_statements == 60 {
+                execute_batch(&mut sql);
+                batch_statements = 0;
+            }
+        }
+        if batch_statements != 0 {
             execute_batch(&mut sql);
-            batch_statements = 0;
         }
     }
-    if batch_statements != 0 {
-        execute_batch(&mut sql);
-    }
-    drop(execute_batch);
 
     for overflow in [
         "CREATE COLLATION capacity_collation_overflow (PROVIDER = libc, LOCALE = 'C')",

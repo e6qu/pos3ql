@@ -105,7 +105,9 @@ pub(crate) const LARGE_OBJECT_BLOCK_SIZE: usize = 2_048;
 pub(crate) const INTERNAL_LARGE_OBJECT_SCHEMA: &str = "pos3ql_internal";
 pub(crate) const INTERNAL_LARGE_OBJECT_TABLE: &str = "large_object_pages";
 
-const fn table_slot_capacity(config: &Config) -> usize {
+/// Physical table slots include the internal large-object page relation after
+/// all configured user-table slots.
+pub(crate) const fn table_slot_capacity(config: &Config) -> usize {
     config.max_tables + 1
 }
 

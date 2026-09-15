@@ -30,7 +30,6 @@ const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
 const MANIFEST_HEADER: &str = "pos3ql-manifest-v14";
 const LEGACY_MANIFEST_HEADER: &str = "pos3ql-manifest-v13";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
-const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
 
@@ -225,7 +224,9 @@ pub(crate) struct TemporarySpiller {
 impl TemporarySpiller {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         crate::store::EphemeralBlockStore::budget_bytes(config.temporary_spill_bytes)
-            + MAX_CKPT_TABLES * crate::storage::MAX_SPILL_SSTS * core::mem::size_of::<SstHandle>()
+            + crate::storage::table_slot_capacity(config)
+                * crate::storage::MAX_SPILL_SSTS
+                * core::mem::size_of::<SstHandle>()
             + SST_ARENA_BYTES
             + SstWriter::budget_bytes()
     }
@@ -242,7 +243,9 @@ impl TemporarySpiller {
                 })?;
         Ok(Self {
             blocks: std::rc::Rc::new(std::cell::RefCell::new(blocks)),
-            handles: Vec::with_capacity(MAX_CKPT_TABLES * crate::storage::MAX_SPILL_SSTS),
+            handles: Vec::with_capacity(
+                crate::storage::table_slot_capacity(config) * crate::storage::MAX_SPILL_SSTS,
+            ),
             sst_arena: Arena::new(budget, "temporary spill sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
             writer: SstWriter::new(),
@@ -453,12 +456,9 @@ pub(crate) struct Checkpointer {
     /// these handles (delta checkpoints). Capacity is reserved at startup so
     /// the post-freeze checkpoint path never allocates.
     prev_ssts: Vec<SlotList>,
-    /// Keys referenced by the manifest just published (GC keep-set).
-    referenced: Vec<StackStr<64>>,
     /// Pre-reserved scratch built during a checkpoint, then swapped into the
     /// fields above; keeps the post-freeze path allocation-free.
     prev_scratch: Vec<SlotList>,
-    ref_scratch: Vec<StackStr<64>>,
     /// Pre-reserved scratch for GC / WAL-segment sweeps.
     doomed_scratch: Vec<StackStr<64>>,
     /// Sliced-checkpoint sweep state: whether a sweep is mid-flight, the
@@ -507,7 +507,6 @@ pub(crate) enum CheckpointStep {
 /// Upper bounds reserved at startup so checkpoint-time bookkeeping never
 /// touches the allocator. Exhausting one is a named checkpoint error; success
 /// must mean every requested maintenance operation completed.
-const MAX_CKPT_TABLES: usize = 1024;
 const MAX_SWEEP_KEYS: usize = 4096;
 /// Block identities the GC keep-set can hold across every live SST.
 const MAX_KEEP_BLOCKS: usize = 64 * 1024;
@@ -540,15 +539,27 @@ const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
 
 impl Checkpointer {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
+        let table_capacity = crate::storage::table_slot_capacity(config);
+        let manifest_capacity = config.checkpoint_manifest_bytes;
+        let table_bookkeeping = table_capacity
+            * (core::mem::size_of::<(usize, SlotInstall)>()
+                + 2 * core::mem::size_of::<SlotList>()
+                + core::mem::size_of::<u64>()
+                + core::mem::size_of::<bool>()
+                + core::mem::size_of::<Option<(BlockId, BlockId)>>());
         // One synchronous manifest/WAL client plus the fixed durable-block
         // read pool. The cache tiers draw their own budget in the constructor.
         (1 + config.object_store_get_slots) * ObjectStore::budget_bytes(config)
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
-            + MAX_CKPT_TABLES
+            + table_bookkeeping
+            + table_capacity
                 * crate::storage::MAX_VALUE_ENFORCERS
                 * core::mem::size_of::<ValueInstall>()
-            + MANIFEST_BUF_BYTES
+            + MAX_KEEP_BLOCKS * core::mem::size_of::<BlockId>()
+            + MAX_SWEEP_KEYS
+                * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
+            + manifest_capacity
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
             + MERGE_SCRATCH_ENTRIES * core::mem::size_of::<(SstKey, u8)>()
@@ -636,7 +647,7 @@ impl Checkpointer {
                         .get(slot)
                         .is_some_and(|list| list.n == crate::storage::MAX_SPILL_SSTS)
             });
-        for slot in 0..storage.physical_table_count().min(MAX_CKPT_TABLES) {
+        for slot in 0..storage.physical_table_count() {
             if !storage.table(slot).live
                 || storage.table(slot).def.persistence
                     == crate::storage::RelationPersistence::Temporary
@@ -895,6 +906,8 @@ impl Checkpointer {
     /// Provider credentials and adapter selection terminate at
     /// [`crate::object_store`].
     pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
+        let table_capacity = crate::storage::table_slot_capacity(config);
+        let manifest_capacity = config.checkpoint_manifest_bytes;
         let base = OwnedObjectStore::new(config, budget, "blocks/")
             .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
         let plan = StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
@@ -920,35 +933,33 @@ impl Checkpointer {
             blocks,
             sst_arena: Arena::new(budget, "checkpoint sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
-            pending_installs: Vec::with_capacity(MAX_CKPT_TABLES),
+            pending_installs: Vec::with_capacity(table_capacity),
             pending_value_installs: Vec::with_capacity(
-                MAX_CKPT_TABLES * crate::storage::MAX_VALUE_ENFORCERS,
+                table_capacity * crate::storage::MAX_VALUE_ENFORCERS,
             ),
             merge_scratch: Vec::with_capacity(MERGE_SCRATCH_ENTRIES),
             roster_scratch: Vec::with_capacity(MAX_KEEP_BLOCKS),
             doomed_blocks: Vec::with_capacity(MAX_SWEEP_KEYS),
-            manifest_buf: FixedBuf::new(budget, "manifest_buf", MANIFEST_BUF_BYTES)
+            manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
             manifest_etag: None,
             manifest_lsn: 0,
             commit_head_etag: None,
             commit_head: None,
-            prev_ssts: Vec::with_capacity(MAX_CKPT_TABLES),
-            referenced: Vec::with_capacity(MAX_CKPT_TABLES),
-            prev_scratch: Vec::with_capacity(MAX_CKPT_TABLES),
-            ref_scratch: Vec::with_capacity(MAX_CKPT_TABLES),
+            prev_ssts: Vec::with_capacity(table_capacity),
+            prev_scratch: Vec::with_capacity(table_capacity),
             doomed_scratch: Vec::with_capacity(MAX_SWEEP_KEYS),
             sweeping: false,
             published_lsn_pending_maintenance: None,
-            sliced_generation: vec![0; MAX_CKPT_TABLES],
-            sliced_this_sweep: vec![false; MAX_CKPT_TABLES],
+            sliced_generation: vec![0; table_capacity],
+            sliced_this_sweep: vec![false; table_capacity],
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
             value_writer: ValueIndexWriter::new(),
             merge_job: None,
             merge_done: None,
             merge_turn: false,
-            merge_overflow: vec![None; MAX_CKPT_TABLES],
+            merge_overflow: vec![None; table_capacity],
             writer_id: crate::object_store::writer_id(config),
         })
     }
@@ -6444,7 +6455,7 @@ impl Checkpointer {
             self.pending_installs.clear();
             self.pending_value_installs.clear();
         }
-        for slot in 0..storage.physical_table_count().min(MAX_CKPT_TABLES) {
+        for slot in 0..storage.physical_table_count() {
             if !self.needs_slice(storage, slot) {
                 continue;
             }
@@ -6472,7 +6483,7 @@ impl Checkpointer {
     /// the replacement's schema. Any slice or merge already built for the
     /// retired identity is now an orphan and is discarded before publish.
     fn reconcile_published_spill_lists(&mut self, storage: &Storage) {
-        for slot in 0..storage.physical_table_count().min(MAX_CKPT_TABLES) {
+        for slot in 0..storage.physical_table_count() {
             let Some(published) = self.prev_ssts.get(slot).copied() else {
                 continue;
             };
@@ -6529,10 +6540,8 @@ impl Checkpointer {
     /// per-table lists, then installs the new spill state and sweeps
     /// garbage. Runs only when no table has an outdated slice.
     fn publish(&mut self, storage: &mut Storage, lsn: u64) -> Result<(), SqlError> {
-        // Delta bookkeeping collects the new per-slot references and GC
-        // keep-set into pre-reserved scratch so this post-freeze path never
-        // allocates.
-        self.ref_scratch.clear();
+        // Delta bookkeeping collects the new per-slot references into
+        // pre-reserved scratch so this post-freeze path never allocates.
         self.manifest_buf.clear();
         write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
         write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
@@ -7418,7 +7427,7 @@ impl Checkpointer {
             // A slot not sliced this sweep carries its published list
             // forward untouched — the table is clean, so today's list is
             // yesterday's. A sliced slot's list was recorded by its beat.
-            if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
+            if self.prev_scratch.len() <= slot {
                 self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
             }
             if !self.sliced_this_sweep.get(slot).copied().unwrap_or(false)
@@ -7889,7 +7898,7 @@ impl Checkpointer {
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "manifest exceeds its fixed buffer"
+                    "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                 )
             })?;
             for (index, ((table, mask), descendants)) in publication.tables
@@ -7908,14 +7917,14 @@ impl Checkpointer {
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "manifest exceeds its fixed buffer"
+                        "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                     )
                 })?;
                 if filter.is_empty() {
                     write!(&mut self.manifest_buf, "-").map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "manifest exceeds its fixed buffer"
+                            "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                         )
                     })?;
                 } else {
@@ -7923,7 +7932,7 @@ impl Checkpointer {
                         write!(&mut self.manifest_buf, "{byte:02x}").map_err(|_| {
                             sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "manifest exceeds its fixed buffer"
+                                "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                             )
                         })?;
                     }
@@ -7933,14 +7942,14 @@ impl Checkpointer {
                 write!(&mut self.manifest_buf, " {schema}").map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "manifest exceeds its fixed buffer"
+                        "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                     )
                 })?;
             }
             writeln!(&mut self.manifest_buf).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "manifest exceeds its fixed buffer"
+                    "checkpoint manifest is full; raise checkpoint_manifest_bytes"
                 )
             })?;
         }
@@ -9937,7 +9946,6 @@ impl Checkpointer {
         self.manifest_etag = Some(etag);
         self.manifest_lsn = lsn;
         std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
-        std::mem::swap(&mut self.referenced, &mut self.ref_scratch);
         // The manifest is durable: install the new spill lists (a collapse
         // remaps the table's spilled entries to slot 0) and forget the
         // flushed tombstones. A failed CAS above reaches none of this, so a
@@ -10203,7 +10211,7 @@ impl Checkpointer {
             }
         };
 
-        if self.prev_scratch.len() <= slot && self.prev_scratch.len() < MAX_CKPT_TABLES {
+        if self.prev_scratch.len() <= slot {
             self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
         }
         if slot < self.prev_scratch.len() {
@@ -10463,21 +10471,20 @@ impl Checkpointer {
         Ok(())
     }
 
+    /// Removes objects from the obsolete pre-content-addressed SST namespace.
+    /// Current manifests reference only content-addressed `blocks/` objects.
     fn collect_garbage(&mut self) -> Result<(), SqlError> {
         // Two passes because list borrows the client: collect keys first
         // into pre-reserved scratch (no allocation post-freeze).
         self.doomed_scratch.clear();
-        let referenced = &self.referenced;
         let doomed = &mut self.doomed_scratch;
         let mut overflow = false;
         self.client
             .list("sst/", |key| {
-                if !referenced.iter().any(|r| r.as_str() == key) {
-                    if doomed.len() < MAX_SWEEP_KEYS {
-                        doomed.push(crate::stack_format!(64, "{}", key));
-                    } else {
-                        overflow = true;
-                    }
+                if doomed.len() < MAX_SWEEP_KEYS {
+                    doomed.push(crate::stack_format!(64, "{}", key));
+                } else {
+                    overflow = true;
                 }
             })
             .map_err(object_store_to_sql)?;
@@ -10650,7 +10657,7 @@ fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Resul
     writeln!(buffer, "{line}").map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "manifest exceeds its fixed buffer"
+            "checkpoint manifest is full; raise checkpoint_manifest_bytes"
         )
     })
 }

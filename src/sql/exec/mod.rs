@@ -42063,7 +42063,6 @@ fn stored_query_dependent_closure(
     use crate::storage::DependencyClass;
     if storage.view_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
-        || storage.table_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.routine_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage
             .rules_visible_to(txid)
@@ -42081,7 +42080,15 @@ fn stored_query_dependent_closure(
     let mut matviews = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut rules = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut matview_tables = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let selected_matview_owns_table = |selected: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+                                       table: usize| {
+        selected
+            .iter()
+            .copied()
+            .enumerate()
+            .take(storage.matview_count())
+            .any(|(slot, selected)| selected && storage.matview_table(slot) == table)
+    };
     loop {
         let mut changed = false;
         for slot in 0..storage.routine_count() {
@@ -42098,7 +42105,7 @@ fn stored_query_dependent_closure(
                         || (dependency.class == DependencyClass::View
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
-                            && matview_tables[dependency.slot as usize])
+                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
                         || (dependency.class == DependencyClass::Routine
                             && routines[dependency.slot as usize])
                 });
@@ -42131,7 +42138,7 @@ fn stored_query_dependent_closure(
                         || (dependency.class == DependencyClass::View
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
-                            && matview_tables[dependency.slot as usize])
+                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
                         || (dependency.class == DependencyClass::Routine
                             && routines[dependency.slot as usize])
                 });
@@ -42160,7 +42167,7 @@ fn stored_query_dependent_closure(
                     || (dependency.class == DependencyClass::View
                         && views[dependency.slot as usize])
                     || (dependency.class == DependencyClass::Table
-                        && matview_tables[dependency.slot as usize])
+                        && selected_matview_owns_table(&matviews, dependency.slot as usize))
                     || (dependency.class == DependencyClass::Routine
                         && routines[dependency.slot as usize])
             });
@@ -42184,14 +42191,12 @@ fn stored_query_dependent_closure(
                         || (dependency.class == DependencyClass::View
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
-                            && matview_tables[dependency.slot as usize])
+                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
                         || (dependency.class == DependencyClass::Routine
                             && routines[dependency.slot as usize])
                 });
             if hit {
                 matviews[slot] = true;
-                let table = storage.matview_table(slot);
-                matview_tables[table] = true;
                 changed = true;
             }
             slot += 1;

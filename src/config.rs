@@ -191,6 +191,9 @@ pub struct Config {
     pub wal_upload_sync: bool,
     /// Scratch for a published commit batch. Must hold one journal batch.
     pub wal_upload_buffer_bytes: usize,
+    /// Startup-fixed buffer for one complete checkpoint manifest. Catalog
+    /// growth beyond it fails loudly before publication.
+    pub checkpoint_manifest_bytes: usize,
     /// S3-compatible data-plane authority (`host:port`).
     pub object_store_endpoint: String,
     /// Bucket containing this database's durable objects.
@@ -318,6 +321,7 @@ impl Config {
             wal_upload: false,
             wal_upload_sync: false,
             wal_upload_buffer_bytes: 8 * MIB,
+            checkpoint_manifest_bytes: 256 * KIB,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
             object_store_bucket: "pos3ql".to_string(),
             object_store_prefix: String::new(),
@@ -656,6 +660,10 @@ impl Config {
                     config.wal_upload_buffer_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
+                "checkpoint_manifest_bytes" => {
+                    config.checkpoint_manifest_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "object_store" => match value {
                     "on" | "true" => config.object_store_on = true,
                     "off" | "false" => config.object_store_on = false,
@@ -848,6 +856,12 @@ impl Config {
             return Err(ConfigError::at(
                 0,
                 "collation_scratch_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if config.checkpoint_manifest_bytes == 0 {
+            return Err(ConfigError::at(
+                0,
+                "checkpoint_manifest_bytes must be greater than zero".to_string(),
             ));
         }
         if config.temporary_spill_bytes != 0
@@ -1143,6 +1157,7 @@ max_subscriptions = 7
 max_rules = 19
 memtable_bytes = 16MiB   # small for tests
 temporary_spill_bytes = 32MiB
+checkpoint_manifest_bytes = 2MiB
 sql_arena_bytes = 4096
 ";
         let c = Config::parse(text).unwrap();
@@ -1155,6 +1170,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_rules, 19);
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.temporary_spill_bytes, 32 * MIB);
+        assert_eq!(c.checkpoint_manifest_bytes, 2 * MIB);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.
         assert_eq!(c.block_cache_bytes, Config::default_dev().block_cache_bytes);
@@ -1169,6 +1185,16 @@ sql_arena_bytes = 4096
                 .unwrap()
                 .temporary_spill_bytes,
             0
+        );
+    }
+
+    #[test]
+    fn checkpoint_manifest_capacity_must_be_nonzero() {
+        let error = Config::parse("checkpoint_manifest_bytes = 0\n").unwrap_err();
+        assert_eq!(error.line, 0);
+        assert_eq!(
+            error.message,
+            "checkpoint_manifest_bytes must be greater than zero"
         );
     }
 

@@ -95,8 +95,14 @@ logical-replication boundary is specified separately in
   text-search objects, event triggers, tablespaces, and comments use independent
   startup-sized pools. Their configured exhaustion is a loud program-limit
   error; object-cold recovery preserves catalogs larger than their former
-  fixed or table-derived limits. Schema, role, type, sequence, database, ACL,
-  extension, and several inline per-object bounds remain compile-time limits.
+  fixed or table-derived limits. Checkpoint bookkeeping covers every configured
+  physical-table slot, including the internal large-object table. The complete
+  checkpoint catalog image has a named startup-reserved
+  `checkpoint_manifest_bytes` bound and fails before publication if it is full.
+  Catalog builders for startup-sized objects allocate row references from the
+  fixed statement arena according to transaction-visible cardinality. Schema,
+  role, type, sequence, database, ACL, and several inline per-object bounds
+  remain compile-time limits.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.
@@ -105,25 +111,20 @@ logical-replication boundary is specified separately in
   unsupported input family; the executable manifest makes every omission
   reviewable instead of converting it into an expected-failure budget.
 
-## Extensions
+## Extensions are not a target
 
-pos3ql implements PostgreSQL's SQL-extension package lifecycle: control files,
-versioned SQL scripts and update paths, dependencies, trusted installation,
-schema selection and relocation, extension membership, configuration-table
-dump metadata, ownership, comments, catalogs, transactions, WAL, checkpoints,
-dump/restore, and object-store recovery. An SQL-only extension can work when
-every object and statement in its install/update scripts is itself in the
-implemented boundary.
+pos3ql already implements PostgreSQL's SQL-extension package lifecycle:
+control files, versioned SQL scripts and update paths, dependencies, trusted
+installation, schema selection and relocation, extension membership,
+configuration-table dump metadata, ownership, comments, catalogs,
+transactions, WAL, checkpoints, dump/restore, and object-store recovery. This
+remains accepted SQL behavior, not a commitment to PostgreSQL's extension
+ecosystem.
 
-No third-party PostgreSQL extension is currently certified. The repository's
-`pos3ql_base` and `pos3ql_ext` packages are conformance fixtures, not user
-extensions. In particular, pos3ql does not load PostgreSQL C shared libraries
-and does not implement PostgreSQL's server ABI, hooks, background workers,
-custom native types, native procedural-language handlers, native foreign-data
-wrappers, or native index access-method callbacks. Extensions requiring those
-facilities cannot run unchanged. They require a native pos3ql implementation
-or a future bounded and sandboxed extension mechanism.
-
-Qualification of real SQL-only extensions, with pinned upstream source and
-their installcheck suites, remains required before naming any extension as
-supported.
+Third-party PostgreSQL extensions, including SQL-only packages, are not a
+compatibility target and are not certified. The repository's `pos3ql_base` and
+`pos3ql_ext` packages are conformance fixtures, not user extensions. pos3ql
+does not load PostgreSQL C shared libraries and does not implement PostgreSQL's
+server ABI, hooks, background workers, custom native types, native procedural-
+language handlers, native foreign-data wrappers, or native index access-method
+callbacks. No native or sandbox extension ABI is planned.

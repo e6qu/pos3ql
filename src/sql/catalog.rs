@@ -15900,6 +15900,18 @@ fn row<'a>(vals: &[Datum<'a>], arena: &'a Arena) -> Result<&'a [Datum<'a>], SqlE
         .map_err(|_| arena_full())
 }
 
+/// Reserves catalog row references from the statement arena according to the
+/// transaction-visible source cardinality instead of imposing a hidden static
+/// row limit.
+fn catalog_rows<'a>(
+    arena: &'a Arena,
+    capacity: usize,
+) -> Result<&'a mut [&'a [Datum<'a>]], SqlError> {
+    arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())
+}
+
 fn catalog_capacity_exceeded(relation: &str) -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -16022,7 +16034,22 @@ fn pg_stats<'a>(
             ("range_bounds_histogram", ColType::AnyArray),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let row_capacity = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .map(|slot| {
+            let statistics = storage.table_statistics(slot, txid);
+            if statistics.valid {
+                statistics
+                    .columns
+                    .iter()
+                    .filter(|column| column.valid)
+                    .count()
+            } else {
+                0
+            }
+        })
+        .sum();
+    let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0usize;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -17037,7 +17064,10 @@ fn pg_publication<'a>(
             ("pubgencols", ColType::Bpchar),
         ],
     );
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let rows = catalog_rows(
+        arena,
+        storage.publications_with_slots_visible_to(txid).count(),
+    )?;
     let mut count = 0;
     for (slot, publication) in storage.publications_with_slots_visible_to(txid) {
         let definition = publication.definition_for(txid);
@@ -17078,8 +17108,11 @@ fn pg_publication_namespace<'a>(
             ("pnnspid", ColType::Int4),
         ],
     );
-    let mut rows: [&[Datum]; crate::storage::MAX_SCHEMAS * 256] =
-        [&[]; crate::storage::MAX_SCHEMAS * 256];
+    let row_capacity = storage
+        .publications_with_slots_visible_to(txid)
+        .map(|(_, publication)| publication.definition_for(txid).schema_count)
+        .sum();
+    let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
     for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
         let publication_definition = publication.definition_for(txid);
@@ -17123,7 +17156,18 @@ fn pg_publication_rel<'a>(
             ("prattrs", ColType::Int2Vector),
         ],
     );
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let row_capacity = storage
+        .publications_with_slots_visible_to(txid)
+        .map(|(_, publication)| {
+            let definition = publication.definition_for(txid);
+            if definition.all_tables {
+                0
+            } else {
+                definition.table_count
+            }
+        })
+        .sum();
+    let rows = catalog_rows(arena, row_capacity)?;
     let mut count = 0;
     for (publication_slot, publication) in storage.publications_with_slots_visible_to(txid) {
         let definition = publication.definition_for(txid);
@@ -17194,11 +17238,21 @@ fn pg_publication_tables<'a>(
             ("rowfilter", ColType::Text),
         ],
     );
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let publication_count = storage.publications_with_slots_visible_to(txid).count();
+    let visible_table_count = storage
+        .live_tables()
+        .filter(|(_, table)| table.visible_to(txid))
+        .count();
+    let row_capacity = publication_count
+        .checked_mul(visible_table_count)
+        .ok_or_else(|| catalog_capacity_exceeded("pg_publication_tables"))?;
+    let rows = catalog_rows(arena, row_capacity)?;
+    let emitted = arena
+        .alloc_slice_with(visible_table_count, |_| usize::MAX)
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for (_, publication) in storage.publications_with_slots_visible_to(txid) {
         let published = publication.definition_for(txid);
-        let mut emitted = [usize::MAX; 256];
         let mut emitted_count = 0;
         for (table_slot, table) in storage.live_tables() {
             if !table.visible_to(txid) {
@@ -18096,7 +18150,7 @@ fn pg_replication_slots<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of("pg_replication_slots", PG_REPLICATION_SLOTS_COLUMNS);
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let rows = catalog_rows(arena, storage.replication_slots_with_slots().count())?;
     let mut count = 0;
     let database_definition = storage.database_definition(
         storage
@@ -18211,7 +18265,13 @@ fn pg_stat_replication<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of("pg_stat_replication", PG_STAT_REPLICATION_COLUMNS);
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let rows = catalog_rows(
+        arena,
+        storage
+            .replication_slots_with_slots()
+            .filter(|(_, slot)| slot.active)
+            .count(),
+    )?;
     let mut count = 0;
     for (_, slot) in storage
         .replication_slots_with_slots()
@@ -18262,7 +18322,7 @@ fn pg_stat_replication_slots<'a>(
         "pg_stat_replication_slots",
         PG_STAT_REPLICATION_SLOTS_COLUMNS,
     );
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let rows = catalog_rows(arena, storage.replication_slots_with_slots().count())?;
     let mut count = 0;
     for (_, slot) in storage.replication_slots_with_slots() {
         if count == rows.len() {
@@ -18324,7 +18384,10 @@ fn pg_subscription<'a>(
             ("suborigin", ColType::Text),
         ],
     );
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let rows = catalog_rows(
+        arena,
+        storage.subscriptions_with_slots_visible_to(txid).count(),
+    )?;
     let mut count = 0;
     for (_slot, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
         if count == rows.len() {
@@ -18453,7 +18516,13 @@ fn pg_stat_subscription<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of("pg_stat_subscription", PG_STAT_SUBSCRIPTION_COLUMNS);
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let rows = catalog_rows(
+        arena,
+        storage
+            .subscriptions_with_slots_visible_to(txid)
+            .filter(|(_, subscription)| subscription.enabled_to(txid))
+            .count(),
+    )?;
     let mut count = 0;
     for (_, subscription) in storage
         .subscriptions_with_slots_visible_to(txid)
@@ -18501,7 +18570,10 @@ fn pg_stat_subscription_stats<'a>(
         "pg_stat_subscription_stats",
         PG_STAT_SUBSCRIPTION_STATS_COLUMNS,
     );
-    let mut rows: [&[Datum]; 256] = [&[]; 256];
+    let rows = catalog_rows(
+        arena,
+        storage.subscriptions_with_slots_visible_to(txid).count(),
+    )?;
     let mut count = 0;
     for (_, subscription) in storage.subscriptions_with_slots_visible_to(txid) {
         if count == rows.len() {
@@ -18643,7 +18715,15 @@ fn pg_partitioned_table<'a>(
             ("partexprs", ColType::Text),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let rows = catalog_rows(
+        arena,
+        (0..storage.table_count())
+            .filter(|slot| {
+                storage.table_slot_visible_to(*slot, txid)
+                    && storage.table_def(*slot, txid).partition.scheme.is_some()
+            })
+            .count(),
+    )?;
     let mut n = 0;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -18734,7 +18814,28 @@ fn pg_class<'a>(
     );
     let indexes = collect_indexes(storage, txid, arena)?;
     let foreign_keys = collect_fkeys(storage, txid, arena)?;
-    let mut out: [&[Datum]; 512] = [&[]; 512];
+    let visible_tables = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .count();
+    let toast_relations = (0..storage.table_count())
+        .filter(|slot| {
+            storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
+        })
+        .count()
+        * 2;
+    let out_capacity = CATALOG_RELATIONS.len()
+        + visible_tables
+        + toast_relations
+        + storage.composites_with_slots_visible_to(txid).count()
+        + indexes.len()
+        + (0..storage.sequence_count())
+            .filter(|slot| storage.sequence_slot_visible_to(*slot, txid))
+            .count()
+        + storage.views_visible_to(txid).count()
+        + 2;
+    let out = arena
+        .alloc_slice_with(out_capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for name in CATALOG_RELATIONS {
         let relation = catalog_relation(name).expect("catalog metadata exists");
@@ -19708,7 +19809,59 @@ fn pg_constraint<'a>(
         ],
     );
     let indexes = collect_indexes(storage, txid, arena)?;
-    let mut out: [&[Datum]; 512] = [&[]; 512];
+    let fks = collect_fkeys(storage, txid, arena)?;
+    let index_constraints = indexes
+        .iter()
+        .filter(|info| {
+            info.is_constraint && (info.is_exclusion || info.is_primary || info.is_unique)
+        })
+        .count();
+    let trigger_constraints = storage
+        .triggers_with_slots_visible_to(txid)
+        .map(|(_, trigger)| {
+            let crate::storage::TriggerKind::Constraint { .. } = trigger.kind else {
+                return 0;
+            };
+            let crate::storage::TriggerTarget::Table(table) = trigger.target else {
+                return 0;
+            };
+            1 + if matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+                (0..storage.table_count())
+                    .filter(|child| {
+                        storage.table_slot_visible_to(*child, txid)
+                            && storage.partition_descends_from(*child, usize::from(table), txid)
+                    })
+                    .count()
+            } else {
+                0
+            }
+        })
+        .sum::<usize>();
+    let table_constraints = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .map(|slot| {
+            let table = storage.table_def(slot, txid);
+            table.checks().len()
+                + usize::from(table.partition.detached_bound.is_some())
+                + table
+                    .columns()
+                    .iter()
+                    .filter(|column| column.not_null.is_required())
+                    .count()
+        })
+        .sum::<usize>();
+    let domain_constraints = (0..storage.domain_count())
+        .filter(|slot| storage.domain_slot_visible_to(*slot, txid))
+        .map(|slot| storage.domain_for(slot, txid).checks().len())
+        .sum::<usize>();
+    let out = catalog_rows(
+        arena,
+        index_constraints
+            + fks.len()
+            + trigger_constraints
+            + table_constraints
+            + domain_constraints,
+    )?;
     let mut n = 0;
     // A PRIMARY KEY or UNIQUE constraint has a backing index; its `conindid`
     // links to that index so psql's `\d` labels a UNIQUE index as a constraint.
@@ -19780,7 +19933,6 @@ fn pg_constraint<'a>(
     // Foreign-key constraints (contype 'f'): conrelid on the child, confrelid on
     // the referenced parent, so psql's "Foreign-key constraints" (child) and
     // "Referenced by" (parent) sections both resolve.
-    let fks = collect_fkeys(storage, txid, arena)?;
     for info in fks {
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_constraint"));
@@ -20473,7 +20625,105 @@ fn pg_depend<'a>(
             ("deptype", ColType::Bpchar),
         ],
     );
-    let mut out: [&[Datum]; 4096] = [&[]; 4096];
+    let dependency_capacity = |dependencies: &crate::storage::StoredQueryDependencies| {
+        dependencies
+            .entries()
+            .iter()
+            .map(|dependency| {
+                if dependency.referenced_columns == 0 {
+                    1
+                } else {
+                    dependency.referenced_columns.count_ones() as usize
+                }
+            })
+            .sum::<usize>()
+    };
+    let sequence_dependencies = (0..storage.sequence_count())
+        .filter(|slot| {
+            storage.sequence_slot_visible_to(*slot, txid)
+                && storage.sequence_for(*slot, txid).owner.is_some()
+        })
+        .count();
+    let domain_dependencies = (0..storage.domain_count())
+        .filter(|slot| storage.domain_slot_visible_to(*slot, txid))
+        .count();
+    let cast_dependencies = storage.casts_visible_to(txid).count() * 3;
+    let operator_dependencies = storage.operators_visible_to(txid).count() * 4;
+    let collation_dependencies = storage.collations_visible_to(txid).count();
+    let conversion_dependencies = storage.conversions_visible_to(txid).count() * 2;
+    let family_dependencies = storage
+        .operator_families_visible_to(txid)
+        .map(|(_, family)| {
+            1 + 2 * family.operators.iter().filter(|member| member.used).count()
+                + 2 * family.functions.iter().filter(|member| member.used).count()
+        })
+        .sum::<usize>();
+    let class_dependencies = storage
+        .operator_classes_visible_to(txid)
+        .map(|(_, class)| {
+            4 + 2 * class.operators.iter().filter(|member| member.used).count()
+                + 2 * class.functions.iter().filter(|member| member.used).count()
+        })
+        .sum::<usize>();
+    let index_dependencies = (0..storage.index_count())
+        .filter_map(|slot| storage.index_visible_to(slot, txid))
+        .map(|index| index.n_cols)
+        .sum::<usize>();
+    let view_dependencies = storage
+        .views_visible_to(txid)
+        .map(|(slot, _)| 1 + dependency_capacity(storage.view_dependencies(slot)))
+        .sum::<usize>();
+    let rule_dependencies = storage
+        .rules_visible_to(txid)
+        .map(|(_, rule)| 1 + dependency_capacity(&rule.definition_for(txid).dependencies))
+        .sum::<usize>();
+    let matview_dependencies = storage
+        .matviews_visible_to(txid)
+        .map(|(slot, _)| storage.matview_dependencies(slot).entries().len())
+        .sum::<usize>();
+    let trigger_dependencies = storage
+        .triggers_with_slots_visible_to(txid)
+        .map(|(_, trigger)| {
+            let constraint_rows = match trigger.kind {
+                crate::storage::TriggerKind::Constraint {
+                    referenced_table, ..
+                } => 1 + usize::from(referenced_table.is_some()),
+                _ => 0,
+            };
+            let base_rows = 2 + constraint_rows + trigger.update_columns.count_ones() as usize;
+            let crate::storage::TriggerTarget::Table(parent) = trigger.target else {
+                return base_rows;
+            };
+            if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+                return base_rows;
+            }
+            let descendants = (0..storage.table_count())
+                .filter(|child| {
+                    storage.table_slot_visible_to(*child, txid)
+                        && storage.partition_descends_from(*child, usize::from(parent), txid)
+                })
+                .count();
+            base_rows + descendants * (base_rows + 2)
+        })
+        .sum::<usize>();
+    let extension_dependencies = storage.extension_dependencies_visible_to(txid).count();
+    let out = catalog_rows(
+        arena,
+        sequence_dependencies
+            + domain_dependencies
+            + cast_dependencies
+            + operator_dependencies
+            + collation_dependencies
+            + conversion_dependencies
+            + family_dependencies
+            + class_dependencies
+            + index_dependencies
+            + view_dependencies
+            + rule_dependencies
+            + matview_dependencies
+            + trigger_dependencies
+            + extension_dependencies,
+    )?;
     let mut count = 0usize;
     let mut push = |class: i32,
                     object: i32,
@@ -22122,7 +22372,31 @@ fn pg_attrdef<'a>(
     // A row per column carrying a DEFAULT — the raw source text in `adbin`.
     // This is the engine's source text, not PostgreSQL's serialized node tree;
     // pg_get_expr exposes it through the same catalog contract.
-    let mut out: [&[Datum]; 512] = [&[]; 512];
+    let table_defaults = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .map(|slot| {
+            storage
+                .table_def(slot, txid)
+                .columns()
+                .iter()
+                .filter(|column| column.default.expression().is_some())
+                .count()
+        })
+        .sum::<usize>();
+    let view_defaults = storage
+        .views_visible_to(txid)
+        .map(|(_, view)| {
+            let columns = view.columns_for(txid);
+            (0..columns.len())
+                .filter(|index| {
+                    columns
+                        .default_at_ref(*index)
+                        .is_some_and(|default| default.expression().is_some())
+                })
+                .count()
+        })
+        .sum::<usize>();
+    let out = catalog_rows(arena, table_defaults + view_defaults)?;
     let mut n = 0;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -22228,7 +22502,6 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("castmethod", ColType::Bpchar),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
     let builtin = [
         (
             10_001,
@@ -22591,6 +22864,10 @@ fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             "b",
         ),
     ];
+    let rows = catalog_rows(
+        arena,
+        builtin.len() + storage.casts_visible_to(txid).count(),
+    )?;
     for (index, (oid, source, target, function, context, method)) in builtin.into_iter().enumerate()
     {
         rows[index] = row(
@@ -22666,7 +22943,12 @@ fn pg_operator<'a>(
             ("oprjoin", ColType::Regproc),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let rows = catalog_rows(
+        arena,
+        CATALOG_OPERATORS.len()
+            + POLYMORPHIC_RANGE_OPERATORS.len()
+            + storage.operators_visible_to(txid).count(),
+    )?;
     for (index, operator) in CATALOG_OPERATORS.iter().enumerate() {
         rows[index] = row(
             &[
@@ -22802,7 +23084,10 @@ fn pg_opfamily<'a>(
             ("opfowner", ColType::Oid),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let rows = catalog_rows(
+        arena,
+        512 + storage.operator_families_visible_to(txid).count(),
+    )?;
     rows[0] = row(
         &[
             Datum::Int4(2753),
@@ -23134,7 +23419,10 @@ fn pg_opclass<'a>(
             ("opckeytype", ColType::Oid),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let rows = catalog_rows(
+        arena,
+        512 + storage.operator_classes_visible_to(txid).count(),
+    )?;
     rows[0] = row(
         &[
             Datum::Int4(2616),
@@ -23656,7 +23944,11 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("amopsortfamily", ColType::Oid),
         ],
     );
-    let mut rows: [&[Datum]; 1024] = [&[]; 1024];
+    let user_rows = storage
+        .operator_families_visible_to(txid)
+        .map(|(_, family)| family.operators.iter().filter(|member| member.used).count())
+        .sum::<usize>();
+    let rows = catalog_rows(arena, 1024 + user_rows)?;
     const XID8_BTREE_OPERATORS: [(i32, i16, i32); 5] = [
         (10050, 1, 5073),
         (10051, 2, 5075),
@@ -24416,7 +24708,11 @@ fn pg_amproc<'a>(
             ("amproc", ColType::Regproc),
         ],
     );
-    let mut rows: [&[Datum]; 1024] = [&[]; 1024];
+    let user_rows = storage
+        .operator_families_visible_to(txid)
+        .map(|(_, family)| family.functions.iter().filter(|member| member.used).count())
+        .sum::<usize>();
+    let rows = catalog_rows(arena, 1024 + user_rows)?;
     rows[0] = row(
         &[
             Datum::Int4(2603),
@@ -25098,7 +25394,28 @@ fn pg_trigger<'a>(
             ("tgnewtable", ColType::Name),
         ],
     );
-    let mut rows: [&[Datum]; 512] = [&[]; 512];
+    let foreign_key_rows = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .map(|slot| storage.table_def(slot, txid).fkeys().len() * 4)
+        .sum::<usize>();
+    let user_trigger_rows = storage
+        .triggers_with_slots_visible_to(txid)
+        .map(|(_, trigger)| {
+            let crate::storage::TriggerTarget::Table(parent) = trigger.target else {
+                return 1;
+            };
+            if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+                return 1;
+            }
+            1 + (0..storage.table_count())
+                .filter(|child| {
+                    storage.table_slot_visible_to(*child, txid)
+                        && storage.partition_descends_from(*child, usize::from(parent), txid)
+                })
+                .count()
+        })
+        .sum::<usize>();
+    let rows = catalog_rows(arena, foreign_key_rows + user_trigger_rows)?;
     let mut count = 0usize;
     let indexes = collect_indexes(storage, txid, arena)?;
     for child_slot in 0..storage.table_count() {
@@ -29801,7 +30118,17 @@ fn pg_tables<'a>(
         ],
     );
     let indexes = collect_indexes(storage, txid, arena)?;
-    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let row_capacity = (0..storage.table_count())
+        .filter(|slot| {
+            if !storage.table_slot_visible_to(*slot, txid) {
+                return false;
+            }
+            let table = storage.table_def(*slot, txid);
+            table.kind != crate::storage::TableKind::Foreign
+                && storage.matview_slot_for_table(*slot, txid).is_none()
+        })
+        .count();
+    let out = catalog_rows(arena, row_capacity)?;
     let mut n = 0;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -30698,11 +31025,11 @@ fn pg_views<'a>(
             ("definition", ColType::Text),
         ],
     );
-    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let out = catalog_rows(arena, storage.views_visible_to(txid).count())?;
     let mut n = 0;
     for slot in 0..storage.view_count() {
         let view = storage.view(slot);
-        if !storage.view_slot_visible_to(slot, txid) || n == out.len() {
+        if !storage.view_slot_visible_to(slot, txid) {
             continue;
         }
         out[n] = row(
@@ -30788,12 +31115,9 @@ fn pg_matviews<'a>(
         ],
     );
     let indexes = collect_indexes(storage, txid, arena)?;
-    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let out = catalog_rows(arena, storage.matviews_visible_to(txid).count())?;
     let mut n = 0;
     for (slot, mv) in storage.matviews_visible_to(txid) {
-        if n == out.len() {
-            continue;
-        }
         let backing = storage.table_def(storage.matview_table(slot), txid);
         out[n] = row(
             &[
@@ -30863,7 +31187,12 @@ fn pg_sequences<'a>(
             ("last_value", ColType::Int8),
         ],
     );
-    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let out = catalog_rows(
+        arena,
+        (0..storage.sequence_count())
+            .filter(|slot| storage.sequence_slot_visible_to(*slot, txid))
+            .count(),
+    )?;
     let mut n = 0;
     for slot in 0..storage.sequence_count() {
         let seq = storage.sequence_for(slot, txid);
@@ -30926,7 +31255,12 @@ fn pg_sequence<'a>(
             ("seqcycle", ColType::Bool),
         ],
     );
-    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let out = catalog_rows(
+        arena,
+        (0..storage.sequence_count())
+            .filter(|slot| storage.sequence_slot_visible_to(*slot, txid))
+            .count(),
+    )?;
     let mut n = 0;
     for slot in 0..storage.sequence_count() {
         let seq = storage.sequence_for(slot, txid);
@@ -31468,7 +31802,13 @@ fn info_tables<'a>(
             ("table_type", ColType::Text),
         ],
     );
-    let mut out: [&[Datum]; 256] = [&[]; 256];
+    let visible_tables = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .count();
+    let out = catalog_rows(
+        arena,
+        visible_tables + storage.views_visible_to(txid).count(),
+    )?;
     let mut n = 0;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -32123,7 +32463,15 @@ fn info_columns<'a>(
             ("is_updatable", ColType::Text),
         ],
     );
-    let mut out: [&[Datum]; 1024] = [&[]; 1024];
+    let table_columns = (0..storage.table_count())
+        .filter(|slot| storage.table_slot_visible_to(*slot, txid))
+        .map(|slot| storage.table_def(slot, txid).columns().len())
+        .sum::<usize>();
+    let view_columns = storage
+        .views_visible_to(txid)
+        .map(|(_, view)| view.columns_for(txid).len())
+        .sum::<usize>();
+    let out = catalog_rows(arena, table_columns + view_columns)?;
     let mut n = 0;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {

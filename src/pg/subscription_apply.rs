@@ -208,39 +208,49 @@ pub struct SubscriptionApply {
 }
 
 impl SubscriptionApply {
-    pub const fn budget_bytes(
-        relation_capacity: usize,
-        txn_rows: usize,
-        arena_bytes: usize,
-    ) -> usize {
-        relation_capacity * core::mem::size_of::<RelationBinding>()
-            + TxnState::budget_bytes(txn_rows)
-            + arena_bytes
+    pub const fn budget_bytes(config: &crate::config::Config) -> usize {
+        config.subscription_relation_capacity * core::mem::size_of::<RelationBinding>()
+            + TxnState::budget_bytes_with_ddl_capacity(
+                config.txn_rows,
+                config.max_ddl_per_transaction,
+            )
+            + config.subscription_arena_bytes
             + TRIGGER_RESPONSE_BYTES
-            + txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
+            + config.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
+            + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences)
     }
 
     pub(crate) fn new(
         budget: &mut Budget,
         stream: crate::storage::SubscriptionStream,
-        relation_capacity: usize,
-        txn_rows: usize,
-        arena_bytes: usize,
+        config: &crate::config::Config,
         confirmed_lsn: u64,
         behavior: crate::storage::SubscriptionBehavior,
     ) -> Result<Self, BudgetError> {
         Ok(Self {
             stream,
-            txn: TxnState::new(budget, txn_rows)?,
-            guc: GucState::new(),
-            relations: RelationMap::new(budget, relation_capacity)?,
-            arena: Arena::new(budget, "subscription_apply_arena", arena_bytes)?,
+            txn: TxnState::new_with_ddl_capacity(
+                budget,
+                config.txn_rows,
+                config.max_ddl_per_transaction,
+            )?,
+            guc: GucState::new_with_sequence_capacity(budget, config.max_sequences)?,
+            relations: RelationMap::new(budget, config.subscription_relation_capacity)?,
+            arena: Arena::new(
+                budget,
+                "subscription_apply_arena",
+                config.subscription_arena_bytes,
+            )?,
             trigger_response: FixedBuf::new(
                 budget,
                 "subscription_trigger_response",
                 TRIGGER_RESPONSE_BYTES,
             )?,
-            trigger_scratch: FixedVec::new(budget, "subscription_trigger_scratch", txn_rows)?,
+            trigger_scratch: FixedVec::new(
+                budget,
+                "subscription_trigger_scratch",
+                config.txn_rows,
+            )?,
             remote: RemoteTransaction::Idle,
             confirmed_lsn,
             behavior,

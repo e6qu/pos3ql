@@ -3976,8 +3976,7 @@ pub(crate) fn collect(
     {
         push_drop_once(drops, &mut drop_count, reference, false, normal)?;
     }
-    let mut seen_commands: [Option<EventObjectRef>; crate::sql::txn::MAX_TXN_DDL] =
-        [None; crate::sql::txn::MAX_TXN_DDL];
+    let mut seen_commands: [Option<EventObjectRef>; MAX_EVENT_OBJECTS] = [None; MAX_EVENT_OBJECTS];
     let mut seen_command_count = 0usize;
     for (&entry, &entry_origin) in undo.iter().zip(undo_origins) {
         if entry_origin != origin {

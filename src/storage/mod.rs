@@ -3602,6 +3602,10 @@ pub(crate) const MAX_RULE_ACTIONS: usize = crate::sql::parser::MAX_LIST;
 
 pub(crate) const MAX_STORED_QUERY_DEPENDENCIES: usize = 64;
 
+/// Sequence relation OIDs occupy `[95_000, 100_000)`, immediately below the
+/// view relation range. The startup parser rejects capacities beyond it.
+pub(crate) const MAX_SEQUENCE_CATALOG_SLOTS: usize = 5_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DependencyClass {
@@ -5383,11 +5387,6 @@ impl MatviewDef {
         self.ddl_state.visible_to(txid)
     }
 }
-
-/// The most sequences the catalog holds. A compile-time cap (not config-driven)
-/// so a session's `currval` bag ([`crate::sql::guc::GucState`]) can be a fixed
-/// inline array keyed by slot; exhausting it is a loud error, never growth.
-pub(crate) const MAX_SEQUENCES: usize = 64;
 
 /// How many domain types may exist at once, and how many CHECK constraints a
 /// single domain may carry. Bounded conservatively: a `DomainDef` inlines its
@@ -14113,7 +14112,7 @@ impl Storage {
             + MAX_COLUMN_ACL_ENTRIES * size_of::<ColumnAclEntry>()
             + MAX_DEFAULT_ACL_ENTRIES * size_of::<DefaultAclEntry>()
             + MAX_PARAMETER_ACL_ENTRIES * size_of::<ParameterAclEntry>()
-            + MAX_SEQUENCES * size_of::<SequenceDef>()
+            + config.max_sequences * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMPOSITES * size_of::<CompositeDef>()
@@ -14607,8 +14606,8 @@ impl Storage {
             "matview_dependencies",
             config.max_materialized_views,
         )?;
-        let mut sequences = FixedVec::new(budget, "sequences", MAX_SEQUENCES)?;
-        for _ in 0..MAX_SEQUENCES {
+        let mut sequences = FixedVec::new(budget, "sequences", config.max_sequences)?;
+        for _ in 0..config.max_sequences {
             sequences
                 .push(SequenceDef {
                     database: DatabaseOid::POSTGRES,
@@ -14638,7 +14637,7 @@ impl Storage {
                     pending_dirty: Cell::new(false),
                     ddl_state: CatalogDdlState::Absent,
                 })
-                .expect("sized to MAX_SEQUENCES");
+                .expect("sized to max_sequences");
         }
         let mut domains = FixedVec::new(budget, "domains", MAX_DOMAINS)?;
         for _ in 0..MAX_DOMAINS {
@@ -42459,6 +42458,7 @@ mod tests {
         config.max_tables = 2;
         config.max_databases = 6;
         config.max_schemas = 17;
+        config.max_sequences = 18;
         config.max_views = 3;
         config.max_materialized_views = 4;
         config.max_routines = 5;
@@ -42483,6 +42483,7 @@ mod tests {
         assert_eq!(storage.databases.len(), 6);
         assert_eq!(storage.database_cumulative_statistics.borrow().len(), 6);
         assert_eq!(storage.schemas.len(), 17);
+        assert_eq!(storage.sequences.len(), 18);
         assert_eq!(storage.views.len(), 3);
         assert_eq!(storage.matviews.len(), 4);
         assert_eq!(storage.matview_dependencies.len(), 4);

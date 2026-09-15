@@ -604,9 +604,7 @@ pub(crate) enum DdlUndo {
     },
 }
 
-/// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and
-/// transaction-versioned inbound foreign key takes one undo entry.
-pub const MAX_TXN_DDL: usize = 64;
+const DEFAULT_DDL_CAPACITY: usize = 64;
 pub const MAX_TXN_ANALYZE: usize = crate::storage::MAX_PENDING_STATISTICS_PER_TXN;
 const SUBSCRIPTION_ADVANCES_PER_TXN: usize = 1;
 pub const MAX_DEFERRED_CONSTRAINTS: usize = 128;
@@ -694,18 +692,34 @@ pub(crate) enum StatisticsUndo {
 
 impl TxnState {
     pub const fn budget_bytes(capacity: usize) -> usize {
-        Self::budget_bytes_with_large_objects(capacity, DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS)
+        Self::budget_bytes_with_large_objects(
+            capacity,
+            DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS,
+            DEFAULT_DDL_CAPACITY,
+        )
+    }
+
+    pub(crate) const fn budget_bytes_with_ddl_capacity(
+        capacity: usize,
+        ddl_capacity: usize,
+    ) -> usize {
+        Self::budget_bytes_with_large_objects(
+            capacity,
+            DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS,
+            ddl_capacity,
+        )
     }
 
     pub const fn budget_bytes_with_large_objects(
         capacity: usize,
         descriptor_capacity: usize,
+        ddl_capacity: usize,
     ) -> usize {
         capacity * core::mem::size_of::<(u32, u64, PriorPending)>()
-            + MAX_TXN_DDL * core::mem::size_of::<TruncateEvent>()
+            + ddl_capacity * core::mem::size_of::<TruncateEvent>()
             + MAX_TRUNCATE_WAL_TABLE_BYTES
-            + MAX_TXN_DDL * core::mem::size_of::<DdlUndo>()
-            + MAX_TXN_DDL * core::mem::size_of::<u32>()
+            + ddl_capacity * core::mem::size_of::<DdlUndo>()
+            + ddl_capacity * core::mem::size_of::<u32>()
             + MAX_TXN_ANALYZE * core::mem::size_of::<StatisticsUndo>()
             + MAX_SAVEPOINTS * core::mem::size_of::<Savepoint>()
             + crate::sql::notify::PER_TXN
@@ -726,13 +740,32 @@ impl TxnState {
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
-        Self::new_with_large_objects(budget, capacity, DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS)
+        Self::new_with_large_objects(
+            budget,
+            capacity,
+            DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS,
+            DEFAULT_DDL_CAPACITY,
+        )
+    }
+
+    pub(crate) fn new_with_ddl_capacity(
+        budget: &mut Budget,
+        capacity: usize,
+        ddl_capacity: usize,
+    ) -> Result<Self, BudgetError> {
+        Self::new_with_large_objects(
+            budget,
+            capacity,
+            DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS,
+            ddl_capacity,
+        )
     }
 
     pub fn new_with_large_objects(
         budget: &mut Budget,
         capacity: usize,
         descriptor_capacity: usize,
+        ddl_capacity: usize,
     ) -> Result<Self, BudgetError> {
         let mut large_object_descriptors =
             FixedVec::new(budget, "large_object_descriptors", descriptor_capacity)?;
@@ -759,14 +792,14 @@ impl TxnState {
             rule_depth: 0,
             concurrent_partition_detach_pending: false,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
-            truncates: FixedVec::new(budget, "txn_truncates", MAX_TXN_DDL)?,
+            truncates: FixedVec::new(budget, "txn_truncates", ddl_capacity)?,
             truncate_wal_tables: FixedBuf::new(
                 budget,
                 "txn_truncate_wal_tables",
                 MAX_TRUNCATE_WAL_TABLE_BYTES,
             )?,
-            ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
-            ddl_origins: FixedVec::new(budget, "txn_ddl_origins", MAX_TXN_DDL)?,
+            ddl: FixedVec::new(budget, "txn_ddl", ddl_capacity)?,
+            ddl_origins: FixedVec::new(budget, "txn_ddl_origins", ddl_capacity)?,
             ddl_origin: 0,
             next_ddl_origin: 0,
             statistics_undo: FixedVec::new(budget, "txn_statistics_undo", MAX_TXN_ANALYZE)?,
@@ -1216,7 +1249,7 @@ impl TxnState {
             sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction contains more than {} TRUNCATE commands",
-                MAX_TXN_DDL
+                self.truncates.capacity()
             )
         })
     }
@@ -2014,8 +2047,8 @@ impl TxnState {
         self.ddl.push(undo).map_err(|_| {
             sql_err!(
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "more than {} DDL statements in one transaction",
-                MAX_TXN_DDL
+                "transaction contains more than {} catalog changes",
+                self.ddl.capacity()
             )
         })?;
         self.ddl_origins
@@ -2026,6 +2059,10 @@ impl TxnState {
 
     pub(crate) fn ddl(&self) -> &[DdlUndo] {
         &self.ddl
+    }
+
+    pub(crate) fn ddl_capacity(&self) -> usize {
+        self.ddl.capacity()
     }
 
     pub(crate) fn ddl_origins(&self) -> &[u32] {

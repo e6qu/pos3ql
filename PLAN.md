@@ -67,12 +67,26 @@ storage. RAM and local disk are bounded, disposable caches.
   accepts the parser's complete bounded target list, and bulk tablespace,
   REINDEX, and CLUSTER scratch is sized from actual configured table
   cardinality rather than an unrelated schema/column product.
+- Sequence catalogs are startup-sized through `max_sequences` across durable
+  definitions, per-session `currval`/`lastval` and cache state, dependency
+  planning, `DROP OWNED`, identity cleanup, catalogs, WAL, checkpoints, and
+  object-cold recovery. Recycled connections retain their startup allocation
+  while clearing every sequence slot. The currently disjoint relation-OID
+  range admits up to 5,000 sequence slots and rejects larger configurations.
+  `max_ddl_per_transaction` now sizes live and prepared transaction undo,
+  subscription apply, commit scratch, and logical decoding together, so atomic
+  catalog operations above the former 64-change boundary remain usable and
+  exactly charged before serving.
+- Test qualification now owns and removes engine, object-fixture, and
+  performance scratch directories. Storage fault injection corrupts only its
+  selected preallocated bytes in place, so repeated full and VOPR runs do not
+  require whole-file replacement space or accumulate transient databases.
 
 ## Remaining production work
 
 ### Remaining bounded scale limits
 
-Replace the compile-time role, type, sequence, ACL, partition-key, constraint,
+Replace the compile-time role, type, ACL, partition-key, constraint,
 and per-object inline ceilings with startup-sized pools or bounded chunked
 structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,

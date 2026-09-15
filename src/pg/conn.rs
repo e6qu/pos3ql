@@ -458,10 +458,11 @@ impl Conn {
                 budget,
                 config.txn_rows,
                 config.max_large_object_descriptors,
+                config.max_ddl_per_transaction,
             )?,
             sqlprep: SqlPreparedPool::new(config, budget)?,
             cursors: crate::sql::cursor::CursorPool::new(config, budget)?,
-            guc: GucState::new(),
+            guc: GucState::new_with_sequence_capacity(budget, config.max_sequences)?,
             scram: ScramFlow::new(),
             role_scram: None,
             login_verifier: LoginVerifier::Rejected,
@@ -520,7 +521,7 @@ impl Conn {
         // reset the GUCs (else a `SET` leaks across connections — SHOW/SET/
         // current_setting all read a stale value), the auth flow, and any COPY
         // left in flight by an abrupt disconnect.
-        self.guc = GucState::new();
+        self.guc.reset_session_state();
         self.scram = ScramFlow::new();
         self.role_scram = None;
         self.login_verifier = LoginVerifier::Rejected;
@@ -5845,6 +5846,19 @@ mod tests {
         apply_startup_options(&guc, "-c event_triggers=off", true)
             .expect("a superuser may disable login event triggers");
         assert!(!guc.event_triggers());
+    }
+
+    #[test]
+    fn recycled_connection_clears_configured_sequence_state_without_allocating() {
+        let mut config = Config::default_dev();
+        config.max_sequences = 80;
+        let mut budget = Budget::new(64 << 20);
+        let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
+        connection.guc.seq_session().record_nextval(79, 11, 37);
+        assert_eq!(connection.guc.seq_session().currval(79, 11), Some(37));
+        crate::mem::guard::forbid_alloc(|| connection.guc.reset_session_state());
+        assert_eq!(connection.guc.seq_session().currval(79, 11), None);
+        assert_eq!(connection.guc.seq_session().lastval(), None);
     }
 
     #[test]

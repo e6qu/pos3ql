@@ -99,9 +99,9 @@ also exposed a quadratic Cartesian catalog test and default-class option
 deparsing that omitted the required operator-class name. A second planner
 audit found an overbroad class/operator gate and a missing GiST DML `EXPLAIN`
 cost path. The exact PostgreSQL 18 search-strategy matrix, physical-plan
-regressions, and differential corpus now cover both fixes. GiST
-K-nearest-neighbor ordering, PostgreSQL page layout, and native callbacks
-remain explicit architecture limits rather than deferred defects.
+regressions, and differential corpus now cover both fixes. PostgreSQL page
+layout and native callbacks remain explicit architecture limits rather than
+deferred defects.
 
 The GIN/SP-GiST review found no externally blocked defect. PostgreSQL 18.6's
 four GIN and seven SP-GiST built-in classes now own physical query and DML
@@ -111,9 +111,26 @@ differential coverage, and warm/cold performance gates. The review also found
 and fixed constant array constructors missing from invariant-expression
 planning, GIN/SP-GiST omissions in `EXPLAIN` cost selection, incomplete GIN
 reloption deparsing, and missing text pattern-order and prefix operators.
-Specialized posting/tree navigation, K-nearest-neighbor ordering, PostgreSQL
-page layout, and native callbacks remain architecture limits rather than
-deferred defects.
+Specialized posting/tree navigation, PostgreSQL page layout, and native
+callbacks remain architecture limits rather than deferred defects.
+
+The K-nearest-neighbor review found no externally blocked defect. PostgreSQL
+18's built-in geometric GiST and SP-GiST ordering families now recognize only
+their catalogued `<-> point` shape and sort compact immutable keys before base
+reads. Prepared origins, filters, NULLs, ties, included-column index-only
+execution, committed overlays, same-transaction key changes, and object-cold
+recovery share the typed planner/executor boundary. The review also added warm
+and cold access-path and zero-base-fetch performance gates. Navigable GiST and
+SP-GiST nodes remain an architecture limit; K-nearest-neighbor execution is
+correct but still walks the complete immutable key generation.
+
+That review also exposed an unrelated catalog-capacity defect: named index
+slots were accidentally sized by `max_tables`, so a valid schema with more
+indexes than tables exhausted its catalog early. `max_indexes` now owns an
+independent startup-fixed pool and memory budget, retains compatible sizing for
+existing configurations that set only `max_tables`, rejects unrepresentable
+capacities at the parse boundary, and is exercised by a schema whose named
+index count exceeds its table capacity.
 
 The ordered-index review found that prefix and range plans advertised physical
 index access but read every immutable value-index data block, and that

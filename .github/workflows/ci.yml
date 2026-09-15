@@ -240,7 +240,7 @@ jobs:
 
       - name: Upload raw performance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: performance-smoke
           path: ${{ runner.temp }}/performance-smoke

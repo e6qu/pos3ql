@@ -9015,6 +9015,7 @@ fn test_config(name: &str) -> Config {
     config.wal_buffer_bytes = 1 << 14;
     config.work_arena_bytes = 1 << 21;
     config.collation_scratch_bytes = 4 << 10;
+    config.remove_test_data_dir_on_drop();
     config
 }
 
@@ -9376,6 +9377,27 @@ fn test_engine_with_budget(bytes: usize) -> (Engine, Budget) {
     let mut budget = Budget::new(bytes);
     let engine = Engine::new(&config, &mut budget).unwrap();
     (engine, budget)
+}
+
+#[test]
+fn test_data_directory_lives_until_the_last_engine_or_configuration_owner() {
+    let config = test_config("test-data-directory-lifetime");
+    let path = std::path::PathBuf::from(&config.data_dir);
+    let mut budget = Budget::new(1 << 27);
+    let first = Engine::new(&config, &mut budget).unwrap();
+    assert!(path.exists());
+    drop(first);
+    assert!(path.exists(), "the configuration still owns recovery state");
+
+    let mut restart_budget = Budget::new(1 << 27);
+    let second = Engine::new(&config, &mut restart_budget).unwrap();
+    drop(config);
+    assert!(
+        path.exists(),
+        "the restarted engine still owns recovery state"
+    );
+    drop(second);
+    assert!(!path.exists(), "the final owner removes the test directory");
 }
 
 fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
@@ -33755,9 +33777,11 @@ fn routine_acls_are_signature_typed_enforced_and_durable() {
 
 #[test]
 fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
+    const ROUTINES: usize = 65;
     let mut config = test_config("revoke-all-functions-public-acl");
-    config.max_tables = crate::sql::txn::MAX_TXN_DDL + 1;
-    config.max_routines = crate::sql::txn::MAX_TXN_DDL + 1;
+    config.max_tables = ROUTINES;
+    config.max_routines = ROUTINES;
+    config.max_ddl_per_transaction = ROUTINES - 1;
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -33770,7 +33794,7 @@ fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    for index in 0..=crate::sql::txn::MAX_TXN_DDL {
+    for index in 0..ROUTINES {
         let created = run_with(
             &mut engine,
             &mut budget,
@@ -34476,6 +34500,243 @@ fn sequence_basics() {
     run_with(&mut e, &mut b, "DROP SEQUENCE s");
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('s')")).contains("42P01")
+    );
+}
+
+#[test]
+fn configured_sequence_capacity_covers_sessions_ddl_catalogs_and_object_cold_recovery() {
+    const CAPACITY: usize = 80;
+    let mut config = test_config("configured-sequence-capacity");
+    config.max_sequences = CAPACITY;
+    config.max_tables = 4;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("configured-sequences-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE sequence_capacity_owner; \
+         GRANT CREATE ON SCHEMA public TO sequence_capacity_owner",
+    );
+    for slot in 0..70 {
+        let sql = format!(
+            "SET ROLE sequence_capacity_owner; CREATE SEQUENCE owned_capacity_{slot} CACHE 3"
+        );
+        let output = run_with(&mut engine, &mut budget, &sql);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "slot {slot}"
+        );
+    }
+    let mut owner_session =
+        GucState::new_with_sequence_capacity(&mut budget, config.max_sequences).unwrap();
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SET ROLE sequence_capacity_owner; \
+             SELECT nextval('owned_capacity_69'); \
+             SELECT currval('owned_capacity_69'); \
+             SELECT lastval()",
+            1 << 18,
+            &mut owner_session,
+        )),
+        ["1", "1", "1"]
+    );
+
+    let mut catalog_transaction = TxnState::new_with_ddl_capacity(
+        &mut budget,
+        config.txn_rows,
+        config.max_ddl_per_transaction,
+    )
+    .unwrap();
+    let dropped = run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut catalog_transaction,
+        "DROP OWNED BY sequence_capacity_owner CASCADE; \
+         SELECT count(*) FROM pg_sequences WHERE sequencename LIKE 'owned_capacity_%'",
+    );
+    assert_eq!(
+        data_rows(&dropped),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+
+    for slot in 0..CAPACITY - 1 {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("CREATE SEQUENCE capacity_filler_{slot}"),
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "slot {slot}"
+        );
+    }
+    let identity = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sequence_capacity_identity (marker integer, id bigint GENERATED ALWAYS AS IDENTITY)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&identity).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&identity)
+    );
+    let identity = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE sequence_capacity_identity DROP COLUMN id",
+    );
+    assert!(
+        !String::from_utf8_lossy(&identity).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&identity)
+    );
+    let durable = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE sequence_capacity_durable CACHE 3",
+    );
+    assert!(
+        !String::from_utf8_lossy(&durable).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&durable)
+    );
+
+    let mut high_session =
+        GucState::new_with_sequence_capacity(&mut budget, config.max_sequences).unwrap();
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('sequence_capacity_durable'); \
+             SELECT currval('sequence_capacity_durable'); \
+             SELECT count(*) FROM pg_sequences; \
+             SELECT count(*) FROM pg_class WHERE relkind = 'S'",
+            1 << 18,
+            &mut high_session,
+        )),
+        ["1", "1", "80", "80"]
+    );
+    let full = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE sequence_capacity_overflow",
+    );
+    let full = String::from_utf8_lossy(&full);
+    assert!(
+        full.contains("54000") && full.contains("too many sequences (limit 80)"),
+        "{full}"
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session =
+        GucState::new_with_sequence_capacity(&mut cold_budget, config.max_sequences).unwrap();
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT count(*) FROM pg_sequences; \
+             SELECT nextval('sequence_capacity_durable')",
+            1 << 18,
+            &mut cold_session,
+        )),
+        ["80", "4"]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn configured_transaction_ddl_capacity_drives_commit_and_index_scratch() {
+    const RELATIONS: usize = 70;
+    let mut config = test_config("configured-transaction-ddl-capacity");
+    config.max_tables = RELATIONS;
+    config.max_indexes = RELATIONS;
+    config.max_value_indexes = RELATIONS;
+    config.table_rows = 8;
+    config.value_index_rows = 8;
+    config.txn_rows = 256;
+    config.max_ddl_per_transaction = 2 * RELATIONS + 16;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 8 << 20;
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for slot in 0..RELATIONS {
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("CREATE TABLE ddl_capacity_{slot} (id integer)"),
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "slot {slot}: {}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+
+    let mut transaction = TxnState::new_with_ddl_capacity(
+        &mut budget,
+        config.txn_rows,
+        config.max_ddl_per_transaction,
+    )
+    .unwrap();
+    run_with_txn_bytes(&mut engine, &mut budget, &mut transaction, "BEGIN");
+    for slot in 0..RELATIONS {
+        let altered = run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &format!("ALTER TABLE ddl_capacity_{slot} ADD COLUMN extra_capacity_column integer"),
+        );
+        assert!(
+            !String::from_utf8_lossy(&altered).contains("ERROR"),
+            "slot {slot}: {}",
+            String::from_utf8_lossy(&altered)
+        );
+    }
+    for slot in 0..RELATIONS {
+        let indexed = run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &format!("CREATE INDEX ddl_capacity_index_{slot} ON ddl_capacity_{slot} (id)"),
+        );
+        assert!(
+            !String::from_utf8_lossy(&indexed).contains("ERROR"),
+            "slot {slot}: {}",
+            String::from_utf8_lossy(&indexed)
+        );
+    }
+    let committed = run_with_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "COMMIT; \
+         SELECT count(*) FROM pg_attribute WHERE attname = 'extra_capacity_column'; \
+         SELECT count(*) FROM pg_class \
+           WHERE relkind = 'i' AND relname LIKE 'ddl_capacity_index_%'",
+    );
+    assert_eq!(
+        data_rows(&committed),
+        [RELATIONS.to_string(), RELATIONS.to_string()],
+        "{}",
+        String::from_utf8_lossy(&committed)
     );
 }
 
@@ -37624,7 +37885,7 @@ fn alter_table_multi_action() {
 #[test]
 fn vacuum_and_analyze() {
     let config = test_config("vacuum");
-    let mut b = Budget::new(1 << 27);
+    let mut b = Budget::new(1 << 28);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE vt (a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO vt VALUES (1, 'x'), (2, 'y')");
@@ -56442,9 +56703,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     let mut apply = SubscriptionApply::new(
         &mut budget,
         stream,
-        8,
-        config.txn_rows,
-        1 << 16,
+        &config,
         engine.subscription_confirmed_lsn("apply_changes").unwrap(),
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
     )
@@ -56795,9 +57054,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     let mut no_origin_apply = SubscriptionApply::new(
         &mut budget,
         no_origin_stream,
-        8,
-        config.txn_rows,
-        1 << 16,
+        &config,
         121,
         no_origin_behavior,
     )
@@ -56878,16 +57135,7 @@ fn streamed_pgoutput_and_skip_share_the_exact_durable_frontier() {
         .unwrap()
         .1
         .behavior;
-    let mut apply = SubscriptionApply::new(
-        &mut budget,
-        stream,
-        8,
-        config.txn_rows,
-        1 << 16,
-        0,
-        behavior,
-    )
-    .unwrap();
+    let mut apply = SubscriptionApply::new(&mut budget, stream, &config, 0, behavior).unwrap();
     let relation = [
         b'R', 0, 0, 0, 1, b'p', b'u', b'b', b'l', b'i', b'c', 0, b's', b't', b'r', b'e', b'a',
         b'm', b'e', b'd', b'_', b'r', b'o', b'w', b's', 0, b'd', 0, 2, 1, b'i', b'd', 0, 0, 0, 0,
@@ -57130,9 +57378,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     let mut apply = SubscriptionApply::new(
         &mut budget,
         engine.subscription_stream("partition_apply").unwrap(),
-        8,
-        config.txn_rows,
-        1 << 16,
+        &config,
         0,
         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
     )

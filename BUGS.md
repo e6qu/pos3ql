@@ -6,7 +6,8 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria. The
-database/schema capacity and bulk-DDL scratch audit found no external blocker.
+sequence, transaction-DDL, and test-resource lifecycle audit found no external
+blocker.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

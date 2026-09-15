@@ -450,12 +450,9 @@ impl Server {
                     crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS,
                     config.subscription_receive_bytes,
                     config.subscription_send_bytes,
-                ) + crate::pg::subscription_apply::SubscriptionApply::budget_bytes(
-                    config.subscription_relation_capacity,
-                    config.txn_rows,
-                    config.subscription_arena_bytes,
-                ) + config.subscription_relation_capacity
-                    * core::mem::size_of::<SubscriptionBootstrapTable>()
+                ) + crate::pg::subscription_apply::SubscriptionApply::budget_bytes(config)
+                    + config.subscription_relation_capacity
+                        * core::mem::size_of::<SubscriptionBootstrapTable>()
                     + config.copy_line_bytes)
     }
 
@@ -536,9 +533,7 @@ impl Server {
                     apply: crate::pg::subscription_apply::SubscriptionApply::new(
                         budget,
                         crate::storage::SubscriptionStream::EMPTY,
-                        config.subscription_relation_capacity,
-                        config.txn_rows,
-                        config.subscription_arena_bytes,
+                        config,
                         0,
                         crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
                     )?,

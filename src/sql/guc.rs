@@ -6,8 +6,9 @@ use crate::sql::eval::sqlstate;
 use core::cell::{Cell, RefCell};
 use core::fmt::Write;
 
+use crate::mem::{Budget, BudgetError, FixedVec};
 use crate::sql_err;
-use crate::storage::{MAX_SEQUENCES, SequenceCacheIdentity, SequenceDef};
+use crate::storage::{SequenceCacheIdentity, SequenceDef};
 use crate::util::StackStr;
 
 use super::ast::{TransactionCharacteristics, TransactionIsolation};
@@ -438,11 +439,15 @@ impl Default for RenderContext {
 /// reused catalog slot cannot leak a dropped sequence's value.
 pub struct SeqSession {
     /// Per-slot `(created_at, value)`; `created_at == 0` means undefined.
-    currvals: [Cell<(u64, i64)>; MAX_SEQUENCES],
+    currvals: [Cell<(u64, i64)>; INLINE_SEQUENCE_SLOTS],
     /// `(defined, value)` for `lastval` — the last `nextval` of any sequence.
     lastval: Cell<(bool, i64)>,
-    caches: [Cell<SequenceCache>; MAX_SEQUENCES],
+    caches: [Cell<SequenceCache>; INLINE_SEQUENCE_SLOTS],
+    overflow_currvals: Option<FixedVec<Cell<(u64, i64)>>>,
+    overflow_caches: Option<FixedVec<Cell<SequenceCache>>>,
 }
+
+const INLINE_SEQUENCE_SLOTS: usize = 64;
 
 #[derive(Clone, Copy)]
 struct SequenceCache {
@@ -480,14 +485,66 @@ impl SequenceCache {
 impl SeqSession {
     const fn new() -> Self {
         SeqSession {
-            currvals: [const { Cell::new((0u64, 0i64)) }; MAX_SEQUENCES],
+            currvals: [const { Cell::new((0u64, 0i64)) }; INLINE_SEQUENCE_SLOTS],
             lastval: Cell::new((false, 0)),
-            caches: [const { Cell::new(SequenceCache::EMPTY) }; MAX_SEQUENCES],
+            caches: [const { Cell::new(SequenceCache::EMPTY) }; INLINE_SEQUENCE_SLOTS],
+            overflow_currvals: None,
+            overflow_caches: None,
+        }
+    }
+
+    pub(crate) const fn extra_budget_bytes(sequence_capacity: usize) -> usize {
+        sequence_capacity.saturating_sub(INLINE_SEQUENCE_SLOTS)
+            * (core::mem::size_of::<Cell<(u64, i64)>>()
+                + core::mem::size_of::<Cell<SequenceCache>>())
+    }
+
+    fn with_capacity(budget: &mut Budget, sequence_capacity: usize) -> Result<Self, BudgetError> {
+        let overflow = sequence_capacity.saturating_sub(INLINE_SEQUENCE_SLOTS);
+        if overflow == 0 {
+            return Ok(Self::new());
+        }
+        let mut overflow_currvals = FixedVec::new(budget, "session_sequence_currvals", overflow)?;
+        let mut overflow_caches = FixedVec::new(budget, "session_sequence_caches", overflow)?;
+        for _ in 0..overflow {
+            overflow_currvals
+                .push(Cell::new((0, 0)))
+                .expect("sized to max_sequences");
+            overflow_caches
+                .push(Cell::new(SequenceCache::EMPTY))
+                .expect("sized to max_sequences");
+        }
+        Ok(Self {
+            overflow_currvals: Some(overflow_currvals),
+            overflow_caches: Some(overflow_caches),
+            ..Self::new()
+        })
+    }
+
+    fn currval_cell(&self, slot: usize) -> &Cell<(u64, i64)> {
+        if slot < INLINE_SEQUENCE_SLOTS {
+            &self.currvals[slot]
+        } else {
+            &self
+                .overflow_currvals
+                .as_ref()
+                .expect("sequence slot is configured")[slot - INLINE_SEQUENCE_SLOTS]
+        }
+    }
+
+    fn cache_cell(&self, slot: usize) -> &Cell<SequenceCache> {
+        if slot < INLINE_SEQUENCE_SLOTS {
+            &self.caches[slot]
+        } else {
+            &self
+                .overflow_caches
+                .as_ref()
+                .expect("sequence slot is configured")[slot - INLINE_SEQUENCE_SLOTS]
         }
     }
 
     pub(crate) fn take_cached(&self, slot: usize, identity: SequenceCacheIdentity) -> Option<i64> {
-        let mut cache = self.caches[slot].get();
+        let mut cache = self.cache_cell(slot).get();
         if cache.identity != Some(identity) || cache.remaining == 0 {
             return None;
         }
@@ -496,7 +553,7 @@ impl SeqSession {
         if cache.remaining != 0 {
             cache.next = cache.advance(value);
         }
-        self.caches[slot].set(cache);
+        self.cache_cell(slot).set(cache);
         Some(value)
     }
 
@@ -517,30 +574,30 @@ impl SeqSession {
             cycle: definition.cycle,
         };
         cache.next = cache.advance(first);
-        self.caches[slot].set(cache);
+        self.cache_cell(slot).set(cache);
     }
 
     pub(crate) fn invalidate_cache(&self, slot: usize) {
-        self.caches[slot].set(SequenceCache::EMPTY);
+        self.cache_cell(slot).set(SequenceCache::EMPTY);
     }
 
     /// Records a `nextval`: defines both this sequence's `currval` and `lastval`.
     pub fn record_nextval(&self, slot: usize, created_at: u64, value: i64) {
-        self.currvals[slot].set((created_at, value));
+        self.currval_cell(slot).set((created_at, value));
         self.lastval.set((true, value));
     }
 
     /// Records a `setval`: defines this sequence's `currval` only (PostgreSQL
     /// does not let `setval` define `lastval`).
     pub fn record_setval(&self, slot: usize, created_at: u64, value: i64) {
-        self.currvals[slot].set((created_at, value));
-        self.caches[slot].set(SequenceCache::EMPTY);
+        self.currval_cell(slot).set((created_at, value));
+        self.cache_cell(slot).set(SequenceCache::EMPTY);
     }
 
     /// This sequence's `currval` in this session, if `nextval`/`setval` has
     /// defined it (the stamp must still match the live sequence).
     pub fn currval(&self, slot: usize, created_at: u64) -> Option<i64> {
-        let (stamp, value) = self.currvals[slot].get();
+        let (stamp, value) = self.currval_cell(slot).get();
         (stamp != 0 && stamp == created_at).then_some(value)
     }
 
@@ -555,6 +612,16 @@ impl SeqSession {
         }
         for cache in &self.caches {
             cache.set(SequenceCache::EMPTY);
+        }
+        if let Some(values) = &self.overflow_currvals {
+            for value in values.iter() {
+                value.set((0, 0));
+            }
+        }
+        if let Some(caches) = &self.overflow_caches {
+            for cache in caches.iter() {
+                cache.set(SequenceCache::EMPTY);
+            }
         }
         self.lastval.set((false, 0));
     }
@@ -1010,6 +1077,24 @@ impl Default for GucState {
 }
 
 impl GucState {
+    pub(crate) fn new_with_sequence_capacity(
+        budget: &mut Budget,
+        sequence_capacity: usize,
+    ) -> Result<Self, BudgetError> {
+        let mut state = Self::new();
+        state.seq_session = SeqSession::with_capacity(budget, sequence_capacity)?;
+        Ok(state)
+    }
+
+    /// Restores connection-local state without replacing startup allocations.
+    pub(crate) fn reset_session_state(&mut self) {
+        let mut sequences = SeqSession::new();
+        core::mem::swap(&mut sequences, &mut self.seq_session);
+        *self = Self::new();
+        core::mem::swap(&mut sequences, &mut self.seq_session);
+        self.seq_session.discard();
+    }
+
     pub(crate) fn source(&self, name: &str) -> &'static str {
         let state = self.store.borrow();
         let bit = guc_bit(name);

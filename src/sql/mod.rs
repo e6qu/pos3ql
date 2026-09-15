@@ -248,6 +248,9 @@ pub struct Engine {
     max_connections: u32,
     max_prepared_transactions: usize,
     max_locks_per_transaction: usize,
+    commit_altered_tables: FixedVec<(usize, bool)>,
+    commit_index_tables: FixedVec<usize>,
+    logical_decoding_truncates: FixedVec<PendingTruncate>,
     prepared_transactions: two_phase::PreparedTransactions,
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
@@ -272,6 +275,8 @@ pub struct Engine {
     system_settings_reloaded: bool,
     discard_protocol_state: bool,
     clean_shutdown_path: std::path::PathBuf,
+    #[cfg(test)]
+    _test_data_dir_cleanup: Option<std::sync::Arc<crate::config::TestDataDirCleanup>>,
 }
 
 pub(crate) struct CursorStatementContext<'a, 'response> {
@@ -1355,6 +1360,15 @@ struct PendingTruncate {
     restart_identity: bool,
     emitted: bool,
 }
+
+const EMPTY_PENDING_TRUNCATE: PendingTruncate = PendingTruncate {
+    command_id: 0,
+    table_slots: [0; crate::sql::txn::MAX_TRUNCATE_TABLES],
+    table_count: 0,
+    cascade: false,
+    restart_identity: false,
+    emitted: false,
+};
 
 #[derive(Clone, Copy)]
 struct PendingLogicalMessage {
@@ -2765,6 +2779,8 @@ impl Engine {
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_connections as usize * size_of::<(i32, u64)>()
             + config.max_databases * size_of::<u16>()
+            + config.max_ddl_per_transaction
+                * (size_of::<(usize, bool)>() + size_of::<usize>() + size_of::<PendingTruncate>())
             + two_phase::PreparedTransactions::budget_bytes(config)
             + crate::pg::replication_client::ReplicationClient::budget_bytes(
                 1,
@@ -3001,6 +3017,16 @@ impl Engine {
                 .push(0)
                 .expect("sized to max_databases");
         }
+        let mut logical_decoding_truncates = FixedVec::new(
+            budget,
+            "logical_decoding_truncates",
+            config.max_ddl_per_transaction,
+        )?;
+        for _ in 0..config.max_ddl_per_transaction {
+            logical_decoding_truncates
+                .push(EMPTY_PENDING_TRUNCATE)
+                .expect("sized to max_ddl_per_transaction");
+        }
         Ok(Self {
             storage,
             wal,
@@ -3030,6 +3056,17 @@ impl Engine {
             max_connections: config.max_connections,
             max_prepared_transactions: config.max_prepared_transactions,
             max_locks_per_transaction: config.max_locks_per_transaction,
+            commit_altered_tables: FixedVec::new(
+                budget,
+                "commit_altered_tables",
+                config.max_ddl_per_transaction,
+            )?,
+            commit_index_tables: FixedVec::new(
+                budget,
+                "commit_index_tables",
+                config.max_ddl_per_transaction,
+            )?,
+            logical_decoding_truncates,
             prepared_transactions,
             notify: notify::NotifyState::new(
                 budget,
@@ -3049,6 +3086,8 @@ impl Engine {
             system_settings_reloaded: false,
             discard_protocol_state: false,
             clean_shutdown_path,
+            #[cfg(test)]
+            _test_data_dir_cleanup: config.test_data_dir_cleanup.clone(),
         })
     }
 
@@ -3702,20 +3741,16 @@ impl Engine {
         self.work.reset();
         let storage = &self.storage;
         let filter_arena = &self.work;
+        for truncate in self.logical_decoding_truncates.iter_mut() {
+            *truncate = EMPTY_PENDING_TRUNCATE;
+        }
+        let truncates = self.logical_decoding_truncates.as_mut_slice();
         let mut emitted = false;
         let mut encode = |end_lsn, transaction: &[u8]| {
             let mut at = 0usize;
             let mut transaction_id = 0u32;
             let mut has_replication_origin = false;
             let mut subscription_origin = None;
-            let mut truncates = [PendingTruncate {
-                command_id: 0,
-                table_slots: [0; crate::sql::txn::MAX_TRUNCATE_TABLES],
-                table_count: 0,
-                cascade: false,
-                restart_identity: false,
-                emitted: false,
-            }; crate::sql::txn::MAX_TXN_DDL];
             let mut truncate_count = 0usize;
             let mut logical_messages =
                 [EMPTY_PENDING_LOGICAL_MESSAGE; crate::sql::query::MAX_ROUTINE_INVOCATIONS];
@@ -5458,28 +5493,29 @@ impl Engine {
         commit_lsn: u64,
         guc: Option<&GucState>,
     ) -> Result<(), SqlError> {
-        let mut altered_tables = [(usize::MAX, false); txn::MAX_TXN_DDL];
-        let mut altered_count = 0usize;
-        let mut index_tables = [usize::MAX; txn::MAX_TXN_DDL];
-        let mut index_table_count = 0usize;
+        self.commit_altered_tables.clear();
+        self.commit_index_tables.clear();
         for undo in txn.ddl() {
             let DdlUndo::TableAltered(slot) = *undo else {
                 continue;
             };
             let slot = slot as usize;
-            if altered_tables[..altered_count]
+            if self
+                .commit_altered_tables
                 .iter()
                 .any(|&(existing, _)| existing == slot)
             {
                 continue;
             }
             let rewrote_rows = self.storage.commit_table_def(slot, txn.txid);
-            altered_tables[altered_count] = (slot, rewrote_rows);
-            altered_count += 1;
+            self.commit_altered_tables
+                .push((slot, rewrote_rows))
+                .expect("commit table scratch matches transaction DDL capacity");
         }
         for &(table, rowid, _) in txn.touched() {
             let table = table as usize;
-            if altered_tables[..altered_count]
+            if self
+                .commit_altered_tables
                 .iter()
                 .any(|&(altered, _)| altered == table)
             {
@@ -5842,20 +5878,22 @@ impl Engine {
                         txn.txid,
                     );
                     if let Some(table) = self.storage.index_table_slot(slot)
-                        && !index_tables[..index_table_count].contains(&table)
+                        && !self.commit_index_tables.contains(&table)
                     {
-                        index_tables[index_table_count] = table;
-                        index_table_count += 1;
+                        self.commit_index_tables
+                            .push(table)
+                            .expect("commit index scratch matches transaction DDL capacity");
                     }
                 }
                 DdlUndo::IndexDropped(slot) => {
                     let slot = *slot as usize;
                     self.storage.commit_index_drop(slot);
                     if let Some(table) = self.storage.index_table_slot(slot)
-                        && !index_tables[..index_table_count].contains(&table)
+                        && !self.commit_index_tables.contains(&table)
                     {
-                        index_tables[index_table_count] = table;
-                        index_table_count += 1;
+                        self.commit_index_tables
+                            .push(table)
+                            .expect("commit index scratch matches transaction DDL capacity");
                     }
                 }
                 DdlUndo::IndexRenamed { slot, .. } => {
@@ -5954,7 +5992,7 @@ impl Engine {
             self.storage.apply_subscription_advance(advance, commit_lsn);
         }
         let mut index_result = Ok(());
-        for &(table, rewrote_rows) in &altered_tables[..altered_count] {
+        for &(table, rewrote_rows) in self.commit_altered_tables.iter() {
             self.storage.finish_table_def_commit(table, rewrote_rows);
             if self.storage.table(table).live
                 && let Err(error) = self.storage.refresh_enforcers(table)
@@ -5964,8 +6002,9 @@ impl Engine {
             }
         }
         if index_result.is_ok() {
-            for &table in &index_tables[..index_table_count] {
-                if altered_tables[..altered_count]
+            for &table in self.commit_index_tables.iter() {
+                if self
+                    .commit_altered_tables
                     .iter()
                     .any(|&(altered, _)| altered == table)
                 {

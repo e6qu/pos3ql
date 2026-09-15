@@ -43,6 +43,7 @@ impl PreparedTransactions {
                 + TxnState::budget_bytes_with_large_objects(
                     config.txn_rows,
                     config.max_large_object_descriptors,
+                    config.max_ddl_per_transaction,
                 )
                 + 2 * config.wal_buffer_bytes)
     }
@@ -61,6 +62,7 @@ impl PreparedTransactions {
                     budget,
                     config.txn_rows,
                     config.max_large_object_descriptors,
+                    config.max_ddl_per_transaction,
                 )?,
                 records: FixedBuf::new(
                     budget,

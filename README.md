@@ -90,15 +90,22 @@ no longer silently sizes indexes, views, materialized views, routines, casts,
 operators, operator families/classes, triggers, or publications; each pool has
 its own configuration and memory-plan charge.
 
-Database and schema catalogs are independently sized by `max_databases` and
-`max_schemas`. Their connection counters, cumulative statistics, catalog rows,
-database cloning, publication membership, WAL, checkpoints, and cold recovery
-use those declared capacities. Schema slots retain their explicit 255-slot
-on-disk representation limit; database slots retain their 65,535-slot limit.
+Database, schema, and sequence catalogs are independently sized by
+`max_databases`, `max_schemas`, and `max_sequences`. Their session state,
+connection counters, cumulative statistics, catalog rows, database cloning,
+publication membership, WAL, checkpoints, and cold recovery use those declared
+capacities. Schema slots retain their explicit 255-slot on-disk representation
+limit; database slots retain their 65,535-slot limit, and sequence relations
+retain their disjoint 5,000-slot OID range.
 
 Legacy configurations that specify only `max_tables` keep the historical
 one-slot-per-table defaults. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.
+
+`max_ddl_per_transaction` sizes catalog undo, commit, prepared-transaction,
+subscription-apply, and logical-decoding state together. It is reserved for
+every transaction slot at startup; exhaustion aborts the current statement or
+transaction instead of partially applying bulk DDL.
 
 Collations, conversions, text-search objects, event triggers, tablespaces, and
 object comments likewise have independent startup capacities. Their catalog

@@ -6544,7 +6544,7 @@ pub fn create_role(
         .saturating_add(request.memberships.role_members.len())
         .saturating_add(request.memberships.admin_members.len())
         .saturating_add(usize::from(!current_is_superuser));
-    if membership_count >= super::txn::MAX_TXN_DDL {
+    if membership_count >= txn.ddl_capacity() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many role memberships in one statement"
@@ -7223,7 +7223,7 @@ pub fn drop_role(
                         .is_some_and(|role| role as usize == slot)
             })
             .count();
-        if membership_count + setting_count + 1 > super::txn::MAX_TXN_DDL {
+        if membership_count + setting_count + 1 > txn.ddl_capacity() {
             return sql_fail(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "dropping role \"{}\" changes too many role memberships",
@@ -7448,11 +7448,11 @@ pub fn grant_role(
         options,
         grantor: written_grantor,
     } = request;
-    if roles.len().saturating_mul(members.len()) > super::txn::MAX_TXN_DDL {
+    if roles.len().saturating_mul(members.len()) > txn.ddl_capacity() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many role memberships in one statement (limit {})",
-            super::txn::MAX_TXN_DDL
+            txn.ddl_capacity()
         ));
     }
     let current = super::eval::funcs::system::current_user_owned();
@@ -7601,11 +7601,11 @@ pub fn revoke_role(
         grantor: written_grantor,
         cascade,
     } = request;
-    if roles.len().saturating_mul(members.len()) > super::txn::MAX_TXN_DDL {
+    if roles.len().saturating_mul(members.len()) > txn.ddl_capacity() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many role memberships in one statement (limit {})",
-            super::txn::MAX_TXN_DDL
+            txn.ddl_capacity()
         ));
     }
     let current = super::eval::funcs::system::current_user_owned();
@@ -8081,7 +8081,7 @@ pub fn alter_default_privileges(
     if owner_count
         .saturating_mul(schema_count)
         .saturating_mul(grantees.len())
-        > super::txn::MAX_TXN_DDL
+        > txn.ddl_capacity()
     {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -8397,7 +8397,7 @@ pub fn reassign_owned(
         .text_search_objects_visible_to(txn.txid)
         .filter(|(_, definition)| definition.owner().is_some_and(source_owns_catalog))
         .count();
-    if changes > super::txn::MAX_TXN_DDL.saturating_sub(txn.ddl().len()) {
+    if changes > txn.ddl_capacity().saturating_sub(txn.ddl().len()) {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many objects to reassign in one transaction"
@@ -8749,7 +8749,7 @@ pub fn drop_owned(
 ) -> Outcome {
     use crate::storage::{
         AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS,
-        MAX_PUBLICATION_SCHEMAS, MAX_ROLES, MAX_SEQUENCES,
+        MAX_PUBLICATION_SCHEMAS, MAX_ROLES,
     };
     let mut owned_roles = [0u16; MAX_ROLES];
     let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
@@ -8776,7 +8776,10 @@ pub fn drop_owned(
     let mut tables = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut views = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut matviews = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut sequences = [false; MAX_SEQUENCES];
+    let sequences = match arena.alloc_slice_with(storage.sequence_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let mut domains = [false; MAX_DOMAINS];
     let mut enums = [false; MAX_ENUMS];
     let mut composites = [false; crate::storage::MAX_COMPOSITES];
@@ -8914,7 +8917,7 @@ pub fn drop_owned(
                     policy,
                     &tables,
                     &views,
-                    &sequences,
+                    sequences,
                     &domains,
                     &enums,
                     &composites,
@@ -8957,7 +8960,7 @@ pub fn drop_owned(
                         policy,
                         &tables,
                         &views,
-                        &sequences,
+                        sequences,
                         &domains,
                         &enums,
                         &composites,
@@ -10148,7 +10151,7 @@ pub fn grant_privileges(
             ));
         }
     }
-    if object_count.saturating_mul(grantees.len()) > super::txn::MAX_TXN_DDL {
+    if object_count.saturating_mul(grantees.len()) > txn.ddl_capacity() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many privilege changes in one statement"
@@ -10685,7 +10688,7 @@ pub fn grant_parameter_privileges(
         .names
         .len()
         .saturating_mul(command.target.grantees.len())
-        > super::txn::MAX_TXN_DDL
+        > txn.ddl_capacity()
     {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -12104,12 +12107,12 @@ pub fn drop_schema(
         + table_trigger_undo
         + routine_trigger_undo
         + n_slots;
-    if txn.ddl().len() + undo_needed > super::txn::MAX_TXN_DDL {
+    if txn.ddl().len() + undo_needed > txn.ddl_capacity() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "DROP SCHEMA needs {} DDL undo entries but only {} remain",
             undo_needed,
-            super::txn::MAX_TXN_DDL - txn.ddl().len()
+            txn.ddl_capacity() - txn.ddl().len()
         ));
     }
     // Persist drops while every referenced type and routine can still be
@@ -40189,12 +40192,12 @@ fn drop_domain_selection(
     }
 
     let undo_needed = selected_count + reserved_undo;
-    if txn.ddl().len() + undo_needed > super::txn::MAX_TXN_DDL {
+    if txn.ddl().len() + undo_needed > txn.ddl_capacity() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "type drop needs {} DDL undo entries but only {} remain",
             undo_needed,
-            super::txn::MAX_TXN_DDL - txn.ddl().len()
+            txn.ddl_capacity() - txn.ddl().len()
         ));
     }
 
@@ -42268,7 +42271,7 @@ fn policy_depends_on_owned_selection(
     policy: &crate::storage::PolicyDef,
     tables: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    sequences: &[bool; crate::storage::MAX_SEQUENCES],
+    sequences: &[bool],
     domains: &[bool; crate::storage::MAX_DOMAINS],
     enums: &[bool; crate::storage::MAX_ENUMS],
     composites: &[bool; crate::storage::MAX_COMPOSITES],
@@ -63888,7 +63891,11 @@ fn alter_table_inner(
     let mut n_identity_sequences = 0usize;
     let mut identity_sequence_alterations = [None; MAX_COLUMNS];
     let mut n_identity_sequence_alterations = 0usize;
-    let mut owned_sequences_to_drop = [usize::MAX; crate::storage::MAX_SEQUENCES];
+    let owned_sequences_to_drop =
+        match arena.alloc_slice_with(storage.sequence_count(), |_| usize::MAX) {
+            Ok(values) => values,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
     let mut n_owned_sequences_to_drop = 0usize;
     let mut column_renames = [(SqlName::EMPTY, SqlName::EMPTY); MAX_COLUMNS];
     let mut n_column_renames = 0usize;

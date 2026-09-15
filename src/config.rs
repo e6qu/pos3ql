@@ -53,6 +53,8 @@ pub struct Config {
     pub max_portals: usize,
     /// Rows one transaction may touch (per connection undo capacity).
     pub txn_rows: usize,
+    /// Catalog mutations one transaction may stage for commit or rollback.
+    pub max_ddl_per_transaction: usize,
     /// Cluster-wide PostgreSQL two-phase transaction slots. Zero disables
     /// PREPARE TRANSACTION, matching PostgreSQL's startup-only setting.
     pub max_prepared_transactions: usize,
@@ -78,6 +80,8 @@ pub struct Config {
     /// Fixed number of database-local schemas, including one public schema for
     /// each built-in database.
     pub max_schemas: usize,
+    /// Fixed number of sequence catalog slots across all databases.
+    pub max_sequences: usize,
     /// Fixed number of named index catalog slots. Physical acceleration
     /// bindings draw separately from `max_value_indexes`.
     pub max_indexes: usize,
@@ -250,6 +254,19 @@ pub struct Config {
     pub database_collation_locale: String,
     /// Startup-reserved bytes for each side of one locale comparison.
     pub collation_scratch_bytes: usize,
+    #[cfg(test)]
+    pub(crate) test_data_dir_cleanup: Option<std::sync::Arc<TestDataDirCleanup>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TestDataDirCleanup(std::path::PathBuf);
+
+#[cfg(test)]
+impl Drop for TestDataDirCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Config {
@@ -271,6 +288,7 @@ impl Config {
             portal_bytes: 4 * KIB,
             portal_result_bytes: 64 * KIB,
             txn_rows: 8192,
+            max_ddl_per_transaction: 256,
             max_prepared_transactions: 0,
             max_locks_per_transaction: 64,
             memtable_bytes: 64 * MIB,
@@ -279,6 +297,7 @@ impl Config {
             max_tables: 32,
             max_databases: 32,
             max_schemas: 32,
+            max_sequences: 64,
             max_indexes: 32,
             max_views: 32,
             max_materialized_views: 32,
@@ -350,7 +369,16 @@ impl Config {
             copy_line_bytes: 256 * KIB,
             database_collation_locale: "C".to_string(),
             collation_scratch_bytes: 256 * KIB,
+            #[cfg(test)]
+            test_data_dir_cleanup: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_test_data_dir_on_drop(&mut self) {
+        self.test_data_dir_cleanup = Some(std::sync::Arc::new(TestDataDirCleanup(
+            self.data_dir.clone().into(),
+        )));
     }
 
     /// Parses `key = value` lines over the development defaults.
@@ -495,6 +523,10 @@ impl Config {
                     config.txn_rows =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "max_ddl_per_transaction" => {
+                    config.max_ddl_per_transaction =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
                 "max_prepared_transactions" => {
                     config.max_prepared_transactions =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -524,6 +556,10 @@ impl Config {
                 }
                 "max_schemas" => {
                     config.max_schemas =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_sequences" => {
+                    config.max_sequences =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_indexes" => {
@@ -899,6 +935,7 @@ impl Config {
         if [
             config.max_tables,
             config.max_schemas,
+            config.max_sequences,
             config.max_indexes,
             config.max_views,
             config.max_materialized_views,
@@ -952,6 +989,17 @@ impl Config {
                 "max_locks_per_transaction must be greater than zero".to_string(),
             ));
         }
+        if config.max_ddl_per_transaction == 0
+            || config.max_ddl_per_transaction > crate::sql::event_trigger::MAX_EVENT_OBJECTS
+        {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "max_ddl_per_transaction must be between 1 and {}",
+                    crate::sql::event_trigger::MAX_EVENT_OBJECTS
+                ),
+            ));
+        }
         if config.max_large_objects == 0
             || config.large_object_pages == 0
             || config.max_large_object_descriptors == 0
@@ -974,6 +1022,7 @@ impl Config {
         for (name, capacity) in [
             ("max_tables", config.max_tables),
             ("max_databases", config.max_databases),
+            ("max_sequences", config.max_sequences),
             ("max_indexes", config.max_indexes),
             ("max_views", config.max_views),
             ("max_materialized_views", config.max_materialized_views),
@@ -1018,6 +1067,15 @@ impl Config {
                 "max_tablespaces exceeds the 65534-slot tablespace representation".to_string(),
             ));
         }
+        if config.max_sequences > crate::storage::MAX_SEQUENCE_CATALOG_SLOTS {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "max_sequences exceeds the {}-slot sequence OID range",
+                    crate::storage::MAX_SEQUENCE_CATALOG_SLOTS
+                ),
+            ));
+        }
         if config.foreign_receive_bytes == 0 || config.foreign_send_bytes == 0 {
             return Err(ConfigError::at(
                 0,
@@ -1048,10 +1106,12 @@ impl Config {
             + self.max_prepared * self.prepared_bytes
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
             + self.max_tables * core::mem::size_of::<crate::storage::SqlName>()
+            + crate::sql::guc::SeqSession::extra_budget_bytes(self.max_sequences)
             + crate::sql::cursor::CursorPool::budget_bytes(self)
             + crate::sql::txn::TxnState::budget_bytes_with_large_objects(
                 self.txn_rows,
                 self.max_large_object_descriptors,
+                self.max_ddl_per_transaction,
             );
         MemoryPlan {
             memtable: self.memtable_bytes,
@@ -1180,6 +1240,7 @@ mod tests {
 # development overrides
 listen_addr = 0.0.0.0:5432
 max_connections = 128
+max_ddl_per_transaction = 192
 max_prepared_transactions = 11
 max_locks_per_transaction = 96
 max_replication_slots = 12
@@ -1187,6 +1248,7 @@ max_subscriptions = 7
 max_rules = 19
 max_databases = 48
 max_schemas = 200
+max_sequences = 300
 memtable_bytes = 16MiB   # small for tests
 temporary_spill_bytes = 32MiB
 checkpoint_manifest_bytes = 2MiB
@@ -1195,6 +1257,7 @@ sql_arena_bytes = 4096
         let c = Config::parse(text).unwrap();
         assert_eq!(c.listen_addr, "0.0.0.0:5432");
         assert_eq!(c.max_connections, 128);
+        assert_eq!(c.max_ddl_per_transaction, 192);
         assert_eq!(c.max_prepared_transactions, 11);
         assert_eq!(c.max_locks_per_transaction, 96);
         assert_eq!(c.max_replication_slots, 12);
@@ -1202,6 +1265,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_rules, 19);
         assert_eq!(c.max_databases, 48);
         assert_eq!(c.max_schemas, 200);
+        assert_eq!(c.max_sequences, 300);
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.temporary_spill_bytes, 32 * MIB);
         assert_eq!(c.checkpoint_manifest_bytes, 2 * MIB);
@@ -1325,10 +1389,13 @@ sql_arena_bytes = 4096
         );
         assert!(Config::parse("memtable_bytes = lots\n").is_err());
         assert!(Config::parse("max_connections = -1\n").is_err());
+        assert!(Config::parse("max_ddl_per_transaction = 0\n").is_err());
+        assert!(Config::parse("max_ddl_per_transaction = 257\n").is_err());
         assert!(Config::parse("max_rules = 0\n").is_err());
         assert!(Config::parse("max_tables = 0\n").is_err());
         assert!(Config::parse("max_databases = 2\n").is_err());
         assert!(Config::parse("max_schemas = 2\n").is_err());
+        assert!(Config::parse("max_sequences = 0\n").is_err());
         assert!(Config::parse("max_indexes = 0\n").is_err());
         for name in [
             "max_views",
@@ -1401,6 +1468,9 @@ sql_arena_bytes = 4096
         let error = Config::parse("max_tablespaces = 65535\n").unwrap_err();
         assert!(error.message.contains("65534-slot"), "{error}");
         Config::parse("max_tablespaces = 65534\n").unwrap();
+        let error = Config::parse("max_sequences = 5001\n").unwrap_err();
+        assert!(error.message.contains("5000-slot sequence OID range"));
+        Config::parse("max_sequences = 5000\n").unwrap();
     }
 
     #[test]
@@ -1482,12 +1552,19 @@ sql_arena_bytes = 4096
         c.max_cursors = 1;
         c.cursor_bytes = 64;
         c.copy_line_bytes = 50;
+        c.max_sequences = 80;
         let plan = c.memory_plan(500, 250);
         // Fixed protocol buffers plus every startup-sized connection pool.
         let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
         let publication_selection = c.max_tables * core::mem::size_of::<crate::storage::SqlName>();
-        let transaction = crate::sql::txn::TxnState::budget_bytes(c.txn_rows);
-        let per_connection = 830 + publication_selection + cursor_pool + transaction;
+        let transaction = crate::sql::txn::TxnState::budget_bytes_with_large_objects(
+            c.txn_rows,
+            c.max_large_object_descriptors,
+            c.max_ddl_per_transaction,
+        );
+        let sequence_session = crate::sql::guc::SeqSession::extra_budget_bytes(c.max_sequences);
+        let per_connection =
+            830 + publication_selection + cursor_pool + transaction + sequence_session;
         assert_eq!(plan.connections, per_connection * 10);
         assert_eq!(plan.total(), per_connection * 10 + 1000 + 2000 + 500 + 250);
     }

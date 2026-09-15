@@ -30,6 +30,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::rc::Rc;
 
@@ -124,6 +125,7 @@ fn vopr_config(seed: u64) -> Config {
     config.cursor_bytes = 16 * 1024;
     config.sql_arena_bytes = 256 * 1024;
     config.work_arena_bytes = 2 << 20;
+    config.remove_test_data_dir_on_drop();
     config
 }
 
@@ -455,11 +457,18 @@ impl World {
             let Some(last) = bytes.iter().rposition(|&b| b != 0) else {
                 continue;
             };
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open local file for corruption");
             for _ in 0..64 {
                 let at = self.rng.next_bounded(last as u32 + 1) as usize;
                 bytes[at] ^= 0xA5;
+                file.seek(SeekFrom::Start(at as u64))
+                    .expect("seek local file for corruption");
+                file.write_all(&bytes[at..=at])
+                    .expect("write corrupted local byte");
             }
-            std::fs::write(&path, &bytes).expect("rewrite corrupted file");
         }
     }
 

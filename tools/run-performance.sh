@@ -36,6 +36,9 @@ cleanup() {
   if [ -n "$POSTGRES_CONTAINER" ]; then
     docker rm -f "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
   fi
+  if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+    rm -rf -- "$WORK"
+  fi
 }
 trap cleanup EXIT INT TERM
 

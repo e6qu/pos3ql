@@ -14061,23 +14061,25 @@ impl Storage {
         INDEX_ARENA_BYTES
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
-                * (size_of::<Table>()
-                    + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
-                    + size_of::<ViewDef>()
-                    + size_of::<RoutineDef>()
-                    + size_of::<CastDef>()
-                    + size_of::<OperatorDef>()
-                    + size_of::<OperatorFamilyDef>()
-                    + size_of::<OperatorClassDef>()
+                * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
+            + config.max_views * size_of::<ViewDef>()
+            + config.max_routines
+                * (size_of::<RoutineDef>()
                     + size_of::<StoredQueryDependencies>()
-                    + MAX_PENDING_TABLE_DEFS * size_of::<PendingRoutineDependencies>()
-                    + size_of::<TriggerDef>()
-                    + config.max_tables * size_of::<PartitionTriggerState>()
-                    + MAX_POLICIES_PER_TABLE * size_of::<PolicyDef>()
-                    + MAX_EXTENDED_STATISTICS_PER_TABLE * size_of::<ExtendedStatisticsDef>()
-                    + size_of::<PublicationDef>()
-                    + size_of::<MatviewDef>()
-                    + size_of::<StoredQueryDependencies>())
+                    + MAX_PENDING_TABLE_DEFS * size_of::<PendingRoutineDependencies>())
+            + config.max_casts * size_of::<CastDef>()
+            + config.max_operators * size_of::<OperatorDef>()
+            + config.max_operator_families * size_of::<OperatorFamilyDef>()
+            + config.max_operator_classes * size_of::<OperatorClassDef>()
+            + config.max_triggers
+                * (size_of::<TriggerDef>() + config.max_tables * size_of::<PartitionTriggerState>())
+            + config.max_tables * MAX_POLICIES_PER_TABLE * size_of::<PolicyDef>()
+            + config.max_tables
+                * MAX_EXTENDED_STATISTICS_PER_TABLE
+                * size_of::<ExtendedStatisticsDef>()
+            + config.max_publications * size_of::<PublicationDef>()
+            + config.max_materialized_views
+                * (size_of::<MatviewDef>() + size_of::<StoredQueryDependencies>())
             + config.max_indexes * (size_of::<IndexDef>() + size_of::<BrinMaintenanceState>())
             + FixedMap::<u64, RowState>::budget_bytes(config.large_object_pages)
                 .saturating_sub(FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
@@ -14140,7 +14142,17 @@ impl Storage {
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<(u32, u64)>()
             + (config.max_connections as usize + config.max_prepared_transactions)
+                * size_of::<ActiveTransactionIdentity>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
+                .saturating_mul(8)
+                .max(64)
+                * size_of::<RecentTransactionStatus>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<u32>()
+            + config.max_routines * size_of::<FunctionCumulativeStatistics>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
+                * config.max_routines
+                * size_of::<FunctionTransactionStatistics>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * table_slot_capacity(config)
                 * size_of::<TableLock>()
@@ -14254,8 +14266,8 @@ impl Storage {
                 .push(LargeObjectDef::EMPTY)
                 .expect("sized to max_large_objects");
         }
-        let mut views = FixedVec::new(budget, "views", config.max_tables)?;
-        for _ in 0..config.max_tables {
+        let mut views = FixedVec::new(budget, "views", config.max_views)?;
+        for _ in 0..config.max_views {
             views
                 .push(ViewDef {
                     database: DatabaseOid::POSTGRES,
@@ -14273,39 +14285,47 @@ impl Storage {
                     pending_columns: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
-                .expect("sized to max_tables");
+                .expect("sized to max_views");
         }
         let mut rules = FixedVec::new(budget, "rules", config.max_rules)?;
         for _ in 0..config.max_rules {
             rules.push(RuleDef::EMPTY).expect("sized to max_rules");
         }
-        let mut routines = FixedVec::new(budget, "routines", config.max_tables)?;
-        for _ in 0..config.max_tables {
+        let mut routines = FixedVec::new(budget, "routines", config.max_routines)?;
+        for _ in 0..config.max_routines {
             routines
                 .push(RoutineDef::EMPTY)
-                .expect("sized to max_tables");
+                .expect("sized to max_routines");
         }
-        let mut casts = FixedVec::new(budget, "casts", config.max_tables)?;
+        let mut casts = FixedVec::new(budget, "casts", config.max_casts)?;
         let mut access_methods = FixedVec::new(budget, "access_methods", MAX_ACCESS_METHODS)?;
         for _ in 0..MAX_ACCESS_METHODS {
             access_methods
                 .push(AccessMethodDef::EMPTY)
                 .expect("sized to access-method capacity");
         }
-        let mut operators = FixedVec::new(budget, "operators", config.max_tables)?;
-        let mut operator_families = FixedVec::new(budget, "operator_families", config.max_tables)?;
-        let mut operator_classes = FixedVec::new(budget, "operator_classes", config.max_tables)?;
-        for _ in 0..config.max_tables {
-            casts.push(CastDef::EMPTY).expect("sized to max_tables");
+        let mut operators = FixedVec::new(budget, "operators", config.max_operators)?;
+        let mut operator_families =
+            FixedVec::new(budget, "operator_families", config.max_operator_families)?;
+        let mut operator_classes =
+            FixedVec::new(budget, "operator_classes", config.max_operator_classes)?;
+        for _ in 0..config.max_casts {
+            casts.push(CastDef::EMPTY).expect("sized to max_casts");
+        }
+        for _ in 0..config.max_operators {
             operators
                 .push(OperatorDef::EMPTY)
-                .expect("sized to max_tables");
+                .expect("sized to max_operators");
+        }
+        for _ in 0..config.max_operator_families {
             operator_families
                 .push(OperatorFamilyDef::EMPTY)
-                .expect("sized to max_tables");
+                .expect("sized to max_operator_families");
+        }
+        for _ in 0..config.max_operator_classes {
             operator_classes
                 .push(OperatorClassDef::EMPTY)
-                .expect("sized to max_tables");
+                .expect("sized to max_operator_classes");
         }
         let mut collations = FixedVec::new(budget, "collations", MAX_COLLATIONS)?;
         for _ in 0..MAX_COLLATIONS {
@@ -14422,24 +14442,24 @@ impl Storage {
                 .expect("sized to event trigger capacity");
         }
         let routine_dependencies =
-            stored_query_dependency_slots(budget, "routine_dependencies", config.max_tables)?;
+            stored_query_dependency_slots(budget, "routine_dependencies", config.max_routines)?;
         let mut pending_routine_dependencies = FixedVec::new(
             budget,
             "pending_routine_dependencies",
-            config.max_tables * MAX_PENDING_TABLE_DEFS,
+            config.max_routines * MAX_PENDING_TABLE_DEFS,
         )?;
-        for _ in 0..config.max_tables * MAX_PENDING_TABLE_DEFS {
+        for _ in 0..config.max_routines * MAX_PENDING_TABLE_DEFS {
             pending_routine_dependencies
                 .push(PendingRoutineDependencies::EMPTY)
                 .expect("sized to pending routine definitions");
         }
-        let mut triggers = FixedVec::new(budget, "triggers", config.max_tables)?;
-        for _ in 0..config.max_tables {
+        let mut triggers = FixedVec::new(budget, "triggers", config.max_triggers)?;
+        for _ in 0..config.max_triggers {
             triggers
                 .push(TriggerDef::EMPTY)
-                .expect("sized to max_tables");
+                .expect("sized to max_triggers");
         }
-        let partition_trigger_state_capacity = config.max_tables * config.max_tables;
+        let partition_trigger_state_capacity = config.max_triggers * config.max_tables;
         let mut partition_trigger_states = FixedVec::new(
             budget,
             "partition_trigger_states",
@@ -14470,8 +14490,8 @@ impl Storage {
             "pending_extended_statistics_data",
             pending_extended_statistics_capacity(config),
         )?;
-        let mut publications = FixedVec::new(budget, "publications", config.max_tables)?;
-        for _ in 0..config.max_tables {
+        let mut publications = FixedVec::new(budget, "publications", config.max_publications)?;
+        for _ in 0..config.max_publications {
             publications
                 .push(PublicationDef {
                     database: DatabaseOid::POSTGRES,
@@ -14496,7 +14516,7 @@ impl Storage {
                     ownership: Ownership::BOOTSTRAP,
                     ddl_state: CatalogDdlState::Absent,
                 })
-                .expect("sized to max_tables");
+                .expect("sized to max_publications");
         }
         let mut replication_slots =
             FixedVec::new(budget, "replication_slots", config.max_replication_slots)?;
@@ -14569,8 +14589,8 @@ impl Storage {
                 })
                 .expect("sized to subscription relation capacity");
         }
-        let mut matviews = FixedVec::new(budget, "matviews", config.max_tables)?;
-        for _ in 0..config.max_tables {
+        let mut matviews = FixedVec::new(budget, "matviews", config.max_materialized_views)?;
+        for _ in 0..config.max_materialized_views {
             matviews
                 .push(MatviewDef {
                     database: DatabaseOid::POSTGRES,
@@ -14582,10 +14602,13 @@ impl Storage {
                     populated: false,
                     ddl_state: CatalogDdlState::Absent,
                 })
-                .expect("sized to max_tables");
+                .expect("sized to max_materialized_views");
         }
-        let matview_dependencies =
-            stored_query_dependency_slots(budget, "matview_dependencies", config.max_tables)?;
+        let matview_dependencies = stored_query_dependency_slots(
+            budget,
+            "matview_dependencies",
+            config.max_materialized_views,
+        )?;
         let mut sequences = FixedVec::new(budget, "sequences", MAX_SEQUENCES)?;
         for _ in 0..MAX_SEQUENCES {
             sequences
@@ -14927,12 +14950,15 @@ impl Storage {
                 .push(DatabaseCumulativeStatistics::empty(database.oid))
                 .expect("sized to the database catalog");
         }
-        let function_cumulative_statistics =
-            FixedVec::new(budget, "function_cumulative_statistics", config.max_tables)?;
+        let function_cumulative_statistics = FixedVec::new(
+            budget,
+            "function_cumulative_statistics",
+            config.max_routines,
+        )?;
         let function_transaction_statistics = FixedVec::new(
             budget,
             "function_transaction_statistics",
-            transaction_capacity * config.max_tables,
+            transaction_capacity * config.max_routines,
         )?;
         let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
@@ -42357,6 +42383,52 @@ mod tests {
     fn stored_query_dependency_arrays_live_outside_catalog_definitions() {
         assert!(size_of::<ViewDef>() < size_of::<StoredQueryDependencies>());
         assert!(size_of::<MatviewDef>() < size_of::<StoredQueryDependencies>());
+    }
+
+    #[test]
+    fn catalog_object_pools_follow_their_independent_startup_capacities() {
+        let mut config = test_config();
+        config.max_tables = 2;
+        config.max_views = 3;
+        config.max_materialized_views = 4;
+        config.max_routines = 5;
+        config.max_casts = 6;
+        config.max_operators = 7;
+        config.max_operator_families = 8;
+        config.max_operator_classes = 9;
+        config.max_triggers = 10;
+        config.max_publications = 11;
+        let expected_budget = config.memtable_bytes + Storage::extra_budget_bytes(&config);
+        let mut budget = Budget::new(expected_budget);
+        let mut storage = Storage::new(&config, &mut budget).unwrap();
+        storage.configure_collation(&config, &mut budget).unwrap();
+
+        assert_eq!(storage.tables.len(), 3); // two relations plus large-object pages
+        assert_eq!(storage.views.len(), 3);
+        assert_eq!(storage.matviews.len(), 4);
+        assert_eq!(storage.matview_dependencies.len(), 4);
+        assert_eq!(storage.routines.len(), 5);
+        assert_eq!(storage.routine_dependencies.len(), 5);
+        assert_eq!(
+            storage.pending_routine_dependencies.len(),
+            5 * MAX_PENDING_TABLE_DEFS
+        );
+        assert_eq!(storage.casts.len(), 6);
+        assert_eq!(storage.operators.len(), 7);
+        assert_eq!(storage.operator_families.len(), 8);
+        assert_eq!(storage.operator_classes.len(), 9);
+        assert_eq!(storage.triggers.len(), 10);
+        assert_eq!(storage.partition_trigger_states.len(), 20);
+        assert_eq!(storage.publications.len(), 11);
+        assert_eq!(
+            storage.function_cumulative_statistics.borrow().capacity(),
+            5
+        );
+        assert_eq!(
+            storage.function_transaction_statistics.borrow().capacity(),
+            (config.max_connections as usize + config.max_prepared_transactions) * 5
+        );
+        assert_eq!(budget.used(), expected_budget);
     }
 
     #[test]

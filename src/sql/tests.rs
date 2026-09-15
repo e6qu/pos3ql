@@ -2215,6 +2215,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     config.object_store_sim = true;
     config.object_store_bucket = format!("plpgsql-dynamic-session-{}", std::process::id());
     config.max_tables = 10;
+    config.max_routines = 10;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -8988,6 +8989,15 @@ fn test_config(name: &str) -> Config {
     config.temporary_spill_bytes = 0;
     config.max_connections = 8;
     config.max_tables = 8;
+    config.max_views = 8;
+    config.max_materialized_views = 8;
+    config.max_routines = 8;
+    config.max_casts = 8;
+    config.max_operators = 8;
+    config.max_operator_families = 8;
+    config.max_operator_classes = 8;
+    config.max_triggers = 8;
+    config.max_publications = 8;
     config.max_large_objects = 64;
     config.large_object_pages = 256;
     config.max_large_object_descriptors = 16;
@@ -26754,6 +26764,7 @@ fn views_survive_restart() {
 fn sql_routine_lifecycle_is_transactional_and_durable() {
     let mut config = test_config("routine_lifecycle");
     config.max_tables = 16;
+    config.max_routines = 16;
     let answer_oid: i32;
     {
         let mut budget = Budget::new(1 << 29);
@@ -27529,6 +27540,7 @@ fn routine_calls_apply_postgresql_implicit_argument_casts() {
 fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
     let mut config = test_config("routine_body_attributes");
     config.max_tables = 16;
+    config.max_routines = 16;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_bucket = format!("routine-body-attributes-{}", std::process::id());
@@ -28314,6 +28326,7 @@ fn sql_standard_dml_bodies_bind_column_typed_overloads() {
 fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
     let mut config = test_config("user-defined-aggregate-execution");
     config.max_tables = 32;
+    config.max_routines = 32;
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -28811,6 +28824,7 @@ fn user_defined_aggregate_survives_wal_and_checkpoint_recovery() {
 fn user_defined_aggregate_resolves_every_postgresql_polymorphic_family() {
     let mut config = test_config("user-defined-aggregate-polymorphic-families");
     config.max_tables = 32;
+    config.max_routines = 32;
     let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(
@@ -31179,6 +31193,8 @@ fn trigger_arguments_survive_checkpoint_and_recovery() {
 fn row_trigger_new_assignments_are_typed_and_rechecked() {
     let mut config = test_config("row-trigger-body");
     config.max_tables = 16;
+    config.max_routines = 16;
+    config.max_triggers = 16;
     let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
@@ -33741,6 +33757,7 @@ fn routine_acls_are_signature_typed_enforced_and_durable() {
 fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
     let mut config = test_config("revoke-all-functions-public-acl");
     config.max_tables = crate::sql::txn::MAX_TXN_DDL + 1;
+    config.max_routines = crate::sql::txn::MAX_TXN_DDL + 1;
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -47955,6 +47972,116 @@ fn like_including_indexes_uses_the_configured_catalog_capacity() {
         String::from_utf8_lossy(&output)
     );
     assert_eq!(data_rows(&output), ["9"]);
+}
+
+#[test]
+fn large_independent_catalogs_survive_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    const OBJECTS: usize = 40;
+    let mut config = test_config("independent-catalog-capacities");
+    config.max_tables = 2;
+    config.max_views = OBJECTS;
+    config.max_materialized_views = 1;
+    config.max_routines = OBJECTS + 1;
+    config.max_triggers = OBJECTS;
+    config.max_publications = OBJECTS;
+    config.max_rules = OBJECTS + 2;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("catalog-capacities-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE capacity_base(id integer);\
+         CREATE FUNCTION capacity_trigger() RETURNS trigger LANGUAGE plpgsql AS $$\
+         BEGIN RETURN NEW; END $$;",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    for slot in 0..OBJECTS {
+        let mut sql = String::new();
+        write!(
+            sql,
+            "CREATE FUNCTION capacity_fn_{slot}(value integer) RETURNS integer \
+               LANGUAGE sql IMMUTABLE AS $$ SELECT value + {slot} $$;\
+             CREATE VIEW capacity_view_{slot} AS \
+               SELECT capacity_fn_{slot}(id) AS value FROM capacity_base;\
+             CREATE TRIGGER capacity_trigger_{slot} BEFORE INSERT ON capacity_base \
+               FOR EACH ROW EXECUTE FUNCTION capacity_trigger();\
+             CREATE PUBLICATION capacity_publication_{slot} FOR TABLE capacity_base;"
+        )
+        .unwrap();
+        let created = run_with_arena_bytes(&mut engine, &mut budget, &sql, 2 << 20);
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "slot {slot}: {}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let created = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE MATERIALIZED VIEW capacity_materialized AS \
+           SELECT count(*) AS rows FROM capacity_base;\
+         INSERT INTO capacity_base VALUES (1);\
+         SELECT count(*) FROM pg_views WHERE viewname LIKE 'capacity_view_%';\
+         SELECT count(*) FROM pg_proc WHERE proname LIKE 'capacity_fn_%';\
+         SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'capacity_trigger_%';\
+         SELECT count(*) FROM pg_publication \
+          WHERE pubname LIKE 'capacity_publication_%';\
+         SELECT count(*) FROM pg_matviews \
+          WHERE matviewname = 'capacity_materialized'",
+        16 << 20,
+    );
+    let text = String::from_utf8_lossy(&created);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(&data_rows(&created)[..5], ["40", "40", "40", "40", "1"]);
+    for overflow in [
+        "CREATE FUNCTION capacity_fn_overflow(value integer) RETURNS integer \
+           LANGUAGE sql AS $$ SELECT value $$",
+        "CREATE VIEW capacity_view_overflow AS SELECT id FROM capacity_base",
+        "CREATE TRIGGER capacity_trigger_overflow BEFORE INSERT ON capacity_base \
+           FOR EACH ROW EXECUTE FUNCTION capacity_trigger()",
+        "CREATE PUBLICATION capacity_publication_overflow FOR TABLE capacity_base",
+    ] {
+        let output = run_with(&mut engine, &mut budget, overflow);
+        assert!(
+            String::from_utf8_lossy(&output).contains("54000"),
+            "{overflow}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = data_rows(&run_with_arena_bytes(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT count(*) FROM pg_views WHERE viewname LIKE 'capacity_view_%';
+         SELECT count(*) FROM pg_proc WHERE proname LIKE 'capacity_fn_%';
+         SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'capacity_trigger_%';
+         SELECT count(*) FROM pg_publication
+          WHERE pubname LIKE 'capacity_publication_%';
+         SELECT count(*) FROM pg_matviews
+          WHERE matviewname = 'capacity_materialized';
+         SELECT capacity_fn_39(10), value FROM capacity_view_39",
+        16 << 20,
+    ));
+    assert_eq!(cold, ["40", "40", "40", "40", "1", "49|40"]);
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

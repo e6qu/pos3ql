@@ -90,6 +90,12 @@ logical-replication boundary is specified separately in
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.
+- Tables, indexes, ordinary and materialized views, routines, casts, operators,
+  operator families/classes, triggers, and publications use independent
+  startup-sized pools. Their configured exhaustion is a loud program-limit
+  error; object-cold recovery preserves catalogs larger than the table pool.
+  Schema, role, type, sequence, database, tablespace, ACL, and several inline
+  per-object bounds remain compile-time limits.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

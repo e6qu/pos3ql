@@ -132,6 +132,24 @@ existing configurations that set only `max_tables`, rejects unrepresentable
 capacities at the parse boundary, and is exercised by a schema whose named
 index count exceeds its table capacity.
 
+The follow-on capacity audit found the same accidental coupling across nine
+more catalogs: views, materialized views, routines, casts, operators, operator
+families, operator classes, triggers, and publications all borrowed
+`max_tables`. Their dependent routine/materialized-view graphs, cumulative
+function statistics, and partition-trigger matrix inherited the same wrong
+size. Each now has an independently parsed, startup-reserved pool with exact
+memory-plan accounting and a 65535-slot representation check. Historical
+configuration files that set only `max_tables` retain the old derived sizes;
+explicit settings are independent. A forty-object-per-class regression fills
+the principal SQL-visible pools, confirms loud atomic exhaustion, checkpoints
+them, and recovers them through an empty local cache.
+
+An exact-budget regression added during that audit also found four startup
+allocations missing from the memory plan: active transaction identities,
+recent transaction statuses, cumulative function statistics, and
+transaction-local function statistics. The plan now charges each registry at
+its configured capacity, and startup is tested with no unaccounted headroom.
+
 The ordered-index review found that prefix and range plans advertised physical
 index access but read every immutable value-index data block, and that
 checkpoint insertion order could not support a real seek. Durable generations

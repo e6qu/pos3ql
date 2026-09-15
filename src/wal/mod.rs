@@ -100,6 +100,9 @@ const KIND_RESET_UNLOGGED_RELATIONS: u8 = 130;
 /// storage replay effect; pgoutput consumes it in command order.
 const KIND_LOGICAL_MESSAGE: u8 = 131;
 const KIND_BRIN_MAINTENANCE: u8 = 132;
+/// Wider text-search slot identity. Kind 111 remains decodable so existing
+/// journals retain their durable meaning.
+const KIND_SET_TEXT_SEARCH_V2: u8 = 133;
 const KIND_SET_PUBLICATION_OWNER: u8 = 43;
 const KIND_RENAME_PUBLICATION: u8 = 44;
 const KIND_CREATE_ROUTINE: u8 = 45;
@@ -1146,7 +1149,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
     },
     SetTextSearch {
-        slot: u8,
+        slot: u16,
         created_at: u64,
         definition: crate::storage::TextSearchDefinition,
     },
@@ -2175,7 +2178,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropCollation { .. } => KIND_DROP_COLLATION,
         WalOp::SetConversion { .. } => KIND_SET_CONVERSION,
         WalOp::DropConversion { .. } => KIND_DROP_CONVERSION,
-        WalOp::SetTextSearch { .. } => KIND_SET_TEXT_SEARCH,
+        WalOp::SetTextSearch { .. } => KIND_SET_TEXT_SEARCH_V2,
         WalOp::DropTextSearch { .. } => KIND_DROP_TEXT_SEARCH,
         WalOp::SetEventTrigger { .. } => KIND_SET_EVENT_TRIGGER,
         WalOp::DropEventTrigger { .. } => KIND_DROP_EVENT_TRIGGER,
@@ -3176,7 +3179,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + 8 + 1 + definition.schema.as_str().len() + 1 + definition.name.as_str().len() + 11
         }
         WalOp::SetTextSearch { definition, .. } => {
-            1 + 8 + 1 + text_search_definition_len(*definition)
+            2 + 8 + 1 + text_search_definition_len(*definition)
         }
         WalOp::DropTextSearch { schema, name, .. } => 1 + 1 + schema.len() + 1 + name.len(),
         WalOp::SetEventTrigger { definition, .. } => {
@@ -5271,7 +5274,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             created_at,
             definition,
         } => {
-            buffer.append(&[*slot])
+            buffer.append(&slot.to_le_bytes())
                 && buffer.append(&created_at.to_le_bytes())
                 && buffer.append(&[match definition.kind() {
                     crate::sql::ast::TextSearchObjectKind::Parser => 0,
@@ -9207,9 +9210,6 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_SET_COLLATION => {
             let slot = *payload.get(at)?;
             at += 1;
-            if usize::from(slot) >= crate::storage::MAX_COLLATIONS {
-                return None;
-            }
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -9291,9 +9291,6 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_SET_CONVERSION => {
             let slot = *payload.get(at)?;
             at += 1;
-            if usize::from(slot) >= crate::storage::MAX_CONVERSIONS {
-                return None;
-            }
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -9329,12 +9326,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 },
             })
         }
-        KIND_SET_TEXT_SEARCH => {
-            let slot = *payload.get(at)?;
-            at += 1;
-            if usize::from(slot) >= crate::storage::MAX_TEXT_SEARCH_OBJECTS {
-                return None;
-            }
+        KIND_SET_TEXT_SEARCH | KIND_SET_TEXT_SEARCH_V2 => {
+            let slot = if kind == KIND_SET_TEXT_SEARCH {
+                let slot = u16::from(*payload.get(at)?);
+                at += 1;
+                slot
+            } else {
+                let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                slot
+            };
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let object_kind = *payload.get(at)?;
@@ -9443,9 +9444,6 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_SET_EVENT_TRIGGER => {
             let slot = *payload.get(at)?;
             at += 1;
-            if usize::from(slot) >= crate::storage::MAX_EVENT_TRIGGERS {
-                return None;
-            }
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let name = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -11335,6 +11333,16 @@ mod tests {
                 pending: None,
             },
         };
+        let text_search = crate::storage::TextSearchDefinition::Parser {
+            schema: public,
+            name: SqlName::parse("parser_300").unwrap(),
+            oid: 310_300,
+            start: 3717,
+            gettoken: 3718,
+            end: 3719,
+            headline: 3720,
+            lextypes: 3721,
+        };
         let operations = [
             WalOp::SetCast(crate::storage::CastDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
@@ -11392,9 +11400,14 @@ mod tests {
                 schema: "public",
                 name: "latin1_to_utf8",
             },
+            WalOp::SetTextSearch {
+                slot: 300,
+                created_at: 16,
+                definition: text_search,
+            },
             WalOp::SetEventTrigger {
                 slot: 3,
-                created_at: 16,
+                created_at: 17,
                 definition: event_trigger,
             },
             WalOp::DropEventTrigger { name: "audit_ddl" },
@@ -11409,6 +11422,23 @@ mod tests {
             trailing[..payload.len()].copy_from_slice(payload);
             assert!(decode_op(kind, &trailing[..payload.len() + 1]).is_none());
         }
+
+        // Kind 111 encoded one-byte slots. Keep it readable after widening
+        // newly written records so existing journals remain recoverable.
+        let operation = WalOp::SetTextSearch {
+            slot: 7,
+            created_at: 18,
+            definition: text_search,
+        };
+        let mut bytes = [0; 4096];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        let mut legacy = [0; 4096];
+        legacy[0] = payload[0];
+        legacy[1..payload.len() - 1].copy_from_slice(&payload[2..]);
+        assert!(matches!(
+            decode_op(KIND_SET_TEXT_SEARCH, &legacy[..payload.len() - 1]),
+            Some(WalOp::SetTextSearch { slot: 7, .. })
+        ));
     }
 
     #[test]

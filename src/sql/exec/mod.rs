@@ -8782,12 +8782,25 @@ pub fn drop_owned(
     let mut composites = [false; crate::storage::MAX_COMPOSITES];
     let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut operators = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut collations = [false; crate::storage::MAX_COLLATIONS];
-    let mut conversions = [false; crate::storage::MAX_CONVERSIONS];
-    let mut text_search_objects = [false; crate::storage::MAX_TEXT_SEARCH_OBJECTS];
+    let collations = match arena.alloc_slice_with(storage.collation_capacity(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let conversions = match arena.alloc_slice_with(storage.conversion_capacity(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let text_search_objects =
+        match arena.alloc_slice_with(storage.text_search_object_capacity(), |_| false) {
+            Ok(values) => values,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
     let mut statistics =
         [false; MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
-    let mut event_triggers = [false; crate::storage::MAX_EVENT_TRIGGERS];
+    let event_triggers = match arena.alloc_slice_with(storage.event_trigger_capacity(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let mut schemas = [false; MAX_SCHEMAS];
     for (class, selected) in [
         (AccessClass::Table, &mut tables[..]),
@@ -8907,7 +8920,7 @@ pub fn drop_owned(
                     &composites,
                     &routines,
                     &operators,
-                    &text_search_objects,
+                    text_search_objects,
                     &dependent_views,
                     &dependent_matviews,
                     &dependent_routines,
@@ -8950,7 +8963,7 @@ pub fn drop_owned(
                         &composites,
                         &routines,
                         &operators,
-                        &text_search_objects,
+                        text_search_objects,
                         &dependent_views,
                         &dependent_matviews,
                         &dependent_routines,
@@ -28584,7 +28597,7 @@ fn stage_text_search_create(
         txn.txid,
         lsn,
         &WalOp::SetTextSearch {
-            slot: slot as u8,
+            slot: slot as u16,
             created_at: stored.created_at,
             definition,
         },
@@ -28613,7 +28626,7 @@ fn stage_text_search_alter(
         txn.txid,
         lsn,
         &WalOp::SetTextSearch {
-            slot: slot as u8,
+            slot: slot as u16,
             created_at: object.created_at,
             definition,
         },
@@ -29298,46 +29311,46 @@ fn drop_text_search_slot(
             drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines, &rules)?;
         }
     }
-    let mut dependent_slots = [usize::MAX; crate::storage::MAX_TEXT_SEARCH_OBJECTS];
-    let mut dependent_count = 0usize;
-    let mut mapped_configs = [usize::MAX; crate::storage::MAX_TEXT_SEARCH_OBJECTS];
-    let mut mapped_count = 0usize;
-    for (candidate_slot, candidate) in storage.text_search_objects_visible_to(txn.txid) {
-        if candidate_slot == slot {
-            continue;
-        }
-        let direct = match (root, candidate) {
-            (
-                crate::storage::TextSearchDefinition::Parser { oid, .. },
-                crate::storage::TextSearchDefinition::Configuration { parser, .. },
-            ) => parser == oid,
-            (
-                crate::storage::TextSearchDefinition::Template { oid, .. },
-                crate::storage::TextSearchDefinition::Dictionary { template, .. },
-            ) => template == oid,
-            _ => false,
-        };
-        if direct {
-            dependent_slots[dependent_count] = candidate_slot;
-            dependent_count += 1;
-        }
-        if let (
-            crate::storage::TextSearchDefinition::Dictionary { oid, .. },
-            crate::storage::TextSearchDefinition::Configuration { mappings, .. },
-        ) = (root, candidate)
-            && mappings
-                .dictionaries
-                .iter()
-                .enumerate()
-                .any(|(token, dictionaries)| {
-                    dictionaries[..mappings.counts[token] as usize].contains(&oid)
-                })
-        {
-            mapped_configs[mapped_count] = candidate_slot;
-            mapped_count += 1;
-        }
-    }
-    if (dependent_count != 0 || mapped_count != 0) && !cascade {
+    let direct_dependent = |candidate_slot, candidate| {
+        candidate_slot != slot
+            && match (root, candidate) {
+                (
+                    crate::storage::TextSearchDefinition::Parser { oid, .. },
+                    crate::storage::TextSearchDefinition::Configuration { parser, .. },
+                ) => parser == oid,
+                (
+                    crate::storage::TextSearchDefinition::Template { oid, .. },
+                    crate::storage::TextSearchDefinition::Dictionary { template, .. },
+                ) => template == oid,
+                _ => false,
+            }
+    };
+    let mapped_dependent = |candidate_slot, candidate| {
+        candidate_slot != slot
+            && if let (
+                crate::storage::TextSearchDefinition::Dictionary { oid, .. },
+                crate::storage::TextSearchDefinition::Configuration { mappings, .. },
+            ) = (root, candidate)
+            {
+                mappings
+                    .dictionaries
+                    .iter()
+                    .enumerate()
+                    .any(|(token, dictionaries)| {
+                        dictionaries[..mappings.counts[token] as usize].contains(&oid)
+                    })
+            } else {
+                false
+            }
+    };
+    let has_catalog_dependents =
+        storage
+            .text_search_objects_visible_to(txn.txid)
+            .any(|(candidate_slot, candidate)| {
+                direct_dependent(candidate_slot, candidate)
+                    || mapped_dependent(candidate_slot, candidate)
+            });
+    if has_catalog_dependents && !cascade {
         return Err(sql_err!(
             sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
             "cannot drop {} {}.{} because other objects depend on it",
@@ -29346,13 +29359,27 @@ fn drop_text_search_slot(
             root.name().as_str()
         ));
     }
-    for dependent in &dependent_slots[..dependent_count] {
-        drop_text_search_slot(storage, wal, txn, *dependent, true)?;
+    loop {
+        let dependent = storage.text_search_objects_visible_to(txn.txid).find_map(
+            |(candidate_slot, candidate)| {
+                direct_dependent(candidate_slot, candidate).then_some(candidate_slot)
+            },
+        );
+        let Some(dependent) = dependent else { break };
+        drop_text_search_slot(storage, wal, txn, dependent, true)?;
     }
     if let crate::storage::TextSearchDefinition::Dictionary { oid, .. } = root {
-        for config_slot in &mapped_configs[..mapped_count] {
+        loop {
+            let config_slot = storage.text_search_objects_visible_to(txn.txid).find_map(
+                |(candidate_slot, candidate)| {
+                    mapped_dependent(candidate_slot, candidate).then_some(candidate_slot)
+                },
+            );
+            let Some(config_slot) = config_slot else {
+                break;
+            };
             let mut config = storage
-                .text_search_object(*config_slot)
+                .text_search_object(config_slot)
                 .definition_for(txn.txid);
             let crate::storage::TextSearchDefinition::Configuration { mappings, .. } = &mut config
             else {
@@ -29370,7 +29397,7 @@ fn drop_text_search_slot(
                 mappings.dictionaries[token][write..].fill(0);
                 mappings.counts[token] = write as u8;
             }
-            stage_text_search_alter(storage, wal, txn, *config_slot, config)?;
+            stage_text_search_alter(storage, wal, txn, config_slot, config)?;
         }
     }
     stage_text_search_drop(storage, wal, txn, slot)
@@ -42237,7 +42264,7 @@ fn policy_depends_on_owned_selection(
     composites: &[bool; crate::storage::MAX_COMPOSITES],
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     operators: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    text_search_objects: &[bool; crate::storage::MAX_TEXT_SEARCH_OBJECTS],
+    text_search_objects: &[bool],
     dependent_views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],

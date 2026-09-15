@@ -92,6 +92,11 @@ its own configuration and memory-plan charge.
 Legacy configurations that specify only `max_tables` keep the historical
 one-slot-per-table defaults. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.
+Collations, conversions, text-search objects, event triggers, tablespaces, and
+object comments likewise have independent startup capacities. Their catalog
+queries allocate from the fixed statement arena according to the actual pool,
+and text-search WAL uses a backward-readable 16-bit slot record so identities
+above 255 survive journal and object-cold recovery without truncation.
 
 SQL/JSON includes first-class `jsonpath`/`jsonpath[]`, strict and lax path execution, path operators and functions, SQL-standard query and construction functions, `JSON_TABLE`, record conversion, SQL/JSON aggregates, and JSONB read/write subscripting. These types and expressions cross text/binary wire, COPY, stored-query, PL/pgSQL, WAL, checkpoint, and object-cold recovery boundaries. [SQL/JSON compatibility and limits](docs/sql-json.md).
 

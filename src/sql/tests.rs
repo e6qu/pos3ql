@@ -48085,6 +48085,200 @@ fn large_independent_catalogs_survive_object_cold_recovery() {
 }
 
 #[test]
+fn startup_sized_metadata_catalogs_exhaust_and_survive_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    const COLLATIONS: usize = 129;
+    const CONVERSIONS: usize = 129;
+    const TEXT_DICTIONARIES: usize = 500;
+    const EVENT_TRIGGERS: usize = 65;
+    const TABLESPACES: usize = 65;
+
+    let mut config = test_config("metadata-catalog-capacities");
+    config.max_tables = 4;
+    config.max_collations = COLLATIONS;
+    config.max_conversions = CONVERSIONS;
+    config.max_text_search_objects = 21 + TEXT_DICTIONARIES;
+    config.max_event_triggers = EVENT_TRIGGERS;
+    config.max_tablespaces = 2 + TABLESPACES;
+    config.max_comments = TABLESPACES;
+    config.wal_buffer_bytes = 8 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("metadata-capacities-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    // Tablespaces are deliberately top-level-only. Fill both their catalog and
+    // the separately sized shared-comment catalog with distinct durable rows.
+    for slot in 0..TABLESPACES {
+        let sql = format!(
+            "CREATE TABLESPACE capacity_space_{slot} LOCATION '/object/capacity-space-{slot}'"
+        );
+        let output = run_with(&mut engine, &mut budget, &sql);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "tablespace {slot}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    let mut sql = String::from("BEGIN;");
+    let mut batch_statements = 0usize;
+    let mut execute_batch = |sql: &mut String| {
+        sql.push_str("COMMIT;");
+        let output = run_with_arena_bytes(&mut engine, &mut budget, sql, 2 << 20);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        sql.clear();
+        sql.push_str("BEGIN;");
+    };
+    for slot in 0..TABLESPACES {
+        write!(
+            sql,
+            "COMMENT ON TABLESPACE capacity_space_{slot} IS 'capacity comment {slot}';"
+        )
+        .unwrap();
+        batch_statements += 1;
+        if batch_statements == 60 {
+            execute_batch(&mut sql);
+            batch_statements = 0;
+        }
+    }
+    for slot in 0..COLLATIONS {
+        write!(
+            sql,
+            "CREATE COLLATION capacity_collation_{slot} (PROVIDER = libc, LOCALE = 'C');"
+        )
+        .unwrap();
+        batch_statements += 1;
+        if batch_statements == 60 {
+            execute_batch(&mut sql);
+            batch_statements = 0;
+        }
+    }
+    for slot in 0..CONVERSIONS {
+        write!(
+            sql,
+            "CREATE CONVERSION capacity_conversion_{slot} FOR 'LATIN1' TO 'UTF8' \
+             FROM pg_catalog.iso8859_1_to_utf8;"
+        )
+        .unwrap();
+        batch_statements += 1;
+        if batch_statements == 60 {
+            execute_batch(&mut sql);
+            batch_statements = 0;
+        }
+    }
+    for slot in 0..TEXT_DICTIONARIES {
+        write!(
+            sql,
+            "CREATE TEXT SEARCH DICTIONARY capacity_dictionary_{slot} \
+             (TEMPLATE = simple, ACCEPT = true);"
+        )
+        .unwrap();
+        batch_statements += 1;
+        if batch_statements == 60 {
+            execute_batch(&mut sql);
+            batch_statements = 0;
+        }
+    }
+    sql.push_str(
+        "CREATE FUNCTION capacity_event_function() RETURNS event_trigger LANGUAGE plpgsql \
+         AS 'BEGIN RETURN; END';",
+    );
+    batch_statements += 1;
+    for slot in 0..EVENT_TRIGGERS {
+        write!(
+            sql,
+            "CREATE EVENT TRIGGER capacity_event_{slot} ON ddl_command_end \
+             EXECUTE FUNCTION capacity_event_function();"
+        )
+        .unwrap();
+        batch_statements += 1;
+        if batch_statements == 60 {
+            execute_batch(&mut sql);
+            batch_statements = 0;
+        }
+    }
+    if batch_statements != 0 {
+        execute_batch(&mut sql);
+    }
+    drop(execute_batch);
+
+    for overflow in [
+        "CREATE COLLATION capacity_collation_overflow (PROVIDER = libc, LOCALE = 'C')",
+        "CREATE CONVERSION capacity_conversion_overflow FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8",
+        "CREATE TEXT SEARCH DICTIONARY capacity_dictionary_overflow (TEMPLATE = simple)",
+        "CREATE EVENT TRIGGER capacity_event_overflow ON ddl_command_end EXECUTE FUNCTION capacity_event_function()",
+        "COMMENT ON TABLESPACE pg_default IS 'overflow'",
+        "CREATE TABLESPACE capacity_space_overflow LOCATION '/object/capacity-space-overflow'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, overflow);
+        assert!(
+            String::from_utf8_lossy(&output).contains("54000"),
+            "{overflow}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let replay = run_with_arena_bytes(
+        &mut replayed,
+        &mut replay_budget,
+        "SELECT ts_lexize('capacity_dictionary_499'::regdictionary, 'Cats');
+         SELECT count(*) FROM pg_ts_dict WHERE dictname LIKE 'capacity_dictionary_%'",
+        4 << 20,
+    );
+    assert_eq!(
+        data_rows(&replay),
+        ["{cats}", "500"],
+        "{}",
+        String::from_utf8_lossy(&replay)
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = run_with_arena_bytes(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT count(*) FROM pg_collation WHERE collname LIKE 'capacity_collation_%';
+         SELECT count(*) FROM pg_conversion WHERE conname LIKE 'capacity_conversion_%';
+         SELECT count(*) FROM pg_ts_dict WHERE dictname LIKE 'capacity_dictionary_%';
+         SELECT count(*) FROM pg_event_trigger WHERE evtname LIKE 'capacity_event_%';
+         SELECT count(*) FROM pg_tablespace WHERE spcname LIKE 'capacity_space_%';
+         SELECT count(*) FROM pg_shdescription WHERE description LIKE 'capacity comment %';
+         SELECT ts_lexize('capacity_dictionary_499'::regdictionary, 'Cats');
+         SELECT 'a' COLLATE capacity_collation_128 < 'b' COLLATE capacity_collation_128",
+        16 << 20,
+    );
+    assert_eq!(
+        data_rows(&cold),
+        ["129", "129", "500", "65", "65", "65", "{cats}", "t"],
+        "{}",
+        String::from_utf8_lossy(&cold)
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn brin_without_a_range_reader_retains_the_authoritative_scan() {
     let mut config = test_config("brin-authoritative-fallback");
     config.temporary_spill_bytes = 4 << 20;

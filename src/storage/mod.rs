@@ -2584,10 +2584,6 @@ pub(crate) const MAX_VALUE_ENFORCERS: usize = 16;
 pub(crate) const MAX_EXTENDED_STATISTICS_PER_TABLE: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
-pub(crate) const MAX_COLLATIONS: usize = 128;
-pub(crate) const MAX_CONVERSIONS: usize = 128;
-pub(crate) const MAX_TEXT_SEARCH_OBJECTS: usize = MAX_DATABASES * 16;
-pub(crate) const MAX_EVENT_TRIGGERS: usize = 64;
 pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = 32;
 pub(crate) const EVENT_TRIGGER_TAG_MAX: usize = 64;
 
@@ -8666,7 +8662,6 @@ pub(crate) fn index_expression_stackstr(
     Ok(value)
 }
 
-pub(crate) const MAX_TABLESPACES: usize = 64;
 pub(crate) const MAX_DATABASES: usize = 32;
 pub(crate) const USER_DATABASE_OID_BASE: i32 = 16_383;
 pub(crate) const TABLESPACE_LOCATION_MAX: usize = 256;
@@ -10352,9 +10347,6 @@ impl SystemSetting {
         }
     }
 }
-
-/// How many distinct objects may carry a comment at once.
-pub(crate) const MAX_COMMENTS: usize = 64;
 
 /// Copies comment text into a fixed buffer, or a loud error if it is longer
 /// than [`COMMENT_MAX`] (never a silent truncation).
@@ -14084,10 +14076,10 @@ impl Storage {
             + FixedMap::<u64, RowState>::budget_bytes(config.large_object_pages)
                 .saturating_sub(FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + config.max_rules * size_of::<RuleDef>()
-            + MAX_COLLATIONS * size_of::<CollationDef>()
-            + MAX_CONVERSIONS * size_of::<ConversionDef>()
-            + MAX_TEXT_SEARCH_OBJECTS * size_of::<TextSearchDef>()
-            + MAX_EVENT_TRIGGERS * size_of::<EventTriggerDef>()
+            + config.max_collations * size_of::<CollationDef>()
+            + config.max_conversions * size_of::<ConversionDef>()
+            + config.max_text_search_objects * size_of::<TextSearchDef>()
+            + config.max_event_triggers * size_of::<EventTriggerDef>()
             + config.max_replication_slots * size_of::<ReplicationSlotDef>()
             + config.max_subscriptions * size_of::<SubscriptionDef>()
             + config.max_subscriptions
@@ -14125,8 +14117,8 @@ impl Storage {
             + MAX_COMPOSITES * size_of::<CompositeDef>()
             + MAX_ACCESS_METHODS * size_of::<AccessMethodDef>()
             + MAX_DATABASES * size_of::<DatabaseDef>()
-            + MAX_TABLESPACES * size_of::<TablespaceDef>()
-            + MAX_COMMENTS * size_of::<CommentEntry>()
+            + config.max_tablespaces * size_of::<TablespaceDef>()
+            + config.max_comments * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<BackendActivity>()
             + config.max_connections as usize * size_of::<BackendSignal>()
             + table_slot_capacity(config) * size_of::<RelationCumulativeStatistics>()
@@ -14327,21 +14319,24 @@ impl Storage {
                 .push(OperatorClassDef::EMPTY)
                 .expect("sized to max_operator_classes");
         }
-        let mut collations = FixedVec::new(budget, "collations", MAX_COLLATIONS)?;
-        for _ in 0..MAX_COLLATIONS {
+        let mut collations = FixedVec::new(budget, "collations", config.max_collations)?;
+        for _ in 0..config.max_collations {
             collations
                 .push(CollationDef::EMPTY)
                 .expect("sized to collation capacity");
         }
-        let mut conversions = FixedVec::new(budget, "conversions", MAX_CONVERSIONS)?;
-        for _ in 0..MAX_CONVERSIONS {
+        let mut conversions = FixedVec::new(budget, "conversions", config.max_conversions)?;
+        for _ in 0..config.max_conversions {
             conversions
                 .push(ConversionDef::EMPTY)
                 .expect("sized to conversion capacity");
         }
-        let mut text_search_objects =
-            FixedVec::new(budget, "text_search_objects", MAX_TEXT_SEARCH_OBJECTS)?;
-        for _ in 0..MAX_TEXT_SEARCH_OBJECTS {
+        let mut text_search_objects = FixedVec::new(
+            budget,
+            "text_search_objects",
+            config.max_text_search_objects,
+        )?;
+        for _ in 0..config.max_text_search_objects {
             text_search_objects
                 .push(TextSearchDef::EMPTY)
                 .expect("sized to text search capacity");
@@ -14435,8 +14430,9 @@ impl Storage {
                 text_search_objects[offset + builtin] = definition;
             }
         }
-        let mut event_triggers = FixedVec::new(budget, "event_triggers", MAX_EVENT_TRIGGERS)?;
-        for _ in 0..MAX_EVENT_TRIGGERS {
+        let mut event_triggers =
+            FixedVec::new(budget, "event_triggers", config.max_event_triggers)?;
+        for _ in 0..config.max_event_triggers {
             event_triggers
                 .push(EventTriggerDef::EMPTY)
                 .expect("sized to event trigger capacity");
@@ -14710,11 +14706,11 @@ impl Storage {
             "extension_script_source",
             config.extension_script_bytes,
         )?;
-        let mut comments = FixedVec::new(budget, "comments", MAX_COMMENTS)?;
-        for _ in 0..MAX_COMMENTS {
+        let mut comments = FixedVec::new(budget, "comments", config.max_comments)?;
+        for _ in 0..config.max_comments {
             comments
                 .push(CommentEntry::empty())
-                .expect("sized to MAX_COMMENTS");
+                .expect("sized to max_comments");
         }
         let mut roles = FixedVec::new(budget, "roles", MAX_ROLES)?;
         for slot in 0..MAX_ROLES {
@@ -14864,8 +14860,8 @@ impl Storage {
                 })
                 .expect("sized to MAX_DATABASES");
         }
-        let mut tablespaces = FixedVec::new(budget, "tablespaces", MAX_TABLESPACES)?;
-        for slot in 0..MAX_TABLESPACES {
+        let mut tablespaces = FixedVec::new(budget, "tablespaces", config.max_tablespaces)?;
+        for slot in 0..config.max_tablespaces {
             let builtin = match slot {
                 0 => Some((1_663, "pg_default")),
                 1 => Some((1_664, "pg_global")),
@@ -14887,7 +14883,7 @@ impl Storage {
                         CatalogDdlState::Absent
                     },
                 })
-                .expect("sized to MAX_TABLESPACES");
+                .expect("sized to max_tablespaces");
         }
         let value_indexes =
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
@@ -16022,7 +16018,9 @@ impl Storage {
         let prior_database = self.current_database;
         self.current_database = target;
         let result = (|| {
-            let mut collation_slots = [u8::MAX; MAX_COLLATIONS];
+            // Catalog collation identities are one byte. Configuration rejects
+            // capacities above the representable range before allocation.
+            let mut collation_slots = [u8::MAX; u8::MAX as usize];
             for source_slot in 0..self.schemas.len() {
                 let source_schema = self.schemas[source_slot];
                 if source_schema.database != source
@@ -21103,6 +21101,10 @@ impl Storage {
         })
     }
 
+    pub(crate) fn comment_capacity(&self) -> usize {
+        self.comments.len()
+    }
+
     pub(crate) fn comment_for_event_trigger(
         &self,
         slot: usize,
@@ -21300,7 +21302,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many object comments (limit {})",
-                MAX_COMMENTS
+                self.comments.capacity()
             ));
         };
         self.comments[slot] = CommentEntry {
@@ -21393,7 +21395,7 @@ impl Storage {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many object comments (limit {})",
-                MAX_COMMENTS
+                self.comments.capacity()
             ));
         };
         self.comments[slot] = CommentEntry {
@@ -37440,6 +37442,10 @@ impl Storage {
             .filter(move |(_, tablespace)| tablespace.visible_to(txid))
     }
 
+    pub(crate) fn tablespace_capacity(&self) -> usize {
+        self.tablespaces.len()
+    }
+
     pub(crate) fn create_tablespace(
         &mut self,
         created_at: u64,
@@ -39350,6 +39356,10 @@ impl Storage {
             .map(move |(slot, collation)| (slot, collation.definition_for(txid)))
     }
 
+    pub(crate) fn collation_capacity(&self) -> usize {
+        self.collations.len()
+    }
+
     pub(crate) fn conversions_visible_to(
         &self,
         txid: u32,
@@ -39363,6 +39373,10 @@ impl Storage {
             .map(move |(slot, conversion)| (slot, conversion.definition_for(txid)))
     }
 
+    pub(crate) fn conversion_capacity(&self) -> usize {
+        self.conversions.len()
+    }
+
     pub(crate) fn text_search_objects_visible_to(
         &self,
         txid: u32,
@@ -39374,6 +39388,10 @@ impl Storage {
                 object.database == self.current_database && object.visible_to(txid)
             })
             .map(move |(slot, object)| (slot, object.definition_for(txid)))
+    }
+
+    pub(crate) fn text_search_object_capacity(&self) -> usize {
+        self.text_search_objects.len()
     }
 
     pub(crate) fn text_search_object(&self, slot: usize) -> TextSearchDef {
@@ -39564,7 +39582,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many collations (limit {})",
-                    MAX_COLLATIONS
+                    self.collations.len()
                 )
             })?;
         self.catalog_seq = self.catalog_seq.saturating_add(1);
@@ -39617,7 +39635,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many conversions (limit {})",
-                    MAX_CONVERSIONS
+                    self.conversions.len()
                 )
             })?;
         self.catalog_seq = self.catalog_seq.saturating_add(1);
@@ -39667,7 +39685,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many text search objects (limit {})",
-                    MAX_TEXT_SEARCH_OBJECTS
+                    self.text_search_objects.len()
                 )
             })?;
         let base = match definition.kind() {
@@ -40265,6 +40283,10 @@ impl Storage {
             .map(move |(slot, trigger)| (slot, trigger.definition_for(txid)))
     }
 
+    pub(crate) fn event_trigger_capacity(&self) -> usize {
+        self.event_triggers.len()
+    }
+
     pub(crate) fn event_trigger(&self, slot: usize) -> EventTriggerDef {
         self.event_triggers[slot]
     }
@@ -40749,7 +40771,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many event triggers (limit {})",
-                    MAX_EVENT_TRIGGERS
+                    self.event_triggers.len()
                 )
             })?;
         self.catalog_seq = self.catalog_seq.saturating_add(1);
@@ -42398,6 +42420,12 @@ mod tests {
         config.max_operator_classes = 9;
         config.max_triggers = 10;
         config.max_publications = 11;
+        config.max_collations = 12;
+        config.max_conversions = 13;
+        config.max_text_search_objects = 27;
+        config.max_event_triggers = 14;
+        config.max_tablespaces = 15;
+        config.max_comments = 16;
         let expected_budget = config.memtable_bytes + Storage::extra_budget_bytes(&config);
         let mut budget = Budget::new(expected_budget);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
@@ -42420,6 +42448,12 @@ mod tests {
         assert_eq!(storage.triggers.len(), 10);
         assert_eq!(storage.partition_trigger_states.len(), 20);
         assert_eq!(storage.publications.len(), 11);
+        assert_eq!(storage.collations.len(), 12);
+        assert_eq!(storage.conversions.len(), 13);
+        assert_eq!(storage.text_search_objects.len(), 27);
+        assert_eq!(storage.event_triggers.len(), 14);
+        assert_eq!(storage.tablespaces.len(), 15);
+        assert_eq!(storage.comments.len(), 16);
         assert_eq!(
             storage.function_cumulative_statistics.borrow().capacity(),
             5

@@ -150,6 +150,18 @@ recent transaction statuses, cumulative function statistics, and
 transaction-local function statistics. The plan now charges each registry at
 its configured capacity, and startup is tested with no unaccounted headroom.
 
+The metadata-capacity audit found six more fixed catalogs: collations,
+conversions, text-search objects, event triggers, tablespaces, and comments.
+All six now have parsed startup capacities, exact memory charges, dynamic
+fixed-arena catalog and ownership-selection scratch, loud exhaustion, and
+object-cold coverage beyond their former bounds. Cascading text-search drops
+use bounded rescans instead of catalog-sized scratch at every recursion level.
+The same review found text-search WAL
+silently narrowing a 512-slot catalog identity to eight bits. New records use
+a 16-bit slot under a distinct durable kind while the legacy record remains
+readable; a 500-dictionary recovery regression crosses both byte 255 and the
+former catalog ceiling. No externally blocked defect remains from this review.
+
 The ordered-index review found that prefix and range plans advertised physical
 index access but read every immutable value-index data block, and that
 checkpoint insertion order could not support a real seek. Durable generations

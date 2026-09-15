@@ -13873,7 +13873,9 @@ fn pg_description<'a>(
             ("description", ColType::Text),
         ],
     );
-    let mut out: [&[Datum]; crate::storage::MAX_COMMENTS] = [&[]; crate::storage::MAX_COMMENTS];
+    let out = arena
+        .alloc_slice_with(storage.comment_capacity(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut n = 0;
     for (class, schema, name, subid, description) in storage.comments_visible(txid) {
         if n == out.len() {
@@ -14177,7 +14179,9 @@ fn pg_shdescription<'a>(
             ("description", ColType::Text),
         ],
     );
-    let mut rows: [&[Datum]; crate::storage::MAX_COMMENTS] = [&[]; crate::storage::MAX_COMMENTS];
+    let rows = arena
+        .alloc_slice_with(storage.comment_capacity(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for (class, _, name, subid, description) in storage.comments_visible(txid) {
         if !matches!(
@@ -19506,8 +19510,9 @@ fn pg_tablespace<'a>(
             ("spcoptions", ColType::Array(super::types::ArrElem::Text)),
         ],
     );
-    let mut rows: [&[Datum]; crate::storage::MAX_TABLESPACES] =
-        [&[]; crate::storage::MAX_TABLESPACES];
+    let rows = arena
+        .alloc_slice_with(storage.tablespace_capacity(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for (slot, tablespace) in storage.tablespaces_visible_to(txid) {
         let object = crate::storage::AccessObject {
@@ -25376,8 +25381,9 @@ fn pg_event_trigger<'a>(
             ("evttags", ColType::Array(super::types::ArrElem::Text)),
         ],
     );
-    let mut rows: [&[Datum]; crate::storage::MAX_EVENT_TRIGGERS] =
-        [&[]; crate::storage::MAX_EVENT_TRIGGERS];
+    let rows = arena
+        .alloc_slice_with(storage.event_trigger_capacity(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for (slot, event_trigger) in storage.event_triggers_visible_to(txid) {
         let routine = storage.routine(usize::from(event_trigger.function));
@@ -26721,9 +26727,7 @@ fn pg_ts_parser<'a>(
         ],
     );
     let rows = arena
-        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
-            &[] as &[Datum]
-        })
+        .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (_, object) in storage.text_search_objects_visible_to(txid) {
@@ -26776,9 +26780,7 @@ fn pg_ts_template<'a>(
         ],
     );
     let rows = arena
-        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
-            &[] as &[Datum]
-        })
+        .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (_, object) in storage.text_search_objects_visible_to(txid) {
@@ -26827,9 +26829,7 @@ fn pg_ts_dict<'a>(
         ],
     );
     let rows = arena
-        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
-            &[] as &[Datum]
-        })
+        .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (_, object) in storage.text_search_objects_visible_to(txid) {
@@ -26883,9 +26883,7 @@ fn pg_ts_config<'a>(
         ],
     );
     let rows = arena
-        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
-            &[] as &[Datum]
-        })
+        .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0;
     for (_, object) in storage.text_search_objects_visible_to(txid) {
@@ -26930,7 +26928,7 @@ fn pg_ts_config_map<'a>(
             ("mapdict", ColType::Oid),
         ],
     );
-    let capacity = crate::storage::MAX_TEXT_SEARCH_OBJECTS
+    let capacity = storage.text_search_object_capacity()
         * crate::storage::TEXT_SEARCH_TOKEN_TYPES
         * crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN;
     let rows = arena
@@ -26987,9 +26985,12 @@ fn pg_collation<'a>(
             ("collversion", ColType::Text),
         ],
     );
-    let mut output: [&[Datum];
-        crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS] =
-        [&[]; crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS];
+    let output = arena
+        .alloc_slice_with(
+            crate::sql::ast::Collation::BUILTIN.len() + storage.collation_capacity(),
+            |_| &[] as &[Datum],
+        )
+        .map_err(|_| arena_full())?;
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         let locale = collation.libc_locale();
         output[index] = row(
@@ -27079,8 +27080,9 @@ fn pg_conversion<'a>(
             ("condefault", ColType::Bool),
         ],
     );
-    let mut output: [&[Datum]; crate::storage::MAX_CONVERSIONS] =
-        [&[]; crate::storage::MAX_CONVERSIONS];
+    let output = arena
+        .alloc_slice_with(storage.conversion_capacity(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for (slot, conversion) in storage.conversions_visible_to(txid) {
         output[count] = row(
@@ -34406,7 +34408,7 @@ fn info_collations<'a>(
     );
     let output = arena
         .alloc_slice_with(
-            crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS,
+            crate::sql::ast::Collation::BUILTIN.len() + storage.collation_capacity(),
             |_| &[] as &[Datum],
         )
         .map_err(|_| arena_full())?;
@@ -34456,7 +34458,7 @@ fn info_collation_character_set_applicability<'a>(
     );
     let output = arena
         .alloc_slice_with(
-            crate::sql::ast::Collation::BUILTIN.len() + crate::storage::MAX_COLLATIONS,
+            crate::sql::ast::Collation::BUILTIN.len() + storage.collation_capacity(),
             |_| &[] as &[Datum],
         )
         .map_err(|_| arena_full())?;

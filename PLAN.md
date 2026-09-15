@@ -59,14 +59,22 @@ storage. RAM and local disk are bounded, disposable caches.
   construct rows from their transaction-visible cardinality instead of hidden
   static arrays. An empty stored-query dependency graph no longer imposes an
   unrelated 128-table drop limit.
+- Database and schema catalogs are independently startup-sized through
+  `max_databases` and `max_schemas`, with their complete memory cost charged
+  before serving. Database connection counters, cumulative statistics,
+  cloning, catalogs, WAL, checkpoints, publication schema membership, and
+  object-cold recovery cover the declared capacities. A single `DROP SCHEMA`
+  accepts the parser's complete bounded target list, and bulk tablespace,
+  REINDEX, and CLUSTER scratch is sized from actual configured table
+  cardinality rather than an unrelated schema/column product.
 
 ## Remaining production work
 
 ### Remaining bounded scale limits
 
-Replace the compile-time schema, role, type, sequence, database, ACL,
-partition-key, constraint, and per-object inline ceilings with startup-sized
-pools or bounded chunked structures where they restrict advertised scale.
+Replace the compile-time role, type, sequence, ACL, partition-key, constraint,
+and per-object inline ceilings with startup-sized pools or bounded chunked
+structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
 catalog construction, compaction, and garbage collection. Exercise maximum-
 capacity role graphs, partitions, transactions, spill, compaction, garbage

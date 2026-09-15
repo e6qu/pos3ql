@@ -8062,7 +8062,7 @@ pub fn alter_default_privileges(
         roles.len()
     };
 
-    let mut schema_slots = [DEFAULT_ACL_ALL_SCHEMAS; crate::storage::MAX_SCHEMAS];
+    let mut schema_slots = [DEFAULT_ACL_ALL_SCHEMAS; crate::storage::MAX_PUBLICATION_SCHEMAS];
     let schema_count = if schemas.is_empty() {
         1
     } else {
@@ -8748,8 +8748,8 @@ pub fn drop_owned(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{
-        AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS, MAX_ROLES, MAX_SCHEMAS,
-        MAX_SEQUENCES,
+        AccessClass, AccessObject, DependencyClass, MAX_DOMAINS, MAX_ENUMS,
+        MAX_PUBLICATION_SCHEMAS, MAX_ROLES, MAX_SEQUENCES,
     };
     let mut owned_roles = [0u16; MAX_ROLES];
     let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
@@ -8801,7 +8801,7 @@ pub fn drop_owned(
         Ok(values) => values,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    let mut schemas = [false; MAX_SCHEMAS];
+    let mut schemas = [false; MAX_PUBLICATION_SCHEMAS];
     for (class, selected) in [
         (AccessClass::Table, &mut tables[..]),
         (AccessClass::View, &mut views[..]),
@@ -10994,8 +10994,10 @@ pub fn drop_schema(
     responder: &mut Responder,
 ) -> Outcome {
     use core::fmt::Write as _;
-    const MAX_DROP_SCHEMAS: usize = 16;
-    let mut slots: [usize; MAX_DROP_SCHEMAS] = [0; MAX_DROP_SCHEMAS];
+    let slots = match arena.alloc_slice_with(names.len(), |_| usize::MAX) {
+        Ok(slots) => slots,
+        Err(_) => return sql_fail(arena_full()),
+    };
     let mut n_slots = 0usize;
     for name in names {
         if *name == "pg_catalog" || *name == "information_schema" {
@@ -11028,12 +11030,6 @@ pub fn drop_schema(
                     return sql_fail(error);
                 }
                 if !slots[..n_slots].contains(&slot) {
-                    if n_slots == MAX_DROP_SCHEMAS {
-                        return sql_fail(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "too many schemas in one DROP SCHEMA"
-                        ));
-                    }
                     slots[n_slots] = slot;
                     n_slots += 1;
                 }
@@ -11059,7 +11055,11 @@ pub fn drop_schema(
             .iter()
             .any(|&slot| storage.schema_def(slot).name.as_str() == schema)
     };
-    let mut objects: [Option<SchemaObject>; 256] = [const { None }; 256];
+    let objects = match arena.alloc_slice_with(storage.schema_drop_object_count(txn.txid), |_| None)
+    {
+        Ok(objects) => objects,
+        Err(_) => return sql_fail(arena_full()),
+    };
     let mut n_objects = 0usize;
     let mut push = |o: SchemaObject, n_objects: &mut usize| -> Result<(), SqlError> {
         if *n_objects == objects.len() {
@@ -12794,8 +12794,8 @@ fn publication_schemas(
     storage: &Storage,
     txid: u32,
     schemas: &[&str],
-) -> Result<[u8; crate::storage::MAX_SCHEMAS], SqlError> {
-    let mut members = [u8::MAX; crate::storage::MAX_SCHEMAS];
+) -> Result<[u8; crate::storage::MAX_PUBLICATION_SCHEMAS], SqlError> {
+    let mut members = [u8::MAX; crate::storage::MAX_PUBLICATION_SCHEMAS];
     if schemas.is_empty() {
         return Ok(members);
     }
@@ -13846,7 +13846,7 @@ pub fn alter_publication(
                 Ok(schemas) => schemas,
                 Err(error) => return sql_fail(error),
             };
-            if definition.schema_count + schemas.len() > crate::storage::MAX_SCHEMAS {
+            if definition.schema_count + schemas.len() > crate::storage::MAX_PUBLICATION_SCHEMAS {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many schemas in publication"
@@ -21768,6 +21768,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         target,
                         nowait: *nowait,
                     },
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropIndex {
@@ -21795,9 +21796,12 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    *target,
-                    *name,
-                    *options,
+                    super::exec::ReindexCommand {
+                        target: *target,
+                        name: *name,
+                        options: *options,
+                    },
+                    context.arena,
                     responder,
                 ),
                 Stmt::Cluster { target, verbose } => super::exec::cluster(
@@ -21806,6 +21810,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     *target,
                     *verbose,
+                    context.arena,
                     responder,
                 ),
                 Stmt::Truncate {
@@ -48415,6 +48420,7 @@ pub fn alter_tables_tablespace(
     wal: &mut Wal,
     txn: &mut TxnState,
     command: AlterTablesTablespaceCommand<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for owner in command.owners {
@@ -48440,7 +48446,10 @@ pub fn alter_tables_tablespace(
         Ok(id) => id,
         Err(error) => return sql_fail(error),
     };
-    let mut tables = [usize::MAX; crate::storage::MAX_SCHEMAS * MAX_COLUMNS];
+    let tables = match arena.alloc_slice_with(storage.table_count(), |_| usize::MAX) {
+        Ok(tables) => tables,
+        Err(_) => return sql_fail(arena_full()),
+    };
     let mut count = 0usize;
     for table in 0..storage.table_count() {
         if !storage.table(table).visible_to(txn.txid) {
@@ -49870,16 +49879,29 @@ pub fn drop_index(
 /// REINDEX rebuilds the selected table's bounded value-index cache from the
 /// authoritative committed rows. The cache is disposable by design, so its
 /// reconstruction is not journaled; restart uses the same reconstruction path.
+pub struct ReindexCommand<'a> {
+    pub target: crate::sql::ast::ReindexTarget,
+    pub name: Option<QualName<'a>>,
+    pub options: crate::sql::ast::ReindexOptions<'a>,
+}
+
 pub fn reindex(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut super::txn::TxnState,
-    target: crate::sql::ast::ReindexTarget,
-    name: Option<QualName<'_>>,
-    options: crate::sql::ast::ReindexOptions<'_>,
+    command: ReindexCommand<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let mut tables = [usize::MAX; crate::storage::MAX_SCHEMAS * crate::storage::MAX_COLUMNS];
+    let ReindexCommand {
+        target,
+        name,
+        options,
+    } = command;
+    let tables = match arena.alloc_slice_with(storage.table_count(), |_| usize::MAX) {
+        Ok(tables) => tables,
+        Err(_) => return sql_fail(arena_full()),
+    };
     let mut table_count = 0usize;
     let mut selected_index = None;
     match target {
@@ -50142,10 +50164,17 @@ pub fn cluster(
     txn: &mut super::txn::TxnState,
     target: crate::sql::ast::ClusterTarget<'_>,
     verbose: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
-    let mut tables = [usize::MAX; crate::storage::MAX_SCHEMAS * crate::storage::MAX_COLUMNS];
-    let mut indexes = [usize::MAX; crate::storage::MAX_SCHEMAS * crate::storage::MAX_COLUMNS];
+    let tables = match arena.alloc_slice_with(storage.table_count(), |_| usize::MAX) {
+        Ok(tables) => tables,
+        Err(_) => return sql_fail(arena_full()),
+    };
+    let indexes = match arena.alloc_slice_with(storage.table_count(), |_| usize::MAX) {
+        Ok(indexes) => indexes,
+        Err(_) => return sql_fail(arena_full()),
+    };
     let mut count = 0usize;
     match target {
         crate::sql::ast::ClusterTarget::All => {

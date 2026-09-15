@@ -90,6 +90,12 @@ no longer silently sizes indexes, views, materialized views, routines, casts,
 operators, operator families/classes, triggers, or publications; each pool has
 its own configuration and memory-plan charge.
 
+Database and schema catalogs are independently sized by `max_databases` and
+`max_schemas`. Their connection counters, cumulative statistics, catalog rows,
+database cloning, publication membership, WAL, checkpoints, and cold recovery
+use those declared capacities. Schema slots retain their explicit 255-slot
+on-disk representation limit; database slots retain their 65,535-slot limit.
+
 Legacy configurations that specify only `max_tables` keep the historical
 one-slot-per-table defaults. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.

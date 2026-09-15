@@ -62,6 +62,15 @@ fn engine_config(run: &str, data_dir: &str) -> Option<Config> {
     config.data_dir = dir.to_str().unwrap().to_string();
     config.memtable_bytes = 1 << 20;
     config.max_tables = 8;
+    config.max_views = 8;
+    config.max_materialized_views = 8;
+    config.max_routines = 8;
+    config.max_casts = 8;
+    config.max_operators = 8;
+    config.max_operator_families = 8;
+    config.max_operator_classes = 8;
+    config.max_triggers = 8;
+    config.max_publications = 8;
     config.table_rows = 4096;
     config.wal_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 14;

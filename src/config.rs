@@ -76,6 +76,25 @@ pub struct Config {
     /// Fixed number of named index catalog slots. Physical acceleration
     /// bindings draw separately from `max_value_indexes`.
     pub max_indexes: usize,
+    /// Fixed number of ordinary view catalog slots.
+    pub max_views: usize,
+    /// Fixed number of materialized-view catalog slots. Their backing tables
+    /// continue to draw from `max_tables`.
+    pub max_materialized_views: usize,
+    /// Fixed number of stored routine catalog slots.
+    pub max_routines: usize,
+    /// Fixed number of user-defined cast catalog slots.
+    pub max_casts: usize,
+    /// Fixed number of user-defined operator catalog slots.
+    pub max_operators: usize,
+    /// Fixed number of user-defined operator-family catalog slots.
+    pub max_operator_families: usize,
+    /// Fixed number of user-defined operator-class catalog slots.
+    pub max_operator_classes: usize,
+    /// Fixed number of trigger catalog slots.
+    pub max_triggers: usize,
+    /// Fixed number of publication catalog slots.
+    pub max_publications: usize,
     /// Fixed number of large-object identities in the cluster catalog.
     pub max_large_objects: usize,
     /// Sparse 2 KiB large-object pages that may be resident in the page map.
@@ -237,6 +256,15 @@ impl Config {
             wal_buffer_bytes: MIB,
             max_tables: 32,
             max_indexes: 32,
+            max_views: 32,
+            max_materialized_views: 32,
+            max_routines: 32,
+            max_casts: 32,
+            max_operators: 32,
+            max_operator_families: 32,
+            max_operator_classes: 32,
+            max_triggers: 32,
+            max_publications: 32,
             max_large_objects: 1024,
             large_object_pages: 8192,
             max_large_object_descriptors: 64,
@@ -463,6 +491,42 @@ impl Config {
                     config.max_indexes =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "max_views" => {
+                    config.max_views =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_materialized_views" => {
+                    config.max_materialized_views =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_routines" => {
+                    config.max_routines =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_casts" => {
+                    config.max_casts =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_operators" => {
+                    config.max_operators =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_operator_families" => {
+                    config.max_operator_families =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_operator_classes" => {
+                    config.max_operator_classes =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_triggers" => {
+                    config.max_triggers =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_publications" => {
+                    config.max_publications =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
                 "max_large_objects" => {
                     config.max_large_objects =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -652,12 +716,27 @@ impl Config {
                 _ => return Err(ConfigError::at(line_no, format!("unknown key '{key}'"))),
             }
         }
-        // Preserve the historical one-index-slot-per-table sizing for existing
-        // configurations. Naming `max_indexes` opts into an independent pool.
-        if seen.iter().any(|setting| setting == "max_tables")
-            && !seen.iter().any(|setting| setting == "max_indexes")
-        {
-            config.max_indexes = config.max_tables;
+        // Preserve historical one-slot-per-table sizing for configurations
+        // that predate the independent catalog pools. Naming a capacity opts
+        // that object class into its own startup budget.
+        if seen.iter().any(|setting| setting == "max_tables") {
+            let inherited_capacity = config.max_tables;
+            for (name, capacity) in [
+                ("max_indexes", &mut config.max_indexes),
+                ("max_views", &mut config.max_views),
+                ("max_materialized_views", &mut config.max_materialized_views),
+                ("max_routines", &mut config.max_routines),
+                ("max_casts", &mut config.max_casts),
+                ("max_operators", &mut config.max_operators),
+                ("max_operator_families", &mut config.max_operator_families),
+                ("max_operator_classes", &mut config.max_operator_classes),
+                ("max_triggers", &mut config.max_triggers),
+                ("max_publications", &mut config.max_publications),
+            ] {
+                if !seen.iter().any(|setting| setting == name) {
+                    *capacity = inherited_capacity;
+                }
+            }
         }
 
         // With object storage enabled it is the durable authority, not an
@@ -744,10 +823,24 @@ impl Config {
                 "max_rules must be greater than zero".to_string(),
             ));
         }
-        if config.max_tables == 0 || config.max_indexes == 0 {
+        if [
+            config.max_tables,
+            config.max_indexes,
+            config.max_views,
+            config.max_materialized_views,
+            config.max_routines,
+            config.max_casts,
+            config.max_operators,
+            config.max_operator_families,
+            config.max_operator_classes,
+            config.max_triggers,
+            config.max_publications,
+        ]
+        .contains(&0)
+        {
             return Err(ConfigError::at(
                 0,
-                "max_tables and max_indexes must be greater than zero".to_string(),
+                "catalog capacities must be greater than zero".to_string(),
             ));
         }
         if config.max_locks_per_transaction == 0 {
@@ -778,6 +871,15 @@ impl Config {
         for (name, capacity) in [
             ("max_tables", config.max_tables),
             ("max_indexes", config.max_indexes),
+            ("max_views", config.max_views),
+            ("max_materialized_views", config.max_materialized_views),
+            ("max_routines", config.max_routines),
+            ("max_casts", config.max_casts),
+            ("max_operators", config.max_operators),
+            ("max_operator_families", config.max_operator_families),
+            ("max_operator_classes", config.max_operator_classes),
+            ("max_triggers", config.max_triggers),
+            ("max_publications", config.max_publications),
             (
                 "max_foreign_data_wrappers",
                 config.max_foreign_data_wrappers,
@@ -1086,6 +1188,19 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_rules = 0\n").is_err());
         assert!(Config::parse("max_tables = 0\n").is_err());
         assert!(Config::parse("max_indexes = 0\n").is_err());
+        for name in [
+            "max_views",
+            "max_materialized_views",
+            "max_routines",
+            "max_casts",
+            "max_operators",
+            "max_operator_families",
+            "max_operator_classes",
+            "max_triggers",
+            "max_publications",
+        ] {
+            assert!(Config::parse(&format!("{name} = 0\n")).is_err(), "{name}");
+        }
         assert!(Config::parse("just some words\n").is_err());
         assert!(Config::parse("database_collation_locale = \n").is_err());
         assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
@@ -1105,6 +1220,15 @@ sql_arena_bytes = 4096
         for name in [
             "max_tables",
             "max_indexes",
+            "max_views",
+            "max_materialized_views",
+            "max_routines",
+            "max_casts",
+            "max_operators",
+            "max_operator_families",
+            "max_operator_classes",
+            "max_triggers",
+            "max_publications",
             "max_foreign_data_wrappers",
             "max_foreign_servers",
             "max_user_mappings",
@@ -1116,14 +1240,55 @@ sql_arena_bytes = 4096
     }
 
     #[test]
-    fn named_index_capacity_is_independent_with_compatible_defaulting() {
+    fn table_derived_catalog_capacities_are_independent_with_compatible_defaulting() {
         let inherited = Config::parse("max_tables = 7\n").unwrap();
         assert_eq!(inherited.max_tables, 7);
-        assert_eq!(inherited.max_indexes, 7);
+        assert_eq!(
+            [
+                inherited.max_indexes,
+                inherited.max_views,
+                inherited.max_materialized_views,
+                inherited.max_routines,
+                inherited.max_casts,
+                inherited.max_operators,
+                inherited.max_operator_families,
+                inherited.max_operator_classes,
+                inherited.max_triggers,
+                inherited.max_publications,
+            ],
+            [7; 10]
+        );
 
-        let independent = Config::parse("max_tables = 7\nmax_indexes = 19\n").unwrap();
+        let independent = Config::parse(
+            "max_tables = 7\n\
+             max_indexes = 11\n\
+             max_views = 12\n\
+             max_materialized_views = 13\n\
+             max_routines = 14\n\
+             max_casts = 15\n\
+             max_operators = 16\n\
+             max_operator_families = 17\n\
+             max_operator_classes = 18\n\
+             max_triggers = 19\n\
+             max_publications = 20\n",
+        )
+        .unwrap();
         assert_eq!(independent.max_tables, 7);
-        assert_eq!(independent.max_indexes, 19);
+        assert_eq!(
+            [
+                independent.max_indexes,
+                independent.max_views,
+                independent.max_materialized_views,
+                independent.max_routines,
+                independent.max_casts,
+                independent.max_operators,
+                independent.max_operator_families,
+                independent.max_operator_classes,
+                independent.max_triggers,
+                independent.max_publications,
+            ],
+            [11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        );
     }
 
     #[test]

@@ -85,6 +85,14 @@ and serial-sequence discovery. These read transaction-visible DDL and retain
 their exact OUT-column metadata through scalar, table-function, raw-wire, and
 driver boundaries.
 
+Major SQL-object catalogs are independently bounded at startup. `max_tables`
+no longer silently sizes indexes, views, materialized views, routines, casts,
+operators, operator families/classes, triggers, or publications; each pool has
+its own configuration and memory-plan charge.
+Legacy configurations that specify only `max_tables` keep the historical
+one-slot-per-table defaults. Exhaustion is a PostgreSQL program-limit error and
+cannot leave a partially published catalog object.
+
 SQL/JSON includes first-class `jsonpath`/`jsonpath[]`, strict and lax path execution, path operators and functions, SQL-standard query and construction functions, `JSON_TABLE`, record conversion, SQL/JSON aggregates, and JSONB read/write subscripting. These types and expressions cross text/binary wire, COPY, stored-query, PL/pgSQL, WAL, checkpoint, and object-cold recovery boundaries. [SQL/JSON compatibility and limits](docs/sql-json.md).
 
 SQL/XML includes first-class `xml`/`xml[]`, constructors and predicates,

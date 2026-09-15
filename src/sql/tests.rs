@@ -37649,6 +37649,23 @@ fn altered_table_survives_restart() {
 }
 
 #[test]
+fn pg_indexes_can_order_constraint_and_explicit_indexes_after_table_rename() {
+    let (mut engine, mut budget) = test_engine();
+    let bytes = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA index_catalog_order;
+         CREATE TABLE index_catalog_order.rows (id int PRIMARY KEY, state text);
+         CREATE INDEX rows_state_idx ON index_catalog_order.rows (state);
+         ALTER TABLE index_catalog_order.rows RENAME TO rows_moved;
+         SELECT indexname FROM pg_indexes
+          WHERE schemaname = 'index_catalog_order' AND tablename = 'rows_moved'
+          ORDER BY indexname;",
+    );
+    assert_eq!(data_rows(&bytes), ["rows_pkey", "rows_state_idx"]);
+}
+
+#[test]
 fn drop_column_removes_dependent_indexes_and_rebinds_survivors_transactionally() {
     let (mut engine, mut budget) = test_engine();
     run_with(

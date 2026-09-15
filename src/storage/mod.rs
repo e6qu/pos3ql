@@ -9951,10 +9951,10 @@ pub(crate) const fn all_object_privileges(class: AccessClass) -> PrivilegeSet {
 
 pub(crate) const PUBLIC_ROLE: u16 = u16::MAX;
 pub(crate) const BOOTSTRAP_ROLE: u16 = 0;
-pub(crate) const MAX_ACL_ENTRIES: usize = 512;
-pub(crate) const MAX_COLUMN_ACL_ENTRIES: usize = 1024;
-pub(crate) const MAX_DEFAULT_ACL_ENTRIES: usize = 256;
-pub(crate) const MAX_PARAMETER_ACL_ENTRIES: usize = 128;
+pub(crate) const MAX_ACL_CATALOG_SLOTS: usize = u16::MAX as usize;
+pub(crate) const MAX_COLUMN_ACL_CATALOG_SLOTS: usize = u16::MAX as usize;
+pub(crate) const MAX_DEFAULT_ACL_CATALOG_SLOTS: usize = u16::MAX as usize;
+pub(crate) const MAX_PARAMETER_ACL_CATALOG_SLOTS: usize = u16::MAX as usize;
 pub(crate) const DEFAULT_ACL_ALL_SCHEMAS: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10087,9 +10087,10 @@ pub(crate) struct DefaultAclEntry {
 /// Startup-bounded PostgreSQL role catalog. Role metadata is catalog state and
 /// therefore follows the same transaction/WAL/manifest lifecycle as schemas;
 /// it never lives in a process-global authentication side table.
-pub(crate) const MAX_ROLES: usize = 64;
-pub(crate) const MAX_ROLE_MEMBERSHIPS: usize = 256;
-pub(crate) const MAX_ROLE_SETTINGS: usize = 128;
+/// Role slots use `u16::MAX` for PUBLIC, leaving indices 0..65534 available.
+pub(crate) const MAX_ROLE_CATALOG_SLOTS: usize = u16::MAX as usize;
+pub(crate) const MAX_ROLE_MEMBERSHIP_CATALOG_SLOTS: usize = u16::MAX as usize;
+pub(crate) const MAX_ROLE_SETTING_CATALOG_SLOTS: usize = u16::MAX as usize;
 pub(crate) const MAX_SYSTEM_SETTINGS: usize = 32;
 pub(crate) const ROLE_SETTING_VALUE_MAX: usize = 256;
 pub(crate) const ROLE_PASSWORD_MAX: usize = 128;
@@ -11091,6 +11092,9 @@ pub struct Storage {
     roles: FixedVec<RoleDef>,
     role_memberships: FixedVec<RoleMembership>,
     role_settings: FixedVec<RoleSetting>,
+    /// Reused authorization-graph bitmap. Query execution is currently
+    /// serialized, so one startup-sized scratch area serves every traversal.
+    role_graph_scratch: std::cell::RefCell<FixedVec<bool>>,
     system_settings: FixedVec<SystemSetting>,
     prepared_transactions: FixedVec<PreparedTransactionCatalogEntry>,
     acl_entries: FixedVec<AclEntry>,
@@ -14103,15 +14107,16 @@ impl Storage {
             + MAX_EXTENSIONS * size_of::<ExtensionPackage>()
             + config.max_extension_scripts * size_of::<ExtensionScript>()
             + config.extension_script_bytes
-            + MAX_ROLES * size_of::<RoleDef>()
-            + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
-            + MAX_ROLE_SETTINGS * size_of::<RoleSetting>()
+            + config.max_roles * size_of::<RoleDef>()
+            + config.max_role_memberships * size_of::<RoleMembership>()
+            + config.max_role_settings * size_of::<RoleSetting>()
+            + config.max_roles * size_of::<bool>()
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
-            + MAX_ACL_ENTRIES * size_of::<AclEntry>()
-            + MAX_COLUMN_ACL_ENTRIES * size_of::<ColumnAclEntry>()
-            + MAX_DEFAULT_ACL_ENTRIES * size_of::<DefaultAclEntry>()
-            + MAX_PARAMETER_ACL_ENTRIES * size_of::<ParameterAclEntry>()
+            + config.max_acl_entries * size_of::<AclEntry>()
+            + config.max_column_acl_entries * size_of::<ColumnAclEntry>()
+            + config.max_default_acl_entries * size_of::<DefaultAclEntry>()
+            + config.max_parameter_acl_entries * size_of::<ParameterAclEntry>()
             + config.max_sequences * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
@@ -14713,8 +14718,8 @@ impl Storage {
                 .push(CommentEntry::empty())
                 .expect("sized to max_comments");
         }
-        let mut roles = FixedVec::new(budget, "roles", MAX_ROLES)?;
-        for slot in 0..MAX_ROLES {
+        let mut roles = FixedVec::new(budget, "roles", config.max_roles)?;
+        for slot in 0..config.max_roles {
             roles
                 .push(RoleDef {
                     name: if slot == 0 {
@@ -14730,10 +14735,11 @@ impl Storage {
                     live: slot == 0,
                     pending: None,
                 })
-                .expect("sized to MAX_ROLES");
+                .expect("sized to max_roles");
         }
-        let mut role_memberships = FixedVec::new(budget, "role_memberships", MAX_ROLE_MEMBERSHIPS)?;
-        for _ in 0..MAX_ROLE_MEMBERSHIPS {
+        let mut role_memberships =
+            FixedVec::new(budget, "role_memberships", config.max_role_memberships)?;
+        for _ in 0..config.max_role_memberships {
             role_memberships
                 .push(RoleMembership {
                     role: 0,
@@ -14743,13 +14749,17 @@ impl Storage {
                     live: false,
                     pending: None,
                 })
-                .expect("sized to MAX_ROLE_MEMBERSHIPS");
+                .expect("sized to max_role_memberships");
         }
-        let mut role_settings = FixedVec::new(budget, "role_settings", MAX_ROLE_SETTINGS)?;
-        for _ in 0..MAX_ROLE_SETTINGS {
+        let mut role_settings = FixedVec::new(budget, "role_settings", config.max_role_settings)?;
+        for _ in 0..config.max_role_settings {
             role_settings
                 .push(RoleSetting::EMPTY)
-                .expect("sized to MAX_ROLE_SETTINGS");
+                .expect("sized to max_role_settings");
+        }
+        let mut role_graph_scratch = FixedVec::new(budget, "role_graph_scratch", config.max_roles)?;
+        for _ in 0..config.max_roles {
+            role_graph_scratch.push(false).expect("sized to max_roles");
         }
         let mut system_settings = FixedVec::new(budget, "system_settings", MAX_SYSTEM_SETTINGS)?;
         for _ in 0..MAX_SYSTEM_SETTINGS {
@@ -14762,7 +14772,7 @@ impl Storage {
             "prepared_transaction_catalog",
             config.max_prepared_transactions,
         )?;
-        let mut acl_entries = FixedVec::new(budget, "acl_entries", MAX_ACL_ENTRIES)?;
+        let mut acl_entries = FixedVec::new(budget, "acl_entries", config.max_acl_entries)?;
         for slot in 0..3 {
             acl_entries
                 .push(AclEntry {
@@ -14779,12 +14789,18 @@ impl Storage {
                 })
                 .expect("ACL pool has room for public schema defaults");
         }
-        let default_acl_entries =
-            FixedVec::new(budget, "default_acl_entries", MAX_DEFAULT_ACL_ENTRIES)?;
+        let default_acl_entries = FixedVec::new(
+            budget,
+            "default_acl_entries",
+            config.max_default_acl_entries,
+        )?;
         let column_acl_entries =
-            FixedVec::new(budget, "column_acl_entries", MAX_COLUMN_ACL_ENTRIES)?;
-        let parameter_acl_entries =
-            FixedVec::new(budget, "parameter_acl_entries", MAX_PARAMETER_ACL_ENTRIES)?;
+            FixedVec::new(budget, "column_acl_entries", config.max_column_acl_entries)?;
+        let parameter_acl_entries = FixedVec::new(
+            budget,
+            "parameter_acl_entries",
+            config.max_parameter_acl_entries,
+        )?;
         let mut indexes = FixedVec::new(budget, "indexes", config.max_indexes)?;
         let mut brin_maintenance = FixedVec::new(budget, "brin_maintenance", config.max_indexes)?;
         for _ in 0..config.max_indexes {
@@ -15053,6 +15069,7 @@ impl Storage {
             roles,
             role_memberships,
             role_settings,
+            role_graph_scratch: std::cell::RefCell::new(role_graph_scratch),
             system_settings,
             prepared_transactions,
             acl_entries,
@@ -18822,7 +18839,7 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many object privilege entries (limit {})",
-                        MAX_ACL_ENTRIES
+                        self.acl_entries.capacity()
                     )
                 })?;
         } else if self.acl_entries[slot].object.slot == u16::MAX {
@@ -19053,7 +19070,7 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many parameter privilege entries (limit {})",
-                        MAX_PARAMETER_ACL_ENTRIES
+                        self.parameter_acl_entries.capacity()
                     )
                 })?;
         } else if self.parameter_acl_entries[slot].parameter.is_empty() {
@@ -19196,7 +19213,7 @@ impl Storage {
         grantor: u16,
         privileges: crate::sql::ast::ParameterPrivileges,
         txid: u32,
-        output: &mut [usize; MAX_PARAMETER_ACL_ENTRIES],
+        output: &mut [usize],
     ) -> usize {
         let mut count = 0usize;
         for (slot, entry) in self.parameter_acl_entries.iter().enumerate() {
@@ -19245,6 +19262,10 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, entry)| Self::parameter_acl_visible(entry, txid).0)
+    }
+
+    pub(crate) fn parameter_acl_entry_count(&self) -> usize {
+        self.parameter_acl_entries.len()
     }
 
     pub(crate) fn checkpoint_parameter_acls(
@@ -19438,7 +19459,7 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many default privilege entries (limit {})",
-                        MAX_DEFAULT_ACL_ENTRIES
+                        self.default_acl_entries.capacity()
                     )
                 })?;
         } else if self.default_acl_entries[slot].owner == PUBLIC_ROLE {
@@ -19535,7 +19556,7 @@ impl Storage {
         grantor: u16,
         privileges: PrivilegeSet,
         txid: u32,
-        output: &mut [usize; MAX_ACL_ENTRIES],
+        output: &mut [usize],
     ) -> usize {
         let mut count = 0usize;
         for (slot, entry) in self.acl_entries.iter().enumerate() {
@@ -19615,7 +19636,7 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many column privilege entries (limit {})",
-                        MAX_COLUMN_ACL_ENTRIES
+                        self.column_acl_entries.capacity()
                     )
                 })?;
         } else if self.column_acl_entries[slot].target.relation.slot == u16::MAX {
@@ -19727,7 +19748,7 @@ impl Storage {
         &self,
         relation: AccessObject,
         txid: u32,
-        output: &mut [ColumnPrivilegeTarget; MAX_COLUMN_ACL_ENTRIES],
+        output: &mut [ColumnPrivilegeTarget],
     ) -> usize {
         let mut count = 0usize;
         for entry in self.column_acl_entries.iter() {
@@ -19769,7 +19790,7 @@ impl Storage {
         grantor: u16,
         privileges: PrivilegeSet,
         txid: u32,
-        output: &mut [usize; MAX_COLUMN_ACL_ENTRIES],
+        output: &mut [usize],
     ) -> usize {
         let mut count = 0usize;
         for (slot, entry) in self.column_acl_entries.iter().enumerate() {
@@ -19869,10 +19890,10 @@ impl Storage {
         if self.has_object_privilege(target.relation, role, privilege, txid) {
             return true;
         }
-        let mut roles = [false; MAX_ROLES];
-        self.inherited_roles(role, txid, &mut roles);
+        let mut roles = self.role_graph_scratch.borrow_mut();
+        self.reachable_roles(role, txid, true, false, &mut roles);
         let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).0;
-        for (slot, inherited) in roles.into_iter().enumerate() {
+        for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
                 effective = effective.union(self.column_acl_to(target, slot as u16, txid).0);
             }
@@ -19890,10 +19911,10 @@ impl Storage {
         if self.has_object_grant_option(target.relation, role, privilege, txid) {
             return true;
         }
-        let mut roles = [false; MAX_ROLES];
-        self.inherited_roles(role, txid, &mut roles);
+        let mut roles = self.role_graph_scratch.borrow_mut();
+        self.reachable_roles(role, txid, true, false, &mut roles);
         let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).1;
-        for (slot, inherited) in roles.into_iter().enumerate() {
+        for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
                 effective = effective.union(self.column_acl_to(target, slot as u16, txid).1);
             }
@@ -19901,17 +19922,37 @@ impl Storage {
         effective.contains(privilege)
     }
 
-    fn inherited_roles(&self, member: usize, txid: u32, out: &mut [bool; MAX_ROLES]) {
-        if out[member] {
+    fn reachable_roles(
+        &self,
+        member: usize,
+        txid: u32,
+        require_inherit: bool,
+        require_set: bool,
+        out: &mut [bool],
+    ) {
+        out.fill(false);
+        if member >= out.len() {
             return;
         }
         out[member] = true;
-        for membership in self.role_memberships.iter() {
-            if membership.visible_to(txid)
-                && membership.member as usize == member
-                && membership.options_to(txid).inherit
-            {
-                self.inherited_roles(membership.role as usize, txid, out);
+        loop {
+            let mut changed = false;
+            for membership in self.role_memberships.iter() {
+                if !membership.visible_to(txid)
+                    || !out[membership.member as usize]
+                    || (require_inherit && !membership.options_to(txid).inherit)
+                    || (require_set && !membership.options_to(txid).set)
+                {
+                    continue;
+                }
+                let role = membership.role as usize;
+                if !out[role] {
+                    out[role] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
     }
@@ -19929,8 +19970,8 @@ impl Storage {
         if self.role(current).attributes_to(txid).superuser {
             return true;
         }
-        let mut roles = [false; MAX_ROLES];
-        self.inherited_roles(current, txid, &mut roles);
+        let mut roles = self.role_graph_scratch.borrow_mut();
+        self.reachable_roles(current, txid, true, false, &mut roles);
         roles.get(role as usize).copied().unwrap_or(false)
     }
 
@@ -19945,8 +19986,8 @@ impl Storage {
         {
             return true;
         }
-        let mut roles = [false; MAX_ROLES];
-        self.inherited_roles(role, txid, &mut roles);
+        let mut roles = self.role_graph_scratch.borrow_mut();
+        self.reachable_roles(role, txid, true, false, &mut roles);
         let acl_defined = self.acl_entries.iter().any(|entry| {
             entry.object == object
                 && entry.object.slot != u16::MAX
@@ -19957,7 +19998,7 @@ impl Storage {
         } else {
             self.acl_to(object, PUBLIC_ROLE, txid).0
         };
-        for (slot, inherited) in roles.into_iter().enumerate() {
+        for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
                 effective = effective.union(self.acl_to(object, slot as u16, txid).0);
             }
@@ -20277,10 +20318,10 @@ impl Storage {
         {
             return true;
         }
-        let mut roles = [false; MAX_ROLES];
-        self.inherited_roles(role, txid, &mut roles);
+        let mut roles = self.role_graph_scratch.borrow_mut();
+        self.reachable_roles(role, txid, true, false, &mut roles);
         let mut effective = self.acl_to(object, PUBLIC_ROLE, txid).1;
-        for (slot, inherited) in roles.into_iter().enumerate() {
+        for (slot, inherited) in roles.iter().copied().enumerate() {
             if inherited {
                 effective = effective.union(self.acl_to(object, slot as u16, txid).1);
             }
@@ -20718,8 +20759,8 @@ impl Storage {
         self.role_settings.iter().enumerate()
     }
 
-    pub(crate) fn role_setting(&self, slot: usize) -> &RoleSetting {
-        &self.role_settings[slot]
+    pub(crate) fn role_setting_count(&self) -> usize {
+        self.role_settings.len()
     }
 
     pub(crate) fn change_role_setting(
@@ -20750,7 +20791,7 @@ impl Storage {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "too many role settings (limit {})",
-                        MAX_ROLE_SETTINGS
+                        self.role_settings.len()
                     )
                 })?,
         };
@@ -20823,7 +20864,7 @@ impl Storage {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many role settings (limit {})",
-                    MAX_ROLE_SETTINGS
+                    self.role_settings.len()
                 )
             })?;
         self.role_settings[slot] = RoleSetting {
@@ -20965,8 +21006,7 @@ impl Storage {
     }
 
     /// Whether `member` may SET ROLE to `target`, following membership edges
-    /// whose SET option is true. Fixed catalog size gives the traversal a
-    /// fixed stack and visited bitmap.
+    /// whose SET option is true.
     pub fn role_can_set(&self, member: usize, target: usize, txid: u32) -> bool {
         self.role_reaches(member, target, txid, true)
     }
@@ -20979,33 +21019,9 @@ impl Storage {
         if member == target {
             return true;
         }
-        let mut visited = [false; MAX_ROLES];
-        let mut stack = [0u16; MAX_ROLES];
-        let mut count = 1usize;
-        stack[0] = member as u16;
-        visited[member] = true;
-        while count > 0 {
-            count -= 1;
-            let current = stack[count] as usize;
-            for membership in self.role_memberships.iter() {
-                if !membership.visible_to(txid)
-                    || membership.member as usize != current
-                    || (require_set && !membership.options_to(txid).set)
-                {
-                    continue;
-                }
-                let next = membership.role as usize;
-                if next == target {
-                    return true;
-                }
-                if !visited[next] {
-                    visited[next] = true;
-                    stack[count] = next as u16;
-                    count += 1;
-                }
-            }
-        }
-        false
+        let mut visited = self.role_graph_scratch.borrow_mut();
+        self.reachable_roles(member, txid, false, require_set, &mut visited);
+        visited.get(target).copied().unwrap_or(false)
     }
 
     pub fn role_can_admin(&self, member: usize, target: usize, txid: u32) -> bool {
@@ -42459,6 +42475,13 @@ mod tests {
         config.max_databases = 6;
         config.max_schemas = 17;
         config.max_sequences = 18;
+        config.max_roles = 19;
+        config.max_role_memberships = 20;
+        config.max_role_settings = 21;
+        config.max_acl_entries = 22;
+        config.max_column_acl_entries = 23;
+        config.max_default_acl_entries = 24;
+        config.max_parameter_acl_entries = 25;
         config.max_views = 3;
         config.max_materialized_views = 4;
         config.max_routines = 5;
@@ -42484,6 +42507,14 @@ mod tests {
         assert_eq!(storage.database_cumulative_statistics.borrow().len(), 6);
         assert_eq!(storage.schemas.len(), 17);
         assert_eq!(storage.sequences.len(), 18);
+        assert_eq!(storage.roles.len(), 19);
+        assert_eq!(storage.role_memberships.len(), 20);
+        assert_eq!(storage.role_settings.len(), 21);
+        assert_eq!(storage.role_graph_scratch.borrow().len(), 19);
+        assert_eq!(storage.acl_entries.capacity(), 22);
+        assert_eq!(storage.column_acl_entries.capacity(), 23);
+        assert_eq!(storage.default_acl_entries.capacity(), 24);
+        assert_eq!(storage.parameter_acl_entries.capacity(), 25);
         assert_eq!(storage.views.len(), 3);
         assert_eq!(storage.matviews.len(), 4);
         assert_eq!(storage.matview_dependencies.len(), 4);

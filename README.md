@@ -98,6 +98,15 @@ capacities. Schema slots retain their explicit 255-slot on-disk representation
 limit; database slots retain their 65,535-slot limit, and sequence relations
 retain their disjoint 5,000-slot OID range.
 
+Cluster authorization is independently startup-sized through `max_roles`,
+`max_role_memberships`, `max_role_settings`, `max_acl_entries`,
+`max_column_acl_entries`, `max_default_acl_entries`, and
+`max_parameter_acl_entries`. These bounds cover authorization traversal,
+connection limits, privilege cascades, catalog rendering, WAL, checkpoints,
+and object-cold recovery. Role and privilege slots retain their 65,535-slot
+on-disk representation limit; object ACL capacity must reserve the three
+built-in public-schema grants.
+
 Legacy configurations that specify only `max_tables` keep the historical
 one-slot-per-table defaults. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.

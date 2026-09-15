@@ -269,7 +269,7 @@ pub struct Engine {
     replication_system_id: u64,
     /// Authenticated sessions per fixed role slot, used to enforce
     /// `CONNECTION LIMIT` without allocating in the server loop.
-    role_connections: [u16; crate::storage::MAX_ROLES],
+    role_connections: FixedVec<u16>,
     database_connections: FixedVec<u16>,
     active_system_settings: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS],
     system_settings_reloaded: bool,
@@ -2778,6 +2778,7 @@ impl Engine {
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_connections as usize * size_of::<(i32, u64)>()
+            + config.max_roles * size_of::<u16>()
             + config.max_databases * size_of::<u16>()
             + config.max_ddl_per_transaction
                 * (size_of::<(usize, bool)>() + size_of::<usize>() + size_of::<PendingTruncate>())
@@ -3017,6 +3018,10 @@ impl Engine {
                 .push(0)
                 .expect("sized to max_databases");
         }
+        let mut role_connections = FixedVec::new(budget, "role_connections", config.max_roles)?;
+        for _ in 0..config.max_roles {
+            role_connections.push(0).expect("sized to max_roles");
+        }
         let mut logical_decoding_truncates = FixedVec::new(
             budget,
             "logical_decoding_truncates",
@@ -3080,7 +3085,7 @@ impl Engine {
                 config.max_connections as usize,
             )?,
             replication_system_id: crate::object_store::writer_id(config),
-            role_connections: [0; crate::storage::MAX_ROLES],
+            role_connections,
             database_connections,
             active_system_settings,
             system_settings_reloaded: false,
@@ -15536,6 +15541,7 @@ impl Engine {
                     grantor: *grantor,
                     cascade: *cascade,
                 },
+                arena,
                 responder,
             ),
             Stmt::GrantPrivileges {
@@ -15604,6 +15610,7 @@ impl Engine {
             } => exec::revoke_parameter_privileges(
                 &mut self.storage,
                 txn,
+                arena,
                 exec::ParameterRevokeCommand {
                     target: exec::ParameterPrivilegeTarget {
                         privileges: *privileges,

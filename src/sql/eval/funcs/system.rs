@@ -41,7 +41,9 @@ impl CatalogOid {
                 .map(Self)
                 .map(Some)
                 .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
-            Datum::RegObject { referenced_oid, .. } => Ok(Some(Self(referenced_oid))),
+            Datum::Regtype { referenced_oid, .. } | Datum::RegObject { referenced_oid, .. } => {
+                Ok(Some(Self(referenced_oid)))
+            }
             // PostgreSQL resolves an untyped string literal against the OID
             // argument in the intrinsic signature before the function runs.
             // String literals are represented as text in the AST, so perform

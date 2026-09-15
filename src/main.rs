@@ -77,8 +77,6 @@ fn run() -> Result<(), String> {
             0
         };
     mem::guard::set_tls_budget(tls_budget as u64);
-    pos3ql::sql::exec::init_record_shapes();
-
     mem::guard::freeze();
     println!(
         "startup complete: memory frozen ({} of {} budget drawn); accepting connections",

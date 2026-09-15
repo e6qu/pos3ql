@@ -6914,7 +6914,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 1 => {
                     let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                     at += 2;
-                    if usize::from(slot) >= crate::storage::MAX_COMPOSITES {
+                    if usize::from(slot) >= crate::storage::MAX_COMPOSITE_CATALOG_SLOTS {
                         return None;
                     }
                     crate::storage::TableTypeMembership::Composite(slot)
@@ -10306,7 +10306,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Enum { len, .. }) => 11 + *len as usize,
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
-        Some(OwnedDatum::Array { len, .. }) => 5 + *len as usize,
+        Some(OwnedDatum::Array { len, .. }) => 7 + *len as usize,
         Some(OwnedDatum::Int2Vector { len, .. }) | Some(OwnedDatum::OidVector { len, .. }) => {
             1 + *len as usize
         }
@@ -10614,21 +10614,33 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             len,
             bytes,
         }) => {
-            out[0] = 21;
+            // Tag 21 remains readable below. Tag 41 carries the full u16
+            // user-defined element slot independently of the legacy byte code.
+            out[0] = 41;
             out[1] = element.code();
-            let (base_code, base_user_slot) = match element {
+            let (element_slot, base_code, base_user_slot) = match element {
+                crate::sql::types::ArrElem::Enum(slot)
+                | crate::sql::types::ArrElem::Composite(slot) => {
+                    (*slot, 0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED)
+                }
                 crate::sql::types::ArrElem::Domain {
+                    slot,
                     base_code,
                     base_user_slot,
                     ..
-                } => (*base_code, *base_user_slot),
-                _ => (0, crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED),
+                } => (*slot, *base_code, *base_user_slot),
+                _ => (
+                    crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED,
+                    0,
+                    crate::sql::types::ColType::ENUM_SLOT_UNRESOLVED,
+                ),
             };
-            out[2] = base_code;
-            out[3..5].copy_from_slice(&base_user_slot.to_le_bytes());
-            out[5] = *len;
-            out[6..6 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
-            6 + *len as usize
+            out[2..4].copy_from_slice(&element_slot.to_le_bytes());
+            out[4] = base_code;
+            out[5..7].copy_from_slice(&base_user_slot.to_le_bytes());
+            out[7] = *len;
+            out[8..8 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            8 + *len as usize
         }
         Some(OwnedDatum::Range {
             kind,
@@ -10931,6 +10943,36 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
                     base_user_slot,
                 };
             }
+            Some(OwnedDatum::Array {
+                element,
+                len: len as u8,
+                bytes,
+            })
+        }
+        41 => {
+            let code = *payload.get(*at)?;
+            let slot = u16::from_le_bytes(payload.get(*at + 1..*at + 3)?.try_into().ok()?);
+            let base_code = *payload.get(*at + 3)?;
+            let base_user_slot =
+                u16::from_le_bytes(payload.get(*at + 4..*at + 6)?.try_into().ok()?);
+            let len = *payload.get(*at + 6)? as usize;
+            *at += 7;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            let element = match crate::sql::types::ArrElem::from_code(code)? {
+                crate::sql::types::ArrElem::Enum(_) => crate::sql::types::ArrElem::Enum(slot),
+                crate::sql::types::ArrElem::Composite(_) => {
+                    crate::sql::types::ArrElem::Composite(slot)
+                }
+                crate::sql::types::ArrElem::Domain { .. } => {
+                    crate::sql::types::ColType::from_code(base_code)?;
+                    crate::sql::types::ArrElem::Domain {
+                        slot,
+                        base_code,
+                        base_user_slot,
+                    }
+                }
+                builtin => builtin,
+            };
             Some(OwnedDatum::Array {
                 element,
                 len: len as u8,
@@ -11474,6 +11516,25 @@ mod tests {
             }),
             Some(OwnedDatum::Array {
                 element: crate::sql::types::ArrElem::Int4,
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Array {
+                element: crate::sql::types::ArrElem::Enum(513),
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Array {
+                element: crate::sql::types::ArrElem::Domain {
+                    slot: 769,
+                    base_code: crate::sql::types::ColType::Composite(1025).code(),
+                    base_user_slot: 1025,
+                },
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Array {
+                element: crate::sql::types::ArrElem::Composite(1281),
                 len: 3,
                 bytes: text,
             }),

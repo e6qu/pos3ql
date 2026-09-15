@@ -158,10 +158,14 @@ pub mod oid {
     /// bands are deliberately disjoint from relation/composite OIDs.
     pub const FIRST_DOMAIN: i32 = 110_000;
     pub const FIRST_ENUM: i32 = 120_000;
+    pub const FIRST_TABLE_COMPOSITE: i32 = 130_000;
+    pub const FIRST_VIEW_COMPOSITE: i32 = 140_000;
     pub const FIRST_COMPOSITE: i32 = 230_000;
     pub const FIRST_DOMAIN_ARRAY: i32 = 150_000;
     pub const FIRST_ENUM_ARRAY: i32 = 160_000;
     pub const FIRST_COMPOSITE_ARRAY: i32 = 240_000;
+    pub const FIRST_TABLE_COMPOSITE_ARRAY: i32 = 1_300_000;
+    pub const FIRST_VIEW_COMPOSITE_ARRAY: i32 = 1_400_000;
     pub fn domain_oid(slot: u16) -> i32 {
         FIRST_DOMAIN + slot as i32
     }
@@ -2715,24 +2719,25 @@ impl ColType {
         }
         // User-defined enum types occupy a synthesized OID band.
         if type_oid >= oid::FIRST_ENUM
-            && type_oid < oid::FIRST_ENUM + crate::storage::MAX_ENUMS as i32
+            && type_oid < oid::FIRST_ENUM + crate::storage::MAX_ENUM_CATALOG_SLOTS as i32
         {
             return Some(Self::Enum((type_oid - oid::FIRST_ENUM) as u16));
         }
         if type_oid >= oid::FIRST_ENUM_ARRAY
-            && type_oid < oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUMS as i32
+            && type_oid < oid::FIRST_ENUM_ARRAY + crate::storage::MAX_ENUM_CATALOG_SLOTS as i32
         {
             return Some(Self::Array(ArrElem::Enum(
                 (type_oid - oid::FIRST_ENUM_ARRAY) as u16,
             )));
         }
         if type_oid >= oid::FIRST_COMPOSITE
-            && type_oid < oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITES as i32
+            && type_oid < oid::FIRST_COMPOSITE + crate::storage::MAX_COMPOSITE_CATALOG_SLOTS as i32
         {
             return Some(Self::Composite((type_oid - oid::FIRST_COMPOSITE) as u16));
         }
         if type_oid >= oid::FIRST_COMPOSITE_ARRAY
-            && type_oid < oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITES as i32
+            && type_oid
+                < oid::FIRST_COMPOSITE_ARRAY + crate::storage::MAX_COMPOSITE_CATALOG_SLOTS as i32
         {
             return Some(Self::Array(ArrElem::Composite(
                 (type_oid - oid::FIRST_COMPOSITE_ARRAY) as u16,
@@ -3969,9 +3974,12 @@ impl ArrElem {
             ArrElem::Record => 128,
             ArrElem::Range(kind) => 51 + kind.code(),
             ArrElem::Multirange(kind) => 57 + kind.code(),
-            ArrElem::Enum(slot) => Self::ENUM_CODE_BASE + slot as u8,
-            ArrElem::Domain { slot, .. } => Self::DOMAIN_CODE_BASE + slot as u8,
-            ArrElem::Composite(slot) => Self::COMPOSITE_CODE_BASE + slot as u8,
+            // User-defined array slots are wider than this legacy byte code.
+            // Self-describing value codecs carry the u16 slot separately;
+            // schema codecs persist the type name and rebind it on recovery.
+            ArrElem::Enum(_) => Self::ENUM_CODE_BASE,
+            ArrElem::Domain { .. } => Self::DOMAIN_CODE_BASE,
+            ArrElem::Composite(_) => Self::COMPOSITE_CODE_BASE,
         }
     }
 
@@ -4041,25 +4049,17 @@ impl ArrElem {
             128 => ArrElem::Record,
             51..=56 => ArrElem::Range(RangeKind::from_code(c - 51)?),
             57..=62 => ArrElem::Multirange(RangeKind::from_code(c - 57)?),
-            c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + crate::storage::MAX_ENUMS as u8)
-                .contains(&c) =>
-            {
+            c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + 32).contains(&c) => {
                 ArrElem::Enum((c - Self::ENUM_CODE_BASE) as u16)
             }
-            c if (Self::DOMAIN_CODE_BASE
-                ..Self::DOMAIN_CODE_BASE + crate::storage::MAX_DOMAINS as u8)
-                .contains(&c) =>
-            {
+            c if (Self::DOMAIN_CODE_BASE..Self::DOMAIN_CODE_BASE + 32).contains(&c) => {
                 ArrElem::Domain {
                     slot: (c - Self::DOMAIN_CODE_BASE) as u16,
                     base_code: ColType::Text.code(),
                     base_user_slot: ColType::ENUM_SLOT_UNRESOLVED,
                 }
             }
-            c if (Self::COMPOSITE_CODE_BASE
-                ..Self::COMPOSITE_CODE_BASE + crate::storage::MAX_COMPOSITES as u8)
-                .contains(&c) =>
-            {
+            c if (Self::COMPOSITE_CODE_BASE..Self::COMPOSITE_CODE_BASE + 32).contains(&c) => {
                 ArrElem::Composite((c - Self::COMPOSITE_CODE_BASE) as u16)
             }
             _ => return None,
@@ -5908,7 +5908,7 @@ mod code_roundtrip_tests {
         assert_ne!(
             ColType::Array(ArrElem::Record).code(),
             ColType::Array(ArrElem::Composite(
-                crate::storage::MAX_COMPOSITES as u16 - 1
+                crate::storage::MAX_COMPOSITE_CATALOG_SLOTS as u16 - 1
             ))
             .code()
         );

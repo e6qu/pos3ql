@@ -56,7 +56,8 @@ SELECT public.bump_moved(amount), public.sum_amount_moved(amount)
   FROM catalog_evolution.rows_moved;
 SELECT state, bumped FROM public.rows_view_moved ORDER BY id;
 SELECT indexname FROM pg_indexes
- WHERE schemaname = 'catalog_evolution' AND tablename = 'rows_moved';
+ WHERE schemaname = 'catalog_evolution' AND tablename = 'rows_moved'
+ ORDER BY indexname;
 SELECT namespace.nspname, pg_get_userbyid(procedure.proowner)
   FROM pg_proc procedure
   JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace

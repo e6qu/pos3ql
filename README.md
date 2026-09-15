@@ -90,13 +90,22 @@ no longer silently sizes indexes, views, materialized views, routines, casts,
 operators, operator families/classes, triggers, or publications; each pool has
 its own configuration and memory-plan charge.
 
-Database, schema, and sequence catalogs are independently sized by
-`max_databases`, `max_schemas`, and `max_sequences`. Their session state,
-connection counters, cumulative statistics, catalog rows, database cloning,
-publication membership, WAL, checkpoints, and cold recovery use those declared
-capacities. Schema slots retain their explicit 255-slot on-disk representation
-limit; database slots retain their 65,535-slot limit, and sequence relations
-retain their disjoint 5,000-slot OID range.
+Database, schema, sequence, and user-defined type catalogs are independently
+sized by `max_databases`, `max_schemas`, `max_sequences`, `max_domains`,
+`max_enums`, and `max_composites`. Their session state, planner metadata,
+catalog rows, database cloning, WAL, checkpoints, and cold recovery use those
+declared capacities. Schema slots retain their explicit 255-slot on-disk
+representation limit; database slots retain their 65,535-slot limit; sequence
+relations retain their disjoint 5,000-slot OID range; and domain, enum, and
+named-composite types each retain a disjoint 10,000-slot `pg_type` OID range.
+Physical table and view row types likewise reject configurations above their
+10,000-slot OID bands instead of synthesizing colliding identities.
+
+User-defined scalar and array types keep their durable schema/name identity
+separate from runtime catalog slots. The schema-less spill and constant-default
+formats carry full 16-bit array slots, while recovery rebinds domain chains,
+enum fields, composite fields, table columns, views, and routines only after
+the complete type catalog is present.
 
 Cluster authorization is independently startup-sized through `max_roles`,
 `max_role_memberships`, `max_role_settings`, `max_acl_entries`,

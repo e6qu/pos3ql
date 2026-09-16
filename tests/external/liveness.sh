@@ -13,6 +13,16 @@ server_alive() {
   return 0
 }
 
+# Unlike a free-port probe, a claim survives the gap before a harness binds.
+# Claims belong to the shell PID, not its short-lived command substitution.
+claim_test_port() {
+  python3 "${TEST_PORT_HELPER:-tests/external/test_ports.py}" claim "$$" "$1" "$2" "$3"
+}
+
+release_test_ports() {
+  python3 "${TEST_PORT_HELPER:-tests/external/test_ports.py}" release "$$"
+}
+
 # Return an unused loopback TCP port from the requested inclusive range. Test
 # harnesses use this only when the caller did not provide a port; an explicit
 # port is checked separately so CI configuration remains deterministic.

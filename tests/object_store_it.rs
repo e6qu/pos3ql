@@ -13,6 +13,45 @@ use pos3ql::sql::Engine;
 
 const ENGINE_BUDGET_BYTES: usize = 512 << 20;
 
+struct TestDirectory(std::path::PathBuf);
+
+impl TestDirectory {
+    fn new(run: &str) -> Self {
+        let identity = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pos3ql-object-it-{}-{run}-{identity}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create owned integration directory");
+        Self(path)
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            if std::thread::panicking() {
+                eprintln!("owned integration directory cleanup failed: {error}");
+            } else {
+                panic!("owned integration directory cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn owned_integration_directory_is_removed_after_scope() {
+    let path = {
+        let directory = TestDirectory::new("cleanup");
+        std::fs::create_dir(directory.0.join("cache")).unwrap();
+        directory.0.clone()
+    };
+    assert!(!path.exists());
+}
+
 fn configured() -> Option<Config> {
     let endpoint = std::env::var("POS3QL_OBJECT_STORE_ENDPOINT").ok()?;
     let mut config = Config::default_dev();
@@ -52,13 +91,10 @@ fn client() -> Option<S3Client> {
     Some(S3Client::new(&config, &mut budget).unwrap())
 }
 
-fn engine_config(run: &str, data_dir: &str) -> Option<Config> {
+fn engine_config(run: &str, data_dir: &str) -> Option<(Config, TestDirectory)> {
     let mut config = configured()?;
-    let dir = std::env::temp_dir().join(format!(
-        "pos3ql-ckpt-{}-{run}-{data_dir}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+    let directory = TestDirectory::new(run);
+    let dir = directory.0.join(data_dir);
     config.data_dir = dir.to_str().unwrap().to_string();
     config.max_connections = 8;
     config.memtable_bytes = 1 << 20;
@@ -77,7 +113,7 @@ fn engine_config(run: &str, data_dir: &str) -> Option<Config> {
     config.wal_buffer_bytes = 1 << 14;
     config.object_store_on = true;
     config.object_store_prefix = format!("ckpt-it/{}-{run}/", std::process::id());
-    Some(config)
+    Some((config, directory))
 }
 
 #[test]
@@ -130,7 +166,7 @@ fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
 fn rpo_zero_disk_loss_recovery() {
     // wal_upload = on: writes after a checkpoint survive TOTAL disk loss
     // (no local WAL), because committed batches were uploaded.
-    let Some(mut cfg) = engine_config("rpo", "a") else {
+    let Some((mut cfg, directory)) = engine_config("rpo", "a") else {
         eprintln!("POS3QL_OBJECT_STORE_ENDPOINT not set; skipping");
         return;
     };
@@ -157,8 +193,7 @@ fn rpo_zero_disk_loss_recovery() {
     }
     // Total disk loss: brand-new empty data dir, same bucket and prefix.
     let mut cfg2 = cfg.clone();
-    let dir = std::env::temp_dir().join(format!("pos3ql-rpo-{}-wiped", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = directory.0.join("wiped");
     cfg2.data_dir = dir.to_str().unwrap().to_string();
     {
         let mut budget = Budget::new(ENGINE_BUDGET_BYTES);
@@ -179,7 +214,7 @@ fn rpo_zero_disk_loss_recovery() {
 
 #[test]
 fn delta_checkpoint_carries_clean_tables() {
-    let Some(cfg) = engine_config("delta", "a") else {
+    let Some((cfg, directory)) = engine_config("delta", "a") else {
         eprintln!("POS3QL_OBJECT_STORE_ENDPOINT not set; skipping");
         return;
     };
@@ -207,8 +242,7 @@ fn delta_checkpoint_carries_clean_tables() {
 
     // Cold start from the bucket: both tables intact.
     let mut cfg2 = cfg.clone();
-    let dir = std::env::temp_dir().join(format!("pos3ql-delta-{}-b", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = directory.0.join("b");
     cfg2.data_dir = dir.to_str().unwrap().to_string();
     let mut budget2 = Budget::new(ENGINE_BUDGET_BYTES);
     let mut e2 = Engine::new(&cfg2, &mut budget2).unwrap();
@@ -223,7 +257,7 @@ fn delta_checkpoint_carries_clean_tables() {
 
 #[test]
 fn checkpoint_and_cold_start_from_bucket() {
-    let Some(config_a) = engine_config("cold", "a") else {
+    let Some((config_a, directory)) = engine_config("cold", "a") else {
         eprintln!("POS3QL_OBJECT_STORE_ENDPOINT not set; skipping");
         return;
     };
@@ -282,8 +316,7 @@ fn checkpoint_and_cold_start_from_bucket() {
 
     // Node B: same bucket and prefix, EMPTY data dir — cold start.
     let mut config_b = config_a.clone();
-    let dir_b = std::env::temp_dir().join(format!("pos3ql-ckpt-{}-cold-b", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir_b);
+    let dir_b = directory.0.join("b");
     config_b.data_dir = dir_b.to_str().unwrap().to_string();
     {
         let mut budget = Budget::new(ENGINE_BUDGET_BYTES);

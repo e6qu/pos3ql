@@ -213,6 +213,11 @@ def workload_sql(workload, worker, operation, rows):
             "SELECT payload FROM benchmark_kv "
             f"WHERE gist_span && '[{lower},{lower + 1})'::int4range"
         )
+    if workload == "gist-spatial":
+        return (
+            "SELECT id, payload FROM benchmark_kv "
+            f"WHERE gist_location <@ box '({key},{key}),({key},{key})'"
+        )
     if workload == "gist-knn":
         return (
             "SELECT id, payload FROM benchmark_kv "
@@ -222,6 +227,11 @@ def workload_sql(workload, worker, operation, rows):
         return f"SELECT payload FROM benchmark_kv WHERE gin_tags @> ARRAY[{key}]"
     if workload == "spgist-prefix":
         return f"SELECT payload FROM benchmark_kv WHERE spgist_label ^@ 'key-{key}'"
+    if workload == "spgist-spatial":
+        return (
+            "SELECT id, payload FROM benchmark_kv "
+            f"WHERE spgist_location <@ box '({key},{-key}),({key},{-key})'"
+        )
     if workload == "spgist-knn":
         return (
             "SELECT id, payload FROM benchmark_kv "
@@ -572,9 +582,11 @@ def parse_args():
             "brin-point",
             "brin-inclusion",
             "gist-inclusion",
+            "gist-spatial",
             "gist-knn",
             "gin-array",
             "spgist-prefix",
+            "spgist-spatial",
             "spgist-knn",
             "tail-range",
             "ordered-limit",
@@ -623,9 +635,11 @@ def parse_args():
             "brin-point",
             "brin-inclusion",
             "gist-inclusion",
+            "gist-spatial",
             "gist-knn",
             "gin-array",
             "spgist-prefix",
+            "spgist-spatial",
             "spgist-knn",
             "tail-range",
             "ordered-limit",

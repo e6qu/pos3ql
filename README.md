@@ -59,7 +59,9 @@ relationships, and `tsvector`/`tsquery` predicates. The nine PostgreSQL 18
 built-in classes, their nine families, 100 strategy rows, 68 support rows,
 `tsvector` `siglen`, relation `fillfactor`/`buffering`, included columns, DML
 maintenance, WAL, checkpoints, and empty-cache recovery share the same bounded
-index state. SQL predicates are evaluated against each immutable encoded key,
+index state. Geometric predicates navigate object-native bounding-box trees
+and skip disjoint subtrees. SQL predicates are evaluated against each selected
+encoded key,
 so this physical GiST path is exact rather than lossy. Built-in point, box,
 polygon, and circle classes also order compact candidates by PostgreSQL's
 `<-> point` operator, including parameterized origins, filters, `LIMIT`,
@@ -77,7 +79,14 @@ partitions, reindexing, and empty-cache recovery share the same bounded index
 lifecycle. Built-in point, box, and polygon SP-GiST classes provide the same
 `<-> point` K-nearest-neighbor boundary. These paths evaluate immutable encoded
 keys exactly; they do not claim PostgreSQL page layout, GIN posting lists,
-SP-GiST node navigation, or custom native callbacks.
+PostgreSQL SP-GiST node layouts, or custom native callbacks. Geometric
+GiST/SP-GiST predicates use immutable bounding-box navigation with fixed-startup
+construction buffers, bounded traversal, exact rechecks, and covering payloads.
+Legacy generations remain readable and are upgraded by the next checkpoint.
+The durable node format and memory bounds are documented in
+[docs/index-navigation.md](docs/index-navigation.md).
+Network/range/full-text navigation, GIN posting extraction, and ranked
+nearest-neighbor node traversal remain production-roadmap work.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

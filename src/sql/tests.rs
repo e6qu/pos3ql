@@ -48854,6 +48854,396 @@ fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
 }
 
 #[test]
+fn nullable_geometric_operators_resolve_declared_types_before_strictness() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT NULL::point ~= '(0,0)'::point, '(0,0)'::point ~= NULL::point, NULL::point ~= NULL::point, NULL::point <@ '((0,0),(1,1))'::box, '((0,0),(1,1))'::box @> NULL::point, NULL::point <-> '(0,0)'::point; PREPARE nullable_shape(point,box) AS SELECT $1 ~= '(0,0)'::point,$1 <@ $2; EXECUTE nullable_shape(NULL,NULL); CREATE TABLE nullable_shapes(shape point); INSERT INTO nullable_shapes VALUES(NULL),('(0,0)'); SELECT count(*) FROM nullable_shapes WHERE shape ~= '(0,0)'::point; SELECT count(*) FROM nullable_shapes WHERE shape <<| '(1,1)'::point;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["NULL|NULL|NULL|NULL|NULL|NULL", "NULL|NULL", "1", "1"]
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT NULL::text ~= '(0,0)'::point",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("42883"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+}
+
+#[test]
+fn wide_geometric_expression_navigation_preserves_the_last_of_32_index_attributes() {
+    use core::fmt::Write as _;
+    let mut config = test_config("wide-geometric-navigation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.memtable_bytes = 8 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.object_store_bucket = format!("wide-geometric-navigation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = Budget::new(512 << 20);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut schema = crate::util::StackStr::<4096>::new();
+    let mut keys = crate::util::StackStr::<4096>::new();
+    let mut values = crate::util::StackStr::<4096>::new();
+    for position in 0..31 {
+        write!(&mut schema, ",r{position} int4range").unwrap();
+        write!(&mut keys, "r{position},").unwrap();
+        write!(&mut values, ",int4range(value,value+1)").unwrap();
+    }
+    session.success(&mut engine,&format!("CREATE TABLE nav_wide(id integer PRIMARY KEY,shape point{}); CREATE INDEX nav_wide_shape ON nav_wide USING gist({},(shape+'(0,0)'::point)); INSERT INTO nav_wide SELECT value,point(value*100,value*100){} FROM generate_series(1,500) source(value); ANALYZE nav_wide",schema.as_str(),keys.as_str().trim_end_matches(','),values.as_str()),false);
+    let queries = "SELECT id FROM nav_wide WHERE (shape+'(0,0)'::point) ~= '(25000,25000)'::point; SELECT id FROM nav_wide ORDER BY (shape+'(0,0)'::point) <-> '(25001,25001)'::point LIMIT 2";
+    let output = data_rows(&session.success(&mut engine, queries, false));
+    assert_eq!(
+        output
+            .iter()
+            .filter(|row| row.chars().all(|character| character.is_ascii_digit()))
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["250", "250", "251"]
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(512 << 20);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let slot = cold.storage.find_table("public", "nav_wide").unwrap();
+    let index = cold
+        .storage
+        .index_slot("public", "nav_wide_shape", 0)
+        .unwrap();
+    let binding = cold
+        .storage
+        .value_binding_for_index(
+            slot,
+            cold.storage.index_visible_to(index, 0).unwrap().created_at,
+        )
+        .unwrap();
+    assert_eq!(
+        cold.storage.value_binding_spatial_position(slot, binding),
+        Some(31)
+    );
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    let plan = data_rows(&cold_session.success(
+        &mut cold,
+        "EXPLAIN SELECT id FROM nav_wide WHERE (shape+'(0,0)'::point) ~= '(25000,25000)'::point",
+        false,
+    ));
+    assert!(
+        plan.iter().any(|row| row.contains("nav_wide_shape")),
+        "{plan:?}"
+    );
+    let query = "SELECT id FROM nav_wide WHERE (shape+'(0,0)'::point) ~= '(25000,25000)'::point; SELECT id FROM nav_wide ORDER BY (shape+'(0,0)'::point) <-> '(25001,25001)'::point LIMIT 2";
+    assert_eq!(
+        data_rows(&cold_session.success(&mut cold, query, false)),
+        ["250", "250", "251"]
+    );
+    assert_eq!(
+        data_rows(&cold_session.success(&mut cold, query, true)),
+        ["250", "250", "251"]
+    );
+    drop(cold_session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class() {
+    use crate::sql::types::GeometryKind;
+    use crate::store::SpatialBounds;
+    let mut config = test_config("geometric-navigation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 2 << 20;
+    config.wal_bytes = 32 << 20;
+    config.memtable_bytes = 32 << 20;
+    config.table_rows = 4096;
+    config.txn_rows = 8192;
+    config.value_index_rows = 8192;
+    config.max_tables = 16;
+    config.max_indexes = 32;
+    config.max_value_indexes = 24;
+    config.object_store_bucket = format!("geometric-navigation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let classes = [
+        ("gist_point", GeometryKind::Point, "gist", "point_ops"),
+        ("gist_box", GeometryKind::Box, "gist", "box_ops"),
+        ("gist_polygon", GeometryKind::Polygon, "gist", "poly_ops"),
+        ("gist_circle", GeometryKind::Circle, "gist", "circle_ops"),
+        (
+            "spgist_quad",
+            GeometryKind::Point,
+            "spgist",
+            "quad_point_ops",
+        ),
+        ("spgist_kd", GeometryKind::Point, "spgist", "kd_point_ops"),
+        ("spgist_box", GeometryKind::Box, "spgist", "box_ops"),
+        (
+            "spgist_polygon",
+            GeometryKind::Polygon,
+            "spgist",
+            "poly_ops",
+        ),
+    ];
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for (name, kind, method, class) in classes {
+        session.success(&mut engine, &format!("CREATE TABLE nav_{name}(id integer PRIMARY KEY, shape {}, payload text); CREATE INDEX nav_{name}_shape ON nav_{name} USING {method}(shape {class}) INCLUDE (id,payload)", kind.name()), false);
+        let expression = match kind {
+            GeometryKind::Point => "point(value*100,value*100)",
+            GeometryKind::Box => {
+                "box(point(value*100-1,value*100-1),point(value*100+1,value*100+1))"
+            }
+            GeometryKind::Polygon => {
+                "polygon(box(point(value*100-1,value*100-1),point(value*100+1,value*100+1)))"
+            }
+            GeometryKind::Circle => "circle(point(value*100,value*100),2)",
+            _ => unreachable!(),
+        };
+        for first in (1..=3000).step_by(500) {
+            session.success(&mut engine, &format!("INSERT INTO nav_{name} SELECT value,{expression},repeat('p',192) FROM generate_series({first},{}) source(value)", first+499), false);
+        }
+        session.success(&mut engine, &format!("ANALYZE nav_{name}"), false);
+    }
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    for (name, kind, _, _) in classes {
+        let text = match kind {
+            GeometryKind::Point => "(120000,120000)",
+            GeometryKind::Box => "(120001,120001),(119999,119999)",
+            GeometryKind::Polygon => {
+                "((119999,119999),(120001,119999),(120001,120001),(119999,120001))"
+            }
+            GeometryKind::Circle => "<(120000,120000),2>",
+            _ => unreachable!(),
+        };
+        let operand = Datum::Geometry { kind, text };
+        let bounds = crate::sql::geometry::index_bounds(operand).unwrap();
+        assert!(matches!(bounds, SpatialBounds::Finite(_)));
+        let slot = cold
+            .storage
+            .find_table("public", &format!("nav_{name}"))
+            .unwrap();
+        let index_slot = cold
+            .storage
+            .index_slot("public", &format!("nav_{name}_shape"), 0)
+            .unwrap();
+        let binding = cold
+            .storage
+            .value_binding_for_index(
+                slot,
+                cold.storage
+                    .index_visible_to(index_slot, 0)
+                    .unwrap()
+                    .created_at,
+            )
+            .unwrap();
+        let (types, count) = cold.storage.value_binding_key_types(slot, binding);
+        let before = cold.storage.block_io_stats();
+        let mut selected = 0;
+        assert!(
+            cold.storage
+                .range_value_index_binding_with_bounds(
+                    slot,
+                    binding,
+                    |position, node| {
+                        assert_eq!(position, 0);
+                        crate::sql::geometry::index_bounds_intersect(
+                            node,
+                            bounds,
+                            crate::sql::ast::BinaryOp::Same,
+                        )
+                    },
+                    |key| {
+                        let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
+                        crate::storage::rowenc::decode(key, &types[..count], &mut values[..count])?;
+                        let matches = crate::sql::eval::binary(
+                            crate::sql::ast::BinaryOp::Same,
+                            values[0],
+                            operand,
+                            false,
+                            false,
+                            &cold_session.arena,
+                        )?;
+                        Ok(if matches == Datum::Bool(true) {
+                            crate::store::ValueIndexPosition::Match
+                        } else {
+                            crate::store::ValueIndexPosition::Skip
+                        })
+                    },
+                    |_, _, _, payload| {
+                        let mut included = [Datum::Null; 2];
+                        crate::storage::rowenc::decode(
+                            payload,
+                            &[ColType::Int4, ColType::Text],
+                            &mut included,
+                        )?;
+                        assert_eq!(included[0], Datum::Int4(1200));
+                        assert!(matches!(included[1],Datum::Text(value) if value.len()==192));
+                        selected += 1;
+                        Ok(())
+                    }
+                )
+                .unwrap()
+        );
+        assert_eq!(selected, 1, "{name}");
+        let traffic = cold.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            traffic.object_gets <= 5,
+            "{name}: {} gets",
+            traffic.object_gets
+        );
+        assert!(
+            traffic.object_read_bytes < 100000,
+            "{name}: {} bytes",
+            traffic.object_read_bytes
+        );
+        let query = format!(
+            "EXPLAIN SELECT id,payload FROM nav_{name} WHERE shape ~= '{text}'::{}; SELECT id,length(payload) FROM nav_{name} WHERE shape ~= '{text}'::{}",
+            kind.name(),
+            kind.name()
+        );
+        let output = data_rows(&cold_session.success(&mut cold, &query, false));
+        assert!(
+            output
+                .iter()
+                .any(|row| row.contains(&format!("nav_{name}_shape"))),
+            "{output:?}"
+        );
+        assert!(output.iter().any(|row| row == "1200|192"), "{output:?}");
+        assert_eq!(
+            data_rows(&cold_session.success(
+                &mut cold,
+                &format!(
+                    "SELECT id,length(payload) FROM nav_{name} WHERE shape ~= '{text}'::{}",
+                    kind.name()
+                ),
+                true
+            )),
+            ["1200|192"]
+        );
+        let mutation = format!(
+            "BEGIN; SAVEPOINT mutation; UPDATE nav_{name} SET shape = '{text}'::{} WHERE id=2500; SELECT id FROM nav_{name} WHERE shape ~= '{text}'::{} ORDER BY id; ROLLBACK TO mutation; SELECT id FROM nav_{name} WHERE shape ~= '{text}'::{}; COMMIT",
+            kind.name(),
+            kind.name(),
+            kind.name()
+        );
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, &mutation, false)),
+            ["1200", "2500", "1200"]
+        );
+        let committed = format!(
+            "UPDATE nav_{name} SET shape = '{text}'::{} WHERE id=2500; DELETE FROM nav_{name} WHERE id=1200; SELECT id FROM nav_{name} WHERE shape ~= '{text}'::{}",
+            kind.name(),
+            kind.name()
+        );
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, &committed, false)),
+            ["2500"]
+        );
+        if kind == GeometryKind::Point {
+            cold_session.success(&mut cold, &format!("INSERT INTO nav_{name} VALUES(4001,'(Infinity,0)','infinite'),(4002,'(NaN,0)','not-a-number'),(4003,NULL,'null')"),false);
+        }
+        assert_eq!(
+            data_rows(&cold_session.success(
+                &mut cold,
+                &format!(
+                    "SELECT id FROM nav_{name} WHERE shape ~= '{text}'::{}",
+                    kind.name()
+                ),
+                true
+            )),
+            ["2500"]
+        );
+    }
+    cold.commit_wal().unwrap();
+    assert!(cold.checkpoint().unwrap());
+    cold_session.success(
+        &mut cold,
+        "UPDATE nav_gist_point SET payload=payload WHERE id=2500",
+        false,
+    );
+    cold.commit_wal().unwrap();
+    assert!(cold.checkpoint().unwrap());
+    drop(cold_session);
+    drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    for (name, kind, _, _) in classes {
+        let output = data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            &format!(
+                "SELECT count(*),max(id) FROM nav_{name}; SELECT id FROM nav_{name} WHERE shape ~= (SELECT shape FROM nav_{name} WHERE id=2500)"
+            ),
+        ));
+        let expected_count = if kind == GeometryKind::Point {
+            "3002|4003"
+        } else {
+            "2999|3000"
+        };
+        assert_eq!(
+            output,
+            [expected_count, "2500"],
+            "{name} {} {output:?}",
+            kind.name()
+        );
+        if kind == GeometryKind::Point {
+            let output = data_rows(&run_with(
+                &mut recovered,
+                &mut recovered_budget,
+                &format!(
+                    "EXPLAIN SELECT id FROM nav_{name} WHERE shape ~= '(120000,120000)'::point; SELECT id FROM nav_{name} WHERE shape ~= '(120000,120000)'::point; SELECT id FROM nav_{name} WHERE shape <@ '((119999,119999),(120001,120001))'::box"
+                ),
+            ));
+            assert!(
+                output
+                    .iter()
+                    .any(|row| row.contains(&format!("nav_{name}_shape"))),
+                "{output:?}"
+            );
+            assert_eq!(
+                output
+                    .iter()
+                    .filter(|row| row.chars().all(|character| character.is_ascii_digit()))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                ["2500", "2500"]
+            );
+        }
+    }
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
     let mut config = test_config("physical-gist-indexes");
     config.object_store_on = true;

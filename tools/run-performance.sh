@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/tests/external/liveness.sh"
+TEST_PORT_HELPER="$ROOT/tests/external/test_ports.py"
 
 MODE=${1:-full}
 case "$MODE" in
@@ -36,14 +37,15 @@ cleanup() {
   if [ -n "$POSTGRES_CONTAINER" ]; then
     docker rm -f "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
   fi
+  release_test_ports
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
     rm -rf -- "$WORK"
   fi
 }
 trap cleanup EXIT INT TERM
 
-S3_PORT=${POS3QL_BENCH_S3_PORT:-$(choose_free_port 19500 19599)}
-POS3QL_PORT=${POS3QL_BENCH_PORT:-$(choose_free_port 19600 19699)}
+S3_PORT=$(claim_test_port "${POS3QL_BENCH_S3_PORT:-}" 19500 19599)
+POS3QL_PORT=$(claim_test_port "${POS3QL_BENCH_PORT:-}" 19600 19699)
 METRICS="$WORK/object-store-metrics.json"
 LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-2}
 python3 "$ROOT/tests/external/s3_test_server.py" \
@@ -53,6 +55,7 @@ python3 "$ROOT/tests/external/s3_test_server.py" \
 S3_PID=$!
 
 for attempt in $(seq 1 100); do
+  if ! server_alive "$S3_PID"; then echo "object-store fixture exited at startup" >&2; exit 1; fi
   if nc -z 127.0.0.1 "$S3_PORT" >/dev/null 2>&1; then break; fi
   if [ "$attempt" = 100 ]; then echo "object-store fixture did not start" >&2; exit 1; fi
   sleep 0.05
@@ -235,11 +238,15 @@ bench_pos3ql warm-memory-brin-inclusion --workload brin-inclusion --clients "$CL
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-gist-inclusion --workload gist-inclusion --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-gist-spatial --workload gist-spatial --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-gist-knn --workload gist-knn --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-gin-array --workload gin-array --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-spgist-prefix --workload spgist-prefix --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-spgist-spatial --workload spgist-spatial --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-spgist-knn --workload spgist-knn --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
@@ -283,11 +290,15 @@ bench_pos3ql cold-object-brin-inclusion --workload brin-inclusion --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-gist-inclusion --workload gist-inclusion --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-gist-spatial --workload gist-spatial --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-gist-knn --workload gist-knn --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-gin-array --workload gin-array --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-spgist-prefix --workload spgist-prefix --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-spgist-spatial --workload spgist-spatial --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-spgist-knn --workload spgist-knn --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
@@ -305,7 +316,7 @@ if [ "$MODE" = full ]; then
   REPLICA_TARGETS=
   REPLICA_COUNT=$REPLICA_SETTING
   for replica in $(seq 1 "$REPLICA_COUNT"); do
-    replica_port=$(choose_free_port $((19800 + replica * 10)) $((19809 + replica * 10)))
+    replica_port=$(claim_test_port "" $((19800 + replica * 10)) $((19809 + replica * 10)))
     launch_replica "replica-$replica" "$replica_port"
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" \
       "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL, brin_span int4range NOT NULL, gist_span int4range NOT NULL, gist_location point NOT NULL, gin_tags integer[] NOT NULL, spgist_label text NOT NULL, spgist_location point NOT NULL, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key); CREATE INDEX benchmark_brin_lookup ON benchmark_kv USING brin (brin_key) WITH (pages_per_range=32, autosummarize=on); CREATE INDEX benchmark_brin_inclusion ON benchmark_kv USING brin (brin_span range_inclusion_ops) WITH (pages_per_range=32); CREATE INDEX benchmark_gist_inclusion ON benchmark_kv USING gist (gist_span); CREATE INDEX benchmark_gist_knn ON benchmark_kv USING gist (gist_location) INCLUDE (id, payload); CREATE INDEX benchmark_gin_array ON benchmark_kv USING gin (gin_tags); CREATE INDEX benchmark_spgist_prefix ON benchmark_kv USING spgist (spgist_label); CREATE INDEX benchmark_spgist_knn ON benchmark_kv USING spgist (spgist_location kd_point_ops) INCLUDE (id, payload); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
@@ -324,8 +335,9 @@ if [ "$MODE" = full ]; then
       --output "$OUTPUT/logical-replicas-$replica.json" >/dev/null
   done
 
-  POSTGRES_PORT=${POS3QL_BENCH_POSTGRES_PORT:-$(choose_free_port 19700 19799)}
+  POSTGRES_PORT=${POS3QL_BENCH_POSTGRES_PORT:-}
   if [ -z "${POS3QL_BENCH_POSTGRES_PORT:-}" ]; then
+    POSTGRES_PORT=$(claim_test_port "" 19700 19799)
     POSTGRES_IMAGE=${POS3QL_BENCH_POSTGRES_IMAGE:-postgres:18}
     POSTGRES_CONTAINER="pos3ql-performance-$$"
     docker run -d --name "$POSTGRES_CONTAINER" -p "$POSTGRES_PORT:5432" \

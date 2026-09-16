@@ -22,6 +22,8 @@ use crate::sql_err;
 use crate::storage::{MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, TableDef, rowenc};
 use crate::util::StackStr;
 
+const _: () = assert!(MAX_INDEX_COLS <= u32::BITS as usize);
+
 use super::plan::{
     MAX_CONJUNCTS, conjunct_passes, expr_tables, fill_join_order, flatten_and, fold_null,
     is_error_safe,
@@ -584,7 +586,7 @@ pub(crate) struct IndexedCandidates<'a> {
     rowids: &'a [u64],
     columns: [u16; MAX_INDEX_COLS],
     n_columns: usize,
-    expression_mask: u16,
+    expression_mask: u32,
     key_types: [ColType; MAX_INDEX_COLS],
     include_mask: u64,
     payload_mask: u64,
@@ -913,7 +915,7 @@ pub(crate) struct IndexAccessPlan<'a> {
     index_oid: i32,
     index_name: StackStr<64>,
     include_mask: u64,
-    expression_mask: u16,
+    expression_mask: u32,
     columns: [u16; MAX_INDEX_COLS],
     key_types: [ColType; MAX_INDEX_COLS],
     collations: [Collation; MAX_INDEX_COLS],
@@ -1824,7 +1826,7 @@ where
             continue;
         };
         let mut expressions = [None; MAX_INDEX_COLS];
-        let mut expression_mask = 0u16;
+        let mut expression_mask = 0u32;
         for (position, source) in index.expressions[..index.n_cols].iter().enumerate() {
             if let Some(source) = source {
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
@@ -2865,6 +2867,36 @@ fn indexed_candidates_for_plan<'a>(
     }
     types[..plan.n_columns].copy_from_slice(&plan.key_types[..plan.n_columns]);
     collations[..plan.n_columns].copy_from_slice(&plan.collations[..plan.n_columns]);
+    let mut search_bounds = [[crate::store::SpatialBounds::Unbounded; MAX_INDEX_COLS]; 2];
+    for position in 0..plan.n_columns {
+        if matches!(types[position], ColType::Geometry(_)) {
+            for bound in 0..2 {
+                search_bounds[bound][position] =
+                    super::super::geometry::index_bounds(values[bound][position])?;
+            }
+        }
+    }
+    let bounds_intersect = |position: u8, bounds| {
+        let position = usize::from(position);
+        if position >= plan.n_columns {
+            return true;
+        }
+        [
+            plan.constraints[position],
+            plan.additional_constraints[position],
+        ]
+        .into_iter()
+        .enumerate()
+        .all(|(bound, constraint)| {
+            constraint.is_none_or(|constraint| {
+                super::super::geometry::index_bounds_intersect(
+                    bounds,
+                    search_bounds[bound][position],
+                    constraint.operator,
+                )
+            })
+        })
+    };
     let key_position = |key: &[u8]| -> Result<crate::store::ValueIndexPosition, SqlError> {
         use crate::store::ValueIndexPosition::{After, Before, Match, Recheck, Skip};
         let mut decoded = [Datum::Null; MAX_INDEX_COLS];
@@ -3015,9 +3047,10 @@ fn indexed_candidates_for_plan<'a>(
             return Ok(None);
         }
     } else {
-        let complete = storage.range_value_index_binding(
+        let complete = storage.range_value_index_binding_with_bounds(
             slot,
             plan.binding,
+            bounds_intersect,
             key_position,
             |_, _, key, payload| {
                 count += 1;
@@ -3080,9 +3113,10 @@ fn indexed_candidates_for_plan<'a>(
             return Ok(None);
         }
     } else {
-        let complete = storage.range_value_index_binding(
+        let complete = storage.range_value_index_binding_with_bounds(
             slot,
             plan.binding,
+            bounds_intersect,
             key_position,
             |rowid, commit_lsn, key, payload| {
                 rowids[fill] = rowid;

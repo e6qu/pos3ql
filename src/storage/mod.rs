@@ -26327,6 +26327,63 @@ impl Storage {
         (enforcer.key_types, enforcer.n_cols)
     }
 
+    pub(crate) fn value_binding_spatial_position(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> Option<u8> {
+        use crate::sql::types::{GistOperatorClass, SpGistOperatorClass};
+        let enforcer = self.tables[table_index].enforcers[binding]?;
+        let created_at = enforcer.index_created_at?;
+        let index = self.indexes.iter().find(|index| {
+            index.created_at == created_at
+                && index.database == self.tables[table_index].database
+                && index.ddl_state != CatalogDdlState::Absent
+        })?;
+        index.resolved_operator_classes[..index.n_cols]
+            .iter()
+            .position(|class| {
+                matches!(
+                    class,
+                    Some(IndexOperatorClass::Gist(
+                        GistOperatorClass::Point
+                            | GistOperatorClass::Box
+                            | GistOperatorClass::Polygon
+                            | GistOperatorClass::Circle
+                    )) | Some(IndexOperatorClass::SpGist(
+                        SpGistOperatorClass::QuadPoint
+                            | SpGistOperatorClass::KdPoint
+                            | SpGistOperatorClass::Box
+                            | SpGistOperatorClass::Polygon
+                    ))
+                )
+            })
+            .map(|position| position as u8)
+    }
+
+    pub(crate) fn value_binding_spatial_bounds(
+        &self,
+        table_index: usize,
+        binding: usize,
+        position: u8,
+        key: &[u8],
+    ) -> Result<crate::store::SpatialBounds, SqlError> {
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        if usize::from(position) >= enforcer.n_cols {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "spatial key position exceeds binding"
+            ));
+        }
+        let mut values = [Datum::Null; MAX_INDEX_COLS];
+        rowenc::decode(
+            key,
+            &enforcer.key_types[..enforcer.n_cols],
+            &mut values[..enforcer.n_cols],
+        )?;
+        crate::sql::geometry::index_bounds(values[usize::from(position)])
+    }
+
     pub(crate) fn value_binding_collations(
         &self,
         table_index: usize,
@@ -26445,10 +26502,28 @@ impl Storage {
         self.range_value_index_binding(table_index, binding, classify, visit)
     }
 
+    #[cfg(test)]
     pub(crate) fn range_value_index_binding(
         &self,
         table_index: usize,
         binding: usize,
+        classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
+        visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        self.range_value_index_binding_with_bounds(
+            table_index,
+            binding,
+            |_, _| true,
+            classify,
+            visit,
+        )
+    }
+
+    pub(crate) fn range_value_index_binding_with_bounds(
+        &self,
+        table_index: usize,
+        binding: usize,
+        intersects: impl FnMut(u8, crate::store::SpatialBounds) -> bool,
         mut classify: impl FnMut(&[u8]) -> Result<crate::store::ValueIndexPosition, SqlError>,
         mut visit: impl FnMut(u64, u64, &[u8], &[u8]) -> Result<(), SqlError>,
     ) -> Result<bool, SqlError> {
@@ -26478,13 +26553,14 @@ impl Storage {
             let ValueIndexScratch { roster, data, .. } = &mut *scratch;
             let callback_error = std::cell::RefCell::new(None);
             crate::store::ValueIndexReader::over(roster, data)
-                .range_covering(
+                .range_covering_with_bounds(
                     &mut *spill
                         .blocks
                         .as_ref()
                         .expect("value-index generations are durable")
                         .borrow_mut(),
                     &handle,
+                    intersects,
                     |key| match classify(key) {
                         Ok(position) => position,
                         Err(error) => {
@@ -26698,10 +26774,38 @@ impl Storage {
         &self,
         table_index: usize,
         binding: usize,
+        spatial_position: Option<u8>,
         left: &[u8],
         right: &[u8],
     ) -> Result<core::cmp::Ordering, SqlError> {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        if let Some(position) = spatial_position {
+            let left_bounds =
+                self.value_binding_spatial_bounds(table_index, binding, position, left)?;
+            let right_bounds =
+                self.value_binding_spatial_bounds(table_index, binding, position, right)?;
+            use crate::store::SpatialBounds;
+            let order_key = |bounds| match bounds {
+                SpatialBounds::Empty => (0u8, 0.0f64, 0.0f64),
+                SpatialBounds::Finite(bounds) => {
+                    let [minimum_x, minimum_y, maximum_x, maximum_y] = bounds.coordinates();
+                    (
+                        1,
+                        minimum_x * 0.5 + maximum_x * 0.5,
+                        minimum_y * 0.5 + maximum_y * 0.5,
+                    )
+                }
+                SpatialBounds::Unbounded => (2, 0.0, 0.0),
+            };
+            let left_key = order_key(left_bounds);
+            let right_key = order_key(right_bounds);
+            return Ok(left_key
+                .0
+                .cmp(&right_key.0)
+                .then_with(|| left_key.1.total_cmp(&right_key.1))
+                .then_with(|| left_key.2.total_cmp(&right_key.2))
+                .then_with(|| left.cmp(right)));
+        }
         if !enforcer.ordered {
             return Ok(left.cmp(right));
         }

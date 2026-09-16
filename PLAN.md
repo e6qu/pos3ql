@@ -179,6 +179,20 @@ dispatch, rather than exhausting a tiny heap while a wide sweep remains paced.
 Tests cover repeated small autocommit updates and deferred OLD-row images larger
 than the row cache through spill, rollback, validation, and cold recovery.
 
+Geometric GiST/SP-GiST predicate navigation uses immutable bounding-box trees
+over small key blocks. All eight built-in geometric classes prune disjoint
+objects before exact key and MVCC recheck, including INCLUDE payloads,
+transaction rollback, committed overlays, repeated checkpoint publication,
+garbage collection, and empty-cache recovery. Construction and traversal
+remain fixed-memory; legacy key generations remain readable. Qualification
+covers three-level pruning, malformed encodings, PostgreSQL's fuzzy geometry
+and non-finite values, and cold reads across every spatial class.
+External harnesses reserve loopback ports across build delays with atomic,
+owner-tracked claims shared by conformance and performance runs. Crashed owners
+are reclaimed under an OS lock; startup probes verify fixture process ownership.
+Live object-store integration tests own unique directories and remove both
+original and cold-recovery caches on scope exit, including assertion failures.
+
 ## Remaining production work
 
 ### Remaining bounded scale limits
@@ -201,10 +215,13 @@ worker limit under read-only, write-heavy, and mixed workloads.
 
 ### Navigable specialized indexes
 
-Replace complete immutable-generation walks with object-native GIN posting
-structures and navigable GiST/SP-GiST nodes. Predicate and nearest-neighbor
-limits must prune object reads without adopting PostgreSQL page layouts or
-native operator-class callbacks.
+Geometric predicate navigation is implemented. Extend object-native navigation
+to network, range/multirange, and full-text generations; replace GIN complete
+key walks with posting structures. Unfiltered nearest-neighbor limits still
+materialize compact keys and need ranked node traversal with MVCC-safe limit
+and residual-filter handling. Preserve exact rechecks, fixed memory, rollback,
+publication, garbage collection, and cold recovery without PostgreSQL page
+layouts or native operator-class callbacks.
 
 ### Availability and operations
 

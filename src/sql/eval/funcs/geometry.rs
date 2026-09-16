@@ -11,7 +11,7 @@ use super::super::{ColumnLookup, EvalHooks, SqlError, arity_err, datum_f64, eval
 
 // PostgreSQL deliberately uses fuzzy comparisons for most geometric
 // primitives. Keep this value in sync with `utils/geo_decls.h`.
-const EPSILON: f64 = 1e-6;
+use crate::sql::geometry::EPSILON;
 
 fn fp_eq(left: f64, right: f64) -> bool {
     left == right || (left - right).abs() <= EPSILON
@@ -267,10 +267,7 @@ fn point_on_geo(point: Point, geo: &Geo) -> bool {
         }),
         GeometryKind::Box => {
             let (high_x, high_y, low_x, low_y) = bounds(geo);
-            point.x >= low_x - EPSILON
-                && point.x <= high_x + EPSILON
-                && point.y >= low_y - EPSILON
-                && point.y <= high_y + EPSILON
+            point.x >= low_x && point.x <= high_x && point.y >= low_y && point.y <= high_y
         }
         GeometryKind::Polygon => point_in_polygon(point, geo),
         GeometryKind::Circle => point.distance(geo.points[0]) <= geo.extra + EPSILON,
@@ -1971,18 +1968,18 @@ pub(crate) fn operator<'a>(
                 let (lhx, lhy, llx, lly) = bounds(&left);
                 let (rhx, rhy, rlx, rly) = bounds(&right);
                 Ok(Datum::Bool(match name {
-                    "<<" => lhx < rlx,
-                    ">>" => llx > rhx,
-                    "&<" => lhx <= rhx,
-                    "&>" => llx >= rlx,
-                    "<<|" => lhy < rly,
-                    "|>>" => lly > rhy,
-                    "&<|" => lhy <= rhy,
-                    "|&>" => lly >= rly,
-                    "<^" if left.kind == GeometryKind::Point => lhy < rly,
-                    ">^" if left.kind == GeometryKind::Point => lly > rhy,
-                    "<^" => lhy <= rly,
-                    _ => lly >= rhy,
+                    "<<" => fp_compare("<", lhx, rlx),
+                    ">>" => fp_compare(">", llx, rhx),
+                    "&<" => fp_compare("<=", lhx, rhx),
+                    "&>" => fp_compare(">=", llx, rlx),
+                    "<<|" => fp_compare("<", lhy, rly),
+                    "|>>" => fp_compare(">", lly, rhy),
+                    "&<|" => fp_compare("<=", lhy, rhy),
+                    "|&>" => fp_compare(">=", lly, rly),
+                    "<^" if left.kind == GeometryKind::Point => fp_compare("<", lhy, rly),
+                    ">^" if left.kind == GeometryKind::Point => fp_compare(">", lly, rhy),
+                    "<^" => fp_compare("<=", lhy, rly),
+                    _ => fp_compare(">=", lly, rhy),
                 }))
             }
             "?#" => Ok(Datum::Bool(geo_intersects(&left, &right))),

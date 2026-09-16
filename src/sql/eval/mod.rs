@@ -1975,6 +1975,18 @@ fn eval_binary_expression<'a>(
     {
         return Ok(value);
     }
+    if (l.is_null() || r.is_null())
+        && let Some(name) = operator.operator_name()
+    {
+        let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid(&l);
+        let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid(&r);
+        // NULL datums erase their declared type. Resolve the geometric
+        // overload before applying strictness, so typed text is not accepted
+        // as geometry and valid nullable columns cannot dispatch as text.
+        if funcs::geometry::operator_result(name, &[left_oid, right_oid]).is_some() {
+            return Ok(Datum::Null);
+        }
+    }
     let left_unknown = is_unknown_literal(left);
     let right_unknown = is_unknown_literal(right);
     if left_unknown && static_type(right, row) == Some(ColType::Name) {

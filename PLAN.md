@@ -107,6 +107,7 @@ storage. RAM and local disk are bounded, disposable caches.
   LEFT JOIN probes; eligible two-catalog joins no longer require quadratic scans.
   `pg_constraint` and `pg_attrdef` expose PostgreSQL 18 column order and types,
   with system `tableoid` addressable but excluded from star expansion.
+  Hash-source decoding includes addressable hidden fields on both sides.
   The shared catalog encoding boundary canonicalizes OID tags. Sequence state
   introspection shares one nullable OID parser and honors transaction-visible
   creation and restart state in SELECT records and FROM functions.

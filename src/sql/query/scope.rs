@@ -1625,6 +1625,10 @@ impl<'d> QueryScope<'d> {
             .sum()
     }
 
+    pub(super) fn row_width(&self, table: usize) -> usize {
+        self.defs[table].expect("resolved").n_columns + self.hidden_columns[table]
+    }
+
     fn scope_column_index(&self, table: usize, name: &str) -> Option<usize> {
         let definition = self.defs[table].expect("resolved");
         definition.column_index(name).or_else(|| {

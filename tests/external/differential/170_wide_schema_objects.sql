@@ -141,6 +141,12 @@ SELECT pg_typeof(d.oid), pg_typeof(d.adrelid), pg_typeof(d.adnum),
        pg_typeof(d.adbin), pg_typeof(d.tableoid)
   FROM pg_attrdef d
  WHERE d.adrelid = 'differential_empty'::regclass;
+SELECT c.relname, b.label FROM pg_class c
+  LEFT JOIN (VALUES (1259::oid,'class'),(NULL::oid,'never')) b(id,label)
+    ON c.tableoid = b.id WHERE c.relname = 'differential_empty';
+SELECT b.id, c.relname FROM (VALUES (1259::oid),(NULL::oid)) b(id)
+  LEFT JOIN pg_class c ON b.id = c.tableoid AND c.relname = 'differential_empty'
+ ORDER BY b.id;
 INSERT INTO differential_hash_source VALUES
   (1,'a',true),(1,'b',true),(2,'c',false),(NULL,'n',true),(4,'reject',true);
 SELECT p.id, b.payload, (b.details).f1

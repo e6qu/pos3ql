@@ -149,8 +149,9 @@ constraints of each modeled kind, 64 domain checks, 64 composite fields, and
 catalog mutation. Index key/include counts and `pg_partitioned_table` expose
 the same accepted shape after empty-cache recovery.
 
-Implicit index and constraint OIDs reserve disjoint bands for every accepted
-table slot and constraint position. Partition-trigger clone OIDs include the
+Implicit index OIDs reserve the complete enforcer stride. Constraint kinds use
+disjoint catalog-local OID bands for every accepted table slot and position.
+Partition-trigger clone OIDs include the
 durable trigger generation and the complete table-slot stride. Creation and
 replay reject finite OID-generation exhaustion before installing an object.
 These synthesized OID assignments changed with the widened schema format;

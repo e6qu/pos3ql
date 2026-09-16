@@ -39233,6 +39233,26 @@ fn constraint_and_default_catalogs_have_postgresql_18_shapes() {
     );
     let defaults = run_with(&mut engine, &mut budget, "SELECT * FROM pg_attrdef");
     assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT c.relname, b.label FROM pg_class c \
+           LEFT JOIN (VALUES (1259::oid,'class'),(NULL::oid,'never')) b(id,label) \
+             ON c.tableoid = b.id WHERE c.relname = 'catalog_shape_child'"
+        )),
+        ["catalog_shape_child|class"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT b.id, c.relname FROM (VALUES (1259::oid),(NULL::oid)) b(id) \
+           LEFT JOIN pg_class c ON b.id = c.tableoid AND c.relname = 'catalog_shape_child' \
+          ORDER BY b.id"
+        )),
+        ["1259|catalog_shape_child", "NULL|NULL"]
+    );
+    assert_eq!(
         row_description_names(&defaults),
         ["oid", "adrelid", "adnum", "adbin"]
     );

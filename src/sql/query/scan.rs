@@ -4868,8 +4868,13 @@ fn scan_source_mode<'a>(
                 .alloc_slice_with(buckets_len, |_| u32::MAX)
                 .map_err(|_| arena_full())?;
             let mut build_schema = [ColType::Bool; MAX_COLUMNS];
-            build_def.schema(&mut build_schema);
-            let build_schema = &build_schema[..build_def.n_columns];
+            for (ctype, column) in build_schema
+                .iter_mut()
+                .zip(&build_def.columns[..scope.row_width(build_t)])
+            {
+                *ctype = column.ctype;
+            }
+            let build_schema = &build_schema[..scope.row_width(build_t)];
             let hash_cols: [u16; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
             let mut key_vals = [Datum::Null; 8];
             let mut n = 0usize;
@@ -4909,14 +4914,14 @@ fn scan_source_mode<'a>(
                 ($bytes:expr) => {{
                     let bytes = $bytes;
                     let mut values = [Datum::Null; MAX_COLUMNS];
-                    for (column, value) in values.iter_mut().enumerate().take(build_def.n_columns) {
+                    for (column, value) in values.iter_mut().enumerate().take(build_schema.len()) {
                         *value =
                             crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
                     }
                     insert_build!(
                         None,
                         BoundRow::Encoded(bytes),
-                        &values[..build_def.n_columns]
+                        &values[..build_schema.len()]
                     );
                 }};
             }
@@ -5012,8 +5017,13 @@ fn scan_source_mode<'a>(
             let probe_slot = scope.slots[probe_t];
             let probe_def = scope.defs[probe_t].expect("resolved");
             let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
-            probe_def.schema(&mut probe_schema);
-            let probe_schema = &probe_schema[..probe_def.n_columns];
+            for (ctype, column) in probe_schema
+                .iter_mut()
+                .zip(&probe_def.columns[..scope.row_width(probe_t)])
+            {
+                *ctype = column.ctype;
+            }
+            let probe_schema = &probe_schema[..scope.row_width(probe_t)];
             if scope.derived[probe_t].is_none()
                 && let Some(demand) = pax_demand.selected_mask(probe_t)
                 && storage.spill_rows_are_unshadowed(probe_slot)

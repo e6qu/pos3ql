@@ -75,8 +75,10 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
 - Modeled GiST indexes physically scan bounded immutable encoded-key
   generations for supported network containment, planar-geometric
   relationships, range/multirange relationships, and `tsvector`/`tsquery`
-  predicates. Each key is evaluated exactly before its row identity becomes a
-  candidate. The nine PostgreSQL 18 built-in classes, nine families, 100
+  predicates. Geometric keys use object-native bounding-box nodes to prune
+  disjoint subtrees. Each selected key is evaluated exactly before its row
+  identity becomes a candidate. The nine PostgreSQL 18 built-in classes,
+  nine families, 100
   strategy rows, 68 support rows, `tsvector` `siglen`, relation
   `fillfactor`/`buffering`, included columns, DML maintenance, WAL,
   checkpoints, and object-cold recovery share one typed boundary. Built-in
@@ -93,8 +95,11 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   strategy rows, 56 support rows, method-specific DDL/options, cloning,
   partition children, reindexing, DML, WAL, checkpoints, and object-cold
   recovery share one typed boundary. Built-in point, box, and polygon SP-GiST
-  classes execute the same `<-> point` K-nearest-neighbor boundary. GIN
-  posting-list extraction, SP-GiST node navigation, PostgreSQL page layout,
+  classes execute the same `<-> point` K-nearest-neighbor boundary.
+  Geometric predicate navigation uses the same immutable bounding-box tree
+  boundary, including both point classes, box and polygon. GIN
+  posting-list extraction, network/range/full-text node navigation, ranked
+  nearest-neighbor traversal, PostgreSQL page layout,
   and native/custom callbacks are not implemented.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not

@@ -9,7 +9,88 @@ use crate::sql_err;
 use crate::util::StackStr;
 
 const MAX_POINTS: usize = 128;
-const EPSILON: f64 = 1e-6;
+pub(crate) const EPSILON: f64 = 1e-6;
+
+pub(crate) fn index_bounds(
+    value: crate::sql::types::Datum<'_>,
+) -> Result<crate::store::SpatialBounds, SqlError> {
+    use crate::sql::types::Datum;
+    use crate::store::SpatialBounds;
+    let (kind, text) = match value {
+        Datum::Null => return Ok(SpatialBounds::Empty),
+        Datum::Geometry { kind, text } => (kind, text),
+        _ => return Ok(SpatialBounds::Unbounded),
+    };
+    if !matches!(
+        kind,
+        GeometryKind::Point | GeometryKind::Box | GeometryKind::Polygon | GeometryKind::Circle
+    ) {
+        return Ok(SpatialBounds::Unbounded);
+    }
+    let mut values = [0.0; MAX_POINTS * 2];
+    let (count, _) = read_values(kind, text, &mut values)?;
+    if values[..count].iter().any(|value| !value.is_finite()) {
+        return Ok(SpatialBounds::Unbounded);
+    }
+    if kind == GeometryKind::Circle {
+        let radius = values[2].abs();
+        return Ok(SpatialBounds::new(
+            values[0] - radius,
+            values[1] - radius,
+            values[0] + radius,
+            values[1] + radius,
+        ));
+    }
+    let mut bounds = SpatialBounds::Empty;
+    for pair in values[..count].as_chunks::<2>().0 {
+        bounds = bounds.union(SpatialBounds::new(pair[0], pair[1], pair[0], pair[1]));
+    }
+    Ok(bounds)
+}
+
+/// A node encloses every descendant key. These tests may retain false
+/// positives, never discard a key accepted by PostgreSQL's fuzzy geometry.
+pub(crate) fn index_bounds_intersect(
+    bounds: crate::store::SpatialBounds,
+    search: crate::store::SpatialBounds,
+    operator: crate::sql::ast::BinaryOp,
+) -> bool {
+    use crate::sql::ast::BinaryOp;
+    use crate::store::SpatialBounds;
+    match (bounds, search) {
+        (SpatialBounds::Empty, _) | (_, SpatialBounds::Empty) => false,
+        (SpatialBounds::Finite(bounds), SpatialBounds::Finite(search)) => {
+            let [minimum_x, minimum_y, maximum_x, maximum_y] = bounds.coordinates();
+            let [x, y, end_x, end_y] = search.coordinates();
+            let left_limit = (x + EPSILON).next_up();
+            let right_limit = (end_x - EPSILON).next_down();
+            let below_limit = (y + EPSILON).next_up();
+            let above_limit = (end_y - EPSILON).next_down();
+            let x = (x - EPSILON).next_down();
+            let y = (y - EPSILON).next_down();
+            let end_x = (end_x + EPSILON).next_up();
+            let end_y = (end_y + EPSILON).next_up();
+            match operator {
+                BinaryOp::Shl => minimum_x <= left_limit,
+                BinaryOp::Shr => maximum_x >= right_limit,
+                BinaryOp::NotRightOf => minimum_x <= end_x,
+                BinaryOp::NotLeftOf => maximum_x >= x,
+                BinaryOp::Below | BinaryOp::BelowPoint => minimum_y <= below_limit,
+                BinaryOp::Above | BinaryOp::AbovePoint => maximum_y >= above_limit,
+                BinaryOp::NotAbove => minimum_y <= end_y,
+                BinaryOp::NotBelow => maximum_y >= y,
+                BinaryOp::Same
+                | BinaryOp::Contains
+                | BinaryOp::ContainedBy
+                | BinaryOp::Overlaps => {
+                    minimum_x <= end_x && maximum_x >= x && minimum_y <= end_y && maximum_y >= y
+                }
+                _ => true,
+            }
+        }
+        _ => true,
+    }
+}
 
 fn fp_zero(value: f64) -> bool {
     value.abs() <= EPSILON
@@ -558,4 +639,111 @@ pub fn decode_binary<'a>(
         }
     }
     parse(kind, out.as_str(), arena)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::ast::BinaryOp;
+    use crate::sql::types::Datum;
+
+    #[test]
+    fn navigation_bounds_never_exclude_exact_geometric_operator_matches() {
+        use BinaryOp::*;
+        use GeometryKind::*;
+        let shapes = [
+            (Point, "(0,0)"),
+            (Point, "(-0.0000005,0)"),
+            (Point, "(0.0000005,0)"),
+            (Point, "(0,-0.0000005)"),
+            (Point, "(0,0.0000005)"),
+            (Point, "(-0,-0)"),
+            (Point, "(Infinity,0)"),
+            (Point, "(NaN,0)"),
+            (Box, "(1,1),(0,0)"),
+            (Box, "(0,0),(-1,-1)"),
+            (Box, "(0.0000005,0.0000005),(-0.0000005,-0.0000005)"),
+            (Polygon, "((0,0),(1,0),(0,1))"),
+            (
+                Polygon,
+                "((-0.0000005,-0.0000005),(0.0000005,-0.0000005),(0,0.0000005))",
+            ),
+            (Circle, "<(0,0),1>"),
+            (Circle, "<(1,0),1>"),
+            (Circle, "<(0,0),0>"),
+        ];
+        let arena = Arena::new(
+            &mut crate::mem::Budget::new(1 << 20),
+            "geometry navigation",
+            1 << 20,
+        )
+        .unwrap();
+        let mut matches = 0;
+        crate::mem::guard::forbid_alloc(|| {
+            for &(left_kind, left_text) in &shapes {
+                for &(right_kind, right_text) in &shapes {
+                    let left = Datum::Geometry {
+                        kind: left_kind,
+                        text: left_text,
+                    };
+                    let right = Datum::Geometry {
+                        kind: right_kind,
+                        text: right_text,
+                    };
+                    for operator in [
+                        Same,
+                        Contains,
+                        ContainedBy,
+                        Overlaps,
+                        Shl,
+                        Shr,
+                        NotRightOf,
+                        NotLeftOf,
+                        Below,
+                        Above,
+                        BelowPoint,
+                        AbovePoint,
+                        NotAbove,
+                        NotBelow,
+                    ] {
+                        let result = crate::sql::eval::funcs::geometry::operator(
+                            operator.operator_name().unwrap(),
+                            &[left, right],
+                            &[left_kind.oid(), right_kind.oid()],
+                            &arena,
+                        );
+                        if result.is_some_and(|result| matches!(result.unwrap(), Datum::Bool(true)))
+                        {
+                            matches += 1;
+                            let bounds = index_bounds(left).unwrap();
+                            let search = index_bounds(right).unwrap();
+                            assert!(
+                                index_bounds_intersect(bounds, search, operator),
+                                "{left_kind:?} {left_text} {operator:?} {right_kind:?} {right_text}"
+                            );
+                            assert!(index_bounds_intersect(
+                                bounds.union(crate::store::SpatialBounds::new(
+                                    10000.0, 10000.0, 10001.0, 10001.0
+                                )),
+                                search,
+                                operator
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(matches, 256, "exercise the accepted geometric matrix");
+        assert_eq!(
+            index_bounds(Datum::Null).unwrap(),
+            crate::store::SpatialBounds::Empty
+        );
+        assert!(
+            index_bounds(Datum::Geometry {
+                kind: Point,
+                text: "garbage"
+            })
+            .is_err()
+        );
+    }
 }

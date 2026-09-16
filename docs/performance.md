@@ -80,9 +80,11 @@ the comparison does not pretend PostgreSQL itself has an S3 cache profile.
 | BRIN point pruning | Repeated warm and object-cold equality probes through a dedicated BRIN key and bitmap plan |
 | BRIN inclusion filtering | Repeated warm and object-cold range-overlap probes through `range_inclusion_ops` and a bitmap plan |
 | GiST inclusion filtering | Repeated warm and object-cold range-overlap probes through a dedicated GiST key generation |
+| GiST geometric pruning | Repeated warm and object-cold point-in-box probes through immutable bounding-box navigation |
 | GiST K-nearest-neighbor | Repeated warm and object-cold `<-> point` ordered limits through a covering geometric GiST generation |
 | GIN array filtering | Repeated warm and object-cold array-containment probes through a GIN bitmap plan |
 | SP-GiST prefix filtering | Repeated warm and object-cold text-prefix probes through an SP-GiST plan |
+| SP-GiST geometric pruning | Repeated warm and object-cold point-in-box probes through the same object-native navigation boundary |
 | SP-GiST K-nearest-neighbor | Repeated warm and object-cold `<-> point` ordered limits through a covering k-d point generation |
 | indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
 | ordered limit | Repeated descending key-only `ORDER BY ... LIMIT` scans that must fetch no base tuples, warm and object-cold |
@@ -109,7 +111,11 @@ branch.
 CI runs the smoke suite and retains all raw artifacts. It gates zero errors
 and complete operation counts, present and ordered percentiles, peak RSS no
 more than 125% of the fixed plan, the stable object-operation metric schema,
-at least one index scan per hash point-read, BRIN point or inclusion probe, GiST inclusion or K-nearest-neighbor probe, GIN array probe, SP-GiST prefix or K-nearest-neighbor probe, btree tail-range, btree ordered-limit, parameterized-btree-join, or hash-targeted synchronized-update operation and
+at least one index scan per hash point-read, BRIN point or inclusion probe,
+GiST inclusion, spatial, or K-nearest-neighbor probe, GIN array probe,
+SP-GiST prefix, spatial, or K-nearest-neighbor probe, btree tail-range,
+btree ordered-limit, parameterized-btree-join, or hash-targeted
+synchronized-update operation and
 zero sequential scans in the complete resident warm-memory paths, actual
 shared-object reads during empty-local-cache recovery, and concurrent commit
 PUT amplification below 1.75 PUTs per transaction. Ordered-limit runs also
@@ -147,9 +153,14 @@ overlap probes now use exact immutable-key predicate scans in warm and
 empty-cache measurements. GIN array containment and SP-GiST text-prefix probes
 have the same warm and empty-cache access-path gates. Built-in geometric GiST
 and SP-GiST classes now provide PostgreSQL-compatible `<-> point` ordering over
-compact immutable keys, including covering scans; navigable tree nodes remain
-the next step for avoiding a complete key-generation walk. The known structural
-limits remain global query serialization, specialized posting/tree navigation,
+compact immutable keys, including covering scans. Geometric predicates now
+prune immutable bounding-box trees; the suite records their warm and cold
+point-in-box workloads before nearest-neighbor probes warm the complete key
+generation. Three-level fixed-allocation regressions and eight-class cold-read
+bounds qualify navigation without a timing claim. Network/range/full-text and
+GIN posting navigation, plus ranked nearest-neighbor traversal, remain.
+The known structural limits remain global query serialization,
+remaining specialized posting/tree navigation,
 and the remaining per-object inline ceilings. Role, type, sequence, and ACL
 catalog pools are startup-sized within their documented identity widths.
 Wide constraints, composites, partition definitions, and index tuples

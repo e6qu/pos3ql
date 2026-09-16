@@ -64,10 +64,13 @@ mod disk;
 mod ephemeral;
 #[cfg(test)]
 mod memory;
+mod navigation;
 mod object;
 mod sst;
 mod tiered;
 mod value;
+
+pub(crate) use navigation::SpatialBounds;
 
 pub(crate) mod lz4;
 
@@ -142,6 +145,8 @@ pub(crate) enum BlockType {
     SstDataPaxV2 = 15,
     /// One physical PAX column extent named by an [`SstDataPaxV2`] descriptor.
     SstDataPaxColumnV1 = 16,
+    /// Bounding-box navigation nodes over immutable secondary-index data.
+    ValueIndexNavigationV1 = 17,
 }
 
 impl BlockType {
@@ -160,6 +165,7 @@ impl BlockType {
             14 => BlockType::SstPackedContainerV1,
             15 => BlockType::SstDataPaxV2,
             16 => BlockType::SstDataPaxColumnV1,
+            17 => BlockType::ValueIndexNavigationV1,
             _ => return None,
         })
     }
@@ -562,6 +568,7 @@ mod tests {
             BlockType::SstIndexV2,
             BlockType::ValueIndexData,
             BlockType::ValueIndexRoster,
+            BlockType::ValueIndexNavigationV1,
         ]
         .into_iter()
         .enumerate()

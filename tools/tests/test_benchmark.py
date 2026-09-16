@@ -128,6 +128,16 @@ class BenchmarkTest(unittest.TestCase):
             "JOIN benchmark_kv AS kv ON kv.id = probe.id",
         )
 
+    def test_spatial_workloads_probe_existing_gist_and_spgist_generations(self):
+        self.assertEqual(
+            benchmark.workload_sql("gist-spatial", 7, 19, 1000),
+            "SELECT id, payload FROM benchmark_kv WHERE gist_location <@ box '(331,331),(331,331)'",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("spgist-spatial", 7, 19, 1000),
+            "SELECT id, payload FROM benchmark_kv WHERE spgist_location <@ box '(331,-331),(331,-331)'",
+        )
+
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),

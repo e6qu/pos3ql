@@ -7,6 +7,7 @@
 //! without fetching a row; every candidate is still checked against the
 //! authoritative MVCC row identity by the storage layer.
 
+use super::navigation::{NavigationCursor, NavigationWriter, SPATIAL_DATA_BYTES, SpatialBounds};
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
 const ENTRY_HEADER: usize = 8 + 8 + 8 + 4;
@@ -78,6 +79,10 @@ pub(crate) struct ValueIndexWriter {
     roster_tail: Option<BlockId>,
     entries: u64,
     covering: Option<bool>,
+    spatial_position: Option<u8>,
+    pending_bounds: SpatialBounds,
+    pending_entries: u64,
+    navigation: NavigationWriter,
 }
 
 impl ValueIndexWriter {
@@ -94,11 +99,15 @@ impl ValueIndexWriter {
             roster_tail: None,
             entries: 0,
             covering: None,
+            spatial_position: None,
+            pending_bounds: SpatialBounds::Empty,
+            pending_entries: 0,
+            navigation: NavigationWriter::new(),
         }
     }
 
     pub(crate) fn budget_bytes() -> usize {
-        MAX_PAYLOAD + BLOCK_FILTER_BYTES + MAX_PAYLOAD
+        MAX_PAYLOAD + BLOCK_FILTER_BYTES + MAX_PAYLOAD + NavigationWriter::budget_bytes()
     }
 
     pub(crate) fn reset(&mut self) {
@@ -111,6 +120,32 @@ impl ValueIndexWriter {
         self.roster_tail = None;
         self.entries = 0;
         self.covering = None;
+        self.spatial_position = None;
+        self.pending_bounds = SpatialBounds::Empty;
+        self.pending_entries = 0;
+    }
+
+    pub(crate) fn reset_spatial(&mut self, position: u8, covering: bool) {
+        self.reset();
+        self.spatial_position = Some(position);
+        self.navigation.reset(position, covering);
+    }
+
+    pub(crate) fn append_spatial(
+        &mut self,
+        store: &mut dyn BlockStore,
+        identity: (u64, u64, u64),
+        key: &[u8],
+        payload: Option<&[u8]>,
+        bounds: SpatialBounds,
+        compare: &mut impl FnMut(&[u8], &[u8]) -> core::cmp::Ordering,
+    ) -> Result<(), ValueIndexError> {
+        if self.spatial_position.is_none() {
+            return Err(ValueIndexError::Corrupt);
+        }
+        self.append_inner(store, identity, key, payload, compare)?;
+        self.pending_bounds = self.pending_bounds.union(bounds);
+        Ok(())
     }
 
     pub(crate) fn append(
@@ -175,7 +210,12 @@ impl ValueIndexWriter {
             ENTRY_HEADER
         };
         let bytes = header + key.len() + payload.len();
-        if self.pending_len + bytes > MAX_PAYLOAD {
+        let block_bytes = if self.spatial_position.is_some() {
+            SPATIAL_DATA_BYTES
+        } else {
+            MAX_PAYLOAD
+        };
+        if self.pending_len != 0 && self.pending_len + bytes > block_bytes {
             self.flush(store)?;
         }
         super::bloom::insert(&mut self.pending_filter, hash);
@@ -194,6 +234,7 @@ impl ValueIndexWriter {
         self.pending_last = Some(key_extent);
         self.pending_len += bytes;
         self.entries += 1;
+        self.pending_entries += 1;
         Ok(())
     }
 
@@ -206,6 +247,17 @@ impl ValueIndexWriter {
             BlockType::ValueIndexData,
             0,
         )?;
+        if self.spatial_position.is_some() {
+            self.navigation
+                .append(store, id, self.pending_entries, self.pending_bounds)?;
+            self.pending_len = 0;
+            self.pending_filter.fill(0);
+            self.pending_first = None;
+            self.pending_last = None;
+            self.pending_bounds = SpatialBounds::Empty;
+            self.pending_entries = 0;
+            return Ok(());
+        }
         let (first_at, first_len) = self.pending_first.expect("non-empty block has first key");
         let (last_at, last_len) = self.pending_last.expect("non-empty block has last key");
         let bounded_bytes = ORDERED_BLOCK_REF_HEADER + first_len + last_len;
@@ -240,6 +292,7 @@ impl ValueIndexWriter {
         self.block_count += 1;
         self.pending_len = 0;
         self.pending_filter.fill(0);
+        self.pending_entries = 0;
         self.pending_first = None;
         self.pending_last = None;
         Ok(())
@@ -288,8 +341,12 @@ impl ValueIndexWriter {
         published_lsn: u64,
     ) -> Result<Option<ValueIndexHandle>, ValueIndexError> {
         self.flush(store)?;
-        self.flush_roster(store)?;
-        let roster = self.roster_tail.expect("finish writes a roster root");
+        let roster = if self.spatial_position.is_some() {
+            self.navigation.finish(store)?
+        } else {
+            self.flush_roster(store)?;
+            self.roster_tail.expect("finish writes a roster root")
+        };
         Ok(Some(ValueIndexHandle {
             roster,
             entries: self.entries,
@@ -402,12 +459,38 @@ pub(crate) fn walk_value_roster(
     scratch: &mut [u8],
     mut visit: impl FnMut(BlockId) -> bool,
 ) -> Result<bool, ValueIndexError> {
+    let first_roster = store.get(&root, scratch)?;
+    let root_kind = first_roster.1;
+    if root_kind == BlockType::ValueIndexNavigationV1 {
+        let mut cursor = NavigationCursor::for_gc(root);
+        let mut stopped = false;
+        loop {
+            let leaf = cursor.next(store, scratch, &mut |_, _| true, &mut |id| {
+                let keep_going = visit(id);
+                stopped |= !keep_going;
+                keep_going
+            })?;
+            if stopped {
+                return Ok(false);
+            }
+            let Some((id, _, _)) = leaf else {
+                return Ok(true);
+            };
+            if !visit(id) {
+                return Ok(false);
+            }
+        }
+    }
     let mut next = Some(root);
     while let Some(roster) = next {
         if !visit(roster) {
             return Ok(false);
         }
-        let (roster_len, kind) = store.get(&roster, scratch)?;
+        let (roster_len, kind) = if roster == root {
+            first_roster
+        } else {
+            store.get(&roster, scratch)?
+        };
         if kind != BlockType::ValueIndexRoster || roster_len < 4 {
             return Err(ValueIndexError::Corrupt);
         }
@@ -501,13 +584,39 @@ impl<'a> ValueIndexReader<'a> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn range_covering(
         &mut self,
         store: &mut dyn BlockStore,
         handle: &ValueIndexHandle,
+        classify: impl FnMut(&[u8]) -> ValueIndexPosition,
+        visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
+    ) -> Result<(), ValueIndexError> {
+        self.range_covering_with_bounds(store, handle, |_, _| true, classify, visit)
+    }
+
+    pub(crate) fn range_covering_with_bounds(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &ValueIndexHandle,
+        intersects: impl FnMut(u8, SpatialBounds) -> bool,
         mut classify: impl FnMut(&[u8]) -> ValueIndexPosition,
         mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
+        let first_roster = store.get(&handle.roster, self.roster)?;
+        let root_kind = first_roster.1;
+        if root_kind == BlockType::ValueIndexNavigationV1 {
+            return self.walk_navigation(
+                store,
+                handle,
+                intersects,
+                |hash, rowid, lsn, key, payload| {
+                    if classify(key) == ValueIndexPosition::Match {
+                        visit(hash, rowid, lsn, key, payload);
+                    }
+                },
+            );
+        }
         let mut next = Some(handle.roster);
         let mut roster_count = 0u64;
         while let Some(roster) = next {
@@ -515,7 +624,11 @@ impl<'a> ValueIndexReader<'a> {
             if roster_count > handle.entries.saturating_add(1) {
                 return Err(ValueIndexError::Corrupt);
             }
-            let (roster_len, kind) = store.get(&roster, self.roster)?;
+            let (roster_len, kind) = if roster_count == 1 {
+                first_roster
+            } else {
+                store.get(&roster, self.roster)?
+            };
             if kind != BlockType::ValueIndexRoster || roster_len < ROSTER_HEADER {
                 return Err(ValueIndexError::Corrupt);
             }
@@ -559,6 +672,20 @@ impl<'a> ValueIndexReader<'a> {
         target_hash: Option<u64>,
         mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
+        let first_roster = store.get(&handle.roster, self.roster)?;
+        let root_kind = first_roster.1;
+        if root_kind == BlockType::ValueIndexNavigationV1 {
+            return self.walk_navigation(
+                store,
+                handle,
+                |_, _| true,
+                |hash, rowid, lsn, key, payload| {
+                    if target_hash.is_none_or(|target| target == hash) {
+                        visit(hash, rowid, lsn, key, payload);
+                    }
+                },
+            );
+        }
         let mut seen = 0u64;
         let mut next = Some(handle.roster);
         let mut roster_count = 0u64;
@@ -567,7 +694,11 @@ impl<'a> ValueIndexReader<'a> {
             if roster_count > handle.entries.saturating_add(1) {
                 return Err(ValueIndexError::Corrupt);
             }
-            let (roster_len, kind) = store.get(&roster, self.roster)?;
+            let (roster_len, kind) = if roster_count == 1 {
+                first_roster
+            } else {
+                store.get(&roster, self.roster)?
+            };
             if kind != BlockType::ValueIndexRoster || roster_len < 4 {
                 return Err(ValueIndexError::Corrupt);
             }
@@ -604,6 +735,37 @@ impl<'a> ValueIndexReader<'a> {
         }
         if target_hash.is_none() && seen != handle.entries {
             return Err(ValueIndexError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn walk_navigation(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &ValueIndexHandle,
+        mut intersects: impl FnMut(u8, SpatialBounds) -> bool,
+        mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
+    ) -> Result<(), ValueIndexError> {
+        let mut cursor = NavigationCursor::new(handle.roster, handle.entries);
+        while let Some((id, expected_entries, covering)) =
+            cursor.next(store, self.roster, &mut intersects, &mut |_| true)?
+        {
+            let (len, kind) = store.get(&id, self.data)?;
+            if kind != BlockType::ValueIndexData {
+                return Err(ValueIndexError::Corrupt);
+            }
+            let mut entries = 0u64;
+            walk_data(
+                &self.data[..len],
+                covering,
+                |hash, rowid, lsn, key, payload| {
+                    entries += 1;
+                    visit(hash, rowid, lsn, key, payload);
+                },
+            )?;
+            if entries != expected_entries {
+                return Err(ValueIndexError::Corrupt);
+            }
         }
         Ok(())
     }
@@ -667,6 +829,111 @@ mod tests {
     use super::*;
     use crate::mem::budget::Budget;
     use crate::store::memory::MemoryBlockStore;
+
+    #[test]
+    fn spatial_covering_generations_prune_data_preserve_payloads_and_walk_every_gc_node() {
+        let mut budget = Budget::new(16 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "spatial values", 8 << 20, 1024).unwrap();
+        let mut writer = ValueIndexWriter::new();
+        let mut roster = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        let mut key = [b'k'; 512];
+        let payload = [b'p'; 2048];
+        let handle = crate::mem::guard::forbid_alloc(|| {
+            writer.reset_spatial(0, true);
+            for rowid in 0..2000u64 {
+                key[..8].copy_from_slice(&rowid.to_be_bytes());
+                let bounds = if rowid == 1999 {
+                    SpatialBounds::Unbounded
+                } else {
+                    SpatialBounds::new(rowid as f64, 0.0, rowid as f64, 0.0)
+                };
+                writer
+                    .append_spatial(
+                        &mut store,
+                        (rowid, rowid, 7),
+                        &key,
+                        Some(&payload),
+                        bounds,
+                        &mut |left, right| left.cmp(right),
+                    )
+                    .unwrap();
+            }
+            writer.finish(&mut store, 8).unwrap().unwrap()
+        });
+        let before = store.reads();
+        let mut found = 0;
+        crate::mem::guard::forbid_alloc(|| {
+            ValueIndexReader::over(&mut roster, &mut data)
+                .range_covering_with_bounds(
+                    &mut store,
+                    &handle,
+                    |_, bounds| match bounds {
+                        SpatialBounds::Finite(bounds) => {
+                            let [minimum_x, _, maximum_x, _] = bounds.coordinates();
+                            minimum_x <= 1024.0 && maximum_x >= 1024.0
+                        }
+                        SpatialBounds::Empty => false,
+                        SpatialBounds::Unbounded => true,
+                    },
+                    |key| {
+                        if u64::from_be_bytes(key[..8].try_into().unwrap()) == 1024 {
+                            ValueIndexPosition::Match
+                        } else {
+                            ValueIndexPosition::Skip
+                        }
+                    },
+                    |hash, rowid, lsn, key, included| {
+                        assert_eq!((hash, rowid, lsn), (1024, 1024, 7));
+                        assert_eq!(key.len(), 512);
+                        assert_eq!(included, payload);
+                        found += 1;
+                    },
+                )
+                .unwrap();
+        });
+        assert_eq!(found, 1);
+        assert!(
+            store.reads() - before <= 9,
+            "{} reads",
+            store.reads() - before
+        );
+        let mut total = 0;
+        ValueIndexReader::over(&mut roster, &mut data)
+            .walk(&mut store, &handle, |_, _, _, _| total += 1)
+            .unwrap();
+        assert_eq!(total, 2000);
+        let mut nodes = 0;
+        assert!(
+            walk_value_roster(&mut store, handle.roster, &mut roster, |_| {
+                nodes += 1;
+                true
+            })
+            .unwrap()
+        );
+        assert!(
+            nodes > 330,
+            "complete GC must retain every small data block and parent, got {nodes}"
+        );
+        let mut bounded = 0;
+        assert!(
+            !walk_value_roster(&mut store, handle.roster, &mut roster, |_| {
+                bounded += 1;
+                bounded < 3
+            })
+            .unwrap()
+        );
+        assert_eq!(bounded, 3);
+        writer.reset_spatial(0, false);
+        let empty = writer.finish(&mut store, 9).unwrap().unwrap();
+        assert_eq!(empty.entries, 0);
+        ValueIndexReader::over(&mut roster, &mut data)
+            .walk(&mut store, &empty, |_, _, _, _| {
+                panic!("empty reused generation")
+            })
+            .unwrap();
+    }
 
     #[test]
     fn generation_round_trips_and_filters_hashes() {

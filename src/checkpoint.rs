@@ -10133,15 +10133,22 @@ impl Checkpointer {
                 continue;
             }
             value_sorter.reset();
+            let spatial_position = storage.value_binding_spatial_position(slot, binding);
             let mut compare = |left: &[u8], right: &[u8]| {
                 storage.compare_value_binding_keys(
                     slot,
                     binding,
+                    spatial_position,
                     value_sort_key(left)?,
                     value_sort_key(right)?,
                 )
             };
-            self.value_writer.reset();
+            let include_mask = storage.value_binding_include_mask(slot, binding);
+            if let Some(position) = spatial_position {
+                self.value_writer.reset_spatial(position, include_mask != 0);
+            } else {
+                self.value_writer.reset();
+            }
             storage.for_each_row_state(slot, &mut |rowid, state| {
                 use core::ops::ControlFlow;
                 let Some(home) = state.committed else {
@@ -10178,7 +10185,7 @@ impl Checkpointer {
                     let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
                     let mut comparison_error = None;
                     let mut compare_keys = |left: &[u8], right: &[u8]| match storage
-                        .compare_value_binding_keys(slot, binding, left, right)
+                        .compare_value_binding_keys(slot, binding, spatial_position, left, right)
                     {
                         Ok(ordering) => ordering,
                         Err(error) => {
@@ -10187,7 +10194,18 @@ impl Checkpointer {
                         }
                     };
                     let include_mask = storage.value_binding_include_mask(slot, binding);
-                    let write = if include_mask == 0 {
+                    let write = if let Some(position) = spatial_position {
+                        let bounds =
+                            storage.value_binding_spatial_bounds(slot, binding, position, key)?;
+                        self.value_writer.append_spatial(
+                            &mut *self.blocks.borrow_mut(),
+                            (hash, rowid, commit_lsn),
+                            key,
+                            (include_mask != 0).then_some(payload),
+                            bounds,
+                            &mut compare_keys,
+                        )
+                    } else if include_mask == 0 {
                         self.value_writer.append(
                             &mut *self.blocks.borrow_mut(),
                             hash,

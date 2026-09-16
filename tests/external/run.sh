@@ -11,7 +11,6 @@ set -u
 cd "$(dirname "$0")/../.." || exit
 ROOT=$(pwd)
 EXT=tests/external
-WORK=$(mktemp -d /tmp/pos3ql-external.XXXXXX)
 KEEP=${1:-}
 
 PSQL=${POS3QL_PSQL:-/opt/homebrew/opt/libpq/bin/psql}
@@ -19,29 +18,17 @@ PSQL=${POS3QL_PSQL:-/opt/homebrew/opt/libpq/bin/psql}
 . "$EXT/liveness.sh"
 
 select_port() { # explicit value, first automatic value, last automatic value
-  local explicit=$1 first=$2 last=$3 selected
-  if [[ -n "$explicit" ]]; then
-    if nc -z 127.0.0.1 "$explicit" >/dev/null 2>&1; then
-      printf 'FAIL: requested test port %s is already in use\n' "$explicit" >&2
-      exit 1
-    fi
-    printf '%s\n' "$explicit"
-    return
-  fi
-  selected=$(choose_free_port "$first" "$last") || {
-    printf 'FAIL: no free loopback test port in %s..%s\n' "$first" "$last" >&2
-    exit 1
-  }
-  printf '%s\n' "$selected"
+  claim_test_port "$1" "$2" "$3"
 }
 
-S3_TEST_PORT=$(select_port "${POS3QL_S3_TEST_PORT:-}" 19311 19331)
+trap release_test_ports EXIT
+S3_TEST_PORT=$(select_port "${POS3QL_S3_TEST_PORT:-}" 19311 19331) || exit 1
 S3_TEST_BUCKET=pos3ql-external
 S3_TEST_REGION=test-region
 S3_TEST_ACCESS_KEY=pos3ql-test-access
 S3_TEST_SECRET_KEY=pos3ql-test-secret
-PG_PORT=$(select_port "${POS3QL_PG_PORT:-}" 15433 15463)
-TORTURE_PG_PORT=$(select_port "${POS3QL_TORTURE_PG_PORT:-}" 15470 15490)
+PG_PORT=$(select_port "${POS3QL_PG_PORT:-}" 15433 15463) || exit 1
+TORTURE_PG_PORT=$(select_port "${POS3QL_TORTURE_PG_PORT:-}" 15470 15490) || exit 1
 # An externally managed publisher is an explicit fixture. When configured, its
 # listener must already exist; otherwise this harness starts a local publisher.
 if [[ -n "${POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT:-}" ]]; then
@@ -51,9 +38,9 @@ if [[ -n "${POS3QL_SUBSCRIPTION_EXTERNAL_PUBLISHER_PORT:-}" ]]; then
     exit 1
   fi
 else
-SUB_PG_PORT=$(select_port "${POS3QL_SUBSCRIPTION_PG_PORT:-}" 15496 15516)
+SUB_PG_PORT=$(select_port "${POS3QL_SUBSCRIPTION_PG_PORT:-}" 15496 15516) || exit 1
 fi
-SUB_POS3QL_PORT=$(select_port "${POS3QL_SUBSCRIPTION_POS3QL_PORT:-}" 15542 15562)
+SUB_POS3QL_PORT=$(select_port "${POS3QL_SUBSCRIPTION_POS3QL_PORT:-}" 15542 15562) || exit 1
 if [[ -n "${POS3QL_EXTERNAL_SUBSCRIBER_PORT:-}" ]]; then
   SUBSCRIBER_PG_PORT=$POS3QL_EXTERNAL_SUBSCRIBER_PORT
   if ! nc -z 127.0.0.1 "$SUBSCRIBER_PG_PORT" >/dev/null 2>&1; then
@@ -61,10 +48,11 @@ if [[ -n "${POS3QL_EXTERNAL_SUBSCRIBER_PORT:-}" ]]; then
     exit 1
   fi
 else
-  SUBSCRIBER_PG_PORT=$(select_port "${POS3QL_SUBSCRIBER_PG_PORT:-}" 15564 15584)
+  SUBSCRIBER_PG_PORT=$(select_port "${POS3QL_SUBSCRIBER_PG_PORT:-}" 15564 15584) || exit 1
 fi
-STLS_PORT=$(select_port "${POS3QL_TLS_PORT:-}" 15520 15540)
+STLS_PORT=$(select_port "${POS3QL_TLS_PORT:-}" 15520 15540) || exit 1
 
+WORK=$(mktemp -d /tmp/pos3ql-external.XXXXXX)
 PASS=0
 FAIL=0
 
@@ -157,7 +145,9 @@ cleanup() {
   fi
   if [[ -n "${S3_TEST_PID:-}" ]]; then
     kill "$S3_TEST_PID" 2>/dev/null
+    wait "$S3_TEST_PID" 2>/dev/null || true
   fi
+  release_test_ports
   if [[ "$KEEP" == "--keep" ]]; then
     printf 'work dir kept: %s\n' "$WORK"
   else
@@ -180,9 +170,20 @@ python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PO
   > "$WORK/object-store.log" 2>&1 &
 S3_TEST_PID=$!
 for _ in {1..50}; do
-  nc -z 127.0.0.1 "$S3_TEST_PORT" && break
+  if ! server_alive "$S3_TEST_PID"; then
+    bad "S3-compatible fixture exited at startup (see $WORK/object-store.log)"
+    tail -10 "$WORK/object-store.log"
+    exit 1
+  fi
+  if nc -z 127.0.0.1 "$S3_TEST_PORT"; then
+    break
+  fi
   sleep 0.1
 done
+if ! server_alive "$S3_TEST_PID" || ! nc -z 127.0.0.1 "$S3_TEST_PORT"; then
+  bad "S3-compatible fixture did not become ready"
+  exit 1
+fi
 ok "S3-compatible test server (pid $S3_TEST_PID)"
 
 write_main_config() { # <object prefix> [data directory name]
@@ -445,9 +446,9 @@ cmt=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
 [[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive restart" \
   || bad "comments after restart: '$cmt'"
 
-step "durable WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WAL"
+step "durable WAL upload: commit, wipe disk (no checkpoint), rebuild from object WAL"
 # Commit without any CHECKPOINT, then destroy the local disk: recovery must
-# come entirely from WAL segments synchronously acknowledged by MinIO.
+# come entirely from WAL segments synchronously acknowledged by object storage.
 if ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -v ON_ERROR_STOP=1 \
   -c "CREATE TABLE waltest (id int, v text)" \
@@ -504,7 +505,7 @@ kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
   && ok "commit-durable-on-bucket by default (no drain pause, no checkpoint)" \
   || bad "commit-durable-on-bucket default: '$out'"
 
-step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
+step "cold start: checkpoint, wipe the disk, rebuild from object storage"
 "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"

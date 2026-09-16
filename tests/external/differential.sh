@@ -15,7 +15,6 @@ DIFFERENTIAL_TRANSACTION_CONFIG=$(< "$EXT/differential-capacities.conf") || exit
 ROOT_VENV=${POS3QL_VENV:-target/external-venv}
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
-WORK=$(mktemp -d /tmp/pos3ql-diff.XXXXXX)
 KEEP=${1:-}
 
 PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
@@ -38,47 +37,20 @@ fi
 # A developer machine can already have a PostgreSQL or pos3ql instance on the
 # historical defaults. Pick an unused pair for the hermetic local run; an
 # explicit port remains an explicit contract and fails before startup if busy.
-port_is_free() {
-  ! nc -z 127.0.0.1 "$1" >/dev/null 2>&1
-}
+. "$EXT/liveness.sh"
+trap release_test_ports EXIT
 
 choose_local_ports() {
   local requested_pg=${POS3QL_DIFF_PG_PORT:-}
   local requested_p3=${POS3QL_DIFF_P3_PORT:-}
-  local candidate
-
-  if [[ -n "$requested_pg" ]] && ! port_is_free "$requested_pg"; then
-    printf 'FAIL: requested PostgreSQL reference port %s is already in use\n' "$requested_pg"
-    exit 1
-  fi
-  if [[ -n "$requested_p3" ]] && ! port_is_free "$requested_p3"; then
-    printf 'FAIL: requested pos3ql port %s is already in use\n' "$requested_p3"
-    exit 1
-  fi
-
-  if [[ -n "$requested_pg" && -n "$requested_p3" ]]; then
-    PG_PORT=$requested_pg
-    P3_PORT=$requested_p3
-    return
-  fi
-
-  for ((candidate = 15498; candidate <= 15598; candidate += 2)); do
-    local pg=${requested_pg:-$candidate}
-    local p3=${requested_p3:-$((candidate + 1))}
-    if port_is_free "$pg" && port_is_free "$p3"; then
-      PG_PORT=$pg
-      P3_PORT=$p3
-      return
-    fi
-  done
-  printf '%s\n' 'FAIL: no free local loopback port pair for differential testing'
-  exit 1
+  PG_PORT=$(claim_test_port "$requested_pg" 15498 15598) || exit 1
+  P3_PORT=$(claim_test_port "$requested_p3" 15499 15599) || exit 1
 }
 
 if [[ "$REFERENCE_MODE" == local ]]; then
   choose_local_ports
 else
-  P3_PORT=${POS3QL_DIFF_P3_PORT:-15499}
+  P3_PORT=$(claim_test_port "${POS3QL_DIFF_P3_PORT:-}" 15499 15599) || exit 1
 fi
 FUZZ_COUNT=${POS3QL_FUZZ_COUNT:-0}
 FUZZ_SEED=${POS3QL_FUZZ_SEED:-1}
@@ -152,13 +124,13 @@ FAIL=0
 ok()  { PASS=$((PASS+1)); printf 'PASS: %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$1"; }
 
-. "$EXT/liveness.sh"
-
+WORK=$(mktemp -d /tmp/pos3ql-diff.XXXXXX)
 cleanup() {
   [[ -n "${P3_PID:-}" ]] && kill "$P3_PID" 2>/dev/null
   if [[ "$REFERENCE_MODE" == local && -d "$WORK/pgdata" ]]; then
     "$PGBIN/pg_ctl" -D "$WORK/pgdata" stop -m immediate >/dev/null 2>&1
   fi
+  release_test_ports
   [[ -n "${SOCKDIR:-}" ]] && rm -rf "$SOCKDIR"
   if [[ "$KEEP" == "--keep" ]]; then
     printf 'work dir kept: %s\n' "$WORK"

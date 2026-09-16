@@ -86,6 +86,16 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT payload FROM benchmark_kv WHERE gist_span && '[993,994)'::int4range",
         )
         self.assertEqual(
+            benchmark.workload_sql("gist-multirange", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv "
+            "WHERE gist_spans && '{[2317,2318)}'::int4multirange",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("gist-network", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv "
+            "WHERE gist_address <<= '10.0.1.75'",
+        )
+        self.assertEqual(
             benchmark.workload_sql("gist-knn", 7, 19, 1000),
             "SELECT id, payload FROM benchmark_kv "
             "ORDER BY gist_location <-> point '(331,331)' LIMIT 8",
@@ -113,6 +123,15 @@ class BenchmarkTest(unittest.TestCase):
         self.assertEqual(
             benchmark.workload_sql("spgist-prefix", 7, 19, 1000),
             "SELECT payload FROM benchmark_kv WHERE spgist_label ^@ 'key-331'",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("spgist-range", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE spgist_span && '[1655,1656)'::int4range",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("spgist-network", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv "
+            "WHERE spgist_address <<= '11.0.1.75'",
         )
         self.assertEqual(
             benchmark.workload_sql("spgist-knn", 7, 19, 1000),
@@ -157,7 +176,7 @@ class BenchmarkTest(unittest.TestCase):
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),
-            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_location, payload) VALUES (2001008, 2001008, 2001008, '[4002016,4002018)'::int4range, '[6003024,6003027)'::int4range, point(2001008, 2001008), ARRAY[2001008], to_tsvector('simple','token2001008'), to_tsvector('simple','gisttoken2001008'), jsonb_build_object('key2001008','value2001008'), jsonb_build_object('token','value2001008'), 'key-2001008', point(2001008, -2001008), 0)",
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_spans, gist_address, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_span, spgist_address, spgist_location, payload) VALUES (2001008, 2001008, 2001008, '[4002016,4002018)'::int4range, '[6003024,6003027)'::int4range, int4multirange(int4range(14007056,14007058), int4range(14007060,14007062)), '10.0.0.0'::inet + 2001008, point(2001008, 2001008), ARRAY[2001008], to_tsvector('simple','token2001008'), to_tsvector('simple','gisttoken2001008'), jsonb_build_object('key2001008','value2001008'), jsonb_build_object('token','value2001008'), 'key-2001008', int4range(10005040,10005042), '11.0.0.0'::inet + 2001008, point(2001008, -2001008), 0)",
         )
 
     def test_point_reads_and_updates_exercise_the_hash_key(self):

@@ -71,7 +71,8 @@ mod tiered;
 mod value;
 
 pub(crate) use navigation::{
-    NavigationKind, NavigationSpec, NavigationSummary, SpatialBounds, TokenSignature,
+    INTERVAL_KEY_BYTES, IntervalSummary, NavigationKind, NavigationSpec, NavigationSummary,
+    SpatialBounds, TokenSignature,
 };
 
 pub(crate) mod lz4;

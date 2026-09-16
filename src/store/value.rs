@@ -10,8 +10,8 @@
 #[cfg(test)]
 use super::navigation::SpatialBounds;
 use super::navigation::{
-    NavigationCursor, NavigationKind, NavigationSummary, NavigationWriter, SIGNATURE_DATA_BYTES,
-    SPATIAL_DATA_BYTES,
+    INTERVAL_DATA_BYTES, NavigationCursor, NavigationKind, NavigationSummary, NavigationWriter,
+    SIGNATURE_DATA_BYTES, SPATIAL_DATA_BYTES,
 };
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
@@ -139,6 +139,7 @@ impl ValueIndexWriter {
         self.navigation_data_bytes = match kind {
             NavigationKind::Spatial => SPATIAL_DATA_BYTES,
             NavigationKind::Signature => SIGNATURE_DATA_BYTES,
+            NavigationKind::Interval => INTERVAL_DATA_BYTES,
         };
         self.navigation.reset(position, covering);
     }
@@ -885,6 +886,7 @@ mod tests {
                         SpatialBounds::Empty => false,
                         SpatialBounds::Unbounded => true,
                         SpatialBounds::Signature(_) => true,
+                        SpatialBounds::Interval(_) => true,
                     },
                     |key| {
                         if u64::from_be_bytes(key[..8].try_into().unwrap()) == 1024 {

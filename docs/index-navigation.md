@@ -3,41 +3,49 @@
 GiST point, box, polygon, and circle classes and SP-GiST quad-point, k-d point,
 box, and polygon classes use bounding-box summaries. GIN array, `tsvector`,
 `jsonb_ops`, and `jsonb_path_ops` classes and GiST `tsvector` use token
-signatures in the same object-native tree. This is not PostgreSQL page storage
-or a native operator-class callback interface.
+signatures in the same object-native tree. GiST range, multirange, and network
+classes and SP-GiST range and network classes use ordered interval envelopes.
+This is not PostgreSQL page storage or a native operator-class callback
+interface.
 
 Checkpoint construction sorts geometric keys by bounding-box center and other
 keys by their deterministic encoding. Geometric data blocks target 16 KiB;
-signature blocks target 1 KiB to keep 256-bit summaries selective. One larger
-valid entry occupies its own block. Immutable parent nodes have at most 32
-children and retain descendant entry counts and merged summaries. Unchanged
-value-index manifest handles name the root and published LSN. Legacy
-flat/linked rosters remain readable until checkpoint replacement.
+signature blocks target 1 KiB to keep 256-bit summaries selective; interval
+blocks target 8 KiB. One larger valid entry occupies its own block. Immutable
+parent nodes have at most 32 children and retain descendant entry counts and
+merged summaries. Unchanged value-index manifest handles name the root and
+published LSN. Legacy flat/linked rosters remain readable until checkpoint
+replacement.
 
 ## Durable format
 
-`ValueIndexNavigationV1` has block-kind code 17. Every integer and floating-point
-coordinate in its payload is little-endian. Content-addressing and block
-integrity use the existing provider-neutral block-store boundary.
+`ValueIndexNavigationV1` has block-kind code 17. Multi-byte counters, spatial
+coordinates, and signature words are little-endian; interval keys are
+order-preserving byte strings compared lexicographically. Content-addressing
+and block integrity use the existing provider-neutral block-store boundary.
 
 | Field | Bytes | Meaning |
 | --- | ---: | --- |
 | Header | 8 | Version 1; height; indexed key position; covering flag; 16-bit child count; two zero reserved bytes |
 | Child identity | 32 | Nonzero immutable block identifier |
 | Child entry count | 8 | Positive descendant count |
-| Child summary | 33 | Tag plus either four binary64 coordinates or a 256-bit token signature |
+| Child summary | 33 | Tag plus four binary64 coordinates, a 256-bit token signature, or two 15-byte interval keys and flags |
 
 Height zero points to value-index data blocks. Greater heights point to nodes
 exactly one level lower. Only an empty generation's root admits zero children.
 Summary tag zero means all keys are NULL, one means unbounded, two means a
-finite ordered rectangle, and three means a token signature. The first two
-tags require zero payload bytes.
+finite ordered rectangle, three means a token signature, and four means an
+interval envelope. The first two tags require zero payload bytes. An interval
+stores flags followed by inclusive lower and upper order keys; the final byte
+is reserved and must be zero. Its flags distinguish an envelope containing
+nonempty values from one containing empty ranges, so empty values never become
+false negatives when summaries merge.
 Non-finite keys use unbounded bounds and always receive exact rechecks;
 non-finite or reversed coordinates under the finite tag are corruption.
 Readers reject inconsistent height, position, covering flags, entry counts,
 aggregate summaries, lengths, and fan-out rather than interpreting another
-format. Mixed finite and signature children merge to unbounded, so a malformed
-writer can reduce pruning but cannot create a false negative.
+format. Mixed finite, signature, and interval children merge to unbounded, so
+a malformed writer can reduce pruning but cannot create a false negative.
 
 ## Memory and correctness
 
@@ -56,6 +64,15 @@ conservative any-token tests. Prefix and negated full-text terms, numeric JSON
 values, JSONPath evaluation, and array contained-by predicates deliberately do
 not prune where a fixed signature cannot prove exclusion. Hash collisions only
 retain extra children.
+Interval summaries cover the outer bounds of every built-in range subtype,
+multiranges, and the network-to-broadcast span of IPv4 and IPv6 values. Integer,
+date, and timestamp keys preserve exact order; numeric keys and the final IPv6
+byte are conservative prefixes, so collisions only retain extra children.
+Equality, containment, overlap, and scalar range containment reject disjoint
+children. Positional range predicates retain all children until a richer
+two-sided proof is available. Empty and unbounded values have explicit
+conservative behavior, and every retained key receives the normal exact SQL
+operator check.
 Transaction-visible resident overlays are evaluated alongside published keys.
 Covering payloads remain intact. Garbage collection walks every parent and
 leaf, independent of predicate pruning.
@@ -66,10 +83,10 @@ GET/byte budgets, rollback and committed overlays, repeated checkpoint and
 garbage-collection cycles, wide expression keys, escaped JSON strings, boolean
 full-text queries, and allocation-forbidden execution. PostgreSQL 18.6 supplies
 the SQL oracle in `tests/external/differential/173_geometric_navigation.sql`
-and `174_inverted_navigation.sql`. Warm-memory and cold-object performance
-artifacts cover each inverted signature family independently.
+through `175_interval_navigation.sql`. Warm-memory and cold-object performance
+artifacts cover every signature and interval operator-class path independently.
 
-Network and range/multirange navigation, dedicated GIN posting structures, and
-ranked nearest-neighbor node traversal remain in [PLAN.md](../PLAN.md).
+Dedicated GIN posting structures and ranked nearest-neighbor node traversal
+remain in [PLAN.md](../PLAN.md).
 Unfiltered nearest-neighbor queries currently order complete compact candidate
 sets; geometric predicates prune candidates without changing that limit boundary.

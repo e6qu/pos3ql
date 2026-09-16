@@ -29,6 +29,43 @@ pub struct Parsed<'a> {
     pub upper_inc: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OuterBounds<'a> {
+    pub(crate) empty: bool,
+    pub(crate) lower: Option<&'a str>,
+    pub(crate) upper: Option<&'a str>,
+}
+
+/// Returns the outer envelope of canonical range or multirange text without
+/// allocating. Multirange holes remain exact-recheck work; the first and last
+/// component are sufficient for conservative immutable navigation.
+pub(crate) fn outer_bounds(text: &str, multirange: bool) -> Result<OuterBounds<'_>, SqlError> {
+    if !multirange {
+        let parsed = parse(text)?;
+        return Ok(OuterBounds {
+            empty: parsed.empty,
+            lower: parsed.lower,
+            upper: parsed.upper,
+        });
+    }
+    let mut components = [""; MAX_MULTIRANGE];
+    let count = split_components(text, &mut components)?;
+    if count == 0 {
+        return Ok(OuterBounds {
+            empty: true,
+            lower: None,
+            upper: None,
+        });
+    }
+    let first = parse(components[0])?;
+    let last = parse(components[count - 1])?;
+    Ok(OuterBounds {
+        empty: false,
+        lower: first.lower,
+        upper: last.upper,
+    })
+}
+
 /// PostgreSQL's value-less overflow, raised when an internal computation — the
 /// discrete increment that makes an inclusive upper bound exclusive — exceeds
 /// the element type, as distinct from a bad input value.

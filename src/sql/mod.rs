@@ -1005,6 +1005,14 @@ enum EventTriggerInvocation<'a> {
     TableRewrite { relation_oid: i32, reason: i32 },
 }
 
+struct StatementDdlEvents<'a> {
+    before: event_trigger::BeforeDdl<'a>,
+    undo_mark: usize,
+    origin: u32,
+    drop: bool,
+    end: bool,
+}
+
 struct EventTriggerExecution<'a, 'response> {
     txn: &'a mut TxnState,
     sqlprep: &'a mut SqlPreparedPool,
@@ -13533,61 +13541,27 @@ impl Engine {
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
-        {
-            let mut commands = [event_trigger::DdlCommand::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
-            let mut drops = [event_trigger::DroppedObject::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
-            let (command_count, drop_count) = match event_trigger::collect(
-                &self.storage,
-                txn.txid,
+            && let Err(error) = self.fire_statement_ddl_events(
                 statement,
                 tag,
-                event_trigger::CollectChanges {
+                StatementDdlEvents {
                     before: event_before,
-                    undo: &txn.ddl()[event_ddl_mark..],
-                    undo_origins: &txn.ddl_origins()[event_ddl_mark..],
+                    undo_mark: event_ddl_mark,
                     origin: event_ddl_origin,
-                    in_extension: txn.in_extension_script(),
+                    drop: event_drop,
+                    end: event_end,
                 },
-                event_trigger::EventGraphs {
-                    commands: &mut commands,
-                    drops: &mut drops,
+                EventTriggerExecution {
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
                 },
-            ) {
-                Ok(counts) => counts,
-                Err(error) => return Ok(Err(error)),
-            };
-            if event_drop {
-                let _scope = event_trigger::enter_dropped_objects(&drops[..drop_count]);
-                if let Err(error) = self.fire_event_triggers(
-                    EventTriggerInvocation::SqlDrop { tag },
-                    EventTriggerExecution {
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        arena,
-                        responder,
-                    },
-                ) {
-                    return Ok(Err(error));
-                }
-            }
-            if event_end {
-                let _scope = event_trigger::enter_ddl_commands(&commands[..command_count]);
-                if let Err(error) = self.fire_event_triggers(
-                    EventTriggerInvocation::DdlCommandEnd { tag },
-                    EventTriggerExecution {
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        arena,
-                        responder,
-                    },
-                ) {
-                    return Ok(Err(error));
-                }
-            }
+            )
+        {
+            return Ok(Err(error));
         }
         outcome
     }
@@ -16106,63 +16080,103 @@ impl Engine {
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
-        {
-            let mut commands = [event_trigger::DdlCommand::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
-            let mut drops = [event_trigger::DroppedObject::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
-            let (command_count, drop_count) = match event_trigger::collect(
-                &self.storage,
-                txn.txid,
+            && let Err(error) = self.fire_statement_ddl_events(
                 statement,
                 tag,
-                event_trigger::CollectChanges {
+                StatementDdlEvents {
                     before: event_before,
-                    undo: &txn.ddl()[event_ddl_mark..],
-                    undo_origins: &txn.ddl_origins()[event_ddl_mark..],
+                    undo_mark: event_ddl_mark,
                     origin: event_ddl_origin,
-                    in_extension: txn.in_extension_script(),
+                    drop: event_drop,
+                    end: event_end,
                 },
-                event_trigger::EventGraphs {
-                    commands: &mut commands,
-                    drops: &mut drops,
+                EventTriggerExecution {
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
                 },
-            ) {
-                Ok(counts) => counts,
-                Err(error) => return Ok(Err(error)),
-            };
-            if event_drop {
-                let _scope = event_trigger::enter_dropped_objects(&drops[..drop_count]);
-                if let Err(error) = self.fire_event_triggers(
-                    EventTriggerInvocation::SqlDrop { tag },
-                    EventTriggerExecution {
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        arena,
-                        responder,
-                    },
-                ) {
-                    return Ok(Err(error));
-                }
-            }
-            if event_end {
-                let _scope = event_trigger::enter_ddl_commands(&commands[..command_count]);
-                if let Err(error) = self.fire_event_triggers(
-                    EventTriggerInvocation::DdlCommandEnd { tag },
-                    EventTriggerExecution {
-                        txn,
-                        sqlprep,
-                        cursors,
-                        guc,
-                        arena,
-                        responder,
-                    },
-                ) {
-                    return Ok(Err(error));
-                }
-            }
+            )
+        {
+            return Ok(Err(error));
         }
         outcome
+    }
+
+    // DDL event graphs are not part of a recursively entered DML frame.
+    #[inline(never)]
+    fn fire_statement_ddl_events(
+        &mut self,
+        statement: &Stmt,
+        tag: &str,
+        events: StatementDdlEvents<'_>,
+        execution: EventTriggerExecution<'_, '_>,
+    ) -> Result<(), SqlError> {
+        let StatementDdlEvents {
+            before: event_before,
+            undo_mark: event_ddl_mark,
+            origin: event_ddl_origin,
+            drop: event_drop,
+            end: event_end,
+        } = events;
+        let EventTriggerExecution {
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            arena,
+            responder,
+        } = execution;
+        let mut commands = [event_trigger::DdlCommand::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
+        let mut drops = [event_trigger::DroppedObject::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
+        let (command_count, drop_count) = event_trigger::collect(
+            &self.storage,
+            txn.txid,
+            statement,
+            tag,
+            event_trigger::CollectChanges {
+                before: event_before,
+                undo: &txn.ddl()[event_ddl_mark..],
+                undo_origins: &txn.ddl_origins()[event_ddl_mark..],
+                origin: event_ddl_origin,
+                in_extension: txn.in_extension_script(),
+            },
+            event_trigger::EventGraphs {
+                commands: &mut commands,
+                drops: &mut drops,
+            },
+        )?;
+        if event_drop {
+            let _scope = event_trigger::enter_dropped_objects(&drops[..drop_count]);
+            self.fire_event_triggers(
+                EventTriggerInvocation::SqlDrop { tag },
+                EventTriggerExecution {
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            )?;
+        }
+        if event_end {
+            let _scope = event_trigger::enter_ddl_commands(&commands[..command_count]);
+            self.fire_event_triggers(
+                EventTriggerInvocation::DdlCommandEnd { tag },
+                EventTriggerExecution {
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

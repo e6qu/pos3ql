@@ -35455,6 +35455,34 @@ impl Storage {
             .filter(move |(_, trigger)| trigger.target == target)
     }
 
+    pub(crate) fn trigger_metadata_for_target(
+        &self,
+        target: TriggerTarget,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &TriggerDef)> + '_ {
+        self.triggers
+            .iter()
+            .enumerate()
+            .filter(move |(_, trigger)| {
+                trigger.database == self.current_database
+                    && trigger.visible_to(txid)
+                    && trigger.target == target
+            })
+    }
+
+    pub(crate) fn trigger_for_target(
+        &self,
+        slot: usize,
+        target: TriggerTarget,
+        txid: u32,
+    ) -> Option<TriggerDef> {
+        let trigger = self.triggers.get(slot)?;
+        (trigger.database == self.current_database
+            && trigger.visible_to(txid)
+            && trigger.target == target)
+            .then(|| trigger.effective_to(txid))
+    }
+
     pub(crate) fn triggers_with_slots_visible_to(
         &self,
         txid: u32,

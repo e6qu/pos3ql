@@ -129,7 +129,6 @@ storage. RAM and local disk are bounded, disposable caches.
   counters, PostgreSQL catalogs and information-schema views, WAL,
   checkpoints, loud exhaustion, and empty-cache recovery are qualified above
   the former 64/128/256/512/1,024-entry ceilings.
-- Test qualification now owns and removes engine, object-fixture, and
 - Row-level security policies use the independent startup-sized `max_policies`
   catalog, with no additional per-table ceiling. Predicate plans and conjoined
   command gates use statement-arena slices rather than fixed policy arrays.
@@ -152,6 +151,10 @@ storage. RAM and local disk are bounded, disposable caches.
   or argument vectors. Custom metadata and direct values use actual-shape
   arena storage; the original cold-PAX 1 MiB query and 8 MiB stack bounds
   remain qualified.
+  Procedural statement scratch is isolated from recursive dispatch. DML
+  frames do not reserve DDL event graphs, and trigger selection borrows
+  metadata until firing. Recursive triggers retain their 16-level named
+  exhaustion boundary and original 16 MiB qualification stack.
 - Test qualification now owns and removes engine, object-fixture, and
   performance scratch directories. Storage fault injection corrupts only its
   selected preallocated bytes in place, so repeated full and VOPR runs do not

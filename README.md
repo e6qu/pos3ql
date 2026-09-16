@@ -117,7 +117,13 @@ on-disk representation limit; object ACL capacity must reserve the three
 built-in public-schema grants.
 
 Legacy configurations that specify only `max_tables` keep the historical
-one-slot-per-table defaults. Exhaustion is a PostgreSQL program-limit error and
+one-slot-per-table defaults for those catalog classes. Row-level security uses
+an independent `max_policies` pool (default 256), not eight slots per table;
+there is no second per-table policy limit. Policy plans draw from the statement
+arena. Routine parameters, output columns, configuration settings, policy role
+lists, and trigger arguments accept the parser's complete 64-item boundary.
+Trigger arguments follow PostgreSQL's zero-based `TG_ARGV` and NULL-for-none
+semantics. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.
 
 `max_ddl_per_transaction` sizes catalog undo, commit, prepared-transaction,

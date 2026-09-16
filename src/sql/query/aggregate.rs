@@ -149,19 +149,19 @@ pub(crate) fn fold_aggregates<'a>(
 #[derive(Clone, Copy)]
 pub(crate) struct AggState<'a> {
     kind: AggKind,
-    custom: Option<crate::storage::AggregateRoutine>,
+    custom: Option<&'a crate::storage::AggregateRoutine>,
     custom_moving: bool,
     custom_state_initialized: bool,
     custom_transition_strict: bool,
     custom_inverse_strict: bool,
     custom_direct_initialized: bool,
-    custom_direct: [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    custom_direct: &'a [Datum<'a>],
     custom_argument_count: u8,
     custom_sort_offset: u8,
     custom_state_oid: i32,
     custom_moving_state_oid: i32,
-    custom_direct_oids: [i32; crate::storage::MAX_ROUTINE_ARGUMENTS],
-    custom_argument_oids: [i32; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    custom_direct_oids: &'a [i32],
+    custom_argument_oids: &'a [i32],
     star: bool,
     count: u64,
     sum_int: i128,
@@ -219,6 +219,9 @@ pub(crate) struct AggState<'a> {
     ord_len: usize,
     ord_cap: usize,
 }
+
+// Built-in groups must not reserve maximum-width custom routine state.
+const _: () = assert!(core::mem::size_of::<AggState<'static>>() <= 2048);
 
 fn compare_ordered_aggregate_rows(
     left: &[u8],
@@ -427,13 +430,13 @@ impl Default for AggState<'_> {
             custom_transition_strict: false,
             custom_inverse_strict: false,
             custom_direct_initialized: false,
-            custom_direct: [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            custom_direct: &[],
             custom_argument_count: 0,
             custom_sort_offset: 0,
             custom_state_oid: 0,
             custom_moving_state_oid: 0,
-            custom_direct_oids: [0; crate::storage::MAX_ROUTINE_ARGUMENTS],
-            custom_argument_oids: [0; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            custom_direct_oids: &[],
+            custom_argument_oids: &[],
             star: false,
             count: 0,
             sum_int: 0,
@@ -506,13 +509,14 @@ impl<'a> AggState<'a> {
         let Expr::Call { args, .. } = node else {
             unreachable!("aggregate state belongs to a call")
         };
-        for (index, expression) in args
-            .iter()
-            .take(usize::from(aggregate.direct_argument_count))
-            .enumerate()
-        {
-            self.custom_direct[index] = eval_full(expression, arena, params, row, hooks)?;
+        let count = usize::from(aggregate.direct_argument_count);
+        let values = arena
+            .alloc_slice_with(count, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        for (value, expression) in values.iter_mut().zip(&args[..count]) {
+            *value = eval_full(expression, arena, params, row, hooks)?;
         }
+        self.custom_direct = values;
         self.custom_direct_initialized = true;
         Ok(())
     }
@@ -661,7 +665,7 @@ impl<'a> AggState<'a> {
                         name
                     ));
                 }
-                self.custom = Some(aggregate);
+                self.custom = Some(arena.alloc(aggregate).map_err(|_| arena_full())?);
             }
         }
         if self.custom.is_none()
@@ -690,7 +694,7 @@ impl<'a> AggState<'a> {
                         name
                     ));
                 }
-                self.custom = Some(aggregate);
+                self.custom = Some(arena.alloc(aggregate).map_err(|_| arena_full())?);
             }
         }
         if let Some(aggregate) = self.custom {
@@ -712,15 +716,18 @@ impl<'a> AggState<'a> {
                         .expect("resolved moving aggregate state type has an OID")
                 });
             let direct_count = usize::from(aggregate.direct_argument_count);
-            self.custom_direct_oids[..direct_count].copy_from_slice(&argument_oids[..direct_count]);
+            self.custom_direct_oids = arena
+                .alloc_slice_copy(&argument_oids[..direct_count])
+                .map_err(|_| arena_full())?;
             let aggregated_count =
                 if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
                     args.len()
                 } else {
                     order_by.len()
                 };
-            self.custom_argument_oids[..aggregated_count]
-                .copy_from_slice(&argument_oids[direct_count..direct_count + aggregated_count]);
+            self.custom_argument_oids = arena
+                .alloc_slice_copy(&argument_oids[direct_count..direct_count + aggregated_count])
+                .map_err(|_| arena_full())?;
             if over.is_some()
                 && (aggregate.final_function.is_some_and(|final_function| {
                     final_function.modify != crate::storage::AggregateFinalModify::ReadOnly

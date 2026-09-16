@@ -9559,6 +9559,36 @@ fn run_with_arena_bytes(
     run_with_guc(engine, budget, sql_text, arena_bytes, &mut guc)
 }
 
+fn run_with_fixed_memory(
+    engine: &mut Engine,
+    budget: &Budget,
+    sql_text: &str,
+    arena_bytes: usize,
+) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let mut buffer = crate::mem::FixedBuf::new(&mut request_budget, "send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut request_budget, "sql", arena_bytes).unwrap();
+    let mut txn = TxnState::new(&mut request_budget, 1024).unwrap();
+    let mut pool = test_pool(&mut request_budget);
+    let mut cursors = test_cursors(&mut request_budget);
+    let mut guc = GucState::new();
+    let mut responder = Responder::new(&mut buffer);
+    crate::mem::guard::forbid_alloc(|| {
+        engine.execute_simple(
+            sql_text,
+            &arena,
+            &mut txn,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut responder,
+            1,
+        )
+    })
+    .unwrap();
+    buffer.readable().to_vec()
+}
+
 fn assert_cold_pax_query(
     config: &Config,
     sql_text: &str,
@@ -30831,7 +30861,7 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
            'BEGIN
               INSERT INTO trigger_context_audit VALUES
                 (TG_NAME, TG_WHEN, TG_LEVEL, TG_OP, TG_RELID, TG_TABLE_NAME,
-                 TG_TABLE_SCHEMA, TG_NARGS, TG_ARGV[1], TG_ARGV[2], TG_RELNAME,
+                 TG_TABLE_SCHEMA, TG_NARGS, TG_ARGV[0], TG_ARGV[1], TG_RELNAME,
                  TG_TABLESPACE IS NOT NULL);
               RETURN NEW;
             END';
@@ -30839,8 +30869,8 @@ fn trigger_invocation_context_exposes_typed_postgres_variables() {
          INSERT INTO trigger_context_conflict VALUES ('first');
          CREATE FUNCTION trigger_context_nested_function() RETURNS trigger LANGUAGE plpgsql AS
            'BEGIN
-              INSERT INTO trigger_context_conflict VALUES (TG_ARGV[1])
-                ON CONFLICT (value) DO UPDATE SET value = TG_ARGV[2];
+              INSERT INTO trigger_context_conflict VALUES (TG_ARGV[0])
+                ON CONFLICT (value) DO UPDATE SET value = TG_ARGV[1];
               RETURN NEW;
             END';
          CREATE TRIGGER trigger_context_name BEFORE INSERT
@@ -31824,7 +31854,7 @@ fn trigger_arguments_survive_checkpoint_and_recovery() {
         "CREATE TABLE durable_trigger_argument_target (id integer PRIMARY KEY);
          CREATE TABLE durable_trigger_argument_audit (value text);
          CREATE FUNCTION durable_trigger_argument_function() RETURNS trigger LANGUAGE plpgsql AS
-           'BEGIN INSERT INTO durable_trigger_argument_audit VALUES (TG_ARGV[1]); RETURN NEW; END';
+           'BEGIN INSERT INTO durable_trigger_argument_audit VALUES (TG_ARGV[0]); RETURN NEW; END';
          CREATE TRIGGER durable_trigger_argument_name BEFORE INSERT
            ON durable_trigger_argument_target FOR EACH ROW
            EXECUTE FUNCTION durable_trigger_argument_function('recovered');",
@@ -49448,6 +49478,434 @@ fn configured_user_type_capacities_cover_ddl_catalogs_spill_and_object_cold_reco
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn startup_sized_policy_catalog_executes_above_old_cluster_and_table_bounds() {
+    use core::fmt::Write as _;
+    const CAPACITY: usize = 1025;
+    let mut config = test_config("policy-catalog-capacity");
+    config.max_tables = 1;
+    config.table_rows = 4;
+    config.max_policies = CAPACITY;
+    config.max_routines = 1;
+    config.max_triggers = 1;
+    config.wal_buffer_bytes = 4 << 20;
+    config.wal_upload_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 8 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("policy-catalog-capacity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = Budget::new(512 << 20);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE policy_capacity_target (v integer); INSERT INTO policy_capacity_target VALUES (1),(2);\
+         CREATE ROLE policy_capacity_client; GRANT ALL ON policy_capacity_target TO policy_capacity_client;\
+         ALTER TABLE policy_capacity_target ENABLE ROW LEVEL SECURITY;\
+         CREATE POLICY policy_capacity_allow ON policy_capacity_target USING (true)",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let mut definitions = String::new();
+    for start in (1..CAPACITY).step_by(32) {
+        definitions.clear();
+        for slot in start..(start + 32).min(CAPACITY) {
+            write!(
+                definitions,
+                "CREATE POLICY policy_capacity_{slot} ON policy_capacity_target \
+                AS RESTRICTIVE USING (v < {}) WITH CHECK (v < {});",
+                if slot == CAPACITY - 1 { 2 } else { 100 },
+                if slot == CAPACITY - 1 { 2 } else { 100 }
+            )
+            .unwrap();
+        }
+        // Separate bounded transactions exercise every startup slot without
+        // pretending that statement-list and transaction limits disappeared.
+        let output = run_with_arena_bytes(&mut engine, &mut budget, &definitions, 8 << 20);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{start}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE POLICY policy_capacity_overflow ON policy_capacity_target USING (true)",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("54000"));
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_policy; SET ROLE policy_capacity_client;\
+         SELECT v FROM policy_capacity_target; RESET ROLE",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1025", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(512 << 20);
+    let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+    let output = run_with_arena_bytes(
+        &mut recovered,
+        &mut cold_budget,
+        "SELECT count(*) FROM pg_policy; SET ROLE policy_capacity_client;\
+         SELECT v FROM policy_capacity_target; RESET ROLE",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1025", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    // The in-process object fixture allocates request bookkeeping. Warm its
+    // cold block before separately guarding the engine's complete query path.
+    let guarded = run_with_fixed_memory(
+        &mut recovered,
+        &cold_budget,
+        "SELECT count(*) FROM pg_policy; SET ROLE policy_capacity_client;\
+         SELECT v FROM policy_capacity_target; RESET ROLE",
+        32 << 20,
+    );
+    assert_eq!(data_rows(&guarded), ["1025", "1"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn routine_setting_values_and_reset_values_share_one_bounded_definition() {
+    let guc = GucState::new();
+    let configurations = [
+        crate::storage::RoutineConfig {
+            name: crate::storage::SqlName::parse("xmloption").unwrap(),
+            value: crate::util::StackStr::from_str("document"),
+        },
+        crate::storage::RoutineConfig {
+            name: crate::storage::SqlName::parse("standard_conforming_strings").unwrap(),
+            value: crate::util::StackStr::from_str("on"),
+        },
+    ];
+    crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            guc.canonical_routine_setting("standard_conforming_strings", "on")
+                .unwrap()
+                .as_str(),
+            "on"
+        );
+        assert_eq!(
+            guc.canonical_routine_setting("xmloption", "document")
+                .unwrap()
+                .as_str(),
+            "document"
+        );
+        let scope = guc.enter_routine_configs(&configurations).unwrap();
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "document");
+        assert_eq!(guc.reset_owned("xmloption").unwrap().as_str(), "content");
+        assert_eq!(
+            guc.get_owned("standard_conforming_strings")
+                .unwrap()
+                .as_str(),
+            "on"
+        );
+        assert_eq!(
+            guc.reset_owned("standard_conforming_strings")
+                .unwrap()
+                .as_str(),
+            "on"
+        );
+        drop(scope);
+        assert_eq!(guc.get_owned("xmloption").unwrap().as_str(), "content");
+    });
+}
+
+#[test]
+fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    const WIDTH: usize = crate::sql::parser::MAX_LIST;
+    const POLICIES: usize = 40;
+    let mut config = test_config("wide-callable-policy");
+    config.max_tables = 2;
+    config.table_rows = 8;
+    config.max_routines = 4;
+    config.max_triggers = 1;
+    config.max_policies = POLICIES;
+    config.max_roles = WIDTH + 2;
+    config.wal_buffer_bytes = 8 << 20;
+    config.wal_upload_buffer_bytes = 8 << 20;
+    config.checkpoint_manifest_bytes = 8 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("wide-callable-policy-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = Budget::new(512 << 20);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    let mut definition = String::from("CREATE FUNCTION wide_arguments(");
+    for argument in 0..WIDTH {
+        if argument != 0 {
+            definition.push(',');
+        }
+        write!(definition, "a{argument} integer DEFAULT 1000000").unwrap();
+    }
+    definition.push_str(") RETURNS integer LANGUAGE SQL AS 'SELECT $1 + $64';");
+    definition.push_str("CREATE FUNCTION wide_result() RETURNS TABLE (");
+    for field in 0..WIDTH {
+        if field != 0 {
+            definition.push(',');
+        }
+        write!(definition, "f{field} integer").unwrap();
+    }
+    definition.push_str(") LANGUAGE SQL AS 'SELECT ");
+    for field in 0..WIDTH {
+        if field != 0 {
+            definition.push(',');
+        }
+        write!(definition, "{field}").unwrap();
+    }
+    definition.push_str("';CREATE TABLE wide_trigger_audit (n integer, first text, last text);\
+        CREATE TABLE wide_policy_target (v integer);\
+        CREATE FUNCTION wide_trigger_function() RETURNS trigger LANGUAGE plpgsql AS \
+        'BEGIN INSERT INTO wide_trigger_audit VALUES (TG_NARGS, TG_ARGV[0], TG_ARGV[63]); RETURN NEW; END';\
+        CREATE TRIGGER wide_trigger BEFORE INSERT ON wide_policy_target \
+        FOR EACH ROW EXECUTE FUNCTION wide_trigger_function(");
+    for argument in 0..WIDTH {
+        if argument != 0 {
+            definition.push(',');
+        }
+        write!(definition, "'argument_{argument}'").unwrap();
+    }
+    definition.push_str(");INSERT INTO wide_policy_target VALUES (1),(2),(3);");
+    definition.push_str("CREATE FUNCTION wide_settings() RETURNS text LANGUAGE SQL SET application_name TO 'wide_settings' SET search_path TO 'public' SET DateStyle TO 'ISO, MDY' SET IntervalStyle TO 'postgres' SET TimeZone TO 'UTC' SET client_encoding TO 'UTF8' SET client_min_messages TO 'notice' SET extra_float_digits TO '1' SET lock_timeout TO '0' SET statement_timeout TO '0' SET row_security TO 'on' SET bytea_output TO 'hex' SET check_function_bodies TO 'on' SET default_transaction_isolation TO 'read committed' SET default_transaction_read_only TO 'off' SET default_transaction_deferrable TO 'off' SET standard_conforming_strings TO 'on' SET xmloption TO 'content' AS 'SELECT current_setting(''application_name'')';");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &definition, 32 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    definition.clear();
+    for role in 0..WIDTH {
+        write!(definition, "CREATE ROLE wide_policy_role_{role};").unwrap();
+    }
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &definition, 8 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    definition.clear();
+    definition.push_str(
+        "GRANT ALL ON wide_policy_target TO wide_policy_role_0;\
+        CREATE POLICY wide_allow ON wide_policy_target TO ",
+    );
+    for role in 0..WIDTH {
+        if role != 0 {
+            definition.push(',');
+        }
+        write!(definition, "wide_policy_role_{role}").unwrap();
+    }
+    definition.push_str(" USING (v > 0) WITH CHECK (v > 0);");
+    for policy in 1..POLICIES {
+        write!(
+            definition,
+            "CREATE POLICY wide_restrict_{policy} ON wide_policy_target \
+            AS RESTRICTIVE USING (v < {}) WITH CHECK (v < {});",
+            if policy == POLICIES - 1 { 3 } else { 100 },
+            if policy == POLICIES - 1 { 3 } else { 100 }
+        )
+        .unwrap();
+    }
+    definition.push_str("ALTER TABLE wide_policy_target ENABLE ROW LEVEL SECURITY;");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &definition, 32 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    for overflow in [
+        format!(
+            "CREATE FUNCTION wide_arguments_overflow({}) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            (0..=WIDTH)
+                .map(|index| format!("a{index} integer"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        format!(
+            "CREATE FUNCTION wide_result_overflow() RETURNS TABLE ({}) LANGUAGE SQL AS 'SELECT 1'",
+            (0..=WIDTH)
+                .map(|index| format!("f{index} integer"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        format!(
+            "CREATE TRIGGER wide_trigger_overflow BEFORE INSERT ON wide_policy_target FOR EACH ROW EXECUTE FUNCTION wide_trigger_function({})",
+            vec!["'argument'"; WIDTH + 1].join(",")
+        ),
+        format!(
+            "ALTER POLICY wide_allow ON wide_policy_target TO {}",
+            vec!["wide_policy_role_0"; WIDTH + 1].join(",")
+        ),
+    ] {
+        let observed = run_with_arena_bytes(&mut engine, &mut budget, &overflow, 8 << 20);
+        assert!(
+            String::from_utf8_lossy(&observed).contains("54000"),
+            "{overflow}: {}",
+            String::from_utf8_lossy(&observed)
+        );
+    }
+
+    let mut call = String::from("SELECT wide_arguments(");
+    for argument in 0..WIDTH {
+        if argument != 0 {
+            call.push(',');
+        }
+        write!(call, "{argument}").unwrap();
+    }
+    call.push(')');
+    for (query, expected) in [
+        (call.as_str(), "63"),
+        ("SELECT wide_arguments()", "2000000"),
+        (
+            "SELECT wide_settings(), current_setting('application_name')",
+            "wide_settings|",
+        ),
+        (
+            "SELECT cardinality(proconfig) FROM pg_proc WHERE proname = 'wide_settings'",
+            "18",
+        ),
+        ("SELECT f0, f63 FROM wide_result()", "0|63"),
+        (
+            "SELECT cardinality(proallargtypes), cardinality(proargmodes), cardinality(proargnames), proargmodes[1], proargmodes[64] FROM pg_proc WHERE proname = 'wide_result'",
+            "64|64|64|t|t",
+        ),
+        (
+            "SELECT n, first, last FROM wide_trigger_audit LIMIT 1",
+            "64|argument_0|argument_63",
+        ),
+        (
+            "SELECT pronargs, pronargdefaults FROM pg_proc WHERE proname = 'wide_arguments'",
+            "64|64",
+        ),
+        (
+            "SELECT cardinality(polroles) FROM pg_policy WHERE polname = 'wide_allow'",
+            "64",
+        ),
+        ("SELECT count(*) FROM pg_policy", "40"),
+        (
+            "SET ROLE wide_policy_role_0; SELECT count(*) FROM wide_policy_target; RESET ROLE",
+            "2",
+        ),
+    ] {
+        let observed = run_with_fixed_memory(&mut engine, &budget, query, 8 << 20);
+        assert_eq!(
+            data_rows(&observed),
+            [expected],
+            "{query}: {}",
+            String::from_utf8_lossy(&observed)
+        );
+    }
+    for (query, state) in [
+        (
+            "CREATE POLICY wide_overflow ON wide_policy_target USING (true)",
+            "54000",
+        ),
+        (
+            "SET ROLE wide_policy_role_0; UPDATE wide_policy_target SET v = v + 10",
+            "42501",
+        ),
+    ] {
+        let observed = run_with(&mut engine, &mut budget, query);
+        assert!(
+            String::from_utf8_lossy(&observed).contains(state),
+            "{query}: {}",
+            String::from_utf8_lossy(&observed)
+        );
+        run_with(&mut engine, &mut budget, "RESET ROLE");
+    }
+    let observed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER POLICY wide_restrict_39 ON wide_policy_target USING (false); ROLLBACK;\
+         DROP POLICY wide_restrict_1 ON wide_policy_target",
+    );
+    assert!(
+        !message_types(&observed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&observed)
+    );
+    let observed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE POLICY wide_replacement ON wide_policy_target AS RESTRICTIVE USING (v < 100)",
+    );
+    assert!(
+        !message_types(&observed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&observed)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    // Replay the complete definitions before checkpointing, then recover with
+    // neither cache tier present. Both durable representations must agree.
+    let mut replay_budget = Budget::new(512 << 20);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT wide_arguments()"
+        )),
+        ["2000000"]
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(512 << 20);
+    let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+    let observed = run_with_arena_bytes(
+        &mut recovered,
+        &mut cold_budget,
+        "SELECT wide_arguments(); SELECT f0, f63 FROM wide_result(); SELECT wide_settings();\
+         SELECT cardinality(polroles) FROM pg_policy WHERE polname = 'wide_allow';\
+         SET ROLE wide_policy_role_0; SELECT count(*) FROM wide_policy_target; RESET ROLE;\
+         INSERT INTO wide_policy_target VALUES (4);\
+         SELECT n, first, last FROM wide_trigger_audit WHERE n = 64 LIMIT 1",
+        16 << 20,
+    );
+    assert_eq!(
+        data_rows(&observed),
+        [
+            "2000000",
+            "0|63",
+            "wide_settings",
+            "64",
+            "2",
+            "64|argument_0|argument_63"
+        ],
+        "{}",
+        String::from_utf8_lossy(&observed)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 }
 
 #[test]

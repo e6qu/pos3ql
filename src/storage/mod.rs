@@ -99,7 +99,7 @@ impl PublicationFilters {
 /// state, rather than an unbounded connection-side string.
 pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = 16;
 pub(crate) const SUBSCRIPTION_CONNINFO_BYTES: usize = 512;
-pub(crate) const MAX_TRIGGER_ARGUMENTS: usize = 16;
+pub(crate) const MAX_TRIGGER_ARGUMENTS: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const TRIGGER_ARGUMENT_BYTES: usize = u8::MAX as usize;
 pub(crate) const LARGE_OBJECT_BLOCK_SIZE: usize = 2_048;
 pub(crate) const INTERNAL_LARGE_OBJECT_SCHEMA: &str = "pos3ql_internal";
@@ -5442,7 +5442,7 @@ fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<
 /// Stored SQL routines share the table-sized catalog budget.  They are not
 /// executable closures: every durable definition is a bounded, replayable SQL
 /// identity and body.
-pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = 16;
+pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
 pub(crate) const ROUTINE_DEFAULT_MAX: usize = DEFAULT_EXPR_MAX;
 pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
@@ -5453,8 +5453,7 @@ pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 /// runtime allocation: its target and function are stable catalog slots.
 pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
 pub(crate) const POLICY_OID_BASE: i32 = 180_000;
-pub(crate) const MAX_POLICIES_PER_TABLE: usize = 8;
-pub(crate) const MAX_POLICY_ROLES: usize = 8;
+pub(crate) const MAX_POLICY_ROLES: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 
 pub(crate) fn trigger_oid(trigger: &TriggerDef) -> i32 {
@@ -6377,7 +6376,7 @@ impl RoutineLanguage {
     }
 }
 
-pub(crate) const MAX_ROUTINE_CONFIGS: usize = 16;
+pub(crate) const MAX_ROUTINE_CONFIGS: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const ROUTINE_CONFIG_VALUE_MAX: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14131,7 +14130,7 @@ impl Storage {
             + config.max_operator_classes * size_of::<OperatorClassDef>()
             + config.max_triggers
                 * (size_of::<TriggerDef>() + config.max_tables * size_of::<PartitionTriggerState>())
-            + config.max_tables * MAX_POLICIES_PER_TABLE * size_of::<PolicyDef>()
+            + config.max_policies * size_of::<PolicyDef>()
             + config.max_tables
                 * MAX_EXTENDED_STATISTICS_PER_TABLE
                 * size_of::<ExtendedStatisticsDef>()
@@ -14534,7 +14533,7 @@ impl Storage {
                 .push(PartitionTriggerState::EMPTY)
                 .expect("sized to trigger-table pairs");
         }
-        let policy_capacity = config.max_tables * MAX_POLICIES_PER_TABLE;
+        let policy_capacity = config.max_policies;
         let mut policies = FixedVec::new(budget, "policies", policy_capacity)?;
         for _ in 0..policy_capacity {
             policies
@@ -33845,6 +33844,10 @@ impl Storage {
     ) -> Option<i32> {
         let result = match routine.kind {
             RoutineKind::Function { result } | RoutineKind::SetFunction { result } => result,
+            RoutineKind::TableFunction if routine.result_column_count == 1 => {
+                let column = routine.result_columns[0];
+                return self.routine_type_oid(column.ctype, column.user_type, txid);
+            }
             RoutineKind::RecordFunction { .. } | RoutineKind::TableFunction => {
                 return Some(crate::sql::types::oid::RECORD);
             }
@@ -35261,13 +35264,6 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        if self.policies_for_table(spec.table, txid).count() == MAX_POLICIES_PER_TABLE {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "table has too many policies (limit {})",
-                MAX_POLICIES_PER_TABLE
-            ));
-        }
         let Some(slot) = self
             .policies
             .iter()
@@ -35457,6 +35453,34 @@ impl Storage {
     ) -> impl Iterator<Item = (usize, TriggerDef)> + '_ {
         self.triggers_with_slots_visible_to(txid)
             .filter(move |(_, trigger)| trigger.target == target)
+    }
+
+    pub(crate) fn trigger_metadata_for_target(
+        &self,
+        target: TriggerTarget,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &TriggerDef)> + '_ {
+        self.triggers
+            .iter()
+            .enumerate()
+            .filter(move |(_, trigger)| {
+                trigger.database == self.current_database
+                    && trigger.visible_to(txid)
+                    && trigger.target == target
+            })
+    }
+
+    pub(crate) fn trigger_for_target(
+        &self,
+        slot: usize,
+        target: TriggerTarget,
+        txid: u32,
+    ) -> Option<TriggerDef> {
+        let trigger = self.triggers.get(slot)?;
+        (trigger.database == self.current_database
+            && trigger.visible_to(txid)
+            && trigger.target == target)
+            .then(|| trigger.effective_to(txid))
     }
 
     pub(crate) fn triggers_with_slots_visible_to(

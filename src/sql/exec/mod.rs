@@ -14729,9 +14729,19 @@ impl<'a> TriggerInvocation<'a> {
                     .map_err(|_| super::query::arena_full_pub())?,
             );
         }
-        let argv = Datum::Array {
-            element: ArrElem::Text,
-            raw: crate::sql::array::build(&arguments[..trigger.arguments.values().len()], arena)?,
+        let count = trigger.arguments.values().len();
+        let argv = if count == 0 {
+            Datum::Null
+        } else {
+            // PostgreSQL trigger arguments are zero-based, unlike ordinary arrays.
+            Datum::Array {
+                element: ArrElem::Text,
+                raw: crate::sql::array::build_shaped(
+                    &arguments[..count],
+                    crate::sql::array::Shape::new(&[count], &[0])?,
+                    arena,
+                )?,
+            }
         };
         let operation = match event {
             TriggerEvents::INSERT => "INSERT",
@@ -22890,15 +22900,18 @@ fn execute_trigger_block<'a>(
     exception: Option<&TriggerExceptionDiagnostic<'_>>,
 ) -> Result<Option<TriggerFlow<'a>>, SqlError> {
     for statement in block.statements {
-        match *statement {
-            TriggerStatement::Null => {}
-            TriggerStatement::TransactionControl(command) => context.host.transaction_control(
-                command,
-                context.txn,
-                context.arena,
-                context.responder,
-            )?,
-            TriggerStatement::ReturnNext(expression) => {
+        let flow = match *statement {
+            TriggerStatement::Null => execute_trigger_statement(|| Ok(None)),
+            TriggerStatement::TransactionControl(command) => execute_trigger_statement(|| {
+                context.host.transaction_control(
+                    command,
+                    context.txn,
+                    context.arena,
+                    context.responder,
+                )?;
+                Ok(None)
+            }),
+            TriggerStatement::ReturnNext(expression) => execute_trigger_statement(|| {
                 let mut values = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
                 let count = match expression {
                     Some(expression) => {
@@ -22949,8 +22962,10 @@ fn execute_trigger_block<'a>(
                     }
                 };
                 status.emit_set_row(&values[..count], context.arena)?;
-            }
-            TriggerStatement::ReturnQuery(query) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::ReturnQuery(query) => execute_trigger_statement(|| {
                 let query = match transition_relations {
                     Some(relations) => super::query::bind_materialized_relations(
                         query,
@@ -23000,8 +23015,10 @@ fn execute_trigger_block<'a>(
                         status.emit_set_row(&detached[..values.len()], context.arena)
                     },
                 )?;
-            }
-            TriggerStatement::ReturnDynamicQuery(query) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::ReturnDynamicQuery(query) => execute_trigger_statement(|| {
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -23032,8 +23049,10 @@ fn execute_trigger_block<'a>(
                     }
                     status.emit_set_row(&detached[..values.len()], context.arena)
                 })?;
-            }
-            TriggerStatement::Return(result) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::Return(result) => execute_trigger_statement(|| {
                 let result = match result {
                     TriggerReturn::New => TriggerReturnValue::New,
                     TriggerReturn::Old => TriggerReturnValue::Old,
@@ -23057,9 +23076,9 @@ fn execute_trigger_block<'a>(
                         )?)
                     }
                 };
-                return Ok(Some(TriggerFlow::Return(result)));
-            }
-            TriggerStatement::Assign(assignment) => {
+                Ok(Some(TriggerFlow::Return(result)))
+            }),
+            TriggerStatement::Assign(assignment) => execute_trigger_statement(|| {
                 if !before || new.is_none() {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
@@ -23101,8 +23120,10 @@ fn execute_trigger_block<'a>(
                     context.arena,
                 )?;
                 new.as_deref_mut().expect("checked NEW image")[column] = value;
-            }
-            TriggerStatement::LocalAssign(assignment) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::LocalAssign(assignment) => execute_trigger_statement(|| {
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -23129,8 +23150,10 @@ fn execute_trigger_block<'a>(
                 } else {
                     assign_trigger_local(context, locals, local_values, assignment.name, value)?;
                 }
-            }
-            TriggerStatement::CursorOpen(statement) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::CursorOpen(statement) => execute_trigger_statement(|| {
                 let local = trigger_local_index(locals, statement.variable)?;
                 if locals[local].ctype != ColType::Refcursor {
                     return Err(sql_err!(
@@ -23249,8 +23272,10 @@ fn execute_trigger_block<'a>(
                     Datum::Text(name),
                 )?;
                 status.assign_output_local(local, local_values[local]);
-            }
-            TriggerStatement::CursorMotion(statement) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::CursorMotion(statement) => execute_trigger_statement(|| {
                 let local = trigger_local_index(locals, statement.variable)?;
                 if locals[local].ctype != ColType::Refcursor {
                     return Err(sql_err!(
@@ -23412,8 +23437,10 @@ fn execute_trigger_block<'a>(
                     }
                 }
                 status.set_rows(count as u64)?;
-            }
-            TriggerStatement::CursorClose(variable) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::CursorClose(variable) => execute_trigger_statement(|| {
                 let local = trigger_local_index(locals, variable)?;
                 if locals[local].ctype != ColType::Refcursor {
                     return Err(sql_err!(
@@ -23442,8 +23469,10 @@ fn execute_trigger_block<'a>(
                         name
                     ));
                 }
-            }
-            TriggerStatement::LoopControl(control) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::LoopControl(control) => execute_trigger_statement(|| {
                 let (condition, unwind) = match control {
                     TriggerLoopControl::Exit { condition, unwind }
                     | TriggerLoopControl::Continue { condition, unwind } => (condition, unwind),
@@ -23468,8 +23497,10 @@ fn execute_trigger_block<'a>(
                         TriggerLoopControl::Continue { .. } => TriggerFlow::Continue(unwind),
                     }));
                 }
-            }
-            TriggerStatement::SelectInto(statement) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::SelectInto(statement) => execute_trigger_statement(|| {
                 let mut targets = [0usize; MAX_COLUMNS];
                 for (index, target) in statement.targets.iter().enumerate() {
                     let Some(local) = locals.iter().position(|local| local.name == *target) else {
@@ -23611,8 +23642,10 @@ fn execute_trigger_block<'a>(
                         selected[index],
                     )?;
                 }
-            }
-            TriggerStatement::DynamicSelectInto(statement) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::DynamicSelectInto(statement) => execute_trigger_statement(|| {
                 let mut targets = [0usize; MAX_COLUMNS];
                 for (index, target) in statement.targets.iter().enumerate() {
                     let Some(local) = locals.iter().position(|local| local.name == *target) else {
@@ -23875,8 +23908,10 @@ fn execute_trigger_block<'a>(
                         selected[index],
                     )?;
                 }
-            }
-            TriggerStatement::DynamicQuery(query) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::DynamicQuery(query) => execute_trigger_statement(|| {
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -23945,8 +23980,10 @@ fn execute_trigger_block<'a>(
                     }
                 };
                 status.set_row_count(row_count)?;
-            }
-            TriggerStatement::Perform(query) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::Perform(query) => execute_trigger_statement(|| {
                 let query = match transition_relations {
                     Some(relations) => super::query::bind_materialized_relations(
                         query,
@@ -23989,8 +24026,10 @@ fn execute_trigger_block<'a>(
                     },
                 )?;
                 status.set_rows(row_count)?;
-            }
-            TriggerStatement::Assert(assertion) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::Assert(assertion) => execute_trigger_statement(|| {
                 if trigger_condition(
                     context,
                     assertion.condition,
@@ -24002,7 +24041,7 @@ fn execute_trigger_block<'a>(
                     &local_values[..locals.len()],
                     status.found,
                 )? {
-                    continue;
+                    return Ok(None);
                 }
                 let transition = TriggerTransition {
                     definition,
@@ -24027,9 +24066,9 @@ fn execute_trigger_block<'a>(
                     }
                     None => stack_format!(192, "assertion failed"),
                 };
-                return Err(sql_err!(sqlstate::ASSERT_FAILURE, "{}", message.as_str()));
-            }
-            TriggerStatement::Raise(TriggerRaise::Rethrow) => {
+                Err(sql_err!(sqlstate::ASSERT_FAILURE, "{}", message.as_str()))
+            }),
+            TriggerStatement::Raise(TriggerRaise::Rethrow) => execute_trigger_statement(|| {
                 let exception =
                     exception.expect("bare RAISE is parsed only in an exception handler");
                 if exception.detail.is_some() || exception.hint.is_some() {
@@ -24038,39 +24077,43 @@ fn execute_trigger_block<'a>(
                         exception.hint.map(StackStr::from_str),
                     );
                 }
-                return Err(SqlError {
+                Err(SqlError {
                     sqlstate: exception.sqlstate,
                     message: StackStr::from_str(exception.message),
-                });
-            }
+                })
+            }),
             TriggerStatement::Raise(TriggerRaise::Message(raise)) => {
-                let transition = TriggerTransition {
-                    definition,
-                    old,
-                    new: new.as_deref(),
-                };
-                let scope = TriggerLocalScope {
-                    locals,
-                    values: &local_values[..locals.len()],
-                    found: status.found,
-                    invocation,
-                    transition: &transition,
-                };
-                let sqlstate = trigger_raise_sqlstate(raise.sqlstate, context, &scope)?;
-                let message = match raise.message {
-                    Some(message) => trigger_diagnostic_text::<192>(message, context, &scope)?,
-                    None if raise.default_message.is_some() => {
-                        stack_format!(192, "{}", raise.default_message.expect("default message"))
-                    }
-                    None => match raise.format {
-                        Some(format) => {
-                            trigger_format_message(format, raise.arguments, context, &scope)?
+                execute_trigger_statement(|| {
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let sqlstate = trigger_raise_sqlstate(raise.sqlstate, context, &scope)?;
+                    let message = match raise.message {
+                        Some(message) => trigger_diagnostic_text::<192>(message, context, &scope)?,
+                        None if raise.default_message.is_some() => {
+                            stack_format!(
+                                192,
+                                "{}",
+                                raise.default_message.expect("default message")
+                            )
                         }
-                        None => stack_format!(192, "{}", sqlstate.as_str()),
-                    },
-                };
-                let detail =
-                    raise
+                        None => match raise.format {
+                            Some(format) => {
+                                trigger_format_message(format, raise.arguments, context, &scope)?
+                            }
+                            None => stack_format!(192, "{}", sqlstate.as_str()),
+                        },
+                    };
+                    let detail = raise
                         .detail
                         .map(|detail| {
                             trigger_diagnostic_text::<
@@ -24078,40 +24121,43 @@ fn execute_trigger_block<'a>(
                             >(detail, context, &scope)
                         })
                         .transpose()?;
-                let hint = raise
-                    .hint
-                    .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope))
-                    .transpose()?;
-                if detail.is_some() || hint.is_some() {
-                    crate::sql::eval::stash_diagnostic(detail.unwrap_or_default(), hint);
-                }
-                match raise.level {
-                    TriggerRaiseLevel::Debug => context
-                        .responder
-                        .debug(sqlstate, message.as_str())
-                        .map_err(trigger_notice_to_sql)?,
-                    TriggerRaiseLevel::Log => context
-                        .responder
-                        .log(sqlstate, message.as_str())
-                        .map_err(trigger_notice_to_sql)?,
-                    TriggerRaiseLevel::Info => context
-                        .responder
-                        .info(sqlstate, message.as_str())
-                        .map_err(trigger_notice_to_sql)?,
-                    TriggerRaiseLevel::Exception => {
-                        return Err(SqlError { sqlstate, message });
+                    let hint = raise
+                        .hint
+                        .map(|hint| trigger_diagnostic_text::<128>(hint, context, &scope))
+                        .transpose()?;
+                    if detail.is_some() || hint.is_some() {
+                        crate::sql::eval::stash_diagnostic(detail.unwrap_or_default(), hint);
                     }
-                    TriggerRaiseLevel::Warning => context
-                        .responder
-                        .warning(sqlstate, message.as_str())
-                        .map_err(trigger_notice_to_sql)?,
-                    TriggerRaiseLevel::Notice => context
-                        .responder
-                        .notice(sqlstate, message.as_str())
-                        .map_err(trigger_notice_to_sql)?,
-                }
+                    match raise.level {
+                        TriggerRaiseLevel::Debug => context
+                            .responder
+                            .debug(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Log => context
+                            .responder
+                            .log(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Info => context
+                            .responder
+                            .info(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Exception => {
+                            return Err(SqlError { sqlstate, message });
+                        }
+                        TriggerRaiseLevel::Warning => context
+                            .responder
+                            .warning(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                        TriggerRaiseLevel::Notice => context
+                            .responder
+                            .notice(sqlstate, message.as_str())
+                            .map_err(trigger_notice_to_sql)?,
+                    }
+
+                    Ok(None)
+                })
             }
-            TriggerStatement::GetDiagnostics(statement) => {
+            TriggerStatement::GetDiagnostics(statement) => execute_trigger_statement(|| {
                 for assignment in statement.assignments {
                     let value = match assignment.item {
                         TriggerDiagnostic::RowCount => Datum::Int8(status.row_count),
@@ -24128,8 +24174,10 @@ fn execute_trigger_block<'a>(
                     };
                     assign_trigger_local(context, locals, local_values, assignment.target, value)?;
                 }
-            }
-            TriggerStatement::GetStackedDiagnostics(statement) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::GetStackedDiagnostics(statement) => execute_trigger_statement(|| {
                 let Some(exception) = exception else {
                     return Err(sql_err!(
                         sqlstate::STACKED_DIAGNOSTICS_ACCESSED_WITHOUT_ACTIVE_HANDLER,
@@ -24163,8 +24211,10 @@ fn execute_trigger_block<'a>(
                         .unwrap_or(Datum::Null);
                     assign_trigger_local(context, locals, local_values, assignment.target, value)?;
                 }
-            }
-            TriggerStatement::Exception(exception_block) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::Exception(exception_block) => execute_trigger_statement(|| {
                 context
                     .txn
                     .savepoint("__trigger_exception__", 0, context.storage().lock_mark())?;
@@ -24255,297 +24305,319 @@ fn execute_trigger_block<'a>(
                         }
                     }
                 }
-            }
+
+                Ok(None)
+            }),
             TriggerStatement::Dml(TriggerDml::Insert(statement)) => {
-                let transition = TriggerTransition {
-                    definition,
-                    old,
-                    new: new.as_deref(),
-                };
-                let scope = TriggerLocalScope {
-                    locals,
-                    values: &local_values[..locals.len()],
-                    found: status.found,
-                    invocation,
-                    transition: &transition,
-                };
-                let prepared_select = match statement.select {
-                    Some(select) => {
-                        let select = match transition_relations {
-                            Some(relations) => super::query::bind_materialized_relations(
-                                select,
-                                relations,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                            )?,
-                            None => select,
-                        };
-                        Some(materialize_trigger_insert_source(
-                            context.storage(),
-                            select,
-                            context.arena,
-                            context.arena,
-                            context.txn.txid,
-                            TriggerQueryExecution {
-                                params: context.params,
-                                seq_session: context.seq_session(),
-                            },
-                            &scope,
-                        )?)
-                    }
-                    None => None,
-                };
-                let conflict_scope = match statement.on_conflict {
-                    Some(_) => Some(snapshot_trigger_dml_scope(
+                execute_trigger_statement(|| {
+                    let transition = TriggerTransition {
                         definition,
-                        locals,
-                        &local_values[..locals.len()],
-                        invocation,
                         old,
-                        new.as_deref(),
-                        context.arena,
-                    )?),
-                    None => None,
-                };
-                let arena = context.arena;
-                let params = context.params;
-                let (storage, txn, scratch, responder, seq_session) =
-                    context.dml_parts_with_sequence();
-                let scratch = unsafe { &mut *scratch };
-                txn.enter_trigger_sql()?;
-                responder.clear_affected_rows();
-                let outcome = responder.without_command_complete(|responder| {
-                    insert(
-                        storage,
-                        txn,
-                        scratch,
-                        &statement,
-                        DmlAuthorization::Invoker,
-                        None,
-                        arena,
-                        params,
-                        seq_session,
-                        responder,
-                        None,
-                        Some(&scope),
-                        transition_relations,
-                        conflict_scope,
-                        prepared_select
-                            .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
-                    )
-                });
-                txn.leave_trigger_sql();
-                match outcome {
-                    Ok(Ok(())) => status.set_rows(
-                        context
-                            .responder
-                            .take_affected_rows()
-                            .expect("trigger INSERT publishes an affected-row count"),
-                    )?,
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "trigger-side INSERT response exceeded the output buffer"
-                        ));
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let prepared_select = match statement.select {
+                        Some(select) => {
+                            let select = match transition_relations {
+                                Some(relations) => super::query::bind_materialized_relations(
+                                    select,
+                                    relations,
+                                    context.storage(),
+                                    context.txn.txid,
+                                    context.arena,
+                                )?,
+                                None => select,
+                            };
+                            Some(materialize_trigger_insert_source(
+                                context.storage(),
+                                select,
+                                context.arena,
+                                context.arena,
+                                context.txn.txid,
+                                TriggerQueryExecution {
+                                    params: context.params,
+                                    seq_session: context.seq_session(),
+                                },
+                                &scope,
+                            )?)
+                        }
+                        None => None,
+                    };
+                    let conflict_scope = match statement.on_conflict {
+                        Some(_) => Some(snapshot_trigger_dml_scope(
+                            definition,
+                            locals,
+                            &local_values[..locals.len()],
+                            invocation,
+                            old,
+                            new.as_deref(),
+                            context.arena,
+                        )?),
+                        None => None,
+                    };
+                    let arena = context.arena;
+                    let params = context.params;
+                    let (storage, txn, scratch, responder, seq_session) =
+                        context.dml_parts_with_sequence();
+                    let scratch = unsafe { &mut *scratch };
+                    txn.enter_trigger_sql()?;
+                    responder.clear_affected_rows();
+                    let outcome = responder.without_command_complete(|responder| {
+                        insert(
+                            storage,
+                            txn,
+                            scratch,
+                            &statement,
+                            DmlAuthorization::Invoker,
+                            None,
+                            arena,
+                            params,
+                            seq_session,
+                            responder,
+                            None,
+                            Some(&scope),
+                            transition_relations,
+                            conflict_scope,
+                            prepared_select
+                                .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
+                        )
+                    });
+                    txn.leave_trigger_sql();
+                    match outcome {
+                        Ok(Ok(())) => status.set_rows(
+                            context
+                                .responder
+                                .take_affected_rows()
+                                .expect("trigger INSERT publishes an affected-row count"),
+                        )?,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "trigger-side INSERT response exceeded the output buffer"
+                            ));
+                        }
                     }
-                }
+
+                    Ok(None)
+                })
             }
             TriggerStatement::Dml(TriggerDml::Update(statement)) => {
-                let statement = match transition_relations {
-                    Some(relations) => {
-                        let dml = context
+                execute_trigger_statement(|| {
+                    let statement = match transition_relations {
+                        Some(relations) => {
+                            let dml = context
+                                .arena
+                                .alloc(super::ast::Stmt::Update(statement))
+                                .map_err(|_| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "trigger UPDATE expansion exceeds the statement arena"
+                                    )
+                                })?;
+                            let super::ast::Stmt::Update(bound) =
+                                *super::query::bind_dml_materialized_relations(
+                                    dml,
+                                    context.storage(),
+                                    context.txn.txid,
+                                    context.arena,
+                                    context.params,
+                                    relations,
+                                )?
+                            else {
+                                unreachable!(
+                                    "UPDATE expansion returned a different statement kind"
+                                );
+                            };
+                            bound
+                        }
+                        None => statement,
+                    };
+                    let scratch = unsafe { &mut *context.scratch() };
+                    let saved =
+                        context
                             .arena
-                            .alloc(super::ast::Stmt::Update(statement))
+                            .alloc_slice_copy(scratch.as_slice())
                             .map_err(|_| {
                                 sql_err!(
                                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "trigger UPDATE expansion exceeds the statement arena"
+                                    "nested trigger UPDATE exceeds the statement arena"
                                 )
                             })?;
-                        let super::ast::Stmt::Update(bound) =
-                            *super::query::bind_dml_materialized_relations(
-                                dml,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                                context.params,
-                                relations,
-                            )?
-                        else {
-                            unreachable!("UPDATE expansion returned a different statement kind");
-                        };
-                        bound
-                    }
-                    None => statement,
-                };
-                let scratch = unsafe { &mut *context.scratch() };
-                let saved = context
-                    .arena
-                    .alloc_slice_copy(scratch.as_slice())
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "nested trigger UPDATE exceeds the statement arena"
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let arena = context.arena;
+                    let params = context.params;
+                    let (storage, txn, _, responder, seq_session) =
+                        context.dml_parts_with_sequence();
+                    txn.enter_trigger_sql()?;
+                    responder.clear_affected_rows();
+                    let outcome = responder.without_command_complete(|responder| {
+                        update(
+                            storage,
+                            txn,
+                            scratch,
+                            &statement,
+                            DmlAuthorization::Invoker,
+                            None,
+                            arena,
+                            params,
+                            seq_session,
+                            responder,
+                            None,
+                            Some(&scope),
                         )
-                    })?;
-                let transition = TriggerTransition {
-                    definition,
-                    old,
-                    new: new.as_deref(),
-                };
-                let scope = TriggerLocalScope {
-                    locals,
-                    values: &local_values[..locals.len()],
-                    found: status.found,
-                    invocation,
-                    transition: &transition,
-                };
-                let arena = context.arena;
-                let params = context.params;
-                let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
-                txn.enter_trigger_sql()?;
-                responder.clear_affected_rows();
-                let outcome = responder.without_command_complete(|responder| {
-                    update(
-                        storage,
-                        txn,
-                        scratch,
-                        &statement,
-                        DmlAuthorization::Invoker,
-                        None,
-                        arena,
-                        params,
-                        seq_session,
-                        responder,
-                        None,
-                        Some(&scope),
-                    )
-                });
-                txn.leave_trigger_sql();
-                scratch.clear();
-                for item in saved.iter().copied() {
-                    scratch.push(item).map_err(|_| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "trigger DML workspace restore failed"
-                        )
-                    })?;
-                }
-                match outcome {
-                    Ok(Ok(())) => status.set_rows(
-                        context
-                            .responder
-                            .take_affected_rows()
-                            .expect("trigger UPDATE publishes an affected-row count"),
-                    )?,
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "trigger-side UPDATE response exceeded the output buffer"
-                        ));
+                    });
+                    txn.leave_trigger_sql();
+                    scratch.clear();
+                    for item in saved.iter().copied() {
+                        scratch.push(item).map_err(|_| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "trigger DML workspace restore failed"
+                            )
+                        })?;
                     }
-                }
+                    match outcome {
+                        Ok(Ok(())) => status.set_rows(
+                            context
+                                .responder
+                                .take_affected_rows()
+                                .expect("trigger UPDATE publishes an affected-row count"),
+                        )?,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "trigger-side UPDATE response exceeded the output buffer"
+                            ));
+                        }
+                    }
+
+                    Ok(None)
+                })
             }
             TriggerStatement::Dml(TriggerDml::Delete(statement)) => {
-                let statement = match transition_relations {
-                    Some(relations) => {
-                        let dml = context
+                execute_trigger_statement(|| {
+                    let statement = match transition_relations {
+                        Some(relations) => {
+                            let dml = context
+                                .arena
+                                .alloc(super::ast::Stmt::Delete(statement))
+                                .map_err(|_| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "trigger DELETE expansion exceeds the statement arena"
+                                    )
+                                })?;
+                            let super::ast::Stmt::Delete(bound) =
+                                *super::query::bind_dml_materialized_relations(
+                                    dml,
+                                    context.storage(),
+                                    context.txn.txid,
+                                    context.arena,
+                                    context.params,
+                                    relations,
+                                )?
+                            else {
+                                unreachable!(
+                                    "DELETE expansion returned a different statement kind"
+                                );
+                            };
+                            bound
+                        }
+                        None => statement,
+                    };
+                    let scratch = unsafe { &mut *context.scratch() };
+                    let saved =
+                        context
                             .arena
-                            .alloc(super::ast::Stmt::Delete(statement))
+                            .alloc_slice_copy(scratch.as_slice())
                             .map_err(|_| {
                                 sql_err!(
                                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "trigger DELETE expansion exceeds the statement arena"
+                                    "nested trigger DELETE exceeds the statement arena"
                                 )
                             })?;
-                        let super::ast::Stmt::Delete(bound) =
-                            *super::query::bind_dml_materialized_relations(
-                                dml,
-                                context.storage(),
-                                context.txn.txid,
-                                context.arena,
-                                context.params,
-                                relations,
-                            )?
-                        else {
-                            unreachable!("DELETE expansion returned a different statement kind");
-                        };
-                        bound
-                    }
-                    None => statement,
-                };
-                let scratch = unsafe { &mut *context.scratch() };
-                let saved = context
-                    .arena
-                    .alloc_slice_copy(scratch.as_slice())
-                    .map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "nested trigger DELETE exceeds the statement arena"
+                    let transition = TriggerTransition {
+                        definition,
+                        old,
+                        new: new.as_deref(),
+                    };
+                    let scope = TriggerLocalScope {
+                        locals,
+                        values: &local_values[..locals.len()],
+                        found: status.found,
+                        invocation,
+                        transition: &transition,
+                    };
+                    let arena = context.arena;
+                    let params = context.params;
+                    let (storage, txn, _, responder, seq_session) =
+                        context.dml_parts_with_sequence();
+                    txn.enter_trigger_sql()?;
+                    responder.clear_affected_rows();
+                    let outcome = responder.without_command_complete(|responder| {
+                        delete(
+                            storage,
+                            txn,
+                            scratch,
+                            &statement,
+                            DmlAuthorization::Invoker,
+                            arena,
+                            params,
+                            seq_session,
+                            responder,
+                            None,
+                            Some(&scope),
                         )
-                    })?;
-                let transition = TriggerTransition {
-                    definition,
-                    old,
-                    new: new.as_deref(),
-                };
-                let scope = TriggerLocalScope {
-                    locals,
-                    values: &local_values[..locals.len()],
-                    found: status.found,
-                    invocation,
-                    transition: &transition,
-                };
-                let arena = context.arena;
-                let params = context.params;
-                let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
-                txn.enter_trigger_sql()?;
-                responder.clear_affected_rows();
-                let outcome = responder.without_command_complete(|responder| {
-                    delete(
-                        storage,
-                        txn,
-                        scratch,
-                        &statement,
-                        DmlAuthorization::Invoker,
-                        arena,
-                        params,
-                        seq_session,
-                        responder,
-                        None,
-                        Some(&scope),
-                    )
-                });
-                txn.leave_trigger_sql();
-                scratch.clear();
-                for item in saved.iter().copied() {
-                    scratch.push(item).map_err(|_| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "trigger DML workspace restore failed"
-                        )
-                    })?;
-                }
-                match outcome {
-                    Ok(Ok(())) => status.set_rows(
-                        context
-                            .responder
-                            .take_affected_rows()
-                            .expect("trigger DELETE publishes an affected-row count"),
-                    )?,
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "trigger-side DELETE response exceeded the output buffer"
-                        ));
+                    });
+                    txn.leave_trigger_sql();
+                    scratch.clear();
+                    for item in saved.iter().copied() {
+                        scratch.push(item).map_err(|_| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "trigger DML workspace restore failed"
+                            )
+                        })?;
                     }
-                }
+                    match outcome {
+                        Ok(Ok(())) => status.set_rows(
+                            context
+                                .responder
+                                .take_affected_rows()
+                                .expect("trigger DELETE publishes an affected-row count"),
+                        )?,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "trigger-side DELETE response exceeded the output buffer"
+                            ));
+                        }
+                    }
+
+                    Ok(None)
+                })
             }
-            TriggerStatement::For(program) => {
+            TriggerStatement::For(program) => execute_trigger_statement(|| {
                 let target = trigger_local_index(locals, program.target)?;
                 match program.source {
                     TriggerForSource::Numeric {
@@ -24877,7 +24949,7 @@ fn execute_trigger_block<'a>(
                             let array = eval_trigger_expression(context, expression, &scope)?;
                             let Datum::Array { element, raw } = array else {
                                 if array.is_null() {
-                                    continue;
+                                    return Ok(None);
                                 }
                                 return Err(sql_err!(
                                     sqlstate::DATATYPE_MISMATCH,
@@ -25009,77 +25081,85 @@ fn execute_trigger_block<'a>(
                         status.set_found(iterated);
                     }
                 }
-            }
-            TriggerStatement::While(program) => loop {
-                if !trigger_condition(
-                    context,
-                    program.condition,
-                    definition,
-                    invocation,
-                    old,
-                    new.as_deref(),
-                    locals,
-                    &local_values[..locals.len()],
-                    status.found,
-                )? {
-                    break;
-                }
-                match execute_trigger_block(
-                    context,
-                    definition,
-                    invocation,
-                    old,
-                    new,
-                    before,
-                    transition_relations,
-                    locals,
-                    local_values,
-                    program.block,
-                    status,
-                    exception,
-                )? {
-                    Some(TriggerFlow::Return(result)) => {
-                        return Ok(Some(TriggerFlow::Return(result)));
+
+                Ok(None)
+            }),
+            TriggerStatement::While(program) => execute_trigger_statement(|| {
+                loop {
+                    if !trigger_condition(
+                        context,
+                        program.condition,
+                        definition,
+                        invocation,
+                        old,
+                        new.as_deref(),
+                        locals,
+                        &local_values[..locals.len()],
+                        status.found,
+                    )? {
+                        break;
                     }
-                    Some(TriggerFlow::Exit(0)) => break,
-                    Some(TriggerFlow::Continue(0)) | None => {}
-                    Some(TriggerFlow::Exit(unwind)) => {
-                        return Ok(Some(TriggerFlow::Exit(unwind - 1)));
-                    }
-                    Some(TriggerFlow::Continue(unwind)) => {
-                        return Ok(Some(TriggerFlow::Continue(unwind - 1)));
-                    }
-                }
-            },
-            TriggerStatement::Loop(block) => loop {
-                match execute_trigger_block(
-                    context,
-                    definition,
-                    invocation,
-                    old,
-                    new,
-                    before,
-                    transition_relations,
-                    locals,
-                    local_values,
-                    block,
-                    status,
-                    exception,
-                )? {
-                    Some(TriggerFlow::Return(result)) => {
-                        return Ok(Some(TriggerFlow::Return(result)));
-                    }
-                    Some(TriggerFlow::Exit(0)) => break,
-                    Some(TriggerFlow::Continue(0)) | None => {}
-                    Some(TriggerFlow::Exit(unwind)) => {
-                        return Ok(Some(TriggerFlow::Exit(unwind - 1)));
-                    }
-                    Some(TriggerFlow::Continue(unwind)) => {
-                        return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                    match execute_trigger_block(
+                        context,
+                        definition,
+                        invocation,
+                        old,
+                        new,
+                        before,
+                        transition_relations,
+                        locals,
+                        local_values,
+                        program.block,
+                        status,
+                        exception,
+                    )? {
+                        Some(TriggerFlow::Return(result)) => {
+                            return Ok(Some(TriggerFlow::Return(result)));
+                        }
+                        Some(TriggerFlow::Exit(0)) => break,
+                        Some(TriggerFlow::Continue(0)) | None => {}
+                        Some(TriggerFlow::Exit(unwind)) => {
+                            return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                        }
+                        Some(TriggerFlow::Continue(unwind)) => {
+                            return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                        }
                     }
                 }
-            },
-            TriggerStatement::If(program) => {
+                Ok(None)
+            }),
+            TriggerStatement::Loop(block) => execute_trigger_statement(|| {
+                loop {
+                    match execute_trigger_block(
+                        context,
+                        definition,
+                        invocation,
+                        old,
+                        new,
+                        before,
+                        transition_relations,
+                        locals,
+                        local_values,
+                        block,
+                        status,
+                        exception,
+                    )? {
+                        Some(TriggerFlow::Return(result)) => {
+                            return Ok(Some(TriggerFlow::Return(result)));
+                        }
+                        Some(TriggerFlow::Exit(0)) => break,
+                        Some(TriggerFlow::Continue(0)) | None => {}
+                        Some(TriggerFlow::Exit(unwind)) => {
+                            return Ok(Some(TriggerFlow::Exit(unwind - 1)));
+                        }
+                        Some(TriggerFlow::Continue(unwind)) => {
+                            return Ok(Some(TriggerFlow::Continue(unwind - 1)));
+                        }
+                    }
+                }
+                Ok(None)
+            }),
+            TriggerStatement::If(program) => execute_trigger_statement(|| {
                 for branch in program.branches {
                     let selected = match branch.condition {
                         None => true,
@@ -25128,8 +25208,10 @@ fn execute_trigger_block<'a>(
                         break;
                     }
                 }
-            }
-            TriggerStatement::Case(program) => {
+
+                Ok(None)
+            }),
+            TriggerStatement::Case(program) => execute_trigger_statement(|| {
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -25205,10 +25287,23 @@ fn execute_trigger_block<'a>(
                 {
                     return Ok(Some(flow));
                 }
-            }
+
+                Ok(None)
+            }),
+        }?;
+        if let Some(flow) = flow {
+            return Ok(Some(flow));
         }
     }
     Ok(None)
+}
+
+// Keep statement-specific scratch off every nested procedural dispatch frame.
+#[inline(never)]
+fn execute_trigger_statement<'a>(
+    execute: impl FnOnce() -> Result<Option<TriggerFlow<'a>>, SqlError>,
+) -> Result<Option<TriggerFlow<'a>>, SqlError> {
+    execute()
 }
 
 #[expect(
@@ -25230,8 +25325,7 @@ fn fire_row_trigger_slot<'a>(
     let mut new = new;
     let trigger = context
         .storage()
-        .triggers_for_target(target, context.txn.txid)
-        .find_map(|(slot, trigger)| (slot == trigger_slot).then_some(trigger))
+        .trigger_for_target(trigger_slot, target, context.txn.txid)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "trigger version is not visible"))?;
     let effective_target = match (target, clone_table) {
         (crate::storage::TriggerTarget::Table(_), Some(table)) => {
@@ -25370,7 +25464,7 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
     let mut last_name: Option<SqlName> = None;
     while let Some(trigger_slot) = context
         .storage()
-        .triggers_for_target(target, context.txn.txid)
+        .trigger_metadata_for_target(target, context.txn.txid)
         .filter(|(_, trigger)| {
             last_name.is_none_or(|last| trigger.name_to(context.txn.txid).as_str() > last.as_str())
         })
@@ -32263,7 +32357,7 @@ pub fn create_routine(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
-                    definition,
+                    definition: &definition,
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         storage.routine_dependencies_for(slot, txn.txid),
                     ),
@@ -32314,7 +32408,7 @@ pub fn create_routine(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: *storage.routine(slot),
+                definition: storage.routine(slot),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),
@@ -33053,7 +33147,7 @@ pub fn create_aggregate(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
-                    definition: durable,
+                    definition: &durable,
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         storage.routine_dependencies_for(slot, txn.txid),
                     ),
@@ -33105,7 +33199,7 @@ pub fn create_aggregate(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: *storage.routine(slot),
+                definition: storage.routine(slot),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),
@@ -34247,7 +34341,7 @@ pub fn alter_routine(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: durable,
+                definition: &durable,
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),

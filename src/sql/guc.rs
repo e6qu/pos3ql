@@ -1116,86 +1116,7 @@ impl GucState {
     }
 
     pub(crate) fn reset_owned(&self, name: &str) -> Option<StackStr<256>> {
-        let state = self.store.borrow();
-        let values = &state.defaults;
-        if name.eq_ignore_ascii_case("datestyle") {
-            Some(StackStr::from_str(values.datestyle.as_str()))
-        } else if name.eq_ignore_ascii_case("intervalstyle") {
-            Some(StackStr::from_str(values.intervalstyle.as_str()))
-        } else if name.eq_ignore_ascii_case("lc_monetary") {
-            Some(StackStr::from_str(values.lc_monetary.as_str()))
-        } else if name.eq_ignore_ascii_case("timezone") {
-            Some(StackStr::from_str(values.timezone.as_str()))
-        } else if name.eq_ignore_ascii_case("client_encoding") {
-            Some(StackStr::from_str(values.client_encoding.as_str()))
-        } else if name.eq_ignore_ascii_case("application_name") {
-            Some(StackStr::from_str(values.application_name.as_str()))
-        } else if name.eq_ignore_ascii_case("search_path") {
-            Some(StackStr::from_str(values.search_path.as_str()))
-        } else if name.eq_ignore_ascii_case("default_tablespace") {
-            Some(StackStr::from_str(values.default_tablespace.as_str()))
-        } else if name.eq_ignore_ascii_case("default_text_search_config") {
-            Some(StackStr::from_str(
-                values.default_text_search_config.as_str(),
-            ))
-        } else if name.eq_ignore_ascii_case("client_min_messages") {
-            Some(StackStr::from_str(values.client_min_messages.as_str()))
-        } else if name.eq_ignore_ascii_case("extra_float_digits") {
-            Some(StackStr::from_str(values.extra_float_digits.as_str()))
-        } else if name.eq_ignore_ascii_case("lock_timeout") {
-            Some(StackStr::from_str(values.lock_timeout.as_str()))
-        } else if name.eq_ignore_ascii_case("statement_timeout") {
-            Some(StackStr::from_str(values.statement_timeout.as_str()))
-        } else if name.eq_ignore_ascii_case("row_security") {
-            Some(StackStr::from_str(values.row_security.as_str()))
-        } else if name.eq_ignore_ascii_case("event_triggers") {
-            Some(StackStr::from_str(if values.event_triggers {
-                "on"
-            } else {
-                "off"
-            }))
-        } else if name.eq_ignore_ascii_case("bytea_output") {
-            Some(StackStr::from_str(if values.bytea_escape {
-                "escape"
-            } else {
-                "hex"
-            }))
-        } else if name.eq_ignore_ascii_case("check_function_bodies") {
-            Some(StackStr::from_str(if values.check_function_bodies {
-                "on"
-            } else {
-                "off"
-            }))
-        } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
-            Some(StackStr::from_str(
-                values.default_transaction_isolation.as_str(),
-            ))
-        } else if name.eq_ignore_ascii_case("default_transaction_read_only") {
-            Some(StackStr::from_str(
-                if values.default_transaction_read_only {
-                    "on"
-                } else {
-                    "off"
-                },
-            ))
-        } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
-            Some(StackStr::from_str(
-                if values.default_transaction_deferrable {
-                    "on"
-                } else {
-                    "off"
-                },
-            ))
-        } else if name.eq_ignore_ascii_case("password_encryption") {
-            Some(StackStr::from_str(match values.password_encryption {
-                PasswordEncryption::ScramSha256 => "scram-sha-256",
-                PasswordEncryption::Md5 => "md5",
-            }))
-        } else if name.eq_ignore_ascii_case("track_functions") {
-            Some(StackStr::from_str(values.track_functions.as_str()))
-        } else {
-            None
-        }
+        owned_setting(&self.store.borrow().defaults, name)
     }
 
     pub fn new() -> Self {
@@ -2372,102 +2293,7 @@ impl GucState {
     /// The current value for `SHOW name`, or None if the parameter is unknown
     /// here (the caller falls back to fixed server parameters).
     pub fn get_owned(&self, name: &str) -> Option<StackStr<256>> {
-        let state = self.store.borrow();
-        let values = &state.current;
-        if name.eq_ignore_ascii_case("datestyle") {
-            Some(StackStr::from_str(values.datestyle.as_str()))
-        } else if name.eq_ignore_ascii_case("timezone") {
-            Some(StackStr::from_str(values.timezone.as_str()))
-        } else if name.eq_ignore_ascii_case("client_encoding") {
-            Some(StackStr::from_str(values.client_encoding.as_str()))
-        } else if name.eq_ignore_ascii_case("application_name") {
-            Some(StackStr::from_str(values.application_name.as_str()))
-        } else if name.eq_ignore_ascii_case("search_path") {
-            Some(StackStr::from_str(values.search_path.as_str()))
-        } else if name.eq_ignore_ascii_case("client_min_messages") {
-            Some(StackStr::from_str(values.client_min_messages.as_str()))
-        } else if name.eq_ignore_ascii_case("extra_float_digits") {
-            Some(StackStr::from_str(values.extra_float_digits.as_str()))
-        } else if name.eq_ignore_ascii_case("lock_timeout") {
-            Some(StackStr::from_str(values.lock_timeout.as_str()))
-        } else if name.eq_ignore_ascii_case("row_security") {
-            Some(StackStr::from_str(values.row_security.as_str()))
-        } else if name.eq_ignore_ascii_case("event_triggers") {
-            Some(StackStr::from_str(if values.event_triggers {
-                "on"
-            } else {
-                "off"
-            }))
-        } else if name.eq_ignore_ascii_case("statement_timeout") {
-            Some(StackStr::from_str(values.statement_timeout.as_str()))
-        } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
-            || name.eq_ignore_ascii_case("transaction_timeout")
-        {
-            Some(StackStr::from_str("0"))
-        } else if name.eq_ignore_ascii_case("bytea_output") {
-            Some(StackStr::from_str(if values.bytea_escape {
-                "escape"
-            } else {
-                "hex"
-            }))
-        } else if name.eq_ignore_ascii_case("check_function_bodies") {
-            Some(StackStr::from_str(if values.check_function_bodies {
-                "on"
-            } else {
-                "off"
-            }))
-        } else if name.eq_ignore_ascii_case("xmloption") {
-            Some(StackStr::from_str(if values.xml_document {
-                "document"
-            } else {
-                "content"
-            }))
-        } else if name.eq_ignore_ascii_case("default_tablespace") {
-            Some(StackStr::from_str(values.default_tablespace.as_str()))
-        } else if name.eq_ignore_ascii_case("default_text_search_config") {
-            Some(StackStr::from_str(
-                values.default_text_search_config.as_str(),
-            ))
-        } else if name.eq_ignore_ascii_case("default_table_access_method") {
-            Some(StackStr::from_str("heap"))
-        } else if name.eq_ignore_ascii_case("intervalstyle") {
-            Some(StackStr::from_str(values.intervalstyle.as_str()))
-        } else if name.eq_ignore_ascii_case("lc_monetary") {
-            Some(StackStr::from_str(values.lc_monetary.as_str()))
-        } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
-            Some(StackStr::from_str("off"))
-        } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
-            Some(StackStr::from_str(
-                values.default_transaction_isolation.as_str(),
-            ))
-        } else if name.eq_ignore_ascii_case("default_transaction_read_only") {
-            Some(StackStr::from_str(
-                if values.default_transaction_read_only {
-                    "on"
-                } else {
-                    "off"
-                },
-            ))
-        } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
-            Some(StackStr::from_str(
-                if values.default_transaction_deferrable {
-                    "on"
-                } else {
-                    "off"
-                },
-            ))
-        } else if name.eq_ignore_ascii_case("password_encryption") {
-            Some(StackStr::from_str(match values.password_encryption {
-                PasswordEncryption::ScramSha256 => "scram-sha-256",
-                PasswordEncryption::Md5 => "md5",
-            }))
-        } else if name.eq_ignore_ascii_case("track_functions") {
-            Some(StackStr::from_str(values.track_functions.as_str()))
-        } else if name.eq_ignore_ascii_case("seed") {
-            Some(StackStr::from_str("unavailable"))
-        } else {
-            None
-        }
+        owned_setting(&self.store.borrow().current, name)
     }
 
     /// Value-rendering settings for the wire layer (DateStyle + zone).
@@ -2494,6 +2320,105 @@ impl GucState {
             xml_document: values.xml_document,
             extra_float_digits: values.extra_float_digits.as_str().parse().unwrap_or(1),
         }
+    }
+}
+
+fn owned_setting(values: &GucValues, name: &str) -> Option<StackStr<256>> {
+    if name.eq_ignore_ascii_case("standard_conforming_strings") {
+        Some(StackStr::from_str("on"))
+    } else if name.eq_ignore_ascii_case("datestyle") {
+        Some(StackStr::from_str(values.datestyle.as_str()))
+    } else if name.eq_ignore_ascii_case("timezone") {
+        Some(StackStr::from_str(values.timezone.as_str()))
+    } else if name.eq_ignore_ascii_case("client_encoding") {
+        Some(StackStr::from_str(values.client_encoding.as_str()))
+    } else if name.eq_ignore_ascii_case("application_name") {
+        Some(StackStr::from_str(values.application_name.as_str()))
+    } else if name.eq_ignore_ascii_case("search_path") {
+        Some(StackStr::from_str(values.search_path.as_str()))
+    } else if name.eq_ignore_ascii_case("client_min_messages") {
+        Some(StackStr::from_str(values.client_min_messages.as_str()))
+    } else if name.eq_ignore_ascii_case("extra_float_digits") {
+        Some(StackStr::from_str(values.extra_float_digits.as_str()))
+    } else if name.eq_ignore_ascii_case("lock_timeout") {
+        Some(StackStr::from_str(values.lock_timeout.as_str()))
+    } else if name.eq_ignore_ascii_case("row_security") {
+        Some(StackStr::from_str(values.row_security.as_str()))
+    } else if name.eq_ignore_ascii_case("event_triggers") {
+        Some(StackStr::from_str(if values.event_triggers {
+            "on"
+        } else {
+            "off"
+        }))
+    } else if name.eq_ignore_ascii_case("statement_timeout") {
+        Some(StackStr::from_str(values.statement_timeout.as_str()))
+    } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")
+        || name.eq_ignore_ascii_case("transaction_timeout")
+    {
+        Some(StackStr::from_str("0"))
+    } else if name.eq_ignore_ascii_case("bytea_output") {
+        Some(StackStr::from_str(if values.bytea_escape {
+            "escape"
+        } else {
+            "hex"
+        }))
+    } else if name.eq_ignore_ascii_case("check_function_bodies") {
+        Some(StackStr::from_str(if values.check_function_bodies {
+            "on"
+        } else {
+            "off"
+        }))
+    } else if name.eq_ignore_ascii_case("xmloption") {
+        Some(StackStr::from_str(if values.xml_document {
+            "document"
+        } else {
+            "content"
+        }))
+    } else if name.eq_ignore_ascii_case("default_tablespace") {
+        Some(StackStr::from_str(values.default_tablespace.as_str()))
+    } else if name.eq_ignore_ascii_case("default_text_search_config") {
+        Some(StackStr::from_str(
+            values.default_text_search_config.as_str(),
+        ))
+    } else if name.eq_ignore_ascii_case("default_table_access_method") {
+        Some(StackStr::from_str("heap"))
+    } else if name.eq_ignore_ascii_case("intervalstyle") {
+        Some(StackStr::from_str(values.intervalstyle.as_str()))
+    } else if name.eq_ignore_ascii_case("lc_monetary") {
+        Some(StackStr::from_str(values.lc_monetary.as_str()))
+    } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
+        Some(StackStr::from_str("off"))
+    } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
+        Some(StackStr::from_str(
+            values.default_transaction_isolation.as_str(),
+        ))
+    } else if name.eq_ignore_ascii_case("default_transaction_read_only") {
+        Some(StackStr::from_str(
+            if values.default_transaction_read_only {
+                "on"
+            } else {
+                "off"
+            },
+        ))
+    } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
+        Some(StackStr::from_str(
+            if values.default_transaction_deferrable {
+                "on"
+            } else {
+                "off"
+            },
+        ))
+    } else if name.eq_ignore_ascii_case("password_encryption") {
+        Some(StackStr::from_str(match values.password_encryption {
+            PasswordEncryption::ScramSha256 => "scram-sha-256",
+            PasswordEncryption::Md5 => "md5",
+        }))
+    } else if name.eq_ignore_ascii_case("track_functions") {
+        Some(StackStr::from_str(values.track_functions.as_str()))
+    } else if name.eq_ignore_ascii_case("seed") {
+        Some(StackStr::from_str("unavailable"))
+    } else {
+        None
     }
 }
 

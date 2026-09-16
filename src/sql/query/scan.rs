@@ -127,14 +127,12 @@ struct NoColumns;
 struct PolicyPredicate<'a> {
     expression: &'a Expr<'a>,
     permissive: bool,
-    group: u8,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct RowSecurityPlan<'a> {
     table: usize,
-    predicates: [PolicyPredicate<'a>; 2 * crate::storage::MAX_POLICIES_PER_TABLE],
-    count: usize,
+    predicates: [&'a [PolicyPredicate<'a>]; 2],
     groups: u8,
     permissive_always: [bool; 2],
 }
@@ -165,11 +163,13 @@ pub(crate) fn plan_row_security<'a>(
             definition.name.as_str()
         ));
     }
-    let mut predicates = [PolicyPredicate {
-        expression: &Expr::Null,
-        permissive: false,
-        group: 0,
-    }; 2 * crate::storage::MAX_POLICIES_PER_TABLE];
+    let capacity = storage.policies_for_table(table, txid).count();
+    let predicates = arena
+        .alloc_slice_with(capacity, |_| PolicyPredicate {
+            expression: &Expr::Null,
+            permissive: false,
+        })
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     let mut permissive_always = false;
     for (_, policy) in storage.policies_for_table(table, txid) {
@@ -204,7 +204,6 @@ pub(crate) fn plan_row_security<'a>(
                         arena,
                     )?,
                     permissive: policy.permissive,
-                    group: 0,
                 };
                 count += 1;
             }
@@ -214,8 +213,7 @@ pub(crate) fn plan_row_security<'a>(
     }
     Ok(Some(RowSecurityPlan {
         table,
-        predicates,
-        count,
+        predicates: [&predicates[..count], &[]],
         groups: 1,
         permissive_always: [permissive_always, false],
     }))
@@ -232,13 +230,7 @@ pub(crate) fn conjoin_row_security<'a>(
             debug_assert_eq!(first.table, second.table);
             debug_assert_eq!(first.groups, 1);
             debug_assert_eq!(second.groups, 1);
-            for predicate in &second.predicates[..second.count] {
-                first.predicates[first.count] = PolicyPredicate {
-                    group: 1,
-                    ..*predicate
-                };
-                first.count += 1;
-            }
+            first.predicates[1] = second.predicates[0];
             first.groups = 2;
             first.permissive_always[1] = second.permissive_always[0];
             Some(first)
@@ -280,18 +272,18 @@ pub(crate) fn row_security_passes<'a>(
     })?;
     let mark = arena.mark();
     let result = (|| {
-        let mut expressions = [None; 2 * crate::storage::MAX_POLICIES_PER_TABLE];
-        for (index, predicate) in plan.predicates[..plan.count].iter().enumerate() {
-            expressions[index] = Some(predicate.expression);
+        let count = plan.predicates.iter().map(|group| group.len()).sum();
+        let expressions = arena
+            .alloc_slice_with(count, |_| None)
+            .map_err(|_| arena_full())?;
+        for (output, predicate) in expressions
+            .iter_mut()
+            .zip(plan.predicates.iter().flat_map(|group| group.iter()))
+        {
+            *output = Some(predicate.expression);
         }
-        let subqueries = super::subquery::subquery_hooks_outer(
-            &expressions[..plan.count],
-            storage,
-            txid,
-            arena,
-            params,
-            row,
-        )?;
+        let subqueries =
+            super::subquery::subquery_hooks_outer(expressions, storage, txid, arena, params, row)?;
         let hooks = EvalHooks {
             group: None,
             aggs: None,
@@ -304,21 +296,23 @@ pub(crate) fn row_security_passes<'a>(
             merge_action: base_hooks.merge_action,
         };
         let mut permissive = plan.permissive_always;
-        for predicate in &plan.predicates[..plan.count] {
-            let passes = match eval_full(predicate.expression, arena, params, row, &hooks)? {
-                Datum::Bool(value) => value,
-                Datum::Null => false,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "row-level security policy expression must be type boolean"
-                    ));
+        for (group, predicates) in plan.predicates.iter().enumerate() {
+            for predicate in *predicates {
+                let passes = match eval_full(predicate.expression, arena, params, row, &hooks)? {
+                    Datum::Bool(value) => value,
+                    Datum::Null => false,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "row-level security policy expression must be type boolean"
+                        ));
+                    }
+                };
+                if predicate.permissive {
+                    permissive[group] |= passes;
+                } else if !passes {
+                    return Ok(false);
                 }
-            };
-            if predicate.permissive {
-                permissive[usize::from(predicate.group)] |= passes;
-            } else if !passes {
-                return Ok(false);
             }
         }
         Ok(permissive[..usize::from(plan.groups)]

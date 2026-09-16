@@ -8250,126 +8250,6 @@ impl Checkpointer {
             for byte in serialized_body.as_bytes() {
                 let _ = write!(body, "{byte:02x}");
             }
-            let mut arguments = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 396 }>::new();
-            for argument in routine.arguments() {
-                let mut argument_name = StackStr::<130>::new();
-                for byte in argument.name.as_str().as_bytes() {
-                    let _ = write!(argument_name, "{byte:02x}");
-                }
-                if argument.name.as_str().is_empty() {
-                    let _ = write!(argument_name, "-");
-                }
-                let _ = write!(
-                    arguments,
-                    " {} {}",
-                    argument_name.as_str(),
-                    argument.ctype.code()
-                );
-                if let Some(identity) = argument.user_type {
-                    let mut schema = StackStr::<130>::new();
-                    let mut name = StackStr::<130>::new();
-                    for byte in identity.schema.as_str().as_bytes() {
-                        let _ = write!(schema, "{byte:02x}");
-                    }
-                    for byte in identity.name.as_str().as_bytes() {
-                        let _ = write!(name, "{byte:02x}");
-                    }
-                    let _ = write!(arguments, " {} {}", schema.as_str(), name.as_str());
-                } else {
-                    let _ = write!(arguments, " - -");
-                }
-            }
-            let mut parameters = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 660 }>::new();
-            let _ = write!(parameters, " {}", routine.parameter_count);
-            for parameter in routine.parameters() {
-                let mut parameter_name = StackStr::<130>::new();
-                for byte in parameter.name.as_str().as_bytes() {
-                    let _ = write!(parameter_name, "{byte:02x}");
-                }
-                if parameter.name.as_str().is_empty() {
-                    let _ = write!(parameter_name, "-");
-                }
-                let _ = write!(
-                    parameters,
-                    " {} {}",
-                    parameter_name.as_str(),
-                    parameter.ctype.code()
-                );
-                if let Some(identity) = parameter.user_type {
-                    let mut schema = StackStr::<130>::new();
-                    let mut name = StackStr::<130>::new();
-                    for byte in identity.schema.as_str().as_bytes() {
-                        let _ = write!(schema, "{byte:02x}");
-                    }
-                    for byte in identity.name.as_str().as_bytes() {
-                        let _ = write!(name, "{byte:02x}");
-                    }
-                    let _ = write!(parameters, " {} {}", schema.as_str(), name.as_str());
-                } else {
-                    let _ = write!(parameters, " - -");
-                }
-                let _ = write!(parameters, " {} ", parameter.mode.code());
-                if let Some(default) = parameter.mode.default() {
-                    for byte in default.as_str().as_bytes() {
-                        let _ = write!(parameters, "{byte:02x}");
-                    }
-                } else {
-                    let _ = write!(parameters, "-");
-                }
-            }
-            let mut configs = StackStr::<{ crate::storage::MAX_ROUTINE_CONFIGS * 390 + 8 }>::new();
-            let _ = write!(configs, " {}", routine.config_count);
-            for config in routine.configs() {
-                let _ = write!(configs, " ");
-                for byte in config.name.as_str().as_bytes() {
-                    let _ = write!(configs, "{byte:02x}");
-                }
-                let _ = write!(configs, " ");
-                if config.value.as_str().is_empty() {
-                    let _ = write!(configs, "-");
-                } else {
-                    for byte in config.value.as_str().as_bytes() {
-                        let _ = write!(configs, "{byte:02x}");
-                    }
-                }
-            }
-            let mut result_columns =
-                StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 396 }>::new();
-            if matches!(
-                routine.kind,
-                crate::storage::RoutineKind::TableFunction
-                    | crate::storage::RoutineKind::RecordFunction { .. }
-            ) {
-                let _ = write!(result_columns, " {}", routine.result_column_count);
-                for column in &routine.result_columns[..routine.result_column_count] {
-                    let mut column_name = StackStr::<130>::new();
-                    for byte in column.name.as_str().as_bytes() {
-                        let _ = write!(column_name, "{byte:02x}");
-                    }
-                    if column.name.as_str().is_empty() {
-                        let _ = write!(column_name, "-");
-                    }
-                    let _ = write!(
-                        result_columns,
-                        " {} {}",
-                        column_name.as_str(),
-                        column.ctype.code()
-                    );
-                    if let Some(identity) = column.user_type {
-                        let mut schema = StackStr::<130>::new();
-                        let mut name = StackStr::<130>::new();
-                        for byte in identity.schema.as_str().as_bytes() {
-                            let _ = write!(schema, "{byte:02x}");
-                        }
-                        for byte in identity.name.as_str().as_bytes() {
-                            let _ = write!(name, "{byte:02x}");
-                        }
-                        let _ = write!(result_columns, " {} {}", schema.as_str(), name.as_str());
-                    } else {
-                        let _ = write!(result_columns, " - -");
-                    }
-                }
-            }
             let result_identity = match routine.kind {
                 crate::storage::RoutineKind::Function { result }
                 | crate::storage::RoutineKind::SetFunction { result } => result.user_type,
@@ -8414,9 +8294,9 @@ impl Checkpointer {
                     schema.as_str(),
                     name.as_str(),
                     body.as_str(),
-                    arguments.as_str(),
-                    parameters.as_str(),
-                    configs.as_str(),
+                    ManifestRoutineArguments(routine.arguments()),
+                    ManifestRoutineParameters(routine.parameters()),
+                    ManifestRoutineConfigs(routine.configs()),
                     u8::from(routine.attributes.strict),
                     routine.attributes.volatility.code(),
                     routine.attributes.parallel.code(),
@@ -8429,7 +8309,7 @@ impl Checkpointer {
                     routine.kind.wire_code(),
                     result_schema.as_str(),
                     result_name.as_str(),
-                    result_columns.as_str(),
+                    ManifestRoutineColumns(routine),
                     creation_path.as_str(),
                     ManifestDependencies(storage.routine_dependencies_for(slot, 0)),
                 ),
@@ -9009,7 +8889,7 @@ impl Checkpointer {
             let mut schema = StackStr::<130>::new();
             let mut table_name = StackStr::<130>::new();
             let mut name = StackStr::<130>::new();
-            let mut roles = StackStr::<1048>::new();
+            let mut roles = StackStr::<{ crate::storage::MAX_POLICY_ROLES * 131 }>::new();
             let mut using = StackStr::<{ crate::storage::POLICY_EXPRESSION_MAX * 2 }>::new();
             let mut with_check = StackStr::<{ crate::storage::POLICY_EXPRESSION_MAX * 2 }>::new();
             for byte in table.schema.as_str().as_bytes() {
@@ -12259,6 +12139,92 @@ struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);
 struct ManifestViewColumns(crate::storage::ViewColumns);
 
 struct ManifestName<'a>(&'a str);
+
+// Stream variable-width routine fields into the one startup-reserved manifest
+// buffer. No intermediate field can truncate and publish an unreadable record.
+struct ManifestRoutineArguments<'a>(&'a [crate::storage::RoutineArgumentDef]);
+struct ManifestRoutineParameters<'a>(&'a [crate::storage::RoutineParameterDef]);
+struct ManifestRoutineConfigs<'a>(&'a [crate::storage::RoutineConfig]);
+struct ManifestRoutineColumns<'a>(&'a crate::storage::RoutineDef);
+
+fn write_manifest_routine_type(
+    output: &mut core::fmt::Formatter<'_>,
+    name: crate::storage::SqlName,
+    ctype: ColType,
+    user_type: Option<crate::storage::UserTypeName>,
+) -> core::fmt::Result {
+    write!(output, " {} {}", ManifestName(name.as_str()), ctype.code())?;
+    match user_type {
+        Some(identity) => write!(
+            output,
+            " {} {}",
+            ManifestName(identity.schema.as_str()),
+            ManifestName(identity.name.as_str())
+        ),
+        None => output.write_str(" - -"),
+    }
+}
+
+impl core::fmt::Display for ManifestRoutineArguments<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for argument in self.0 {
+            write_manifest_routine_type(output, argument.name, argument.ctype, argument.user_type)?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for ManifestRoutineParameters<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(output, " {}", self.0.len())?;
+        for parameter in self.0 {
+            write_manifest_routine_type(
+                output,
+                parameter.name,
+                parameter.ctype,
+                parameter.user_type,
+            )?;
+            let default = parameter.mode.default();
+            write!(
+                output,
+                " {} {}",
+                parameter.mode.code(),
+                ManifestName(default.as_ref().map_or("", |value| value.as_str()))
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for ManifestRoutineConfigs<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(output, " {}", self.0.len())?;
+        for config in self.0 {
+            write!(
+                output,
+                " {} {}",
+                ManifestName(config.name.as_str()),
+                ManifestName(config.value.as_str())
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for ManifestRoutineColumns<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if matches!(
+            self.0.kind,
+            crate::storage::RoutineKind::TableFunction
+                | crate::storage::RoutineKind::RecordFunction { .. }
+        ) {
+            write!(output, " {}", self.0.result_column_count)?;
+            ManifestRoutineArguments(&self.0.result_columns[..self.0.result_column_count])
+                .fmt(output)?;
+        }
+        Ok(())
+    }
+}
 
 fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u8 {
     match behavior {

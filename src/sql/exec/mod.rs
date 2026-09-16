@@ -14729,9 +14729,19 @@ impl<'a> TriggerInvocation<'a> {
                     .map_err(|_| super::query::arena_full_pub())?,
             );
         }
-        let argv = Datum::Array {
-            element: ArrElem::Text,
-            raw: crate::sql::array::build(&arguments[..trigger.arguments.values().len()], arena)?,
+        let count = trigger.arguments.values().len();
+        let argv = if count == 0 {
+            Datum::Null
+        } else {
+            // PostgreSQL trigger arguments are zero-based, unlike ordinary arrays.
+            Datum::Array {
+                element: ArrElem::Text,
+                raw: crate::sql::array::build_shaped(
+                    &arguments[..count],
+                    crate::sql::array::Shape::new(&[count], &[0])?,
+                    arena,
+                )?,
+            }
         };
         let operation = match event {
             TriggerEvents::INSERT => "INSERT",
@@ -32263,7 +32273,7 @@ pub fn create_routine(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
-                    definition,
+                    definition: &definition,
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         storage.routine_dependencies_for(slot, txn.txid),
                     ),
@@ -32314,7 +32324,7 @@ pub fn create_routine(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: *storage.routine(slot),
+                definition: storage.routine(slot),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),
@@ -33053,7 +33063,7 @@ pub fn create_aggregate(
                 txn.txid,
                 lsn,
                 &WalOp::CreateRoutine {
-                    definition: durable,
+                    definition: &durable,
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                         storage.routine_dependencies_for(slot, txn.txid),
                     ),
@@ -33105,7 +33115,7 @@ pub fn create_aggregate(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: *storage.routine(slot),
+                definition: storage.routine(slot),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),
@@ -34247,7 +34257,7 @@ pub fn alter_routine(
             txn.txid,
             lsn,
             &WalOp::CreateRoutine {
-                definition: durable,
+                definition: &durable,
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(
                     storage.routine_dependencies_for(slot, txn.txid),
                 ),

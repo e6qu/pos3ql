@@ -18690,6 +18690,13 @@ fn apply_table_wal_payload(storage: &mut Storage, payload: &[u8]) -> Result<(), 
     Ok(())
 }
 
+#[inline(never)]
+fn apply_routine_wal_payload(storage: &mut Storage, payload: &[u8]) -> Result<(), SqlError> {
+    let (definition, dependencies) = crate::wal::decode_routine_payload(payload)
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid routine journal payload"))?;
+    storage.replay_create_routine(definition, dependencies.materialize()?)
+}
+
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
         WalOp::DatabaseScope { oid } => {
@@ -20156,10 +20163,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_domain_drop(slot);
             }
         }
-        WalOp::CreateRoutine {
-            definition,
-            dependencies,
-        } => storage.replay_create_routine(definition, dependencies.materialize()?)?,
+        WalOp::RestoreRoutine(payload) => apply_routine_wal_payload(storage, payload)?,
+        WalOp::CreateRoutine { .. } => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal decoder returned an unstaged routine definition"
+            ));
+        }
         WalOp::DropRoutine {
             schema,
             name,

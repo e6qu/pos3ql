@@ -12263,7 +12263,7 @@ fn routine_signature<'a>(
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
-    let mut text = StackStr::<256>::new();
+    let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
     write_identifier(&mut text, name);
     text.write_char('(')
         .map_err(|_| super::eval::arena_full())?;
@@ -12286,7 +12286,7 @@ fn routine_declared_signature<'a>(
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
-    let mut text = StackStr::<256>::new();
+    let mut text = StackStr::<{ (MAX_ROUTINE_ARGUMENTS + 1) * 264 }>::new();
     let schema = routine.schema_for(txid);
     if !storage.schema_is_on_path(schema) {
         write_identifier(&mut text, schema.as_str());
@@ -25530,13 +25530,16 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 });
             argument_oids[index] = argument_oid;
         }
-        let mut all_argument_types = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut argument_modes = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        let mut argument_names = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut all_argument_types = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
+        let mut argument_modes = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
+        let mut argument_names = [Datum::Null; 2 * MAX_ROUTINE_ARGUMENTS];
+        let mut all_parameter_count = routine.parameter_count;
         let mut has_modes = false;
         let mut has_names = false;
         let mut default_count = 0i32;
-        let mut default_expressions = crate::util::StackStr::<256>::new();
+        let mut default_expressions = crate::util::StackStr::<
+            { MAX_ROUTINE_ARGUMENTS * (crate::storage::ROUTINE_DEFAULT_MAX + 2) },
+        >::new();
         let mut variadic_oid = 0;
         for (index, parameter) in routine.parameters().iter().enumerate() {
             let parameter_oid = storage
@@ -25580,6 +25583,19 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 default_count += 1;
             }
         }
+        if matches!(routine.kind, crate::storage::RoutineKind::TableFunction) {
+            for column in &routine.result_columns[..routine.result_column_count] {
+                let column_oid = storage
+                    .routine_type_oid(column.ctype, column.user_type, txid)
+                    .expect("table-function output type is catalog-resolved");
+                all_argument_types[all_parameter_count] = Datum::Oid(column_oid as u32);
+                argument_modes[all_parameter_count] = Datum::Char(b't');
+                argument_names[all_parameter_count] = text(column.name.as_str(), arena)?;
+                all_parameter_count += 1;
+            }
+            has_modes = true;
+            has_names = true;
+        }
         if default_expressions.is_truncated() {
             return Err(catalog_capacity_exceeded("pg_proc.proargdefaults"));
         }
@@ -25604,7 +25620,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(match routine.kind {
                     crate::storage::RoutineKind::Function { .. }
                     | crate::storage::RoutineKind::SetFunction { .. }
-                    | crate::storage::RoutineKind::RecordFunction { .. } => storage
+                    | crate::storage::RoutineKind::RecordFunction { .. }
+                    | crate::storage::RoutineKind::TableFunction => storage
                         .routine_function_result_oid(&routine, txid)
                         .unwrap_or_else(|| {
                             panic!(
@@ -25612,7 +25629,6 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                                 routine.name.as_str()
                             )
                         }),
-                    crate::storage::RoutineKind::TableFunction => crate::sql::types::oid::RECORD,
                     crate::storage::RoutineKind::Trigger => crate::sql::types::oid::TRIGGER,
                     crate::storage::RoutineKind::EventTrigger => {
                         crate::sql::types::oid::EVENT_TRIGGER
@@ -25707,7 +25723,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     Datum::Array {
                         element: super::types::ArrElem::Oid,
                         raw: super::array::build(
-                            &all_argument_types[..routine.parameter_count],
+                            &all_argument_types[..all_parameter_count],
                             arena,
                         )?,
                     }
@@ -25717,10 +25733,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 if has_modes {
                     Datum::Array {
                         element: super::types::ArrElem::Char,
-                        raw: super::array::build(
-                            &argument_modes[..routine.parameter_count],
-                            arena,
-                        )?,
+                        raw: super::array::build(&argument_modes[..all_parameter_count], arena)?,
                     }
                 } else {
                     Datum::Null
@@ -25728,10 +25741,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 if has_names {
                     Datum::Array {
                         element: super::types::ArrElem::Text,
-                        raw: super::array::build(
-                            &argument_names[..routine.parameter_count],
-                            arena,
-                        )?,
+                        raw: super::array::build(&argument_names[..all_parameter_count], arena)?,
                     }
                 } else {
                     Datum::Null

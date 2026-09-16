@@ -122,6 +122,8 @@ pub struct Config {
     pub max_operator_classes: usize,
     /// Fixed number of trigger catalog slots.
     pub max_triggers: usize,
+    /// Fixed number of row-level security policy catalog slots, shared by tables.
+    pub max_policies: usize,
     /// Fixed number of publication catalog slots.
     pub max_publications: usize,
     /// Fixed number of user-defined collation catalog slots.
@@ -337,6 +339,7 @@ impl Config {
             max_operator_families: 32,
             max_operator_classes: 32,
             max_triggers: 32,
+            max_policies: 256,
             max_publications: 32,
             max_collations: 128,
             max_conversions: 128,
@@ -666,6 +669,10 @@ impl Config {
                 }
                 "max_triggers" => {
                     config.max_triggers =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_policies" => {
+                    config.max_policies =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_publications" => {
@@ -1025,6 +1032,7 @@ impl Config {
             config.max_operator_families,
             config.max_operator_classes,
             config.max_triggers,
+            config.max_policies,
             config.max_publications,
             config.max_collations,
             config.max_conversions,
@@ -1121,6 +1129,7 @@ impl Config {
             ("max_operator_families", config.max_operator_families),
             ("max_operator_classes", config.max_operator_classes),
             ("max_triggers", config.max_triggers),
+            ("max_policies", config.max_policies),
             ("max_publications", config.max_publications),
             ("max_text_search_objects", config.max_text_search_objects),
             (
@@ -1613,6 +1622,7 @@ sql_arena_bytes = 4096
             "max_operator_families",
             "max_operator_classes",
             "max_triggers",
+            "max_policies",
             "max_publications",
             "max_collations",
             "max_conversions",
@@ -1650,6 +1660,7 @@ sql_arena_bytes = 4096
             "max_operator_families",
             "max_operator_classes",
             "max_triggers",
+            "max_policies",
             "max_publications",
             "max_text_search_objects",
             "max_foreign_data_wrappers",
@@ -1780,6 +1791,24 @@ sql_arena_bytes = 4096
                 .unwrap();
         assert_eq!(config.database_collation_locale, "C.UTF-8");
         assert_eq!(config.collation_scratch_bytes, 8 * KIB);
+    }
+
+    #[test]
+    fn policy_catalog_capacity_is_independent_and_exactly_budgeted() {
+        let defaults = Config::parse("max_tables = 7\n").unwrap();
+        assert_eq!(defaults.max_policies, 256);
+        let mut larger = defaults.clone();
+        larger.max_policies += 41;
+        assert_eq!(
+            crate::storage::Storage::extra_budget_bytes(&larger)
+                - crate::storage::Storage::extra_budget_bytes(&defaults),
+            41 * core::mem::size_of::<crate::storage::PolicyDef>()
+        );
+        assert_eq!(
+            Config::parse("max_policies = 1025\n").unwrap().max_policies,
+            1025
+        );
+        assert!(Config::parse("max_policies = 256\nmax_policies = 257\n").is_err());
     }
 
     #[test]

@@ -130,6 +130,25 @@ storage. RAM and local disk are bounded, disposable caches.
   checkpoints, loud exhaustion, and empty-cache recovery are qualified above
   the former 64/128/256/512/1,024-entry ceilings.
 - Test qualification now owns and removes engine, object-fixture, and
+- Row-level security policies use the independent startup-sized `max_policies`
+  catalog, with no additional per-table ceiling. Predicate plans and conjoined
+  command gates use statement-arena slices rather than fixed policy arrays.
+  A 1,025-policy relation qualifies enforcement, catalog output, named
+  exhaustion, checkpoint publication, and empty-cache recovery. Policy role
+  lists, routine parameters/results/configuration, and trigger arguments use
+  the parser's complete 64-item boundary. Routine signatures and default
+  metadata admit those shapes; routine manifest fields stream directly into
+  the reserved buffer. `pg_proc` includes TABLE output names, modes, and types
+  alongside input parameters, and single-column TABLE result OIDs match
+  PostgreSQL. Wide callable definitions, rollback, journal replay,
+  checkpoint recovery, and allocation-forbidden execution share regressions.
+  PostgreSQL trigger arguments are zero-based and NULL when absent. Routine
+  setting values and reset values share one bounded definition, including
+  `standard_conforming_strings` and `xmloption`.
+  Routine WAL staging borrows images and replay isolates owned decoding;
+  the journal event type has a compile-time size bound so wide definitions
+  cannot inflate every logical-replication dispatch frame.
+- Test qualification now owns and removes engine, object-fixture, and
   performance scratch directories. Storage fault injection corrupts only its
   selected preallocated bytes in place, so repeated full and VOPR runs do not
   require whole-file replacement space or accumulate transient databases.

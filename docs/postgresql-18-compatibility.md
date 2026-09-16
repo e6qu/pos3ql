@@ -91,7 +91,7 @@ logical-replication boundary is specified separately in
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.
 - Tables, indexes, ordinary and materialized views, routines, casts, operators,
-  operator families/classes, triggers, publications, collations, conversions,
+  operator families/classes, triggers, row-level security policies, publications, collations, conversions,
   text-search objects, event triggers, tablespaces, and comments use independent
   startup-sized pools. Their configured exhaustion is a loud program-limit
   error; object-cold recovery preserves catalogs larger than their former
@@ -99,6 +99,13 @@ logical-replication boundary is specified separately in
   physical-table slot, including the internal large-object table. The complete
   checkpoint catalog image has a named startup-reserved
   `checkpoint_manifest_bytes` bound and fails before publication if it is full.
+  Policies use `max_policies` (default 256) without a second per-table ceiling;
+  their predicates are statement-arena bounded. Routine parameters, output
+  columns, configuration settings, trigger arguments, and policy roles accept
+  the complete 64-item parser boundary. This remains below PostgreSQL's
+  100-input-argument routine limit. `RETURNS TABLE` catalog argument metadata
+  includes the independently bounded input and output shapes. Trigger arguments
+  are zero-based and NULL when absent, matching PostgreSQL.
   Database and schema catalogs, connection counters, statistics, cloning, and
   publication membership are also startup-sized and survive object-cold
   recovery above their former 32-slot limits. Catalog builders for

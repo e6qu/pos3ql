@@ -148,6 +148,10 @@ storage. RAM and local disk are bounded, disposable caches.
   Routine WAL staging borrows images and replay isolates owned decoding;
   the journal event type has a compile-time size bound so wide definitions
   cannot inflate every logical-replication dispatch frame.
+  Built-in aggregate groups do not reserve maximum-width custom definitions
+  or argument vectors. Custom metadata and direct values use actual-shape
+  arena storage; the original cold-PAX 1 MiB query and 8 MiB stack bounds
+  remain qualified.
 - Test qualification now owns and removes engine, object-fixture, and
   performance scratch directories. Storage fault injection corrupts only its
   selected preallocated bytes in place, so repeated full and VOPR runs do not

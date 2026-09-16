@@ -141,6 +141,22 @@ replication, subscription, dependency, trigger, sequence, and information-schema
 catalog builders use their transaction-visible cardinality rather than hidden
 256/512/1,024-row arrays.
 
+Wide schema objects use one explicit boundary through DDL, enforcement,
+catalogs, WAL, checkpoints, and recovery. Index tuples and partition keys match
+PostgreSQL 18's 32-attribute limits; the bounded SQL parser admits 64 table
+constraints of each modeled kind, 64 domain checks, 64 composite fields, and
+64 LIST-bound values. Crossing a boundary returns a program-limit error before
+catalog mutation. Index key/include counts and `pg_partitioned_table` expose
+the same accepted shape after empty-cache recovery.
+
+Implicit index and constraint OIDs reserve disjoint bands for every accepted
+table slot and constraint position. Partition-trigger clone OIDs include the
+durable trigger generation and the complete table-slot stride. Creation and
+replay reject finite OID-generation exhaustion before installing an object.
+These synthesized OID assignments changed with the widened schema format;
+upgrading an existing deployment requires logical dump/restore rather than
+assuming old persisted `oid`/`regclass` values retain their numeric identity.
+
 SQL/JSON includes first-class `jsonpath`/`jsonpath[]`, strict and lax path execution, path operators and functions, SQL-standard query and construction functions, `JSON_TABLE`, record conversion, SQL/JSON aggregates, and JSONB read/write subscripting. These types and expressions cross text/binary wire, COPY, stored-query, PL/pgSQL, WAL, checkpoint, and object-cold recovery boundaries. [SQL/JSON compatibility and limits](docs/sql-json.md).
 
 SQL/XML includes first-class `xml`/`xml[]`, constructors and predicates,

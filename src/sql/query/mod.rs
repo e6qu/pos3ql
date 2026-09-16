@@ -2653,7 +2653,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn sequence_state_by_oid(&self, oid: i32) -> Option<(i64, bool)> {
-        super::catalog::sequence_state_by_oid(self.storage, oid)
+        super::catalog::sequence_state_by_oid(self.storage, oid, self.txid)
     }
 
     fn routine_invocation_cursor(&self) -> Option<usize> {
@@ -7923,6 +7923,22 @@ fn array_subquery_field_type<'q>(
     txid: u32,
     arena: &'q Arena,
 ) -> Result<Option<(ColType, i32)>, SqlError> {
+    let mark = arena.mark();
+    let result = array_subquery_field_type_inner(expression, outer_scope, storage, txid, arena);
+    // Type identities are owned values, not references to the temporary scope.
+    unsafe {
+        arena.rewind_to(mark);
+    }
+    result
+}
+
+fn array_subquery_field_type_inner<'q>(
+    expression: &Expr<'q>,
+    outer_scope: Option<&QueryScope<'q>>,
+    storage: &'q Storage,
+    txid: u32,
+    arena: &'q Arena,
+) -> Result<Option<(ColType, i32)>, SqlError> {
     let Expr::Field { base, field } = expression else {
         return Ok(None);
     };
@@ -7984,6 +8000,21 @@ struct SubqueryResultType {
 }
 
 fn subquery_result_type<'a>(
+    expression: &Expr<'a>,
+    outer_scope: Option<&QueryScope<'a>>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Option<SubqueryResultType>, SqlError> {
+    let mark = arena.mark();
+    let result = subquery_result_type_inner(expression, outer_scope, storage, txid, arena);
+    unsafe {
+        arena.rewind_to(mark);
+    }
+    result
+}
+
+fn subquery_result_type_inner<'a>(
     expression: &Expr<'a>,
     outer_scope: Option<&QueryScope<'a>>,
     storage: &'a Storage,

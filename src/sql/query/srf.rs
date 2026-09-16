@@ -1428,10 +1428,10 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
                 "pg_get_sequence_data(...) argument count"
             ));
         }
-        let oid = match eval_full(args[0], arena, params, row, hooks)? {
-            Datum::Int4(oid) => oid,
-            Datum::Null => return Ok(0),
-            _ => return Err(srf_signature_error(name)),
+        let Some(oid) =
+            crate::sql::eval::sequence_data_oid(eval_full(args[0], arena, params, row, hooks)?)?
+        else {
+            return Ok(0);
         };
         Ok(usize::from(
             hooks
@@ -3426,6 +3426,15 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
     invocations: Option<&super::RoutineInvocationState<'a>>,
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
+    let argument_catalog = super::storage_catalog(storage, arena, txid);
+    let argument_hooks = EvalHooks {
+        catalog: eval_hooks
+            .and_then(|hooks| hooks.catalog)
+            .or(Some(&argument_catalog)),
+        ..eval_hooks.copied().unwrap_or(crate::sql::eval::NO_HOOKS)
+    };
+    // FROM arguments require the same catalog-aware casts as SELECT values.
+    let eval_hooks = Some(&argument_hooks);
     if let Some(functions) = tref.rows_from {
         return rows_from_base_rows_outer(
             functions,
@@ -3530,10 +3539,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             Ok(&*rows)
         });
     }
-    let eval_argument = |argument| match eval_hooks {
-        Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
-        None => crate::sql::eval::eval(argument, arena, params, columns),
-    };
+    let eval_argument =
+        |argument| crate::sql::eval::eval_full(argument, arena, params, columns, &argument_hooks);
     if tref.table.eq_ignore_ascii_case("parse_ident") {
         if !(1..=2).contains(&args.len()) || tref.func_variadic {
             return Err(srf_signature_error(tref.table));
@@ -4104,13 +4111,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "pg_get_sequence_data(...) argument count"
             ));
         }
-        let oid = match eval_argument(args[0])? {
-            Datum::Int4(oid) => oid,
-            Datum::Null => return Ok(&[]),
-            _ => return Err(srf_signature_error(tref.table)),
+        let Some(oid) = crate::sql::eval::sequence_data_oid(eval_argument(args[0])?)? else {
+            return Ok(&[]);
         };
         let Some((last_value, is_called)) =
-            crate::sql::catalog::sequence_state_by_oid(storage, oid)
+            crate::sql::catalog::sequence_state_by_oid(storage, oid, txid)
         else {
             return Ok(&[]);
         };

@@ -103,8 +103,15 @@ logical-replication boundary is specified separately in
   publication membership are also startup-sized and survive object-cold
   recovery above their former 32-slot limits. Catalog builders for
   startup-sized objects allocate row references from the fixed statement arena
-  according to transaction-visible cardinality. Role, type, sequence, ACL, and
-  several inline per-object bounds remain compile-time limits.
+  according to transaction-visible cardinality. Remaining per-object inline
+  bounds and the documented catalog-identity widths still limit accepted scale.
+- Index tuples and partition keys enforce PostgreSQL 18's exact 32-attribute
+  boundaries. The current bounded parser and row format support 64 table
+  constraints of each modeled kind, 64 domain checks, 64 named-composite
+  fields, and 64 LIST-bound values. Those accepted widths are enforced and
+  preserved through record typing, catalogs, WAL, checkpoints, and object-cold
+  recovery; wider PostgreSQL tables, composites, constraint collections, and
+  LIST bounds remain loud program-limit errors rather than partial objects.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

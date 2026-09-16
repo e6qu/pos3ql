@@ -4279,9 +4279,8 @@ pub(crate) fn select_hash_join_plan<'a>(
     if scope.lateral[first_table] || scope.lateral[second_table] {
         return Ok(None);
     }
-    // An inner or cross join may build its fixed hash table from a derived
-    // source. Its encoded rows carry a fixed output schema; probing a derived
-    // source would instead require a second materialization lifetime.
+    // Keep the physical probe's established scan order when only the first
+    // source is derived. Otherwise probe the first source in its own row order.
     let (probe_table, build_table) = if scope.derived[first_table].is_some()
         && scope.derived[second_table].is_none()
         && matches!(join.kind, JoinKind::Inner | JoinKind::Cross)
@@ -4290,9 +4289,6 @@ pub(crate) fn select_hash_join_plan<'a>(
     } else {
         (first_table, second_table)
     };
-    if scope.derived[probe_table].is_some() {
-        return Ok(None);
-    }
     // A partitioned source owns rows in several leaf maps. Its physical row
     // identity is not representable by the hash run's rowid-only payload.
     // Derived sources have no storage slot, so classify that boundary before
@@ -4322,9 +4318,13 @@ pub(crate) fn select_hash_join_plan<'a>(
             <[&[u8]]>::len,
         )
     };
-    if build_capacity == 0 || build_capacity > MAX_HASH_ENTRIES {
+    if build_capacity > MAX_HASH_ENTRIES {
         return Ok(None);
     }
+    // Empty builds still need buckets for NULL-preserving probes. Schema-only
+    // EXPLAIN scopes also have no materialized rows; they select the same
+    // representation without executing a derived query for planning.
+    let build_capacity = build_capacity.max(1);
     let mut key_collations = [Collation::None; 8];
     for (index, &(probe_column, _)) in keys.iter().take(key_count).enumerate() {
         key_collations[index] =
@@ -4800,6 +4800,30 @@ fn scan_source_mode<'a>(
         })
     }
 
+    fn decode_hash_source<'a>(
+        row: BoundRow<'a>,
+        schema: &[ColType],
+        derived: bool,
+        arena: &'a Arena,
+        output: &mut [Datum<'a>; MAX_COLUMNS],
+    ) -> Result<(), SqlError> {
+        match row {
+            BoundRow::Encoded(bytes) if derived => {
+                for (column, value) in output.iter_mut().enumerate().take(schema.len()) {
+                    *value = crate::sql::exec::decode_projected_col_record(bytes, column, arena)?;
+                }
+            }
+            BoundRow::Encoded(bytes) => rowenc::decode(bytes, schema, output)?,
+            BoundRow::Values(values) => {
+                if values.len() > output.len() {
+                    return Err(arena_full());
+                }
+                output[..values.len()].copy_from_slice(values);
+            }
+        }
+        Ok(())
+    }
+
     /// Executes a previously selected two-table hash plan. Its fixed capacity
     /// is a plan invariant: stale statistics that exceed it raise 54000 rather
     /// than changing the execution strategy after query execution begins.
@@ -4990,7 +5014,8 @@ fn scan_source_mode<'a>(
             let mut probe_schema = [ColType::Bool; MAX_COLUMNS];
             probe_def.schema(&mut probe_schema);
             let probe_schema = &probe_schema[..probe_def.n_columns];
-            if let Some(demand) = pax_demand.selected_mask(probe_t)
+            if scope.derived[probe_t].is_none()
+                && let Some(demand) = pax_demand.selected_mask(probe_t)
                 && storage.spill_rows_are_unshadowed(probe_slot)
             {
                 storage.record_relation_scan(txid, probe_slot, None, 0)?;
@@ -5032,16 +5057,13 @@ fn scan_source_mode<'a>(
                                     let entry = &entries[index as usize];
                                     if entry.hash == hash {
                                         let mut build_values = [Datum::Null; MAX_COLUMNS];
-                                        match entry.row {
-                                            BoundRow::Encoded(bytes) => rowenc::decode(
-                                                bytes,
-                                                build_schema,
-                                                &mut build_values,
-                                            )?,
-                                            BoundRow::Values(row_values) => build_values
-                                                [..row_values.len()]
-                                                .copy_from_slice(row_values),
-                                        }
+                                        decode_hash_source(
+                                            entry.row,
+                                            build_schema,
+                                            build_derived_rows.is_some(),
+                                            arena,
+                                            &mut build_values,
+                                        )?;
                                         let mut keys_match = true;
                                         for key in 0..nkeys {
                                             if !compare_datums_collated(
@@ -5141,161 +5163,199 @@ fn scan_source_mode<'a>(
                 }
                 return Ok(true);
             }
-            // Collect and sort the probe table's visible rows to match the
-            // nested loop's output order.
-            storage.record_relation_scan(txid, probe_slot, None, 0)?;
-            let probe_count = storage.visible_row_count(probe_slot, txid)?;
-            let probe_ordered = arena
-                .alloc_slice_with(probe_count.max(1), |_| {
-                    (
-                        0u64,
-                        crate::storage::RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }),
-                    )
-                })
-                .map_err(|_| arena_full())?;
-            let mut probe_fill = 0usize;
-            storage.for_each_row_state(probe_slot, &mut |rowid, state| {
-                if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
-                    probe_ordered[probe_fill] = (rowid, home);
-                    probe_fill += 1;
-                }
-                Ok(ControlFlow::Continue(()))
-            })?;
-            probe_ordered[..probe_fill].sort_unstable_by_key(|(rowid, home)| match home {
-                crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
-                crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
-            });
-            for &(rowid, home) in &probe_ordered[..probe_fill] {
-                storage.record_relation_tuple_read(txid, probe_slot, None)?;
-                let keep = recycled(arena, recycle_rows, None, || -> Result<bool, SqlError> {
-                    check_timeout()?;
-                    let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
-                    let mut buffer = [Datum::Null; MAX_COLUMNS];
-                    rowenc::decode(bytes, probe_schema, &mut buffer)?;
-                    let mut any_null = false;
-                    for i in 0..nkeys {
-                        key_vals[i] = buffer[keys[i].0];
-                        if key_vals[i].is_null() {
-                            any_null = true;
-                            break;
-                        }
+            let mut visit_probe = |rowid: Option<u64>, bytes: &'a [u8]| -> Result<bool, SqlError> {
+                check_timeout()?;
+                let mut buffer = [Datum::Null; MAX_COLUMNS];
+                decode_hash_source(
+                    BoundRow::Encoded(bytes),
+                    probe_schema,
+                    scope.derived[probe_t].is_some(),
+                    arena,
+                    &mut buffer,
+                )?;
+                let mut any_null = false;
+                for i in 0..nkeys {
+                    key_vals[i] = buffer[keys[i].0];
+                    if key_vals[i].is_null() {
+                        any_null = true;
+                        break;
                     }
-                    let mut matched_any = false;
-                    if !any_null {
-                        let hash = hash_key_collated(
-                            &key_vals[..nkeys],
-                            &hash_cols[..nkeys],
-                            &key_collations[..nkeys],
-                        );
-                        let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
-                        while idx != u32::MAX {
-                            let entry = &entries[idx as usize];
-                            if entry.hash == hash {
-                                let mut build_buf = [Datum::Null; MAX_COLUMNS];
-                                match entry.row {
-                                    BoundRow::Encoded(bytes) => {
-                                        rowenc::decode(bytes, build_schema, &mut build_buf)?;
-                                    }
-                                    BoundRow::Values(values) => {
-                                        build_buf[..values.len()].copy_from_slice(values);
-                                    }
+                }
+                let mut matched_any = false;
+                if !any_null {
+                    let hash = hash_key_collated(
+                        &key_vals[..nkeys],
+                        &hash_cols[..nkeys],
+                        &key_collations[..nkeys],
+                    );
+                    let mut idx = buckets[(hash as usize) & (buckets_len - 1)];
+                    while idx != u32::MAX {
+                        let entry = &entries[idx as usize];
+                        if entry.hash == hash {
+                            let mut build_buf = [Datum::Null; MAX_COLUMNS];
+                            decode_hash_source(
+                                entry.row,
+                                build_schema,
+                                build_derived_rows.is_some(),
+                                arena,
+                                &mut build_buf,
+                            )?;
+                            let mut matched = true;
+                            for i in 0..nkeys {
+                                if !compare_datums_collated(
+                                    storage,
+                                    key_collations[i],
+                                    &build_buf[keys[i].1],
+                                    &key_vals[i],
+                                )?
+                                .is_eq()
+                                {
+                                    matched = false;
+                                    break;
                                 }
-                                let mut matched = true;
-                                for i in 0..nkeys {
-                                    if !compare_datums_collated(
-                                        storage,
-                                        key_collations[i],
-                                        &build_buf[keys[i].1],
-                                        &key_vals[i],
-                                    )?
-                                    .is_eq()
-                                    {
-                                        matched = false;
-                                        break;
-                                    }
-                                }
-                                if matched {
-                                    let bound = &mut [None::<BoundRow>, None];
-                                    let bound_rowids = &mut [None, None];
-                                    bound[probe_t] = Some(BoundRow::Encoded(bytes));
-                                    bound_rowids[probe_t] = Some(rowid);
-                                    bound[build_t] = Some(entry.row);
-                                    bound_rowids[build_t] = entry.rowid;
-                                    let row = assemble(
-                                        storage,
-                                        txid,
-                                        scope,
-                                        bound,
-                                        bound_rowids,
-                                        order,
-                                        2,
-                                        decode_buffers,
-                                        arena,
-                                    )?;
-                                    if let Some(on) = on {
-                                        let chained = Chained { inner: &row, outer };
-                                        match eval_full(on, arena, params, &chained, hooks)? {
-                                            Datum::Bool(true) => {}
-                                            Datum::Bool(false) | Datum::Null => {
-                                                idx = next[idx as usize];
-                                                continue;
-                                            }
-                                            _ => {
-                                                return Err(sql_err!(
-                                                    sqlstate::DATATYPE_MISMATCH,
-                                                    "argument of JOIN/ON must be type boolean"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    matched_any = true;
-                                    if let Some(w) = where_clause {
-                                        let chained = Chained { inner: &row, outer };
-                                        if !where_passes(w, arena, params, &chained, hooks)? {
+                            }
+                            if matched {
+                                let bound = &mut [None::<BoundRow>, None];
+                                let bound_rowids = &mut [None, None];
+                                bound[probe_t] = Some(BoundRow::Encoded(bytes));
+                                bound_rowids[probe_t] = rowid;
+                                bound[build_t] = Some(entry.row);
+                                bound_rowids[build_t] = entry.rowid;
+                                let row = assemble(
+                                    storage,
+                                    txid,
+                                    scope,
+                                    bound,
+                                    bound_rowids,
+                                    order,
+                                    2,
+                                    decode_buffers,
+                                    arena,
+                                )?;
+                                if let Some(on) = on {
+                                    let chained = Chained { inner: &row, outer };
+                                    match eval_full(on, arena, params, &chained, hooks)? {
+                                        Datum::Bool(true) => {}
+                                        Datum::Bool(false) | Datum::Null => {
                                             idx = next[idx as usize];
                                             continue;
                                         }
-                                    }
-                                    if !f(&row)? {
-                                        return Ok(false);
+                                        _ => {
+                                            return Err(sql_err!(
+                                                sqlstate::DATATYPE_MISMATCH,
+                                                "argument of JOIN/ON must be type boolean"
+                                            ));
+                                        }
                                     }
                                 }
-                            }
-                            idx = next[idx as usize];
-                        }
-                    }
-                    // LEFT JOIN: no ON-passing match (NULL key, or all candidates
-                    // rejected) → preserve the outer row with NULLs for the inner.
-                    if !matched_any && plan.preserves_probe_rows {
-                        let bound = &mut [None::<BoundRow>, None];
-                        let bound_rowids = &mut [None, None];
-                        bound[probe_t] = Some(BoundRow::Encoded(bytes));
-                        bound_rowids[probe_t] = Some(rowid);
-                        let row = assemble(
-                            storage,
-                            txid,
-                            scope,
-                            bound,
-                            bound_rowids,
-                            order,
-                            2,
-                            decode_buffers,
-                            arena,
-                        )?;
-                        if let Some(w) = where_clause {
-                            let chained = Chained { inner: &row, outer };
-                            if !where_passes(w, arena, params, &chained, hooks)? {
-                                return Ok(true);
+                                matched_any = true;
+                                if let Some(w) = where_clause {
+                                    let chained = Chained { inner: &row, outer };
+                                    if !where_passes(w, arena, params, &chained, hooks)? {
+                                        idx = next[idx as usize];
+                                        continue;
+                                    }
+                                }
+                                if !f(&row)? {
+                                    return Ok(false);
+                                }
                             }
                         }
-                        if !f(&row)? {
-                            return Ok(false);
+                        idx = next[idx as usize];
+                    }
+                }
+                // LEFT JOIN: no ON-passing match (NULL key, or all candidates
+                // rejected) → preserve the outer row with NULLs for the inner.
+                if !matched_any && plan.preserves_probe_rows {
+                    let bound = &mut [None::<BoundRow>, None];
+                    let bound_rowids = &mut [None, None];
+                    bound[probe_t] = Some(BoundRow::Encoded(bytes));
+                    bound_rowids[probe_t] = rowid;
+                    let row = assemble(
+                        storage,
+                        txid,
+                        scope,
+                        bound,
+                        bound_rowids,
+                        order,
+                        2,
+                        decode_buffers,
+                        arena,
+                    )?;
+                    if let Some(w) = where_clause {
+                        let chained = Chained { inner: &row, outer };
+                        if !where_passes(w, arena, params, &chained, hooks)? {
+                            return Ok(true);
                         }
                     }
-                    Ok(true)
+                    if !f(&row)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
+            if let Some(run) = scope.external_runs[probe_t] {
+                let mut reader = storage.external_run_reader()?;
+                storage
+                    .with_block_store(|blocks| reader.start(blocks, run))
+                    .expect("external run has a block store")?;
+                while let Some(bytes) = reader.row() {
+                    let keep = recycled(arena, recycle_rows, None, || {
+                        // The reader replaces its buffer on advance; any value
+                        // retained by the callback must borrow statement storage.
+                        let owned = arena.alloc_slice_copy(bytes).map_err(|_| arena_full())?;
+                        visit_probe(None, owned)
+                    })?;
+                    if !keep {
+                        break;
+                    }
+                    storage
+                        .with_block_store(|blocks| reader.advance(blocks))
+                        .expect("external run has a block store")?;
+                }
+            } else if let Some(rows) = scope.derived[probe_t] {
+                for &bytes in rows {
+                    if !recycled(arena, recycle_rows, None, || visit_probe(None, bytes))? {
+                        break;
+                    }
+                }
+            } else {
+                // Collect and sort the probe table's visible rows to match the
+                // nested loop's output order.
+                storage.record_relation_scan(txid, probe_slot, None, 0)?;
+                let probe_count = storage.visible_row_count(probe_slot, txid)?;
+                let probe_ordered = arena
+                    .alloc_slice_with(probe_count.max(1), |_| {
+                        (
+                            0u64,
+                            crate::storage::RowHome::Heap(crate::storage::RowLoc {
+                                offset: 0,
+                                len: 0,
+                            }),
+                        )
+                    })
+                    .map_err(|_| arena_full())?;
+                let mut probe_fill = 0usize;
+                storage.for_each_row_state(probe_slot, &mut |rowid, state| {
+                    if let Some(home) = storage.visible_row_home(probe_slot, rowid, state, txid)? {
+                        probe_ordered[probe_fill] = (rowid, home);
+                        probe_fill += 1;
+                    }
+                    Ok(ControlFlow::Continue(()))
                 })?;
-                if !keep {
-                    break;
+                probe_ordered[..probe_fill].sort_unstable_by_key(|(rowid, home)| match home {
+                    crate::storage::RowHome::Spilled { .. } => (0u8, *rowid, 0u32),
+                    crate::storage::RowHome::Heap(loc) => (1u8, 0, loc.offset),
+                });
+
+                for &(rowid, home) in &probe_ordered[..probe_fill] {
+                    storage.record_relation_tuple_read(txid, probe_slot, None)?;
+                    if !recycled(arena, recycle_rows, None, || {
+                        let bytes = storage.row_bytes(probe_slot, rowid, home, arena)?;
+                        visit_probe(Some(rowid), bytes)
+                    })? {
+                        break;
+                    }
                 }
             }
             Ok(true)

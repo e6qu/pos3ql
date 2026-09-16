@@ -18278,6 +18278,46 @@ fn decode_wal_routine_signature(
     Ok((arguments, count))
 }
 
+#[inline(never)]
+fn apply_prepared_table_wal_payload(
+    storage: &mut Storage,
+    prepared: &mut two_phase::PreparedTransactions,
+    prepared_slot: usize,
+    transaction_id: u32,
+    payload: &[u8],
+) -> Result<(), SqlError> {
+    let definition = crate::wal::decode_table_payload(payload).ok_or_else(|| {
+        sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "prepared transaction table WAL is corrupt"
+        )
+    })?;
+    if storage
+        .table_access_method_name(definition.access_method, transaction_id)
+        .is_none()
+    {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "prepared transaction references an unknown table access method"
+        ));
+    }
+    if storage
+        .find_visible(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            transaction_id,
+        )
+        .is_none()
+    {
+        let table = storage.create_table_in(definition, transaction_id)?;
+        prepared
+            .slot_mut(prepared_slot)
+            .transaction
+            .record_ddl(DdlUndo::Created(table as u32))?;
+    }
+    Ok(())
+}
+
 fn replay_transaction_batches(
     storage: &mut Storage,
     prepared: &mut two_phase::PreparedTransactions,
@@ -18362,31 +18402,13 @@ fn replay_transaction_batches(
                             "prepared transaction WAL is corrupt"
                         )
                     })? {
-                        WalOp::CreateTable(definition) => {
-                            if storage
-                                .table_access_method_name(definition.access_method, transaction_id)
-                                .is_none()
-                            {
-                                return Err(sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "prepared transaction references an unknown table access method"
-                                ));
-                            }
-                            if storage
-                                .find_visible(
-                                    definition.schema.as_str(),
-                                    definition.name.as_str(),
-                                    transaction_id,
-                                )
-                                .is_none()
-                            {
-                                let table = storage.create_table_in(definition, transaction_id)?;
-                                prepared
-                                    .slot_mut(slot)
-                                    .transaction
-                                    .record_ddl(DdlUndo::Created(table as u32))?;
-                            }
-                        }
+                        WalOp::RestoreTable(payload) => apply_prepared_table_wal_payload(
+                            storage,
+                            prepared,
+                            slot,
+                            transaction_id,
+                            payload,
+                        )?,
                         WalOp::CreateSequence {
                             schema,
                             name,
@@ -18638,6 +18660,32 @@ fn replay_transaction_batches(
             sqlstate::DATA_EXCEPTION,
             "recovery input ends inside a transaction"
         ));
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn apply_table_wal_payload(storage: &mut Storage, payload: &[u8]) -> Result<(), SqlError> {
+    let definition = crate::wal::decode_table_payload(payload).ok_or_else(|| {
+        sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "journal table definition is corrupt"
+        )
+    })?;
+    // A journal written before its schema existed cannot occur going forward
+    // (CreateSchema precedes in LSN order), but pre-schema WAL names only
+    // public, which always exists.
+    if storage
+        .table_access_method_name(definition.access_method, 0)
+        .is_none()
+    {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "journal table references an unknown access method"
+        ));
+    }
+    if !storage.complete_replay_table_rewrite(definition)? {
+        storage.create_table(definition)?;
     }
     Ok(())
 }
@@ -19121,22 +19169,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 ));
             }
         }
-        WalOp::CreateTable(def) => {
-            // A journal written before its schema existed cannot occur going
-            // forward (CreateSchema precedes in LSN order), but a pre-schema
-            // journal names only public, which always exists.
-            if storage
-                .table_access_method_name(def.access_method, 0)
-                .is_none()
-            {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "journal table references an unknown access method"
-                ));
-            }
-            if !storage.complete_replay_table_rewrite(def)? {
-                storage.create_table(def)?;
-            }
+        WalOp::RestoreTable(payload) => apply_table_wal_payload(storage, payload)?,
+        WalOp::CreateTable(_) => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal decoder returned an unstaged table definition"
+            ));
         }
         WalOp::BeginTableRewrite {
             previous_schema,
@@ -20081,7 +20119,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.apply_sequence_advance(schema, name, last, is_called);
         }
         WalOp::ResetUnloggedRelations => storage.reset_unlogged_relations()?,
-        WalOp::CreateDomain(def) => {
+        WalOp::RestoreDomain(payload) => {
+            let def = crate::wal::decode_domain_payload(payload).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "journal domain definition is corrupt"
+                )
+            })?;
             // An ALTER replays as a redefinition: redefine in place if it
             // exists, else create it committed (txid 0).
             let spec = crate::storage::DomainSpec {
@@ -20100,6 +20144,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             } else {
                 storage.create_domain(def.schema, def.name, spec, 0)?;
             }
+        }
+        WalOp::CreateDomain(_) => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "journal decoder returned an unstaged domain definition"
+            ));
         }
         WalOp::DropDomain { schema, name } => {
             if let Some(slot) = storage.drop_domain(schema, name, 0)? {

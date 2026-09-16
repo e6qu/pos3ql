@@ -8917,6 +8917,39 @@ pub(crate) fn object_acl_by_address<'a>(
     Ok(None)
 }
 
+/// Retains only the owned relation definition for schema-only resolution.
+/// Catalog rows and their strings cannot escape the temporary suffix.
+pub(crate) fn synthesize_definition<'a>(
+    storage: &Storage,
+    qualifier: Option<&str>,
+    name: &'a str,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = arena.alloc(TableDef::empty()).map_err(|_| arena_full())?;
+    let scratch_mark = arena.mark();
+    let result = synthesize(storage, qualifier, name, txid, arena);
+    let hidden_columns = match result {
+        Ok(table) => {
+            *definition = *table.def;
+            table.hidden_columns
+        }
+        Err(error) => {
+            // No result escapes on error, and the caller's inputs and output
+            // definition are below the scratch frontier.
+            unsafe { arena.rewind_to(scratch_mark) };
+            return Err(error);
+        }
+    };
+    // TableDef owns every field; only row data referred into this suffix.
+    unsafe { arena.rewind_to(scratch_mark) };
+    Ok(SynthTable {
+        def: definition,
+        rows: &[],
+        hidden_columns,
+    })
+}
+
 /// Builds the requested catalog relation. `qualifier` is the schema (or
 /// None). Allocates rows in `arena`.
 pub fn synthesize<'a>(
@@ -10610,19 +10643,19 @@ pub(crate) fn role_oid_by_written(storage: &Storage, txid: u32, written: &str) -
 
 /// Index relations get OIDs from a separate range so they never collide with
 /// table OIDs; `pos` is the index's position within its table's index list.
-const FIRST_INDEX_OID: i32 = 90_000;
-const FIRST_EXPLICIT_INDEX_OID: i32 = 190_000;
-const MAX_INDEXES_PER_TABLE: i32 = 64;
 pub(crate) fn index_oid(slot: usize, pos: usize) -> i32 {
-    FIRST_INDEX_OID + slot as i32 * MAX_INDEXES_PER_TABLE + pos as i32
+    assert!(slot < crate::storage::MAX_TABLE_TYPE_OID_SLOTS);
+    assert!(pos < crate::storage::MAX_VALUE_ENFORCERS);
+    crate::storage::FIRST_IMPLICIT_INDEX_OID
+        + (slot * crate::storage::MAX_VALUE_ENFORCERS + pos) as i32
 }
 
 pub(crate) fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
-    FIRST_EXPLICIT_INDEX_OID
-        + i32::try_from(index.created_at).unwrap_or(i32::MAX - FIRST_EXPLICIT_INDEX_OID)
+    assert!((1..=crate::storage::MAX_INDEX_OID_GENERATION).contains(&index.created_at));
+    crate::storage::FIRST_EXPLICIT_INDEX_OID + index.created_at as i32
 }
 
-/// Sequence relations get OIDs from their own range, above the index range.
+/// Sequence relation OIDs occupy their startup-validated band below views.
 const FIRST_SEQUENCE_OID: i32 = 95_000;
 pub(crate) fn sequence_oid(slot: usize) -> i32 {
     FIRST_SEQUENCE_OID + slot as i32
@@ -10659,11 +10692,13 @@ pub(crate) fn extension_config_relation_by_oid(
     None
 }
 
-pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32) -> Option<(i64, bool)> {
-    storage
-        .sequences_with_slots()
-        .find(|(slot, _)| sequence_oid(*slot) == oid)
-        .map(|(_, sequence)| (sequence.last_value.get(), sequence.is_called.get()))
+pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32, txid: u32) -> Option<(i64, bool)> {
+    let slot = usize::try_from(oid.checked_sub(FIRST_SEQUENCE_OID)?).ok()?;
+    if slot >= storage.sequence_count() || !storage.sequence_slot_visible_to(slot, txid) {
+        return None;
+    }
+    let sequence = storage.sequence_for(slot, txid);
+    Some((sequence.last_value.get(), sequence.is_called.get()))
 }
 
 /// Plain views get OIDs from their own range so `'view'::regclass` resolves and
@@ -14797,11 +14832,11 @@ struct FkInfo {
     name: StackStr<64>,
 }
 
-pub(crate) const FIRST_FK_OID: i32 = 200_000;
-pub(crate) const FIRST_CHECK_OID: i32 = 300_000;
-pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
-pub(crate) const FIRST_NOT_NULL_OID: i32 = 450_000;
-pub(crate) const FIRST_DETACHED_PARTITION_CHECK_OID: i32 = 475_000;
+pub(crate) const FIRST_FK_OID: i32 = 10_000_000;
+pub(crate) const FIRST_CHECK_OID: i32 = 20_000_000;
+pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 30_000_000;
+pub(crate) const FIRST_NOT_NULL_OID: i32 = 40_000_000;
+pub(crate) const FIRST_DETACHED_PARTITION_CHECK_OID: i32 = 50_000_000;
 
 /// The current catalog OID of a named table constraint. Constraint comments
 /// retain the table-slot/name identity because index and check positions are
@@ -14848,7 +14883,9 @@ pub(crate) fn table_constraint_oid(
         .enumerate()
         .find(|(_, constraint)| constraint.name.as_str() == name)
     {
-        return Some(FIRST_FK_OID + table_slot as i32 * MAX_INDEXES_PER_TABLE + index as i32);
+        return Some(
+            FIRST_FK_OID + table_slot as i32 * crate::storage::MAX_FKEYS as i32 + index as i32,
+        );
     }
     table
         .columns()
@@ -14936,7 +14973,7 @@ fn visit_fkeys(storage: &Storage, txid: u32, mut visit: impl FnMut(FkInfo)) {
                 continue;
             };
             visit(FkInfo {
-                oid: FIRST_FK_OID + slot as i32 * MAX_INDEXES_PER_TABLE + i as i32,
+                oid: FIRST_FK_OID + slot as i32 * crate::storage::MAX_FKEYS as i32 + i as i32,
                 conrelid,
                 confrelid: table_oid(storage, pslot),
                 child_slot: slot,
@@ -15000,7 +15037,7 @@ fn inherited_foreign_key_parent_oid(
                 && parent.on_update == child.on_update
         })
         .map_or(0, |index| {
-            FIRST_FK_OID + parent_slot as i32 * MAX_INDEXES_PER_TABLE + index as i32
+            FIRST_FK_OID + parent_slot as i32 * crate::storage::MAX_FKEYS as i32 + index as i32
         })
 }
 
@@ -15899,10 +15936,28 @@ fn finish_with_hidden<'a>(
         column.collation = crate::sql::ast::Collation::None;
     }
     let def = arena.alloc(definition).map_err(|_| arena_full())?;
-    let rows = arena.alloc_slice_copy(rows).map_err(|_| arena_full())?;
+    let typed = arena
+        .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let width = def.n_columns + hidden.len();
+    for (target, source) in typed.iter_mut().zip(rows) {
+        if source.len() != width {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid catalog row width"
+            ));
+        }
+        let mut values = [Datum::Null; MAX_COLUMNS];
+        for (index, value) in source.iter().copied().enumerate() {
+            // Tagged derived rows must carry the advertised representation,
+            // notably oid rather than int4, before hashing or wire encoding.
+            values[index] = super::eval::cast_to(value, def.columns[index].ctype, arena)?;
+        }
+        *target = row(&values[..width], arena)?;
+    }
     Ok(SynthTable {
         def,
-        rows: &*rows,
+        rows: typed,
         hidden_columns: hidden.len(),
     })
 }
@@ -18723,10 +18778,13 @@ fn pg_partitioned_table<'a>(
         "pg_partitioned_table",
         &[
             ("partrelid", ColType::Int4),
-            ("partstrat", ColType::Bpchar),
-            ("partattrs", ColType::Text),
-            ("partclass", ColType::Array(super::types::ArrElem::Oid)),
-            ("partexprs", ColType::Text),
+            ("partstrat", ColType::Char),
+            ("partnatts", ColType::Int2),
+            ("partdefid", ColType::Int4),
+            ("partattrs", ColType::Int2Vector),
+            ("partclass", ColType::OidVector),
+            ("partcollation", ColType::OidVector),
+            ("partexprs", ColType::PgNodeTree),
         ],
     );
     let rows = catalog_rows(
@@ -18754,25 +18812,54 @@ fn pg_partitioned_table<'a>(
         if n == rows.len() {
             return Err(catalog_capacity_exceeded("pg_partitioned_table"));
         }
-        let strategy = match strategy {
-            PartitionStrategy::Range => "r",
-            PartitionStrategy::List => "l",
-            PartitionStrategy::Hash => "h",
+        let strategy_code = match strategy {
+            PartitionStrategy::Range => b'r',
+            PartitionStrategy::List => b'l',
+            PartitionStrategy::Hash => b'h',
         };
-        let mut attributes = StackStr::<128>::new();
-        use core::fmt::Write;
-        for (i, key) in keys[..usize::from(n_keys)].iter().enumerate() {
-            if i != 0 {
-                let _ = write!(attributes, " ");
-            }
-            let _ = write!(attributes, "{}", key + 1);
+        let key_count = usize::from(n_keys);
+        let table = storage.table_def(slot, txid);
+        let mut operator_classes = [0i32; crate::storage::MAX_PARTITION_KEYS];
+        let mut collations = [0i32; crate::storage::MAX_PARTITION_KEYS];
+        for (position, key) in keys[..key_count].iter().copied().enumerate() {
+            let column = &table.columns()[usize::from(key)];
+            operator_classes[position] = match strategy {
+                PartitionStrategy::Hash => {
+                    crate::sql::types::HashOperatorClass::for_type(column.ctype)
+                        .map_or(0, crate::sql::types::HashOperatorClass::oid)
+                }
+                PartitionStrategy::Range | PartitionStrategy::List => {
+                    crate::sql::types::BtreeOperatorClass::for_type(column.ctype)
+                        .map_or(0, crate::sql::types::BtreeOperatorClass::oid)
+                }
+            };
+            collations[position] = column.collation.oid();
         }
+        let default_partition = (0..storage.table_count())
+            .find(|child| {
+                storage.table_slot_visible_to(*child, txid)
+                    && storage
+                        .table_def(*child, txid)
+                        .partition
+                        .attachment
+                        .is_some_and(|attachment| {
+                            usize::from(attachment.parent) == slot
+                                && matches!(
+                                    attachment.bound,
+                                    crate::storage::PartitionBound::Default
+                                )
+                        })
+            })
+            .map_or(0, |child| table_oid(storage, child));
         rows[n] = row(
             &[
                 Datum::Int4(table_oid(storage, slot)),
-                text(strategy, arena)?,
-                text(attributes.as_str(), arena)?,
-                Datum::Null,
+                Datum::Char(strategy_code),
+                Datum::Int2(i16::from(n_keys)),
+                Datum::Int4(default_partition),
+                int2vector(&keys[..key_count], arena)?,
+                oidvector(&operator_classes[..key_count], arena)?,
+                oidvector(&collations[..key_count], arena)?,
                 Datum::Null,
             ],
             arena,
@@ -19788,38 +19875,37 @@ fn pg_constraint<'a>(
     let def = def_of(
         "pg_constraint",
         &[
-            ("oid", ColType::Int4),
-            ("conname", ColType::Text),
-            ("conrelid", ColType::Int4),
-            ("contypid", ColType::Int4),
-            ("contype", ColType::Bpchar),
-            ("conparentid", ColType::Int4),
-            ("conindid", ColType::Int4),
-            ("confrelid", ColType::Int4),
+            ("oid", ColType::Oid),
+            ("conname", ColType::Name),
+            ("connamespace", ColType::Oid),
+            ("contype", ColType::Char),
             ("condeferrable", ColType::Bool),
             ("condeferred", ColType::Bool),
             ("conenforced", ColType::Bool),
             ("convalidated", ColType::Bool),
-            ("conperiod", ColType::Bool),
-            ("confupdtype", ColType::Bpchar),
-            ("confdeltype", ColType::Bpchar),
-            ("conkey", ColType::Array(super::types::ArrElem::Int4)),
-            ("confkey", ColType::Array(super::types::ArrElem::Int4)),
-            ("tableoid", ColType::Int4),
-            ("connamespace", ColType::Int4),
-            ("confmatchtype", ColType::Bpchar),
+            ("conrelid", ColType::Oid),
+            ("contypid", ColType::Oid),
+            ("conindid", ColType::Oid),
+            ("conparentid", ColType::Oid),
+            ("confrelid", ColType::Oid),
+            ("confupdtype", ColType::Char),
+            ("confdeltype", ColType::Char),
+            ("confmatchtype", ColType::Char),
             ("conislocal", ColType::Bool),
-            ("coninhcount", ColType::Int4),
+            ("coninhcount", ColType::Int2),
             ("connoinherit", ColType::Bool),
-            ("conpfeqop", ColType::Array(super::types::ArrElem::Int4)),
-            ("conppeqop", ColType::Array(super::types::ArrElem::Int4)),
-            ("conffeqop", ColType::Array(super::types::ArrElem::Int4)),
+            ("conperiod", ColType::Bool),
+            ("conkey", ColType::Array(super::types::ArrElem::Int2)),
+            ("confkey", ColType::Array(super::types::ArrElem::Int2)),
+            ("conpfeqop", ColType::Array(super::types::ArrElem::Oid)),
+            ("conppeqop", ColType::Array(super::types::ArrElem::Oid)),
+            ("conffeqop", ColType::Array(super::types::ArrElem::Oid)),
             (
                 "confdelsetcols",
-                ColType::Array(super::types::ArrElem::Int4),
+                ColType::Array(super::types::ArrElem::Int2),
             ),
-            ("conexclop", ColType::Array(super::types::ArrElem::Int4)),
-            ("conbin", ColType::Text),
+            ("conexclop", ColType::Array(super::types::ArrElem::Oid)),
+            ("conbin", ColType::PgNodeTree),
         ],
     );
     let indexes = collect_indexes(storage, txid, arena)?;
@@ -20293,7 +20379,24 @@ fn pg_constraint<'a>(
             n += 1;
         }
     }
-    finish(def, &out[..n], arena)
+    // PostgreSQL 18 column order and types:
+    // https://www.postgresql.org/docs/18/catalog-pg-constraint.html
+    let compatible = arena
+        .alloc_slice_with(n, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    const SOURCE_COLUMNS: [usize; 28] = [
+        0, 1, 18, 4, 8, 9, 10, 11, 2, 3, 6, 5, 7, 13, 14, 19, 20, 21, 22, 12, 15, 16, 23, 24, 25,
+        26, 27, 28,
+    ];
+    for (target, source) in compatible.iter_mut().zip(&out[..n]) {
+        let mut values = [Datum::Null; 29];
+        for (column, ((_, ctype), original)) in def.columns.iter().zip(SOURCE_COLUMNS).enumerate() {
+            values[column] = super::eval::cast_to(source[original], *ctype, arena)?;
+        }
+        values[28] = super::eval::cast_to(source[17], ColType::Oid, arena)?;
+        *target = row(&values, arena)?;
+    }
+    finish_with_hidden(def, &[("tableoid", ColType::Oid)], compatible, arena)
 }
 
 fn pg_rewrite<'a>(
@@ -22376,11 +22479,10 @@ fn pg_attrdef<'a>(
     let def = def_of(
         "pg_attrdef",
         &[
-            ("oid", ColType::Int4),
-            ("adrelid", ColType::Int4),
-            ("adnum", ColType::Int4),
-            ("adbin", ColType::Text),
-            ("tableoid", ColType::Int4),
+            ("oid", ColType::Oid),
+            ("adrelid", ColType::Oid),
+            ("adnum", ColType::Int2),
+            ("adbin", ColType::PgNodeTree),
         ],
     );
     // A row per column carrying a DEFAULT — the raw source text in `adbin`.
@@ -22427,11 +22529,11 @@ fn pg_attrdef<'a>(
             }
             out[n] = row(
                 &[
-                    Datum::Int4(relid * 100 + ci as i32 + 1), // synthetic adbin oid
-                    Datum::Int4(relid),
-                    Datum::Int4(ci as i32 + 1),
+                    Datum::Oid((relid * 100 + ci as i32 + 1) as u32), // synthetic adbin oid
+                    Datum::Oid(relid as u32),
+                    Datum::Int2(ci as i16 + 1),
                     text(text_expr.as_str(), arena)?,
-                    Datum::Int4(2604),
+                    Datum::Oid(2604),
                 ],
                 arena,
             )?;
@@ -22451,18 +22553,19 @@ fn pg_attrdef<'a>(
             let relid = view_oid(slot);
             out[n] = row(
                 &[
-                    Datum::Int4(relid * 100 + column as i32 + 1),
-                    Datum::Int4(relid),
-                    Datum::Int4(column as i32 + 1),
+                    Datum::Oid((relid * 100 + column as i32 + 1) as u32),
+                    Datum::Oid(relid as u32),
+                    Datum::Int2(column as i16 + 1),
                     text(default.as_str(), arena)?,
-                    Datum::Int4(2604),
+                    Datum::Oid(2604),
                 ],
                 arena,
             )?;
             n += 1;
         }
     }
-    finish(def, &out[..n], arena)
+    // https://www.postgresql.org/docs/18/catalog-pg-attrdef.html
+    finish_with_hidden(def, &[("tableoid", ColType::Oid)], &out[..n], arena)
 }
 
 fn catalog_routine_result_oid(
@@ -25357,18 +25460,16 @@ fn pg_amproc<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000;
-
 fn partition_trigger_oid(
     trigger: &crate::storage::TriggerDef,
     table: usize,
 ) -> Result<i32, SqlError> {
     let ordinal = trigger
         .created_at
-        .checked_mul(u64::from(u16::MAX) + 1)
+        .checked_mul(crate::storage::MAX_TABLE_TYPE_OID_SLOTS as u64)
         .and_then(|value| value.checked_add(table as u64))
         .and_then(|value| i32::try_from(value).ok())
-        .and_then(|value| FIRST_PARTITION_TRIGGER_OID.checked_add(value))
+        .and_then(|value| crate::storage::FIRST_PARTITION_TRIGGER_OID.checked_add(value))
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -25455,8 +25556,9 @@ fn pg_trigger<'a>(
                         && index.columns[..index.n_cols] == *foreign_key.parent_cols()
                 })
                 .map_or(0, |index| index.oid);
-            let constraint_oid =
-                FIRST_FK_OID + child_slot as i32 * MAX_INDEXES_PER_TABLE + foreign_key_index as i32;
+            let constraint_oid = FIRST_FK_OID
+                + child_slot as i32 * crate::storage::MAX_FKEYS as i32
+                + foreign_key_index as i32;
             for ordinal in 0..4 {
                 if count == rows.len() {
                     return Err(catalog_capacity_exceeded("pg_trigger"));

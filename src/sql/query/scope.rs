@@ -737,7 +737,17 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
-        let synth = crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, arena)?;
+        let synth = if materialize {
+            crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, arena)?
+        } else {
+            crate::sql::catalog::synthesize_definition(
+                storage,
+                tref.schema,
+                tref.table,
+                txid,
+                arena,
+            )?
+        };
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {
             return Err(sql_err!(
@@ -770,7 +780,21 @@ impl<'d> QueryScope<'d> {
                 .alloc_slice_with(synth.rows.len(), |_| EMPTY)
                 .map_err(|_| arena_full())?;
             for (i, r) in synth.rows.iter().enumerate() {
-                encoded[i] = crate::sql::exec::encode_projected_pub(r, arena)?;
+                if r.len() > MAX_COLUMNS {
+                    return Err(arena_full());
+                }
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                for (column, value) in r.iter().copied().enumerate() {
+                    // Catalog builders may compute identifiers as signed
+                    // integers, but tagged rows must carry the advertised oid
+                    // representation before joins and expression evaluation.
+                    values[column] = if synth.def.columns[column].ctype == ColType::Oid {
+                        super::super::eval::cast_to(value, ColType::Oid, arena)?
+                    } else {
+                        value
+                    };
+                }
+                encoded[i] = crate::sql::exec::encode_projected_pub(&values[..r.len()], arena)?;
             }
             encoded
         } else {

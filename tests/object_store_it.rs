@@ -60,6 +60,7 @@ fn engine_config(run: &str, data_dir: &str) -> Option<Config> {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     config.data_dir = dir.to_str().unwrap().to_string();
+    config.max_connections = 8;
     config.memtable_bytes = 1 << 20;
     config.max_tables = 8;
     config.max_views = 8;
@@ -89,6 +90,10 @@ fn bucket_exists_and_is_listable() {
 }
 
 fn run_sql(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> String {
+    // Request allocations are released together; charge their peak against
+    // the engine's remaining startup budget, not each successive request.
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buf = FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
     let mut txn = pos3ql::sql::txn::TxnState::new(budget, 1024).unwrap();

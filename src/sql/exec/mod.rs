@@ -781,7 +781,7 @@ fn create_table_kind(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(txn.txid, lsn, &WalOp::CreateTable(def))
+                wal.stage(txn.txid, lsn, &WalOp::CreateTable(&def))
             };
             if let Err(e) = wal_result {
                 // Nothing reached the journal; undo the in-memory apply.
@@ -2828,10 +2828,16 @@ fn resolve_partition_scheme(
     strategy: PartitionStrategy,
     columns: &[&str],
 ) -> Result<crate::storage::PartitionScheme, SqlError> {
-    if columns.is_empty() || columns.len() > crate::storage::MAX_PARTITION_KEYS {
+    if columns.is_empty() {
         return Err(sql_err!(
             sqlstate::INVALID_OBJECT_DEFINITION,
-            "partition key must contain between 1 and {} columns",
+            "partition key must contain at least one column"
+        ));
+    }
+    if columns.len() > crate::storage::MAX_PARTITION_KEYS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "cannot partition using more than {} columns",
             crate::storage::MAX_PARTITION_KEYS
         ));
     }
@@ -4037,6 +4043,10 @@ fn next_auto_value<'x>(
 /// as the conflict; `Columns` restricts the conflict to rows equal on exactly
 /// this column set, so a violation of a *different* unique falls through to a
 /// normal 23505 — matching PostgreSQL, which uses the arbiter index alone.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the fixed index-column array is bounded and cannot allocate after startup"
+)]
 enum Arbiter<'a> {
     Any,
     Keys {
@@ -19556,6 +19566,7 @@ where
     'result: 'query,
 {
     let mut count = 0usize;
+    let count_mark = query_arena.mark();
     {
         let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
         super::query::select_into_rows_recycling(
@@ -19572,6 +19583,9 @@ where
             },
         )?;
     }
+    // The dry pass retains only the row count; AST and caller scope precede
+    // the mark, and no query value escapes its callback.
+    unsafe { query_arena.rewind_to(count_mark) };
     const EMPTY: &[u8] = &[];
     let rows = result_arena
         .alloc_slice_with(count, |_| EMPTY)
@@ -22630,6 +22644,7 @@ where
     'result: 'query,
 {
     let mut count = 0usize;
+    let count_mark = query_arena.mark();
     {
         let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
         super::query::select_into_rows_recycling(
@@ -22652,6 +22667,8 @@ where
             },
         )?;
     }
+    // Only the count survives this pass; all caller-owned inputs precede it.
+    unsafe { query_arena.rewind_to(count_mark) };
     let rows = result_arena
         .alloc_slice_with(count, |_| Datum::Null)
         .map_err(|_| super::query::arena_full_pub())?;
@@ -22791,6 +22808,7 @@ where
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns)?;
     let mut count = 0usize;
+    let count_mark = query_arena.mark();
     let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
     super::query::select_into_rows_recycling(
         storage,
@@ -22811,6 +22829,9 @@ where
             Ok(())
         },
     )?;
+    // Preserve the described column names below the mark, but not the dry
+    // execution's temporary scope or row values.
+    unsafe { query_arena.rewind_to(count_mark) };
     let rows = result_arena
         .alloc_slice_with(count, |_| Datum::Null)
         .map_err(|_| super::query::arena_full_pub())?;
@@ -37957,7 +37978,7 @@ pub fn create_table_as(
                 Ok(())
             } else {
                 let lsn = storage.bump_lsn();
-                wal.stage(txn.txid, lsn, &WalOp::CreateTable(def))
+                wal.stage(txn.txid, lsn, &WalOp::CreateTable(&def))
             };
             if let Err(e) = wal_result {
                 storage.rollback_create(slot);
@@ -39051,7 +39072,7 @@ fn rewrite_sequence_default_references(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered))?;
+        wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
             storage.rollback_table_def(table_slot, txn.txid);
             return Err(error);
@@ -39760,7 +39781,7 @@ pub fn create_domain(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(*storage.domain(slot))) {
+    if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateDomain(storage.domain(slot))) {
         storage.rollback_domain_create(slot);
         return sql_fail(e);
     }
@@ -40797,7 +40818,7 @@ pub fn alter_domain(
     if let Err(e) = wal.stage(
         txn.txid,
         lsn,
-        &WalOp::CreateDomain(storage.domain_for(slot, txn.txid)),
+        &WalOp::CreateDomain(&storage.domain_for(slot, txn.txid)),
     ) {
         storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
@@ -44937,7 +44958,7 @@ fn rewrite_composite_dependent_domains(
         if let Err(error) = wal.stage(
             txn.txid,
             lsn,
-            &WalOp::CreateDomain(storage.domain_for(domain_slot, txn.txid)),
+            &WalOp::CreateDomain(&storage.domain_for(domain_slot, txn.txid)),
         ) {
             storage.rollback_domain_alter(domain_slot, prior);
             return Err(error);
@@ -45063,7 +45084,7 @@ fn rewrite_composite_dependent_tables(
                 return Err(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered)) {
+            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered)) {
                 storage.rollback_table_def(table_slot, txn.txid);
                 return Err(error);
             }
@@ -46984,6 +47005,13 @@ pub fn create_index(
             MAX_INDEX_COLS
         ));
     }
+    if command.columns.len() + command.include_columns.len() > MAX_INDEX_COLS {
+        return sql_fail(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "cannot use more than {} columns in an index",
+            MAX_INDEX_COLS
+        ));
+    }
     if let Err(error) = validate_index_storage_options(command.method, command.options) {
         return sql_fail(error);
     }
@@ -47622,13 +47650,6 @@ pub fn create_index(
             };
             explicit_collations[index] = true;
         }
-    }
-    if command.include_columns.len() > MAX_INDEX_COLS {
-        return sql_fail(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "an index may include at most {} columns",
-            MAX_INDEX_COLS
-        ));
     }
     for (i, name) in command.include_columns.iter().enumerate() {
         let Some(column_index) = tdef.column_index(name) else {
@@ -48683,7 +48704,7 @@ fn stage_table_definition(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage(txn.txid, lsn, &WalOp::CreateTable(next))?;
+        wal.stage(txn.txid, lsn, &WalOp::CreateTable(&next))?;
     }
     storage.write_table_def(table, txn.txid, next, &mapping, false)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table as u32)) {
@@ -61343,7 +61364,7 @@ fn rename_attached_index_constraint(
         },
     )?;
     let lsn = storage.bump_lsn();
-    wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered))?;
+    wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
     storage.write_table_def(table_index, txn.txid, altered, &mapping, false)?;
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
         storage.rollback_table_def(table_index, txn.txid);
@@ -61420,7 +61441,7 @@ fn drop_dependent_foreign_keys(
             },
         )?;
         let lsn = storage.bump_lsn();
-        wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered))?;
+        wal.stage(txn.txid, lsn, &WalOp::CreateTable(&altered))?;
         storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
             storage.rollback_table_def(table_slot, txn.txid);
@@ -62573,7 +62594,7 @@ fn alter_table_inheritance(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(updated)) {
+    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&updated)) {
         return sql_fail(error);
     }
     if let Err(error) = storage.write_table_def(child, txn.txid, updated, &mapping, false) {
@@ -62997,7 +63018,7 @@ fn alter_partition_attachment(
         return sql_fail(error);
     }
     let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
+    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
         return sql_fail(error);
     }
     if let Err(error) = storage.write_table_def(child, txn.txid, new_def, &mapping, false) {
@@ -63049,7 +63070,7 @@ fn alter_partition_attachment(
                     return sql_fail(error);
                 }
                 let lsn = storage.bump_lsn();
-                if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(dependent)) {
+                if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&dependent)) {
                     return sql_fail(error);
                 }
                 if let Err(error) =
@@ -63128,6 +63149,205 @@ fn detached_partition_constraint_name(
 
 #[allow(clippy::too_many_arguments)]
 fn alter_table_inner(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    statement: &AlterTable,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+    emit_completion: bool,
+    expected_kind: Option<crate::storage::TableKind>,
+    tag: &'static str,
+    inheritance_scope: AlterInheritanceScope,
+) -> Outcome {
+    let root =
+        match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::Table(root))
+                if !statement.only
+                    && ordinary_inheritance_propagates(
+                        storage.table_def(root, txn.txid),
+                        statement.actions,
+                    )
+                    && (0..storage.table_count()).any(|child| {
+                        storage.relation_visible_to_current_session(child, txn.txid)
+                            && storage
+                                .table_def(child, txn.txid)
+                                .inheritance
+                                .contains(root)
+                    }) =>
+            {
+                root
+            }
+            _ => {
+                return alter_table_relation(
+                    storage,
+                    wal,
+                    txn,
+                    scratch,
+                    statement,
+                    arena,
+                    seq_session,
+                    responder,
+                    emit_completion,
+                    expected_kind,
+                    tag,
+                    inheritance_scope,
+                );
+            }
+        };
+    // One bounded parent-first plan replaces recursive ALTER frames. A diamond
+    // reaches its shared descendant once, after both inherited parents change.
+    let reachable = match arena.alloc_slice_with(storage.table_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    reachable[root] = true;
+    loop {
+        let mut changed = false;
+        for child in 0..storage.table_count() {
+            if !reachable[child]
+                && storage.relation_visible_to_current_session(child, txn.txid)
+                && storage
+                    .table_def(child, txn.txid)
+                    .inheritance
+                    .parents_ref()
+                    .iter()
+                    .any(|parent| reachable[usize::from(*parent)])
+            {
+                reachable[child] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let count = reachable.iter().filter(|value| **value).count();
+    let order = match arena.alloc_slice_with(count, |_| usize::MAX) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    order[0] = root;
+    for position in 1..count {
+        let Some(child) = (0..storage.table_count()).find(|child| {
+            reachable[*child]
+                && !order[..position].contains(child)
+                && storage
+                    .table_def(*child, txn.txid)
+                    .inheritance
+                    .parents_ref()
+                    .iter()
+                    .all(|parent| {
+                        !reachable[usize::from(*parent)]
+                            || order[..position].contains(&usize::from(*parent))
+                    })
+        }) else {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "circular inheritance is not allowed"
+            ));
+        };
+        order[position] = child;
+    }
+    let definition = match arena.alloc(*storage.table_def(root, txn.txid)) {
+        Ok(definition) => &*definition,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let mut inherited_actions =
+        [AlterAction::DropDefault { column: "" }; crate::sql::parser::MAX_ALTER_ACTIONS];
+    let mut inherited_action_count = 0;
+    for action in statement.actions {
+        if !ordinary_inheritance_propagates_action(definition, action) {
+            continue;
+        }
+        inherited_actions[inherited_action_count] = match action {
+            AlterAction::AlterConstraint {
+                name,
+                alteration: crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit },
+            } => {
+                let Some(column) = definition.columns().iter().find(|column| {
+                    column.not_null.is_required()
+                        && stack_format!(
+                            128,
+                            "{}_{}_not_null",
+                            definition.name.as_str(),
+                            column.name.as_str()
+                        )
+                        .as_str()
+                            == *name
+                }) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "constraint \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        definition.name.as_str()
+                    ));
+                };
+                AlterAction::SetNotNullInheritance {
+                    column: column.name.as_str(),
+                    inherit: *inherit,
+                }
+            }
+            _ => *action,
+        };
+        inherited_action_count += 1;
+    }
+    for (position, &table) in order.iter().enumerate() {
+        let (schema, name) = {
+            let definition = storage.table_def(table, txn.txid);
+            (definition.schema, definition.name)
+        };
+        let inherited = AlterTable {
+            table: QualName {
+                schema: Some(schema.as_str()),
+                name: name.as_str(),
+            },
+            if_exists: false,
+            only: false,
+            actions: &inherited_actions[..inherited_action_count],
+        };
+        let mark = arena.mark();
+        let outcome = alter_table_relation(
+            storage,
+            wal,
+            txn,
+            scratch,
+            if position == 0 { statement } else { &inherited },
+            arena,
+            seq_session,
+            responder,
+            false,
+            if position == 0 {
+                expected_kind
+            } else {
+                Some(crate::storage::TableKind::Local)
+            },
+            tag,
+            if position == 0 {
+                inheritance_scope
+            } else {
+                AlterInheritanceScope::Propagated
+            },
+        );
+        // ALTER stores owned catalog definitions and encoded WAL, not arena references.
+        unsafe {
+            arena.rewind_to(mark);
+        }
+        match outcome {
+            Ok(Ok(())) => {}
+            other => return other,
+        }
+    }
+    if emit_completion {
+        responder.command_complete(tag)?;
+    }
+    sql_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alter_table_relation(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
@@ -63885,7 +64105,7 @@ fn alter_table_inner(
                 return sql_fail(error);
             }
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
+            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
                 return sql_fail(error);
             }
         }
@@ -65504,7 +65724,7 @@ fn alter_table_inner(
             return sql_fail(e);
         }
         let lsn = storage.bump_lsn();
-        if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
+        if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&new_def)) {
             return sql_fail(e);
         }
         for i in 0..scratch.len() {
@@ -66029,7 +66249,7 @@ fn alter_table_inner(
                         return sql_fail(error);
                     }
                     let lsn = storage.bump_lsn();
-                    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(dependent)) {
+                    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&dependent)) {
                         return sql_fail(error);
                     }
                 }
@@ -66111,88 +66331,6 @@ fn alter_table_inner(
                 }
             }
             Err(error) => return sql_fail(error),
-        }
-    }
-    if has_ordinary_child
-        && !statement.only
-        && ordinary_inheritance_propagates(&def, statement.actions)
-    {
-        // Descendants run after this relation has consumed the shared bounded
-        // rewrite scratch. Each then uses the same typed ALTER pipeline for
-        // row validation, WAL, undo, checkpoint recovery, and catalogs.
-        let mut inherited_actions =
-            [AlterAction::DropDefault { column: "" }; crate::sql::parser::MAX_ALTER_ACTIONS];
-        let mut inherited_action_count = 0usize;
-        for action in statement.actions {
-            if ordinary_inheritance_propagates_action(&def, action) {
-                inherited_actions[inherited_action_count] = match action {
-                    AlterAction::AlterConstraint {
-                        name,
-                        alteration:
-                            crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit },
-                    } => {
-                        let column = def
-                            .columns()
-                            .iter()
-                            .find(|column| {
-                                column.not_null.is_required()
-                                    && stack_format!(
-                                        128,
-                                        "{}_{}_not_null",
-                                        def.name.as_str(),
-                                        column.name.as_str()
-                                    )
-                                    .as_str()
-                                        == *name
-                            })
-                            .expect("direct ALTER CONSTRAINT already resolved its NOT NULL column");
-                        AlterAction::SetNotNullInheritance {
-                            column: column.name.as_str(),
-                            inherit: *inherit,
-                        }
-                    }
-                    _ => *action,
-                };
-                inherited_action_count += 1;
-            }
-        }
-        for child in 0..storage.table_count() {
-            if !storage.relation_visible_to_current_session(child, txn.txid)
-                || !storage
-                    .table_def(child, txn.txid)
-                    .inheritance
-                    .contains(table_index)
-            {
-                continue;
-            }
-            let child_def = *storage.table_def(child, txn.txid);
-            let child_statement = AlterTable {
-                table: QualName {
-                    schema: Some(child_def.schema.as_str()),
-                    name: child_def.name.as_str(),
-                },
-                if_exists: false,
-                only: false,
-                actions: &inherited_actions[..inherited_action_count],
-            };
-            match alter_table_inner(
-                storage,
-                wal,
-                txn,
-                scratch,
-                &child_statement,
-                arena,
-                seq_session,
-                responder,
-                false,
-                Some(crate::storage::TableKind::Local),
-                tag,
-                AlterInheritanceScope::Propagated,
-            ) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Ok(Err(error)),
-                Err(error) => return Err(error),
-            }
         }
     }
     if emit_completion {
@@ -66410,7 +66548,7 @@ fn alter_table_replica_identity(
             return sql_fail(error);
         }
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(next)) {
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(&next)) {
             return sql_fail(error);
         }
     }

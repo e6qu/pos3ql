@@ -982,11 +982,15 @@ fn leaf_col_unknown<'a>(
                     if matches!(expression, Expr::Cast { .. }) {
                         return false;
                     }
+                    let scratch_mark = arena.mark();
                     let raw = match &s.from {
                         None => exec::infer_type_pub(expression, None).map(|t| t.0),
                         Some(f) => QueryScope::resolve_schema(storage, f, txid, arena)
                             .and_then(|sc| infer_scope_type(expression, &sc).map(|t| t.0)),
                     };
+                    // Inference retains only an owned OID/error, not its
+                    // temporary FROM scope or catalog rows.
+                    unsafe { arena.rewind_to(scratch_mark) };
                     // infer_scope_type already coerces UNKNOWN→TEXT, so only the
                     // FROM-less path (raw infer) can report UNKNOWN.
                     return matches!(raw, Ok(crate::sql::types::oid::UNKNOWN));
@@ -1003,6 +1007,33 @@ fn leaf_col_unknown<'a>(
 
 /// Column descriptions of a set-operation leaf (FROM-less or table-backed).
 fn describe_leaf<'a>(
+    storage: &'a Storage,
+    s: &'a Select<'a>,
+    txid: u32,
+    columns: &mut [ColDesc<'a>],
+    arena: &'a Arena,
+) -> Result<usize, SqlError> {
+    let mark = arena.mark();
+    let result = (|| {
+        let count = describe_leaf_inner(storage, s, txid, columns, arena)?;
+        let mut names = [crate::storage::SqlName::EMPTY; MAX_PROJ];
+        for (name, column) in names.iter_mut().zip(&columns[..count]) {
+            *name = crate::storage::SqlName::parse(column.name)?;
+        }
+        Ok((count, names))
+    })();
+    // Only scalar descriptor fields and owned names escape the describe scope.
+    unsafe {
+        arena.rewind_to(mark);
+    }
+    let (count, names) = result?;
+    for (column, name) in columns[..count].iter_mut().zip(&names[..count]) {
+        column.name = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
+    }
+    Ok(count)
+}
+
+fn describe_leaf_inner<'a>(
     storage: &'a Storage,
     s: &'a Select<'a>,
     txid: u32,
@@ -1146,6 +1177,29 @@ fn describe_set_collations(
 /// no exception: carry its registered shape with that description so a derived
 /// set source remains a typed composite instead of an anonymous record.
 fn register_first_leaf_record_shapes(
+    storage: &Storage,
+    statement: &Select,
+    txid: u32,
+    arena: &Arena,
+    columns: &mut [ColDesc],
+    count: usize,
+) -> Result<(), SqlError> {
+    if !columns[..count]
+        .iter()
+        .any(|column| column.type_oid == crate::sql::types::oid::RECORD)
+    {
+        return Ok(());
+    }
+    let mark = arena.mark();
+    let result = register_record_shapes_inner(storage, statement, txid, arena, columns, count);
+    // The fixed record registry owns its fields; descriptors retain handles only.
+    unsafe {
+        arena.rewind_to(mark);
+    }
+    result
+}
+
+fn register_record_shapes_inner(
     storage: &Storage,
     statement: &Select,
     txid: u32,

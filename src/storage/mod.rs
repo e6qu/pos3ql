@@ -1175,18 +1175,22 @@ impl ColumnMeta {
     };
 }
 
+/// Per-kind table-constraint capacity. This follows the SQL parser's complete
+/// bounded list instead of imposing a smaller storage-only ceiling after DDL
+/// has already been accepted.
+pub(crate) const MAX_TABLE_CONSTRAINTS: usize = crate::sql::parser::MAX_LIST;
 /// Maximum number of named or multi-column UNIQUE/PRIMARY KEY constraints per
 /// table. Inline single-column keys use column flags until they need an
 /// independent catalog name.
-pub(crate) const MAX_UNIQUES: usize = 8;
+pub(crate) const MAX_UNIQUES: usize = MAX_TABLE_CONSTRAINTS;
 /// Maximum number of CHECK constraints per table.
-pub(crate) const MAX_CHECKS: usize = 8;
+pub(crate) const MAX_CHECKS: usize = MAX_TABLE_CONSTRAINTS;
 /// Maximum stored length of a CHECK predicate's source text.
 pub(crate) const CHECK_SQL_MAX: usize = 512;
 /// Maximum number of FOREIGN KEY constraints per table.
-pub(crate) const MAX_FKEYS: usize = 8;
+pub(crate) const MAX_FKEYS: usize = MAX_TABLE_CONSTRAINTS;
 /// Maximum number of exclusion constraints per table.
-pub(crate) const MAX_EXCLUSIONS: usize = 8;
+pub(crate) const MAX_EXCLUSIONS: usize = MAX_TABLE_CONSTRAINTS;
 /// Exclusion predicates share the bounded table-definition footprint with
 /// CHECK expressions. Exhaustion is reported while parsing DDL.
 pub(crate) const EXCLUSION_PREDICATE_MAX: usize = 128;
@@ -1845,9 +1849,12 @@ impl PartitionDef {
     }
 }
 
-/// Inline catalog bounds have an explicit, startup-bounded capacity.
-pub(crate) const MAX_PARTITION_KEYS: usize = 4;
-pub(crate) const MAX_PARTITION_LIST_VALUES: usize = 8;
+/// PostgreSQL 18 source boundary (`PARTITION_MAX_KEYS`):
+/// https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/pg_config_manual.h
+pub(crate) const MAX_PARTITION_KEYS: usize = 32;
+/// LIST bounds follow the parser's complete bounded value list instead of
+/// imposing a narrower storage-only limit.
+pub(crate) const MAX_PARTITION_LIST_VALUES: usize = crate::sql::parser::MAX_LIST;
 
 impl TableDef {
     /// A table with a name and no columns or constraints, for spread-init of
@@ -2578,7 +2585,12 @@ pub(crate) const MAX_TOMBSTONES: usize = 1024;
 /// The most value indexes one table can carry: one per distinct indexed
 /// column tuple, whether introduced by a constraint or a named index.
 /// Exceeding it at DDL is a loud error.
-pub(crate) const MAX_VALUE_ENFORCERS: usize = 16;
+/// A table may require one value binding for every inline UNIQUE column,
+/// table-level UNIQUE constraint, and exclusion constraint. Named indexes
+/// share identical tuples and draw from the separately configured global
+/// value-index pool. This roster must never become a narrower constraint
+/// boundary than the table definition it accelerates and enforces.
+pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS;
 
 /// Extended-statistics objects and their computed values are startup-bounded.
 /// PostgreSQL accepts more objects/keys/MCV entries; crossing one of these
@@ -5401,6 +5413,32 @@ pub(crate) const MAX_VIEW_TYPE_OID_SLOTS: usize = (crate::sql::types::oid::FIRST
     - crate::sql::types::oid::FIRST_VIEW_COMPOSITE)
     as usize;
 
+pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = 80_000_000;
+pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 100_000_000;
+pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
+pub(crate) const INDEX_CONSTRAINT_OID_OFFSET: i32 = 500_000;
+pub(crate) const MAX_INDEX_OID_GENERATION: u64 =
+    (FIRST_PARTITION_TRIGGER_OID - FIRST_EXPLICIT_INDEX_OID - INDEX_CONSTRAINT_OID_OFFSET - 1)
+        as u64;
+// Reserve complete table-slot strides and the derived constraint OID at the
+// top of the signed OID space. Validate before installation, not catalog reads.
+pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = (i32::MAX as u64
+    - FIRST_PARTITION_TRIGGER_OID as u64
+    - INDEX_CONSTRAINT_OID_OFFSET as u64
+    - (MAX_TABLE_TYPE_OID_SLOTS as u64 - 1))
+    / MAX_TABLE_TYPE_OID_SLOTS as u64;
+
+fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<u64, SqlError> {
+    if value == 0 || value > maximum {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "{} OID range exhausted",
+            object
+        ));
+    }
+    Ok(value)
+}
+
 /// Stored SQL routines share the table-sized catalog budget.  They are not
 /// executable closures: every durable definition is a bounded, replayable SQL
 /// identity and body.
@@ -7867,7 +7905,9 @@ pub(crate) struct PendingRoutineIdentity {
     pub schema: SqlName,
     pub name: SqlName,
 }
-pub(crate) const MAX_DOMAIN_CHECKS: usize = 4;
+/// Domain constraint lists use the same complete bounded list accepted by the
+/// parser; recovery never observes a definition wider than this boundary.
+pub(crate) const MAX_DOMAIN_CHECKS: usize = crate::sql::parser::MAX_LIST;
 
 /// A `CREATE DOMAIN` type: a base type (with its typmod) plus optional
 /// `NOT NULL`, `DEFAULT` and `CHECK (VALUE ...)` constraints, enforced when a
@@ -7986,8 +8026,9 @@ pub(crate) const MAX_ENUM_LABELS: usize = 64;
 pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = (crate::sql::types::oid::FIRST_COMPOSITE_ARRAY
     - crate::sql::types::oid::FIRST_COMPOSITE)
     as usize;
-/// A named composite cannot be partially defined.
-pub(crate) const MAX_COMPOSITE_FIELDS: usize = 16;
+/// Named composites share the durable row-format column boundary. This avoids
+/// accepting a table shape that the corresponding named record cannot model.
+pub(crate) const MAX_COMPOSITE_FIELDS: usize = MAX_COLUMNS;
 
 /// One member of an enum type: a label plus its sort key. Ordering among enum
 /// values is by `sort` (PostgreSQL's `pg_enum.enumsortorder`), *not* by label
@@ -8452,6 +8493,10 @@ impl SequenceDef {
                     generator_for: pending.generator_for,
                     persistence: pending.persistence,
                     cache_generation: self.cache_generation.wrapping_add(1),
+                    last_value: Cell::new(self.pending_last_value.get()),
+                    is_called: Cell::new(self.pending_is_called.get()),
+                    log_count: Cell::new(self.pending_log_count.get()),
+                    dirty: Cell::new(self.pending_dirty.get()),
                     pending_definition: None,
                     ..self.clone()
                 },
@@ -8576,8 +8621,10 @@ impl SequenceDef {
     }
 }
 
-/// Maximum columns in an index key.
-pub(crate) const MAX_INDEX_COLS: usize = 8;
+/// PostgreSQL 18's `INDEX_MAX_KEYS` boundary is 32 attributes, including
+/// INCLUDE columns. Source:
+/// https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/pg_config_manual.h
+pub(crate) const MAX_INDEX_COLS: usize = 32;
 pub(crate) const MAX_BRIN_UNSUMMARIZED_RANGES: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
@@ -35631,7 +35678,12 @@ impl Storage {
                 self.triggers.len()
             ));
         };
-        self.catalog_seq += 1;
+        let created_at = bounded_catalog_generation(
+            self.catalog_seq.saturating_add(1),
+            MAX_TRIGGER_OID_GENERATION,
+            "trigger",
+        )?;
+        self.catalog_seq = created_at;
         self.triggers[slot] = TriggerDef {
             database: self.current_database,
             created_at: self.catalog_seq,
@@ -35812,6 +35864,7 @@ impl Storage {
         spec: TriggerSpec,
         enabled: TriggerEnabled,
     ) -> Result<usize, SqlError> {
+        bounded_catalog_generation(created_at, MAX_TRIGGER_OID_GENERATION, "trigger")?;
         if !spec.is_valid() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -36647,6 +36700,15 @@ impl Storage {
     /// transaction; returns its slot. Errors on a duplicate visible name or
     /// another transaction's uncommitted DDL on the name.
     pub fn create_index(&mut self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+        let created_at = bounded_catalog_generation(
+            if def.created_at == 0 {
+                self.catalog_seq.saturating_add(1)
+            } else {
+                def.created_at
+            },
+            MAX_INDEX_OID_GENERATION,
+            "index",
+        )?;
         def.database = self.current_database;
         self.require_schema_create(def.schema.as_str(), txid)?;
         match def.method {
@@ -36928,13 +36990,7 @@ impl Storage {
             class: AccessClass::Index,
             slot: i as u16,
         });
-        let created_at = if def.created_at == 0 {
-            self.catalog_seq = self.catalog_seq.saturating_add(1);
-            self.catalog_seq
-        } else {
-            self.catalog_seq = self.catalog_seq.max(def.created_at);
-            def.created_at
-        };
+        self.catalog_seq = self.catalog_seq.max(created_at);
         self.indexes[i] = IndexDef {
             created_at,
             ownership,
@@ -42335,6 +42391,29 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_generations_reject_exhaustion_without_saturation() {
+        for (maximum, object) in [
+            (MAX_TRIGGER_OID_GENERATION, "trigger"),
+            (MAX_INDEX_OID_GENERATION, "index"),
+        ] {
+            crate::mem::guard::forbid_alloc(|| {
+                assert_eq!(
+                    bounded_catalog_generation(maximum, maximum, object).unwrap(),
+                    maximum
+                );
+                for invalid in [0, maximum + 1, u64::MAX] {
+                    assert_eq!(
+                        bounded_catalog_generation(invalid, maximum, object)
+                            .unwrap_err()
+                            .sqlstate,
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED
+                    );
+                }
+            });
+        }
+    }
 
     #[test]
     fn pending_value_index_object_read_is_an_internal_wait() {

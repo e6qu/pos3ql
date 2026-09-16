@@ -32,7 +32,8 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
   larger builds choose a nested-loop plan before execution.
 - Schema-only catalog resolution reads shared definitions without constructing
   rows or recursively describing catalog-backed views. Resolved view OID
-  lookups do not enumerate unrelated indexes.
+  lookups do not enumerate unrelated indexes. Reverse relation-OID lookups
+  allocate only the rendered name, not a complete index catalog per cast.
 
 ## Running the suite
 

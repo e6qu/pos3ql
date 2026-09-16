@@ -11329,57 +11329,52 @@ pub fn relname_text<'a>(
     if let Some(name) = catalog_relation_name(oid) {
         return arena.alloc_str(name).map(Some).map_err(|_| arena_full());
     }
-    for slot in 0..storage.table_count() {
-        if !storage.table_slot_visible_to(slot, txid) {
-            continue;
-        }
-        if table_oid(storage, slot) == oid {
-            let bytes = arena
-                .alloc_slice_copy(storage.table_def(slot, txid).name.as_str().as_bytes())
-                .map_err(|_| arena_full())?;
-            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
-        }
+    let slot_in = |first: i32, count: usize| {
+        usize::try_from(oid.checked_sub(first)?)
+            .ok()
+            .filter(|slot| *slot < count)
+    };
+    if let Some(slot) = slot_in(user_table_oid(0), storage.table_count())
+        && storage.table_slot_visible_to(slot, txid)
+    {
+        return arena
+            .alloc_str(storage.table_def(slot, txid).name.as_str())
+            .map(Some)
+            .map_err(|_| arena_full());
     }
-    let indices = collect_indexes(storage, txid, arena)?;
-    for info in indices {
-        if info.oid == oid {
-            let bytes = arena
-                .alloc_slice_copy(info.name.as_str().as_bytes())
-                .map_err(|_| arena_full())?;
-            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
-        }
+    if let Some(slot) = slot_in(FIRST_SEQUENCE_OID, storage.sequence_count())
+        && storage.sequence_slot_visible_to(slot, txid)
+    {
+        return arena
+            .alloc_str(storage.sequence_for(slot, txid).name.as_str())
+            .map(Some)
+            .map_err(|_| arena_full());
     }
-    for slot in 0..storage.sequence_count() {
-        let seq = storage.sequence_for(slot, txid);
-        if !storage.sequence_slot_visible_to(slot, txid) {
-            continue;
-        }
-        if sequence_oid(slot) == oid {
-            let bytes = arena
-                .alloc_slice_copy(seq.name.as_str().as_bytes())
-                .map_err(|_| arena_full())?;
-            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
-        }
-    }
-    for slot in 0..storage.view_count() {
-        let view = storage.view(slot);
-        if !storage.view_slot_visible_to(slot, txid) {
-            continue;
-        }
-        if view_oid(slot) == oid {
-            let bytes = arena
-                .alloc_slice_copy(view.name_for(txid).as_str().as_bytes())
-                .map_err(|_| arena_full())?;
-            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
-        }
+    if let Some(slot) = slot_in(FIRST_VIEW_OID, storage.view_count())
+        && storage.view_slot_visible_to(slot, txid)
+    {
+        return arena
+            .alloc_str(storage.view(slot).name_for(txid).as_str())
+            .map(Some)
+            .map_err(|_| arena_full());
     }
     for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
         if named_composite_relation_oid(slot) == oid {
-            let bytes = arena
-                .alloc_slice_copy(composite.name.as_str().as_bytes())
-                .map_err(|_| arena_full())?;
-            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+            return arena
+                .alloc_str(composite.name.as_str())
+                .map(Some)
+                .map_err(|_| arena_full());
         }
+    }
+    // Startup validates disjoint relation bands. Only index identities need
+    // the synthesized-index walk, and its owned name needs no catalog rows.
+    if oid >= crate::storage::FIRST_IMPLICIT_INDEX_OID
+        && let Some((_, name)) = index_identity_by_oid(storage, txid, oid)
+    {
+        return arena
+            .alloc_str(name.as_str())
+            .map(Some)
+            .map_err(|_| arena_full());
     }
     Ok(None)
 }

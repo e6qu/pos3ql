@@ -112,7 +112,10 @@ storage. RAM and local disk are bounded, disposable caches.
   with system `tableoid` addressable but excluded from star expansion.
   Hash-source decoding includes addressable hidden fields on both sides.
   The shared catalog encoding boundary canonicalizes OID tags, and resolved
-  view identities bypass unrelated index enumeration. Sequence state
+  view identities bypass unrelated index enumeration. Reverse relation-OID
+  lookup uses validated identity bands and allocates only the rendered name,
+  including index names, rather than materializing an index catalog per row.
+  Sequence state
   introspection shares one nullable OID parser and honors transaction-visible
   creation and restart state in SELECT records and FROM functions.
   Implicit index identities reserve the complete enforcer

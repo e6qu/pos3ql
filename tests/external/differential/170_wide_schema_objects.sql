@@ -139,6 +139,9 @@ SELECT column_name FROM information_schema.columns
  WHERE table_name = 'differential_schema_attributes' ORDER BY ordinal_position;
 SELECT relname FROM differential_schema_classes
  WHERE oid = 'differential_schema_source'::regclass;
+SELECT 'differential_schema_attributes'::regclass::text;
+SELECT 'differential_schema_source'::regclass::text;
+SELECT 2147483647::oid::regclass::text;
 
 CREATE TABLE differential_hash_source (id int, payload text, active bool);
 BEGIN;

@@ -15860,6 +15860,53 @@ fn catalog_backed_views_describe_without_constructing_catalog_rows() {
 }
 
 #[test]
+fn relation_oid_names_need_only_the_rendered_name_arena() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_oid_source (value integer);
+         CREATE VIEW bounded_oid_view AS SELECT value FROM bounded_oid_source;
+         CREATE SEQUENCE bounded_oid_sequence;
+         CREATE TYPE bounded_oid_record AS (value integer);
+         CREATE INDEX bounded_oid_index ON bounded_oid_source (value);",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let mut name_budget = Budget::new(64);
+    let arena = Arena::new(&mut name_budget, "relation identity name", 64).unwrap();
+    for name in [
+        "bounded_oid_source",
+        "bounded_oid_view",
+        "bounded_oid_sequence",
+        "bounded_oid_record",
+        "bounded_oid_index",
+    ] {
+        let mark = arena.mark();
+        crate::mem::guard::forbid_alloc(|| {
+            let oid = crate::sql::catalog::reloid_of_name(&engine.storage, 0, name).unwrap();
+            assert_eq!(
+                crate::sql::catalog::relname_text(&engine.storage, 0, oid, &arena).unwrap(),
+                Some(name)
+            );
+            assert_eq!(arena.used(), name.len());
+        });
+        // Each name was consumed before this fixed arena is reused.
+        unsafe { arena.rewind_to(mark) };
+    }
+    for oid in [0, 30_000, -1, i32::MAX] {
+        assert_eq!(
+            crate::sql::catalog::relname_text(&engine.storage, 0, oid, &arena).unwrap(),
+            None
+        );
+        assert_eq!(arena.used(), 0);
+    }
+}
+
+#[test]
 fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let (mut engine, mut budget) = test_engine();
     run_with(

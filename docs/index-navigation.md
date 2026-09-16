@@ -1,15 +1,18 @@
-# Geometric index navigation
+# Immutable specialized-index navigation
 
 GiST point, box, polygon, and circle classes and SP-GiST quad-point, k-d point,
-box, and polygon classes share one object-native bounding-box tree. This is
-not PostgreSQL page storage or a native operator-class callback interface.
+box, and polygon classes use bounding-box summaries. GIN array, `tsvector`,
+`jsonb_ops`, and `jsonb_path_ops` classes and GiST `tsvector` use token
+signatures in the same object-native tree. This is not PostgreSQL page storage
+or a native operator-class callback interface.
 
-Checkpoint construction sorts compact keys by bounding-box center, then by
-encoded key for a deterministic tie-breaker. Data blocks target 16 KiB; one
-otherwise valid larger entry occupies its own block. Immutable parent nodes
-have at most 32 children and retain descendant entry counts and bounds.
-Unchanged value-index manifest handles name the root and published LSN.
-Legacy flat/linked rosters remain readable until checkpoint replacement.
+Checkpoint construction sorts geometric keys by bounding-box center and other
+keys by their deterministic encoding. Geometric data blocks target 16 KiB;
+signature blocks target 1 KiB to keep 256-bit summaries selective. One larger
+valid entry occupies its own block. Immutable parent nodes have at most 32
+children and retain descendant entry counts and merged summaries. Unchanged
+value-index manifest handles name the root and published LSN. Legacy
+flat/linked rosters remain readable until checkpoint replacement.
 
 ## Durable format
 
@@ -22,16 +25,19 @@ integrity use the existing provider-neutral block-store boundary.
 | Header | 8 | Version 1; height; indexed key position; covering flag; 16-bit child count; two zero reserved bytes |
 | Child identity | 32 | Nonzero immutable block identifier |
 | Child entry count | 8 | Positive descendant count |
-| Child bounds | 33 | Tag plus four binary64 coordinates: minimum X/Y and maximum X/Y |
+| Child summary | 33 | Tag plus either four binary64 coordinates or a 256-bit token signature |
 
 Height zero points to value-index data blocks. Greater heights point to nodes
 exactly one level lower. Only an empty generation's root admits zero children.
-Bounds tag zero means all keys are NULL, one means unbounded, and two means a
-finite ordered rectangle. The first two tags require zero coordinate bytes.
+Summary tag zero means all keys are NULL, one means unbounded, two means a
+finite ordered rectangle, and three means a token signature. The first two
+tags require zero payload bytes.
 Non-finite keys use unbounded bounds and always receive exact rechecks;
 non-finite or reversed coordinates under the finite tag are corruption.
 Readers reject inconsistent height, position, covering flags, entry counts,
-aggregate bounds, lengths, and fan-out rather than interpreting another format.
+aggregate summaries, lengths, and fan-out rather than interpreting another
+format. Mixed finite and signature children merge to unbounded, so a malformed
+writer can reduce pruning but cannot create a false negative.
 
 ## Memory and correctness
 
@@ -43,20 +49,27 @@ complete unsigned 64-bit entry space at fan-out 32.
 Predicates reject disjoint child bounds before fetching those objects. Bounds
 are conservative around PostgreSQL's geometric tolerance and floating-point
 rounding; selected keys still receive exact SQL operator and MVCC checks.
+Token signatures set three deterministic bits per array element, full-text
+lexeme, JSON key, JSON string/literal, or top-level JSON existence token.
+Containment uses required-token tests; overlap, JSON `?|`, and full-text OR use
+conservative any-token tests. Prefix and negated full-text terms, numeric JSON
+values, JSONPath evaluation, and array contained-by predicates deliberately do
+not prune where a fixed signature cannot prove exclusion. Hash collisions only
+retain extra children.
 Transaction-visible resident overlays are evaluated alongside published keys.
 Covering payloads remain intact. Garbage collection walks every parent and
 leaf, independent of predicate pruning.
 
 Qualification includes three-level bounded reads, recycled and empty builders,
-malformed encodings, all eight classes with empty caches, rollback and committed
-overlays, repeated checkpoint/garbage-collection cycles, wide expression keys,
-and allocation-forbidden execution. PostgreSQL 18.6 supplies the SQL oracle in
-`tests/external/differential/173_geometric_navigation.sql`; its native GiST NaN
-mislookup and quad-point construction error are isolated from the finite-index
-comparisons. Unindexed non-finite SQL remains differential-tested, and Rust
-cold-tree tests mix finite, infinite, NaN, and NULL keys in our durable format.
+malformed encodings, every summarized class with empty caches, measured object
+GET/byte budgets, rollback and committed overlays, repeated checkpoint and
+garbage-collection cycles, wide expression keys, escaped JSON strings, boolean
+full-text queries, and allocation-forbidden execution. PostgreSQL 18.6 supplies
+the SQL oracle in `tests/external/differential/173_geometric_navigation.sql`
+and `174_inverted_navigation.sql`. Warm-memory and cold-object performance
+artifacts cover each inverted signature family independently.
 
-Network, range/multirange, and full-text navigation, GIN posting structures,
-and ranked nearest-neighbor node traversal remain in [PLAN.md](../PLAN.md).
+Network and range/multirange navigation, dedicated GIN posting structures, and
+ranked nearest-neighbor node traversal remain in [PLAN.md](../PLAN.md).
 Unfiltered nearest-neighbor queries currently order complete compact candidate
 sets; geometric predicates prune candidates without changing that limit boundary.

@@ -95,6 +95,22 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT payload FROM benchmark_kv WHERE gin_tags @> ARRAY[331]",
         )
         self.assertEqual(
+            benchmark.workload_sql("gin-tsvector", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE gin_document @@ 'token331'::tsquery",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("gist-tsvector", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE gist_document @@ 'gisttoken331'::tsquery",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("gin-jsonb", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE json_ops ? 'key331'",
+        )
+        self.assertEqual(
+            benchmark.workload_sql("gin-jsonb-path", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE json_path @> '{\"token\":\"value331\"}'::jsonb",
+        )
+        self.assertEqual(
             benchmark.workload_sql("spgist-prefix", 7, 19, 1000),
             "SELECT payload FROM benchmark_kv WHERE spgist_label ^@ 'key-331'",
         )
@@ -141,7 +157,7 @@ class BenchmarkTest(unittest.TestCase):
     def test_insert_workload_leaves_the_fixed_row_body_at_its_default(self):
         self.assertEqual(
             benchmark.workload_sql("insert", 2, 7, 1000),
-            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, spgist_label, spgist_location, payload) VALUES (2001008, 2001008, 2001008, '[4002016,4002018)'::int4range, '[6003024,6003027)'::int4range, point(2001008, 2001008), ARRAY[2001008], 'key-2001008', point(2001008, -2001008), 0)",
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_location, payload) VALUES (2001008, 2001008, 2001008, '[4002016,4002018)'::int4range, '[6003024,6003027)'::int4range, point(2001008, 2001008), ARRAY[2001008], to_tsvector('simple','token2001008'), to_tsvector('simple','gisttoken2001008'), jsonb_build_object('key2001008','value2001008'), jsonb_build_object('token','value2001008'), 'key-2001008', point(2001008, -2001008), 0)",
         )
 
     def test_point_reads_and_updates_exercise_the_hash_key(self):

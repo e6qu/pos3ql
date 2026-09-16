@@ -2868,6 +2868,8 @@ fn indexed_candidates_for_plan<'a>(
     types[..plan.n_columns].copy_from_slice(&plan.key_types[..plan.n_columns]);
     collations[..plan.n_columns].copy_from_slice(&plan.collations[..plan.n_columns]);
     let mut search_bounds = [[crate::store::SpatialBounds::Unbounded; MAX_INDEX_COLS]; 2];
+    let mut signature_predicates =
+        [[super::super::index_signature::SignaturePredicate::Always; MAX_INDEX_COLS]; 2];
     for position in 0..plan.n_columns {
         if matches!(types[position], ColType::Geometry(_)) {
             for bound in 0..2 {
@@ -2875,11 +2877,38 @@ fn indexed_candidates_for_plan<'a>(
                     super::super::geometry::index_bounds(values[bound][position])?;
             }
         }
+        for (bound, constraint) in [
+            plan.constraints[position],
+            plan.additional_constraints[position],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(constraint) = constraint
+                && !values[bound][position].is_null()
+            {
+                signature_predicates[bound][position] = super::super::index_signature::predicate(
+                    values[bound][position],
+                    constraint.operator,
+                );
+            }
+        }
     }
-    let bounds_intersect = |position: u8, bounds| {
+    let bounds_intersect = |position: u8, summary| {
         let position = usize::from(position);
         if position >= plan.n_columns {
             return true;
+        }
+        if matches!(summary, crate::store::NavigationSummary::Signature(_)) {
+            return [
+                plan.constraints[position],
+                plan.additional_constraints[position],
+            ]
+            .into_iter()
+            .enumerate()
+            .all(|(bound, constraint)| {
+                constraint.is_none() || signature_predicates[bound][position].may_match(summary)
+            });
         }
         [
             plan.constraints[position],
@@ -2890,7 +2919,7 @@ fn indexed_candidates_for_plan<'a>(
         .all(|(bound, constraint)| {
             constraint.is_none_or(|constraint| {
                 super::super::geometry::index_bounds_intersect(
-                    bounds,
+                    summary,
                     search_bounds[bound][position],
                     constraint.operator,
                 )

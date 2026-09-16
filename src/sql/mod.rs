@@ -23,6 +23,7 @@ mod gin_catalog;
 mod gist_catalog;
 pub mod guc;
 pub mod identity;
+pub(crate) mod index_signature;
 pub mod json;
 pub mod jsonpath;
 pub(crate) mod large_object;

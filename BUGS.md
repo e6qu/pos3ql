@@ -6,8 +6,9 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
-The geometric index-navigation, concurrent-harness port, and integration-scratch
-audits have no external blocker; their fixes are qualified in the current change.
+The geometric and inverted index-navigation, concurrent-harness port, and
+integration-scratch audits have no external blocker; their fixes are qualified
+in the implementation and regression suites.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

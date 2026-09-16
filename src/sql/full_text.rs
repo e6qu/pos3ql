@@ -4033,6 +4033,22 @@ struct UnescapedBytes<'a> {
     at: usize,
 }
 
+/// Visits stable hashes of the lexemes in canonical `tsvector` text without
+/// reparsing positions or allocating another vector representation.
+pub(crate) fn for_each_vector_lexeme_hash(source: &str, mut visit: impl FnMut(u64)) {
+    use core::hash::Hasher as _;
+    for entry in CanonicalVectorEntries::new(source) {
+        let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
+        for byte in (UnescapedBytes {
+            raw: entry.lexeme,
+            at: 0,
+        }) {
+            hasher.write_u8(byte);
+        }
+        visit(hasher.finish());
+    }
+}
+
 impl Iterator for UnescapedBytes<'_> {
     type Item = u8;
 
@@ -4166,7 +4182,7 @@ pub fn compare_vector(left: &str, right: &str) -> Ordering {
 
 #[derive(Clone, Copy)]
 enum CanonicalQueryNode<'a> {
-    Lexeme(&'a [u8]),
+    Lexeme { raw: &'a [u8], prefix: bool },
     Not(u16),
     And(u16, u16),
     Or(u16, u16),
@@ -4191,7 +4207,10 @@ impl<'a> CanonicalQueryParser<'a> {
             source: source.as_bytes(),
             at: 0,
             query: CanonicalQuery {
-                nodes: [CanonicalQueryNode::Lexeme(&[]); MAX_QUERY_NODES],
+                nodes: [CanonicalQueryNode::Lexeme {
+                    raw: &[],
+                    prefix: false,
+                }; MAX_QUERY_NODES],
                 count: 0,
                 root: None,
             },
@@ -4303,17 +4322,22 @@ impl<'a> CanonicalQueryParser<'a> {
         }
         let lexeme = &self.source[start..self.at];
         self.at += 1;
+        let mut prefix = false;
         if self.source.get(self.at) == Some(&b':') {
             self.at += 1;
-            while self
-                .source
-                .get(self.at)
-                .is_some_and(|byte| matches!(byte, b'*' | b'A'..=b'D'))
-            {
+            while let Some(byte) = self.source.get(self.at).copied() {
+                match byte {
+                    b'*' => prefix = true,
+                    b'A'..=b'D' => {}
+                    _ => break,
+                }
                 self.at += 1;
             }
         }
-        self.push(CanonicalQueryNode::Lexeme(lexeme))
+        self.push(CanonicalQueryNode::Lexeme {
+            raw: lexeme,
+            prefix,
+        })
     }
 }
 
@@ -4337,7 +4361,7 @@ fn query_storage_size(query: &CanonicalQuery<'_>) -> usize {
         + query.nodes[..query.count]
             .iter()
             .map(|node| match node {
-                CanonicalQueryNode::Lexeme(raw) => escaped_len(raw) + 1,
+                CanonicalQueryNode::Lexeme { raw, .. } => escaped_len(raw) + 1,
                 _ => 0,
             })
             .sum::<usize>()
@@ -4351,13 +4375,16 @@ fn compare_query_nodes(
 ) -> Ordering {
     let left_node = left.nodes[usize::from(left_index)];
     let right_node = right.nodes[usize::from(right_index)];
-    let is_left_operator = !matches!(left_node, CanonicalQueryNode::Lexeme(_));
-    let is_right_operator = !matches!(right_node, CanonicalQueryNode::Lexeme(_));
+    let is_left_operator = !matches!(left_node, CanonicalQueryNode::Lexeme { .. });
+    let is_right_operator = !matches!(right_node, CanonicalQueryNode::Lexeme { .. });
     is_left_operator
         .cmp(&is_right_operator)
         .reverse()
         .then_with(|| match (left_node, right_node) {
-            (CanonicalQueryNode::Lexeme(a), CanonicalQueryNode::Lexeme(b)) => legacy_crc32(a)
+            (
+                CanonicalQueryNode::Lexeme { raw: a, .. },
+                CanonicalQueryNode::Lexeme { raw: b, .. },
+            ) => legacy_crc32(a)
                 .cmp(&legacy_crc32(b))
                 .reverse()
                 .then_with(|| compare_escaped(a, b)),
@@ -4380,7 +4407,7 @@ fn compare_query_nodes(
                     CanonicalQueryNode::And(..) => 2,
                     CanonicalQueryNode::Or(..) => 3,
                     CanonicalQueryNode::Phrase(..) => 4,
-                    CanonicalQueryNode::Lexeme(_) => 0,
+                    CanonicalQueryNode::Lexeme { .. } => 0,
                 };
                 operator(a).cmp(&operator(b)).reverse()
             }
@@ -4401,7 +4428,7 @@ pub fn compare_query(left: &str, right: &str) -> Ordering {
 
 fn emit_query_hash_node(query: &CanonicalQuery<'_>, index: u16, emit: &mut impl FnMut(&[u8])) {
     match query.nodes[usize::from(index)] {
-        CanonicalQueryNode::Lexeme(raw) => {
+        CanonicalQueryNode::Lexeme { raw, .. } => {
             emit(&[1]);
             for byte in (UnescapedBytes { raw, at: 0 }) {
                 emit(&[byte]);
@@ -4429,6 +4456,60 @@ fn emit_query_hash_node(query: &CanonicalQuery<'_>, index: u16, emit: &mut impl 
             emit(&distance.to_le_bytes());
         }
     }
+}
+
+/// Folds the already validated canonical query tree without allocating. The
+/// lexeme callback receives the same stable unescaped hash used by vectors.
+pub(crate) fn fold_query_lexemes<T: Copy>(
+    source: &str,
+    mut lexeme: impl FnMut(u64, bool) -> T,
+    negated: T,
+    mut conjunction: impl FnMut(T, T) -> T,
+    mut disjunction: impl FnMut(T, T) -> T,
+) -> Option<T> {
+    use core::hash::Hasher as _;
+
+    fn fold<T: Copy>(
+        query: &CanonicalQuery<'_>,
+        node: u16,
+        lexeme: &mut impl FnMut(u64, bool) -> T,
+        negated: T,
+        conjunction: &mut impl FnMut(T, T) -> T,
+        disjunction: &mut impl FnMut(T, T) -> T,
+    ) -> T {
+        match query.nodes[usize::from(node)] {
+            CanonicalQueryNode::Lexeme { raw, prefix, .. } => {
+                let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
+                for byte in (UnescapedBytes { raw, at: 0 }) {
+                    hasher.write_u8(byte);
+                }
+                lexeme(hasher.finish(), prefix)
+            }
+            CanonicalQueryNode::Not(_) => negated,
+            CanonicalQueryNode::And(left, right) | CanonicalQueryNode::Phrase(left, right, _) => {
+                let left = fold(query, left, lexeme, negated, conjunction, disjunction);
+                let right = fold(query, right, lexeme, negated, conjunction, disjunction);
+                conjunction(left, right)
+            }
+            CanonicalQueryNode::Or(left, right) => {
+                let left = fold(query, left, lexeme, negated, conjunction, disjunction);
+                let right = fold(query, right, lexeme, negated, conjunction, disjunction);
+                disjunction(left, right)
+            }
+        }
+    }
+
+    let query = CanonicalQueryParser::new(source).parse();
+    query.root.map(|root| {
+        fold(
+            &query,
+            root,
+            &mut lexeme,
+            negated,
+            &mut conjunction,
+            &mut disjunction,
+        )
+    })
 }
 
 pub fn emit_query_hash(source: &str, mut emit: impl FnMut(&[u8])) {

@@ -7,7 +7,12 @@
 //! without fetching a row; every candidate is still checked against the
 //! authoritative MVCC row identity by the storage layer.
 
-use super::navigation::{NavigationCursor, NavigationWriter, SPATIAL_DATA_BYTES, SpatialBounds};
+#[cfg(test)]
+use super::navigation::SpatialBounds;
+use super::navigation::{
+    NavigationCursor, NavigationKind, NavigationSummary, NavigationWriter, SIGNATURE_DATA_BYTES,
+    SPATIAL_DATA_BYTES,
+};
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
 const ENTRY_HEADER: usize = 8 + 8 + 8 + 4;
@@ -79,8 +84,9 @@ pub(crate) struct ValueIndexWriter {
     roster_tail: Option<BlockId>,
     entries: u64,
     covering: Option<bool>,
-    spatial_position: Option<u8>,
-    pending_bounds: SpatialBounds,
+    navigation_position: Option<u8>,
+    navigation_data_bytes: usize,
+    pending_summary: NavigationSummary,
     pending_entries: u64,
     navigation: NavigationWriter,
 }
@@ -99,8 +105,9 @@ impl ValueIndexWriter {
             roster_tail: None,
             entries: 0,
             covering: None,
-            spatial_position: None,
-            pending_bounds: SpatialBounds::Empty,
+            navigation_position: None,
+            navigation_data_bytes: MAX_PAYLOAD,
+            pending_summary: NavigationSummary::Empty,
             pending_entries: 0,
             navigation: NavigationWriter::new(),
         }
@@ -120,31 +127,36 @@ impl ValueIndexWriter {
         self.roster_tail = None;
         self.entries = 0;
         self.covering = None;
-        self.spatial_position = None;
-        self.pending_bounds = SpatialBounds::Empty;
+        self.navigation_position = None;
+        self.navigation_data_bytes = MAX_PAYLOAD;
+        self.pending_summary = NavigationSummary::Empty;
         self.pending_entries = 0;
     }
 
-    pub(crate) fn reset_spatial(&mut self, position: u8, covering: bool) {
+    pub(crate) fn reset_navigation(&mut self, position: u8, kind: NavigationKind, covering: bool) {
         self.reset();
-        self.spatial_position = Some(position);
+        self.navigation_position = Some(position);
+        self.navigation_data_bytes = match kind {
+            NavigationKind::Spatial => SPATIAL_DATA_BYTES,
+            NavigationKind::Signature => SIGNATURE_DATA_BYTES,
+        };
         self.navigation.reset(position, covering);
     }
 
-    pub(crate) fn append_spatial(
+    pub(crate) fn append_navigation(
         &mut self,
         store: &mut dyn BlockStore,
         identity: (u64, u64, u64),
         key: &[u8],
         payload: Option<&[u8]>,
-        bounds: SpatialBounds,
+        summary: NavigationSummary,
         compare: &mut impl FnMut(&[u8], &[u8]) -> core::cmp::Ordering,
     ) -> Result<(), ValueIndexError> {
-        if self.spatial_position.is_none() {
+        if self.navigation_position.is_none() {
             return Err(ValueIndexError::Corrupt);
         }
         self.append_inner(store, identity, key, payload, compare)?;
-        self.pending_bounds = self.pending_bounds.union(bounds);
+        self.pending_summary = self.pending_summary.union(summary);
         Ok(())
     }
 
@@ -210,11 +222,7 @@ impl ValueIndexWriter {
             ENTRY_HEADER
         };
         let bytes = header + key.len() + payload.len();
-        let block_bytes = if self.spatial_position.is_some() {
-            SPATIAL_DATA_BYTES
-        } else {
-            MAX_PAYLOAD
-        };
+        let block_bytes = self.navigation_data_bytes;
         if self.pending_len != 0 && self.pending_len + bytes > block_bytes {
             self.flush(store)?;
         }
@@ -247,14 +255,14 @@ impl ValueIndexWriter {
             BlockType::ValueIndexData,
             0,
         )?;
-        if self.spatial_position.is_some() {
+        if self.navigation_position.is_some() {
             self.navigation
-                .append(store, id, self.pending_entries, self.pending_bounds)?;
+                .append(store, id, self.pending_entries, self.pending_summary)?;
             self.pending_len = 0;
             self.pending_filter.fill(0);
             self.pending_first = None;
             self.pending_last = None;
-            self.pending_bounds = SpatialBounds::Empty;
+            self.pending_summary = NavigationSummary::Empty;
             self.pending_entries = 0;
             return Ok(());
         }
@@ -341,7 +349,7 @@ impl ValueIndexWriter {
         published_lsn: u64,
     ) -> Result<Option<ValueIndexHandle>, ValueIndexError> {
         self.flush(store)?;
-        let roster = if self.spatial_position.is_some() {
+        let roster = if self.navigation_position.is_some() {
             self.navigation.finish(store)?
         } else {
             self.flush_roster(store)?;
@@ -599,7 +607,7 @@ impl<'a> ValueIndexReader<'a> {
         &mut self,
         store: &mut dyn BlockStore,
         handle: &ValueIndexHandle,
-        intersects: impl FnMut(u8, SpatialBounds) -> bool,
+        intersects: impl FnMut(u8, NavigationSummary) -> bool,
         mut classify: impl FnMut(&[u8]) -> ValueIndexPosition,
         mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
@@ -743,7 +751,7 @@ impl<'a> ValueIndexReader<'a> {
         &mut self,
         store: &mut dyn BlockStore,
         handle: &ValueIndexHandle,
-        mut intersects: impl FnMut(u8, SpatialBounds) -> bool,
+        mut intersects: impl FnMut(u8, NavigationSummary) -> bool,
         mut visit: impl FnMut(u64, u64, u64, &[u8], &[u8]),
     ) -> Result<(), ValueIndexError> {
         let mut cursor = NavigationCursor::new(handle.roster, handle.entries);
@@ -841,7 +849,7 @@ mod tests {
         let mut key = [b'k'; 512];
         let payload = [b'p'; 2048];
         let handle = crate::mem::guard::forbid_alloc(|| {
-            writer.reset_spatial(0, true);
+            writer.reset_navigation(0, NavigationKind::Spatial, true);
             for rowid in 0..2000u64 {
                 key[..8].copy_from_slice(&rowid.to_be_bytes());
                 let bounds = if rowid == 1999 {
@@ -850,7 +858,7 @@ mod tests {
                     SpatialBounds::new(rowid as f64, 0.0, rowid as f64, 0.0)
                 };
                 writer
-                    .append_spatial(
+                    .append_navigation(
                         &mut store,
                         (rowid, rowid, 7),
                         &key,
@@ -876,6 +884,7 @@ mod tests {
                         }
                         SpatialBounds::Empty => false,
                         SpatialBounds::Unbounded => true,
+                        SpatialBounds::Signature(_) => true,
                     },
                     |key| {
                         if u64::from_be_bytes(key[..8].try_into().unwrap()) == 1024 {
@@ -925,7 +934,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(bounded, 3);
-        writer.reset_spatial(0, false);
+        writer.reset_navigation(0, NavigationKind::Spatial, false);
         let empty = writer.finish(&mut store, 9).unwrap().unwrap();
         assert_eq!(empty.entries, 0);
         ValueIndexReader::over(&mut roster, &mut data)

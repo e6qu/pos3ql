@@ -189,7 +189,9 @@ pub(crate) fn array_set_op<'a>(
         |sub_elem, sub_raw: &'a [u8], sup_elem, sup_raw: &'a [u8]| -> Result<bool, SqlError> {
             for i in 0..array::len(sub_raw) {
                 let v = array::get(sub_raw, sub_elem, i).unwrap_or(Datum::Null);
-                if !v.is_null() && !member(&v, sup_elem, sup_raw)? {
+                // PostgreSQL's containment does not consider a NULL element
+                // equal to another NULL element.
+                if v.is_null() || !member(&v, sup_elem, sup_raw)? {
                     return Ok(false);
                 }
             }

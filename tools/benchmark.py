@@ -225,6 +225,23 @@ def workload_sql(workload, worker, operation, rows):
         )
     if workload == "gin-array":
         return f"SELECT payload FROM benchmark_kv WHERE gin_tags @> ARRAY[{key}]"
+    if workload == "gin-tsvector":
+        return (
+            "SELECT payload FROM benchmark_kv "
+            f"WHERE gin_document @@ 'token{key}'::tsquery"
+        )
+    if workload == "gist-tsvector":
+        return (
+            "SELECT payload FROM benchmark_kv "
+            f"WHERE gist_document @@ 'gisttoken{key}'::tsquery"
+        )
+    if workload == "gin-jsonb":
+        return f"SELECT payload FROM benchmark_kv WHERE json_ops ? 'key{key}'"
+    if workload == "gin-jsonb-path":
+        return (
+            "SELECT payload FROM benchmark_kv "
+            f"WHERE json_path @> '{{\"token\":\"value{key}\"}}'::jsonb"
+        )
     if workload == "spgist-prefix":
         return f"SELECT payload FROM benchmark_kv WHERE spgist_label ^@ 'key-{key}'"
     if workload == "spgist-spatial":
@@ -260,11 +277,14 @@ def workload_sql(workload, worker, operation, rows):
     if workload == "insert":
         inserted_key = rows + worker * 1_000_000 + operation + 1
         return (
-            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, spgist_label, spgist_location, payload) "
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_location, payload) "
             f"VALUES ({inserted_key}, {inserted_key}, {inserted_key}, "
             f"'[{inserted_key * 2},{inserted_key * 2 + 2})'::int4range, "
             f"'[{inserted_key * 3},{inserted_key * 3 + 3})'::int4range, point({inserted_key}, {inserted_key}), "
-            f"ARRAY[{inserted_key}], 'key-{inserted_key}', point({inserted_key}, {-inserted_key}), 0)"
+            f"ARRAY[{inserted_key}], to_tsvector('simple','token{inserted_key}'), "
+            f"to_tsvector('simple','gisttoken{inserted_key}'), jsonb_build_object('key{inserted_key}','value{inserted_key}'), "
+            f"jsonb_build_object('token','value{inserted_key}'), 'key-{inserted_key}', "
+            f"point({inserted_key}, {-inserted_key}), 0)"
         )
     raise ValueError(f"unknown workload {workload}")
 
@@ -283,7 +303,9 @@ def setup_database(connection, rows):
         "CREATE TABLE benchmark_kv("
         "id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL, "
         "brin_span int4range NOT NULL, gist_span int4range NOT NULL, gist_location point NOT NULL, "
-        "gin_tags integer[] NOT NULL, spgist_label text NOT NULL, spgist_location point NOT NULL, "
+        "gin_tags integer[] NOT NULL, gin_document tsvector NOT NULL, "
+        "gist_document tsvector NOT NULL, json_ops jsonb NOT NULL, json_path jsonb NOT NULL, "
+        "spgist_label text NOT NULL, spgist_location point NOT NULL, "
         "payload bigint NOT NULL, "
         "padding text NOT NULL DEFAULT repeat('x', 8192))"
     )
@@ -308,6 +330,18 @@ def setup_database(connection, rows):
         "CREATE INDEX benchmark_gin_array ON benchmark_kv USING gin (gin_tags)"
     )
     connection.query(
+        "CREATE INDEX benchmark_gin_document ON benchmark_kv USING gin (gin_document)"
+    )
+    connection.query(
+        "CREATE INDEX benchmark_gist_document ON benchmark_kv USING gist (gist_document)"
+    )
+    connection.query(
+        "CREATE INDEX benchmark_gin_json_ops ON benchmark_kv USING gin (json_ops)"
+    )
+    connection.query(
+        "CREATE INDEX benchmark_gin_json_path ON benchmark_kv USING gin (json_path jsonb_path_ops)"
+    )
+    connection.query(
         "CREATE INDEX benchmark_spgist_prefix ON benchmark_kv USING spgist (spgist_label)"
     )
     connection.query(
@@ -319,12 +353,16 @@ def setup_database(connection, rows):
     )
     # Keep setup valid for startup-sized transaction pools smaller than the
     # dataset; each chunk is its own implicit transaction on both engines.
-    for first in range(1, rows + 1, 1000):
-        last = min(rows, first + 999)
+    for first in range(1, rows + 1, 100):
+        last = min(rows, first + 99)
         connection.query(
-            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, spgist_label, spgist_location, payload) "
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_location, payload) "
             "SELECT value, value, value, int4range(value * 2, value * 2 + 2), "
             "int4range(value * 3, value * 3 + 3), point(value, value), ARRAY[value], "
+            "to_tsvector('simple','token' || value::text), "
+            "to_tsvector('simple','gisttoken' || value::text), "
+            "jsonb_build_object('key' || value::text,'value' || value::text), "
+            "jsonb_build_object('token','value' || value::text), "
             "'key-' || value::text, point(value, -value), 0 "
             f"FROM generate_series({first}, {last}) AS value"
         )
@@ -585,6 +623,10 @@ def parse_args():
             "gist-spatial",
             "gist-knn",
             "gin-array",
+            "gin-tsvector",
+            "gist-tsvector",
+            "gin-jsonb",
+            "gin-jsonb-path",
             "spgist-prefix",
             "spgist-spatial",
             "spgist-knn",
@@ -638,6 +680,10 @@ def parse_args():
             "gist-spatial",
             "gist-knn",
             "gin-array",
+            "gin-tsvector",
+            "gist-tsvector",
+            "gin-jsonb",
+            "gin-jsonb-path",
             "spgist-prefix",
             "spgist-spatial",
             "spgist-knn",

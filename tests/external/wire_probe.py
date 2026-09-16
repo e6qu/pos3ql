@@ -76,7 +76,11 @@ def simple_query(s, text):
     s.sendall(frontend_message(b"Q", text.encode() + b"\x00"))
     out = []
     while True:
-        item = read_message(s)
+        try:
+            item = read_message(s)
+        except TimeoutError:
+            print(f"Timed out executing {text!r}; received frames: {out!r}", flush=True)
+            raise
         out.append(item)
         if item[0] == b"Z":
             return out
@@ -5794,6 +5798,34 @@ def test_view_output_columns_over_raw_wire():
         "view output columns: raw wire retains declared names through DML and rename",
         not any(kind == b"E" for kind, _ in result)
         and rows == [["7"], ["8"], ["current_value"]],
+        result,
+    )
+    s.close()
+
+
+def test_catalog_backed_view_metadata_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_schema_source (value integer); "
+        "CREATE VIEW wire_schema_attributes AS SELECT attname, atttypid "
+        "FROM pg_attribute WHERE attrelid = 'wire_schema_source'::regclass AND attnum > 0; "
+        "CREATE VIEW wire_schema_columns AS SELECT column_name FROM information_schema.columns "
+        "WHERE table_name = 'wire_schema_source'; "
+        "SELECT attname, atttypid FROM wire_schema_attributes; "
+        "SELECT column_name FROM wire_schema_columns; "
+        "SELECT attname FROM pg_attribute WHERE attrelid = 'wire_schema_attributes'::regclass "
+        "AND attnum > 0 ORDER BY attnum; "
+        "DROP VIEW wire_schema_columns; DROP VIEW wire_schema_attributes; "
+        "DROP TABLE wire_schema_source",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "catalog-backed views: schema resolution does not construct or recursively describe rows",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["value", "23"], ["value"], ["attname"], ["atttypid"]],
         result,
     )
     s.close()

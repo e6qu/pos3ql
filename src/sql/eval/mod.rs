@@ -5100,10 +5100,9 @@ fn call<'a>(
         }
         "pg_get_sequence_data" => {
             arity(1)?;
-            let oid = match eval_full(args[0], arena, params, row, hooks)? {
-                Datum::Int4(oid) => oid,
-                Datum::Null => return Ok(Datum::Null),
-                other => return Err(type_mismatch("pg_get_sequence_data", &other)),
+            let Some(oid) = sequence_data_oid(eval_full(args[0], arena, params, row, hooks)?)?
+            else {
+                return Ok(Datum::Null);
             };
             let (last_value, is_called) = hooks
                 .catalog
@@ -7506,6 +7505,18 @@ fn division_by_zero() -> SqlError {
 /// [`type_mismatch`] for callers outside this module (table-function args).
 pub fn type_mismatch_pub(operator: &str, d: &Datum) -> SqlError {
     type_mismatch(operator, d)
+}
+
+pub(crate) fn sequence_data_oid(value: Datum<'_>) -> Result<Option<i32>, SqlError> {
+    match value {
+        Datum::Oid(oid) => Ok(Some(oid as i32)),
+        Datum::Int4(oid) => Ok(Some(oid)),
+        Datum::Null => Ok(None),
+        _ => Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function pg_get_sequence_data does not exist for the supplied argument type"
+        )),
+    }
 }
 
 fn type_mismatch(operator: &str, d: &Datum) -> SqlError {

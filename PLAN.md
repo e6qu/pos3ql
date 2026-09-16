@@ -86,6 +86,42 @@ storage. RAM and local disk are bounded, disposable caches.
   runtime slot, so identities above the former 32-entry ceiling survive sort,
   replay, and recovery. Accepted domain, enum, composite, table, and view
   capacities are checked against disjoint `pg_type` OID bands before serving.
+- Wide schema definitions no longer encounter narrower storage-only limits:
+  table constraint kinds and domain checks use the parser's complete 64-item
+  bounded list, named composites use the 64-column row boundary, partition
+  keys and index tuples use PostgreSQL 18's exact 32-attribute limits, and
+  LIST bounds use the complete 64-value parser list. Constraint enforcement,
+  record shapes, PostgreSQL catalogs, WAL, checkpoint manifests, loud
+  over-boundary errors, and empty-cache object recovery share those limits.
+  New index WAL uses 32-bit masks while legacy 8-bit WAL remains readable;
+  textual checkpoint masks remain backward-readable.
+  Wide table/domain WAL staging borrows definitions, decoder branches isolate
+  fixed scratch, and manifest replay transfers pending table ownership at one
+  choke point rather than reserving a copy in every branch. Schema-only catalog
+  resolution reads one shared, storage-independent definition rather than
+  constructing and discarding rows. Catalog-backed view descriptions cannot
+  recursively materialize their own catalogs. Procedural count passes recycle
+  temporary query state.
+  Inherited ALTER uses a bounded parent-first plan rather than recursive
+  rewrite frames, visiting diamond descendants once. Empty table definitions
+  accept PostgreSQL's zero-column syntax without accepting trailing commas.
+  Bounded hash joins decode physical and self-describing derived rows at their
+  respective boundaries, including external runs, empty builds, and preserved
+  LEFT JOIN probes; eligible two-catalog joins no longer require quadratic scans.
+  `pg_constraint` and `pg_attrdef` expose PostgreSQL 18 column order and types,
+  with system `tableoid` addressable but excluded from star expansion.
+  Hash-source decoding includes addressable hidden fields on both sides.
+  The shared catalog encoding boundary canonicalizes OID tags, and resolved
+  view identities bypass unrelated index enumeration. Reverse relation-OID
+  lookup uses validated identity bands and allocates only the rendered name,
+  including index names, rather than materializing an index catalog per row.
+  Sequence state
+  introspection shares one nullable OID parser and honors transaction-visible
+  creation and restart state in SELECT records and FROM functions.
+  Implicit index identities reserve the complete enforcer
+  stride; constraint kinds and partition-trigger clones occupy disjoint OID
+  bands. Finite index/trigger generation ranges reject exhaustion before
+  installation, including replay, rather than saturating or failing on reads.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those
@@ -102,13 +138,12 @@ storage. RAM and local disk are bounded, disposable caches.
 
 ### Remaining bounded scale limits
 
-Replace the compile-time partition-key, constraint, and per-object inline
-ceilings with startup-sized pools or bounded chunked
-structures where they restrict advertised scale.
+Replace remaining compile-time per-object inline ceilings with startup-sized
+pools or bounded chunked structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
 catalog construction, compaction, and garbage collection. Exercise maximum-
-capacity partitions, transactions, spill, compaction, garbage
-collection, checkpoint retry, and object-cold recovery while checking exact
+capacity inheritance, routine, trigger, policy, transaction, spill, compaction,
+garbage collection, checkpoint retry, and object-cold recovery while checking exact
 startup memory accounting and loud exhaustion.
 
 ### Multi-core execution

@@ -7,6 +7,81 @@
 use super::*;
 
 #[test]
+fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
+    use crate::storage::{MAX_TABLE_TYPE_OID_SLOTS, MAX_VALUE_ENFORCERS};
+    crate::mem::guard::forbid_alloc(|| {
+        for table in 0..MAX_TABLE_TYPE_OID_SLOTS - 1 {
+            assert!(
+                catalog::index_oid(table, MAX_VALUE_ENFORCERS - 1)
+                    < catalog::index_oid(table + 1, 0)
+            );
+        }
+        let index_maximum =
+            catalog::index_oid(MAX_TABLE_TYPE_OID_SLOTS - 1, MAX_VALUE_ENFORCERS - 1);
+        assert!(catalog::toast_index_oid(MAX_TABLE_TYPE_OID_SLOTS - 1) < catalog::index_oid(0, 0));
+        assert!(index_maximum < crate::storage::FIRST_EXPLICIT_INDEX_OID);
+        let ranges = [
+            (
+                catalog::FIRST_FK_OID,
+                MAX_TABLE_TYPE_OID_SLOTS * crate::storage::MAX_FKEYS,
+            ),
+            (
+                catalog::FIRST_CHECK_OID,
+                MAX_TABLE_TYPE_OID_SLOTS * crate::storage::MAX_CHECKS,
+            ),
+            (
+                catalog::FIRST_DOMAIN_CHECK_OID,
+                crate::storage::MAX_DOMAIN_CATALOG_SLOTS * crate::storage::MAX_DOMAIN_CHECKS,
+            ),
+            (
+                catalog::FIRST_NOT_NULL_OID,
+                MAX_TABLE_TYPE_OID_SLOTS * crate::storage::MAX_COLUMNS,
+            ),
+            (
+                catalog::FIRST_DETACHED_PARTITION_CHECK_OID,
+                MAX_TABLE_TYPE_OID_SLOTS,
+            ),
+            (
+                catalog::index_oid(0, 0) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                MAX_TABLE_TYPE_OID_SLOTS * MAX_VALUE_ENFORCERS,
+            ),
+        ];
+        for pair in ranges.windows(2) {
+            assert!(pair[0].0 + pair[0].1 as i32 <= pair[1].0);
+        }
+        assert!(
+            index_maximum + crate::storage::INDEX_CONSTRAINT_OID_OFFSET
+                < crate::storage::FIRST_EXPLICIT_INDEX_OID
+        );
+        assert!(
+            crate::storage::FIRST_EXPLICIT_INDEX_OID as u64
+                + crate::storage::MAX_INDEX_OID_GENERATION
+                + (crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64)
+                < crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
+        );
+        assert!(
+            crate::storage::TRIGGER_OID_BASE as u64 + crate::storage::MAX_TRIGGER_OID_GENERATION
+                < catalog::FIRST_FOREIGN_KEY_TRIGGER_OID as u64
+        );
+        assert!(
+            catalog::foreign_key_trigger_oid(
+                MAX_TABLE_TYPE_OID_SLOTS - 1,
+                crate::storage::MAX_FKEYS - 1,
+                3
+            ) < crate::storage::FIRST_PARTITION_TRIGGER_OID
+        );
+        assert!(
+            crate::storage::FIRST_PARTITION_TRIGGER_OID as u64
+                + crate::storage::MAX_TRIGGER_OID_GENERATION * MAX_TABLE_TYPE_OID_SLOTS as u64
+                + MAX_TABLE_TYPE_OID_SLOTS as u64
+                - 1
+                + crate::storage::INDEX_CONSTRAINT_OID_OFFSET as u64
+                <= i32::MAX as u64
+        );
+    });
+}
+
+#[test]
 fn postgresql_object_introspection_and_serial_sequences_are_transactional() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -1290,7 +1365,7 @@ fn sql_xml_crosses_dml_stored_query_and_object_recovery_boundaries() {
              COLUMNS id integer PATH '@id', name text PATH 'name');
          FETCH ALL FROM xml_cursor;
          COMMIT",
-        1 << 20,
+        1 << 21,
     );
     assert_eq!(
         data_rows(&setup),
@@ -6217,7 +6292,7 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
          COMMENT ON ACCESS METHOD btree IS 'access method'; \
          COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language'; \
          SELECT kind FROM comment_catalog_events ORDER BY kind",
-        1 << 20,
+        1 << 21,
     );
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
@@ -9013,7 +9088,7 @@ fn test_config(name: &str) -> Config {
     config.max_value_indexes = 8;
     config.wal_bytes = 1 << 20;
     config.wal_buffer_bytes = 1 << 14;
-    config.work_arena_bytes = 1 << 21;
+    config.work_arena_bytes = 1 << 22;
     config.collation_scratch_bytes = 4 << 10;
     config.remove_test_data_dir_on_drop();
     config
@@ -9402,7 +9477,7 @@ fn test_data_directory_lives_until_the_last_engine_or_configuration_owner() {
 
 fn run_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
     let mut guc = GucState::new();
-    run_with_guc(engine, budget, sql_text, 1 << 18, &mut guc)
+    run_with_guc(engine, budget, sql_text, 1 << 22, &mut guc)
 }
 
 fn run_with_ddl_capacity(
@@ -9412,6 +9487,8 @@ fn run_with_ddl_capacity(
     ddl_capacity: usize,
     arena_bytes: usize,
 ) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buffer = crate::mem::FixedBuf::new(budget, "ddl capacity send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "ddl capacity sql", arena_bytes).unwrap();
     let mut txn = TxnState::new_with_ddl_capacity(budget, 1024, ddl_capacity).unwrap();
@@ -9615,6 +9692,10 @@ fn run_with_guc(
     arena_bytes: usize,
     guc: &mut GucState,
 ) -> Vec<u8> {
+    // These fixtures drop every request-local pool before returning. Charge
+    // their peak against remaining live memory, not cumulative freed requests.
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", arena_bytes).unwrap();
     let mut txn = TxnState::new(budget, 1024).unwrap();
@@ -9644,8 +9725,10 @@ fn run_with_session(
     pool: &mut SqlPreparedPool,
     cursors: &mut crate::sql::cursor::CursorPool,
 ) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buffer = crate::mem::FixedBuf::new(budget, "session_send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "session_sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "session_sql", 1 << 21).unwrap();
     let mut responder = Responder::new(&mut buffer);
     engine
         .execute_simple(sql_text, &arena, txn, pool, cursors, guc, &mut responder, 1)
@@ -9654,8 +9737,10 @@ fn run_with_session(
 }
 
 fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buffer = crate::mem::FixedBuf::new(budget, "describe send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "describe sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "describe sql", 1 << 21).unwrap();
     let transaction = TxnState::new(budget, 1024).unwrap();
     let described = {
         let mut responder =
@@ -9672,8 +9757,10 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
 /// connection, deliberately leaving publication to the caller's flush
 /// boundary.
 fn stage_without_publication(engine: &mut Engine, budget: &mut Budget, sql_text: &str) {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
     let mut cursors = test_cursors(budget);
@@ -9698,8 +9785,10 @@ fn stage_without_publication(engine: &mut Engine, budget: &mut Budget, sql_text:
 /// Runs one simple-query message as a specific connection id (for LISTEN /
 /// NOTIFY, whose semantics are cross-connection).
 fn run_as(engine: &mut Engine, budget: &mut Budget, conn_id: i32, sql_text: &str) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut txn = TxnState::new(budget, 1024).unwrap();
     let mut pool = test_pool(budget);
     let mut guc = GucState::new();
@@ -15682,6 +15771,142 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
 }
 
 #[test]
+fn catalog_schema_resolution_retains_only_its_owned_definition() {
+    let (engine, mut budget) = test_engine();
+    let arena = Arena::new(&mut budget, "catalog schema scratch", 2 << 20).unwrap();
+    for catalog in [
+        "pg_amop",
+        "pg_depend",
+        "pg_partitioned_table",
+        "pg_class",
+        "pg_constraint",
+        "pg_attrdef",
+    ] {
+        let mark = arena.mark();
+        let before = arena.used();
+        crate::mem::guard::forbid_alloc(|| {
+            let shape =
+                crate::sql::catalog::synthesize_definition(Some("pg_catalog"), catalog, &arena)
+                    .unwrap();
+            assert!(shape.rows.is_empty());
+            assert_eq!(shape.def.name.as_str(), catalog);
+            assert_eq!(
+                arena.used() - before,
+                core::mem::size_of::<crate::storage::TableDef>()
+            );
+            let materialized = crate::sql::catalog::synthesize(
+                &engine.storage,
+                Some("pg_catalog"),
+                catalog,
+                0,
+                &arena,
+            )
+            .unwrap();
+            assert_eq!(shape.hidden_columns, materialized.hidden_columns);
+            assert_eq!(shape.def.n_columns, materialized.def.n_columns);
+            let width = shape.def.n_columns + shape.hidden_columns;
+            for (actual, expected) in shape.def.columns[..width]
+                .iter()
+                .zip(&materialized.def.columns[..width])
+            {
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.ctype, expected.ctype);
+                assert_eq!(actual.type_mod, expected.type_mod);
+                assert_eq!(actual.collation, expected.collation);
+            }
+        });
+        // Every descriptor and row from this iteration was consumed above.
+        unsafe { arena.rewind_to(mark) };
+    }
+}
+
+#[test]
+fn catalog_backed_views_describe_without_constructing_catalog_rows() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE schema_only_source (value integer);
+         CREATE VIEW schema_only_attributes AS
+           SELECT attname, atttypid FROM pg_attribute
+            WHERE attrelid = 'schema_only_source'::regclass AND attnum > 0;
+         CREATE VIEW schema_only_classes AS SELECT oid, relname FROM pg_class;
+         CREATE VIEW schema_only_columns AS
+           SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'schema_only_source';
+         SELECT attname, atttypid FROM schema_only_attributes;
+         SELECT column_name FROM schema_only_columns;
+         SELECT attname FROM pg_attribute
+          WHERE attrelid = 'schema_only_attributes'::regclass AND attnum > 0
+          ORDER BY attnum;
+         SELECT column_name FROM information_schema.columns
+          WHERE table_name = 'schema_only_attributes' ORDER BY ordinal_position;
+         SELECT relname FROM schema_only_classes WHERE oid = 'schema_only_source'::regclass;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "value|23",
+            "value",
+            "attname",
+            "atttypid",
+            "attname",
+            "atttypid",
+            "schema_only_source"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn relation_oid_names_need_only_the_rendered_name_arena() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_oid_source (value integer);
+         CREATE VIEW bounded_oid_view AS SELECT value FROM bounded_oid_source;
+         CREATE SEQUENCE bounded_oid_sequence;
+         CREATE TYPE bounded_oid_record AS (value integer);
+         CREATE INDEX bounded_oid_index ON bounded_oid_source (value);",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let mut name_budget = Budget::new(64);
+    let arena = Arena::new(&mut name_budget, "relation identity name", 64).unwrap();
+    for name in [
+        "bounded_oid_source",
+        "bounded_oid_view",
+        "bounded_oid_sequence",
+        "bounded_oid_record",
+        "bounded_oid_index",
+    ] {
+        let mark = arena.mark();
+        crate::mem::guard::forbid_alloc(|| {
+            let oid = crate::sql::catalog::reloid_of_name(&engine.storage, 0, name).unwrap();
+            assert_eq!(
+                crate::sql::catalog::relname_text(&engine.storage, 0, oid, &arena).unwrap(),
+                Some(name)
+            );
+            assert_eq!(arena.used(), name.len());
+        });
+        // Each name was consumed before this fixed arena is reused.
+        unsafe { arena.rewind_to(mark) };
+    }
+    for oid in [0, 30_000, -1, i32::MAX] {
+        assert_eq!(
+            crate::sql::catalog::relname_text(&engine.storage, 0, oid, &arena).unwrap(),
+            None
+        );
+        assert_eq!(arena.used(), 0);
+    }
+}
+
+#[test]
 fn declared_user_types_survive_protocol_description_and_parameter_inference() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -15869,7 +16094,7 @@ fn range_multirange_support_aggregates_and_expansion_are_typed() {
 fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
     let config = test_config("range-array-restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -15894,7 +16119,7 @@ fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -16615,9 +16840,11 @@ fn run_txn_bytes(
     txn: &mut TxnState,
     sql_text: &str,
 ) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let connection_id = test_connection_id(txn);
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
@@ -16643,8 +16870,10 @@ fn run_txn_conn(
     connection_id: i32,
     sql_text: &str,
 ) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
     let mut guc = GucState::new();
     let mut responder = Responder::new(&mut buffer);
@@ -21910,7 +22139,7 @@ fn array_type() {
 fn array_subscripts_survive_dml_wal_checkpoint_and_cold_recovery() {
     let config = test_config("array-subscripts-restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -21922,7 +22151,7 @@ fn array_subscripts_survive_dml_wal_checkpoint_and_cold_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -24634,7 +24863,7 @@ fn pg_collation_rows_have_catalog_relation_identity_and_types() {
 fn column_collation_survives_wal_and_checkpoint_recovery() {
     let config = test_config("collation-restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let created = run_with(
             &mut engine,
@@ -24664,7 +24893,7 @@ fn column_collation_survives_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -26540,7 +26769,7 @@ fn commit_makes_writes_visible_and_durable() {
 
 fn commit_makes_writes_visible_and_durable_on_sized_stack() {
     let config = test_config("txn-durable");
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     {
         let mut e = Engine::new(&config, &mut b).unwrap();
         let mut t = TxnState::new(&mut b, 256).unwrap();
@@ -26568,7 +26797,7 @@ fn commit_makes_writes_visible_and_durable_on_sized_stack() {
             .unwrap();
         assert_eq!(stamped, 2);
     }
-    let mut b2 = Budget::new(1 << 26);
+    let mut b2 = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b2).unwrap();
     let mut t = TxnState::new(&mut b2, 256).unwrap();
     let out = run_txn(&mut e, &mut b2, &mut t, "SELECT id FROM t ORDER BY id");
@@ -26622,24 +26851,7 @@ fn run_session(
     guc: &mut GucState,
     sql_text: &str,
 ) -> Vec<u8> {
-    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
-    let mut txn = TxnState::new(budget, 1024).unwrap();
-    let mut pool = test_pool(budget);
-    let mut responder = Responder::new(&mut buffer);
-    engine
-        .execute_simple(
-            sql_text,
-            &arena,
-            &mut txn,
-            &mut pool,
-            &mut test_cursors(budget),
-            guc,
-            &mut responder,
-            1,
-        )
-        .unwrap();
-    buffer.readable().to_vec()
+    run_with_guc(engine, budget, sql_text, 1 << 21, guc)
 }
 
 fn run_session_transaction(
@@ -26649,9 +26861,11 @@ fn run_session_transaction(
     guc: &mut GucState,
     sql_text: &str,
 ) -> Vec<u8> {
+    let mut request_budget = Budget::new(budget.remaining());
+    let budget = &mut request_budget;
     let connection_id = test_connection_id(transaction);
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "sql", 1 << 21).unwrap();
     let mut pool = test_pool(budget);
     let mut responder = Responder::new(&mut buffer);
     engine
@@ -26675,25 +26889,7 @@ fn run_with_txn_bytes(
     txn: &mut TxnState,
     sql_text: &str,
 ) -> Vec<u8> {
-    let connection_id = test_connection_id(txn);
-    let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
-    let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
-    let mut pool = test_pool(budget);
-    let mut guc = GucState::new();
-    let mut responder = Responder::new(&mut buffer);
-    engine
-        .execute_simple(
-            sql_text,
-            &arena,
-            txn,
-            &mut pool,
-            &mut test_cursors(budget),
-            &mut guc,
-            &mut responder,
-            connection_id,
-        )
-        .unwrap();
-    buffer.readable().to_vec()
+    run_txn_bytes(engine, budget, txn, sql_text)
 }
 
 #[test]
@@ -26839,7 +27035,7 @@ fn ddl_rolls_back_with_implicit_transaction() {
 fn data_survives_engine_restart() {
     let config = test_config("restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v text)");
         run_with(
@@ -26853,7 +27049,7 @@ fn data_survives_engine_restart() {
         run_with(&mut e, &mut budget, "DROP TABLE gone");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     let bytes = run_with(&mut e, &mut budget, "SELECT id, v FROM t ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1|a", "2|B"]);
@@ -26955,7 +27151,7 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
 fn regtype_columns_survive_wal_and_checkpoint_recovery() {
     let config = test_config("regtype-restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -26967,7 +27163,7 @@ fn regtype_columns_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -26993,7 +27189,7 @@ fn regtype_columns_survive_wal_and_checkpoint_recovery() {
 fn reg_arrays_survive_wal_and_checkpoint_recovery() {
     let config = test_config("reg-arrays-restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -27033,7 +27229,7 @@ fn reg_arrays_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -27071,7 +27267,7 @@ fn reg_arrays_survive_wal_and_checkpoint_recovery() {
 fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
     let config = test_config("catalog-object-restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -27102,7 +27298,7 @@ fn catalog_object_columns_survive_wal_and_checkpoint_recovery() {
         run_with(&mut engine, &mut budget, "CHECKPOINT");
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -27148,7 +27344,7 @@ fn indexes_survive_restart() {
     // WAL-replay restart.
     let config = test_config("idx_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (a int, b int)");
         run_with(&mut e, &mut budget, "INSERT INTO t VALUES (1,1),(1,2)");
@@ -27159,7 +27355,7 @@ fn indexes_survive_restart() {
         );
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -27185,7 +27381,7 @@ fn views_survive_restart() {
     // View definitions are journaled, so they survive a WAL-replay restart.
     let config = test_config("view_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
         run_with(
@@ -27202,7 +27398,7 @@ fn views_survive_restart() {
         run_with(&mut e, &mut budget, "DROP VIEW gone");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The surviving view still expands and queries.
     assert_eq!(
@@ -35634,7 +35830,7 @@ fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
 fn sequence_survives_restart() {
     let config = test_config("sequence_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut e,
@@ -35645,7 +35841,7 @@ fn sequence_survives_restart() {
         run_with(&mut e, &mut budget, "SELECT nextval('s')"); // 15
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // Value state (last=15, is_called) survived replay: the next value is 20.
     assert_eq!(
@@ -35667,7 +35863,7 @@ fn sequence_survives_restart() {
 fn sequence_advance_in_creating_transaction_survives_restart() {
     let config = test_config("sequence_create_advance_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let result = run_with(
             &mut engine,
@@ -35682,7 +35878,7 @@ fn sequence_advance_in_creating_transaction_survives_restart() {
         assert!(!String::from_utf8_lossy(&result).contains("ERROR"));
     }
 
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(&mut engine, &mut budget, "SELECT nextval('s')")),
@@ -35709,7 +35905,7 @@ fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     // Reserve the durable transaction marker as well as the CREATE record;
     // this remains too small for the later absolute sequence retry record.
     config.wal_bytes = 192;
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");
     assert!(
@@ -35819,7 +36015,7 @@ fn foreign_key_set_default_evaluates_expression_per_action() {
 fn expression_default_survives_restart() {
     let config = test_config("default_expr_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE SEQUENCE s");
         run_with(
@@ -35830,7 +36026,7 @@ fn expression_default_survives_restart() {
         run_with(&mut e, &mut budget, "INSERT INTO t (v) VALUES (10)");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The default expression survived replay: the next insert still assigns
     // nextval (continuing the sequence).
@@ -35943,7 +36139,7 @@ fn generated_columns() {
 fn generated_column_survives_restart() {
     let config = test_config("generated_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut e,
@@ -35953,7 +36149,7 @@ fn generated_column_survives_restart() {
         run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (10)");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The generation expression survived replay: a new insert still computes it.
     run_with(&mut e, &mut budget, "INSERT INTO g (a) VALUES (20)");
@@ -36496,7 +36692,7 @@ fn sequence_ownership_is_distinct_from_generation() {
 fn identity_survives_restart() {
     let config = test_config("identity_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut e,
@@ -36522,7 +36718,7 @@ fn identity_survives_restart() {
         run_with(&mut e, &mut budget, "ALTER TABLE ic RENAME TO ic2");
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The identity step (5) and counter survived replay: next value is 15.
     run_with(&mut e, &mut budget, "INSERT INTO ic2 (value) VALUES ('b')");
@@ -37629,7 +37825,7 @@ fn sql_surface_batch() {
 fn altered_table_survives_restart() {
     let config = test_config("alter-durable");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE a (id int, v text)");
         run_with(&mut e, &mut b, "CREATE INDEX a_v_idx ON a (v)");
@@ -37637,7 +37833,7 @@ fn altered_table_survives_restart() {
         run_with(&mut e, &mut b, "ALTER TABLE a ADD COLUMN n int DEFAULT 42");
         run_with(&mut e, &mut b, "ALTER TABLE a RENAME TO b");
     }
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(
         &mut e,
@@ -37907,7 +38103,7 @@ fn alter_column_default_and_not_null() {
 fn alter_column_type_rewrites_and_persists() {
     let config = test_config("alter-column-type");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a int, b text)");
         run_with(
@@ -37954,7 +38150,7 @@ fn alter_column_type_rewrites_and_persists() {
         );
     }
     // The rewritten shape and values survive a restart.
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(
         &mut e,
@@ -38157,14 +38353,13 @@ fn value_index_matches_uniqueness_oracle() {
         rng
     };
     let mut present: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    // Each statement gets a fresh scratch budget: the harness's per-statement
-    // draws are not reclaimed, and this workload runs a thousand of them.
+    // The bounded request fixture is separate from the live engine budget.
     let run = |e: &mut Engine, sql: &str| {
-        String::from_utf8_lossy(&run_with(e, &mut Budget::new(3 << 20), sql)).to_string()
+        String::from_utf8_lossy(&run_with(e, &mut Budget::new(16 << 20), sql)).to_string()
     };
 
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run(&mut e, "CREATE TABLE t (k int UNIQUE, v int)");
         for _ in 0..800 {
@@ -38206,9 +38401,9 @@ fn value_index_matches_uniqueness_oracle() {
     }
 
     // Restart: the index is gone and must be rebuilt from the replayed rows.
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
-    let bytes = run_with(&mut e, &mut Budget::new(3 << 20), "SELECT count(*) FROM t");
+    let bytes = run_with(&mut e, &mut b, "SELECT count(*) FROM t");
     assert_eq!(data_rows(&bytes), [format!("{}", present.len())]);
     for _ in 0..200 {
         let key = (next() % 50) as i64;
@@ -39041,7 +39236,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
 fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
     let mut config = test_config("correlated-composite-explain");
     config.wal_buffer_bytes = 1 << 20;
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -39068,6 +39263,251 @@ fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
         rows.iter().any(|row| row.contains("rows=100 ")),
         "joint NDV=10 must estimate the 100 correlated matches instead of multiplying two 0.1 estimates: {rows:?}"
     );
+}
+
+#[test]
+fn constraint_and_default_catalogs_have_postgresql_18_shapes() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_shape_parent(id int PRIMARY KEY); \
+         CREATE TABLE catalog_shape_child(id int DEFAULT 1 REFERENCES catalog_shape_parent(id), \
+             value int NOT NULL CHECK (value > 0)); \
+         INSERT INTO catalog_shape_parent VALUES (1); \
+         INSERT INTO catalog_shape_child(value) VALUES (2)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let constraints = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM pg_constraint LIMIT 0",
+    );
+    assert_eq!(
+        row_description_names(&constraints),
+        [
+            "oid",
+            "conname",
+            "connamespace",
+            "contype",
+            "condeferrable",
+            "condeferred",
+            "conenforced",
+            "convalidated",
+            "conrelid",
+            "contypid",
+            "conindid",
+            "conparentid",
+            "confrelid",
+            "confupdtype",
+            "confdeltype",
+            "confmatchtype",
+            "conislocal",
+            "coninhcount",
+            "connoinherit",
+            "conperiod",
+            "conkey",
+            "confkey",
+            "conpfeqop",
+            "conppeqop",
+            "conffeqop",
+            "confdelsetcols",
+            "conexclop",
+            "conbin"
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&constraints),
+        [
+            26, 19, 26, 18, 16, 16, 16, 16, 26, 26, 26, 26, 26, 18, 18, 18, 16, 21, 16, 16, 1005,
+            1005, 1028, 1028, 1028, 1005, 1028, 194
+        ]
+    );
+    let defaults = run_with(&mut engine, &mut budget, "SELECT * FROM pg_attrdef");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT c.relname, b.label FROM pg_class c \
+           LEFT JOIN (VALUES (1259::oid,'class'),(NULL::oid,'never')) b(id,label) \
+             ON c.tableoid = b.id WHERE c.relname = 'catalog_shape_child'"
+        )),
+        ["catalog_shape_child|class"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT b.id, c.relname FROM (VALUES (1259::oid),(NULL::oid)) b(id) \
+           LEFT JOIN pg_class c ON b.id = c.tableoid AND c.relname = 'catalog_shape_child' \
+          ORDER BY b.id"
+        )),
+        ["1259|catalog_shape_child", "NULL|NULL"]
+    );
+    assert_eq!(
+        row_description_names(&defaults),
+        ["oid", "adrelid", "adnum", "adbin"]
+    );
+    assert_eq!(row_description_type_oids(&defaults), [26, 26, 21, 194]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid \
+          WHERE c.relname = 'catalog_shape_child' AND a.attnum > 0 ORDER BY a.attnum"
+        )),
+        ["id", "value"]
+    );
+    let sequence = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE catalog_shape_sequence START WITH 7; \
+         SELECT (pg_get_sequence_data(oid)).* FROM pg_class WHERE relname = 'catalog_shape_sequence'",
+    );
+    assert_eq!(
+        data_rows(&sequence),
+        ["7|f"],
+        "{}",
+        String::from_utf8_lossy(&sequence)
+    );
+    let sequence_transactions = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER SEQUENCE catalog_shape_sequence RESTART WITH 11; \
+         SELECT (pg_get_sequence_data(oid)).* FROM pg_class WHERE relname = 'catalog_shape_sequence'; \
+         ROLLBACK; \
+         SELECT * FROM pg_get_sequence_data('catalog_shape_sequence'::regclass::oid); \
+         SELECT s.last_value, s.is_called FROM pg_class c \
+           CROSS JOIN LATERAL pg_get_sequence_data(c.oid) s \
+          WHERE c.relname = 'catalog_shape_sequence'",
+    );
+    assert_eq!(
+        data_rows(&sequence_transactions),
+        ["11|f", "7|f", "7|f"],
+        "{}",
+        String::from_utf8_lossy(&sequence_transactions)
+    );
+    for invalid in [
+        "SELECT (pg_get_sequence_data(true)).*",
+        "SELECT * FROM pg_get_sequence_data(true)",
+    ] {
+        let response = run_with(&mut engine, &mut budget, invalid);
+        assert!(
+            String::from_utf8_lossy(&response).contains("42883"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_get_sequence_data(NULL::oid)"
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(k.conkey), pg_typeof(k.conpfeqop), pg_typeof(k.tableoid), \
+                k.conkey::text, k.confkey::text \
+           FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid \
+          WHERE c.relname = 'catalog_shape_child' AND k.contype = 'f'"
+        )),
+        ["smallint[]|oid[]|oid|{1}|{1}"]
+    );
+    for query in [
+        "SELECT count(*) FROM pg_constraint k JOIN pg_class c ON c.oid = k.conrelid",
+        "SELECT count(*) FROM pg_attrdef d JOIN pg_class c ON c.oid = d.adrelid",
+    ] {
+        let plan = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!("EXPLAIN {query}"),
+        ));
+        assert!(
+            plan.iter().any(|line| line.contains("Hash Join")),
+            "{plan:?}"
+        );
+    }
+}
+
+#[test]
+fn hash_join_decodes_derived_sources_and_preserves_left_join_semantics() {
+    for external in [false, true] {
+        let mut config = test_config(if external {
+            "derived-hash-external"
+        } else {
+            "derived-hash-inline"
+        });
+        config.object_store_on = external;
+        config.object_store_sim = external;
+        config.object_store_bucket = format!("derived-hash-{}-{external}", std::process::id());
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(engine.storage.spill_attached(), external);
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE derived_hash_source (id int, payload text, active bool); \
+         INSERT INTO derived_hash_source VALUES \
+           (1,'a',true),(1,'b',true),(2,'c',false),(NULL,'n',true),(4,'reject',true)",
+        );
+        assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+        let query = "SELECT p.id, b.payload, (b.details).f1 \
+         FROM (VALUES (1),(1),(2),(3),(NULL),(4)) AS p(id) \
+         LEFT JOIN (SELECT id, payload, active, ROW(payload, ROW(id)) AS details \
+                      FROM derived_hash_source) AS b \
+           ON p.id = b.id AND b.active \
+         WHERE b.payload IS NULL OR b.payload <> 'reject' \
+         ORDER BY p.id, b.payload";
+        let plan = data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            &format!("EXPLAIN {query}"),
+        ));
+        assert!(
+            plan.iter().any(|line| line.contains("Hash Join")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            data_rows(&run_with(&mut engine, &mut budget, query)),
+            [
+                "1|a|a",
+                "1|a|a",
+                "1|b|b",
+                "1|b|b",
+                "2|NULL|NULL",
+                "3|NULL|NULL",
+                "NULL|NULL|NULL"
+            ]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT s.id, b.payload FROM derived_hash_source AS s \
+             JOIN (VALUES (1,'one'),(1,'again'),(NULL,'never')) AS b(id,payload) \
+               ON s.id = b.id ORDER BY s.id, b.payload",
+            )),
+            ["1|again", "1|again", "1|one", "1|one"]
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT p.id, b.payload FROM (VALUES (1),(NULL)) AS p(id) \
+                 LEFT JOIN (SELECT id, payload FROM derived_hash_source WHERE FALSE) AS b \
+                   ON p.id = b.id ORDER BY p.id",
+            )),
+            ["1|NULL", "NULL|NULL"]
+        );
+        drop(engine);
+        if external {
+            crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        }
+    }
 }
 
 #[test]
@@ -39781,7 +40221,7 @@ fn joins_group_by_subqueries() {
 fn datetime_uuid_bytea_types() {
     let config = test_config("types-durable");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -39807,7 +40247,7 @@ fn datetime_uuid_bytea_types() {
         assert_eq!(data_rows(&bytes), ["1"]);
     }
     // Types survive WAL replay.
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT u FROM ev");
     assert_eq!(data_rows(&bytes), ["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"]);
@@ -39917,7 +40357,7 @@ fn postgresql18_uuid_functions_catalogs_and_input_boundary() {
 fn generated_uuid_defaults_survive_wal_and_checkpoint_recovery() {
     let config = test_config("uuid-functions-recovery");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -39931,7 +40371,7 @@ fn generated_uuid_defaults_survive_wal_and_checkpoint_recovery() {
              CHECKPOINT",
         );
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -41818,7 +42258,7 @@ fn stored_query_binding_survives_relation_and_type_renames() {
 fn stored_query_dependencies_survive_wal_replay() {
     let config = test_config("stored_query_dependencies_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let created = run_with(
             &mut engine,
@@ -41837,7 +42277,7 @@ fn stored_query_dependencies_survive_wal_replay() {
             String::from_utf8_lossy(&created)
         );
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let selected = run_with(
         &mut engine,
@@ -41909,7 +42349,7 @@ fn materialized_view_refresh_uses_captured_dependencies_after_rename() {
 fn comment_survives_restart_and_drop_clears_it() {
     let config = test_config("comment-durable");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE TABLE ct (id int, a text)");
         run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
@@ -41919,7 +42359,7 @@ fn comment_survives_restart_and_drop_clears_it() {
     }
     // The comment survives WAL replay.
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
         assert_eq!(data_rows(&bytes), ["durable"]);
@@ -41948,7 +42388,7 @@ fn comment_survives_restart_and_drop_clears_it() {
     }
     // The drop's comment removal is itself durable across another restart.
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
         assert_eq!(data_rows(&bytes), ["NULL"]);
@@ -42025,7 +42465,7 @@ fn network_functions_match_postgres() {
 fn network_types_survive_restart() {
     let config = test_config("network-durable");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -42039,7 +42479,7 @@ fn network_types_survive_restart() {
         );
     }
     // The values survive WAL replay byte-for-byte (the rowenc codec).
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(&mut e, &mut b, "SELECT a, c, m, m8 FROM nd");
     assert_eq!(
@@ -45070,7 +45510,7 @@ fn sequence_alterations_are_private_until_commit() {
 fn domains_survive_restart() {
     let config = test_config("domain-durable");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -45083,7 +45523,7 @@ fn domains_survive_restart() {
     }
     // WAL replay: the domain and its column identity survive.
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT pg_typeof(a), a FROM dt");
         assert_eq!(data_rows(&bytes), ["posint|42"]);
@@ -45330,7 +45770,7 @@ fn enum_float4_renumbering_and_new_value_safety() {
 fn enums_survive_restart() {
     let config = test_config("enum-durable");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(
             &mut e,
@@ -45354,7 +45794,7 @@ fn enums_survive_restart() {
     // WAL replay: the enum, its rename, added value, ordering, and column
     // identity survive, including through grouped projection's schema lookup.
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(&mut e, &mut b, "SELECT id FROM et ORDER BY m, id");
         assert_eq!(data_rows(&bytes), ["3", "2", "1"]);
@@ -45387,7 +45827,7 @@ fn enums_survive_restart() {
 fn user_type_schema_identity_survives_restart() {
     let config = test_config("user-type-schema-durable");
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         run_with(&mut e, &mut b, "CREATE SCHEMA first; CREATE SCHEMA second");
         run_with(
@@ -45446,7 +45886,7 @@ fn user_type_schema_identity_survives_restart() {
         e.commit_wal().unwrap();
     }
     {
-        let mut b = Budget::new(1 << 26);
+        let mut b = Budget::new(1 << 27);
         let mut e = Engine::new(&config, &mut b).unwrap();
         let bytes = run_with(
             &mut e,
@@ -46443,7 +46883,7 @@ fn current_setting_reads_gucs() {
 fn altered_sequence_definition_and_value_survive_restart() {
     let config = test_config("sequence_alter_restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 27);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         run_with(
             &mut engine,
@@ -46454,7 +46894,7 @@ fn altered_sequence_definition_and_value_survive_restart() {
         );
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(&mut engine, &mut budget, "SELECT nextval('s')")),
@@ -49000,6 +49440,407 @@ fn configured_user_type_capacities_cover_ddl_catalogs_spill_and_object_cold_reco
             "80",
             "80",
             "capacity_chain_domain_39[]|capacity_enum_39[]|capacity_composite_39[]",
+        ],
+        "{}",
+        String::from_utf8_lossy(&cold)
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn wide_schema_objects_cover_full_definition_bounds_and_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    const WIDTH: usize = crate::storage::MAX_COLUMNS;
+    const PARTITION_WIDTH: usize = crate::storage::MAX_PARTITION_KEYS;
+    const CONSTRAINTS: usize = crate::storage::MAX_TABLE_CONSTRAINTS;
+
+    let mut config = test_config("wide-schema-objects");
+    config.max_tables = 12;
+    config.max_domains = 2;
+    config.max_composites = 2;
+    config.max_indexes = 4;
+    config.max_value_indexes = 132;
+    config.value_index_rows = 8;
+    config.table_rows = 16;
+    config.wal_buffer_bytes = 64 << 20;
+    config.wal_upload_buffer_bytes = 64 << 20;
+    config.checkpoint_manifest_bytes = 64 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("wide-schema-objects-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut sql = String::new();
+    sql.push_str("CREATE TYPE wide_composite AS (");
+    for field in 0..WIDTH {
+        if field != 0 {
+            sql.push(',');
+        }
+        write!(sql, "f{field} integer").unwrap();
+    }
+    sql.push_str(");CREATE DOMAIN wide_domain AS integer ");
+    for constraint in 0..CONSTRAINTS {
+        write!(
+            sql,
+            "CONSTRAINT wide_domain_check_{constraint} CHECK (VALUE >= -{constraint}) "
+        )
+        .unwrap();
+    }
+    sql.push(';');
+
+    sql.push_str("CREATE TABLE wide_partitioned (");
+    for column in 0..PARTITION_WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        write!(sql, "k{column} integer").unwrap();
+    }
+    sql.push_str(") PARTITION BY RANGE (");
+    for column in 0..PARTITION_WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        write!(sql, "k{column}").unwrap();
+    }
+    sql.push_str(");CREATE TABLE wide_partition PARTITION OF wide_partitioned FOR VALUES FROM (");
+    for column in 0..PARTITION_WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        sql.push('0');
+    }
+    sql.push_str(") TO (");
+    for column in 0..PARTITION_WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        sql.push_str("10");
+    }
+    sql.push_str(
+        ");CREATE TABLE wide_partition_default PARTITION OF wide_partitioned DEFAULT;\
+                  INSERT INTO wide_partitioned VALUES (",
+    );
+    for column in 0..PARTITION_WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        sql.push('1');
+    }
+    sql.push_str(");");
+
+    sql.push_str(
+        "CREATE TABLE wide_list_parent (value integer) PARTITION BY LIST (value);\
+         CREATE TABLE wide_list_child PARTITION OF wide_list_parent FOR VALUES IN (",
+    );
+    for value in 0..crate::storage::MAX_PARTITION_LIST_VALUES {
+        if value != 0 {
+            sql.push(',');
+        }
+        write!(sql, "{value}").unwrap();
+    }
+    sql.push_str(");INSERT INTO wide_list_parent VALUES (63);");
+
+    sql.push_str("CREATE TABLE wide_unique (");
+    for column in 0..WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        write!(sql, "u{column} integer").unwrap();
+    }
+    for constraint in 0..CONSTRAINTS {
+        write!(
+            sql,
+            ",CONSTRAINT wide_unique_{constraint} UNIQUE (u{constraint})"
+        )
+        .unwrap();
+    }
+    sql.push_str(");INSERT INTO wide_unique VALUES (");
+    for value in 0..WIDTH {
+        if value != 0 {
+            sql.push(',');
+        }
+        write!(sql, "{value}").unwrap();
+    }
+    sql.push_str(");");
+
+    sql.push_str("CREATE TABLE wide_foreign_keys (");
+    for column in 0..WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        write!(sql, "f{column} integer").unwrap();
+    }
+    for constraint in 0..CONSTRAINTS {
+        write!(
+            sql,
+            ",CONSTRAINT wide_foreign_{constraint} FOREIGN KEY (f{constraint}) \
+             REFERENCES wide_unique (u{constraint})"
+        )
+        .unwrap();
+    }
+    sql.push_str(");INSERT INTO wide_foreign_keys VALUES (");
+    for value in 0..WIDTH {
+        if value != 0 {
+            sql.push(',');
+        }
+        write!(sql, "{value}").unwrap();
+    }
+    sql.push_str(");");
+
+    sql.push_str("CREATE TABLE wide_checks (value integer");
+    for constraint in 0..CONSTRAINTS {
+        write!(
+            sql,
+            ",CONSTRAINT wide_check_{constraint} CHECK (value >= -{constraint})"
+        )
+        .unwrap();
+    }
+    sql.push_str(");INSERT INTO wide_checks VALUES (1);");
+
+    sql.push_str("CREATE TABLE wide_exclusions (");
+    for column in 0..WIDTH {
+        if column != 0 {
+            sql.push(',');
+        }
+        write!(sql, "r{column} int8range").unwrap();
+    }
+    for constraint in 0..CONSTRAINTS {
+        write!(
+            sql,
+            ",CONSTRAINT wide_exclusion_{constraint} EXCLUDE USING gist \
+             (r{constraint} WITH &&)"
+        )
+        .unwrap();
+    }
+    sql.push_str(");INSERT INTO wide_exclusions VALUES (");
+    for value in 0..WIDTH {
+        if value != 0 {
+            sql.push(',');
+        }
+        write!(sql, "int8range({value},{})", value + 1).unwrap();
+    }
+    sql.push_str(");CREATE INDEX wide_covering_idx ON wide_unique (");
+    for column in 0..24 {
+        if column != 0 {
+            sql.push(',');
+        }
+        if column == 23 {
+            sql.push_str("(u23 + 0) DESC NULLS FIRST");
+        } else {
+            write!(sql, "u{column}").unwrap();
+        }
+    }
+    sql.push_str(") INCLUDE (");
+    for column in 24..32 {
+        if column != 24 {
+            sql.push(',');
+        }
+        write!(sql, "u{column}").unwrap();
+    }
+    sql.push_str(");");
+
+    let mut budget = Budget::new(1536 << 20);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &sql, 64 << 20);
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    for (query, expected) in [
+        (
+            "SELECT typrelid FROM pg_type WHERE typname = 'wide_composite'",
+            "180000",
+        ),
+        (
+            "SELECT count(*) FROM pg_attribute \
+               WHERE attrelid = 180000 \
+                 AND attnum > 0 AND NOT attisdropped",
+            "64",
+        ),
+        (
+            "SELECT count(*) FROM pg_constraint \
+               WHERE contypid = 'wide_domain'::regtype AND contype = 'c'",
+            "64",
+        ),
+        (
+            "SELECT count(*) FROM pg_constraint \
+               WHERE conrelid = 'wide_checks'::regclass AND contype = 'c'",
+            "64",
+        ),
+        (
+            "SELECT count(*) FROM pg_constraint \
+               WHERE conrelid = 'wide_unique'::regclass AND contype = 'u'",
+            "64",
+        ),
+        (
+            "SELECT count(*) FROM pg_constraint \
+               WHERE conrelid = 'wide_foreign_keys'::regclass AND contype = 'f'",
+            "64",
+        ),
+        (
+            "SELECT count(*) FROM pg_constraint \
+               WHERE conrelid = 'wide_exclusions'::regclass AND contype = 'x'",
+            "64",
+        ),
+        (
+            "SELECT partnatts, partdefid <> 0, pg_typeof(partattrs), \
+                    pg_typeof(partclass), pg_typeof(partcollation), pg_typeof(partexprs) \
+               FROM pg_partitioned_table \
+               WHERE partrelid = 'wide_partitioned'::regclass",
+            "32|t|int2vector|oidvector|oidvector|pg_node_tree",
+        ),
+        (
+            "SELECT indnkeyatts, indnatts FROM pg_index \
+               WHERE indexrelid = 'wide_covering_idx'::regclass",
+            "24|32",
+        ),
+        (
+            "SELECT (SELECT count(*) FROM wide_partitioned),\
+                    (SELECT count(*) FROM wide_list_parent),\
+                    (SELECT count(*) FROM wide_unique),\
+                    (SELECT count(*) FROM wide_foreign_keys),\
+                    (SELECT count(*) FROM wide_checks),\
+                    (SELECT count(*) FROM wide_exclusions)",
+            "1|1|1|1|1|1",
+        ),
+    ] {
+        let observed = run_with_arena_bytes(&mut engine, &mut budget, query, 32 << 20);
+        assert_eq!(
+            data_rows(&observed),
+            [expected],
+            "{query}: {}",
+            String::from_utf8_lossy(&observed)
+        );
+    }
+
+    for (overflow, sqlstate) in [
+        (
+            "ALTER TABLE wide_checks ADD CONSTRAINT wide_check_overflow CHECK (value < 100)",
+            "54000",
+        ),
+        (
+            "ALTER TABLE wide_unique ADD CONSTRAINT wide_unique_overflow UNIQUE (u0)",
+            "54000",
+        ),
+        (
+            "ALTER TABLE wide_foreign_keys ADD CONSTRAINT wide_foreign_overflow \
+             FOREIGN KEY (f0) REFERENCES wide_unique (u0)",
+            "54000",
+        ),
+        (
+            "ALTER TABLE wide_exclusions ADD CONSTRAINT wide_exclusion_overflow \
+             EXCLUDE USING gist (r0 WITH &&)",
+            "54000",
+        ),
+        (
+            "ALTER DOMAIN wide_domain ADD CONSTRAINT wide_domain_overflow CHECK (VALUE < 100)",
+            "54000",
+        ),
+        (
+            "ALTER TYPE wide_composite ADD ATTRIBUTE overflow integer",
+            "54000",
+        ),
+        (
+            "CREATE INDEX wide_index_overflow ON wide_unique \
+             (u0,u1,u2,u3,u4,u5,u6,u7,u8,u9,u10,u11,u12,u13,u14,u15,u16,u17,u18,u19,u20,u21,u22,u23,u24) \
+             INCLUDE (u25,u26,u27,u28,u29,u30,u31,u32)",
+            "54011",
+        ),
+    ] {
+        let output = run_with(&mut engine, &mut budget, overflow);
+        assert!(
+            String::from_utf8_lossy(&output).contains(sqlstate),
+            "{overflow}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    let mut partition_overflow = String::from("CREATE TABLE wide_partition_overflow (");
+    for column in 0..=PARTITION_WIDTH {
+        if column != 0 {
+            partition_overflow.push(',');
+        }
+        write!(partition_overflow, "k{column} integer").unwrap();
+    }
+    partition_overflow.push_str(") PARTITION BY RANGE (");
+    for column in 0..=PARTITION_WIDTH {
+        if column != 0 {
+            partition_overflow.push(',');
+        }
+        write!(partition_overflow, "k{column}").unwrap();
+    }
+    partition_overflow.push(')');
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &partition_overflow, 1 << 20);
+    assert!(
+        String::from_utf8_lossy(&output).contains("54011"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut list_overflow = String::from(
+        "CREATE TABLE wide_list_overflow PARTITION OF wide_list_parent FOR VALUES IN (",
+    );
+    for value in 0..=crate::storage::MAX_PARTITION_LIST_VALUES {
+        if value != 0 {
+            list_overflow.push(',');
+        }
+        write!(list_overflow, "{}", value + 100).unwrap();
+    }
+    list_overflow.push(')');
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &list_overflow, 1 << 20);
+    assert!(
+        String::from_utf8_lossy(&output).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1536 << 20);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = run_with_arena_bytes(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT count(*) FROM pg_constraint \
+           WHERE conrelid = 'wide_unique'::regclass AND contype = 'u';\
+         SELECT count(*) FROM pg_constraint \
+           WHERE conrelid = 'wide_foreign_keys'::regclass AND contype = 'f';\
+         SELECT count(*) FROM pg_constraint \
+           WHERE conrelid = 'wide_exclusions'::regclass AND contype = 'x';\
+         SELECT partnatts, partdefid <> 0, pg_typeof(partattrs), \
+                pg_typeof(partclass), pg_typeof(partcollation), pg_typeof(partexprs) \
+           FROM pg_partitioned_table \
+           WHERE partrelid = 'wide_partitioned'::regclass;\
+         SELECT indnkeyatts, indnatts FROM pg_index \
+           WHERE indexrelid = 'wide_covering_idx'::regclass;\
+         SELECT (SELECT count(*) FROM wide_partitioned),\
+                (SELECT count(*) FROM wide_list_parent),\
+                (SELECT count(*) FROM wide_unique),\
+                (SELECT count(*) FROM wide_foreign_keys),\
+                (SELECT count(*) FROM wide_checks),\
+                (SELECT count(*) FROM wide_exclusions)",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&cold),
+        [
+            "64",
+            "64",
+            "64",
+            "32|t|int2vector|oidvector|oidvector|pg_node_tree",
+            "24|32",
+            "1|1|1|1|1|1",
         ],
         "{}",
         String::from_utf8_lossy(&cold)
@@ -51675,7 +52516,7 @@ fn uniqueness_cache_capacity_never_limits_table_correctness() {
     let mut config = test_config("value-index-cache-capacity");
     config.table_rows = 32;
     config.value_index_rows = 1;
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
 
     run_with(
@@ -51762,7 +52603,7 @@ fn durable_value_probe_is_not_capped_by_the_resident_overlay() {
 fn failed_index_cache_reservation_restores_every_pool_slot() {
     let mut config = test_config("value-index-cache-pool");
     config.max_value_indexes = 1;
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
 
     run_with(
@@ -54935,6 +55776,79 @@ fn ordinary_inheritance_parent_alter_rewrites_every_descendant() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn inherited_alter_visits_diamond_descendants_once_and_rolls_back() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE diamond_root(id integer); \
+         CREATE TABLE diamond_left(extra text) INHERITS (diamond_root); \
+         CREATE TABLE diamond_right(extra text) INHERITS (diamond_root); \
+         CREATE TABLE diamond_leaf() INHERITS (diamond_left); \
+         ALTER TABLE diamond_leaf INHERIT diamond_right; \
+         INSERT INTO diamond_leaf VALUES (1, 'leaf'); \
+         ALTER TABLE diamond_root ADD COLUMN amount integer DEFAULT 7 NOT NULL; \
+         ALTER TABLE diamond_root RENAME COLUMN amount TO total; \
+         SELECT id, extra, total FROM ONLY diamond_leaf",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(data_rows(&setup), ["1|leaf|7"]);
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TABLE diamond_root ADD COLUMN temporary integer DEFAULT 9; \
+         ROLLBACK; SELECT id, extra, total FROM ONLY diamond_leaf",
+    );
+    assert!(
+        !message_types(&rollback).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&rollback)
+    );
+    assert_eq!(data_rows(&rollback), ["1|leaf|7"]);
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT temporary FROM ONLY diamond_leaf"
+        ))
+        .contains("42703")
+    );
+}
+
+#[test]
+fn empty_table_definitions_are_usable_and_do_not_accept_trailing_commas() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE empty_definition(); \
+         INSERT INTO empty_definition DEFAULT VALUES; \
+         SELECT count(*) FROM empty_definition; \
+         ALTER TABLE empty_definition ADD COLUMN value integer DEFAULT 7; \
+         SELECT value FROM empty_definition",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["1", "7"]);
+    for invalid in [
+        "CREATE TABLE trailing_column(value integer,)",
+        "CREATE TABLE trailing_constraint(value integer, CHECK (value > 0),)",
+        "CREATE TABLE trailing_like(LIKE empty_definition,)",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut engine, &mut budget, invalid)).contains("42601")
+        );
+    }
 }
 
 #[test]

@@ -25,6 +25,15 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
 - Several writable processes on one object prefix remain unsupported. Writer
   fencing, ownership leases, automatic failover, and a read-only
   shared-snapshot protocol do not exist.
+- Eligible two-source equi-joins use a bounded hash build for physical tables,
+  synthesized catalogs, and derived tables, including external runs. NULL keys,
+  duplicate matches, residual ON predicates, and LEFT JOIN preservation share
+  one execution path. The fixed build-entry ceiling still bounds eligibility;
+  larger builds choose a nested-loop plan before execution.
+- Schema-only catalog resolution reads shared definitions without constructing
+  rows or recursively describing catalog-backed views. Resolved view OID
+  lookups do not enumerate unrelated indexes. Reverse relation-OID lookups
+  allocate only the rendered name, not a complete index catalog per cast.
 
 ## Running the suite
 
@@ -141,7 +150,10 @@ and SP-GiST classes now provide PostgreSQL-compatible `<-> point` ordering over
 compact immutable keys, including covering scans; navigable tree nodes remain
 the next step for avoiding a complete key-generation walk. The known structural
 limits remain global query serialization, specialized posting/tree navigation,
-and compile-time role, type, sequence, ACL, and per-object inline ceilings.
+and the remaining per-object inline ceilings. Role, type, sequence, and ACL
+catalog pools are startup-sized within their documented identity widths.
+Wide constraints, composites, partition definitions, and index tuples
+already share their documented SQL, WAL, checkpoint, and recovery bounds.
 Major SQL-object, metadata, database, and schema catalogs now have independent
 startup-sized pools; database connection and statistics registries, checkpoint
 row bookkeeping, and the named `checkpoint_manifest_bytes` reservation are

@@ -7977,13 +7977,16 @@ impl<'a> Parser<'a> {
         }; MAX_LIST];
         let mut n_likes = 0;
         loop {
-            if n == MAX_LIST {
-                return Err(self.limit("column list", MAX_LIST));
+            if n == 0 && n_cons == 0 && n_likes == 0 && self.peeked == Tok::Op(")") {
+                break;
             }
             // The first column's name was pre-read to tell a definition list
             // from a `CREATE TABLE ... AS` column-name list; use it, skipping the
             // LIKE / constraint forms it cannot be.
             let col_name = if let Some(pre_read) = pending_first_col.take() {
+                if n == MAX_LIST {
+                    return Err(self.limit("column list", MAX_LIST));
+                }
                 pre_read
             } else {
                 // `LIKE source [INCLUDING ...]` copies another table's columns in
@@ -8028,6 +8031,9 @@ impl<'a> Parser<'a> {
                 }
                 if cons_name.is_some() {
                     return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
+                }
+                if n == MAX_LIST {
+                    return Err(self.limit("column list", MAX_LIST));
                 }
                 self.col_ident("column name")?
             };

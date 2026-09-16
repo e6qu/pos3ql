@@ -1397,7 +1397,10 @@ impl RecordShapeField {
     }
 }
 
-const MAX_SHAPE_FIELDS: usize = 16;
+// A transient record and a named composite share the table-column boundary;
+// accepting a wider durable shape only to make it unusable in expressions
+// would violate the SQL boundary.
+const MAX_SHAPE_FIELDS: usize = crate::storage::MAX_COLUMNS;
 const MAX_TRANSIENT_SHAPES: usize = 32;
 
 const EMPTY_RECORD_SHAPE_FIELD: RecordShapeField = RecordShapeField {

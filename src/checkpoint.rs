@@ -1462,7 +1462,7 @@ impl Checkpointer {
                     saw_large_object_allocator = true;
                 }
                 Some("dbctx") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let oid: i32 = parse_field(words.next(), "database context")?;
                     let database = crate::storage::DatabaseOid::parse(oid)
                         .ok_or(CheckpointSetupError::Corrupt("invalid database context"))?;
@@ -1476,7 +1476,7 @@ impl Checkpointer {
                         .map_err(|_| CheckpointSetupError::Corrupt("unknown database context"))?;
                 }
                 Some("am") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at: u64 = parse_field(words.next(), "access method sequence")?;
                     let name = decode_hex_name(
                         words
@@ -1512,7 +1512,7 @@ impl Checkpointer {
                     storage.commit_access_method_create(slot);
                 }
                 Some("table") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let mindex: usize = parse_field(words.next(), "table index")?;
                     let n_cols: usize = parse_field(words.next(), "table columns")?;
                     if n_cols > MAX_COLUMNS {
@@ -1815,7 +1815,7 @@ impl Checkpointer {
                     };
                 }
                 Some("estat") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at: u64 = parse_field(words.next(), "estat identity")?;
                     let table_index: usize = parse_field(words.next(), "estat table")?;
                     let target_raw: i32 = parse_field(words.next(), "estat target")?;
@@ -2097,7 +2097,7 @@ impl Checkpointer {
                     }
                 }
                 Some("nsp") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let hex = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("nsp name missing"))?;
@@ -2112,7 +2112,7 @@ impl Checkpointer {
                     }
                 }
                 Some("lob") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let oid = parse_field::<u32>(words.next(), "large-object OID")?;
                     let created_at = parse_field::<u64>(words.next(), "large-object creation")?;
                     if words.next().is_some() {
@@ -2132,7 +2132,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("rol") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let name = decode_hex_name(
                         words
                             .next()
@@ -2244,7 +2244,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("rmem") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let decode = |word: Option<&str>, missing: &'static str| {
                         word.ok_or(CheckpointSetupError::Corrupt(missing))
                             .and_then(decode_hex_name)
@@ -2275,7 +2275,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("db") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let oid: i32 = parse_field(words.next(), "db oid")?;
                     let oid = crate::storage::DatabaseOid::parse(oid)
                         .ok_or(CheckpointSetupError::Corrupt("invalid db oid"))?;
@@ -2367,7 +2367,7 @@ impl Checkpointer {
                     }
                 }
                 Some("rset") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let scope: u8 = parse_field(words.next(), "rset scope")?;
                     let role = words
                         .next()
@@ -2449,7 +2449,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("sset") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let name = decode_hex_name(
                         words
                             .next()
@@ -2478,7 +2478,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("ptx") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let transaction_id = parse_field(words.next(), "ptx transaction")?;
                     let first_lsn = parse_field(words.next(), "ptx first lsn")?;
                     let prepared_lsn = parse_field(words.next(), "ptx prepared lsn")?;
@@ -2530,7 +2530,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("own") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let class: u8 = parse_field(words.next(), "own class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid own class"))?;
@@ -2582,7 +2582,7 @@ impl Checkpointer {
                     storage.set_object_owner(object, owner, 0);
                 }
                 Some("acl") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let class: u8 = parse_field(words.next(), "acl class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .ok_or(CheckpointSetupError::Corrupt("invalid acl class"))?;
@@ -2644,7 +2644,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("cacl") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let class: u8 = parse_field(words.next(), "cacl class")?;
                     let class = crate::storage::AccessClass::from_u8(class)
                         .filter(|class| {
@@ -2725,7 +2725,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("dacl") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let decode = |word: Option<&str>, missing: &'static str| {
                         word.ok_or(CheckpointSetupError::Corrupt(missing))
                             .and_then(decode_hex_name)
@@ -2785,7 +2785,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("pacl") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let decode = |word: Option<&str>, missing: &'static str| {
                         word.ok_or(CheckpointSetupError::Corrupt(missing))
                             .and_then(decode_hex_name)
@@ -2997,7 +2997,7 @@ impl Checkpointer {
                     def.n_exclusions += 1;
                 }
                 Some("dsst") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let mindex: usize = parse_field(words.next(), "dsst table")?;
                     let idx: usize = parse_field(words.next(), "dsst list index")?;
                     let count: u64 = parse_field(words.next(), "dsst count")?;
@@ -3015,7 +3015,7 @@ impl Checkpointer {
                     bssts.push((mindex, idx, count, crc, handle));
                 }
                 Some("vix") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let mindex: usize = parse_field(words.next(), "vix table")?;
                     let n_columns: usize = parse_field(words.next(), "vix columns")?;
                     if n_columns == 0 || n_columns > crate::storage::MAX_INDEX_COLS {
@@ -3061,7 +3061,7 @@ impl Checkpointer {
                     ));
                 }
                 Some("fdw") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "foreign wrapper slot")?;
                     let created_at: u64 = parse_field(words.next(), "foreign wrapper sequence")?;
                     let owner = decode_hex_name(words.next().ok_or(
@@ -3117,7 +3117,7 @@ impl Checkpointer {
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign wrapper"))?;
                 }
                 Some("fsrv") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "foreign server slot")?;
                     let created_at: u64 = parse_field(words.next(), "foreign server sequence")?;
                     let owner = decode_hex_name(words.next().ok_or(
@@ -3171,7 +3171,7 @@ impl Checkpointer {
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign server"))?;
                 }
                 Some("fum") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "user mapping slot")?;
                     let created_at: u64 = parse_field(words.next(), "user mapping sequence")?;
                     let server_name =
@@ -3225,7 +3225,7 @@ impl Checkpointer {
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid user mapping"))?;
                 }
                 Some("ftab") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "foreign table slot")?;
                     let created_at: u64 = parse_field(words.next(), "foreign table sequence")?;
                     let schema = decode_hex_name(words.next().ok_or(
@@ -3298,31 +3298,31 @@ impl Checkpointer {
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
                 Some("vw11" | "vw12") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_view(storage, line)?;
                 }
                 Some("mv5") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_matview(storage, line)?;
                 }
                 Some("pub") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_publication(storage, line)?;
                 }
                 Some("rslot") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_replication_slot(storage, line)?;
                 }
                 Some("sub") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_subscription(storage, line)?;
                 }
                 Some("subrel") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_subscription_relation(storage, line)?;
                 }
                 Some("rtn") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at: u64 = parse_field(words.next(), "routine created_at")?;
                     let owner = decode_hex_name(
                         words
@@ -3656,7 +3656,7 @@ impl Checkpointer {
                     storage.commit_routine_create(slot, 0);
                 }
                 Some("evt") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot: usize = parse_field(words.next(), "event trigger slot")?;
                     let created_at = parse_field(words.next(), "event trigger created_at")?;
                     let name =
@@ -3749,7 +3749,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("rul") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot: usize = parse_field(words.next(), "rule slot")?;
                     let created_at = parse_field(words.next(), "rule created_at")?;
                     let target_kind: u8 = parse_field(words.next(), "rule target kind")?;
@@ -3891,7 +3891,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("cst") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at = parse_field(words.next(), "cast created_at")?;
                     let source = manifest_routine_result(&mut words)?;
                     let target = manifest_routine_result(&mut words)?;
@@ -3931,7 +3931,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("tsobj") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot: usize = parse_field(words.next(), "text-search slot")?;
                     let created_at = parse_field(words.next(), "text-search created_at")?;
                     let kind = words
@@ -4128,7 +4128,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("coll") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "collation slot")?;
                     let created_at = parse_field(words.next(), "collation created_at")?;
                     let schema =
@@ -4247,7 +4247,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("conv") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let slot = parse_field(words.next(), "conversion slot")?;
                     let created_at = parse_field(words.next(), "conversion created_at")?;
                     let schema =
@@ -4309,7 +4309,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("opr") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at = parse_field(words.next(), "operator created_at")?;
                     let schema =
                         sql_name(&decode_hex_name(words.next().ok_or(
@@ -4388,7 +4388,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("oprl") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let operator_oid = parse_field(words.next(), "operator oid")?;
                     let commutator_oid: i32 = parse_field(words.next(), "operator commutator")?;
                     let negator_oid: i32 = parse_field(words.next(), "operator negator")?;
@@ -4424,7 +4424,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("opf") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at = parse_field(words.next(), "operator family created_at")?;
                     let schema = sql_name(&decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("operator family schema missing"),
@@ -4465,7 +4465,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("opfo") | Some("opff") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let is_operator = line.starts_with("opfo ");
                     let family_oid = parse_field(words.next(), "operator family oid")?;
                     let family_slot = storage
@@ -4541,7 +4541,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("opc") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at = parse_field(words.next(), "operator class created_at")?;
                     let schema = sql_name(&decode_hex_name(words.next().ok_or(
                         CheckpointSetupError::Corrupt("operator class schema missing"),
@@ -4604,7 +4604,7 @@ impl Checkpointer {
                         })?;
                 }
                 tag @ (Some("opco") | Some("opcf")) => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let class_oid: i32 = parse_field(words.next(), "operator class member class")?;
                     let class_oid = crate::storage::OperatorClassOid::parse(class_oid).ok_or(
                         CheckpointSetupError::Corrupt("invalid operator class identity"),
@@ -4681,19 +4681,19 @@ impl Checkpointer {
                         })?;
                 }
                 Some("trg") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_trigger(storage, line)?;
                 }
                 Some("trgs") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_partition_trigger_state(storage, line)?;
                 }
                 Some("pol") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     load_policy(storage, line)?;
                 }
                 tag @ (Some("sq5") | Some("sq6")) => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let read_hex = |w: Option<&str>, what: &'static str| {
                         w.ok_or(CheckpointSetupError::Corrupt(what))
                             .and_then(|value| {
@@ -4794,7 +4794,7 @@ impl Checkpointer {
                     let has_parent = matches!(tag, Some("dom2") | Some("dom3") | Some("dom4"));
                     let has_base_identity = matches!(tag, Some("dom3") | Some("dom4"));
                     let has_validation = tag == Some("dom4");
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
                     let hexstr = |w: Option<&str>,
@@ -4899,7 +4899,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("enm") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let hexstr = |w: Option<&str>,
                                   what: &'static str|
                      -> Result<String, CheckpointSetupError> {
@@ -4935,7 +4935,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("cmp") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let hexstr = |w: Option<&str>,
                                   what: &'static str|
                      -> Result<String, CheckpointSetupError> {
@@ -5032,7 +5032,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("ext") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let created_at: u64 = parse_field(words.next(), "ext sequence")?;
                     let owner: usize = parse_field(words.next(), "ext owner")?;
                     let relocatable = match parse_field::<u8>(words.next(), "ext relocatable")? {
@@ -5083,7 +5083,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("xpk") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let package_slot: usize = parse_field(words.next(), "extension package slot")?;
                     let key = words
                         .next()
@@ -5125,7 +5125,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("xsc") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let package_slot: usize =
                         parse_field(words.next(), "extension script package")?;
                     let from = decode_hex_name(
@@ -5212,7 +5212,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("exd") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let extension_name = decode_hex_name(
                         words
                             .next()
@@ -5268,7 +5268,7 @@ impl Checkpointer {
                     storage.commit_extension_dependency(slot, 0);
                 }
                 Some("exc") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let extension_name = decode_hex_name(
                         words
                             .next()
@@ -5335,7 +5335,7 @@ impl Checkpointer {
                     storage.commit_extension_config(slot, 0);
                 }
                 Some("cmt") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let class: u8 = parse_field(words.next(), "cmt class")?;
                     let subid: u32 = parse_field(words.next(), "cmt subid")?;
                     let read_hex = |w: Option<&str>, what: &'static str| {
@@ -5365,7 +5365,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("tsp") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let mut words = line.split_ascii_whitespace();
                     if words.next() != Some("tsp") {
                         return Err(CheckpointSetupError::Corrupt("tablespace tag"));
@@ -5428,7 +5428,7 @@ impl Checkpointer {
                         })?;
                 }
                 Some("idx") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let mut words = line.split_ascii_whitespace();
                     if words.next() != Some("idx") {
                         return Err(CheckpointSetupError::Corrupt("idx tag"));
@@ -5459,8 +5459,8 @@ impl Checkpointer {
                             .next()
                             .ok_or(CheckpointSetupError::Corrupt("idx schema missing"))?,
                     )?;
-                    let descending_mask: u16 = parse_field(words.next(), "idx descending mask")?;
-                    let nulls_first_mask: u16 = parse_field(words.next(), "idx nulls-first mask")?;
+                    let descending_mask: u32 = parse_field(words.next(), "idx descending mask")?;
+                    let nulls_first_mask: u32 = parse_field(words.next(), "idx nulls-first mask")?;
                     let predicate = match words.next() {
                         Some("-") => None,
                         Some(hex) => Some(
@@ -5495,12 +5495,12 @@ impl Checkpointer {
                             }
                         };
                     let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
-                    let mask: u16 = parse_field(words.next(), "idx expression mask")?;
-                    if mask >> n_cols != 0 {
+                    let mask: u32 = parse_field(words.next(), "idx expression mask")?;
+                    if n_cols < u32::BITS as usize && mask >> n_cols != 0 {
                         return Err(CheckpointSetupError::Corrupt("bad index expression mask"));
                     };
                     for (index, expression) in expressions.iter_mut().enumerate().take(n_cols) {
-                        if mask & (1 << index) != 0 {
+                        if mask & (1u32 << index) != 0 {
                             *expression = Some(
                                 crate::storage::index_expression_stackstr(&decode_hex_name(
                                     words.next().ok_or(CheckpointSetupError::Corrupt(
@@ -5977,14 +5977,16 @@ impl Checkpointer {
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
-                    if descending_mask >> n_cols != 0 || nulls_first_mask >> n_cols != 0 {
+                    if n_cols < u32::BITS as usize
+                        && (descending_mask >> n_cols != 0 || nulls_first_mask >> n_cols != 0)
+                    {
                         return Err(CheckpointSetupError::Corrupt("bad index ordering mask"));
                     }
                     let mut descending = [false; crate::storage::MAX_INDEX_COLS];
                     let mut nulls_first = [false; crate::storage::MAX_INDEX_COLS];
                     for i in 0..n_cols {
-                        descending[i] = descending_mask & (1 << i) != 0;
-                        nulls_first[i] = nulls_first_mask & (1 << i) != 0;
+                        descending[i] = descending_mask & (1u32 << i) != 0;
+                        nulls_first[i] = nulls_first_mask & (1u32 << i) != 0;
                     }
                     let method = if resolved_operator_classes[..n_cols].iter().all(|class| {
                         matches!(class, Some(crate::storage::IndexOperatorClass::Hash(_)))
@@ -6092,7 +6094,7 @@ impl Checkpointer {
                     }
                 }
                 Some("end") => {
-                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     saw_end = true;
                 }
                 // The writer identity is CAS bookkeeping (see `writer_id`),
@@ -9245,11 +9247,11 @@ impl Checkpointer {
                 index.database,
             )?;
             use core::fmt::Write;
-            let mut columns = StackStr::<128>::new();
+            let mut columns = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
             for c in &index.columns[..index.n_cols] {
                 let _ = write!(columns, "{c} ");
             }
-            let mut includes = StackStr::<128>::new();
+            let mut includes = StackStr::<{ crate::storage::MAX_INDEX_COLS * 6 }>::new();
             for c in &index.include_columns[..index.n_include_cols] {
                 let _ = write!(includes, "{c} ");
             }
@@ -9265,11 +9267,11 @@ impl Checkpointer {
             for b in index.schema.as_str().as_bytes() {
                 let _ = write!(hschema, "{b:02x}");
             }
-            let mut descending_mask = 0u16;
-            let mut nulls_first_mask = 0u16;
+            let mut descending_mask = 0u32;
+            let mut nulls_first_mask = 0u32;
             for i in 0..index.n_cols {
-                descending_mask |= u16::from(index.descending[i]) << i;
-                nulls_first_mask |= u16::from(index.nulls_first[i]) << i;
+                descending_mask |= u32::from(index.descending[i]) << i;
+                nulls_first_mask |= u32::from(index.nulls_first[i]) << i;
             }
             let predicate = match index.predicate {
                 Some(text) => {
@@ -9282,7 +9284,7 @@ impl Checkpointer {
                 }
                 None => StackStr::from_str("-"),
             };
-            let mut expression_mask = 0u16;
+            let mut expression_mask = 0u32;
             let mut encoded_expressions = StackStr::<
                 { crate::storage::MAX_INDEX_COLS * (crate::storage::INDEX_EXPRESSION_MAX * 2 + 1) },
             >::new();
@@ -9290,17 +9292,19 @@ impl Checkpointer {
                 let Some(expression) = expression else {
                     continue;
                 };
-                expression_mask |= 1 << position;
+                expression_mask |= 1u32 << position;
                 let _ = encoded_expressions.write_str(" ");
                 for byte in expression.as_str().as_bytes() {
                     let _ = write!(encoded_expressions, "{byte:02x}");
                 }
             }
-            let mut collations = StackStr::<128>::new();
-            let mut operator_classes = StackStr::<128>::new();
-            let mut resolved_operator_classes = StackStr::<128>::new();
-            let mut operator_class_options = StackStr::<512>::new();
-            let mut statistics = StackStr::<128>::new();
+            let mut collations = StackStr::<{ crate::storage::MAX_INDEX_COLS * 8 }>::new();
+            let mut operator_classes = StackStr::<{ crate::storage::MAX_INDEX_COLS * 14 }>::new();
+            let mut resolved_operator_classes =
+                StackStr::<{ crate::storage::MAX_INDEX_COLS * 14 }>::new();
+            let mut operator_class_options =
+                StackStr::<{ crate::storage::MAX_INDEX_COLS * 64 }>::new();
+            let mut statistics = StackStr::<{ crate::storage::MAX_INDEX_COLS * 8 }>::new();
             let maintenance = storage.brin_maintenance_state(index_slot);
             let mut unsummarized_ranges = StackStr::<1400>::new();
             for range in &maintenance.ranges[..usize::from(maintenance.count)] {
@@ -11138,9 +11142,9 @@ fn verify_extension_object_key(
 fn finish_pending(
     storage: &mut Storage,
     slot_of: &mut Vec<Option<usize>>,
-    pending: Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])>,
+    pending: &mut Option<(usize, TableDef, usize, [i64; crate::storage::MAX_COLUMNS])>,
 ) -> Result<(), CheckpointSetupError> {
-    if let Some((manifest_index, definition, seen, serials)) = pending {
+    if let Some((manifest_index, definition, seen, serials)) = pending.take() {
         if seen != definition.n_columns {
             return Err(CheckpointSetupError::Corrupt(
                 "manifest column count mismatch",

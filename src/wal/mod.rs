@@ -483,7 +483,7 @@ impl TriggerTargetKind {
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
-    reason = "TableDef is a fixed inline array by design (no heap); WalOp lives briefly on the stack"
+    reason = "catalog definitions are fixed inline values by design; WalOp lives briefly on the bounded worker stack"
 )]
 pub(crate) enum WalOp<'a> {
     /// Database identity for following records in a staged transaction.
@@ -520,7 +520,14 @@ pub(crate) enum WalOp<'a> {
         created_at: u64,
         definition: Option<crate::storage::foreign::ForeignTableDefinition>,
     },
-    CreateTable(TableDef),
+    /// A table definition staged by the SQL executor. Borrowing keeps the WAL
+    /// operation discriminant small even when configured inline schema bounds
+    /// make `TableDef` large.
+    CreateTable(&'a TableDef),
+    /// A validated table-definition payload read from WAL. Replay materializes
+    /// it into its bounded stack scratch only at the table-application choke
+    /// point, rather than inflating every decoded WAL operation.
+    RestoreTable(&'a [u8]),
     /// Begins ALTER TABLE's in-place definition/row rewrite. The immediately
     /// following CreateTable record supplies the final definition; this marker
     /// carries the old identity and composed column ordinals without inflating
@@ -1055,11 +1062,11 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
     },
-    /// CREATE DOMAIN (or ALTER DOMAIN — journaled absolutely, so an ALTER
-    /// replays as a redefinition). Carries the whole definition inline, like
-    /// [`WalOp::CreateTable`]; the value's `live`/`pending`/`created_at` are
-    /// not journaled (replay sets them).
-    CreateDomain(crate::storage::DomainDef),
+    /// CREATE or ALTER DOMAIN stages a borrowed absolute definition. Catalog
+    /// lifecycle state is not journaled; replay establishes that state.
+    CreateDomain(&'a crate::storage::DomainDef),
+    /// The validated durable domain image, materialized only while applying it.
+    RestoreDomain(&'a [u8]),
     DropDomain {
         schema: &'a str,
         name: &'a str,
@@ -2079,7 +2086,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetForeignServer { .. } => KIND_SET_FOREIGN_SERVER,
         WalOp::SetUserMapping { .. } => KIND_SET_USER_MAPPING,
         WalOp::SetForeignTable { .. } => KIND_SET_FOREIGN_TABLE,
-        WalOp::CreateTable(_) => KIND_CREATE,
+        WalOp::CreateTable(_) | WalOp::RestoreTable(_) => KIND_CREATE,
         WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
         WalOp::Delete { .. } => KIND_DELETE,
@@ -2157,7 +2164,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SequenceAdvance { .. } => KIND_SEQUENCE_ADVANCE,
         WalOp::ResetUnloggedRelations => KIND_RESET_UNLOGGED_RELATIONS,
         WalOp::Comment { .. } => KIND_COMMENT,
-        WalOp::CreateDomain(_) => KIND_CREATE_DOMAIN,
+        WalOp::CreateDomain(_) | WalOp::RestoreDomain(_) => KIND_CREATE_DOMAIN,
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
         WalOp::CreateEnum(_) => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
@@ -2286,6 +2293,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                         .sum::<usize>()
             })
         }
+        WalOp::RestoreTable(payload) => payload.len(),
         WalOp::CreateTable(def) => {
             let mut n = 1 + 1 + def.name.as_str().len() + 2 + 4 + 2;
             n += match def.access_method {
@@ -2727,7 +2735,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 2
                 + n_include_cols * 2
                 + 2
-                + 2
+                + 5
                 + expressions
                     .iter()
                     .take(*n_cols)
@@ -2949,6 +2957,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             }
             n
         }
+        WalOp::RestoreDomain(payload) => payload.len(),
         WalOp::DropDomain { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateEnum(def) => {
             let mut n = 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
@@ -3923,6 +3932,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
+        WalOp::RestoreTable(payload) => buffer.append(payload),
         WalOp::CreateTable(def) => {
             let mut ok = buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
                 && name_bytes(buffer, def.name.as_str());
@@ -4606,10 +4616,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let expression_mask = expressions[..*n_cols]
                 .iter()
                 .enumerate()
-                .fold(0u8, |mask, (index, expression)| {
-                    mask | (u8::from(expression.is_some()) << index)
+                .fold(0u32, |mask, (index, expression)| {
+                    mask | (u32::from(expression.is_some()) << index)
                 });
-            ok &= buffer.append(&[0xa5, expression_mask]);
+            // 0xa5 used a one-byte mask when index keys were limited to eight.
+            // Keep decoding it below; new records use the full PostgreSQL
+            // index-attribute boundary.
+            ok &= buffer.append(&[0xb0]) && buffer.append(&expression_mask.to_le_bytes());
             for expression in expressions[..*n_cols].iter().flatten() {
                 ok &= expression.len() <= u16::MAX as usize
                     && buffer.append(&(expression.len() as u16).to_le_bytes())
@@ -5003,6 +5016,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
+        WalOp::RestoreDomain(payload) => buffer.append(payload),
         WalOp::DropDomain { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
@@ -6396,7 +6410,48 @@ fn decode_optional_foreign_value(
     }
 }
 
+/// Keep branch-local fixed scratch out of the shared dispatch frame. Debug
+/// builds otherwise reserve every variant's temporaries in one worker frame.
+#[inline(never)]
+fn decode_large_op<'a>(decode: impl FnOnce() -> Option<WalOp<'a>>) -> Option<WalOp<'a>> {
+    decode()
+}
+
+fn bounded_wal_text<const N: usize>(source: &str) -> Option<StackStr<N>> {
+    let text = StackStr::from_str(source);
+    (!text.is_truncated()).then_some(text)
+}
+
+fn stored_boolean(code: u8) -> Option<bool> {
+    match code {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
+    decode_op_inner(kind, payload, None, None)
+}
+
+pub(crate) fn decode_table_payload(payload: &[u8]) -> Option<TableDef> {
+    let mut definition = TableDef::empty();
+    decode_op_inner(KIND_CREATE, payload, Some(&mut definition), None)?;
+    Some(definition)
+}
+
+pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<crate::storage::DomainDef> {
+    let mut definition = crate::storage::DomainDef::EMPTY;
+    decode_op_inner(KIND_CREATE_DOMAIN, payload, None, Some(&mut definition))?;
+    Some(definition)
+}
+
+fn decode_op_inner<'a>(
+    kind: u8,
+    payload: &'a [u8],
+    decoded_table: Option<&mut TableDef>,
+    decoded_domain: Option<&mut crate::storage::DomainDef>,
+) -> Option<WalOp<'a>> {
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Option<&str> {
         let len = *payload.get(*at)? as usize;
@@ -6406,12 +6461,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         core::str::from_utf8(raw).ok()
     };
     match kind {
-        KIND_DATABASE_SCOPE => {
+        KIND_DATABASE_SCOPE => decode_large_op(|| {
             let oid = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
             at = 4;
             (at == payload.len()).then_some(WalOp::DatabaseScope { oid })
-        }
-        KIND_CREATE_LARGE_OBJECT => {
+        }),
+        KIND_CREATE_LARGE_OBJECT => decode_large_op(|| {
             let oid = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
             let created_at = u64::from_le_bytes(payload.get(4..12)?.try_into().ok()?);
             let allocated = match *payload.get(12)? {
@@ -6425,13 +6480,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at,
                 allocated,
             })
-        }
-        KIND_DROP_LARGE_OBJECT => {
+        }),
+        KIND_DROP_LARGE_OBJECT => decode_large_op(|| {
             let oid = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
             at = 4;
             (oid != 0 && at == payload.len()).then_some(WalOp::DropLargeObject { oid })
-        }
-        KIND_SET_FOREIGN_DATA_WRAPPER => {
+        }),
+        KIND_SET_FOREIGN_DATA_WRAPPER => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -6473,8 +6528,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 owner,
                 definition,
             })
-        }
-        KIND_SET_FOREIGN_SERVER => {
+        }),
+        KIND_SET_FOREIGN_SERVER => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -6507,8 +6562,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 owner,
                 definition,
             })
-        }
-        KIND_SET_USER_MAPPING => {
+        }),
+        KIND_SET_USER_MAPPING => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -6545,8 +6600,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at,
                 definition,
             })
-        }
-        KIND_SET_FOREIGN_TABLE => {
+        }),
+        KIND_SET_FOREIGN_TABLE => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -6592,8 +6647,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at,
                 definition,
             })
-        }
-        KIND_CREATE => {
+        }),
+        KIND_CREATE => decode_large_op(|| {
             let table_version = payload.get(at).copied()?;
             if !matches!(table_version, 3 | TABLE_DEF_PAYLOAD_VERSION) {
                 return None;
@@ -6605,7 +6660,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if n_cols > MAX_COLUMNS {
                 return None;
             }
-            let has_toast = *payload.get(at)? != 0;
+            let has_toast = stored_boolean(*payload.get(at)?)?;
             at += 1;
             let kind = match *payload.get(at)? {
                 0 => crate::storage::TableKind::Local,
@@ -6683,7 +6738,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let default_expr = if de_len > 0 {
                     let s = core::str::from_utf8(payload.get(at..at + de_len)?).ok()?;
                     at += de_len;
-                    Some(crate::util::StackStr::from_str(s))
+                    Some(bounded_wal_text(s)?)
                 } else {
                     None
                 };
@@ -6765,7 +6820,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }
                 let mut uk = UniqueKey::EMPTY;
                 uk.name = SqlName::parse(uname).ok()?;
-                uk.is_primary = meta[0] != 0;
+                uk.is_primary = stored_boolean(meta[0])?;
                 uk.timing = crate::storage::ConstraintTiming::from_code(meta[2])?;
                 uk.n_cols = n;
                 for c in uk.columns.iter_mut().take(n) {
@@ -6943,9 +6998,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             def.replica_identity =
                 crate::storage::ReplicaIdentityMode::from_code(*payload.get(at)?)?;
             at += 1;
-            (at == payload.len()).then_some(WalOp::CreateTable(def))
-        }
-        KIND_REWRITE_TABLE => {
+            if at != payload.len() {
+                return None;
+            }
+            if let Some(output) = decoded_table {
+                *output = def;
+            }
+            Some(WalOp::RestoreTable(payload))
+        }),
+        KIND_REWRITE_TABLE => decode_large_op(|| {
             let previous_schema = take_name(&mut at)?;
             let previous_name = take_name(&mut at)?;
             let preserve_rows = match *payload.get(at)? {
@@ -6965,13 +7026,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 preserve_rows,
                 column_mapping,
             })
-        }
-        KIND_DROP => {
+        }),
+        KIND_DROP => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTable { schema, name })
-        }
-        KIND_UPSERT => {
+        }),
+        KIND_UPSERT => decode_large_op(|| {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
@@ -7013,8 +7074,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 old_row,
                 command_id,
             })
-        }
-        KIND_DELETE => {
+        }),
+        KIND_DELETE => decode_large_op(|| {
             let table = take_name(&mut at)?;
             let rowid = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
@@ -7044,8 +7105,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 old_row,
                 command_id,
             })
-        }
-        KIND_TRUNCATE => {
+        }),
+        KIND_TRUNCATE => decode_large_op(|| {
             let count = *payload.get(at)? as usize;
             at += 1;
             if count > crate::sql::txn::MAX_TRUNCATE_TABLES {
@@ -7071,8 +7132,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 restart_identity: flags & 2 != 0,
                 command_id,
             })
-        }
-        KIND_LOGICAL_MESSAGE => {
+        }),
+        KIND_LOGICAL_MESSAGE => decode_large_op(|| {
             let transactional = match *payload.get(at)? {
                 0 => false,
                 1 => true,
@@ -7099,8 +7160,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 prefix,
                 content,
             })
-        }
-        KIND_CREATE_VIEW => {
+        }),
+        KIND_CREATE_VIEW => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let column_count = *payload.get(at)? as usize;
             at += 1;
@@ -7168,13 +7229,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 check_option,
                 dependencies,
             })
-        }
-        KIND_DROP_VIEW => {
+        }),
+        KIND_DROP_VIEW => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
-        }
-        KIND_SET_VIEW_OPTIONS => {
+        }),
+        KIND_SET_VIEW_OPTIONS => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let security_invoker = match *payload.get(at)? {
@@ -7198,8 +7259,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 security_barrier,
                 check_option,
             })
-        }
-        KIND_SET_VIEW_COLUMNS => {
+        }),
+        KIND_SET_VIEW_COLUMNS => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let count = *payload.get(at)? as usize;
@@ -7230,8 +7291,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 columns,
             })
-        }
-        KIND_RENAME_VIEW => {
+        }),
+        KIND_RENAME_VIEW => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
@@ -7240,8 +7301,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 new_name,
             })
-        }
-        KIND_SET_RULE => {
+        }),
+        KIND_SET_RULE => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -7339,8 +7400,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 path,
                 dependencies,
             })
-        }
-        KIND_DROP_RULE => {
+        }),
+        KIND_DROP_RULE => decode_large_op(|| {
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
             let table_schema = take_name(&mut at)?;
@@ -7352,8 +7413,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 table,
                 name,
             })
-        }
-        KIND_CREATE_PUBLICATION_V2 => {
+        }),
+        KIND_CREATE_PUBLICATION_V2 => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -7427,12 +7488,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     crate::storage::PublishGeneratedColumns::None
                 },
             })
-        }
-        KIND_DROP_PUBLICATION => {
+        }),
+        KIND_DROP_PUBLICATION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPublication { name })
-        }
-        KIND_ALTER_PUBLICATION_V2 => {
+        }),
+        KIND_ALTER_PUBLICATION_V2 => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let flags = *payload.get(at)?;
             at += 1;
@@ -7503,19 +7564,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     crate::storage::PublishGeneratedColumns::None
                 },
             })
-        }
-        KIND_SET_PUBLICATION_OWNER => {
+        }),
+        KIND_SET_PUBLICATION_OWNER => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             (at == payload.len()).then_some(WalOp::SetPublicationOwner { name, owner })
-        }
-        KIND_RENAME_PUBLICATION => {
+        }),
+        KIND_RENAME_PUBLICATION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RenamePublication { name, new_name })
-        }
-        KIND_CREATE_SUBSCRIPTION => {
+        }),
+        KIND_CREATE_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -7566,12 +7627,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 behavior,
                 bootstrap,
             })
-        }
-        KIND_DROP_SUBSCRIPTION => {
+        }),
+        KIND_DROP_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropSubscription { name })
-        }
-        KIND_ADVANCE_SUBSCRIPTION => {
+        }),
+        KIND_ADVANCE_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -7596,8 +7657,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 confirmed_lsn,
                 local_lsn,
             })
-        }
-        KIND_SET_SUBSCRIPTION_ENABLED => {
+        }),
+        KIND_SET_SUBSCRIPTION_ENABLED => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let enabled = match *payload.get(at)? {
                 0 => false,
@@ -7606,14 +7667,14 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             at += 1;
             (at == payload.len()).then_some(WalOp::SetSubscriptionEnabled { name, enabled })
-        }
-        KIND_SET_SUBSCRIPTION_BOOTSTRAP => {
+        }),
+        KIND_SET_SUBSCRIPTION_BOOTSTRAP => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let bootstrap = crate::storage::SubscriptionBootstrap::from_code(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::SetSubscriptionBootstrap { name, bootstrap })
-        }
-        KIND_RESET_SUBSCRIPTION_RELATIONS => {
+        }),
+        KIND_RESET_SUBSCRIPTION_RELATIONS => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -7625,8 +7686,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at,
                 definition_generation,
             })
-        }
-        KIND_ADD_SUBSCRIPTION_RELATION => {
+        }),
+        KIND_ADD_SUBSCRIPTION_RELATION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -7642,14 +7703,14 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 table,
             })
-        }
-        KIND_COMPLETE_SUBSCRIPTION_CLEANUP => {
+        }),
+        KIND_COMPLETE_SUBSCRIPTION_CLEANUP => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             (at == payload.len()).then_some(WalOp::CompleteSubscriptionCleanup { name, created_at })
-        }
-        KIND_FAIL_SUBSCRIPTION => {
+        }),
+        KIND_FAIL_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -7667,8 +7728,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 sqlstate,
                 message,
             })
-        }
-        KIND_ALTER_SUBSCRIPTION => {
+        }),
+        KIND_ALTER_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let connection_len =
                 u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
@@ -7706,19 +7767,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 slot,
                 behavior,
             })
-        }
-        KIND_SET_SUBSCRIPTION_OWNER => {
+        }),
+        KIND_SET_SUBSCRIPTION_OWNER => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             (at == payload.len()).then_some(WalOp::SetSubscriptionOwner { name, owner })
-        }
-        KIND_RENAME_SUBSCRIPTION => {
+        }),
+        KIND_RENAME_SUBSCRIPTION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RenameSubscription { name, new_name })
-        }
-        KIND_CREATE_TRIGGER => {
+        }),
+        KIND_CREATE_TRIGGER => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -7816,8 +7877,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 arguments,
                 argument_count,
             })
-        }
-        KIND_DROP_TRIGGER => {
+        }),
+        KIND_DROP_TRIGGER => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -7829,8 +7890,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 table_schema,
                 table,
             })
-        }
-        KIND_ALTER_TRIGGER => {
+        }),
+        KIND_ALTER_TRIGGER => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -7848,8 +7909,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 new_name,
                 enabled,
             })
-        }
-        KIND_SET_POLICY => {
+        }),
+        KIND_SET_POLICY => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let name = take_name(&mut at)?;
@@ -7898,8 +7959,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 with_check,
                 dependencies: WalStoredQueryDependencies::Encoded(encoded),
             })
-        }
-        KIND_DROP_POLICY => {
+        }),
+        KIND_DROP_POLICY => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let name = take_name(&mut at)?;
@@ -7908,12 +7969,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 table,
                 name,
             })
-        }
+        }),
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit {
             transaction_id: 0,
             assigned_transaction_identity: false,
         }),
-        KIND_COMMIT => {
+        KIND_COMMIT => decode_large_op(|| {
             let transaction_id = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
             let assigned_transaction_identity = match payload.get(4..) {
                 // Commit records written before transaction introspection had
@@ -7927,8 +7988,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 transaction_id,
                 assigned_transaction_identity,
             })
-        }
-        KIND_PREPARE_TRANSACTION => {
+        }),
+        KIND_PREPARE_TRANSACTION => decode_large_op(|| {
             let transaction_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
@@ -7945,8 +8006,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 prepared_at,
                 gid,
             })
-        }
-        KIND_PREPARED_LOCKS => {
+        }),
+        KIND_PREPARED_LOCKS => decode_large_op(|| {
             let transaction_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let length = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
@@ -7957,16 +8018,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 transaction_id,
                 encoded,
             })
-        }
-        KIND_COMMIT_PREPARED => {
+        }),
+        KIND_COMMIT_PREPARED => decode_large_op(|| {
             let gid = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CommitPrepared { gid })
-        }
-        KIND_ROLLBACK_PREPARED => {
+        }),
+        KIND_ROLLBACK_PREPARED => decode_large_op(|| {
             let gid = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RollbackPrepared { gid })
-        }
-        KIND_CREATE_REPLICATION_SLOT => {
+        }),
+        KIND_CREATE_REPLICATION_SLOT => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let restart_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -7977,18 +8038,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 restart_lsn,
                 behavior,
             })
-        }
-        KIND_ALTER_REPLICATION_SLOT => {
+        }),
+        KIND_ALTER_REPLICATION_SLOT => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let behavior = crate::storage::ReplicationSlotBehavior::from_code(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::AlterReplicationSlot { name, behavior })
-        }
-        KIND_DROP_REPLICATION_SLOT => {
+        }),
+        KIND_DROP_REPLICATION_SLOT => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropReplicationSlot { name })
-        }
-        KIND_ADVANCE_REPLICATION_SLOT => {
+        }),
+        KIND_ADVANCE_REPLICATION_SLOT => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let confirmed_flush_lsn = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -7996,8 +8057,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 confirmed_flush_lsn,
             })
-        }
-        KIND_CREATE_MATVIEW => {
+        }),
+        KIND_CREATE_MATVIEW => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
@@ -8009,7 +8070,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 2;
             let path = core::str::from_utf8(payload.get(at..at + path_len)?).ok()?;
             at += path_len;
-            let populated = *payload.get(at)? != 0;
+            let populated = stored_boolean(*payload.get(at)?)?;
             at += 1;
             let encoded = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded) {
@@ -8025,29 +8086,29 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 dependencies,
                 populated,
             })
-        }
-        KIND_DROP_MATVIEW => {
+        }),
+        KIND_DROP_MATVIEW => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropMatview { schema, name })
-        }
-        KIND_SET_MATVIEW_POPULATED => {
+        }),
+        KIND_SET_MATVIEW_POPULATED => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let populated = *payload.get(at)? != 0;
+            let populated = stored_boolean(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::SetMatviewPopulated {
                 schema,
                 name,
                 populated,
             })
-        }
-        KIND_CREATE_INDEX => {
+        }),
+        KIND_CREATE_INDEX => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let name = take_name(&mut at)?;
             let table = take_name(&mut at)?;
-            let unique = *payload.get(at)? != 0;
+            let unique = stored_boolean(*payload.get(at)?)?;
             at += 1;
             let n_cols = *payload.get(at)? as usize;
             at += 1;
@@ -8118,17 +8179,26 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
-            if *payload.get(at)? != 0xa5 {
-                return None;
-            }
-            at += 1;
-            let mask = *payload.get(at)?;
-            at += 1;
-            if mask >> n_cols != 0 {
+            let mask = match *payload.get(at)? {
+                0xa5 => {
+                    at += 1;
+                    let mask = u32::from(*payload.get(at)?);
+                    at += 1;
+                    mask
+                }
+                0xb0 => {
+                    at += 1;
+                    let mask = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                    at += 4;
+                    mask
+                }
+                _ => return None,
+            };
+            if n_cols < u32::BITS as usize && mask >> n_cols != 0 {
                 return None;
             }
             for (index, expression) in expressions.iter_mut().enumerate().take(n_cols) {
-                if mask & (1 << index) == 0 {
+                if mask & (1u32 << index) == 0 {
                     continue;
                 }
                 let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
@@ -8338,8 +8408,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 unique,
                 definition,
             })
-        }
-        KIND_BRIN_MAINTENANCE => {
+        }),
+        KIND_BRIN_MAINTENANCE => decode_large_op(|| {
             let index_created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let pages_per_range = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -8367,8 +8437,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 unsummarized_ranges,
                 range_count: count as u8,
             })
-        }
-        KIND_ALTER_INDEX_DEFINITION => {
+        }),
+        KIND_ALTER_INDEX_DEFINITION => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let definition = decode_index_definition(payload, &mut at)?;
@@ -8377,8 +8447,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 definition,
             })
-        }
-        KIND_CREATE_TABLESPACE => {
+        }),
+        KIND_CREATE_TABLESPACE => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let name = take_name(&mut at)?;
@@ -8397,8 +8467,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 options,
                 owner,
             })
-        }
-        KIND_ALTER_TABLESPACE => {
+        }),
+        KIND_ALTER_TABLESPACE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             let options = decode_tablespace_options(payload, &mut at)?;
@@ -8410,12 +8480,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 options,
                 owner,
             })
-        }
-        KIND_DROP_TABLESPACE => {
+        }),
+        KIND_DROP_TABLESPACE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTablespace { name })
-        }
-        KIND_CREATE_ACCESS_METHOD => {
+        }),
+        KIND_CREATE_ACCESS_METHOD => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let name = take_name(&mut at)?;
@@ -8426,12 +8496,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 handler,
             })
-        }
-        KIND_DROP_ACCESS_METHOD => {
+        }),
+        KIND_DROP_ACCESS_METHOD => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropAccessMethod { name })
-        }
-        KIND_CREATE_DATABASE => {
+        }),
+        KIND_CREATE_DATABASE => decode_large_op(|| {
             let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let template_oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -8445,8 +8515,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 definition,
                 owner,
             })
-        }
-        KIND_ALTER_DATABASE => {
+        }),
+        KIND_ALTER_DATABASE => decode_large_op(|| {
             let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let definition = decode_database_definition(payload, &mut at)?;
@@ -8457,18 +8527,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 definition,
                 owner,
             })
-        }
-        KIND_DROP_DATABASE => {
+        }),
+        KIND_DROP_DATABASE => decode_large_op(|| {
             let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             (at == payload.len()).then_some(WalOp::DropDatabase { oid })
-        }
-        KIND_DROP_INDEX => {
+        }),
+        KIND_DROP_INDEX => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropIndex { schema, name })
-        }
-        KIND_RENAME_INDEX => {
+        }),
+        KIND_RENAME_INDEX => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
@@ -8477,8 +8547,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 new_name,
             })
-        }
-        KIND_SEQUENCE_SET => {
+        }),
+        KIND_SEQUENCE_SET => decode_large_op(|| {
             let table = take_name(&mut at)?;
             let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap());
             at += 2;
@@ -8491,8 +8561,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 column,
                 last,
             })
-        }
-        KIND_CREATE_SEQUENCE => {
+        }),
+        KIND_CREATE_SEQUENCE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let marker = *payload.get(at)?;
@@ -8517,9 +8587,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let max_value = take_i64(&mut at)?;
             let start_value = take_i64(&mut at)?;
             let cache = take_i64(&mut at)?;
-            let cycle = *payload.get(at)? != 0;
+            let cycle = stored_boolean(*payload.get(at)?)?;
             at += 1;
-            let has_owner = *payload.get(at)? != 0;
+            let has_owner = stored_boolean(*payload.get(at)?)?;
             at += 1;
             let owner = has_owner
                 .then(|| {
@@ -8530,7 +8600,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     })
                 })
                 .flatten();
-            let has_generator = *payload.get(at)? != 0;
+            let has_generator = stored_boolean(*payload.get(at)?)?;
             at += 1;
             let generator_for = has_generator
                 .then(|| {
@@ -8555,18 +8625,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 generator_for,
                 persistence,
             })
-        }
-        KIND_DROP_SEQUENCE => {
+        }),
+        KIND_DROP_SEQUENCE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropSequence { schema, name })
-        }
-        KIND_SEQUENCE_ADVANCE => {
+        }),
+        KIND_SEQUENCE_ADVANCE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let last = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
             at += 8;
-            let is_called = *payload.get(at)? != 0;
+            let is_called = stored_boolean(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::SequenceAdvance {
                 schema,
@@ -8574,20 +8644,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 last,
                 is_called,
             })
-        }
+        }),
         KIND_RESET_UNLOGGED_RELATIONS => {
-            (at == payload.len()).then_some(WalOp::ResetUnloggedRelations)
+            decode_large_op(|| (at == payload.len()).then_some(WalOp::ResetUnloggedRelations))
         }
-        KIND_COMMENT => {
+        KIND_COMMENT => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let class = *payload.get(at)?;
             at += 1;
             let subid = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
             at += 4;
-            let present = *payload.get(at)?;
+            let present = stored_boolean(*payload.get(at)?)?;
             at += 1;
-            let text = if present != 0 {
+            let text = if present {
                 let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
                 at += 2;
                 let raw = payload.get(at..at + len)?;
@@ -8603,8 +8673,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 subid,
                 text,
             })
-        }
-        KIND_CREATE_DOMAIN => {
+        }),
+        KIND_CREATE_DOMAIN => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let payload_version = *payload.get(at)?;
@@ -8662,13 +8732,17 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             let base_type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
             at += 4;
-            let not_null = *payload.get(at)? != 0;
+            let not_null = stored_boolean(*payload.get(at)?)?;
             at += 1;
             let de_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let de = core::str::from_utf8(payload.get(at..at + de_len)?).ok()?;
             at += de_len;
-            let default_expr = (de_len > 0).then(|| crate::util::StackStr::from_str(de));
+            let default_expr = if de_len > 0 {
+                Some(bounded_wal_text(de)?)
+            } else {
+                None
+            };
             let n_checks = *payload.get(at)? as usize;
             at += 1;
             if n_checks > crate::storage::MAX_DOMAIN_CHECKS {
@@ -8693,11 +8767,14 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 };
                 *check = crate::storage::CheckConstraint {
                     name: SqlName::parse(cname).ok()?,
-                    expression: crate::util::StackStr::from_str(expr),
+                    expression: bounded_wal_text(expr)?,
                     validation,
                 };
             }
-            (at == payload.len()).then_some(WalOp::CreateDomain(crate::storage::DomainDef {
+            if at != payload.len() {
+                return None;
+            }
+            let definition = crate::storage::DomainDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
                 created_at: 0,
                 schema: SqlName::parse(schema).ok()?,
@@ -8713,14 +8790,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 n_checks,
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
-            }))
-        }
-        KIND_DROP_DOMAIN => {
+            };
+            if let Some(output) = decoded_domain {
+                *output = definition;
+            }
+            Some(WalOp::RestoreDomain(payload))
+        }),
+        KIND_DROP_DOMAIN => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropDomain { schema, name })
-        }
-        KIND_CREATE_ENUM => {
+        }),
+        KIND_CREATE_ENUM => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let n_members = *payload.get(at)? as usize;
@@ -8749,13 +8830,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 pending_definition: None,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             }))
-        }
-        KIND_DROP_ENUM => {
+        }),
+        KIND_DROP_ENUM => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropEnum { schema, name })
-        }
-        KIND_RENAME_ENUM => {
+        }),
+        KIND_RENAME_ENUM => decode_large_op(|| {
             let old_name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
@@ -8764,8 +8845,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 old_name,
                 new_name,
             })
-        }
-        KIND_CREATE_COMPOSITE => {
+        }),
+        KIND_CREATE_COMPOSITE => decode_large_op(|| {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let name = take_name(&mut at)?;
@@ -8835,13 +8916,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     ddl_state: crate::storage::CatalogDdlState::Absent,
                 },
             })
-        }
-        KIND_DROP_COMPOSITE => {
+        }),
+        KIND_DROP_COMPOSITE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropComposite { schema, name })
-        }
-        KIND_CREATE_ROUTINE => {
+        }),
+        KIND_CREATE_ROUTINE => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
@@ -9106,8 +9187,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 },
                 dependencies: WalStoredQueryDependencies::Encoded(encoded_dependencies),
             })
-        }
-        KIND_SET_CAST => {
+        }),
+        KIND_SET_CAST => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let source = decode_routine_result(payload, &mut at)?;
@@ -9143,13 +9224,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 context,
                 ddl_state: crate::storage::CatalogDdlState::Absent,
             }))
-        }
-        KIND_DROP_CAST => {
+        }),
+        KIND_DROP_CAST => decode_large_op(|| {
             let source = decode_routine_result(payload, &mut at)?;
             let target = decode_routine_result(payload, &mut at)?;
             (at == payload.len()).then_some(WalOp::DropCast { source, target })
-        }
-        KIND_SET_OPERATOR => {
+        }),
+        KIND_SET_OPERATOR => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -9196,8 +9277,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     owner,
                 },
             })
-        }
-        KIND_DROP_OPERATOR => {
+        }),
+        KIND_DROP_OPERATOR => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let signature = decode_operator_signature(payload, &mut at)?;
@@ -9206,8 +9287,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 signature,
             })
-        }
-        KIND_SET_COLLATION => {
+        }),
+        KIND_SET_COLLATION => decode_large_op(|| {
             let slot = *payload.get(at)?;
             at += 1;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -9275,8 +9356,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     behavior,
                 },
             })
-        }
-        KIND_DROP_COLLATION | KIND_DROP_CONVERSION => {
+        }),
+        KIND_DROP_COLLATION | KIND_DROP_CONVERSION => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             if at != payload.len() {
@@ -9287,8 +9368,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             } else {
                 WalOp::DropConversion { schema, name }
             })
-        }
-        KIND_SET_CONVERSION => {
+        }),
+        KIND_SET_CONVERSION => decode_large_op(|| {
             let slot = *payload.get(at)?;
             at += 1;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -9325,8 +9406,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     default,
                 },
             })
-        }
-        KIND_SET_TEXT_SEARCH | KIND_SET_TEXT_SEARCH_V2 => {
+        }),
+        KIND_SET_TEXT_SEARCH | KIND_SET_TEXT_SEARCH_V2 => decode_large_op(|| {
             let slot = if kind == KIND_SET_TEXT_SEARCH {
                 let slot = u16::from(*payload.get(at)?);
                 at += 1;
@@ -9427,8 +9508,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 created_at,
                 definition,
             })
-        }
-        KIND_DROP_TEXT_SEARCH => {
+        }),
+        KIND_DROP_TEXT_SEARCH => decode_large_op(|| {
             let kind = match *payload.get(at)? {
                 0 => crate::sql::ast::TextSearchObjectKind::Parser,
                 1 => crate::sql::ast::TextSearchObjectKind::Template,
@@ -9440,8 +9521,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTextSearch { kind, schema, name })
-        }
-        KIND_SET_EVENT_TRIGGER => {
+        }),
+        KIND_SET_EVENT_TRIGGER => decode_large_op(|| {
             let slot = *payload.get(at)?;
             at += 1;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -9480,12 +9561,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     },
                 },
             })
-        }
-        KIND_DROP_EVENT_TRIGGER => {
+        }),
+        KIND_DROP_EVENT_TRIGGER => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropEventTrigger { name })
-        }
-        KIND_SET_OPERATOR_FAMILY => {
+        }),
+        KIND_SET_OPERATOR_FAMILY => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -9553,8 +9634,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     functions,
                 },
             })
-        }
-        KIND_DROP_OPERATOR_FAMILY | KIND_DROP_OPERATOR_CLASS => {
+        }),
+        KIND_DROP_OPERATOR_FAMILY | KIND_DROP_OPERATOR_CLASS => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             if at != payload.len() {
@@ -9565,8 +9646,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             } else {
                 WalOp::DropOperatorClass { schema, name }
             })
-        }
-        KIND_SET_OPERATOR_CLASS => {
+        }),
+        KIND_SET_OPERATOR_CLASS => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let schema = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -9651,8 +9732,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     functions,
                 },
             })
-        }
-        KIND_DROP_ROUTINE => {
+        }),
+        KIND_DROP_ROUTINE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let argument_signature = payload.get(at..)?;
@@ -9665,8 +9746,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 argument_signature,
             })
-        }
-        KIND_ALTER_ROUTINE_IDENTITY => {
+        }),
+        KIND_ALTER_ROUTINE_IDENTITY => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let signature_start = at;
@@ -9693,8 +9774,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 new_schema,
                 new_name,
             })
-        }
-        KIND_ALTER_DOMAIN_IDENTITY => {
+        }),
+        KIND_ALTER_DOMAIN_IDENTITY => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let new_schema = take_name(&mut at)?;
@@ -9705,8 +9786,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 new_schema,
                 new_name,
             })
-        }
-        KIND_ALTER_ENUM_IDENTITY => {
+        }),
+        KIND_ALTER_ENUM_IDENTITY => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let new_schema = take_name(&mut at)?;
@@ -9717,21 +9798,21 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 new_schema,
                 new_name,
             })
-        }
-        KIND_CREATE_SCHEMA => {
+        }),
+        KIND_CREATE_SCHEMA => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::CreateSchema(name))
-        }
-        KIND_DROP_SCHEMA => {
+        }),
+        KIND_DROP_SCHEMA => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropSchema(name))
-        }
-        KIND_RENAME_SCHEMA => {
+        }),
+        KIND_RENAME_SCHEMA => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RenameSchema { name, new_name })
-        }
-        KIND_UPSERT_EXTENSION => {
+        }),
+        KIND_UPSERT_EXTENSION => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let name = take_name(&mut at)?;
@@ -9752,12 +9833,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 owner,
                 created_at,
             })
-        }
-        KIND_DROP_EXTENSION => {
+        }),
+        KIND_DROP_EXTENSION => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropExtension { name })
-        }
-        KIND_SET_EXTENSION_DEPENDENCY => {
+        }),
+        KIND_SET_EXTENSION_DEPENDENCY => decode_large_op(|| {
             let extension = take_name(&mut at)?;
             let class = *payload.get(at)?;
             at += 1;
@@ -9787,8 +9868,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 kind,
                 exists,
             })
-        }
-        KIND_SET_TABLE_SCHEMA => {
+        }),
+        KIND_SET_TABLE_SCHEMA => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_schema = take_name(&mut at)?;
@@ -9797,8 +9878,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 new_schema,
             })
-        }
-        KIND_SET_SEQUENCE_SCHEMA => {
+        }),
+        KIND_SET_SEQUENCE_SCHEMA => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_schema = take_name(&mut at)?;
@@ -9807,8 +9888,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 new_schema,
             })
-        }
-        KIND_RENAME_SEQUENCE => {
+        }),
+        KIND_RENAME_SEQUENCE => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
@@ -9817,8 +9898,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 new_name,
             })
-        }
-        KIND_SET_VIEW_SCHEMA => {
+        }),
+        KIND_SET_VIEW_SCHEMA => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let new_schema = take_name(&mut at)?;
@@ -9827,8 +9908,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 new_schema,
             })
-        }
-        KIND_SET_EXTENSION_CONFIG => {
+        }),
+        KIND_SET_EXTENSION_CONFIG => decode_large_op(|| {
             let extension = take_name(&mut at)?;
             let ordinal = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -9857,8 +9938,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 condition,
                 exists,
             })
-        }
-        KIND_DROP_FK => {
+        }),
+        KIND_DROP_FK => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let fk_name = take_name(&mut at)?;
@@ -9867,8 +9948,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 table,
                 fk_name,
             })
-        }
-        KIND_ANALYZE => {
+        }),
+        KIND_ANALYZE => decode_large_op(|| {
             let table = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let encoded = payload.get(at..)?;
@@ -9878,8 +9959,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 table,
                 statistics: WalTableStatistics::Encoded(encoded),
             })
-        }
-        KIND_SET_EXTENDED_STATISTICS => {
+        }),
+        KIND_SET_EXTENDED_STATISTICS => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let schema = take_name(&mut at)?;
@@ -9946,13 +10027,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 keys,
                 key_count,
             })
-        }
-        KIND_DROP_EXTENDED_STATISTICS => {
+        }),
+        KIND_DROP_EXTENDED_STATISTICS => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropExtendedStatistics { schema, name })
-        }
-        KIND_ANALYZE_EXTENDED_STATISTICS => {
+        }),
+        KIND_ANALYZE_EXTENDED_STATISTICS => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let name = take_name(&mut at)?;
             let encoded = payload.get(at..)?;
@@ -9962,8 +10043,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 statistics: WalExtendedStatisticsData::Encoded(encoded),
             })
-        }
-        KIND_UPSERT_ROLE => {
+        }),
+        KIND_UPSERT_ROLE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let flags = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -10032,17 +10113,17 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                         .then(|| crate::util::StackStr::from_str(valid_until)),
                 },
             })
-        }
-        KIND_DROP_ROLE => {
+        }),
+        KIND_DROP_ROLE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropRole { name })
-        }
-        KIND_RENAME_ROLE => {
+        }),
+        KIND_RENAME_ROLE => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RenameRole { name, new_name })
-        }
-        KIND_UPSERT_ROLE_MEMBERSHIP => {
+        }),
+        KIND_UPSERT_ROLE_MEMBERSHIP => decode_large_op(|| {
             let role = take_name(&mut at)?;
             let member = take_name(&mut at)?;
             let grantor = take_name(&mut at)?;
@@ -10061,13 +10142,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     set: flags & 4 != 0,
                 },
             })
-        }
-        KIND_DROP_ROLE_MEMBERSHIP => {
+        }),
+        KIND_DROP_ROLE_MEMBERSHIP => decode_large_op(|| {
             let role = take_name(&mut at)?;
             let member = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropRoleMembership { role, member })
-        }
-        KIND_SET_ROLE_SETTING => {
+        }),
+        KIND_SET_ROLE_SETTING => decode_large_op(|| {
             let flags = *payload.get(at)?;
             at += 1;
             if flags & !0x07 != 0 || flags & 0x02 == 0 && flags & 0x01 == 0 {
@@ -10101,8 +10182,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 value,
             })
-        }
-        KIND_SET_SYSTEM_SETTING => {
+        }),
+        KIND_SET_SYSTEM_SETTING => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let present = *payload.get(at)?;
             at += 1;
@@ -10119,8 +10200,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             (at == payload.len()).then_some(WalOp::SetSystemSetting { name, value })
-        }
-        KIND_SET_OBJECT_OWNER => {
+        }),
+        KIND_SET_OBJECT_OWNER => decode_large_op(|| {
             let class = *payload.get(at)?;
             at += 1;
             crate::storage::AccessClass::from_u8(class)?;
@@ -10141,8 +10222,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 owner,
             })
-        }
-        KIND_SET_OBJECT_ACL => {
+        }),
+        KIND_SET_OBJECT_ACL => decode_large_op(|| {
             let class = *payload.get(at)?;
             at += 1;
             let class = crate::storage::AccessClass::from_u8(class)?;
@@ -10176,8 +10257,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 privileges: crate::storage::PrivilegeSet(privileges),
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
-        }
-        KIND_SET_COLUMN_ACL => {
+        }),
+        KIND_SET_COLUMN_ACL => decode_large_op(|| {
             let class = *payload.get(at)?;
             at += 1;
             let class = crate::storage::AccessClass::from_u8(class)?;
@@ -10216,8 +10297,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 privileges: crate::storage::PrivilegeSet(privileges),
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
-        }
-        KIND_SET_DEFAULT_ACL => {
+        }),
+        KIND_SET_DEFAULT_ACL => decode_large_op(|| {
             let owner = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let class = *payload.get(at)?;
@@ -10247,8 +10328,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 privileges: crate::storage::PrivilegeSet(privileges),
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
-        }
-        KIND_SET_PARAMETER_ACL => {
+        }),
+        KIND_SET_PARAMETER_ACL => decode_large_op(|| {
             let parameter = take_name(&mut at)?;
             crate::sql::ast::ParameterName::parse(parameter)?;
             let grantee = take_name(&mut at)?;
@@ -10267,7 +10348,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 privileges,
                 grant_options,
             })
-        }
+        }),
         _ => None,
     }
 }
@@ -10697,7 +10778,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         2 => {
             let b = *payload.get(*at)?;
             *at += 1;
-            Some(OwnedDatum::Bool(b != 0))
+            Some(OwnedDatum::Bool(stored_boolean(b)?))
         }
         30 => {
             let byte = *payload.get(*at)?;
@@ -10905,7 +10986,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             Some(OwnedDatum::Uuid(bytes.try_into().unwrap()))
         }
         20 => {
-            let jsonb = *payload.get(*at)? != 0;
+            let jsonb = stored_boolean(*payload.get(*at)?)?;
             let len = *payload.get(*at + 1)? as usize;
             *at += 2;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
@@ -10981,7 +11062,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
         }
         22 => {
             let kind = crate::sql::types::RangeKind::from_code(*payload.get(*at)?)?;
-            let multirange = *payload.get(*at + 1)? != 0;
+            let multirange = stored_boolean(*payload.get(*at + 1)?)?;
             let len = *payload.get(*at + 2)? as usize;
             *at += 3;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
@@ -10994,7 +11075,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             })
         }
         23 => {
-            let varying = *payload.get(*at)? != 0;
+            let varying = stored_boolean(*payload.get(*at)?)?;
             let len = *payload.get(*at + 1)? as usize;
             *at += 2;
             let bytes = decode_bounded_default_bytes(payload, at, len)?;
@@ -11677,12 +11758,39 @@ mod tests {
     }
 
     #[test]
-    fn operation_size_is_bounded_by_the_table_definition_variant() {
+    fn operation_does_not_embed_wide_schema_definitions() {
         assert!(
-            core::mem::size_of::<WalOp<'static>>() <= core::mem::size_of::<TableDef>() + 64,
-            "WalOp grew to {} bytes",
-            core::mem::size_of::<WalOp<'static>>()
+            core::mem::size_of::<WalOp<'static>>() < core::mem::size_of::<TableDef>(),
+            "WalOp {} must remain smaller than TableDef {}",
+            core::mem::size_of::<WalOp<'static>>(),
+            core::mem::size_of::<TableDef>()
         );
+        assert!(
+            core::mem::size_of::<WalOp<'static>>()
+                < core::mem::size_of::<crate::storage::DomainDef>()
+        );
+    }
+
+    #[test]
+    fn stored_default_boolean_flags_are_canonical() {
+        crate::mem::guard::forbid_alloc(|| {
+            for invalid in [2, 127, 255] {
+                for encoded in [
+                    [2, invalid, 0, 0],
+                    [20, invalid, 0, 0],
+                    [22, 0, invalid, 0],
+                    [23, invalid, 0, 0],
+                ] {
+                    assert!(decode_default(&encoded, &mut 0).is_none());
+                }
+            }
+            for valid in [0, 1] {
+                assert_eq!(
+                    decode_default(&[2, valid], &mut 0),
+                    Some(Some(OwnedDatum::Bool(valid == 1)))
+                );
+            }
+        });
     }
 
     #[test]
@@ -12187,7 +12295,18 @@ mod tests {
         let mut seen = Vec::new();
         wal.replay(floor, |lsn, record| {
             let operation = decode_record(record).unwrap();
-            seen.push(format!("{lsn}:{operation:?}"));
+            let shown = match operation {
+                WalOp::RestoreTable(payload) => {
+                    let definition = decode_table_payload(payload).unwrap();
+                    format!("{lsn}:CreateTable({definition:?})")
+                }
+                WalOp::RestoreDomain(payload) => {
+                    let definition = decode_domain_payload(payload).unwrap();
+                    format!("{lsn}:CreateDomain({definition:?})")
+                }
+                operation => format!("{lsn}:{operation:?}"),
+            };
+            seen.push(shown);
             Ok(())
         })
         .unwrap();
@@ -12208,7 +12327,7 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "truncated table payload", 4096).unwrap();
         assert!(append_payload(
             &mut payload,
-            &WalOp::CreateTable(definition)
+            &WalOp::CreateTable(&definition)
         ));
         let truncated_len = payload.len() - definition.n_columns;
         assert!(decode_op(KIND_CREATE, &payload.readable()[..truncated_len]).is_none());
@@ -12252,11 +12371,10 @@ mod tests {
         let mut payload = FixedBuf::new(&mut budget, "partition table payload", 4096).unwrap();
         assert!(append_payload(
             &mut payload,
-            &WalOp::CreateTable(definition)
+            &WalOp::CreateTable(&definition)
         ));
-        let Some(WalOp::CreateTable(restored)) = decode_op(KIND_CREATE, payload.readable()) else {
-            panic!("partition table definition did not decode")
-        };
+        let restored = decode_table_payload(payload.readable())
+            .expect("partition table definition did not decode");
         assert_eq!(restored.inheritance.parents_ref(), &[3, 7]);
         assert_eq!(
             restored.type_membership,
@@ -12736,7 +12854,7 @@ mod tests {
         };
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
-            wal.append_committed(1, &WalOp::CreateTable(sample_def()))
+            wal.append_committed(1, &WalOp::CreateTable(&sample_def()))
                 .unwrap();
             wal.append_committed(
                 2,
@@ -13209,6 +13327,8 @@ mod tests {
 
     #[test]
     fn partial_index_payload_round_trips_without_name_length_limits() {
+        let mut expressions = [None; MAX_INDEX_COLS];
+        expressions[0] = Some("lower(value)");
         let operation = WalOp::CreateIndex {
             created_at: 42,
             schema: "public",
@@ -13216,16 +13336,7 @@ mod tests {
             table: "rows",
             method: crate::sql::ast::IndexAccessMethod::Btree,
             columns: [1; MAX_INDEX_COLS],
-            expressions: [
-                Some("lower(value)"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ],
+            expressions,
             include_columns: [2; MAX_INDEX_COLS],
             collations: [crate::sql::ast::Collation::Default; MAX_INDEX_COLS],
             explicit_collations: [false; MAX_INDEX_COLS],
@@ -13273,14 +13384,35 @@ mod tests {
         assert!(definition.clustered);
         assert_eq!(predicate, Some("active AND value IS NOT NULL"));
 
+        // The former eight-key format used tag 0xa5 followed by one mask
+        // byte. Recovery must keep accepting it after the mask widens.
+        let current = payload.readable();
+        let mut legacy = [0u8; 4096];
+        {
+            let expression_mask_at = current
+                .windows(5)
+                .position(|window| window == [0xb0, 1, 0, 0, 0])
+                .expect("wide expression mask marker");
+            legacy[..expression_mask_at].copy_from_slice(&current[..expression_mask_at]);
+            legacy[expression_mask_at] = 0xa5;
+            legacy[expression_mask_at + 1] = 1;
+            legacy[expression_mask_at + 2..current.len() - 3]
+                .copy_from_slice(&current[expression_mask_at + 5..]);
+            let Some(WalOp::CreateIndex { expressions, .. }) =
+                decode_op(KIND_CREATE_INDEX, &legacy[..current.len() - 3])
+            else {
+                panic!("legacy expression-mask WAL payload must decode");
+            };
+            assert_eq!(expressions[0], Some("lower(value)"));
+        }
+
         // WAL written before access methods became durable metadata has no
         // 0xaa method field. Its only executable index method was btree.
-        let current = payload.readable();
         let method_at = current
             .windows(3)
             .rposition(|window| window == [0xaa, 0, 0xa8])
             .expect("encoded btree method marker");
-        let mut legacy = [0u8; 4096];
+        legacy.fill(0);
         legacy[..method_at].copy_from_slice(&current[..method_at]);
         legacy[method_at..current.len() - 2].copy_from_slice(&current[method_at + 2..]);
         let Some(WalOp::CreateIndex { method, .. }) =
@@ -13533,6 +13665,83 @@ mod tests {
         assert_eq!(schema, "public");
         assert_eq!(name, "clustered_rows");
         assert!(definition.clustered);
+    }
+
+    #[test]
+    fn wide_domain_payload_round_trips_without_embedding_the_definition() {
+        let mut definition = crate::storage::DomainDef::EMPTY;
+        definition.schema = SqlName::parse("public").unwrap();
+        definition.name = SqlName::parse("wide_domain").unwrap();
+        definition.base = ColType::Int4;
+        definition.default_expr = Some(StackStr::from_str("64"));
+        definition.n_checks = crate::storage::MAX_DOMAIN_CHECKS;
+        for (index, check) in definition.checks.iter_mut().enumerate() {
+            check.name = SqlName::parse(&format!("wide_check_{index}")).unwrap();
+            check.expression = StackStr::from_str("VALUE >= 0");
+            check.validation = crate::storage::ConstraintValidation::NotEnforced;
+        }
+        let operation = WalOp::CreateDomain(&definition);
+        let length = encoded_payload_len(&operation);
+        let mut budget = Budget::new(length);
+        let mut payload = FixedBuf::new(&mut budget, "wide domain payload", length).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(append_payload(&mut payload, &operation));
+            let Some(WalOp::RestoreDomain(encoded)) =
+                decode_op(KIND_CREATE_DOMAIN, payload.readable())
+            else {
+                panic!("expected encoded domain image");
+            };
+            let decoded = decode_domain_payload(encoded).unwrap();
+            assert_eq!(decoded.schema, definition.schema);
+            assert_eq!(decoded.name, definition.name);
+            assert_eq!(decoded.base, definition.base);
+            assert_eq!(decoded.default_expr, definition.default_expr);
+            assert_eq!(decoded.n_checks, definition.n_checks);
+            for (actual, expected) in decoded.checks().iter().zip(definition.checks()) {
+                assert_eq!(actual.name, expected.name);
+                assert_eq!(actual.expression, expected.expression);
+                assert_eq!(actual.validation, expected.validation);
+            }
+            assert!(decode_domain_payload(&encoded[..encoded.len() - 1]).is_none());
+        });
+    }
+
+    #[test]
+    fn domain_payload_rejects_overlong_text_and_invalid_boolean_codes() {
+        fn payload(default: &str, expression: &str, not_null: u8) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for name in ["bounded_domain", "public"] {
+                bytes.push(name.len() as u8);
+                bytes.extend_from_slice(name.as_bytes());
+            }
+            bytes.extend_from_slice(&[DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION, 0, 0, 0, 0]);
+            bytes.push(ColType::Int4.code());
+            bytes.extend_from_slice(&NO_DOMAIN_BASE_SLOT.to_le_bytes());
+            bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+            bytes.push(not_null);
+            bytes.extend_from_slice(&(default.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(default.as_bytes());
+            bytes.extend_from_slice(&[1, 5]);
+            bytes.extend_from_slice(b"check");
+            bytes.extend_from_slice(&(expression.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(expression.as_bytes());
+            bytes.push(crate::storage::ConstraintValidation::EnforcedValidated.code());
+            bytes
+        }
+        let valid = payload("7", "VALUE > 0", 1);
+        assert!(decode_op(KIND_CREATE_DOMAIN, &valid).is_some());
+        for invalid in [
+            payload(
+                &"1".repeat(crate::storage::DEFAULT_EXPR_MAX + 1),
+                "VALUE > 0",
+                1,
+            ),
+            payload("7", &"x".repeat(crate::storage::CHECK_SQL_MAX + 1), 1),
+            payload("7", "VALUE > 0", 2),
+        ] {
+            assert!(decode_op(KIND_CREATE_DOMAIN, &invalid).is_none());
+            assert!(decode_domain_payload(&invalid).is_none());
+        }
     }
 
     #[test]

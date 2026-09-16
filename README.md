@@ -131,6 +131,28 @@ subscription-apply, and logical-decoding state together. It is reserved for
 every transaction slot at startup; exhaustion aborts the current statement or
 transaction instead of partially applying bulk DDL.
 
+Atomic transaction bookkeeping is independently startup-sized by
+`max_savepoints_per_transaction` (default 16),
+`max_deferred_constraints_per_transaction` (128), `deferred_trigger_bytes`
+(256KiB), and `max_analyze_per_transaction` (64 statistics changes, including
+extended statistics). These capacities cover connection, prepared-transaction,
+and subscription-apply slots. Savepoint configuration also reserves GUC,
+foreign-query, large-object descriptor depth, and per-relation nested statistics
+state; session reset reuses the original allocation. Statement arenas, row undo,
+and WAL staging remain separate named bounds.
+
+TRUNCATE fan-out uses the complete configured physical-table capacity, including
+inheritance and partition descendants and foreign-key cascades. Transaction and
+logical-decoding table lists are startup-reserved, not sixteen-table arrays.
+The journal writes a 16-bit relation-count record and still reads the older
+8-bit count format; pgoutput retains its PostgreSQL 32-bit relation count.
+
+Checkpoint maintenance is normally paced. At critical row-cache pressure it
+finishes publication before dispatch resumes, preventing many-table sweeps
+from exhausting the cache during small autocommit writes. Oversized pending
+transactions still report their named memory bound; cache pressure never
+grows a pool or weakens durable publication.
+
 Collations, conversions, text-search objects, event triggers, tablespaces, and
 object comments likewise have independent startup capacities. Their catalog
 queries allocate from the fixed statement arena according to the actual pool,

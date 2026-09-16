@@ -210,10 +210,8 @@ pub struct SubscriptionApply {
 impl SubscriptionApply {
     pub const fn budget_bytes(config: &crate::config::Config) -> usize {
         config.subscription_relation_capacity * core::mem::size_of::<RelationBinding>()
-            + TxnState::budget_bytes_with_ddl_capacity(
-                config.txn_rows,
-                config.max_ddl_per_transaction,
-            )
+            + TxnState::budget_bytes_with_config(config)
+            + GucState::extra_savepoint_budget_bytes(config.max_savepoints_per_transaction)
             + config.subscription_arena_bytes
             + TRIGGER_RESPONSE_BYTES
             + config.txn_rows * core::mem::size_of::<crate::sql::exec::PhysicalRow>()
@@ -229,12 +227,12 @@ impl SubscriptionApply {
     ) -> Result<Self, BudgetError> {
         Ok(Self {
             stream,
-            txn: TxnState::new_with_ddl_capacity(
+            txn: TxnState::new_with_config(budget, config)?,
+            guc: GucState::new_with_capacities(
                 budget,
-                config.txn_rows,
-                config.max_ddl_per_transaction,
+                config.max_sequences,
+                config.max_savepoints_per_transaction,
             )?,
-            guc: GucState::new_with_sequence_capacity(budget, config.max_sequences)?,
             relations: RelationMap::new(budget, config.subscription_relation_capacity)?,
             arena: Arena::new(
                 budget,
@@ -783,16 +781,16 @@ impl SubscriptionApply {
                         "subscription TRUNCATE is outside BEGIN/COMMIT",
                     ));
                 }
-                let mut tables = [0_usize; crate::sql::txn::MAX_TRUNCATE_TABLES];
-                if truncate.relation_ids().len() > tables.len() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "subscription TRUNCATE has {} tables, maximum is {}",
-                        truncate.relation_ids().len(),
-                        tables.len()
-                    ));
-                }
-                for (index, &relation_id) in truncate.relation_ids().iter().enumerate() {
+                let tables = self
+                    .arena
+                    .alloc_slice_with(truncate.relation_ids().len(), |_| 0usize)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "subscription TRUNCATE arena exhausted"
+                        )
+                    })?;
+                for (index, relation_id) in truncate.relation_ids().enumerate() {
                     tables[index] = self.relations.binding(relation_id)?.table_slot();
                 }
                 engine.apply_subscription_truncate(

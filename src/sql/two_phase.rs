@@ -40,11 +40,7 @@ impl PreparedTransactions {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         config.max_prepared_transactions
             * (core::mem::size_of::<PreparedTransactionSlot>()
-                + TxnState::budget_bytes_with_large_objects(
-                    config.txn_rows,
-                    config.max_large_object_descriptors,
-                    config.max_ddl_per_transaction,
-                )
+                + TxnState::budget_bytes_with_config(config)
                 + 2 * config.wal_buffer_bytes)
     }
 
@@ -58,12 +54,7 @@ impl PreparedTransactions {
         for _ in 0..config.max_prepared_transactions {
             slots.push(PreparedTransactionSlot {
                 metadata: None,
-                transaction: TxnState::new_with_large_objects(
-                    budget,
-                    config.txn_rows,
-                    config.max_large_object_descriptors,
-                    config.max_ddl_per_transaction,
-                )?,
+                transaction: TxnState::new_with_config(budget, config)?,
                 records: FixedBuf::new(
                     budget,
                     "prepared transaction WAL",

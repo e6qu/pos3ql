@@ -962,7 +962,7 @@ struct GucTransaction {
     session: GucValues,
     start_overrides: u32,
     session_overrides: u32,
-    savepoints: [Option<GucSavepoint>; super::txn::MAX_SAVEPOINTS],
+    savepoints: Vec<Option<GucSavepoint>>,
     savepoint_count: usize,
 }
 
@@ -1077,11 +1077,33 @@ impl Default for GucState {
 }
 
 impl GucState {
+    #[cfg(test)]
     pub(crate) fn new_with_sequence_capacity(
         budget: &mut Budget,
         sequence_capacity: usize,
     ) -> Result<Self, BudgetError> {
-        let mut state = Self::new();
+        Self::new_with_capacities(
+            budget,
+            sequence_capacity,
+            super::txn::DEFAULT_MAX_SAVEPOINTS,
+        )
+    }
+
+    pub(crate) const fn extra_savepoint_budget_bytes(capacity: usize) -> usize {
+        capacity * core::mem::size_of::<Option<GucSavepoint>>()
+    }
+
+    pub(crate) fn new_with_capacities(
+        budget: &mut Budget,
+        sequence_capacity: usize,
+        savepoint_capacity: usize,
+    ) -> Result<Self, BudgetError> {
+        budget.draw_array(
+            savepoint_capacity,
+            core::mem::size_of::<Option<GucSavepoint>>(),
+            "GUC savepoints",
+        )?;
+        let mut state = Self::with_savepoints(vec![None; savepoint_capacity]);
         state.seq_session = SeqSession::with_capacity(budget, sequence_capacity)?;
         Ok(state)
     }
@@ -1090,9 +1112,16 @@ impl GucState {
     pub(crate) fn reset_session_state(&mut self) {
         let mut sequences = SeqSession::new();
         core::mem::swap(&mut sequences, &mut self.seq_session);
-        *self = Self::new();
+        let mut savepoints = core::mem::take(&mut self.store.get_mut().transaction.savepoints);
+        savepoints.fill(None);
+        *self = Self::with_savepoints(savepoints);
         core::mem::swap(&mut sequences, &mut self.seq_session);
         self.seq_session.discard();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_savepoint_allocation_for_test(&self) -> usize {
+        self.store.borrow().transaction.savepoints.as_ptr() as usize
     }
 
     pub(crate) fn source(&self, name: &str) -> &'static str {
@@ -1120,6 +1149,10 @@ impl GucState {
     }
 
     pub fn new() -> Self {
+        Self::with_savepoints(vec![None; super::txn::DEFAULT_MAX_SAVEPOINTS])
+    }
+
+    fn with_savepoints(savepoints: Vec<Option<GucSavepoint>>) -> Self {
         let values = GucValues::new();
         let mut g = Self {
             store: RefCell::new(GucStore {
@@ -1139,7 +1172,7 @@ impl GucState {
                     session: values,
                     start_overrides: 0,
                     session_overrides: 0,
-                    savepoints: [None; super::txn::MAX_SAVEPOINTS],
+                    savepoints,
                     savepoint_count: 0,
                 },
             }),
@@ -1721,7 +1754,10 @@ impl GucState {
             return;
         }
         let index = state.transaction.savepoint_count;
-        debug_assert!(index < super::txn::MAX_SAVEPOINTS);
+        assert!(
+            index < state.transaction.savepoints.len(),
+            "GUC savepoint capacity mirrors transaction capacity"
+        );
         state.transaction.savepoints[index] = Some(GucSavepoint {
             current: state.current,
             session: state.transaction.session,

@@ -160,6 +160,25 @@ storage. RAM and local disk are bounded, disposable caches.
   selected preallocated bytes in place, so repeated full and VOPR runs do not
   require whole-file replacement space or accumulate transient databases.
 
+The atomic-transaction capacity audit is implemented: savepoints, deferred
+constraint and trigger metadata, retained trigger rows, and statistics undo
+have named startup capacities shared by connection, prepared, and apply slots.
+Deep savepoints preserve GUC, foreign-query, large-object, and cumulative
+statistics state without 8-bit nesting or truncated name lists. TRUNCATE closes
+inheritance, partition, and foreign-key fan-out over every configured table;
+its transaction, journal, logical output, and subscription input paths no
+longer impose sixteen-table or 255-relation ceilings. The journal's single
+record-kind registry also prevents startup recognition from drifting behind
+new encodings. Regressions cover 257 savepoints, 300 deferred trigger firings,
+129-table bulk ANALYZE, and 300-table TRUNCATE through rollback, logical apply,
+prepared locks, journal replay, checkpoints, and empty-cache recovery.
+Both differential harnesses load one capacity fixture; a contract test prevents
+local and hosted corpus runs from drifting back to different transaction limits.
+Critical cache pressure completes checkpoint publication before further client
+dispatch, rather than exhausting a tiny heap while a wide sweep remains paced.
+Tests cover repeated small autocommit updates and deferred OLD-row images larger
+than the row cache through spill, rollback, validation, and cold recovery.
+
 ## Remaining production work
 
 ### Remaining bounded scale limits

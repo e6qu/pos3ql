@@ -30,6 +30,15 @@ logical-replication boundary is specified separately in
 
 ## Deliberate and current limits
 
+Atomic transaction capacity is configurable at startup: savepoint count,
+deferred constraint/trigger metadata, retained trigger row bytes, and ANALYZE
+undo entries. Exhaustion reports a program-limit error rather than growing
+runtime memory. TRUNCATE includes inheritance and partition descendants and
+foreign-key cascade closure, with table lists bounded by configured physical
+table capacity across SQL, prepared transactions, durability, and pgoutput.
+The differential corpus checks these SQL semantics against PostgreSQL 18.6;
+fixed-allocation and object-cold tests exercise larger declared capacities.
+
 - PostgreSQL heap layout, page identifiers, `ctid` semantics, HOT, vacuum's
   physical implementation, physical XLOG, physical streaming replication,
   hot standby, and binary-WAL tooling are not targets.

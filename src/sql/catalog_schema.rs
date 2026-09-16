@@ -1,88 +1,6 @@
 //! One schema definition for planning and materialized catalog rows.
 //! Schema resolution never reads storage or constructs catalog data.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_exposed_catalog_has_a_bounded_shared_definition() {
-        let bytes = core::mem::size_of::<crate::storage::TableDef>();
-        let mut budget = crate::mem::budget::Budget::new(bytes);
-        let arena =
-            crate::mem::arena::Arena::new(&mut budget, "schema definition only", bytes).unwrap();
-        for name in super::super::CATALOG_RELATIONS {
-            let definition =
-                definition(name, false).expect("exposed PostgreSQL catalog has a schema");
-            assert_eq!(definition.name, *name);
-            assert!(
-                definition.columns.len() + hidden_columns(name, false).len()
-                    <= crate::storage::MAX_COLUMNS
-            );
-            let mark = arena.mark();
-            crate::mem::guard::forbid_alloc(|| {
-                let table =
-                    super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
-                assert_eq!(arena.used(), bytes);
-                assert!(table.rows.is_empty());
-            });
-            // No descriptor from this iteration remains live.
-            unsafe { arena.rewind_to(mark) };
-        }
-        for name in [
-            "foreign_data_wrappers",
-            "foreign_data_wrapper_options",
-            "foreign_servers",
-            "foreign_server_options",
-            "foreign_tables",
-            "foreign_table_options",
-            "column_options",
-            "user_mappings",
-            "user_mapping_options",
-            "tables",
-            "routines",
-            "routine_privileges",
-            "role_routine_grants",
-            "parameters",
-            "views",
-            "view_table_usage",
-            "view_column_usage",
-            "columns",
-            "table_constraints",
-            "key_column_usage",
-            "constraint_column_usage",
-            "sequences",
-            "usage_privileges",
-            "table_privileges",
-            "role_table_grants",
-            "column_privileges",
-            "role_column_grants",
-            "referential_constraints",
-            "domains",
-            "domain_constraints",
-            "check_constraints",
-            "column_domain_usage",
-            "column_udt_usage",
-            "domain_udt_usage",
-            "schemata",
-            "collations",
-            "collation_character_set_applicability",
-            "enabled_roles",
-            "administrable_role_authorizations",
-            "applicable_roles",
-        ] {
-            assert!(super::super::is_catalog_relation(
-                Some("information_schema"),
-                name
-            ));
-            let definition =
-                definition(name, true).expect("exposed information schema has a schema");
-            assert!(definition.columns.len() <= crate::storage::MAX_COLUMNS);
-        }
-        assert!(definition("not_an_implemented_catalog", false).is_none());
-    }
-}
-
 use super::{
     ColType, PG_AIOS_COLUMNS, PG_BACKEND_MEMORY_CONTEXTS_COLUMNS, PG_CONFIG_COLUMNS,
     PG_CURSORS_COLUMNS, PG_FILE_SETTINGS_COLUMNS, PG_HBA_FILE_RULES_COLUMNS,
@@ -1629,5 +1547,87 @@ pub(super) fn hidden_columns(
     match (information_schema, name) {
         (false, "pg_class" | "pg_constraint" | "pg_attrdef") => &[("tableoid", ColType::Oid)],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_exposed_catalog_has_a_bounded_shared_definition() {
+        let bytes = core::mem::size_of::<crate::storage::TableDef>();
+        let mut budget = crate::mem::budget::Budget::new(bytes);
+        let arena =
+            crate::mem::arena::Arena::new(&mut budget, "schema definition only", bytes).unwrap();
+        for name in super::super::CATALOG_RELATIONS {
+            let definition =
+                definition(name, false).expect("exposed PostgreSQL catalog has a schema");
+            assert_eq!(definition.name, *name);
+            assert!(
+                definition.columns.len() + hidden_columns(name, false).len()
+                    <= crate::storage::MAX_COLUMNS
+            );
+            let mark = arena.mark();
+            crate::mem::guard::forbid_alloc(|| {
+                let table =
+                    super::super::synthesize_definition(Some("pg_catalog"), name, &arena).unwrap();
+                assert_eq!(arena.used(), bytes);
+                assert!(table.rows.is_empty());
+            });
+            // No descriptor from this iteration remains live.
+            unsafe { arena.rewind_to(mark) };
+        }
+        for name in [
+            "foreign_data_wrappers",
+            "foreign_data_wrapper_options",
+            "foreign_servers",
+            "foreign_server_options",
+            "foreign_tables",
+            "foreign_table_options",
+            "column_options",
+            "user_mappings",
+            "user_mapping_options",
+            "tables",
+            "routines",
+            "routine_privileges",
+            "role_routine_grants",
+            "parameters",
+            "views",
+            "view_table_usage",
+            "view_column_usage",
+            "columns",
+            "table_constraints",
+            "key_column_usage",
+            "constraint_column_usage",
+            "sequences",
+            "usage_privileges",
+            "table_privileges",
+            "role_table_grants",
+            "column_privileges",
+            "role_column_grants",
+            "referential_constraints",
+            "domains",
+            "domain_constraints",
+            "check_constraints",
+            "column_domain_usage",
+            "column_udt_usage",
+            "domain_udt_usage",
+            "schemata",
+            "collations",
+            "collation_character_set_applicability",
+            "enabled_roles",
+            "administrable_role_authorizations",
+            "applicable_roles",
+        ] {
+            assert!(super::super::is_catalog_relation(
+                Some("information_schema"),
+                name
+            ));
+            let definition =
+                definition(name, true).expect("exposed information schema has a schema");
+            assert!(definition.columns.len() <= crate::storage::MAX_COLUMNS);
+        }
+        assert!(definition("not_an_implemented_catalog", false).is_none());
     }
 }

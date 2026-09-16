@@ -11,6 +11,7 @@
 set -u
 cd "$(dirname "$0")/../.." || exit
 EXT=tests/external
+DIFFERENTIAL_TRANSACTION_CONFIG=$(< "$EXT/differential-capacities.conf") || exit 1
 ROOT_VENV=${POS3QL_VENV:-target/external-venv}
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
@@ -212,6 +213,7 @@ max_tables = 64
 table_rows = 8192
 max_value_indexes = 64
 max_prepared_transactions = 8
+${DIFFERENTIAL_TRANSACTION_CONFIG}
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
 extension_control_path = ${EXTENSION_CONTROL_ROOT}
 ${POS3QL_EXTRA_CONF:-}

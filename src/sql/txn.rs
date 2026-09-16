@@ -79,7 +79,7 @@ pub(crate) struct StatementMark {
     pub deferred_trigger_bytes: usize,
 }
 
-pub const MAX_SAVEPOINTS: usize = 16;
+pub const DEFAULT_MAX_SAVEPOINTS: usize = 16;
 pub const DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub(crate) struct LargeObjectDescriptor {
     pub oid: crate::storage::LargeObjectOid,
     pub position: i64,
     pub mode: LargeObjectDescriptorMode,
-    opened_savepoint_depth: u8,
+    opened_savepoint_depth: usize,
     active: bool,
 }
 
@@ -113,8 +113,7 @@ impl LargeObjectDescriptor {
 // SQL limit below the smallest supported thread stack's native-frame limit.
 pub const MAX_TRIGGER_NESTING: u16 = 16;
 pub const MAX_RULE_NESTING: usize = 16;
-pub const MAX_TRUNCATE_TABLES: usize = 16;
-pub const MAX_TRUNCATE_WAL_TABLE_BYTES: usize = MAX_TRUNCATE_TABLES * 128;
+const DEFAULT_MAX_TRUNCATE_TABLES: usize = 16;
 
 /// One SQL TRUNCATE command, retained until commit so durable logical
 /// decoding preserves its statement-level semantics instead of inferring them
@@ -122,7 +121,7 @@ pub const MAX_TRUNCATE_WAL_TABLE_BYTES: usize = MAX_TRUNCATE_TABLES * 128;
 #[derive(Clone, Copy)]
 pub(crate) struct TruncateEvent {
     pub command_id: u32,
-    pub tables: [u16; MAX_TRUNCATE_TABLES],
+    pub table_offset: usize,
     pub table_count: usize,
     pub cascade: bool,
     pub restart_identity: bool,
@@ -193,6 +192,7 @@ pub struct TxnState {
     /// reverse-replay to any earlier point.
     touched: FixedVec<(u32, u64, PriorPending)>,
     truncates: FixedVec<TruncateEvent>,
+    truncate_table_slots: FixedVec<u16>,
     truncate_wal_tables: FixedBuf,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
@@ -605,9 +605,9 @@ pub(crate) enum DdlUndo {
 }
 
 const DEFAULT_DDL_CAPACITY: usize = 64;
-pub const MAX_TXN_ANALYZE: usize = crate::storage::MAX_PENDING_STATISTICS_PER_TXN;
+const DEFAULT_MAX_TXN_ANALYZE: usize = 64;
 const SUBSCRIPTION_ADVANCES_PER_TXN: usize = 1;
-pub const MAX_DEFERRED_CONSTRAINTS: usize = 128;
+const DEFAULT_MAX_DEFERRED_CONSTRAINTS: usize = 128;
 
 /// A table constraint is versioned across DROP/recreate while a constraint
 /// trigger has a stable catalog slot. Keeping these identities distinct means
@@ -672,6 +672,46 @@ pub(crate) enum DeferredTriggerKind {
 
 pub const DEFERRED_TRIGGER_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Copy)]
+pub(crate) struct TransactionCapacity {
+    rows: usize,
+    ddl: usize,
+    descriptors: usize,
+    savepoints: usize,
+    deferred_constraints: usize,
+    deferred_trigger_bytes: usize,
+    analyze: usize,
+    tables: usize,
+}
+
+impl TransactionCapacity {
+    pub(crate) const fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            rows: config.txn_rows,
+            ddl: config.max_ddl_per_transaction,
+            descriptors: config.max_large_object_descriptors,
+            savepoints: config.max_savepoints_per_transaction,
+            deferred_constraints: config.max_deferred_constraints_per_transaction,
+            deferred_trigger_bytes: config.deferred_trigger_bytes,
+            analyze: config.max_analyze_per_transaction,
+            tables: config.max_tables + 1,
+        }
+    }
+
+    const fn with_defaults(rows: usize, descriptors: usize, ddl: usize) -> Self {
+        Self {
+            rows,
+            ddl,
+            descriptors,
+            savepoints: DEFAULT_MAX_SAVEPOINTS,
+            deferred_constraints: DEFAULT_MAX_DEFERRED_CONSTRAINTS,
+            deferred_trigger_bytes: DEFERRED_TRIGGER_BYTES,
+            analyze: DEFAULT_MAX_TXN_ANALYZE,
+            tables: DEFAULT_MAX_TRUNCATE_TABLES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConstraintLifecycle {
     Rename {
@@ -699,29 +739,31 @@ impl TxnState {
         )
     }
 
-    pub(crate) const fn budget_bytes_with_ddl_capacity(
-        capacity: usize,
-        ddl_capacity: usize,
-    ) -> usize {
-        Self::budget_bytes_with_large_objects(
-            capacity,
-            DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS,
-            ddl_capacity,
-        )
-    }
-
     pub const fn budget_bytes_with_large_objects(
         capacity: usize,
         descriptor_capacity: usize,
         ddl_capacity: usize,
     ) -> usize {
-        capacity * core::mem::size_of::<(u32, u64, PriorPending)>()
-            + ddl_capacity * core::mem::size_of::<TruncateEvent>()
-            + MAX_TRUNCATE_WAL_TABLE_BYTES
-            + ddl_capacity * core::mem::size_of::<DdlUndo>()
-            + ddl_capacity * core::mem::size_of::<u32>()
-            + MAX_TXN_ANALYZE * core::mem::size_of::<StatisticsUndo>()
-            + MAX_SAVEPOINTS * core::mem::size_of::<Savepoint>()
+        Self::budget_bytes_with_capacity(TransactionCapacity::with_defaults(
+            capacity,
+            descriptor_capacity,
+            ddl_capacity,
+        ))
+    }
+
+    pub(crate) const fn budget_bytes_with_config(config: &crate::config::Config) -> usize {
+        Self::budget_bytes_with_capacity(TransactionCapacity::from_config(config))
+    }
+
+    const fn budget_bytes_with_capacity(capacity: TransactionCapacity) -> usize {
+        capacity.rows * core::mem::size_of::<(u32, u64, PriorPending)>()
+            + capacity.ddl * core::mem::size_of::<TruncateEvent>()
+            + capacity.tables * 128
+            + capacity.ddl * capacity.tables * core::mem::size_of::<u16>()
+            + capacity.ddl * core::mem::size_of::<DdlUndo>()
+            + capacity.ddl * core::mem::size_of::<u32>()
+            + capacity.analyze * core::mem::size_of::<StatisticsUndo>()
+            + capacity.savepoints * core::mem::size_of::<Savepoint>()
             + crate::sql::notify::PER_TXN
                 * core::mem::size_of::<crate::sql::notify::BufferedNotify>()
             + crate::sql::notify::PER_TXN_PAYLOAD_BYTES
@@ -729,14 +771,14 @@ impl TxnState {
                 * core::mem::size_of::<crate::sql::notify::ListenOp>()
             + SUBSCRIPTION_ADVANCES_PER_TXN
                 * core::mem::size_of::<crate::storage::SubscriptionAdvance>()
-            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintObligation>()
-            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<usize>()
-            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintModeChange>()
-            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintLifecycle>()
-            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<DeferredTriggerEvent>()
-            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<usize>()
-            + DEFERRED_TRIGGER_BYTES
-            + descriptor_capacity * core::mem::size_of::<LargeObjectDescriptor>()
+            + capacity.deferred_constraints * core::mem::size_of::<ConstraintObligation>()
+            + capacity.deferred_constraints * core::mem::size_of::<usize>()
+            + capacity.deferred_constraints * core::mem::size_of::<ConstraintModeChange>()
+            + capacity.deferred_constraints * core::mem::size_of::<ConstraintLifecycle>()
+            + capacity.deferred_constraints * core::mem::size_of::<DeferredTriggerEvent>()
+            + capacity.deferred_constraints * core::mem::size_of::<usize>()
+            + capacity.deferred_trigger_bytes
+            + capacity.descriptors * core::mem::size_of::<LargeObjectDescriptor>()
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -748,6 +790,7 @@ impl TxnState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_ddl_capacity(
         budget: &mut Budget,
         capacity: usize,
@@ -767,9 +810,26 @@ impl TxnState {
         descriptor_capacity: usize,
         ddl_capacity: usize,
     ) -> Result<Self, BudgetError> {
+        Self::new_with_capacity(
+            budget,
+            TransactionCapacity::with_defaults(capacity, descriptor_capacity, ddl_capacity),
+        )
+    }
+
+    pub(crate) fn new_with_config(
+        budget: &mut Budget,
+        config: &crate::config::Config,
+    ) -> Result<Self, BudgetError> {
+        Self::new_with_capacity(budget, TransactionCapacity::from_config(config))
+    }
+
+    fn new_with_capacity(
+        budget: &mut Budget,
+        capacity: TransactionCapacity,
+    ) -> Result<Self, BudgetError> {
         let mut large_object_descriptors =
-            FixedVec::new(budget, "large_object_descriptors", descriptor_capacity)?;
-        for _ in 0..descriptor_capacity {
+            FixedVec::new(budget, "large_object_descriptors", capacity.descriptors)?;
+        for _ in 0..capacity.descriptors {
             large_object_descriptors
                 .push(LargeObjectDescriptor::EMPTY)
                 .expect("sized to descriptor capacity");
@@ -791,19 +851,24 @@ impl TxnState {
             rule_stack: [0; MAX_RULE_NESTING],
             rule_depth: 0,
             concurrent_partition_detach_pending: false,
-            touched: FixedVec::new(budget, "txn_touched", capacity)?,
-            truncates: FixedVec::new(budget, "txn_truncates", ddl_capacity)?,
+            touched: FixedVec::new(budget, "txn_touched", capacity.rows)?,
+            truncates: FixedVec::new(budget, "txn_truncates", capacity.ddl)?,
+            truncate_table_slots: FixedVec::new(
+                budget,
+                "txn_truncate_table_slots",
+                capacity.ddl * capacity.tables,
+            )?,
             truncate_wal_tables: FixedBuf::new(
                 budget,
                 "txn_truncate_wal_tables",
-                MAX_TRUNCATE_WAL_TABLE_BYTES,
+                capacity.tables * 128,
             )?,
-            ddl: FixedVec::new(budget, "txn_ddl", ddl_capacity)?,
-            ddl_origins: FixedVec::new(budget, "txn_ddl_origins", ddl_capacity)?,
+            ddl: FixedVec::new(budget, "txn_ddl", capacity.ddl)?,
+            ddl_origins: FixedVec::new(budget, "txn_ddl_origins", capacity.ddl)?,
             ddl_origin: 0,
             next_ddl_origin: 0,
-            statistics_undo: FixedVec::new(budget, "txn_statistics_undo", MAX_TXN_ANALYZE)?,
-            savepoints: FixedVec::new(budget, "txn_savepoints", MAX_SAVEPOINTS)?,
+            statistics_undo: FixedVec::new(budget, "txn_statistics_undo", capacity.analyze)?,
+            savepoints: FixedVec::new(budget, "txn_savepoints", capacity.savepoints)?,
             pending_notifies: FixedVec::new(
                 budget,
                 "txn_pending_notifies",
@@ -827,37 +892,37 @@ impl TxnState {
             deferred_constraints: FixedVec::new(
                 budget,
                 "txn_deferred_constraints",
-                MAX_DEFERRED_CONSTRAINTS,
+                capacity.deferred_constraints,
             )?,
             completed_constraints: FixedVec::new(
                 budget,
                 "txn_completed_constraints",
-                MAX_DEFERRED_CONSTRAINTS,
+                capacity.deferred_constraints,
             )?,
             constraint_modes: FixedVec::new(
                 budget,
                 "txn_constraint_modes",
-                MAX_DEFERRED_CONSTRAINTS,
+                capacity.deferred_constraints,
             )?,
             constraint_renames: FixedVec::new(
                 budget,
                 "txn_constraint_renames",
-                MAX_DEFERRED_CONSTRAINTS,
+                capacity.deferred_constraints,
             )?,
             deferred_triggers: FixedVec::new(
                 budget,
                 "txn_deferred_triggers",
-                MAX_DEFERRED_CONSTRAINTS,
+                capacity.deferred_constraints,
             )?,
             completed_deferred_triggers: FixedVec::new(
                 budget,
                 "txn_completed_deferred_triggers",
-                MAX_DEFERRED_CONSTRAINTS,
+                capacity.deferred_constraints,
             )?,
             deferred_trigger_bytes: FixedBuf::new(
                 budget,
                 "txn_deferred_trigger_bytes",
-                DEFERRED_TRIGGER_BYTES,
+                capacity.deferred_trigger_bytes,
             )?,
             large_object_descriptors,
         })
@@ -883,7 +948,7 @@ impl TxnState {
             oid,
             position: 0,
             mode,
-            opened_savepoint_depth: self.savepoints.len() as u8,
+            opened_savepoint_depth: self.savepoints.len(),
             active: true,
         };
         Ok(slot as i32)
@@ -933,8 +998,7 @@ impl TxnState {
 
     pub(crate) fn rollback_large_object_descriptors_to(&mut self, savepoint_depth: usize) {
         for descriptor in self.large_object_descriptors.iter_mut() {
-            if descriptor.active && usize::from(descriptor.opened_savepoint_depth) > savepoint_depth
-            {
+            if descriptor.active && descriptor.opened_savepoint_depth > savepoint_depth {
                 descriptor.active = false;
             }
         }
@@ -971,15 +1035,8 @@ impl TxnState {
         !self.savepoints.is_empty()
     }
 
-    pub(crate) fn copy_savepoint_names(&self, output: &mut [StackStr<63>]) -> usize {
-        let count = self.savepoints.len().min(output.len());
-        for (target, savepoint) in output[..count]
-            .iter_mut()
-            .zip(&self.savepoints.as_slice()[..count])
-        {
-            *target = savepoint.name;
-        }
-        count
+    pub(crate) fn savepoint_names(&self) -> impl Iterator<Item = StackStr<63>> + '_ {
+        self.savepoints.iter().map(|savepoint| savepoint.name)
     }
 
     /// The ReadyForQuery status byte: idle / in transaction / failed.
@@ -1244,22 +1301,56 @@ impl TxnState {
         &self.touched
     }
 
-    pub(crate) fn record_truncate(&mut self, event: TruncateEvent) -> Result<(), SqlError> {
-        self.truncates.push(event).map_err(|_| {
-            sql_err!(
-                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "transaction contains more than {} TRUNCATE commands",
-                self.truncates.capacity()
-            )
-        })
+    pub(crate) fn record_truncate(
+        &mut self,
+        tables: &[usize],
+        cascade: bool,
+        restart_identity: bool,
+    ) -> Result<(), SqlError> {
+        if self.truncates.len() == self.truncates.capacity()
+            || tables.len() > self.truncate_table_capacity()
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction TRUNCATE capacity exceeded"
+            ));
+        }
+        let table_offset = self.truncate_table_slots.len();
+        for &table in tables {
+            self.truncate_table_slots
+                .push(u16::try_from(table).expect("validated physical table slot"))
+                .expect("one full table set reserved per TRUNCATE event");
+        }
+        self.truncates
+            .push(TruncateEvent {
+                command_id: self.command_id(),
+                table_offset,
+                table_count: tables.len(),
+                cascade,
+                restart_identity,
+            })
+            .expect("TRUNCATE event capacity checked before mutation");
+        Ok(())
     }
 
     pub(crate) fn truncates(&self) -> &[TruncateEvent] {
         &self.truncates
     }
 
-    pub(crate) fn truncate_wal_tables(&mut self) -> &mut FixedBuf {
-        &mut self.truncate_wal_tables
+    pub(crate) fn truncate_table_capacity(&self) -> usize {
+        self.truncate_wal_tables.capacity() / 128
+    }
+
+    pub(crate) fn constraint_capacity(&self) -> usize {
+        self.deferred_constraints.capacity()
+    }
+
+    pub(crate) fn truncate_wal_tables(&mut self, event: TruncateEvent) -> (&[u16], &mut FixedBuf) {
+        (
+            &self.truncate_table_slots.as_slice()
+                [event.table_offset..event.table_offset + event.table_count],
+            &mut self.truncate_wal_tables,
+        )
     }
 
     /// Buffers a NOTIFY, collapsing an identical (channel, payload) already
@@ -1403,7 +1494,7 @@ impl TxnState {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "transaction changes constraint modes more than {} times",
-                    MAX_DEFERRED_CONSTRAINTS
+                    self.constraint_capacity()
                 )
             })
     }
@@ -1435,7 +1526,7 @@ impl TxnState {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction defers more than {} constraints",
-                MAX_DEFERRED_CONSTRAINTS
+                self.constraint_capacity()
             )
         })
     }
@@ -1470,7 +1561,7 @@ impl TxnState {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction completes more than {} deferred constraints",
-                MAX_DEFERRED_CONSTRAINTS
+                self.constraint_capacity()
             )
         })
     }
@@ -1488,7 +1579,7 @@ impl TxnState {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "transaction renames more than {} constraints",
-                    MAX_DEFERRED_CONSTRAINTS
+                    self.constraint_capacity()
                 )
             })
     }
@@ -1517,7 +1608,7 @@ impl TxnState {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "transaction changes more than {} constraint identities",
-                    MAX_DEFERRED_CONSTRAINTS
+                    self.constraint_capacity()
                 )
             })
     }
@@ -1736,7 +1827,7 @@ impl TxnState {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "deferred trigger row images exceed {} bytes",
-                    DEFERRED_TRIGGER_BYTES
+                    self.deferred_trigger_bytes.capacity()
                 ));
             }
             Ok(Some(DeferredTriggerTuple {
@@ -1767,7 +1858,7 @@ impl TxnState {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction queues more than {} constraint trigger firings",
-                MAX_DEFERRED_CONSTRAINTS
+                self.constraint_capacity()
             ));
         }
         Ok(())
@@ -1801,7 +1892,7 @@ impl TxnState {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction completes more than {} deferred trigger firings",
-                MAX_DEFERRED_CONSTRAINTS
+                self.constraint_capacity()
             )
         })
     }
@@ -1916,7 +2007,7 @@ impl TxnState {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "more than {} active savepoints",
-                MAX_SAVEPOINTS
+                self.savepoints.capacity()
             )
         })
     }
@@ -1964,8 +2055,8 @@ impl TxnState {
     /// `RELEASE SAVEPOINT`; the changes themselves are kept).
     pub fn release_savepoints_from(&mut self, index: usize) {
         for descriptor in self.large_object_descriptors.iter_mut() {
-            if descriptor.active && usize::from(descriptor.opened_savepoint_depth) > index {
-                descriptor.opened_savepoint_depth = index as u8;
+            if descriptor.active && descriptor.opened_savepoint_depth > index {
+                descriptor.opened_savepoint_depth = index;
             }
         }
         while self.savepoints.len() > index {
@@ -1992,7 +2083,10 @@ impl TxnState {
 
     pub(crate) fn rewind_truncates(&mut self, truncate_mark: usize) {
         while self.truncates.len() > truncate_mark {
-            self.truncates.pop();
+            let event = self.truncates.pop().expect("nonempty TRUNCATE event list");
+            while self.truncate_table_slots.len() > event.table_offset {
+                self.truncate_table_slots.pop();
+            }
         }
     }
 
@@ -2010,7 +2104,7 @@ impl TxnState {
                 sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "more than {} ANALYZE targets in one transaction",
-                    MAX_TXN_ANALYZE
+                    self.statistics_undo.capacity()
                 )
             })
     }
@@ -2022,7 +2116,7 @@ impl TxnState {
                 sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "more than {} ANALYZE targets in one transaction",
-                    MAX_TXN_ANALYZE
+                    self.statistics_undo.capacity()
                 )
             })
     }
@@ -2101,6 +2195,7 @@ impl TxnState {
         self.touched.clear();
         self.truncates.clear();
         self.truncate_wal_tables.clear();
+        self.truncate_table_slots.clear();
         self.ddl.clear();
         self.ddl_origins.clear();
         self.ddl_origin = 0;

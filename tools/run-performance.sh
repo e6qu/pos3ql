@@ -244,6 +244,14 @@ bench_pos3ql warm-memory-gist-knn --workload gist-knn --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-gin-array --workload gin-array --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-gin-tsvector --workload gin-tsvector --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-gist-tsvector --workload gist-tsvector --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-gin-jsonb --workload gin-jsonb --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-gin-jsonb-path --workload gin-jsonb-path --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-spgist-prefix --workload spgist-prefix --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-spgist-spatial --workload spgist-spatial --clients "$CLIENTS" \
@@ -296,6 +304,14 @@ bench_pos3ql cold-object-gist-knn --workload gist-knn --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-gin-array --workload gin-array --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-gin-tsvector --workload gin-tsvector --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-gist-tsvector --workload gist-tsvector --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-gin-jsonb --workload gin-jsonb --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-gin-jsonb-path --workload gin-jsonb-path --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-spgist-prefix --workload spgist-prefix --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-spgist-spatial --workload spgist-spatial --clients 1 \
@@ -319,7 +335,7 @@ if [ "$MODE" = full ]; then
     replica_port=$(claim_test_port "" $((19800 + replica * 10)) $((19809 + replica * 10)))
     launch_replica "replica-$replica" "$replica_port"
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" \
-      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL, brin_span int4range NOT NULL, gist_span int4range NOT NULL, gist_location point NOT NULL, gin_tags integer[] NOT NULL, spgist_label text NOT NULL, spgist_location point NOT NULL, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key); CREATE INDEX benchmark_brin_lookup ON benchmark_kv USING brin (brin_key) WITH (pages_per_range=32, autosummarize=on); CREATE INDEX benchmark_brin_inclusion ON benchmark_kv USING brin (brin_span range_inclusion_ops) WITH (pages_per_range=32); CREATE INDEX benchmark_gist_inclusion ON benchmark_kv USING gist (gist_span); CREATE INDEX benchmark_gist_knn ON benchmark_kv USING gist (gist_location) INCLUDE (id, payload); CREATE INDEX benchmark_gin_array ON benchmark_kv USING gin (gin_tags); CREATE INDEX benchmark_spgist_prefix ON benchmark_kv USING spgist (spgist_label); CREATE INDEX benchmark_spgist_knn ON benchmark_kv USING spgist (spgist_location kd_point_ops) INCLUDE (id, payload); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
+      "CREATE TABLE benchmark_kv(id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL, brin_span int4range NOT NULL, gist_span int4range NOT NULL, gist_location point NOT NULL, gin_tags integer[] NOT NULL, gin_document tsvector NOT NULL, gist_document tsvector NOT NULL, json_ops jsonb NOT NULL, json_path jsonb NOT NULL, spgist_label text NOT NULL, spgist_location point NOT NULL, payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192)); CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key); CREATE INDEX benchmark_brin_lookup ON benchmark_kv USING brin (brin_key) WITH (pages_per_range=32, autosummarize=on); CREATE INDEX benchmark_brin_inclusion ON benchmark_kv USING brin (brin_span range_inclusion_ops) WITH (pages_per_range=32); CREATE INDEX benchmark_gist_inclusion ON benchmark_kv USING gist (gist_span); CREATE INDEX benchmark_gist_knn ON benchmark_kv USING gist (gist_location) INCLUDE (id, payload); CREATE INDEX benchmark_gin_array ON benchmark_kv USING gin (gin_tags); CREATE INDEX benchmark_gin_document ON benchmark_kv USING gin (gin_document); CREATE INDEX benchmark_gist_document ON benchmark_kv USING gist (gist_document); CREATE INDEX benchmark_gin_json_ops ON benchmark_kv USING gin (json_ops); CREATE INDEX benchmark_gin_json_path ON benchmark_kv USING gin (json_path jsonb_path_ops); CREATE INDEX benchmark_spgist_prefix ON benchmark_kv USING spgist (spgist_label); CREATE INDEX benchmark_spgist_knn ON benchmark_kv USING spgist (spgist_location kd_point_ops) INCLUDE (id, payload); CREATE SUBSCRIPTION benchmark_scale_subscription_$replica CONNECTION 'host=127.0.0.1 port=$POS3QL_PORT user=postgres dbname=postgres application_name=performance_replica_$replica sslmode=disable' PUBLICATION benchmark_scale_publication" >/dev/null
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" --expect "$SCALE_ROWS" \
       --timeout 30 "SELECT count(*) FROM benchmark_kv" >/dev/null
     REPLICA_TARGETS="$REPLICA_TARGETS --target 127.0.0.1:$replica_port"

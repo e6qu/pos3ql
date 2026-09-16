@@ -26327,12 +26327,13 @@ impl Storage {
         (enforcer.key_types, enforcer.n_cols)
     }
 
-    pub(crate) fn value_binding_spatial_position(
+    pub(crate) fn value_binding_navigation(
         &self,
         table_index: usize,
         binding: usize,
-    ) -> Option<u8> {
-        use crate::sql::types::{GistOperatorClass, SpGistOperatorClass};
+    ) -> Option<crate::store::NavigationSpec> {
+        use crate::sql::types::{GinOperatorClass, GistOperatorClass, SpGistOperatorClass};
+        use crate::store::{NavigationKind, NavigationSpec};
         let enforcer = self.tables[table_index].enforcers[binding]?;
         let created_at = enforcer.index_created_at?;
         let index = self.indexes.iter().find(|index| {
@@ -26342,37 +26343,49 @@ impl Storage {
         })?;
         index.resolved_operator_classes[..index.n_cols]
             .iter()
-            .position(|class| {
-                matches!(
-                    class,
+            .enumerate()
+            .find_map(|(position, class)| {
+                let kind = match class {
                     Some(IndexOperatorClass::Gist(
                         GistOperatorClass::Point
-                            | GistOperatorClass::Box
-                            | GistOperatorClass::Polygon
-                            | GistOperatorClass::Circle
-                    )) | Some(IndexOperatorClass::SpGist(
-                        SpGistOperatorClass::QuadPoint
-                            | SpGistOperatorClass::KdPoint
-                            | SpGistOperatorClass::Box
-                            | SpGistOperatorClass::Polygon
+                        | GistOperatorClass::Box
+                        | GistOperatorClass::Polygon
+                        | GistOperatorClass::Circle,
                     ))
-                )
+                    | Some(IndexOperatorClass::SpGist(
+                        SpGistOperatorClass::QuadPoint
+                        | SpGistOperatorClass::KdPoint
+                        | SpGistOperatorClass::Box
+                        | SpGistOperatorClass::Polygon,
+                    )) => NavigationKind::Spatial,
+                    Some(IndexOperatorClass::Gist(GistOperatorClass::TsVector))
+                    | Some(IndexOperatorClass::Gin(
+                        GinOperatorClass::Array
+                        | GinOperatorClass::TsVector
+                        | GinOperatorClass::Jsonb
+                        | GinOperatorClass::JsonbPath,
+                    )) => NavigationKind::Signature,
+                    _ => return None,
+                };
+                Some(NavigationSpec {
+                    position: position as u8,
+                    kind,
+                })
             })
-            .map(|position| position as u8)
     }
 
-    pub(crate) fn value_binding_spatial_bounds(
+    pub(crate) fn value_binding_navigation_summary(
         &self,
         table_index: usize,
         binding: usize,
-        position: u8,
+        navigation: crate::store::NavigationSpec,
         key: &[u8],
-    ) -> Result<crate::store::SpatialBounds, SqlError> {
+    ) -> Result<crate::store::NavigationSummary, SqlError> {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
-        if usize::from(position) >= enforcer.n_cols {
+        if usize::from(navigation.position) >= enforcer.n_cols {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
-                "spatial key position exceeds binding"
+                "navigation key position exceeds binding"
             ));
         }
         let mut values = [Datum::Null; MAX_INDEX_COLS];
@@ -26381,7 +26394,14 @@ impl Storage {
             &enforcer.key_types[..enforcer.n_cols],
             &mut values[..enforcer.n_cols],
         )?;
-        crate::sql::geometry::index_bounds(values[usize::from(position)])
+        match navigation.kind {
+            crate::store::NavigationKind::Spatial => {
+                crate::sql::geometry::index_bounds(values[usize::from(navigation.position)])
+            }
+            crate::store::NavigationKind::Signature => Ok(crate::sql::index_signature::summary(
+                values[usize::from(navigation.position)],
+            )),
+        }
     }
 
     pub(crate) fn value_binding_collations(
@@ -26774,16 +26794,22 @@ impl Storage {
         &self,
         table_index: usize,
         binding: usize,
-        spatial_position: Option<u8>,
+        navigation: Option<crate::store::NavigationSpec>,
         left: &[u8],
         right: &[u8],
     ) -> Result<core::cmp::Ordering, SqlError> {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
-        if let Some(position) = spatial_position {
+        if let Some(
+            navigation @ crate::store::NavigationSpec {
+                kind: crate::store::NavigationKind::Spatial,
+                ..
+            },
+        ) = navigation
+        {
             let left_bounds =
-                self.value_binding_spatial_bounds(table_index, binding, position, left)?;
+                self.value_binding_navigation_summary(table_index, binding, navigation, left)?;
             let right_bounds =
-                self.value_binding_spatial_bounds(table_index, binding, position, right)?;
+                self.value_binding_navigation_summary(table_index, binding, navigation, right)?;
             use crate::store::SpatialBounds;
             let order_key = |bounds| match bounds {
                 SpatialBounds::Empty => (0u8, 0.0f64, 0.0f64),
@@ -26796,6 +26822,7 @@ impl Storage {
                     )
                 }
                 SpatialBounds::Unbounded => (2, 0.0, 0.0),
+                SpatialBounds::Signature(_) => (2, 0.0, 0.0),
             };
             let left_key = order_key(left_bounds);
             let right_key = order_key(right_bounds);

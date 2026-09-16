@@ -187,6 +187,16 @@ garbage collection, and empty-cache recovery. Construction and traversal
 remain fixed-memory; legacy key generations remain readable. Qualification
 covers three-level pruning, malformed encodings, PostgreSQL's fuzzy geometry
 and non-finite values, and cold reads across every spatial class.
+GIN array, `tsvector`, `jsonb_ops`, and `jsonb_path_ops` generations and GiST
+`tsvector` generations use the same immutable navigation format with 256-bit
+token signatures and smaller leaves. Array containment/overlap, JSON
+containment/existence, and exact boolean full-text requirements reject
+impossible subtrees before object reads while exact SQL and MVCC rechecks stay
+authoritative. Prefix, negation, JSONPath, numeric JSON, empty-token, and
+contained-by cases conservatively retain children. Empty-cache object-read
+budgets, transaction overlays, recovery, malformed summaries, PostgreSQL 18
+differential cases, and distinct warm/cold performance workloads qualify all
+five operator-class paths without runtime allocation.
 External harnesses reserve loopback ports across build delays with atomic,
 owner-tracked claims shared by conformance and performance runs. Crashed owners
 are reclaimed under an OS lock; startup probes verify fixture process ownership.
@@ -215,9 +225,10 @@ worker limit under read-only, write-heavy, and mixed workloads.
 
 ### Navigable specialized indexes
 
-Geometric predicate navigation is implemented. Extend object-native navigation
-to network, range/multirange, and full-text generations; replace GIN complete
-key walks with posting structures. Unfiltered nearest-neighbor limits still
+Geometric and signature navigation is implemented. Extend object-native
+navigation to network and range/multirange generations. Dedicated GIN posting
+structures can further reduce leaf rechecks and duplicate-value work beyond
+the implemented array, JSONB, and full-text signature pruning. Unfiltered nearest-neighbor limits still
 materialize compact keys and need ranked node traversal with MVCC-safe limit
 and residual-filter handling. Preserve exact rechecks, fixed memory, rollback,
 publication, garbage collection, and cold recovery without PostgreSQL page

@@ -22559,6 +22559,10 @@ fn array_type() {
     assert!(run("SELECT cardinality(ARRAY[1,2,3])").contains('3'));
     assert!(run("SELECT 20 = ANY(ARRAY[10,20,30])").contains('t'));
     assert!(run("SELECT 99 = ANY(ARRAY[10,20,30])").contains('f'));
+    assert!(run("SELECT ARRAY[1,NULL] @> ARRAY[NULL]").contains('f'));
+    assert!(run("SELECT ARRAY[1,NULL] <@ ARRAY[1,NULL]").contains('f'));
+    assert!(run("SELECT ARRAY[1,NULL] && ARRAY[NULL]").contains('f'));
+    assert!(run("SELECT ARRAY[]::int[] <@ ARRAY[1,NULL]").contains('t'));
     // Array slicing a[lo:hi], with optional bounds and clamping.
     assert!(run("SELECT (ARRAY[1,2,3,4,5])[2:4]").contains("{2,3,4}"));
     assert!(run("SELECT (ARRAY[1,2,3,4,5])[:3]").contains("{1,2,3}"));
@@ -48937,8 +48941,11 @@ fn wide_geometric_expression_navigation_preserves_the_last_of_32_index_attribute
         )
         .unwrap();
     assert_eq!(
-        cold.storage.value_binding_spatial_position(slot, binding),
-        Some(31)
+        cold.storage.value_binding_navigation(slot, binding),
+        Some(crate::store::NavigationSpec {
+            position: 31,
+            kind: crate::store::NavigationKind::Spatial,
+        })
     );
     let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
     let plan = data_rows(&cold_session.success(
@@ -49238,6 +49245,176 @@ fn geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class()
                 ["2500", "2500"]
             );
         }
+    }
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn inverted_index_navigation_prunes_cold_objects_and_merges_mvcc_overlays() {
+    let mut config = test_config("inverted-index-navigation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 2 << 20;
+    config.wal_bytes = 32 << 20;
+    config.memtable_bytes = 32 << 20;
+    config.table_rows = 4096;
+    config.txn_rows = 8192;
+    config.value_index_rows = 32768;
+    config.max_indexes = 16;
+    config.max_value_indexes = 16;
+    config.object_store_bucket = format!("inverted-navigation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE signature_rows (
+             id integer PRIMARY KEY,
+             tags integer[],
+             gin_document tsvector,
+             gist_document tsvector,
+             json_ops jsonb,
+             json_path jsonb
+         );
+         CREATE INDEX signature_tags ON signature_rows USING gin(tags);
+         CREATE INDEX signature_gin_document ON signature_rows USING gin(gin_document);
+         CREATE INDEX signature_gist_document ON signature_rows USING gist(gist_document);
+         CREATE INDEX signature_json_ops ON signature_rows USING gin(json_ops);
+         CREATE INDEX signature_json_path ON signature_rows USING gin(json_path jsonb_path_ops)",
+        false,
+    );
+    for first in (1..=3000).step_by(100) {
+        session.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO signature_rows
+                   SELECT value, ARRAY[value,value+10000],
+                          to_tsvector('simple','token'||value::text),
+                          to_tsvector('simple','gisttoken'||value::text),
+                          jsonb_build_object('key'||value::text,'value'||value::text),
+                          jsonb_build_object('token','value'||value::text)
+                     FROM generate_series({first},{}) AS source(value)",
+                first + 99
+            ),
+            false,
+        );
+    }
+    session.success(
+        &mut engine,
+        "INSERT INTO signature_rows VALUES
+             (3001,NULL,NULL,NULL,NULL,NULL),
+             (3002,ARRAY[]::integer[],''::tsvector,''::tsvector,'{}'::jsonb,'{}'::jsonb)",
+        false,
+    );
+    session.success(&mut engine, "ANALYZE signature_rows", false);
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    let plans = data_rows(&session.success(
+        &mut engine,
+        "EXPLAIN SELECT id FROM signature_rows WHERE tags @> ARRAY[1200];
+         EXPLAIN SELECT id FROM signature_rows WHERE gin_document @@ 'token1200'::tsquery;
+         EXPLAIN SELECT id FROM signature_rows WHERE gist_document @@ 'gisttoken1200'::tsquery;
+         EXPLAIN SELECT id FROM signature_rows WHERE json_ops ? 'key1200';
+         EXPLAIN SELECT id FROM signature_rows
+          WHERE json_path @> '{\"token\":\"value1200\"}'::jsonb",
+        false,
+    ));
+    for index in [
+        "signature_tags",
+        "signature_gin_document",
+        "signature_gist_document",
+        "signature_json_ops",
+        "signature_json_path",
+    ] {
+        assert!(
+            plans.iter().any(|row| row.contains(index)),
+            "{index}: {plans:?}"
+        );
+    }
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    let queries = [
+        "SELECT id FROM signature_rows WHERE tags @> ARRAY[1200]",
+        "SELECT id FROM signature_rows WHERE gin_document @@ 'token1200'::tsquery",
+        "SELECT id FROM signature_rows WHERE gist_document @@ 'gisttoken1200'::tsquery",
+        "SELECT id FROM signature_rows WHERE json_ops ? 'key1200'",
+        "SELECT id FROM signature_rows WHERE json_path @> '{\"token\":\"value1200\"}'::jsonb",
+    ];
+    for query in queries {
+        let before = cold.storage.block_io_stats();
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, query, false)),
+            ["1200"]
+        );
+        let traffic = cold.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            traffic.object_gets <= 16,
+            "{query}: navigation used {} object GETs ({traffic:?})",
+            traffic.object_gets
+        );
+        assert!(
+            traffic.object_read_bytes < 400_000,
+            "{query}: navigation read {} bytes ({traffic:?})",
+            traffic.object_read_bytes
+        );
+    }
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "SELECT id FROM signature_rows WHERE tags=ARRAY[]::integer[];
+             SELECT count(*) FROM signature_rows WHERE gin_document @@ ''::tsquery",
+            false,
+        )),
+        ["3002", "0"]
+    );
+
+    let mutation = "UPDATE signature_rows
+                        SET tags=ARRAY[1200],
+                            gin_document='token1200'::tsvector,
+                            gist_document='gisttoken1200'::tsvector,
+                            json_ops='{\"key1200\":\"value1200\"}'::jsonb,
+                            json_path='{\"token\":\"value1200\"}'::jsonb
+                      WHERE id=2500";
+    cold_session.success(&mut cold, "BEGIN; SAVEPOINT changed", false);
+    cold_session.success(&mut cold, mutation, false);
+    for query in queries {
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, &format!("{query} ORDER BY id"), false,)),
+            ["1200", "2500"]
+        );
+    }
+    cold_session.success(&mut cold, "ROLLBACK TO changed; COMMIT", false);
+    for query in queries {
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, query, false)),
+            ["1200"]
+        );
+    }
+    cold_session.success(&mut cold, mutation, false);
+    cold_session.success(&mut cold, "DELETE FROM signature_rows WHERE id=1200", false);
+    cold.commit_wal().unwrap();
+    assert!(cold.checkpoint().unwrap());
+    drop(cold_session);
+    drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    for query in queries {
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovery_budget, query)),
+            ["2500"]
+        );
     }
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

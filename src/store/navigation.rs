@@ -1,4 +1,4 @@
-//! Immutable bounding-box navigation over secondary-index data blocks.
+//! Immutable summaries for navigating secondary-index data blocks.
 
 use super::{BlockId, BlockStore, BlockType, ValueIndexError};
 
@@ -9,14 +9,71 @@ const REFERENCE: usize = 32 + 8 + 33;
 const NODE_BYTES: usize = HEADER + FANOUT * REFERENCE;
 const PENDING: usize = 1 + (FANOUT - 1) * LEVELS;
 pub(crate) const SPATIAL_DATA_BYTES: usize = 16 * 1024;
+pub(crate) const SIGNATURE_DATA_BYTES: usize = 1024;
 
-/// Empty means no non-NULL geometric keys. Unbounded retains non-finite
-/// geometry for exact SQL recheck; it must never imply an ordering exclusion.
+/// A small, mergeable token signature. It is deliberately a one-sided filter:
+/// collisions may retain irrelevant children, but can never hide a match.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct TokenSignature([u64; 4]);
+
+impl TokenSignature {
+    pub(crate) fn insert(&mut self, namespace: u8, hash: u64) {
+        let mixed = hash ^ (u64::from(namespace).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        for shift in [0, 21, 42] {
+            let bit = ((mixed.rotate_left(shift) ^ (mixed >> (shift / 3 + 1))) & 255) as usize;
+            self.0[bit / 64] |= 1u64 << (bit % 64);
+        }
+    }
+
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self(core::array::from_fn(|index| self.0[index] | other.0[index]))
+    }
+
+    pub(crate) fn intersection(self, other: Self) -> Self {
+        Self(core::array::from_fn(|index| self.0[index] & other.0[index]))
+    }
+
+    pub(crate) fn contains(self, required: Self) -> bool {
+        self.0
+            .iter()
+            .zip(required.0)
+            .all(|(available, required)| available & required == required)
+    }
+
+    pub(crate) fn intersects(self, required: Self) -> bool {
+        self.0
+            .iter()
+            .zip(required.0)
+            .any(|(available, required)| available & required != 0)
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == [0; 4]
+    }
+}
+
+/// Empty means no non-NULL keys. Unbounded retains values that cannot be
+/// summarized for exact SQL recheck; it must never imply an exclusion.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum SpatialBounds {
+pub(crate) enum NavigationSummary {
     Empty,
     Unbounded,
     Finite(SpatialBox),
+    Signature(TokenSignature),
+}
+
+pub(crate) type SpatialBounds = NavigationSummary;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NavigationKind {
+    Spatial,
+    Signature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NavigationSpec {
+    pub(crate) position: u8,
+    pub(crate) kind: NavigationKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,7 +95,7 @@ impl SpatialBox {
     }
 }
 
-impl SpatialBounds {
+impl NavigationSummary {
     pub(crate) fn new(minimum_x: f64, minimum_y: f64, maximum_x: f64, maximum_y: f64) -> Self {
         if [minimum_x, minimum_y, maximum_x, maximum_y]
             .iter()
@@ -67,6 +124,8 @@ impl SpatialBounds {
                 left.maximum_x.max(right.maximum_x),
                 left.maximum_y.max(right.maximum_y),
             ),
+            (Self::Signature(left), Self::Signature(right)) => Self::Signature(left.union(right)),
+            _ => Self::Unbounded,
         }
     }
 
@@ -82,6 +141,17 @@ impl SpatialBounds {
                     .0
                     .iter_mut()
                     .zip(bounds.coordinates())
+                {
+                    bytes.copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            Self::Signature(signature) => {
+                output[0] = 3;
+                for (bytes, value) in output[1..]
+                    .as_chunks_mut::<8>()
+                    .0
+                    .iter_mut()
+                    .zip(signature.0)
                 {
                     bytes.copy_from_slice(&value.to_le_bytes());
                 }
@@ -107,6 +177,9 @@ impl SpatialBounds {
                     Err(ValueIndexError::Corrupt)
                 }
             }
+            3 => Ok(Self::Signature(TokenSignature(core::array::from_fn(
+                |index| u64::from_le_bytes(input[1 + index * 8..9 + index * 8].try_into().unwrap()),
+            )))),
             _ => Err(ValueIndexError::Corrupt),
         }
     }
@@ -116,20 +189,20 @@ impl SpatialBounds {
 struct NavigationReference {
     id: BlockId,
     entries: u64,
-    bounds: SpatialBounds,
+    summary: NavigationSummary,
 }
 
 impl NavigationReference {
     const EMPTY: Self = Self {
         id: BlockId([0; 32]),
         entries: 0,
-        bounds: SpatialBounds::Empty,
+        summary: NavigationSummary::Empty,
     };
 
     fn encode(self, output: &mut [u8]) {
         output[..32].copy_from_slice(&self.id.0);
         output[32..40].copy_from_slice(&self.entries.to_le_bytes());
-        self.bounds.encode(&mut output[40..]);
+        self.summary.encode(&mut output[40..]);
     }
 
     fn decode(input: &[u8]) -> Result<Self, ValueIndexError> {
@@ -140,7 +213,7 @@ impl NavigationReference {
         Ok(Self {
             id: BlockId(input[..32].try_into().unwrap()),
             entries,
-            bounds: SpatialBounds::decode(&input[40..])?,
+            summary: NavigationSummary::decode(&input[40..])?,
         })
     }
 }
@@ -151,7 +224,7 @@ pub(crate) struct NavigationWriter {
     nodes: Box<[u8]>,
     counts: [usize; LEVELS],
     entries: [u64; LEVELS],
-    bounds: [SpatialBounds; LEVELS],
+    summaries: [NavigationSummary; LEVELS],
     position: u8,
     covering: bool,
 }
@@ -162,7 +235,7 @@ impl NavigationWriter {
             nodes: vec![0; NODE_BYTES * LEVELS].into_boxed_slice(),
             counts: [0; LEVELS],
             entries: [0; LEVELS],
-            bounds: [SpatialBounds::Empty; LEVELS],
+            summaries: [NavigationSummary::Empty; LEVELS],
             position: 0,
             covering: false,
         }
@@ -175,7 +248,7 @@ impl NavigationWriter {
     pub(crate) fn reset(&mut self, position: u8, covering: bool) {
         self.counts.fill(0);
         self.entries.fill(0);
-        self.bounds.fill(SpatialBounds::Empty);
+        self.summaries.fill(NavigationSummary::Empty);
         self.position = position;
         self.covering = covering;
     }
@@ -185,7 +258,7 @@ impl NavigationWriter {
         store: &mut dyn BlockStore,
         id: BlockId,
         entries: u64,
-        bounds: SpatialBounds,
+        summary: NavigationSummary,
     ) -> Result<(), ValueIndexError> {
         if entries == 0 || id == BlockId([0; 32]) {
             return Err(ValueIndexError::Corrupt);
@@ -196,7 +269,7 @@ impl NavigationWriter {
             NavigationReference {
                 id,
                 entries,
-                bounds,
+                summary,
             },
         )
     }
@@ -223,7 +296,7 @@ impl NavigationWriter {
         reference.encode(&mut self.nodes[at..at + REFERENCE]);
         self.counts[level] += 1;
         self.entries[level] = entries;
-        self.bounds[level] = self.bounds[level].union(reference.bounds);
+        self.summaries[level] = self.summaries[level].union(reference.summary);
         Ok(())
     }
 
@@ -248,11 +321,11 @@ impl NavigationWriter {
         let reference = NavigationReference {
             id,
             entries: self.entries[level],
-            bounds: self.bounds[level],
+            summary: self.summaries[level],
         };
         self.counts[level] = 0;
         self.entries[level] = 0;
-        self.bounds[level] = SpatialBounds::Empty;
+        self.summaries[level] = NavigationSummary::Empty;
         Ok(reference)
     }
 
@@ -304,7 +377,7 @@ impl NavigationCursor {
         result.pending[0].reference = NavigationReference {
             id: root,
             entries,
-            bounds: SpatialBounds::Unbounded,
+            summary: NavigationSummary::Unbounded,
         };
         result
     }
@@ -319,7 +392,7 @@ impl NavigationCursor {
         &mut self,
         store: &mut dyn BlockStore,
         scratch: &mut [u8],
-        intersects: &mut impl FnMut(u8, SpatialBounds) -> bool,
+        intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
         visit_node: &mut impl FnMut(BlockId) -> bool,
     ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
         while self.count != 0 {
@@ -327,7 +400,7 @@ impl NavigationCursor {
             let pending = self.pending[self.count];
             if self
                 .position
-                .is_some_and(|position| !intersects(position, pending.reference.bounds))
+                .is_some_and(|position| !intersects(position, pending.reference.summary))
             {
                 continue;
             }
@@ -379,14 +452,14 @@ impl NavigationCursor {
                 return Err(ValueIndexError::Corrupt);
             }
             let mut entries = 0u64;
-            let mut bounds = SpatialBounds::Empty;
+            let mut summary = NavigationSummary::Empty;
             for index in (0..count).rev() {
                 let at = HEADER + index * REFERENCE;
                 let reference = NavigationReference::decode(&scratch[at..at + REFERENCE])?;
                 entries = entries
                     .checked_add(reference.entries)
                     .ok_or(ValueIndexError::Corrupt)?;
-                bounds = bounds.union(reference.bounds);
+                summary = summary.union(reference.summary);
                 self.pending[self.count] = PendingReference {
                     reference,
                     height: Some(height),
@@ -395,7 +468,7 @@ impl NavigationCursor {
             }
             if ((pending.height.is_some() || self.root_entries_known)
                 && entries != pending.reference.entries)
-                || (pending.height.is_some() && bounds != pending.reference.bounds)
+                || (pending.height.is_some() && summary != pending.reference.summary)
             {
                 return Err(ValueIndexError::Corrupt);
             }
@@ -441,6 +514,7 @@ mod tests {
                 }
                 SpatialBounds::Empty => false,
                 SpatialBounds::Unbounded => true,
+                SpatialBounds::Signature(_) => true,
             }
         };
         crate::mem::guard::forbid_alloc(|| {
@@ -517,6 +591,53 @@ mod tests {
     }
 
     #[test]
+    fn signature_tree_prunes_exact_tokens_without_false_negatives() {
+        let mut budget = Budget::new(16 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "signature tree", 8 << 20, 2048).unwrap();
+        let mut writer = NavigationWriter::new();
+        let mut scratch = vec![0; super::super::MAX_PAYLOAD];
+        writer.reset(0, false);
+        for index in 0..1057u64 {
+            let id = store
+                .put(&index.to_le_bytes(), BlockType::ValueIndexData, 0)
+                .unwrap();
+            let mut signature = TokenSignature::default();
+            signature.insert(7, index);
+            writer
+                .append(&mut store, id, 1, NavigationSummary::Signature(signature))
+                .unwrap();
+        }
+        let root = writer.finish(&mut store).unwrap();
+        let mut required = TokenSignature::default();
+        required.insert(7, 512);
+        let mut cursor = NavigationCursor::new(root, 1057);
+        let mut found = false;
+        let mut candidates = 0;
+        while let Some((id, _, _)) = cursor
+            .next(
+                &mut store,
+                &mut scratch,
+                &mut |_, summary| match summary {
+                    NavigationSummary::Signature(available) => available.contains(required),
+                    NavigationSummary::Empty => false,
+                    _ => true,
+                },
+                &mut |_| true,
+            )
+            .unwrap()
+        {
+            let (len, kind) = store.get(&id, &mut scratch).unwrap();
+            assert_eq!(kind, BlockType::ValueIndexData);
+            assert_eq!(len, 8);
+            found |= u64::from_le_bytes(scratch[..8].try_into().unwrap()) == 512;
+            candidates += 1;
+        }
+        assert!(found);
+        assert!(candidates < 64, "{candidates} candidate leaves");
+    }
+
+    #[test]
     fn malformed_node_headers_counts_bounds_and_child_height_are_loud() {
         let mut budget = Budget::new(8 << 20);
         let mut store = MemoryBlockStore::new(&mut budget, "bad navigation", 4 << 20, 128).unwrap();
@@ -544,7 +665,7 @@ mod tests {
             (4, 33),
             (6, 1),
             (HEADER + 32, 0),
-            (HEADER + 40, 3),
+            (HEADER + 40, 4),
         ] {
             let mut bytes = original;
             bytes[at] = value;

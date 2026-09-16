@@ -70,7 +70,9 @@ mod sst;
 mod tiered;
 mod value;
 
-pub(crate) use navigation::SpatialBounds;
+pub(crate) use navigation::{
+    NavigationKind, NavigationSpec, NavigationSummary, SpatialBounds, TokenSignature,
+};
 
 pub(crate) mod lz4;
 

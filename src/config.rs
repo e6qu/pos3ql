@@ -55,6 +55,10 @@ pub struct Config {
     pub txn_rows: usize,
     /// Catalog mutations one transaction may stage for commit or rollback.
     pub max_ddl_per_transaction: usize,
+    pub max_savepoints_per_transaction: usize,
+    pub max_deferred_constraints_per_transaction: usize,
+    pub deferred_trigger_bytes: usize,
+    pub max_analyze_per_transaction: usize,
     /// Cluster-wide PostgreSQL two-phase transaction slots. Zero disables
     /// PREPARE TRANSACTION, matching PostgreSQL's startup-only setting.
     pub max_prepared_transactions: usize,
@@ -311,6 +315,10 @@ impl Config {
             portal_result_bytes: 64 * KIB,
             txn_rows: 8192,
             max_ddl_per_transaction: 256,
+            max_savepoints_per_transaction: 16,
+            max_deferred_constraints_per_transaction: 128,
+            deferred_trigger_bytes: 256 * KIB,
+            max_analyze_per_transaction: 64,
             max_prepared_transactions: 0,
             max_locks_per_transaction: 64,
             memtable_bytes: 64 * MIB,
@@ -559,6 +567,22 @@ impl Config {
                 "max_ddl_per_transaction" => {
                     config.max_ddl_per_transaction =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_savepoints_per_transaction" => {
+                    config.max_savepoints_per_transaction =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
+                }
+                "max_deferred_constraints_per_transaction" => {
+                    config.max_deferred_constraints_per_transaction =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
+                }
+                "deferred_trigger_bytes" => {
+                    config.deferred_trigger_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?;
+                }
+                "max_analyze_per_transaction" => {
+                    config.max_analyze_per_transaction =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
                 }
                 "max_prepared_transactions" => {
                     config.max_prepared_transactions =
@@ -1094,6 +1118,28 @@ impl Config {
                 ),
             ));
         }
+        for (name, capacity) in [
+            (
+                "max_savepoints_per_transaction",
+                config.max_savepoints_per_transaction,
+            ),
+            (
+                "max_deferred_constraints_per_transaction",
+                config.max_deferred_constraints_per_transaction,
+            ),
+            (
+                "max_analyze_per_transaction",
+                config.max_analyze_per_transaction,
+            ),
+            ("deferred_trigger_bytes", config.deferred_trigger_bytes),
+        ] {
+            if capacity == 0 || capacity > u32::MAX as usize {
+                return Err(ConfigError::at(
+                    0,
+                    format!("{name} must be between 1 and {}", u32::MAX),
+                ));
+            }
+        }
         if config.max_large_objects == 0
             || config.large_object_pages == 0
             || config.max_large_object_descriptors == 0
@@ -1293,11 +1339,10 @@ impl Config {
             + self.max_tables * core::mem::size_of::<crate::storage::SqlName>()
             + crate::sql::guc::SeqSession::extra_budget_bytes(self.max_sequences)
             + crate::sql::cursor::CursorPool::budget_bytes(self)
-            + crate::sql::txn::TxnState::budget_bytes_with_large_objects(
-                self.txn_rows,
-                self.max_large_object_descriptors,
-                self.max_ddl_per_transaction,
-            );
+            + crate::sql::guc::GucState::extra_savepoint_budget_bytes(
+                self.max_savepoints_per_transaction,
+            )
+            + crate::sql::txn::TxnState::budget_bytes_with_config(self);
         MemoryPlan {
             memtable: self.memtable_bytes,
             tables: tables_bytes,
@@ -1417,6 +1462,71 @@ mod tests {
             Config::parse("# just a comment\n\n").unwrap(),
             Config::default_dev()
         );
+    }
+
+    #[test]
+    fn transaction_capacities_are_validated_and_exactly_budgeted() {
+        let config = Config::parse(
+            "max_savepoints_per_transaction = 257\n\
+             max_deferred_constraints_per_transaction = 1024\n\
+             deferred_trigger_bytes = 1MiB\n\
+             max_analyze_per_transaction = 260\n",
+        )
+        .unwrap();
+        assert_eq!(config.max_savepoints_per_transaction, 257);
+        assert_eq!(config.max_deferred_constraints_per_transaction, 1024);
+        assert_eq!(config.deferred_trigger_bytes, MIB);
+        assert_eq!(config.max_analyze_per_transaction, 260);
+        let bytes = crate::sql::txn::TxnState::budget_bytes_with_config(&config);
+        let mut budget = crate::mem::budget::Budget::new(bytes);
+        let transaction = crate::sql::txn::TxnState::new_with_config(&mut budget, &config).unwrap();
+        assert_eq!(budget.remaining(), 0);
+        assert_eq!(transaction.constraint_capacity(), 1024);
+        assert_eq!(transaction.truncate_table_capacity(), config.max_tables + 1);
+        for key in [
+            "max_savepoints_per_transaction",
+            "max_deferred_constraints_per_transaction",
+            "deferred_trigger_bytes",
+            "max_analyze_per_transaction",
+        ] {
+            assert!(Config::parse(&format!("{key} = 0\n")).is_err());
+            assert!(Config::parse(&format!("{key} = 4294967296\n")).is_err());
+            assert!(Config::parse(&format!("{key} = 1\n{key} = 2\n")).is_err());
+        }
+        let guc_bytes = crate::sql::guc::GucState::extra_savepoint_budget_bytes(257)
+            + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences);
+        let mut budget = crate::mem::budget::Budget::new(guc_bytes);
+        crate::sql::guc::GucState::new_with_capacities(&mut budget, config.max_sequences, 257)
+            .unwrap();
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn differential_harnesses_share_transaction_capacities() {
+        let config = Config::parse(include_str!(
+            "../tests/external/differential-capacities.conf"
+        ))
+        .unwrap();
+        assert!(config.max_savepoints_per_transaction >= 20);
+        assert!(config.max_deferred_constraints_per_transaction >= 600);
+        assert!(config.deferred_trigger_bytes >= 300 * 2048);
+        for harness in [
+            include_str!("../tests/external/differential.sh"),
+            include_str!("../tests/external/ci_diff.sh"),
+        ] {
+            assert!(harness.contains("DIFFERENTIAL_TRANSACTION_CONFIG=$(< \"$EXT/differential-capacities.conf\") || exit 1"));
+            assert!(harness.contains("\n${DIFFERENTIAL_TRANSACTION_CONFIG}\n"));
+            for key in [
+                "max_savepoints_per_transaction",
+                "max_deferred_constraints_per_transaction",
+                "deferred_trigger_bytes",
+            ] {
+                assert!(
+                    !harness.contains(&format!("\n{key} = ")),
+                    "the shared corpus must have one capacity definition"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1834,11 +1944,10 @@ sql_arena_bytes = 4096
         // Fixed protocol buffers plus every startup-sized connection pool.
         let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
         let publication_selection = c.max_tables * core::mem::size_of::<crate::storage::SqlName>();
-        let transaction = crate::sql::txn::TxnState::budget_bytes_with_large_objects(
-            c.txn_rows,
-            c.max_large_object_descriptors,
-            c.max_ddl_per_transaction,
-        );
+        let transaction = crate::sql::txn::TxnState::budget_bytes_with_config(&c)
+            + crate::sql::guc::GucState::extra_savepoint_budget_bytes(
+                c.max_savepoints_per_transaction,
+            );
         let sequence_session = crate::sql::guc::SeqSession::extra_budget_bytes(c.max_sequences);
         let per_connection =
             830 + publication_selection + cursor_pool + transaction + sequence_session;

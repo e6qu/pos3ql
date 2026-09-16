@@ -241,8 +241,8 @@ fn enter_session(
         // established before the first foreign access so later RELEASE and
         // ROLLBACK TO operate on the same transaction shape locally and
         // remotely.
-        let (savepoints, savepoint_count) = storage.foreign_statement_savepoints(txid);
-        for name in &savepoints[..savepoint_count] {
+        let savepoints = storage.foreign_statement_savepoints(txid);
+        for name in savepoints.iter() {
             let mut command = StackStr::<256>::new();
             let _ = command.write_str("SAVEPOINT ");
             quote_identifier(&mut command, name.as_str());

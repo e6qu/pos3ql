@@ -9589,6 +9589,455 @@ fn run_with_fixed_memory(
     buffer.readable().to_vec()
 }
 
+struct ConfiguredTransactionSession {
+    send: crate::mem::FixedBuf,
+    arena: Arena,
+    transaction: TxnState,
+    guc: GucState,
+    pool: SqlPreparedPool,
+    cursors: crate::sql::cursor::CursorPool,
+}
+
+impl ConfiguredTransactionSession {
+    fn new(config: &Config, budget: &mut Budget) -> Self {
+        Self {
+            send: crate::mem::FixedBuf::new(budget, "configured transaction send", 4 << 20)
+                .unwrap(),
+            arena: Arena::new(budget, "configured transaction arena", 4 << 20).unwrap(),
+            transaction: TxnState::new_with_config(budget, config).unwrap(),
+            guc: GucState::new_with_capacities(
+                budget,
+                config.max_sequences,
+                config.max_savepoints_per_transaction,
+            )
+            .unwrap(),
+            pool: SqlPreparedPool::new(config, budget).unwrap(),
+            cursors: crate::sql::cursor::CursorPool::new(config, budget).unwrap(),
+        }
+    }
+
+    fn execute(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+        self.send.clear();
+        self.arena.reset();
+        let mut responder = Responder::new(&mut self.send);
+        let mut execute = || {
+            engine.execute_simple(
+                sql,
+                &self.arena,
+                &mut self.transaction,
+                &mut self.pool,
+                &mut self.cursors,
+                &mut self.guc,
+                &mut responder,
+                1,
+            )
+        };
+        if fixed_memory {
+            crate::mem::guard::forbid_alloc(execute)
+        } else {
+            execute()
+        }
+        .unwrap();
+        self.send.readable().to_vec()
+    }
+
+    fn success(&mut self, engine: &mut Engine, sql: &str, fixed_memory: bool) -> Vec<u8> {
+        let output = self.execute(engine, sql, fixed_memory);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        output
+    }
+}
+
+#[test]
+fn configured_transaction_capacity_covers_deep_savepoints_and_deferred_checking() {
+    let mut config = test_config("deep-savepoints-deferred-checking");
+    config.max_savepoints_per_transaction = 257;
+    config.max_deferred_constraints_per_transaction = 1024;
+    config.deferred_trigger_bytes = 1 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.txn_rows = 4096;
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(&mut engine,
+        "CREATE TABLE capacity_parent(id int PRIMARY KEY); \
+         CREATE TABLE capacity_child(id int UNIQUE DEFERRABLE INITIALLY DEFERRED, parent_id int REFERENCES capacity_parent(id) DEFERRABLE INITIALLY DEFERRED, body text); \
+         CREATE TABLE capacity_audit(id int); \
+         CREATE TABLE capacity_depth_statistics(id int); \
+         CREATE FUNCTION capacity_audit_trigger() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO capacity_audit VALUES(NEW.id); RETURN NULL; END$$; \
+         CREATE CONSTRAINT TRIGGER capacity_audit_deferred AFTER INSERT ON capacity_child DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION capacity_audit_trigger(); \
+         SELECT lo_create(62002::oid); BEGIN", false);
+    for depth in 0..257 {
+        session.success(
+            &mut engine,
+            &format!("SAVEPOINT capacity_{depth}; SET LOCAL application_name = 'depth_{depth}'; INSERT INTO capacity_depth_statistics VALUES({depth})"),
+            true,
+        );
+    }
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT lo_open(62002::oid, 131072); ROLLBACK TO SAVEPOINT capacity_255; SHOW application_name", true)), ["0", "depth_254"]);
+    let invalid_descriptor = session.execute(&mut engine, "SELECT lo_tell64(0)", true);
+    assert!(String::from_utf8_lossy(&invalid_descriptor).contains("ERROR"));
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT capacity_255; SAVEPOINT capacity_reused",
+        true,
+    );
+    let exhaustion = session.execute(&mut engine, "SAVEPOINT capacity_overflow", true);
+    assert!(String::from_utf8_lossy(&exhaustion).contains("54000"));
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT capacity_255; RELEASE SAVEPOINT capacity_0",
+        true,
+    );
+    session.success(&mut engine, "INSERT INTO capacity_child SELECT i, 1, repeat('x', 2048) FROM generate_series(1, 300) AS g(i); INSERT INTO capacity_parent VALUES(1)", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM capacity_audit; SAVEPOINT validation; SET CONSTRAINTS ALL IMMEDIATE; SELECT count(*) FROM capacity_audit", true)), ["0", "300"]);
+    assert_eq!(data_rows(&session.success(&mut engine, "ROLLBACK TO SAVEPOINT validation; SELECT count(*) FROM capacity_audit; COMMIT; SELECT count(*) FROM capacity_audit; SELECT count(*), min(octet_length(body)) FROM capacity_child; SHOW application_name", true)), ["0", "300", "300|2048", ""]);
+    let pointer = session.guc.store_savepoint_allocation_for_test();
+    crate::mem::guard::forbid_alloc(|| session.guc.reset_session_state());
+    assert_eq!(session.guc.store_savepoint_allocation_for_test(), pointer);
+    session.success(&mut engine, "BEGIN; SAVEPOINT recycled; ROLLBACK", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM capacity_depth_statistics",
+            true
+        )),
+        ["255"]
+    );
+}
+
+#[test]
+fn configured_transaction_capacity_covers_bulk_analyze_undo_and_exhaustion() {
+    const TABLES: usize = 129;
+    let mut config = test_config("bulk-analyze-transaction-capacity");
+    config.max_tables = TABLES;
+    config.table_rows = 8;
+    config.value_index_rows = 8;
+    config.max_analyze_per_transaction = 2 * (TABLES + 1);
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    let mut budget = Budget::new(2 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for table in 0..TABLES {
+        session.success(&mut engine, &format!("CREATE TABLE bulk_analyze_{table}(id int, other_id int); INSERT INTO bulk_analyze_{table} VALUES(1, 2), (3, 4)"), false);
+    }
+    session.success(&mut engine, "CREATE STATISTICS bulk_analyze_extended (ndistinct) ON id, other_id FROM bulk_analyze_0; BEGIN; ANALYZE; SAVEPOINT analyzed; ANALYZE", true);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_stats; SELECT count(*) FROM pg_statistic_ext_data",
+            true
+        )),
+        ["258", "1"]
+    );
+    let exhausted = session.execute(&mut engine, "ANALYZE bulk_analyze_0", true);
+    assert!(String::from_utf8_lossy(&exhausted).contains("54000"));
+    session.success(&mut engine, "ROLLBACK TO SAVEPOINT analyzed; COMMIT", true);
+    assert_eq!(data_rows(&session.success(&mut engine, "SELECT count(*) FROM pg_stats; BEGIN; ANALYZE; ROLLBACK; SELECT count(*) FROM pg_stats", true)), ["258", "258"]);
+    session.success(&mut engine, "BEGIN; ANALYZE; COMMIT", true);
+}
+
+#[test]
+fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
+    for (label, metadata, row_bytes, failing_insert) in [
+        (
+            "deferred-metadata",
+            2,
+            4096,
+            "INSERT INTO bounded_deferred VALUES(1, 'x'), (2, 'x'), (3, 'x')",
+        ),
+        (
+            "deferred-row-images",
+            8,
+            128,
+            "INSERT INTO bounded_deferred VALUES(1, repeat('x', 256))",
+        ),
+    ] {
+        let mut config = test_config(label);
+        config.max_deferred_constraints_per_transaction = metadata;
+        config.deferred_trigger_bytes = row_bytes;
+        let mut budget = Budget::new(1 << 28);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+        session.success(&mut engine, "CREATE TABLE bounded_deferred(id int UNIQUE DEFERRABLE INITIALLY DEFERRED, body text); CREATE TABLE bounded_deferred_audit(id int); CREATE FUNCTION bounded_deferred_trace() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO bounded_deferred_audit VALUES(NEW.id); RETURN NULL; END$$; CREATE CONSTRAINT TRIGGER bounded_deferred_trigger AFTER INSERT ON bounded_deferred DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION bounded_deferred_trace(); BEGIN; SAVEPOINT before_exhaustion", false);
+        let exhausted = session.execute(&mut engine, failing_insert, true);
+        assert!(
+            String::from_utf8_lossy(&exhausted).contains("54000"),
+            "{label}: {}",
+            String::from_utf8_lossy(&exhausted)
+        );
+        assert_eq!(data_rows(&session.success(&mut engine, "ROLLBACK TO before_exhaustion; SELECT count(*) FROM bounded_deferred; INSERT INTO bounded_deferred VALUES(1, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit; BEGIN; INSERT INTO bounded_deferred VALUES(2, 'x'); COMMIT; SELECT count(*) FROM bounded_deferred_audit", true)), ["0", "1", "2"]);
+    }
+}
+
+#[test]
+fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_recovery() {
+    const TABLES: usize = 300;
+    let mut config = test_config("truncate-fanout-prepared-cold-recovery");
+    config.max_tables = TABLES;
+    config.max_indexes = TABLES;
+    config.max_value_indexes = TABLES;
+    config.max_prepared_transactions = 2;
+    config.subscription_relation_capacity = TABLES;
+    config.table_rows = 4;
+    config.value_index_rows = 4;
+    config.txn_rows = 1024;
+    config.memtable_bytes = 8 << 20;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("truncate-fanout-capacity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = Budget::new(3usize << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for table in 0..TABLES {
+        let foreign_key = if table == 0 {
+            String::new()
+        } else {
+            format!(" REFERENCES truncate_fanout_{}(id)", table - 1)
+        };
+        session.success(&mut engine, &format!("CREATE TABLE truncate_fanout_{table}(id int PRIMARY KEY{foreign_key}); INSERT INTO truncate_fanout_{table} VALUES(1)"), false);
+    }
+    session.success(
+        &mut engine,
+        "CREATE PUBLICATION truncate_fanout_publication FOR ALL TABLES",
+        false,
+    );
+    let floor = engine.storage.lsn();
+    assert_eq!(data_rows(&session.success(&mut engine, "BEGIN; SAVEPOINT before_truncate; TRUNCATE truncate_fanout_0 CASCADE; ROLLBACK TO SAVEPOINT before_truncate; SELECT count(*) FROM truncate_fanout_0; SELECT count(*) FROM truncate_fanout_299; TRUNCATE truncate_fanout_0 CASCADE; COMMIT", false)), ["1", "1"]);
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "wide truncate logical scratch", 4 << 20).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "wide truncate logical send", 4 << 20).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("truncate_fanout_publication").unwrap()],
+            true,
+            crate::pg::pgoutput::ProtocolVersion::V4,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(emitted);
+    let mut truncate_count = 0;
+    crate::mem::guard::forbid_alloc(|| {
+        let mut at = 0;
+        while at < send.len() {
+            let bytes = send.readable();
+            let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            if let crate::pg::pginput::CopyData::XLogData {
+                message: crate::pg::pginput::Message::Truncate { truncate, .. },
+                ..
+            } = crate::pg::pginput::copy_data(&bytes[at + 5..at + 1 + length]).unwrap()
+            {
+                assert_eq!(truncate.relation_ids().len(), TABLES);
+                assert!(truncate.cascade);
+                truncate_count += 1;
+            }
+            at += 1 + length;
+        }
+    });
+    assert_eq!(
+        truncate_count, 1,
+        "rolled-back TRUNCATE must not be published"
+    );
+    for table in 0..TABLES {
+        session.success(
+            &mut engine,
+            &format!("INSERT INTO truncate_fanout_{table} VALUES(1)"),
+            false,
+        );
+    }
+    session.success(&mut engine, "CREATE SUBSCRIPTION truncate_fanout_apply CONNECTION 'host=127.0.0.1 port=5432 user=repl dbname=publisher sslmode=disable' PUBLICATION truncate_fanout_publication WITH (connect = false, slot_name = NONE)", false);
+    let apply_budget_before = budget.used();
+    let mut apply = crate::pg::subscription_apply::SubscriptionApply::new(
+        &mut budget,
+        engine.subscription_stream("truncate_fanout_apply").unwrap(),
+        &config,
+        0,
+        crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
+    )
+    .unwrap();
+    assert_eq!(
+        budget.used() - apply_budget_before,
+        crate::pg::subscription_apply::SubscriptionApply::budget_bytes(&config)
+    );
+    let mut acknowledged = false;
+    let mut at = 0;
+    while at < send.len() {
+        let bytes = send.readable();
+        let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+        let frame = crate::pg::pginput::copy_data(&bytes[at + 5..at + 1 + length]).unwrap();
+        // The simulated durable tier allocates its test namespace on commit;
+        // relation binding and the complete apply operation remain fixed-memory.
+        let result = if matches!(
+            frame,
+            crate::pg::pginput::CopyData::XLogData {
+                message: crate::pg::pginput::Message::Commit { .. },
+                ..
+            }
+        ) {
+            apply.receive(&mut engine, frame)
+        } else {
+            crate::mem::guard::forbid_alloc(|| apply.receive(&mut engine, frame))
+        }
+        .unwrap();
+        acknowledged |= matches!(
+            result,
+            crate::pg::subscription_apply::ApplyResult::Acknowledge { .. }
+        );
+        at += 1 + length;
+    }
+    assert!(acknowledged);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM truncate_fanout_0; SELECT count(*) FROM truncate_fanout_299",
+            false
+        )),
+        ["0", "0"]
+    );
+    drop(apply);
+    for table in 0..TABLES {
+        session.success(
+            &mut engine,
+            &format!("INSERT INTO truncate_fanout_{table} VALUES(1)"),
+            false,
+        );
+    }
+    session.success(&mut engine, "BEGIN; TRUNCATE truncate_fanout_0 CASCADE; PREPARE TRANSACTION 'capacity_truncate_pending'", false);
+    drop(session);
+    drop(engine);
+    if std::path::Path::new(&config.data_dir).exists() {
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+    let mut cold_budget = Budget::new(3usize << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "SELECT count(*) FROM pg_prepared_xacts",
+            false
+        )),
+        ["1"]
+    );
+    let retained_lock = cold_session.execute(
+        &mut cold,
+        "BEGIN; LOCK TABLE truncate_fanout_0 IN ACCESS SHARE MODE NOWAIT",
+        false,
+    );
+    assert!(String::from_utf8_lossy(&retained_lock).contains("55P03"));
+    cold_session.success(&mut cold, "ROLLBACK", false);
+    cold_session.success(
+        &mut cold,
+        "COMMIT PREPARED 'capacity_truncate_pending'",
+        false,
+    );
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "SELECT count(*) FROM truncate_fanout_0; SELECT count(*) FROM truncate_fanout_299",
+            false
+        )),
+        ["0", "0"]
+    );
+    assert!(cold.checkpoint().unwrap());
+    drop(cold_session);
+    drop(cold);
+    if std::path::Path::new(&config.data_dir).exists() {
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+    let mut recovered_budget = Budget::new(3usize << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let mut recovered_session = ConfiguredTransactionSession::new(&config, &mut recovered_budget);
+    assert_eq!(data_rows(&recovered_session.success(&mut recovered, "SELECT count(*) FROM truncate_fanout_0; SELECT count(*) FROM truncate_fanout_299; SELECT count(*) FROM pg_prepared_xacts", false)), ["0", "0", "0"]);
+    drop(recovered_session);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn critical_cache_pressure_completes_checkpoint_before_small_autocommit_writes_fail() {
+    let mut config = test_config("critical-cache-checkpoint-progress");
+    config.max_tables = 32;
+    config.table_rows = 512;
+    config.value_index_rows = 512;
+    config.memtable_bytes = 256 << 10;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("critical-cache-checkpoint-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    for peer in 0..31 {
+        session.success(&mut engine, &format!("CREATE TABLE cache_pressure_peer_{peer}(id int); INSERT INTO cache_pressure_peer_{peer} VALUES(1)"), false);
+        assert!(engine.maybe_checkpoint());
+    }
+    session.success(&mut engine, "CREATE TABLE cache_pressure_rows(id int PRIMARY KEY, body text); INSERT INTO cache_pressure_rows SELECT i, repeat('x', 512) FROM generate_series(1, 300) AS g(i)", false);
+    assert!(engine.maybe_checkpoint());
+    let mut critical_publications = 0;
+    for id in 1..=300 {
+        session.success(
+            &mut engine,
+            &format!("UPDATE cache_pressure_rows SET body = repeat('x', 2048) WHERE id = {id}"),
+            false,
+        );
+        let critical = engine.storage.heap.used() * 100 >= engine.storage.heap.capacity() * 85;
+        assert!(engine.maybe_checkpoint());
+        if critical {
+            critical_publications += 1;
+            assert!(engine.storage.heap.used() * 100 < engine.storage.heap.capacity() * 85);
+        }
+    }
+    assert!(critical_publications > 0);
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*), min(octet_length(body)) FROM cache_pressure_rows",
+            false
+        )),
+        ["300|2048"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    if std::path::Path::new(&config.data_dir).exists() {
+        std::fs::remove_dir_all(&config.data_dir).unwrap();
+    }
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "SELECT count(*), min(octet_length(body)) FROM cache_pressure_rows",
+            false
+        )),
+        ["300|2048"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
 fn assert_cold_pax_query(
     config: &Config,
     sql_text: &str,
@@ -49544,7 +49993,7 @@ fn startup_sized_policy_catalog_executes_above_old_cluster_and_table_bounds() {
     assert!(String::from_utf8_lossy(&output).contains("54000"));
     let output = run_with_fixed_memory(
         &mut engine,
-        &mut budget,
+        &budget,
         "SELECT count(*) FROM pg_policy; SET ROLE policy_capacity_client;\
          SELECT v FROM policy_capacity_target; RESET ROLE",
         32 << 20,

@@ -52393,12 +52393,12 @@ pub fn apply_replication_truncate(
     cascade: bool,
     restart_identity: bool,
 ) -> Result<(), SqlError> {
-    if tables.is_empty() || tables.len() > crate::sql::txn::MAX_TRUNCATE_TABLES {
+    if tables.is_empty() || tables.len() > txn.truncate_table_capacity() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "subscription TRUNCATE has {} tables, maximum is {}",
             tables.len(),
-            crate::sql::txn::MAX_TRUNCATE_TABLES
+            txn.truncate_table_capacity()
         ));
     }
     if tables
@@ -52510,17 +52510,7 @@ pub fn apply_replication_truncate(
             }
         }
     }
-    let mut truncated = [0_u16; crate::sql::txn::MAX_TRUNCATE_TABLES];
-    for (index, &table) in tables.iter().enumerate() {
-        truncated[index] = table as u16;
-    }
-    txn.record_truncate(crate::sql::txn::TruncateEvent {
-        command_id: txn.command_id(),
-        tables: truncated,
-        table_count: tables.len(),
-        cascade,
-        restart_identity,
-    })?;
+    txn.record_truncate(tables, cascade, restart_identity)?;
     for &table in tables {
         storage.record_relation_transaction_truncate(txn.txid, table)?;
     }
@@ -60669,7 +60659,10 @@ pub fn truncate(
     responder: &mut Responder,
 ) -> Outcome {
     // Resolve the listed tables (views are not truncatable).
-    let mut list: [usize; MAX_TRUNCATE_TABLES] = [0; MAX_TRUNCATE_TABLES];
+    let list = match arena.alloc_slice_with(storage.table_count(), |_| 0usize) {
+        Ok(list) => list,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let mut n = 0usize;
     for name in tables {
         let index = match storage.resolve_relation(name.schema, name.name, txn.txid) {
@@ -60684,7 +60677,7 @@ pub fn truncate(
             _ => return sql_fail(undefined_qual(name)),
         };
         if !list[..n].contains(&index) {
-            if n == MAX_TRUNCATE_TABLES {
+            if n == list.len() {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many tables in TRUNCATE"
@@ -60694,9 +60687,34 @@ pub fn truncate(
             n += 1;
         }
     }
-    // Foreign-key closure: a table outside the list referencing a listed one
-    // blocks the truncate — or joins it under CASCADE.
+    // Close descendants before testing foreign-key restrictions. Cascade
+    // additions also contribute their descendants; diamonds enter only once.
     loop {
+        loop {
+            let mut descendants_added = false;
+            for other in 0..storage.table_count() {
+                if !storage.table(other).visible_to(txn.txid) || list[..n].contains(&other) {
+                    continue;
+                }
+                let definition = storage.table_def(other, txn.txid);
+                let inherited = definition
+                    .inheritance
+                    .parents_ref()
+                    .iter()
+                    .any(|parent| list[..n].contains(&usize::from(*parent)))
+                    || definition.partition.attachment.is_some_and(|attachment| {
+                        list[..n].contains(&usize::from(attachment.parent))
+                    });
+                if inherited {
+                    list[n] = other;
+                    n += 1;
+                    descendants_added = true;
+                }
+            }
+            if !descendants_added {
+                break;
+            }
+        }
         let mut grew = false;
         for other in 0..storage.table_count() {
             if !storage.table(other).visible_to(txn.txid) || list[..n].contains(&other) {
@@ -60719,7 +60737,7 @@ pub fn truncate(
                     "cannot truncate a table referenced in a foreign key constraint"
                 ));
             }
-            if n == MAX_TRUNCATE_TABLES {
+            if n == list.len() {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "too many tables in TRUNCATE"
@@ -60935,17 +60953,7 @@ pub fn truncate(
             return sql_fail(error);
         }
     }
-    let mut truncated_tables = [0_u16; crate::sql::txn::MAX_TRUNCATE_TABLES];
-    for (position, &table_index) in list[..n].iter().enumerate() {
-        truncated_tables[position] = table_index as u16;
-    }
-    if let Err(error) = txn.record_truncate(crate::sql::txn::TruncateEvent {
-        command_id: txn.command_id(),
-        tables: truncated_tables,
-        table_count: n,
-        cascade,
-        restart_identity,
-    }) {
+    if let Err(error) = txn.record_truncate(&list[..n], cascade, restart_identity) {
         return sql_fail(error);
     }
     for &table_index in &list[..n] {
@@ -60956,9 +60964,6 @@ pub fn truncate(
     responder.command_complete("TRUNCATE TABLE")?;
     sql_ok()
 }
-
-/// The most tables one TRUNCATE can name, its CASCADE closure included.
-const MAX_TRUNCATE_TABLES: usize = crate::sql::txn::MAX_TRUNCATE_TABLES;
 
 /// ALTER TABLE, autocommit-only: rewrites are journaled as DROP, CREATE,
 /// full re-UPSERT within one WAL batch, so replay reproduces the new
@@ -66044,7 +66049,10 @@ fn alter_table_relation(
         storage.rollback_table_def(table_index, txn.txid);
         return sql_fail(error);
     }
-    let mut dropped_constraints = [None; crate::sql::txn::MAX_DEFERRED_CONSTRAINTS];
+    let dropped_constraints = match arena.alloc_slice_with(txn.constraint_capacity(), |_| None) {
+        Ok(constraints) => constraints,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let mut dropped_constraint_count = 0usize;
     for dropped_table in 0..storage.table_count() {
         for name in txn.dropped_constraint_names(dropped_table as u32) {

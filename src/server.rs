@@ -808,8 +808,9 @@ impl Server {
             // Active checkpoint and compaction work advances even on an
             // idle server — a trigger must not wait for the next client
             // message to finish what it started, and a merge owes its beats
-            // regardless of traffic. One beat per loop turn, backing off
-            // when the bucket errors.
+            // regardless of traffic. Work is paced unless critical cache
+            // pressure requires publication before dispatch resumes; bucket
+            // errors back off.
             if self.engine.checkpoint_work_pending() || (had_responses && responses_durable) {
                 beat_backoff = if self.engine.maybe_checkpoint() {
                     Duration::ZERO

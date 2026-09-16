@@ -8,7 +8,7 @@
 pub(crate) mod foreign;
 pub(crate) mod rowenc;
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::hash::{Hash, Hasher};
 
 use crate::config::Config;
@@ -3540,15 +3540,16 @@ impl CatalogDdlState {
 /// The maximum number of ALTER TABLE commands one transaction may apply to a
 /// single table. This is a static-memory bound, not an accept-and-ignore limit.
 pub(crate) const MAX_PENDING_TABLE_DEFS: usize = 8;
-pub(crate) const MAX_PENDING_STATISTICS_PER_TXN: usize = 64;
 
 fn pending_extended_statistics_capacity(config: &Config) -> usize {
     let object_bound = config
         .max_tables
         .saturating_mul(MAX_EXTENDED_STATISTICS_PER_TABLE)
         .saturating_mul(MAX_PENDING_TABLE_DEFS);
-    let transaction_bound =
-        (config.max_connections as usize).saturating_mul(MAX_PENDING_STATISTICS_PER_TXN);
+    let transaction_bound = (config.max_connections as usize
+        + config.max_prepared_transactions
+        + config.max_subscriptions)
+        .saturating_mul(config.max_analyze_per_transaction);
     object_bound.min(transaction_bound)
 }
 
@@ -10797,12 +10798,10 @@ pub(crate) struct ForeignSession {
     timeout: std::time::Duration,
 }
 
-#[derive(Clone, Copy)]
 struct ForeignStatementContext {
     transaction_id: u32,
     serializable: bool,
-    savepoints: [crate::util::StackStr<63>; crate::sql::txn::MAX_SAVEPOINTS],
-    savepoint_count: usize,
+    savepoints: FixedVec<crate::util::StackStr<63>>,
 }
 
 #[derive(Clone, Copy)]
@@ -10969,7 +10968,7 @@ impl RelationCumulativeStatistics {
 pub(crate) struct RelationTransactionStatistics {
     txid: u32,
     table: u32,
-    nest_level: u8,
+    nest_level: usize,
     pub(crate) seq_scan: u64,
     last_seq_scan: Option<i64>,
     pub(crate) seq_tup_read: u64,
@@ -10987,7 +10986,7 @@ pub(crate) struct RelationTransactionStatistics {
 }
 
 impl RelationTransactionStatistics {
-    const fn new(txid: u32, table: usize, nest_level: u8) -> Self {
+    const fn new(txid: u32, table: usize, nest_level: usize) -> Self {
         Self {
             txid,
             table: table as u32,
@@ -11113,7 +11112,7 @@ pub struct Storage {
     foreign: foreign::ForeignCatalog,
     foreign_client: std::cell::RefCell<Option<crate::pg::replication_client::ReplicationClient>>,
     foreign_session: std::cell::RefCell<Option<ForeignSession>>,
-    foreign_statement_context: Cell<Option<ForeignStatementContext>>,
+    foreign_statement_context: RefCell<ForeignStatementContext>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
     matview_dependencies: FixedVec<StoredQueryDependencies>,
@@ -11131,7 +11130,7 @@ pub struct Storage {
     backend_signals: std::cell::RefCell<FixedVec<BackendSignal>>,
     relation_cumulative_statistics: std::cell::RefCell<FixedVec<RelationCumulativeStatistics>>,
     relation_transaction_statistics: std::cell::RefCell<FixedVec<RelationTransactionStatistics>>,
-    cumulative_transaction_nesting: std::cell::RefCell<FixedVec<(u32, u8)>>,
+    cumulative_transaction_nesting: std::cell::RefCell<FixedVec<(u32, usize)>>,
     index_cumulative_statistics: std::cell::RefCell<FixedVec<IndexCumulativeStatistics>>,
     database_cumulative_statistics: std::cell::RefCell<FixedVec<DatabaseCumulativeStatistics>>,
     function_cumulative_statistics: std::cell::RefCell<FixedVec<FunctionCumulativeStatistics>>,
@@ -11984,7 +11983,7 @@ fn rename_table_sql_identity(
 }
 
 impl Storage {
-    fn cumulative_transaction_nest_level(&self, txid: u32) -> u8 {
+    fn cumulative_transaction_nest_level(&self, txid: u32) -> usize {
         self.cumulative_transaction_nesting
             .borrow()
             .iter()
@@ -11992,7 +11991,7 @@ impl Storage {
             .map_or(1, |(_, nest_level)| *nest_level)
     }
 
-    pub(crate) fn set_cumulative_transaction_nest_level(&self, txid: u32, nest_level: u8) {
+    pub(crate) fn set_cumulative_transaction_nest_level(&self, txid: u32, nest_level: usize) {
         if txid == 0 {
             return;
         }
@@ -12149,7 +12148,7 @@ impl Storage {
     pub(crate) fn finish_cumulative_subtransactions(
         &self,
         txid: u32,
-        minimum_nest_level: u8,
+        minimum_nest_level: usize,
         committed: bool,
     ) {
         let maximum_nest_level = self
@@ -14116,6 +14115,7 @@ impl Storage {
     /// Bytes drawn beyond the row heap itself, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         INDEX_ARENA_BYTES
+            + config.max_savepoints_per_transaction * size_of::<crate::util::StackStr<63>>()
             + 2 * config.collation_scratch_bytes
             + table_slot_capacity(config)
                 * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
@@ -14191,9 +14191,10 @@ impl Storage {
             + table_slot_capacity(config) * size_of::<RelationCumulativeStatistics>()
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * table_slot_capacity(config)
+                * (config.max_savepoints_per_transaction + 1)
                 * size_of::<RelationTransactionStatistics>()
             + (config.max_connections as usize + config.max_prepared_transactions)
-                * size_of::<(u32, u8)>()
+                * size_of::<(u32, usize)>()
             + (table_slot_capacity(config) * (MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS)
                 + config.max_value_indexes)
                 * size_of::<IndexCumulativeStatistics>()
@@ -15009,7 +15010,7 @@ impl Storage {
         let relation_transaction_statistics = FixedVec::new(
             budget,
             "relation_transaction_statistics",
-            transaction_capacity * table_capacity,
+            transaction_capacity * table_capacity * (config.max_savepoints_per_transaction + 1),
         )?;
         let cumulative_transaction_nesting = FixedVec::new(
             budget,
@@ -15095,7 +15096,15 @@ impl Storage {
             foreign,
             foreign_client: std::cell::RefCell::new(None),
             foreign_session: std::cell::RefCell::new(None),
-            foreign_statement_context: Cell::new(None),
+            foreign_statement_context: RefCell::new(ForeignStatementContext {
+                transaction_id: 0,
+                serializable: false,
+                savepoints: FixedVec::new(
+                    budget,
+                    "foreign_statement_savepoints",
+                    config.max_savepoints_per_transaction,
+                )?,
+            }),
             subscription_relations,
             matviews,
             matview_dependencies,
@@ -15277,42 +15286,39 @@ impl Storage {
         &self,
         transaction_id: u32,
         serializable: bool,
-        savepoints: &[crate::util::StackStr<63>],
-    ) {
-        let mut names = [crate::util::StackStr::new(); crate::sql::txn::MAX_SAVEPOINTS];
-        names[..savepoints.len()].copy_from_slice(savepoints);
-        self.foreign_statement_context
-            .set(Some(ForeignStatementContext {
-                transaction_id,
-                serializable,
-                savepoints: names,
-                savepoint_count: savepoints.len(),
-            }));
+        savepoints: impl Iterator<Item = crate::util::StackStr<63>>,
+    ) -> Result<(), SqlError> {
+        let mut context = self.foreign_statement_context.borrow_mut();
+        context.transaction_id = transaction_id;
+        context.serializable = serializable;
+        context.savepoints.clear();
+        for name in savepoints {
+            context.savepoints.push(name).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "foreign statement savepoint capacity exceeded"
+                )
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn foreign_statement_is_serializable(&self, transaction_id: u32) -> bool {
-        self.foreign_statement_context
-            .get()
-            .is_some_and(|context| context.transaction_id == transaction_id && context.serializable)
+        let context = self.foreign_statement_context.borrow();
+        context.transaction_id == transaction_id && context.serializable
     }
 
     pub(crate) fn foreign_statement_savepoints(
         &self,
         transaction_id: u32,
-    ) -> (
-        [crate::util::StackStr<63>; crate::sql::txn::MAX_SAVEPOINTS],
-        usize,
-    ) {
-        self.foreign_statement_context
-            .get()
-            .filter(|context| context.transaction_id == transaction_id)
-            .map_or(
-                (
-                    [crate::util::StackStr::new(); crate::sql::txn::MAX_SAVEPOINTS],
-                    0,
-                ),
-                |context| (context.savepoints, context.savepoint_count),
-            )
+    ) -> core::cell::Ref<'_, [crate::util::StackStr<63>]> {
+        core::cell::Ref::map(self.foreign_statement_context.borrow(), |context| {
+            if context.transaction_id == transaction_id {
+                context.savepoints.as_slice()
+            } else {
+                &[]
+            }
+        })
     }
 
     pub(crate) fn prepared_transaction_catalog(&self) -> &[PreparedTransactionCatalogEntry] {

@@ -52,154 +52,180 @@ impl CommittedBatch {
 }
 const TABLE_STATISTICS_V3: u8 = u8::MAX - 1;
 
-const KIND_CREATE: u8 = 1;
-const KIND_DROP: u8 = 2;
-const KIND_UPSERT: u8 = 3;
-const KIND_DELETE: u8 = 4;
-const KIND_CREATE_VIEW: u8 = 5;
-const KIND_DROP_VIEW: u8 = 6;
-const KIND_CREATE_INDEX: u8 = 7;
-const KIND_DROP_INDEX: u8 = 8;
-const KIND_SEQUENCE_SET: u8 = 9;
-const KIND_CREATE_SCHEMA: u8 = 10;
-const KIND_DROP_SCHEMA: u8 = 11;
-const KIND_SET_TABLE_SCHEMA: u8 = 12;
-const KIND_DROP_FK: u8 = 13;
-const KIND_CREATE_MATVIEW: u8 = 14;
-const KIND_DROP_MATVIEW: u8 = 15;
-const KIND_SET_MATVIEW_POPULATED: u8 = 16;
-const KIND_CREATE_SEQUENCE: u8 = 17;
-const KIND_DROP_SEQUENCE: u8 = 18;
-const KIND_SEQUENCE_ADVANCE: u8 = 19;
-const KIND_COMMENT: u8 = 20;
-const KIND_CREATE_DOMAIN: u8 = 21;
-const KIND_DROP_DOMAIN: u8 = 22;
-const KIND_CREATE_ENUM: u8 = 23;
-const KIND_DROP_ENUM: u8 = 24;
-const KIND_RENAME_ENUM: u8 = 25;
-const KIND_ANALYZE: u8 = 26;
-const KIND_UPSERT_ROLE: u8 = 27;
-const KIND_DROP_ROLE: u8 = 28;
-const KIND_UPSERT_ROLE_MEMBERSHIP: u8 = 29;
-const KIND_DROP_ROLE_MEMBERSHIP: u8 = 30;
-const KIND_SET_OBJECT_OWNER: u8 = 31;
-const KIND_SET_OBJECT_ACL: u8 = 32;
-const KIND_REWRITE_TABLE: u8 = 33;
-const KIND_SET_DEFAULT_ACL: u8 = 34;
+// One registry defines both durable discriminants and startup recognition.
+macro_rules! wal_record_kinds {
+    ($( $(#[$attribute:meta])* $name:ident = $value:literal; )*) => {
+        $( $(#[$attribute])* const $name: u8 = $value; )*
+        fn record_kind_known(kind: u8) -> bool {
+            matches!(kind, $( $name )|*)
+        }
+        const _: () = {
+            let kinds = [$( $value ),*];
+            let mut index = 0;
+            while index < kinds.len() {
+                assert!(kinds[index] != 0, "zero WAL kind");
+                let mut previous = 0;
+                while previous < index {
+                    assert!(kinds[index] != kinds[previous], "duplicate WAL kind");
+                    previous += 1;
+                }
+                index += 1;
+            }
+        };
+    };
+}
+
+wal_record_kinds! {
+    KIND_CREATE = 1;
+    KIND_DROP = 2;
+    KIND_UPSERT = 3;
+    KIND_DELETE = 4;
+    KIND_CREATE_VIEW = 5;
+    KIND_DROP_VIEW = 6;
+    KIND_CREATE_INDEX = 7;
+    KIND_DROP_INDEX = 8;
+    KIND_SEQUENCE_SET = 9;
+    KIND_CREATE_SCHEMA = 10;
+    KIND_DROP_SCHEMA = 11;
+    KIND_SET_TABLE_SCHEMA = 12;
+    KIND_DROP_FK = 13;
+    KIND_CREATE_MATVIEW = 14;
+    KIND_DROP_MATVIEW = 15;
+    KIND_SET_MATVIEW_POPULATED = 16;
+    KIND_CREATE_SEQUENCE = 17;
+    KIND_DROP_SEQUENCE = 18;
+    KIND_SEQUENCE_ADVANCE = 19;
+    KIND_COMMENT = 20;
+    KIND_CREATE_DOMAIN = 21;
+    KIND_DROP_DOMAIN = 22;
+    KIND_CREATE_ENUM = 23;
+    KIND_DROP_ENUM = 24;
+    KIND_RENAME_ENUM = 25;
+    KIND_ANALYZE = 26;
+    KIND_UPSERT_ROLE = 27;
+    KIND_DROP_ROLE = 28;
+    KIND_UPSERT_ROLE_MEMBERSHIP = 29;
+    KIND_DROP_ROLE_MEMBERSHIP = 30;
+    KIND_SET_OBJECT_OWNER = 31;
+    KIND_SET_OBJECT_ACL = 32;
+    KIND_REWRITE_TABLE = 33;
+    KIND_SET_DEFAULT_ACL = 34;
 // Publication records carry the typed ordinary-descendant selection added
 // after the original record layout. New kinds make older bytes fail recovery
 // loudly instead of being reinterpreted as a different catalog contract.
-const KIND_CREATE_PUBLICATION_V2: u8 = 128;
-const KIND_DROP_PUBLICATION: u8 = 36;
-const KIND_ALTER_PUBLICATION_V2: u8 = 129;
+    KIND_CREATE_PUBLICATION_V2 = 128;
+    KIND_DROP_PUBLICATION = 36;
+    KIND_ALTER_PUBLICATION_V2 = 129;
 /// Recovery-only state transition emitted after an unclean startup. It makes
 /// the in-memory reset of every unlogged relation durable across later clean
 /// restarts without exposing the reset through logical replication.
-const KIND_RESET_UNLOGGED_RELATIONS: u8 = 130;
+    KIND_RESET_UNLOGGED_RELATIONS = 130;
 /// User-defined logical decoding message. It is durable engine WAL but has no
 /// storage replay effect; pgoutput consumes it in command order.
-const KIND_LOGICAL_MESSAGE: u8 = 131;
-const KIND_BRIN_MAINTENANCE: u8 = 132;
+    KIND_LOGICAL_MESSAGE = 131;
+    KIND_BRIN_MAINTENANCE = 132;
 /// Wider text-search slot identity. Kind 111 remains decodable so existing
 /// journals retain their durable meaning.
-const KIND_SET_TEXT_SEARCH_V2: u8 = 133;
-const KIND_SET_PUBLICATION_OWNER: u8 = 43;
-const KIND_RENAME_PUBLICATION: u8 = 44;
-const KIND_CREATE_ROUTINE: u8 = 45;
-const KIND_DROP_ROUTINE: u8 = 46;
-const KIND_ALTER_ROUTINE_IDENTITY: u8 = 47;
-const KIND_ALTER_DOMAIN_IDENTITY: u8 = 48;
-const KIND_RENAME_INDEX: u8 = 49;
-const KIND_CREATE_SUBSCRIPTION: u8 = 50;
-const KIND_DROP_SUBSCRIPTION: u8 = 51;
-const KIND_ADVANCE_SUBSCRIPTION: u8 = 52;
-const KIND_SET_SUBSCRIPTION_ENABLED: u8 = 53;
-const KIND_ALTER_SUBSCRIPTION: u8 = 54;
-const KIND_CREATE_TRIGGER: u8 = 55;
-const KIND_DROP_TRIGGER: u8 = 56;
-const KIND_ALTER_TRIGGER: u8 = 57;
-const KIND_CREATE_COMPOSITE: u8 = 58;
-const KIND_DROP_COMPOSITE: u8 = 59;
-const KIND_ALTER_ENUM_IDENTITY: u8 = 60;
-const KIND_SET_SUBSCRIPTION_BOOTSTRAP: u8 = 61;
-const KIND_RESET_SUBSCRIPTION_RELATIONS: u8 = 62;
-const KIND_ADD_SUBSCRIPTION_RELATION: u8 = 63;
-const KIND_COMPLETE_SUBSCRIPTION_CLEANUP: u8 = 64;
-const KIND_FAIL_SUBSCRIPTION: u8 = 65;
-const KIND_SET_SUBSCRIPTION_OWNER: u8 = 66;
-const KIND_RENAME_SUBSCRIPTION: u8 = 67;
-const KIND_ALTER_REPLICATION_SLOT: u8 = 68;
-const KIND_SET_POLICY: u8 = 69;
-const KIND_DROP_POLICY: u8 = 70;
-const KIND_ALTER_INDEX_DEFINITION: u8 = 71;
-const KIND_CREATE_TABLESPACE: u8 = 72;
-const KIND_ALTER_TABLESPACE: u8 = 73;
-const KIND_DROP_TABLESPACE: u8 = 74;
-const KIND_SET_EXTENDED_STATISTICS: u8 = 75;
-const KIND_DROP_EXTENDED_STATISTICS: u8 = 76;
-const KIND_ANALYZE_EXTENDED_STATISTICS: u8 = 77;
-const KIND_UPSERT_EXTENSION: u8 = 78;
-const KIND_DROP_EXTENSION: u8 = 79;
-const KIND_SET_EXTENSION_DEPENDENCY: u8 = 80;
-const KIND_SET_SEQUENCE_SCHEMA: u8 = 81;
-const KIND_SET_VIEW_SCHEMA: u8 = 82;
-const KIND_SET_EXTENSION_CONFIG: u8 = 83;
-const KIND_SET_ROLE_SETTING: u8 = 84;
-const KIND_SET_COLUMN_ACL: u8 = 85;
-const KIND_SET_CAST: u8 = 86;
-const KIND_DROP_CAST: u8 = 87;
-const KIND_SET_OPERATOR: u8 = 88;
-const KIND_DROP_OPERATOR: u8 = 89;
-const KIND_SET_OPERATOR_FAMILY: u8 = 90;
-const KIND_DROP_OPERATOR_FAMILY: u8 = 91;
-const KIND_SET_OPERATOR_CLASS: u8 = 92;
-const KIND_DROP_OPERATOR_CLASS: u8 = 93;
-const KIND_CREATE_DATABASE: u8 = 94;
-const KIND_ALTER_DATABASE: u8 = 95;
-const KIND_DROP_DATABASE: u8 = 96;
-const KIND_SET_SYSTEM_SETTING: u8 = 97;
-const KIND_DATABASE_SCOPE: u8 = 98;
-const KIND_SET_COLLATION: u8 = 99;
-const KIND_DROP_COLLATION: u8 = 100;
-const KIND_SET_CONVERSION: u8 = 101;
-const KIND_DROP_CONVERSION: u8 = 102;
-const KIND_SET_EVENT_TRIGGER: u8 = 103;
-const KIND_DROP_EVENT_TRIGGER: u8 = 104;
-const KIND_SET_RULE: u8 = 105;
-const KIND_DROP_RULE: u8 = 106;
+    KIND_SET_TEXT_SEARCH_V2 = 133;
+    KIND_SET_PUBLICATION_OWNER = 43;
+    KIND_RENAME_PUBLICATION = 44;
+    KIND_CREATE_ROUTINE = 45;
+    KIND_DROP_ROUTINE = 46;
+    KIND_ALTER_ROUTINE_IDENTITY = 47;
+    KIND_ALTER_DOMAIN_IDENTITY = 48;
+    KIND_RENAME_INDEX = 49;
+    KIND_CREATE_SUBSCRIPTION = 50;
+    KIND_DROP_SUBSCRIPTION = 51;
+    KIND_ADVANCE_SUBSCRIPTION = 52;
+    KIND_SET_SUBSCRIPTION_ENABLED = 53;
+    KIND_ALTER_SUBSCRIPTION = 54;
+    KIND_CREATE_TRIGGER = 55;
+    KIND_DROP_TRIGGER = 56;
+    KIND_ALTER_TRIGGER = 57;
+    KIND_CREATE_COMPOSITE = 58;
+    KIND_DROP_COMPOSITE = 59;
+    KIND_ALTER_ENUM_IDENTITY = 60;
+    KIND_SET_SUBSCRIPTION_BOOTSTRAP = 61;
+    KIND_RESET_SUBSCRIPTION_RELATIONS = 62;
+    KIND_ADD_SUBSCRIPTION_RELATION = 63;
+    KIND_COMPLETE_SUBSCRIPTION_CLEANUP = 64;
+    KIND_FAIL_SUBSCRIPTION = 65;
+    KIND_SET_SUBSCRIPTION_OWNER = 66;
+    KIND_RENAME_SUBSCRIPTION = 67;
+    KIND_ALTER_REPLICATION_SLOT = 68;
+    KIND_SET_POLICY = 69;
+    KIND_DROP_POLICY = 70;
+    KIND_ALTER_INDEX_DEFINITION = 71;
+    KIND_CREATE_TABLESPACE = 72;
+    KIND_ALTER_TABLESPACE = 73;
+    KIND_DROP_TABLESPACE = 74;
+    KIND_SET_EXTENDED_STATISTICS = 75;
+    KIND_DROP_EXTENDED_STATISTICS = 76;
+    KIND_ANALYZE_EXTENDED_STATISTICS = 77;
+    KIND_UPSERT_EXTENSION = 78;
+    KIND_DROP_EXTENSION = 79;
+    KIND_SET_EXTENSION_DEPENDENCY = 80;
+    KIND_SET_SEQUENCE_SCHEMA = 81;
+    KIND_SET_VIEW_SCHEMA = 82;
+    KIND_SET_EXTENSION_CONFIG = 83;
+    KIND_SET_ROLE_SETTING = 84;
+    KIND_SET_COLUMN_ACL = 85;
+    KIND_SET_CAST = 86;
+    KIND_DROP_CAST = 87;
+    KIND_SET_OPERATOR = 88;
+    KIND_DROP_OPERATOR = 89;
+    KIND_SET_OPERATOR_FAMILY = 90;
+    KIND_DROP_OPERATOR_FAMILY = 91;
+    KIND_SET_OPERATOR_CLASS = 92;
+    KIND_DROP_OPERATOR_CLASS = 93;
+    KIND_CREATE_DATABASE = 94;
+    KIND_ALTER_DATABASE = 95;
+    KIND_DROP_DATABASE = 96;
+    KIND_SET_SYSTEM_SETTING = 97;
+    KIND_DATABASE_SCOPE = 98;
+    KIND_SET_COLLATION = 99;
+    KIND_DROP_COLLATION = 100;
+    KIND_SET_CONVERSION = 101;
+    KIND_DROP_CONVERSION = 102;
+    KIND_SET_EVENT_TRIGGER = 103;
+    KIND_DROP_EVENT_TRIGGER = 104;
+    KIND_SET_RULE = 105;
+    KIND_DROP_RULE = 106;
+    KIND_SET_PARAMETER_ACL = 123;
+    KIND_PREPARE_TRANSACTION = 107;
+    KIND_COMMIT_PREPARED = 108;
+    KIND_ROLLBACK_PREPARED = 109;
+    KIND_PREPARED_LOCKS = 110;
+    KIND_SET_TEXT_SEARCH = 111;
+    KIND_DROP_TEXT_SEARCH = 112;
+    KIND_CREATE_LARGE_OBJECT = 113;
+    KIND_DROP_LARGE_OBJECT = 114;
+    KIND_SET_FOREIGN_DATA_WRAPPER = 115;
+    KIND_SET_FOREIGN_SERVER = 116;
+    KIND_SET_USER_MAPPING = 117;
+    KIND_SET_FOREIGN_TABLE = 118;
+    KIND_CREATE_ACCESS_METHOD = 119;
+    KIND_RENAME_VIEW = 120;
+    KIND_DROP_ACCESS_METHOD = 121;
+    KIND_RENAME_ROLE = 122;
+    KIND_RENAME_SEQUENCE = 124;
+    KIND_RENAME_SCHEMA = 125;
+    KIND_SET_VIEW_COLUMNS = 126;
+    KIND_SET_VIEW_OPTIONS = 127;
+/// A durable transaction boundary. Logical replication may expose only the
+/// records preceding one of these markers.
+    KIND_COMMIT = 37;
+    KIND_CREATE_REPLICATION_SLOT = 38;
+    KIND_DROP_REPLICATION_SLOT = 39;
+    KIND_ADVANCE_REPLICATION_SLOT = 40;
+    KIND_TRUNCATE = 41;
+    KIND_TRUNCATE_WIDE = 134;
+}
+
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
 const TABLE_DEF_PAYLOAD_VERSION: u8 = 4;
-const KIND_SET_PARAMETER_ACL: u8 = 123;
-const KIND_PREPARE_TRANSACTION: u8 = 107;
-const KIND_COMMIT_PREPARED: u8 = 108;
-const KIND_ROLLBACK_PREPARED: u8 = 109;
-const KIND_PREPARED_LOCKS: u8 = 110;
-const KIND_SET_TEXT_SEARCH: u8 = 111;
-const KIND_DROP_TEXT_SEARCH: u8 = 112;
-const KIND_CREATE_LARGE_OBJECT: u8 = 113;
-const KIND_DROP_LARGE_OBJECT: u8 = 114;
-const KIND_SET_FOREIGN_DATA_WRAPPER: u8 = 115;
-const KIND_SET_FOREIGN_SERVER: u8 = 116;
-const KIND_SET_USER_MAPPING: u8 = 117;
-const KIND_SET_FOREIGN_TABLE: u8 = 118;
-const KIND_CREATE_ACCESS_METHOD: u8 = 119;
-const KIND_RENAME_VIEW: u8 = 120;
-const KIND_DROP_ACCESS_METHOD: u8 = 121;
-const KIND_RENAME_ROLE: u8 = 122;
-const KIND_RENAME_SEQUENCE: u8 = 124;
-const KIND_RENAME_SCHEMA: u8 = 125;
-const KIND_SET_VIEW_COLUMNS: u8 = 126;
-const KIND_SET_VIEW_OPTIONS: u8 = 127;
-/// A durable transaction boundary. Logical replication may expose only the
-/// records preceding one of these markers.
-const KIND_COMMIT: u8 = 37;
-const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
-const KIND_DROP_REPLICATION_SLOT: u8 = 39;
-const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
-const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_LOGICAL_MESSAGE;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -1528,7 +1554,7 @@ impl Wal {
                 let payload_len = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 let kind = data[16];
-                if !(KIND_CREATE..=LAST_KIND).contains(&kind)
+                if !record_kind_known(kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
                     || lsn <= last_seen_lsn
                 {
@@ -2095,7 +2121,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
         WalOp::Delete { .. } => KIND_DELETE,
-        WalOp::Truncate { .. } => KIND_TRUNCATE,
+        WalOp::Truncate { .. } => KIND_TRUNCATE_WIDE,
         WalOp::LogicalMessage { .. } => KIND_LOGICAL_MESSAGE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
@@ -2407,7 +2433,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             1 + table.len() + 8 + 1 + schema.len() + 1 + old_row.map_or(0, |old| 4 + old.len()) + 4
         }
-        WalOp::Truncate { tables, .. } => 1 + tables.len() + 1 + 4,
+        WalOp::Truncate { tables, .. } => 2 + tables.len() + 1 + 4,
         WalOp::LogicalMessage {
             prefix, content, ..
         } => 1 + 8 + 4 + 2 + prefix.len() + 4 + content.len(),
@@ -4136,8 +4162,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             restart_identity,
             command_id,
         } => {
-            *table_count <= u8::MAX as usize
-                && buffer.append(&[*table_count as u8])
+            *table_count > 0
+                && *table_count <= u16::MAX as usize
+                && buffer.append(&(*table_count as u16).to_le_bytes())
                 && buffer.append(tables)
                 && buffer.append(&[u8::from(*cascade) | (u8::from(*restart_identity) << 1)])
                 && buffer.append(&command_id.to_le_bytes())
@@ -7129,10 +7156,17 @@ fn decode_op_inner<'a>(
                 command_id,
             })
         }),
-        KIND_TRUNCATE => decode_large_op(|| {
-            let count = *payload.get(at)? as usize;
-            at += 1;
-            if count > crate::sql::txn::MAX_TRUNCATE_TABLES {
+        KIND_TRUNCATE | KIND_TRUNCATE_WIDE => decode_large_op(|| {
+            let count = if kind == KIND_TRUNCATE {
+                let count = *payload.get(at)? as usize;
+                at += 1;
+                count
+            } else {
+                let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                count
+            };
+            if count == 0 {
                 return None;
             }
             let tables_start = at;
@@ -12072,6 +12106,102 @@ mod tests {
     }
 
     #[test]
+    fn newest_record_kinds_survive_journal_startup_and_wide_truncate_replay() {
+        let dir = temp_dir("newest-record-kinds-wide-truncate-replay");
+        let config = test_config(&dir);
+        let mut tables = Vec::new();
+        for table in 0..300 {
+            let name = format!("t{table}");
+            tables.extend_from_slice(&[1, b's', name.len() as u8]);
+            tables.extend_from_slice(name.as_bytes());
+        }
+        let mut payload = 300_u16.to_le_bytes().to_vec();
+        payload.extend_from_slice(&tables);
+        payload.push(1);
+        payload.extend_from_slice(&8_u32.to_le_bytes());
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(matches!(
+                decode_op(KIND_TRUNCATE_WIDE, &payload),
+                Some(WalOp::Truncate {
+                    table_count: 300,
+                    command_id: 8,
+                    ..
+                })
+            ));
+            assert!(decode_op(KIND_TRUNCATE_WIDE, &payload[..payload.len() - 1]).is_none());
+        });
+        let flags_at = payload.len() - 5;
+        payload[flags_at] = 4;
+        assert!(decode_op(KIND_TRUNCATE_WIDE, &payload).is_none());
+        payload[flags_at] = 1;
+        payload[..2].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(decode_op(KIND_TRUNCATE_WIDE, &payload).is_none());
+        payload[..2].copy_from_slice(&299_u16.to_le_bytes());
+        assert!(decode_op(KIND_TRUNCATE_WIDE, &payload).is_none());
+        let text_search = crate::storage::TextSearchDefinition::Parser {
+            schema: crate::storage::SqlName::parse("public").unwrap(),
+            name: crate::storage::SqlName::parse("parser_300").unwrap(),
+            oid: 310_300,
+            start: 3717,
+            gettoken: 3718,
+            end: 3719,
+            headline: 3720,
+            lextypes: 3721,
+        };
+        let mut budget = Budget::new(1 << 20);
+        {
+            let mut wal = Wal::open(&config, &mut budget).unwrap();
+            wal.append_committed(
+                1,
+                &WalOp::BrinMaintenance {
+                    index_created_at: 44,
+                    pages_per_range: 32,
+                    summarized_until_page: 128,
+                    unsummarized_ranges: [0; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES],
+                    range_count: 0,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                2,
+                &WalOp::SetTextSearch {
+                    slot: 300,
+                    created_at: 16,
+                    definition: text_search,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                3,
+                &WalOp::Truncate {
+                    tables: &tables,
+                    table_count: 300,
+                    cascade: true,
+                    restart_identity: false,
+                    command_id: 8,
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                4,
+                &WalOp::Commit {
+                    transaction_id: 1,
+                    assigned_transaction_identity: false,
+                },
+            )
+            .unwrap();
+            wal.commit();
+        }
+        let mut replay_budget = Budget::new(1 << 20);
+        let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
+        let seen = collect_replay_operations(&mut wal, 0);
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen[0].contains("BrinMaintenance"));
+        assert!(seen[1].contains("SetTextSearch") && seen[1].contains("slot: 300"));
+        assert!(seen[2].contains("Truncate") && seen[2].contains("table_count: 300"));
+    }
+
+    #[test]
     fn column_acl_codec_accepts_view_relation_classes() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "view column acl wal", 1024).unwrap();
@@ -13944,30 +14074,24 @@ mod tests {
         definition.config_count = MAX_ROUTINE_CONFIGS;
         let name = SqlName::parse(&"n".repeat(63)).unwrap();
         let default = StackStr::from_str(&"1".repeat(crate::storage::ROUTINE_DEFAULT_MAX));
-        for argument in &mut definition.arguments {
-            *argument = RoutineArgumentDef {
-                name,
-                ctype: ColType::Int4,
-                user_type: None,
-            };
-        }
-        for column in &mut definition.result_columns {
-            *column = RoutineArgumentDef {
-                name,
-                ctype: ColType::Int4,
-                user_type: None,
-            };
-        }
-        for parameter in &mut definition.parameters {
-            *parameter = RoutineParameterDef {
-                name,
-                ctype: ColType::Int4,
-                user_type: None,
-                mode: RoutineParameterMode::In {
-                    default: Some(default),
-                },
-            };
-        }
+        definition.arguments.fill(RoutineArgumentDef {
+            name,
+            ctype: ColType::Int4,
+            user_type: None,
+        });
+        definition.result_columns.fill(RoutineArgumentDef {
+            name,
+            ctype: ColType::Int4,
+            user_type: None,
+        });
+        definition.parameters.fill(RoutineParameterDef {
+            name,
+            ctype: ColType::Int4,
+            user_type: None,
+            mode: RoutineParameterMode::In {
+                default: Some(default),
+            },
+        });
         for config in &mut definition.configs {
             *config = RoutineConfig {
                 name,
@@ -14071,6 +14195,22 @@ mod tests {
         assert!(cascade);
         assert!(restart_identity);
         assert_eq!(command_id, 17);
+        let mut legacy = Vec::new();
+        legacy.push(2);
+        legacy.extend_from_slice(&expected_tables);
+        legacy.push(3);
+        legacy.extend_from_slice(&17u32.to_le_bytes());
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(matches!(
+                decode_op(KIND_TRUNCATE, &legacy),
+                Some(WalOp::Truncate {
+                    table_count: 2,
+                    command_id: 17,
+                    ..
+                })
+            ));
+            assert!(decode_op(KIND_TRUNCATE, &legacy[..legacy.len() - 1]).is_none());
+        });
     }
 
     #[test]

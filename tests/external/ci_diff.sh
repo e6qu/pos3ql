@@ -23,6 +23,7 @@
 set -u
 cd "$(dirname "$0")/../.." || exit
 EXT=tests/external
+DIFFERENTIAL_TRANSACTION_CONFIG=$(< "$EXT/differential-capacities.conf") || exit 1
 VENV=${POS3QL_VENV:-target/external-venv}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pos3ql-ci-diff.XXXXXX")
 
@@ -182,6 +183,7 @@ max_tables = 64
 table_rows = 8192
 max_value_indexes = 64
 max_prepared_transactions = 8
+${DIFFERENTIAL_TRANSACTION_CONFIG}
 memtable_bytes = 256MiB
 extension_control_path = ${EXTENSION_CONTROL_ROOT}
 EOF

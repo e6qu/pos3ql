@@ -251,6 +251,8 @@ pub struct Engine {
     commit_altered_tables: FixedVec<(usize, bool)>,
     commit_index_tables: FixedVec<usize>,
     logical_decoding_truncates: FixedVec<PendingTruncate>,
+    logical_decoding_truncate_tables: FixedVec<u16>,
+    logical_decoding_truncate_relations: FixedVec<u32>,
     prepared_transactions: two_phase::PreparedTransactions,
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
@@ -1362,7 +1364,7 @@ fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
 #[derive(Clone, Copy)]
 struct PendingTruncate {
     command_id: u32,
-    table_slots: [u16; crate::sql::txn::MAX_TRUNCATE_TABLES],
+    table_offset: usize,
     table_count: usize,
     cascade: bool,
     restart_identity: bool,
@@ -1371,7 +1373,7 @@ struct PendingTruncate {
 
 const EMPTY_PENDING_TRUNCATE: PendingTruncate = PendingTruncate {
     command_id: 0,
-    table_slots: [0; crate::sql::txn::MAX_TRUNCATE_TABLES],
+    table_offset: 0,
     table_count: 0,
     cascade: false,
     restart_identity: false,
@@ -1571,6 +1573,10 @@ fn emit_replication_relation(
         .map_err(|_| overflow())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "logical TRUNCATE needs the publication and bounded emission scratch"
+)]
 fn emit_pending_truncates(
     storage: &Storage,
     publication_names: &[SqlName],
@@ -1578,15 +1584,18 @@ fn emit_pending_truncates(
     end_lsn: u64,
     command_id: u32,
     truncates: &mut [PendingTruncate],
+    table_slots: &[u16],
+    relation_ids: &mut FixedVec<u32>,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
     for truncate in truncates {
         if truncate.emitted || truncate.command_id > command_id {
             continue;
         }
-        let mut relation_ids = [0_u32; crate::sql::txn::MAX_TRUNCATE_TABLES];
-        let mut relation_count = 0usize;
-        for &table_slot in &truncate.table_slots[..truncate.table_count] {
+        relation_ids.clear();
+        for &table_slot in
+            &table_slots[truncate.table_offset..truncate.table_offset + truncate.table_count]
+        {
             let table_slot = table_slot as usize;
             let Some(column_mask) = publication_column_mask(
                 storage,
@@ -1605,7 +1614,7 @@ fn emit_pending_truncates(
             )?;
             let definition = storage.table_def(output_slot, 0);
             let relation_id = output_slot as u32 + 1;
-            if relation_ids[..relation_count].contains(&relation_id) {
+            if relation_ids.contains(&relation_id) {
                 continue;
             }
             emit_replication_relation(
@@ -1617,10 +1626,14 @@ fn emit_pending_truncates(
                 responder,
                 end_lsn,
             )?;
-            relation_ids[relation_count] = relation_id;
-            relation_count += 1;
+            relation_ids.push(relation_id).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "logical TRUNCATE relation capacity exceeded"
+                )
+            })?;
         }
-        if relation_count != 0 {
+        if !relation_ids.is_empty() {
             if proto_version < crate::pg::pgoutput::ProtocolVersion::V2 {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1632,7 +1645,7 @@ fn emit_pending_truncates(
                     pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
                         pgoutput::truncate(
                             plugin,
-                            &relation_ids[..relation_count],
+                            relation_ids.as_slice(),
                             truncate.cascade,
                             truncate.restart_identity,
                         )
@@ -2521,7 +2534,7 @@ impl Engine {
                 "subscription TRUNCATE has no relations"
             ));
         }
-        if tables.len() > crate::sql::txn::MAX_TRUNCATE_TABLES {
+        if tables.len() > txn.truncate_table_capacity() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "subscription TRUNCATE exceeds its fixed table capacity"
@@ -2791,6 +2804,8 @@ impl Engine {
             + config.max_databases * size_of::<u16>()
             + config.max_ddl_per_transaction
                 * (size_of::<(usize, bool)>() + size_of::<usize>() + size_of::<PendingTruncate>())
+            + (config.max_tables + 1)
+                * (config.max_ddl_per_transaction * size_of::<u16>() + size_of::<u32>())
             + two_phase::PreparedTransactions::budget_bytes(config)
             + crate::pg::replication_client::ReplicationClient::budget_bytes(
                 1,
@@ -3086,6 +3101,16 @@ impl Engine {
                 config.max_ddl_per_transaction,
             )?,
             logical_decoding_truncates,
+            logical_decoding_truncate_tables: FixedVec::new(
+                budget,
+                "logical_decoding_truncate_tables",
+                config.max_ddl_per_transaction * (config.max_tables + 1),
+            )?,
+            logical_decoding_truncate_relations: FixedVec::new(
+                budget,
+                "logical_decoding_truncate_relations",
+                config.max_tables + 1,
+            )?,
             prepared_transactions,
             notify: notify::NotifyState::new(
                 budget,
@@ -3764,8 +3789,11 @@ impl Engine {
             *truncate = EMPTY_PENDING_TRUNCATE;
         }
         let truncates = self.logical_decoding_truncates.as_mut_slice();
+        let truncate_tables = &mut self.logical_decoding_truncate_tables;
+        let truncate_relations = &mut self.logical_decoding_truncate_relations;
         let mut emitted = false;
         let mut encode = |end_lsn, transaction: &[u8]| {
+            truncate_tables.clear();
             let mut at = 0usize;
             let mut transaction_id = 0u32;
             let mut has_replication_origin = false;
@@ -3818,9 +3846,9 @@ impl Engine {
                             "replication transaction contains too many TRUNCATE commands"
                         ));
                     }
-                    let mut table_slots = [0_u16; crate::sql::txn::MAX_TRUNCATE_TABLES];
+                    let table_offset = truncate_tables.len();
                     let mut table_at = 0usize;
-                    for table_slot in &mut table_slots[..table_count] {
+                    for _ in 0..table_count {
                         let schema_length = *tables.get(table_at).ok_or_else(|| {
                             sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt truncate WAL schema")
                         })? as usize;
@@ -3864,7 +3892,12 @@ impl Engine {
                                 table
                             ));
                         };
-                        *table_slot = found_table_slot as u16;
+                        truncate_tables.push(found_table_slot as u16).map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "logical TRUNCATE table capacity exceeded"
+                            )
+                        })?;
                     }
                     if table_at != tables.len() {
                         return Err(sql_err!(
@@ -3874,7 +3907,7 @@ impl Engine {
                     }
                     truncates[truncate_count] = PendingTruncate {
                         command_id,
-                        table_slots,
+                        table_offset,
                         table_count,
                         cascade,
                         restart_identity,
@@ -3931,7 +3964,9 @@ impl Engine {
             // not manufacture an empty subscriber transaction.
             let mut publication_change = messages && logical_message_count != 0;
             for truncate in &truncates[..truncate_count] {
-                for table_slot in &truncate.table_slots[..truncate.table_count] {
+                for table_slot in &truncate_tables
+                    [truncate.table_offset..truncate.table_offset + truncate.table_count]
+                {
                     if publication_selects(
                         storage,
                         publication_names,
@@ -4041,7 +4076,8 @@ impl Engine {
                             let suppressed_by_truncate =
                                 truncates[..truncate_count].iter().any(|truncate| {
                                     truncate.command_id >= command_id
-                                        && truncate.table_slots[..truncate.table_count]
+                                        && truncate_tables[truncate.table_offset
+                                            ..truncate.table_offset + truncate.table_count]
                                             .contains(&(table_slot as u16))
                                 });
                             if suppressed_by_truncate {
@@ -4145,6 +4181,8 @@ impl Engine {
                             end_lsn,
                             command_id,
                             &mut truncates[..truncate_count],
+                            truncate_tables.as_slice(),
+                            truncate_relations,
                             responder,
                         )?;
                         let Some(table_slot) = storage.find_table(schema, table) else {
@@ -4339,7 +4377,8 @@ impl Engine {
                         let suppressed_by_truncate =
                             truncates[..truncate_count].iter().any(|truncate| {
                                 truncate.command_id >= command_id
-                                    && truncate.table_slots[..truncate.table_count]
+                                    && truncate_tables[truncate.table_offset
+                                        ..truncate.table_offset + truncate.table_count]
                                         .contains(&(table_slot as u16))
                             });
                         if let Some(column_mask) = publication_column_mask(
@@ -4356,6 +4395,8 @@ impl Engine {
                                 end_lsn,
                                 command_id,
                                 &mut truncates[..truncate_count],
+                                truncate_tables.as_slice(),
+                                truncate_relations,
                                 responder,
                             )?;
                             let old = old_row.ok_or_else(|| {
@@ -4434,6 +4475,8 @@ impl Engine {
                 end_lsn,
                 u32::MAX,
                 &mut truncates[..truncate_count],
+                truncate_tables.as_slice(),
+                truncate_relations,
                 responder,
             )?;
             emit_pending_logical_messages(
@@ -4494,14 +4537,11 @@ impl Engine {
         txn: &mut TxnState,
         takes_snapshot: bool,
     ) -> Result<(), SqlError> {
-        let mut foreign_savepoints =
-            [crate::util::StackStr::new(); crate::sql::txn::MAX_SAVEPOINTS];
-        let foreign_savepoint_count = txn.copy_savepoint_names(&mut foreign_savepoints);
         self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
-            &foreign_savepoints[..foreign_savepoint_count],
-        );
+            txn.savepoint_names(),
+        )?;
         txn.begin_command();
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let snapshot = if takes_snapshot {
@@ -4574,10 +4614,10 @@ impl Engine {
         for event_index in 0..txn.truncates().len() {
             let event = txn.truncates()[event_index];
             let transaction_id = txn.txid;
-            let tables = txn.truncate_wal_tables();
+            let (table_slots, tables) = txn.truncate_wal_tables(event);
             tables.clear();
             let mut durable_table_count = 0usize;
-            for &table_slot in &event.tables[..event.table_count] {
+            for &table_slot in table_slots {
                 let definition = self.storage.table_def(table_slot as usize, transaction_id);
                 if definition.persistence == crate::storage::RelationPersistence::Temporary {
                     continue;
@@ -7028,9 +7068,9 @@ impl Engine {
             }
         }
         self.storage
-            .finish_cumulative_subtransactions(txn.txid, index as u8 + 2, false);
+            .finish_cumulative_subtransactions(txn.txid, index + 2, false);
         self.storage
-            .set_cumulative_transaction_nest_level(txn.txid, index as u8 + 2);
+            .set_cumulative_transaction_nest_level(txn.txid, index + 2);
         txn.rewind_touched(sp.touched_mark);
         txn.rewind_truncates(sp.truncate_mark);
         txn.rewind_ddl(sp.ddl_mark);
@@ -7724,19 +7764,30 @@ impl Engine {
             name: crate::storage::SqlName::EMPTY,
             generation: 0,
         };
-        let mut identities = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
+        let capacity = if matches!(targets, ast::ConstraintTargets::All) {
+            0
+        } else {
+            txn.constraint_capacity()
+        };
+        let identities = match arena.alloc_slice_with(capacity, |_| empty) {
+            Ok(identities) => identities,
+            Err(_) => return Ok(Err(query::arena_full_pub())),
+        };
+        let matches = match arena.alloc_slice_with(capacity, |_| empty) {
+            Ok(matches) => matches,
+            Err(_) => return Ok(Err(query::arena_full_pub())),
+        };
         let count = match targets {
             ast::ConstraintTargets::All => 0,
             ast::ConstraintTargets::Named(names) => {
                 let mut count = 0;
                 for name in names {
-                    let mut matches = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
                     let matched = match exec::constraints::resolve_constraint_name(
                         &self.storage,
                         name,
                         mode,
                         txn.txid,
-                        &mut matches,
+                        matches,
                     ) {
                         Ok(matched) => matched,
                         Err(error) => return Ok(Err(error)),
@@ -7769,7 +7820,7 @@ impl Engine {
             return Ok(Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction changes constraint modes more than {} times",
-                txn::MAX_DEFERRED_CONSTRAINTS
+                txn.constraint_capacity()
             )));
         }
         if mode == ast::ConstraintMode::Immediate {
@@ -8450,7 +8501,18 @@ impl Engine {
         // after yielding. Its block reads therefore own the store
         // synchronously, just as an explicit CHECKPOINT does.
         ckpt.disable_async_block_reads();
-        let checkpoint = ckpt.checkpoint_step(&mut self.storage, &mut self.scratch);
+        // A wide sweep can lose headroom faster than one beat reclaims it.
+        // Complete publication under critical pressure before dispatch resumes.
+        let checkpoint = if self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 85 {
+            ckpt.checkpoint(&mut self.storage, &mut self.scratch)
+                .map(|published| {
+                    published.map_or(CheckpointStep::Idle, |lsn| CheckpointStep::Published {
+                        lsn,
+                    })
+                })
+        } else {
+            ckpt.checkpoint_step(&mut self.storage, &mut self.scratch)
+        };
         ckpt.enable_async_block_reads();
         match checkpoint {
             Ok(CheckpointStep::Published { lsn }) => {
@@ -15752,7 +15814,7 @@ impl Engine {
                     .savepoint_index(name)
                     .expect("savepoint was retained after remote mirroring");
                 self.storage
-                    .set_cumulative_transaction_nest_level(txn.txid, index as u8 + 2);
+                    .set_cumulative_transaction_nest_level(txn.txid, index + 2);
                 guc.savepoint();
                 responder.command_complete("SAVEPOINT")?;
                 Ok(Ok(()))
@@ -15771,13 +15833,10 @@ impl Engine {
                         {
                             return Ok(Err(error));
                         }
-                        self.storage.finish_cumulative_subtransactions(
-                            txn.txid,
-                            index as u8 + 2,
-                            true,
-                        );
                         self.storage
-                            .set_cumulative_transaction_nest_level(txn.txid, index as u8 + 1);
+                            .finish_cumulative_subtransactions(txn.txid, index + 2, true);
+                        self.storage
+                            .set_cumulative_transaction_nest_level(txn.txid, index + 1);
                         txn.release_savepoints_from(index);
                         guc.release_savepoints_from(index);
                         responder.command_complete("RELEASE")?;

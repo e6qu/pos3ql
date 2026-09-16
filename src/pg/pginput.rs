@@ -9,7 +9,6 @@ use crate::storage::MAX_COLUMNS;
 
 /// PostgreSQL permits an arbitrary list here.  The apply worker is
 /// startup-bounded, so its protocol boundary names the matching limit.
-pub const MAX_TRUNCATE_RELATIONS: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
@@ -99,16 +98,15 @@ impl<'a> Relation<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Truncate {
-    relation_ids: [u32; MAX_TRUNCATE_RELATIONS],
-    count: usize,
+pub struct Truncate<'a> {
+    relation_ids: &'a [[u8; 4]],
     pub cascade: bool,
     pub restart_identity: bool,
 }
 
-impl Truncate {
-    pub fn relation_ids(&self) -> &[u32] {
-        &self.relation_ids[..self.count]
+impl Truncate<'_> {
+    pub fn relation_ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.relation_ids.iter().copied().map(u32::from_be_bytes)
     }
 }
 
@@ -160,7 +158,7 @@ pub enum Message<'a> {
     },
     Truncate {
         xid: Option<u32>,
-        truncate: Truncate,
+        truncate: Truncate<'a>,
     },
     LogicalMessage {
         xid: Option<u32>,
@@ -444,22 +442,21 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
         b'T' => {
             let xid = streamed_xid(&mut input, *state)?;
             let count: usize = input.u32()?.try_into().map_err(|_| DecodeError::Limit)?;
-            if count > MAX_TRUNCATE_RELATIONS {
-                return Err(DecodeError::Limit);
+            if count == 0 {
+                return Err(DecodeError::Invalid);
             }
             let flags = input.u8()?;
             if flags & !3 != 0 {
                 return Err(DecodeError::Invalid);
             }
-            let mut relation_ids = [0; MAX_TRUNCATE_RELATIONS];
-            for relation_id in &mut relation_ids[..count] {
-                *relation_id = input.u32()?;
-            }
+            let relation_ids = input
+                .bytes(count.checked_mul(4).ok_or(DecodeError::Limit)?)?
+                .as_chunks::<4>()
+                .0;
             Message::Truncate {
                 xid,
                 truncate: Truncate {
                     relation_ids,
-                    count,
                     cascade: flags & 1 != 0,
                     restart_identity: flags & 2 != 0,
                 },
@@ -652,6 +649,43 @@ mod tests {
             copy_data(&bytes[..25 + relation_frame.len() - 1]),
             Err(DecodeError::Truncated)
         );
+    }
+
+    #[test]
+    fn wide_truncate_borrows_all_relation_ids_and_rejects_malformed_counts() {
+        let mut bytes = vec![0_u8; 25];
+        bytes[0] = b'w';
+        bytes.push(b'T');
+        bytes.extend_from_slice(&300_u32.to_be_bytes());
+        bytes.push(3);
+        for id in 1..=300_u32 {
+            bytes.extend_from_slice(&id.to_be_bytes());
+        }
+        guard::forbid_alloc(|| {
+            let CopyData::XLogData {
+                message: Message::Truncate { truncate, .. },
+                ..
+            } = copy_data(&bytes).unwrap()
+            else {
+                panic!("wrong frame")
+            };
+            assert!(truncate.cascade && truncate.restart_identity);
+            assert_eq!(truncate.relation_ids().len(), 300);
+            assert!(truncate.relation_ids().eq(1..=300));
+            assert_eq!(
+                copy_data(&bytes[..bytes.len() - 1]),
+                Err(DecodeError::Truncated)
+            );
+        });
+        bytes[30] = 4;
+        assert_eq!(copy_data(&bytes), Err(DecodeError::Invalid));
+        bytes[30] = 0;
+        bytes[26..30].copy_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(copy_data(&bytes), Err(DecodeError::Invalid));
+        bytes[26..30].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(copy_data(&bytes), Err(DecodeError::Truncated));
+        bytes[26..30].copy_from_slice(&299_u32.to_be_bytes());
+        assert_eq!(copy_data(&bytes), Err(DecodeError::Invalid));
     }
 
     #[test]

@@ -22,6 +22,9 @@ use super::eval::{
 };
 use super::types::{ColType, Datum, TypeMod};
 
+#[path = "catalog_schema.rs"]
+mod schema;
+
 /// A materialized catalog relation: its shape plus rows in the arena.
 pub struct SynthTable<'a> {
     pub def: &'a TableDef,
@@ -8917,36 +8920,28 @@ pub(crate) fn object_acl_by_address<'a>(
     Ok(None)
 }
 
-/// Retains only the owned relation definition for schema-only resolution.
-/// Catalog rows and their strings cannot escape the temporary suffix.
+/// Resolves the same definition used by row synthesis without constructing rows.
 pub(crate) fn synthesize_definition<'a>(
-    storage: &Storage,
     qualifier: Option<&str>,
     name: &'a str,
-    txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = arena.alloc(TableDef::empty()).map_err(|_| arena_full())?;
-    let scratch_mark = arena.mark();
-    let result = synthesize(storage, qualifier, name, txid, arena);
-    let hidden_columns = match result {
-        Ok(table) => {
-            *definition = *table.def;
-            table.hidden_columns
-        }
-        Err(error) => {
-            // No result escapes on error, and the caller's inputs and output
-            // definition are below the scratch frontier.
-            unsafe { arena.rewind_to(scratch_mark) };
-            return Err(error);
-        }
-    };
-    // TableDef owns every field; only row data referred into this suffix.
-    unsafe { arena.rewind_to(scratch_mark) };
+    let information_schema = qualifier == Some("information_schema");
+    let specification = schema::definition(name, information_schema).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            name
+        )
+    })?;
+    let hidden = schema::hidden_columns(name, information_schema);
+    let definition = arena
+        .alloc(materialize_with_hidden(specification, hidden)?)
+        .map_err(|_| arena_full())?;
     Ok(SynthTable {
         def: definition,
         rows: &[],
-        hidden_columns,
+        hidden_columns: hidden.len(),
     })
 }
 
@@ -8971,32 +8966,18 @@ pub fn synthesize<'a>(
         (false, "pg_cursors") => pg_cursors(arena),
         (false, "pg_prepared_statements") => pg_prepared_statements(storage, txid, arena),
         (false, "pg_wait_events") => pg_wait_events(arena),
-        (false, "pg_aios") => empty_monitoring_view("pg_aios", PG_AIOS_COLUMNS, arena),
-        (false, "pg_backend_memory_contexts") => empty_monitoring_view(
-            "pg_backend_memory_contexts",
-            PG_BACKEND_MEMORY_CONTEXTS_COLUMNS,
-            arena,
-        ),
-        (false, "pg_config") => empty_monitoring_view("pg_config", PG_CONFIG_COLUMNS, arena),
-        (false, "pg_file_settings") => {
-            empty_monitoring_view("pg_file_settings", PG_FILE_SETTINGS_COLUMNS, arena)
+        (false, "pg_aios") => empty_monitoring_view("pg_aios", arena),
+        (false, "pg_backend_memory_contexts") => {
+            empty_monitoring_view("pg_backend_memory_contexts", arena)
         }
-        (false, "pg_hba_file_rules") => {
-            empty_monitoring_view("pg_hba_file_rules", PG_HBA_FILE_RULES_COLUMNS, arena)
+        (false, "pg_config") => empty_monitoring_view("pg_config", arena),
+        (false, "pg_file_settings") => empty_monitoring_view("pg_file_settings", arena),
+        (false, "pg_hba_file_rules") => empty_monitoring_view("pg_hba_file_rules", arena),
+        (false, "pg_ident_file_mappings") => empty_monitoring_view("pg_ident_file_mappings", arena),
+        (false, "pg_shmem_allocations") => empty_monitoring_view("pg_shmem_allocations", arena),
+        (false, "pg_shmem_allocations_numa") => {
+            empty_monitoring_view("pg_shmem_allocations_numa", arena)
         }
-        (false, "pg_ident_file_mappings") => empty_monitoring_view(
-            "pg_ident_file_mappings",
-            PG_IDENT_FILE_MAPPINGS_COLUMNS,
-            arena,
-        ),
-        (false, "pg_shmem_allocations") => {
-            empty_monitoring_view("pg_shmem_allocations", PG_SHMEM_ALLOCATIONS_COLUMNS, arena)
-        }
-        (false, "pg_shmem_allocations_numa") => empty_monitoring_view(
-            "pg_shmem_allocations_numa",
-            PG_SHMEM_ALLOCATIONS_NUMA_COLUMNS,
-            arena,
-        ),
         (false, "pg_stat_activity") => pg_stat_activity(storage, txid, arena),
         (false, "pg_stat_ssl") => pg_stat_ssl(storage, arena),
         (false, "pg_stat_all_tables") => pg_stat_tables(
@@ -9132,9 +9113,7 @@ pub fn synthesize<'a>(
             StatisticsScope::User,
         ),
         (false, "pg_stat_slru") => pg_stat_slru(storage, arena),
-        (false, "pg_stat_wal_receiver") => {
-            empty_monitoring_view("pg_stat_wal_receiver", PG_STAT_WAL_RECEIVER_COLUMNS, arena)
-        }
+        (false, "pg_stat_wal_receiver") => empty_monitoring_view("pg_stat_wal_receiver", arena),
         (false, "pg_stat_recovery_prefetch") => pg_stat_recovery_prefetch(storage, arena),
         (false, "pg_stat_gssapi") => pg_stat_gssapi(storage, arena),
         (false, "pg_stat_database") => pg_stat_database(storage, txid, arena),
@@ -9146,36 +9125,22 @@ pub fn synthesize<'a>(
         (false, "pg_stat_checkpointer") => pg_stat_checkpointer(storage, arena),
         (false, "pg_stat_io") => pg_stat_io(storage, arena),
         (false, "pg_stat_wal") => pg_stat_wal(storage, arena),
-        (false, "pg_stat_progress_analyze") => empty_monitoring_view(
-            "pg_stat_progress_analyze",
-            PG_STAT_PROGRESS_ANALYZE_COLUMNS,
-            arena,
-        ),
-        (false, "pg_stat_progress_vacuum") => empty_monitoring_view(
-            "pg_stat_progress_vacuum",
-            PG_STAT_PROGRESS_VACUUM_COLUMNS,
-            arena,
-        ),
-        (false, "pg_stat_progress_cluster") => empty_monitoring_view(
-            "pg_stat_progress_cluster",
-            PG_STAT_PROGRESS_CLUSTER_COLUMNS,
-            arena,
-        ),
-        (false, "pg_stat_progress_create_index") => empty_monitoring_view(
-            "pg_stat_progress_create_index",
-            PG_STAT_PROGRESS_CREATE_INDEX_COLUMNS,
-            arena,
-        ),
-        (false, "pg_stat_progress_basebackup") => empty_monitoring_view(
-            "pg_stat_progress_basebackup",
-            PG_STAT_PROGRESS_BASEBACKUP_COLUMNS,
-            arena,
-        ),
-        (false, "pg_stat_progress_copy") => empty_monitoring_view(
-            "pg_stat_progress_copy",
-            PG_STAT_PROGRESS_COPY_COLUMNS,
-            arena,
-        ),
+        (false, "pg_stat_progress_analyze") => {
+            empty_monitoring_view("pg_stat_progress_analyze", arena)
+        }
+        (false, "pg_stat_progress_vacuum") => {
+            empty_monitoring_view("pg_stat_progress_vacuum", arena)
+        }
+        (false, "pg_stat_progress_cluster") => {
+            empty_monitoring_view("pg_stat_progress_cluster", arena)
+        }
+        (false, "pg_stat_progress_create_index") => {
+            empty_monitoring_view("pg_stat_progress_create_index", arena)
+        }
+        (false, "pg_stat_progress_basebackup") => {
+            empty_monitoring_view("pg_stat_progress_basebackup", arena)
+        }
+        (false, "pg_stat_progress_copy") => empty_monitoring_view("pg_stat_progress_copy", arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
@@ -9230,21 +9195,7 @@ pub fn synthesize<'a>(
         (false, "pg_ts_config_map") => pg_ts_config_map(storage, txid, arena),
         (false, "pg_init_privs") => pg_init_privs(arena),
         (false, "pg_cast") => pg_cast(storage, txid, arena),
-        (false, "pg_transform") => finish(
-            def_of(
-                "pg_transform",
-                &[
-                    ("tableoid", ColType::Oid),
-                    ("oid", ColType::Oid),
-                    ("trftype", ColType::Oid),
-                    ("trflang", ColType::Oid),
-                    ("trffromsql", ColType::Regproc),
-                    ("trftosql", ColType::Regproc),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_transform") => finish(schema::require("pg_transform", false), &[], arena),
         (false, "pg_language") => pg_language(storage, txid, arena),
         (false, "pg_auth_members") => pg_auth_members(storage, txid, arena),
         (false, "pg_db_role_setting") => pg_db_role_setting(storage, txid, arena),
@@ -9262,65 +9213,16 @@ pub fn synthesize<'a>(
         (false, "pg_shadow") => pg_shadow(storage, txid, arena, false),
         (false, "pg_user") => pg_shadow(storage, txid, arena, true),
         (false, "pg_authid") => pg_authid(storage, txid, arena, true),
-        (false, "pg_seclabel") => empty_monitoring_view(
-            "pg_seclabel",
-            &[
-                ("objoid", ColType::Oid),
-                ("classoid", ColType::Oid),
-                ("objsubid", ColType::Int4),
-                ("provider", ColType::Text),
-                ("label", ColType::Text),
-            ],
-            arena,
-        ),
+        (false, "pg_seclabel") => empty_monitoring_view("pg_seclabel", arena),
         (false, "pg_shdepend") => pg_shdepend(storage, txid, arena),
         (false, "pg_description") => pg_description(storage, txid, arena),
         (false, "pg_shdescription") => pg_shdescription(storage, txid, arena),
-        (false, "pg_seclabels") => finish(
-            def_of(
-                "pg_seclabels",
-                &[
-                    ("objoid", ColType::Int4),
-                    ("classoid", ColType::Int4),
-                    ("objsubid", ColType::Int4),
-                    ("objtype", ColType::Text),
-                    ("objnamespace", ColType::Int4),
-                    ("objname", ColType::Text),
-                    ("provider", ColType::Text),
-                    ("label", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_shseclabel") => finish(
-            def_of(
-                "pg_shseclabel",
-                &[
-                    ("objoid", ColType::Int4),
-                    ("classoid", ColType::Int4),
-                    ("provider", ColType::Text),
-                    ("label", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_seclabels") => finish(schema::require("pg_seclabels", false), &[], arena),
+        (false, "pg_shseclabel") => finish(schema::require("pg_shseclabel", false), &[], arena),
         (false, "pg_largeobject_metadata") => pg_largeobject_metadata(storage, txid, arena),
         (false, "pg_largeobject") => pg_largeobject(storage, txid, arena),
         (false, "pg_enum") => pg_enum(storage, txid, arena),
-        (false, "pg_range") => finish(
-            def_of(
-                "pg_range",
-                &[
-                    ("rngtypid", ColType::Int4),
-                    ("rngsubtype", ColType::Int4),
-                    ("rngmultitypid", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_range") => finish(schema::require("pg_range", false), &[], arena),
         (false, "pg_matviews") => pg_matviews(storage, txid, arena),
         (false, "pg_sequences") => pg_sequences(storage, txid, arena),
         (false, "pg_sequence") => pg_sequence(storage, txid, arena),
@@ -9470,19 +9372,7 @@ fn pg_foreign_data_wrapper<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_foreign_data_wrapper",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("fdwname", ColType::Name),
-            ("fdwowner", ColType::Int4),
-            ("fdwhandler", ColType::Int4),
-            ("fdwvalidator", ColType::Int4),
-            ("fdwacl", ColType::Array(super::types::ArrElem::AclItem)),
-            ("fdwoptions", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require("pg_foreign_data_wrapper", false);
     let count = storage.foreign_wrappers(txid).count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -9529,20 +9419,7 @@ fn pg_foreign_server<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_foreign_server",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("srvname", ColType::Name),
-            ("srvowner", ColType::Int4),
-            ("srvfdw", ColType::Int4),
-            ("srvtype", ColType::Text),
-            ("srvversion", ColType::Text),
-            ("srvacl", ColType::Array(super::types::ArrElem::AclItem)),
-            ("srvoptions", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require("pg_foreign_server", false);
     let count = storage.foreign_servers(txid).count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -9586,14 +9463,7 @@ fn pg_foreign_table<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_foreign_table",
-        &[
-            ("ftrelid", ColType::Int4),
-            ("ftserver", ColType::Int4),
-            ("ftoptions", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require("pg_foreign_table", false);
     let count = storage.foreign_tables(txid).count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -9617,15 +9487,7 @@ fn pg_user_mapping<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_user_mapping",
-        &[
-            ("oid", ColType::Int4),
-            ("umuser", ColType::Int4),
-            ("umserver", ColType::Int4),
-            ("umoptions", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require("pg_user_mapping", false);
     let count = storage.foreign_user_mappings(txid).count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -9660,17 +9522,7 @@ fn pg_user_mappings<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_user_mappings",
-        &[
-            ("umid", ColType::Int4),
-            ("srvid", ColType::Int4),
-            ("srvname", ColType::Name),
-            ("umuser", ColType::Int4),
-            ("usename", ColType::Name),
-            ("umoptions", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require("pg_user_mappings", false);
     let count = storage.foreign_user_mappings(txid).count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -10043,16 +9895,7 @@ fn builtin_acl<'a>(values: &[&str], arena: &'a Arena) -> Result<Datum<'a>, SqlEr
 }
 
 fn pg_init_privs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_init_privs",
-        &[
-            ("objoid", ColType::Int4),
-            ("classoid", ColType::Int4),
-            ("objsubid", ColType::Int4),
-            ("privtype", ColType::Bpchar),
-            ("initprivs", ColType::Array(super::types::ArrElem::AclItem)),
-        ],
-    );
+    let definition = schema::require("pg_init_privs", false);
     let rows = arena
         .alloc_slice_with(9, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -10079,14 +9922,7 @@ fn pg_largeobject_metadata<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_largeobject_metadata",
-        &[
-            ("oid", ColType::Oid),
-            ("lomowner", ColType::Oid),
-            ("lomacl", ColType::Array(super::types::ArrElem::AclItem)),
-        ],
-    );
+    let definition = schema::require("pg_largeobject_metadata", false);
     let count = storage.large_objects_visible_to(txid).count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -10125,14 +9961,7 @@ fn pg_largeobject<'a>(
             "permission denied for table pg_largeobject"
         ));
     }
-    let definition = def_of(
-        "pg_largeobject",
-        &[
-            ("loid", ColType::Oid),
-            ("pageno", ColType::Int4),
-            ("data", ColType::Bytea),
-        ],
-    );
+    let definition = schema::require("pg_largeobject", false);
     let mut count = 0usize;
     super::large_object::for_each_page(storage, txid, &mut |_, _, _| {
         count = count
@@ -10233,13 +10062,7 @@ fn pg_parameter_acl<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     use core::fmt::Write;
-    let definition = def_of(
-        "pg_parameter_acl",
-        &[
-            ("parname", ColType::Text),
-            ("paracl", ColType::Array(super::types::ArrElem::AclItem)),
-        ],
-    );
+    let definition = schema::require("pg_parameter_acl", false);
     let rows = arena
         .alloc_slice_with(storage.parameter_acl_entry_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -10329,17 +10152,7 @@ fn pg_default_acl<'a>(
     };
     use core::fmt::Write;
 
-    let def = def_of(
-        "pg_default_acl",
-        &[
-            ("oid", ColType::Int4),
-            ("tableoid", ColType::Int4),
-            ("defaclrole", ColType::Int4),
-            ("defaclnamespace", ColType::Int4),
-            ("defaclobjtype", ColType::Bpchar),
-            ("defaclacl", ColType::Array(super::types::ArrElem::AclItem)),
-        ],
-    );
+    let def = schema::require("pg_default_acl", false);
     let rows = arena
         .alloc_slice_with(storage.default_acl_entry_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -11601,10 +11414,12 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
         }
         (None, schema) => schema,
     };
-    if let Some(crate::storage::ResolvedRelation::Table(slot)) =
-        storage.resolve_relation(schema, relation, txid)
-    {
-        return Some(table_oid(storage, slot));
+    match storage.resolve_relation(schema, relation, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => {
+            return Some(table_oid(storage, slot));
+        }
+        Some(crate::storage::ResolvedRelation::View(slot)) => return Some(view_oid(slot)),
+        Some(crate::storage::ResolvedRelation::Catalog) | None => {}
     }
     for slot in 0..storage.table_count() {
         if storage.table_slot_visible_to(slot, txid)
@@ -13914,15 +13729,7 @@ fn pg_description<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_description",
-        &[
-            ("objoid", ColType::Oid),
-            ("classoid", ColType::Oid),
-            ("objsubid", ColType::Int4),
-            ("description", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_description", false);
     let out = arena
         .alloc_slice_with(storage.comment_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -14221,14 +14028,7 @@ fn pg_shdescription<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_shdescription",
-        &[
-            ("objoid", ColType::Int4),
-            ("classoid", ColType::Int4),
-            ("description", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_shdescription", false);
     let rows = arena
         .alloc_slice_with(storage.comment_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -15876,10 +15676,6 @@ struct SynthDef<'a> {
     columns: &'a [(&'a str, ColType)],
 }
 
-fn def_of<'a>(name: &'a str, columns: &'a [(&'a str, ColType)]) -> SynthDef<'a> {
-    SynthDef { name, columns }
-}
-
 fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     let mut definition = TableDef {
         name: SqlName::parse(specification.name).expect("catalog name fits"),
@@ -15919,12 +15715,10 @@ fn finish<'a>(
 /// Materializes an exact visible relation shape plus addressable PostgreSQL
 /// system columns. Hidden columns are encoded in each row after the visible
 /// fields but remain outside `n_columns`, so star expansion cannot expose them.
-fn finish_with_hidden<'a>(
+fn materialize_with_hidden(
     specification: SynthDef<'_>,
     hidden: &[(&str, ColType)],
-    rows: &[&'a [Datum<'a>]],
-    arena: &'a Arena,
-) -> Result<SynthTable<'a>, SqlError> {
+) -> Result<TableDef, SqlError> {
     if specification.columns.len() + hidden.len() > MAX_COLUMNS {
         return Err(catalog_capacity_exceeded(specification.name));
     }
@@ -15935,7 +15729,18 @@ fn finish_with_hidden<'a>(
         column.ctype = *column_type;
         column.collation = crate::sql::ast::Collation::None;
     }
-    let def = arena.alloc(definition).map_err(|_| arena_full())?;
+    Ok(definition)
+}
+
+fn finish_with_hidden<'a>(
+    specification: SynthDef<'_>,
+    hidden: &[(&str, ColType)],
+    rows: &[&'a [Datum<'a>]],
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = arena
+        .alloc(materialize_with_hidden(specification, hidden)?)
+        .map_err(|_| arena_full())?;
     let typed = arena
         .alloc_slice_with(rows.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -16072,37 +15877,7 @@ fn pg_stats<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_stats",
-        &[
-            ("schemaname", ColType::Name),
-            ("tablename", ColType::Name),
-            ("attname", ColType::Name),
-            ("inherited", ColType::Bool),
-            ("null_frac", ColType::Float4),
-            ("avg_width", ColType::Int4),
-            ("n_distinct", ColType::Float4),
-            ("most_common_vals", ColType::AnyArray),
-            (
-                "most_common_freqs",
-                ColType::Array(super::types::ArrElem::Float4),
-            ),
-            ("histogram_bounds", ColType::AnyArray),
-            ("correlation", ColType::Float4),
-            ("most_common_elems", ColType::AnyArray),
-            (
-                "most_common_elem_freqs",
-                ColType::Array(super::types::ArrElem::Float4),
-            ),
-            (
-                "elem_count_histogram",
-                ColType::Array(super::types::ArrElem::Float4),
-            ),
-            ("range_length_histogram", ColType::AnyArray),
-            ("range_empty_frac", ColType::Float4),
-            ("range_bounds_histogram", ColType::AnyArray),
-        ],
-    );
+    let def = schema::require("pg_stats", false);
     let row_capacity = (0..storage.table_count())
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
         .map(|slot| {
@@ -16288,21 +16063,7 @@ fn pg_statistic_ext<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_statistic_ext",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("stxrelid", ColType::Int4),
-            ("stxname", ColType::Name),
-            ("stxnamespace", ColType::Int4),
-            ("stxowner", ColType::Int4),
-            ("stxkeys", ColType::Int2Vector),
-            ("stxstattarget", ColType::Int2),
-            ("stxkind", ColType::Array(super::types::ArrElem::Char)),
-            ("stxexprs", ColType::PgNodeTree),
-        ],
-    );
+    let definition = schema::require("pg_statistic_ext", false);
     let rows = arena
         .alloc_slice_with(storage.extended_statistics_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -16598,18 +16359,7 @@ fn pg_statistic_ext_data<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_statistic_ext_data",
-        &[
-            ("tableoid", ColType::Int4),
-            ("stxoid", ColType::Int4),
-            ("stxdinherit", ColType::Bool),
-            ("stxdndistinct", ColType::PgNdistinct),
-            ("stxddependencies", ColType::PgDependencies),
-            ("stxdmcv", ColType::PgMcvList),
-            ("stxdexpr", ColType::PgStatisticArray),
-        ],
-    );
+    let definition = schema::require("pg_statistic_ext_data", false);
     let rows = arena
         .alloc_slice_with(storage.extended_statistics_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -16679,38 +16429,7 @@ fn pg_stats_ext<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_stats_ext",
-        &[
-            ("schemaname", ColType::Name),
-            ("tablename", ColType::Name),
-            ("statistics_schemaname", ColType::Name),
-            ("statistics_name", ColType::Name),
-            ("statistics_owner", ColType::Name),
-            ("attnames", ColType::Array(super::types::ArrElem::Name)),
-            ("exprs", ColType::Array(super::types::ArrElem::Text)),
-            ("kinds", ColType::Array(super::types::ArrElem::Char)),
-            ("inherited", ColType::Bool),
-            ("n_distinct", ColType::PgNdistinct),
-            ("dependencies", ColType::PgDependencies),
-            (
-                "most_common_vals",
-                ColType::Array(super::types::ArrElem::Text),
-            ),
-            (
-                "most_common_val_nulls",
-                ColType::Array(super::types::ArrElem::Bool),
-            ),
-            (
-                "most_common_freqs",
-                ColType::Array(super::types::ArrElem::Float8),
-            ),
-            (
-                "most_common_base_freqs",
-                ColType::Array(super::types::ArrElem::Float8),
-            ),
-        ],
-    );
+    let definition = schema::require("pg_stats_ext", false);
     let rows = arena
         .alloc_slice_with(storage.extended_statistics_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -16901,37 +16620,7 @@ fn pg_stats_ext_exprs<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_stats_ext_exprs",
-        &[
-            ("schemaname", ColType::Name),
-            ("tablename", ColType::Name),
-            ("statistics_schemaname", ColType::Name),
-            ("statistics_name", ColType::Name),
-            ("statistics_owner", ColType::Name),
-            ("expr", ColType::Text),
-            ("inherited", ColType::Bool),
-            ("null_frac", ColType::Float4),
-            ("avg_width", ColType::Int4),
-            ("n_distinct", ColType::Float4),
-            ("most_common_vals", ColType::AnyArray),
-            (
-                "most_common_freqs",
-                ColType::Array(super::types::ArrElem::Float4),
-            ),
-            ("histogram_bounds", ColType::AnyArray),
-            ("correlation", ColType::Float4),
-            ("most_common_elems", ColType::AnyArray),
-            (
-                "most_common_elem_freqs",
-                ColType::Array(super::types::ArrElem::Float4),
-            ),
-            (
-                "elem_count_histogram",
-                ColType::Array(super::types::ArrElem::Float4),
-            ),
-        ],
-    );
+    let definition = schema::require("pg_stats_ext_exprs", false);
     let capacity = storage
         .extended_statistics_count()
         .checked_mul(crate::storage::MAX_EXTENDED_STATISTICS_KEYS)
@@ -17004,20 +16693,7 @@ fn pg_policy<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_policy",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("polname", ColType::Name),
-            ("polrelid", ColType::Int4),
-            ("polcmd", ColType::Bpchar),
-            ("polpermissive", ColType::Bool),
-            ("polroles", ColType::Array(super::types::ArrElem::Oid)),
-            ("polqual", ColType::PgNodeTree),
-            ("polwithcheck", ColType::PgNodeTree),
-        ],
-    );
+    let definition = schema::require("pg_policy", false);
     let rows = arena
         .alloc_slice_with(storage.policy_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -17059,19 +16735,7 @@ fn pg_policies<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_policies",
-        &[
-            ("schemaname", ColType::Name),
-            ("tablename", ColType::Name),
-            ("policyname", ColType::Name),
-            ("permissive", ColType::Text),
-            ("roles", ColType::Array(super::types::ArrElem::Name)),
-            ("cmd", ColType::Text),
-            ("qual", ColType::Text),
-            ("with_check", ColType::Text),
-        ],
-    );
+    let definition = schema::require("pg_policies", false);
     let rows = arena
         .alloc_slice_with(storage.policy_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -17117,22 +16781,7 @@ fn pg_publication<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_publication",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("pubname", ColType::Text),
-            ("pubowner", ColType::Int4),
-            ("puballtables", ColType::Bool),
-            ("pubinsert", ColType::Bool),
-            ("pubupdate", ColType::Bool),
-            ("pubdelete", ColType::Bool),
-            ("pubtruncate", ColType::Bool),
-            ("pubviaroot", ColType::Bool),
-            ("pubgencols", ColType::Bpchar),
-        ],
-    );
+    let definition = schema::require("pg_publication", false);
     let rows = catalog_rows(
         arena,
         storage.publications_with_slots_visible_to(txid).count(),
@@ -17168,15 +16817,7 @@ fn pg_publication_namespace<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_publication_namespace",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("pnpubid", ColType::Int4),
-            ("pnnspid", ColType::Int4),
-        ],
-    );
+    let definition = schema::require("pg_publication_namespace", false);
     let row_capacity = storage
         .publications_with_slots_visible_to(txid)
         .map(|(_, publication)| publication.definition_for(txid).schema_count)
@@ -17214,17 +16855,7 @@ fn pg_publication_rel<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_publication_rel",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("prpubid", ColType::Int4),
-            ("prrelid", ColType::Int4),
-            ("prqual", ColType::Text),
-            ("prattrs", ColType::Int2Vector),
-        ],
-    );
+    let definition = schema::require("pg_publication_rel", false);
     let row_capacity = storage
         .publications_with_slots_visible_to(txid)
         .map(|(_, publication)| {
@@ -17297,16 +16928,7 @@ fn pg_publication_tables<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_publication_tables",
-        &[
-            ("pubname", ColType::Name),
-            ("schemaname", ColType::Name),
-            ("tablename", ColType::Name),
-            ("attnames", ColType::Array(super::types::ArrElem::Name)),
-            ("rowfilter", ColType::Text),
-        ],
-    );
+    let definition = schema::require("pg_publication_tables", false);
     let publication_count = storage.publications_with_slots_visible_to(txid).count();
     let visible_table_count = storage
         .live_tables()
@@ -18218,7 +17840,7 @@ fn pg_replication_slots<'a>(
     storage: &Storage,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_replication_slots", PG_REPLICATION_SLOTS_COLUMNS);
+    let definition = schema::require("pg_replication_slots", false);
     let rows = catalog_rows(arena, storage.replication_slots_with_slots().count())?;
     let mut count = 0;
     let database_definition = storage.database_definition(
@@ -18275,10 +17897,7 @@ fn pg_replication_origin<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_replication_origin",
-        &[("roident", ColType::Oid), ("roname", ColType::Text)],
-    );
+    let definition = schema::require("pg_replication_origin", false);
     let rows = arena
         .alloc_slice_with(
             storage.subscriptions_with_slots_visible_to(txid).count(),
@@ -18302,10 +17921,7 @@ fn pg_replication_origin_status<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_replication_origin_status",
-        PG_REPLICATION_ORIGIN_STATUS_COLUMNS,
-    );
+    let definition = schema::require("pg_replication_origin_status", false);
     let rows = arena
         .alloc_slice_with(
             storage.subscriptions_with_slots_visible_to(txid).count(),
@@ -18333,7 +17949,7 @@ fn pg_stat_replication<'a>(
     storage: &Storage,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_stat_replication", PG_STAT_REPLICATION_COLUMNS);
+    let definition = schema::require("pg_stat_replication", false);
     let rows = catalog_rows(
         arena,
         storage
@@ -18387,10 +18003,7 @@ fn pg_stat_replication_slots<'a>(
     storage: &Storage,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_stat_replication_slots",
-        PG_STAT_REPLICATION_SLOTS_COLUMNS,
-    );
+    let definition = schema::require("pg_stat_replication_slots", false);
     let rows = catalog_rows(arena, storage.replication_slots_with_slots().count())?;
     let mut count = 0;
     for (_, slot) in storage.replication_slots_with_slots() {
@@ -18426,33 +18039,7 @@ fn pg_subscription<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_subscription",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("subdbid", ColType::Int4),
-            ("subskiplsn", ColType::Text),
-            ("subname", ColType::Name),
-            ("subowner", ColType::Int4),
-            ("subenabled", ColType::Bool),
-            ("subbinary", ColType::Bool),
-            ("substream", ColType::Bpchar),
-            ("subtwophasestate", ColType::Bpchar),
-            ("subdisableonerr", ColType::Bool),
-            ("subpasswordrequired", ColType::Bool),
-            ("subrunasowner", ColType::Bool),
-            ("subfailover", ColType::Bool),
-            ("subconninfo", ColType::Text),
-            ("subslotname", ColType::Name),
-            ("subsynccommit", ColType::Text),
-            (
-                "subpublications",
-                ColType::Array(super::types::ArrElem::Text),
-            ),
-            ("suborigin", ColType::Text),
-        ],
-    );
+    let definition = schema::require("pg_subscription", false);
     let rows = catalog_rows(
         arena,
         storage.subscriptions_with_slots_visible_to(txid).count(),
@@ -18535,15 +18122,7 @@ fn pg_subscription_rel<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_subscription_rel",
-        &[
-            ("srsubid", ColType::Int4),
-            ("srrelid", ColType::Int4),
-            ("srsubstate", ColType::Bpchar),
-            ("srsublsn", ColType::Text),
-        ],
-    );
+    let definition = schema::require("pg_subscription_rel", false);
     let count = storage
         .subscriptions_with_slots_visible_to(txid)
         .map(|(_, subscription)| {
@@ -18584,7 +18163,7 @@ fn pg_stat_subscription<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_stat_subscription", PG_STAT_SUBSCRIPTION_COLUMNS);
+    let definition = schema::require("pg_stat_subscription", false);
     let rows = catalog_rows(
         arena,
         storage
@@ -18635,10 +18214,7 @@ fn pg_stat_subscription_stats<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_stat_subscription_stats",
-        PG_STAT_SUBSCRIPTION_STATS_COLUMNS,
-    );
+    let definition = schema::require("pg_stat_subscription_stats", false);
     let rows = catalog_rows(
         arena,
         storage.subscriptions_with_slots_visible_to(txid).count(),
@@ -18681,15 +18257,7 @@ fn pg_inherits<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_inherits",
-        &[
-            ("inhrelid", ColType::Int4),
-            ("inhparent", ColType::Int4),
-            ("inhseqno", ColType::Int4),
-            ("inhdetachpending", ColType::Bool),
-        ],
-    );
+    let def = schema::require("pg_inherits", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let inherited_indexes = indexes
         .iter()
@@ -18774,19 +18342,7 @@ fn pg_partitioned_table<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_partitioned_table",
-        &[
-            ("partrelid", ColType::Int4),
-            ("partstrat", ColType::Char),
-            ("partnatts", ColType::Int2),
-            ("partdefid", ColType::Int4),
-            ("partattrs", ColType::Int2Vector),
-            ("partclass", ColType::OidVector),
-            ("partcollation", ColType::OidVector),
-            ("partexprs", ColType::PgNodeTree),
-        ],
-    );
+    let def = schema::require("pg_partitioned_table", false);
     let rows = catalog_rows(
         arena,
         (0..storage.table_count())
@@ -18874,45 +18430,7 @@ fn pg_class<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_class",
-        &[
-            ("oid", ColType::Oid),
-            ("relname", ColType::Name),
-            ("relnamespace", ColType::Oid),
-            ("reltype", ColType::Oid),
-            ("reloftype", ColType::Oid),
-            ("relowner", ColType::Oid),
-            ("relam", ColType::Oid),
-            ("relfilenode", ColType::Oid),
-            ("reltablespace", ColType::Oid),
-            ("relpages", ColType::Int4),
-            ("reltuples", ColType::Float4),
-            ("relallvisible", ColType::Int4),
-            ("relallfrozen", ColType::Int4),
-            ("reltoastrelid", ColType::Oid),
-            ("relhasindex", ColType::Bool),
-            ("relisshared", ColType::Bool),
-            ("relpersistence", ColType::Char),
-            ("relkind", ColType::Char),
-            ("relnatts", ColType::Int2),
-            ("relchecks", ColType::Int2),
-            ("relhasrules", ColType::Bool),
-            ("relhastriggers", ColType::Bool),
-            ("relhassubclass", ColType::Bool),
-            ("relrowsecurity", ColType::Bool),
-            ("relforcerowsecurity", ColType::Bool),
-            ("relispopulated", ColType::Bool),
-            ("relreplident", ColType::Char),
-            ("relispartition", ColType::Bool),
-            ("relrewrite", ColType::Oid),
-            ("relfrozenxid", ColType::Xid),
-            ("relminmxid", ColType::Xid),
-            ("relacl", ColType::Array(super::types::ArrElem::AclItem)),
-            ("reloptions", ColType::Array(super::types::ArrElem::Text)),
-            ("relpartbound", ColType::PgNodeTree),
-        ],
-    );
+    let def = schema::require("pg_class", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let foreign_keys = collect_fkeys(storage, txid, arena)?;
     let visible_tables = (0..storage.table_count())
@@ -19637,7 +19155,12 @@ fn pg_class<'a>(
             arena,
         )?;
     }
-    finish_with_hidden(def, &[("tableoid", ColType::Oid)], compatible, arena)
+    finish_with_hidden(
+        def,
+        schema::hidden_columns(def.name, false),
+        compatible,
+        arena,
+    )
 }
 
 pub(crate) fn tablespace_oid(tablespace: crate::storage::TablespaceDef) -> i32 {
@@ -19701,17 +19224,7 @@ fn pg_tablespace<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_tablespace",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("spcname", ColType::Name),
-            ("spcowner", ColType::Int4),
-            ("spcacl", ColType::Array(super::types::ArrElem::AclItem)),
-            ("spcoptions", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let def = schema::require("pg_tablespace", false);
     let rows = arena
         .alloc_slice_with(storage.tablespace_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -19872,42 +19385,7 @@ fn pg_constraint<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_constraint",
-        &[
-            ("oid", ColType::Oid),
-            ("conname", ColType::Name),
-            ("connamespace", ColType::Oid),
-            ("contype", ColType::Char),
-            ("condeferrable", ColType::Bool),
-            ("condeferred", ColType::Bool),
-            ("conenforced", ColType::Bool),
-            ("convalidated", ColType::Bool),
-            ("conrelid", ColType::Oid),
-            ("contypid", ColType::Oid),
-            ("conindid", ColType::Oid),
-            ("conparentid", ColType::Oid),
-            ("confrelid", ColType::Oid),
-            ("confupdtype", ColType::Char),
-            ("confdeltype", ColType::Char),
-            ("confmatchtype", ColType::Char),
-            ("conislocal", ColType::Bool),
-            ("coninhcount", ColType::Int2),
-            ("connoinherit", ColType::Bool),
-            ("conperiod", ColType::Bool),
-            ("conkey", ColType::Array(super::types::ArrElem::Int2)),
-            ("confkey", ColType::Array(super::types::ArrElem::Int2)),
-            ("conpfeqop", ColType::Array(super::types::ArrElem::Oid)),
-            ("conppeqop", ColType::Array(super::types::ArrElem::Oid)),
-            ("conffeqop", ColType::Array(super::types::ArrElem::Oid)),
-            (
-                "confdelsetcols",
-                ColType::Array(super::types::ArrElem::Int2),
-            ),
-            ("conexclop", ColType::Array(super::types::ArrElem::Oid)),
-            ("conbin", ColType::PgNodeTree),
-        ],
-    );
+    let def = schema::require("pg_constraint", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let fks = collect_fkeys(storage, txid, arena)?;
     let index_constraints = indexes
@@ -20396,7 +19874,12 @@ fn pg_constraint<'a>(
         values[28] = super::eval::cast_to(source[17], ColType::Oid, arena)?;
         *target = row(&values, arena)?;
     }
-    finish_with_hidden(def, &[("tableoid", ColType::Oid)], compatible, arena)
+    finish_with_hidden(
+        def,
+        schema::hidden_columns(def.name, false),
+        compatible,
+        arena,
+    )
 }
 
 fn pg_rewrite<'a>(
@@ -20404,18 +19887,7 @@ fn pg_rewrite<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_rewrite",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("rulename", ColType::Text),
-            ("ev_class", ColType::Int4),
-            ("ev_type", ColType::Bpchar),
-            ("ev_enabled", ColType::Bpchar),
-            ("is_instead", ColType::Bool),
-        ],
-    );
+    let def = schema::require("pg_rewrite", false);
     let count = storage.rules_visible_to(txid).count();
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -20470,15 +19942,7 @@ fn pg_available_extensions<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_available_extensions",
-        &[
-            ("name", ColType::Name),
-            ("default_version", ColType::Text),
-            ("installed_version", ColType::Text),
-            ("comment", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_available_extensions", false);
     let count = storage.extension_packages().count();
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -20515,20 +19979,7 @@ fn pg_available_extension_versions<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_available_extension_versions",
-        &[
-            ("name", ColType::Name),
-            ("version", ColType::Text),
-            ("installed", ColType::Bool),
-            ("superuser", ColType::Bool),
-            ("trusted", ColType::Bool),
-            ("relocatable", ColType::Bool),
-            ("schema", ColType::Name),
-            ("requires", ColType::Array(super::types::ArrElem::Name)),
-            ("comment", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_available_extension_versions", false);
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut emitted: [Option<(usize, crate::storage::ExtensionVersion)>; 256] = [None; 256];
     let mut count = 0usize;
@@ -20577,20 +20028,7 @@ fn pg_extension<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_extension",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("extname", ColType::Name),
-            ("extowner", ColType::Int4),
-            ("extnamespace", ColType::Int4),
-            ("extrelocatable", ColType::Bool),
-            ("extversion", ColType::Text),
-            ("extconfig", ColType::Array(super::types::ArrElem::Oid)),
-            ("extcondition", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let def = schema::require("pg_extension", false);
     let count = storage.extensions_visible_to(txid).count();
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -20730,18 +20168,7 @@ fn pg_depend<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_depend",
-        &[
-            ("classid", ColType::Oid),
-            ("objid", ColType::Oid),
-            ("objsubid", ColType::Int4),
-            ("refclassid", ColType::Oid),
-            ("refobjid", ColType::Oid),
-            ("refobjsubid", ColType::Int4),
-            ("deptype", ColType::Bpchar),
-        ],
-    );
+    let def = schema::require("pg_depend", false);
     let dependency_capacity = |dependencies: &crate::storage::StoredQueryDependencies| {
         dependencies
             .entries()
@@ -21521,31 +20948,7 @@ fn pg_index<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_index",
-        &[
-            ("indexrelid", ColType::Int4),
-            ("indrelid", ColType::Int4),
-            ("indisprimary", ColType::Bool),
-            ("indisunique", ColType::Bool),
-            ("indisclustered", ColType::Bool),
-            ("indischeckxmin", ColType::Bool),
-            ("indisvalid", ColType::Bool),
-            ("indimmediate", ColType::Bool),
-            ("indisreplident", ColType::Bool),
-            ("indnullsnotdistinct", ColType::Bool),
-            ("indnatts", ColType::Int4),
-            ("indnkeyatts", ColType::Int4),
-            ("indkey", ColType::Int2Vector),
-            ("indoption", ColType::Array(super::types::ArrElem::Int4)),
-            ("indpred", ColType::Text),
-            ("indisready", ColType::Bool),
-            ("indislive", ColType::Bool),
-            ("indexprs", ColType::Text),
-            ("indcollation", ColType::Array(super::types::ArrElem::Int4)),
-            ("indclass", ColType::OidVector),
-        ],
-    );
+    let def = schema::require("pg_index", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let toast_indexes = (0..storage.table_count())
         .filter(|slot| {
@@ -21908,36 +21311,7 @@ fn pg_attribute<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_attribute",
-        &[
-            ("attrelid", ColType::Oid),
-            ("attname", ColType::Name),
-            ("atttypid", ColType::Oid),
-            ("attlen", ColType::Int2),
-            ("attnum", ColType::Int2),
-            ("atttypmod", ColType::Int4),
-            ("attndims", ColType::Int2),
-            ("attbyval", ColType::Bool),
-            ("attalign", ColType::Char),
-            ("attstorage", ColType::Char),
-            ("attcompression", ColType::Char),
-            ("attnotnull", ColType::Bool),
-            ("atthasdef", ColType::Bool),
-            ("atthasmissing", ColType::Bool),
-            ("attidentity", ColType::Char),
-            ("attgenerated", ColType::Char),
-            ("attisdropped", ColType::Bool),
-            ("attislocal", ColType::Bool),
-            ("attinhcount", ColType::Int2),
-            ("attcollation", ColType::Oid),
-            ("attstattarget", ColType::Int2),
-            ("attacl", ColType::Array(super::types::ArrElem::AclItem)),
-            ("attoptions", ColType::Array(super::types::ArrElem::Text)),
-            ("attfdwoptions", ColType::Array(super::types::ArrElem::Text)),
-            ("attmissingval", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_attribute", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let composite_attributes = storage
         .composites_with_slots_visible_to(txid)
@@ -22476,15 +21850,7 @@ fn pg_attrdef<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_attrdef",
-        &[
-            ("oid", ColType::Oid),
-            ("adrelid", ColType::Oid),
-            ("adnum", ColType::Int2),
-            ("adbin", ColType::PgNodeTree),
-        ],
-    );
+    let def = schema::require("pg_attrdef", false);
     // A row per column carrying a DEFAULT — the raw source text in `adbin`.
     // This is the engine's source text, not PostgreSQL's serialized node tree;
     // pg_get_expr exposes it through the same catalog contract.
@@ -22565,7 +21931,12 @@ fn pg_attrdef<'a>(
         }
     }
     // https://www.postgresql.org/docs/18/catalog-pg-attrdef.html
-    finish_with_hidden(def, &[("tableoid", ColType::Oid)], &out[..n], arena)
+    finish_with_hidden(
+        def,
+        schema::hidden_columns(def.name, false),
+        &out[..n],
+        arena,
+    )
 }
 
 fn catalog_routine_result_oid(
@@ -22607,18 +21978,7 @@ fn catalog_regproc<'a>(
 }
 
 fn pg_cast<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_cast",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("castsource", ColType::Oid),
-            ("casttarget", ColType::Oid),
-            ("castfunc", ColType::Oid),
-            ("castcontext", ColType::Bpchar),
-            ("castmethod", ColType::Bpchar),
-        ],
-    );
+    let definition = schema::require("pg_cast", false);
     let builtin = [
         (
             10_001,
@@ -23039,27 +22399,7 @@ fn pg_operator<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_operator",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("oprname", ColType::Name),
-            ("oprnamespace", ColType::Oid),
-            ("oprowner", ColType::Oid),
-            ("oprkind", ColType::Bpchar),
-            ("oprcanmerge", ColType::Bool),
-            ("oprcanhash", ColType::Bool),
-            ("oprleft", ColType::Oid),
-            ("oprright", ColType::Oid),
-            ("oprresult", ColType::Oid),
-            ("oprcom", ColType::Oid),
-            ("oprnegate", ColType::Oid),
-            ("oprcode", ColType::Regproc),
-            ("oprrest", ColType::Regproc),
-            ("oprjoin", ColType::Regproc),
-        ],
-    );
+    let definition = schema::require("pg_operator", false);
     let rows = catalog_rows(
         arena,
         CATALOG_OPERATORS.len()
@@ -23190,17 +22530,7 @@ fn pg_opfamily<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_opfamily",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("opfmethod", ColType::Oid),
-            ("opfname", ColType::Name),
-            ("opfnamespace", ColType::Oid),
-            ("opfowner", ColType::Oid),
-        ],
-    );
+    let definition = schema::require("pg_opfamily", false);
     let rows = catalog_rows(
         arena,
         512 + storage.operator_families_visible_to(txid).count(),
@@ -23521,21 +22851,7 @@ fn pg_opclass<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_opclass",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("opcmethod", ColType::Oid),
-            ("opcname", ColType::Name),
-            ("opcnamespace", ColType::Oid),
-            ("opcowner", ColType::Oid),
-            ("opcfamily", ColType::Oid),
-            ("opcintype", ColType::Oid),
-            ("opcdefault", ColType::Bool),
-            ("opckeytype", ColType::Oid),
-        ],
-    );
+    let definition = schema::require("pg_opclass", false);
     let rows = catalog_rows(
         arena,
         512 + storage.operator_classes_visible_to(txid).count(),
@@ -24046,21 +23362,7 @@ fn operator_family_member_oid(family_oid: i32, position: usize) -> i32 {
 }
 
 fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_amop",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("amopfamily", ColType::Oid),
-            ("amoplefttype", ColType::Oid),
-            ("amoprighttype", ColType::Oid),
-            ("amopstrategy", ColType::Int2),
-            ("amoppurpose", ColType::Bpchar),
-            ("amopopr", ColType::Oid),
-            ("amopmethod", ColType::Oid),
-            ("amopsortfamily", ColType::Oid),
-        ],
-    );
+    let definition = schema::require("pg_amop", false);
     let user_rows = storage
         .operator_families_visible_to(txid)
         .map(|(_, family)| family.operators.iter().filter(|member| member.used).count())
@@ -24813,18 +24115,7 @@ fn pg_amproc<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_amproc",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("amprocfamily", ColType::Oid),
-            ("amproclefttype", ColType::Oid),
-            ("amprocrighttype", ColType::Oid),
-            ("amprocnum", ColType::Int2),
-            ("amproc", ColType::Regproc),
-        ],
-    );
+    let definition = schema::require("pg_amproc", false);
     let user_rows = storage
         .operator_families_visible_to(txid)
         .map(|(_, family)| family.functions.iter().filter(|member| member.used).count())
@@ -25484,31 +24775,7 @@ fn pg_trigger<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_trigger",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("tgrelid", ColType::Oid),
-            ("tgparentid", ColType::Oid),
-            ("tgname", ColType::Name),
-            ("tgfoid", ColType::Oid),
-            ("tgtype", ColType::Int2),
-            ("tgenabled", ColType::Bpchar),
-            ("tgisinternal", ColType::Bool),
-            ("tgconstrrelid", ColType::Oid),
-            ("tgconstrindid", ColType::Oid),
-            ("tgconstraint", ColType::Oid),
-            ("tgdeferrable", ColType::Bool),
-            ("tginitdeferred", ColType::Bool),
-            ("tgnargs", ColType::Int2),
-            ("tgattr", ColType::Int2Vector),
-            ("tgargs", ColType::Bytea),
-            ("tgqual", ColType::Text),
-            ("tgoldtable", ColType::Name),
-            ("tgnewtable", ColType::Name),
-        ],
-    );
+    let definition = schema::require("pg_trigger", false);
     let foreign_key_rows = (0..storage.table_count())
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
         .map(|slot| storage.table_def(slot, txid).fkeys().len() * 4)
@@ -25801,19 +25068,7 @@ fn pg_event_trigger<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_event_trigger",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("evtname", ColType::Name),
-            ("evtevent", ColType::Name),
-            ("evtowner", ColType::Oid),
-            ("evtfoid", ColType::Oid),
-            ("evtenabled", ColType::Bpchar),
-            ("evttags", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require("pg_event_trigger", false);
     let rows = arena
         .alloc_slice_with(storage.event_trigger_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -25858,16 +25113,7 @@ fn pg_event_trigger<'a>(
 }
 
 fn pg_am<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_am",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("amname", ColType::Name),
-            ("amhandler", ColType::Regproc),
-            ("amtype", ColType::Char),
-        ],
-    );
+    let definition = schema::require("pg_am", false);
     let mut rows: [&[Datum]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS] =
         [&[]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS];
     let mut count = 0usize;
@@ -25935,21 +25181,7 @@ fn pg_language<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_language",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("lanname", ColType::Name),
-            ("lanowner", ColType::Int4),
-            ("lanpltrusted", ColType::Bool),
-            ("lanispl", ColType::Bool),
-            ("lanplcallfoid", ColType::Int4),
-            ("lanvalidator", ColType::Int4),
-            ("laninline", ColType::Int4),
-            ("lanacl", ColType::Array(super::types::ArrElem::AclItem)),
-        ],
-    );
+    let definition = schema::require("pg_language", false);
     let internal = row(
         &[
             Datum::Int4(PG_LANGUAGE_OID),
@@ -26046,42 +25278,7 @@ fn pg_language<'a>(
 }
 
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_proc",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("proname", ColType::Name),
-            ("pronamespace", ColType::Oid),
-            ("pronargs", ColType::Int4),
-            ("prorettype", ColType::Oid),
-            ("proretset", ColType::Bool),
-            ("prokind", ColType::Bpchar),
-            ("proargtypes", ColType::OidVector),
-            ("provolatile", ColType::Bpchar),
-            ("proparallel", ColType::Bpchar),
-            ("proowner", ColType::Oid),
-            ("prosecdef", ColType::Bool),
-            ("proacl", ColType::Array(super::types::ArrElem::AclItem)),
-            ("prolang", ColType::Oid),
-            ("prosrc", ColType::Text),
-            ("probin", ColType::Text),
-            ("proisstrict", ColType::Bool),
-            ("proleakproof", ColType::Bool),
-            ("proconfig", ColType::Array(super::types::ArrElem::Text)),
-            ("procost", ColType::Float8),
-            ("prorows", ColType::Float8),
-            ("protrftypes", ColType::Array(super::types::ArrElem::Oid)),
-            ("prosupport", ColType::Regproc),
-            ("pronargdefaults", ColType::Int4),
-            ("provariadic", ColType::Oid),
-            ("proallargtypes", ColType::Array(super::types::ArrElem::Oid)),
-            ("proargmodes", ColType::Array(super::types::ArrElem::Char)),
-            ("proargnames", ColType::Array(super::types::ArrElem::Text)),
-            ("proargdefaults", ColType::PgNodeTree),
-            ("prosqlbody", ColType::PgNodeTree),
-        ],
-    );
+    let definition = schema::require("pg_proc", false);
     // The routine inventory is fixed at startup, so size the synthesized row
     // index from that same bound instead of coupling it to the built-in count.
     let row_capacity = INTRINSIC_ROUTINES
@@ -26614,33 +25811,7 @@ fn pg_aggregate<'a>(
             name,
         })
     };
-    let definition = def_of(
-        "pg_aggregate",
-        &[
-            ("aggfnoid", ColType::Regproc),
-            ("aggkind", ColType::Bpchar),
-            ("aggnumdirectargs", ColType::Int2),
-            ("aggtransfn", ColType::Regproc),
-            ("aggfinalfn", ColType::Regproc),
-            ("aggcombinefn", ColType::Regproc),
-            ("aggserialfn", ColType::Regproc),
-            ("aggdeserialfn", ColType::Regproc),
-            ("aggmtransfn", ColType::Regproc),
-            ("aggminvtransfn", ColType::Regproc),
-            ("aggmfinalfn", ColType::Regproc),
-            ("aggfinalextra", ColType::Bool),
-            ("aggmfinalextra", ColType::Bool),
-            ("aggfinalmodify", ColType::Bpchar),
-            ("aggmfinalmodify", ColType::Bpchar),
-            ("aggsortop", ColType::Oid),
-            ("aggtranstype", ColType::Oid),
-            ("aggtransspace", ColType::Int4),
-            ("aggmtranstype", ColType::Oid),
-            ("aggmtransspace", ColType::Int4),
-            ("agginitval", ColType::Text),
-            ("aggminitval", ColType::Text),
-        ],
-    );
+    let definition = schema::require("pg_aggregate", false);
     let count = 34
         + (0..storage.routine_count())
             .filter(|slot| {
@@ -27145,20 +26316,7 @@ fn pg_ts_parser<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_ts_parser",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("prsname", ColType::Name),
-            ("prsnamespace", ColType::Oid),
-            ("prsstart", ColType::Regproc),
-            ("prstoken", ColType::Regproc),
-            ("prsend", ColType::Regproc),
-            ("prsheadline", ColType::Regproc),
-            ("prslextype", ColType::Regproc),
-        ],
-    );
+    let definition = schema::require("pg_ts_parser", false);
     let rows = arena
         .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -27201,17 +26359,7 @@ fn pg_ts_template<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_ts_template",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("tmplname", ColType::Name),
-            ("tmplnamespace", ColType::Oid),
-            ("tmplinit", ColType::Regproc),
-            ("tmpllexize", ColType::Regproc),
-        ],
-    );
+    let definition = schema::require("pg_ts_template", false);
     let rows = arena
         .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -27249,18 +26397,7 @@ fn pg_ts_dict<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_ts_dict",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("dictname", ColType::Name),
-            ("dictnamespace", ColType::Oid),
-            ("dictowner", ColType::Oid),
-            ("dicttemplate", ColType::Oid),
-            ("dictinitoption", ColType::Text),
-        ],
-    );
+    let definition = schema::require("pg_ts_dict", false);
     let rows = arena
         .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -27304,17 +26441,7 @@ fn pg_ts_config<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_ts_config",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("cfgname", ColType::Name),
-            ("cfgnamespace", ColType::Oid),
-            ("cfgowner", ColType::Oid),
-            ("cfgparser", ColType::Oid),
-        ],
-    );
+    let definition = schema::require("pg_ts_config", false);
     let rows = arena
         .alloc_slice_with(storage.text_search_object_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -27352,15 +26479,7 @@ fn pg_ts_config_map<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_ts_config_map",
-        &[
-            ("mapcfg", ColType::Oid),
-            ("maptokentype", ColType::Int4),
-            ("mapseqno", ColType::Int4),
-            ("mapdict", ColType::Oid),
-        ],
-    );
+    let definition = schema::require("pg_ts_config_map", false);
     let capacity = storage.text_search_object_capacity()
         * crate::storage::TEXT_SEARCH_TOKEN_TYPES
         * crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN;
@@ -27400,24 +26519,7 @@ fn pg_collation<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_collation",
-        &[
-            ("tableoid", ColType::Oid),
-            ("oid", ColType::Oid),
-            ("collname", ColType::Name),
-            ("collnamespace", ColType::Oid),
-            ("collowner", ColType::Oid),
-            ("collprovider", ColType::Bpchar),
-            ("collisdeterministic", ColType::Bool),
-            ("collencoding", ColType::Int4),
-            ("collcollate", ColType::Text),
-            ("collctype", ColType::Text),
-            ("colllocale", ColType::Text),
-            ("collicurules", ColType::Text),
-            ("collversion", ColType::Text),
-        ],
-    );
+    let definition = schema::require("pg_collation", false);
     let output = arena
         .alloc_slice_with(
             crate::sql::ast::Collation::BUILTIN.len() + storage.collation_capacity(),
@@ -27499,20 +26601,7 @@ fn pg_conversion<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_conversion",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("conname", ColType::Name),
-            ("connamespace", ColType::Int4),
-            ("conowner", ColType::Int4),
-            ("conforencoding", ColType::Int4),
-            ("contoencoding", ColType::Int4),
-            ("conproc", ColType::Regproc),
-            ("condefault", ColType::Bool),
-        ],
-    );
+    let definition = schema::require("pg_conversion", false);
     let output = arena
         .alloc_slice_with(storage.conversion_capacity(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -27538,15 +26627,7 @@ fn pg_conversion<'a>(
 }
 
 fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_enum",
-        &[
-            ("oid", ColType::Int4),
-            ("enumtypid", ColType::Int4),
-            ("enumsortorder", ColType::Float8),
-            ("enumlabel", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_enum", false);
     let capacity = (0..storage.enum_count())
         .filter(|&slot| storage.enum_slot_visible_to(slot, txid))
         .map(|slot| storage.enum_for(slot, txid).members().len())
@@ -27585,7 +26666,7 @@ fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
 }
 
 fn pg_locks<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_locks", PG_LOCKS_COLUMNS);
+    let definition = schema::require("pg_locks", false);
     let advisory_capacity = storage.advisory_lock_view_count();
     let advisory: &mut [Option<crate::sql::lock::AdvisoryLockView>] = arena
         .alloc_slice_with(advisory_capacity, |_| None)
@@ -27715,7 +26796,7 @@ fn pg_stat_activity<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_stat_activity", PG_STAT_ACTIVITY_COLUMNS);
+    let definition = schema::require("pg_stat_activity", false);
     let rows = arena
         .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -27787,7 +26868,7 @@ fn pg_stat_activity<'a>(
 }
 
 fn pg_stat_ssl<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_stat_ssl", PG_STAT_SSL_COLUMNS);
+    let definition = schema::require("pg_stat_ssl", false);
     let rows = arena
         .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -27851,14 +26932,7 @@ fn pg_stat_tables<'a>(
     scope: StatisticsScope,
     transaction_local: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        name,
-        if transaction_local {
-            PG_STAT_XACT_TABLES_COLUMNS
-        } else {
-            PG_STAT_TABLES_COLUMNS
-        },
-    );
+    let definition = schema::require(name, false);
     let indexes = (!transaction_local)
         .then(|| collect_indexes(storage, txid, arena))
         .transpose()?;
@@ -27974,7 +27048,7 @@ fn pg_stat_indexes<'a>(
     name: &'static str,
     scope: StatisticsScope,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(name, PG_STAT_INDEXES_COLUMNS);
+    let definition = schema::require(name, false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let rows = arena
         .alloc_slice_with(indexes.len(), |_| &[] as &[Datum])
@@ -28012,10 +27086,9 @@ fn pg_stat_indexes<'a>(
 
 fn empty_monitoring_view<'a>(
     name: &'static str,
-    columns: &'static [(&'static str, ColType)],
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    finish(def_of(name, columns), &[], arena)
+    finish(schema::require(name, false), &[], arena)
 }
 
 fn pg_statio_tables<'a>(
@@ -28025,7 +27098,7 @@ fn pg_statio_tables<'a>(
     name: &'static str,
     scope: StatisticsScope,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(name, PG_STATIO_TABLES_COLUMNS);
+    let definition = schema::require(name, false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let rows = arena
         .alloc_slice_with(storage.table_count(), |_| &[] as &[Datum])
@@ -28095,7 +27168,7 @@ fn pg_statio_indexes<'a>(
     name: &'static str,
     scope: StatisticsScope,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(name, PG_STATIO_INDEXES_COLUMNS);
+    let definition = schema::require(name, false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let rows = arena
         .alloc_slice_with(indexes.len(), |_| &[] as &[Datum])
@@ -28133,7 +27206,7 @@ fn pg_statio_sequences<'a>(
     name: &'static str,
     scope: StatisticsScope,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(name, PG_STATIO_SEQUENCES_COLUMNS);
+    let definition = schema::require(name, false);
     let rows = arena
         .alloc_slice_with(storage.sequence_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28172,7 +27245,7 @@ fn pg_stat_slru<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a
         "subtransaction",
         "transaction",
     ];
-    let definition = def_of("pg_stat_slru", PG_STAT_SLRU_COLUMNS);
+    let definition = schema::require("pg_stat_slru", false);
     let rows = arena
         .alloc_slice_with(NAMES.len(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28217,17 +27290,14 @@ fn pg_stat_recovery_prefetch<'a>(
         arena,
     )?;
     finish(
-        def_of(
-            "pg_stat_recovery_prefetch",
-            PG_STAT_RECOVERY_PREFETCH_COLUMNS,
-        ),
+        schema::require("pg_stat_recovery_prefetch", false),
         &[encoded],
         arena,
     )
 }
 
 fn pg_stat_gssapi<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_stat_gssapi", PG_STAT_GSSAPI_COLUMNS);
+    let definition = schema::require("pg_stat_gssapi", false);
     let rows = arena
         .alloc_slice_with(storage.backend_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28271,7 +27341,7 @@ fn pg_stat_functions<'a>(
     } else {
         "pg_stat_user_functions"
     };
-    let definition = def_of(name, PG_STAT_FUNCTIONS_COLUMNS);
+    let definition = schema::require(name, false);
     let rows = arena
         .alloc_slice_with(storage.routine_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28324,7 +27394,7 @@ fn pg_stat_archiver<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTabl
         arena,
     )?;
     finish(
-        def_of("pg_stat_archiver", PG_STAT_ARCHIVER_COLUMNS),
+        schema::require("pg_stat_archiver", false),
         &[encoded],
         arena,
     )
@@ -28342,7 +27412,7 @@ fn pg_stat_bgwriter<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTabl
         arena,
     )?;
     finish(
-        def_of("pg_stat_bgwriter", PG_STAT_BGWRITER_COLUMNS),
+        schema::require("pg_stat_bgwriter", false),
         &[encoded],
         arena,
     )
@@ -28370,14 +27440,14 @@ fn pg_stat_checkpointer<'a>(
         arena,
     )?;
     finish(
-        def_of("pg_stat_checkpointer", PG_STAT_CHECKPOINTER_COLUMNS),
+        schema::require("pg_stat_checkpointer", false),
         &[encoded],
         arena,
     )
 }
 
 fn pg_stat_io<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_stat_io", PG_STAT_IO_COLUMNS);
+    let definition = schema::require("pg_stat_io", false);
     let rows = arena
         .alloc_slice_with(8, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28463,11 +27533,7 @@ fn pg_stat_wal<'a>(storage: &Storage, arena: &'a Arena) -> Result<SynthTable<'a>
         ],
         arena,
     )?;
-    finish(
-        def_of("pg_stat_wal", PG_STAT_WAL_COLUMNS),
-        &[encoded],
-        arena,
-    )
+    finish(schema::require("pg_stat_wal", false), &[encoded], arena)
 }
 
 fn pg_stat_database<'a>(
@@ -28475,7 +27541,7 @@ fn pg_stat_database<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_stat_database", PG_STAT_DATABASE_COLUMNS);
+    let definition = schema::require("pg_stat_database", false);
     let rows = arena
         .alloc_slice_with(storage.database_count() + 1, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28553,10 +27619,7 @@ fn pg_stat_database_conflicts<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_stat_database_conflicts",
-        PG_STAT_DATABASE_CONFLICTS_COLUMNS,
-    );
+    let definition = schema::require("pg_stat_database_conflicts", false);
     let rows = arena
         .alloc_slice_with(storage.database_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -28585,7 +27648,7 @@ fn pg_stat_database_conflicts<'a>(
 }
 
 fn pg_cursors<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_cursors", PG_CURSORS_COLUMNS);
+    let definition = schema::require("pg_cursors", false);
     crate::sql::cursor::with_active(|pool| {
         let count = pool.map_or(0, crate::sql::cursor::CursorPool::len);
         let rows = arena
@@ -28641,25 +27704,7 @@ fn pg_prepared_statements<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_prepared_statements",
-        &[
-            ("name", ColType::Text),
-            ("statement", ColType::Text),
-            ("prepare_time", ColType::Timestamptz),
-            (
-                "parameter_types",
-                ColType::Array(super::types::ArrElem::Regtype),
-            ),
-            (
-                "result_types",
-                ColType::Array(super::types::ArrElem::Regtype),
-            ),
-            ("from_sql", ColType::Bool),
-            ("generic_plans", ColType::Int8),
-            ("custom_plans", ColType::Int8),
-        ],
-    );
+    let definition = schema::require("pg_prepared_statements", false);
     let catalog_types = pg_type(storage, txid, arena)?;
     crate::sql::prep::with_active(|pool| {
         let rows = arena
@@ -28780,7 +27825,7 @@ fn pg_prepared_statements<'a>(
 }
 
 fn pg_wait_events<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("pg_wait_events", PG_WAIT_EVENTS_COLUMNS);
+    let definition = schema::require("pg_wait_events", false);
     let values = [
         (
             "Lock",
@@ -28822,18 +27867,7 @@ fn pg_shdepend<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_shdepend",
-        &[
-            ("dbid", ColType::Oid),
-            ("classid", ColType::Oid),
-            ("objid", ColType::Oid),
-            ("objsubid", ColType::Int4),
-            ("refclassid", ColType::Oid),
-            ("refobjid", ColType::Oid),
-            ("deptype", ColType::Char),
-        ],
-    );
+    let definition = schema::require("pg_shdepend", false);
     let capacity = storage
         .table_count()
         .checked_add(storage.view_count())
@@ -28927,15 +27961,7 @@ fn pg_shdepend<'a>(
 }
 
 fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_timezone_names",
-        &[
-            ("name", ColType::Text),
-            ("abbrev", ColType::Text),
-            ("utc_offset", ColType::Interval),
-            ("is_dst", ColType::Bool),
-        ],
-    );
+    let definition = schema::require("pg_timezone_names", false);
     let mut rows: [&[Datum]; 1024] = [&[]; 1024];
     let mut count = 0usize;
     let mut found_error = None;
@@ -28993,14 +28019,7 @@ fn pg_timezone_names<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
 }
 
 fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_timezone_abbrevs",
-        &[
-            ("abbrev", ColType::Text),
-            ("utc_offset", ColType::Interval),
-            ("is_dst", ColType::Bool),
-        ],
-    );
+    let definition = schema::require("pg_timezone_abbrevs", false);
     let rows = arena
         .alloc_slice_with(
             crate::sql::catalog_metadata::TIMEZONE_ABBREVIATIONS.len(),
@@ -29028,33 +28047,7 @@ fn pg_timezone_abbrevs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError>
 }
 
 fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_type",
-        &[
-            ("oid", ColType::Int4),
-            ("typname", ColType::Name),
-            ("typlen", ColType::Int4),
-            ("typcollation", ColType::Int4),
-            ("typnamespace", ColType::Int4),
-            ("typtype", ColType::Bpchar), // 'b' = base type
-            ("typcategory", ColType::Bpchar),
-            ("typbasetype", ColType::Int4), // 0 unless a domain
-            ("typelem", ColType::Int4),     // element type of an array, else 0
-            ("typarray", ColType::Int4),    // the array type over this type, else 0
-            ("typrelid", ColType::Int4),    // 0 unless a composite type
-            ("typtypmod", ColType::Int4),
-            ("typnotnull", ColType::Bool),
-            ("typdefault", ColType::Text),
-            ("typinput", ColType::Text),
-            ("typoutput", ColType::Text),
-            ("typacl", ColType::Array(super::types::ArrElem::AclItem)),
-            ("tableoid", ColType::Int4),
-            ("typowner", ColType::Int4),
-            ("typisdefined", ColType::Bool),
-            ("typstorage", ColType::Bpchar),
-            ("typdefaultbin", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_type", false);
     let types = [
         ColType::Void,
         ColType::Internal,
@@ -29966,16 +28959,7 @@ fn pg_namespace<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_namespace",
-        &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("nspname", ColType::Text),
-            ("nspowner", ColType::Int4),
-            ("nspacl", ColType::Array(super::types::ArrElem::AclItem)),
-        ],
-    );
+    let def = schema::require("pg_namespace", false);
     let capacity = 4 + storage.schema_count() + storage.table_count() + storage.sequence_count();
     let out = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
@@ -30096,16 +29080,7 @@ fn pg_indexes<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_indexes",
-        &[
-            ("schemaname", ColType::Text),
-            ("tablename", ColType::Text),
-            ("indexname", ColType::Text),
-            ("tablespace", ColType::Text),
-            ("indexdef", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_indexes", false);
     let indices = collect_indexes(storage, txid, arena)?;
     let out = arena
         .alloc_slice_with(indices.len() + 2, |_| &[] as &[Datum])
@@ -30244,19 +29219,7 @@ fn pg_tables<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_tables",
-        &[
-            ("schemaname", ColType::Text),
-            ("tablename", ColType::Text),
-            ("tableowner", ColType::Text),
-            ("tablespace", ColType::Text),
-            ("hasindexes", ColType::Bool),
-            ("hasrules", ColType::Bool),
-            ("hastriggers", ColType::Bool),
-            ("rowsecurity", ColType::Bool),
-        ],
-    );
+    let def = schema::require("pg_tables", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let row_capacity = (0..storage.table_count())
         .filter(|slot| {
@@ -30328,14 +29291,7 @@ fn pg_group<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_group",
-        &[
-            ("groname", ColType::Name),
-            ("grosysid", ColType::Oid),
-            ("grolist", ColType::Array(super::types::ArrElem::Oid)),
-        ],
-    );
+    let definition = schema::require("pg_group", false);
     let rows = arena
         .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
             &[] as &[Datum]
@@ -30406,20 +29362,7 @@ fn pg_shadow<'a>(
     } else {
         "pg_shadow"
     };
-    let definition = def_of(
-        name,
-        &[
-            ("usename", ColType::Name),
-            ("usesysid", ColType::Oid),
-            ("usecreatedb", ColType::Bool),
-            ("usesuper", ColType::Bool),
-            ("userepl", ColType::Bool),
-            ("usebypassrls", ColType::Bool),
-            ("passwd", ColType::Text),
-            ("valuntil", ColType::Timestamptz),
-            ("useconfig", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require(name, false);
     let authid = pg_authid(storage, txid, arena, !mask_password)?;
     let rows = arena
         .alloc_slice_with(authid.rows.len(), |_| &[] as &[Datum])
@@ -30501,23 +29444,7 @@ fn pg_roles<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_roles",
-        &[
-            ("oid", ColType::Int4),
-            ("rolname", ColType::Name),
-            ("rolsuper", ColType::Bool),
-            ("rolinherit", ColType::Bool),
-            ("rolcreaterole", ColType::Bool),
-            ("rolcreatedb", ColType::Bool),
-            ("rolcanlogin", ColType::Bool),
-            ("rolconnlimit", ColType::Int4),
-            ("rolpassword", ColType::Text),
-            ("rolvaliduntil", ColType::Timestamptz),
-            ("rolreplication", ColType::Bool),
-            ("rolbypassrls", ColType::Bool),
-        ],
-    );
+    let def = schema::require("pg_roles", false);
     let output = arena
         .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
             &[] as &[Datum]
@@ -30627,23 +29554,7 @@ fn pg_authid<'a>(
             "permission denied for table pg_authid"
         ));
     }
-    let def = def_of(
-        "pg_authid",
-        &[
-            ("oid", ColType::Int4),
-            ("rolname", ColType::Name),
-            ("rolsuper", ColType::Bool),
-            ("rolinherit", ColType::Bool),
-            ("rolcreaterole", ColType::Bool),
-            ("rolcreatedb", ColType::Bool),
-            ("rolcanlogin", ColType::Bool),
-            ("rolreplication", ColType::Bool),
-            ("rolbypassrls", ColType::Bool),
-            ("rolconnlimit", ColType::Int4),
-            ("rolpassword", ColType::Text),
-            ("rolvaliduntil", ColType::Timestamptz),
-        ],
-    );
+    let def = schema::require("pg_authid", false);
     let output = arena
         .alloc_slice_with(storage.role_count() + PREDEFINED_ROLES.len(), |_| {
             &[] as &[Datum]
@@ -30743,18 +29654,7 @@ fn pg_auth_members<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_auth_members",
-        &[
-            ("oid", ColType::Int4),
-            ("roleid", ColType::Int4),
-            ("member", ColType::Int4),
-            ("grantor", ColType::Int4),
-            ("admin_option", ColType::Bool),
-            ("inherit_option", ColType::Bool),
-            ("set_option", ColType::Bool),
-        ],
-    );
+    let def = schema::require("pg_auth_members", false);
     let output = arena
         .alloc_slice_with(storage.role_membership_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -30789,14 +29689,7 @@ fn pg_db_role_setting<'a>(
 ) -> Result<SynthTable<'a>, SqlError> {
     use crate::storage::RoleSettingScope;
     use core::fmt::Write;
-    let definition = def_of(
-        "pg_db_role_setting",
-        &[
-            ("setdatabase", ColType::Int4),
-            ("setrole", ColType::Int4),
-            ("setconfig", ColType::Array(super::types::ArrElem::Text)),
-        ],
-    );
+    let definition = schema::require("pg_db_role_setting", false);
     let output = arena
         .alloc_slice_with(storage.role_setting_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -30863,29 +29756,7 @@ fn pg_database<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_database",
-        &[
-            ("oid", ColType::Int4),
-            ("datname", ColType::Name),
-            ("datdba", ColType::Int4),
-            ("encoding", ColType::Int4),
-            ("datlocprovider", ColType::Bpchar),
-            ("datistemplate", ColType::Bool),
-            ("datallowconn", ColType::Bool),
-            ("dathasloginevt", ColType::Bool),
-            ("datconnlimit", ColType::Int4),
-            ("datfrozenxid", ColType::Int4),
-            ("datminmxid", ColType::Int4),
-            ("dattablespace", ColType::Int4),
-            ("datcollate", ColType::Text),
-            ("datctype", ColType::Text),
-            ("datlocale", ColType::Text),
-            ("daticurules", ColType::Text),
-            ("datcollversion", ColType::Text),
-            ("datacl", ColType::Array(super::types::ArrElem::AclItem)),
-        ],
-    );
+    let definition = schema::require("pg_database", false);
     let output = arena
         .alloc_slice_with(storage.database_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -30945,28 +29816,7 @@ fn pg_database<'a>(
 }
 
 fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_settings",
-        &[
-            ("name", ColType::Text),
-            ("setting", ColType::Text),
-            ("unit", ColType::Text),
-            ("category", ColType::Text),
-            ("short_desc", ColType::Text),
-            ("extra_desc", ColType::Text),
-            ("context", ColType::Text),
-            ("vartype", ColType::Text),
-            ("source", ColType::Text),
-            ("min_val", ColType::Text),
-            ("max_val", ColType::Text),
-            ("enumvals", ColType::Array(super::types::ArrElem::Text)),
-            ("boot_val", ColType::Text),
-            ("reset_val", ColType::Text),
-            ("sourcefile", ColType::Text),
-            ("sourceline", ColType::Int4),
-            ("pending_restart", ColType::Bool),
-        ],
-    );
+    let definition = schema::require("pg_settings", false);
     let output = arena
         .alloc_slice_with(crate::sql::SETTING_NAMES.len() + 2, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -31153,16 +30003,7 @@ fn pg_prepared_xacts<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "pg_prepared_xacts",
-        &[
-            ("transaction", ColType::Xid),
-            ("gid", ColType::Text),
-            ("prepared", ColType::Timestamptz),
-            ("owner", ColType::Name),
-            ("database", ColType::Name),
-        ],
-    );
+    let definition = schema::require("pg_prepared_xacts", false);
     let entries = storage.prepared_transaction_catalog();
     let output = arena
         .alloc_slice_with(entries.len(), |_| &[] as &[Datum])
@@ -31196,15 +30037,7 @@ fn pg_views<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_views",
-        &[
-            ("schemaname", ColType::Name),
-            ("viewname", ColType::Name),
-            ("viewowner", ColType::Name),
-            ("definition", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_views", false);
     let out = catalog_rows(arena, storage.views_visible_to(txid).count())?;
     let mut n = 0;
     for slot in 0..storage.view_count() {
@@ -31237,15 +30070,7 @@ fn pg_rules<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_rules",
-        &[
-            ("schemaname", ColType::Name),
-            ("tablename", ColType::Name),
-            ("rulename", ColType::Name),
-            ("definition", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_rules", false);
     let count = storage.rules_visible_to(txid).count();
     let rows = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -31282,18 +30107,7 @@ fn pg_matviews<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_matviews",
-        &[
-            ("schemaname", ColType::Name),
-            ("matviewname", ColType::Name),
-            ("matviewowner", ColType::Name),
-            ("tablespace", ColType::Name),
-            ("hasindexes", ColType::Bool),
-            ("ispopulated", ColType::Bool),
-            ("definition", ColType::Text),
-        ],
-    );
+    let def = schema::require("pg_matviews", false);
     let indexes = collect_indexes(storage, txid, arena)?;
     let out = catalog_rows(arena, storage.matviews_visible_to(txid).count())?;
     let mut n = 0;
@@ -31351,22 +30165,7 @@ fn pg_sequences<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_sequences",
-        &[
-            ("schemaname", ColType::Text),
-            ("sequencename", ColType::Text),
-            ("sequenceowner", ColType::Text),
-            ("data_type", ColType::Text),
-            ("start_value", ColType::Int8),
-            ("min_value", ColType::Int8),
-            ("max_value", ColType::Int8),
-            ("increment_by", ColType::Int8),
-            ("cycle", ColType::Bool),
-            ("cache_size", ColType::Int8),
-            ("last_value", ColType::Int8),
-        ],
-    );
+    let def = schema::require("pg_sequences", false);
     let out = catalog_rows(
         arena,
         (0..storage.sequence_count())
@@ -31422,19 +30221,7 @@ fn pg_sequence<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "pg_sequence",
-        &[
-            ("seqrelid", ColType::Int4),
-            ("seqtypid", ColType::Int4),
-            ("seqstart", ColType::Int8),
-            ("seqincrement", ColType::Int8),
-            ("seqmax", ColType::Int8),
-            ("seqmin", ColType::Int8),
-            ("seqcache", ColType::Int8),
-            ("seqcycle", ColType::Bool),
-        ],
-    );
+    let def = schema::require("pg_sequence", false);
     let out = catalog_rows(
         arena,
         (0..storage.sequence_count())
@@ -31473,16 +30260,7 @@ fn info_foreign_data_wrappers<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "foreign_data_wrappers",
-        &[
-            ("foreign_data_wrapper_catalog", ColType::Text),
-            ("foreign_data_wrapper_name", ColType::Text),
-            ("authorization_identifier", ColType::Text),
-            ("library_name", ColType::Text),
-            ("foreign_data_wrapper_language", ColType::Text),
-        ],
-    );
+    let definition = schema::require("foreign_data_wrappers", true);
     let capacity = storage.foreign_wrappers(txid).count();
     let rows = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
@@ -31530,15 +30308,7 @@ fn info_foreign_data_wrapper_options<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "foreign_data_wrapper_options",
-        &[
-            ("foreign_data_wrapper_catalog", ColType::Text),
-            ("foreign_data_wrapper_name", ColType::Text),
-            ("option_name", ColType::Text),
-            ("option_value", ColType::Text),
-        ],
-    );
+    let definition = schema::require("foreign_data_wrapper_options", true);
     let capacity = storage
         .foreign_wrappers(txid)
         .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
@@ -31579,18 +30349,7 @@ fn info_foreign_servers<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "foreign_servers",
-        &[
-            ("foreign_server_catalog", ColType::Text),
-            ("foreign_server_name", ColType::Text),
-            ("foreign_data_wrapper_catalog", ColType::Text),
-            ("foreign_data_wrapper_name", ColType::Text),
-            ("foreign_server_type", ColType::Text),
-            ("foreign_server_version", ColType::Text),
-            ("authorization_identifier", ColType::Text),
-        ],
-    );
+    let definition = schema::require("foreign_servers", true);
     let capacity = storage.foreign_servers(txid).count();
     let rows = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
@@ -31647,15 +30406,7 @@ fn info_foreign_server_options<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "foreign_server_options",
-        &[
-            ("foreign_server_catalog", ColType::Text),
-            ("foreign_server_name", ColType::Text),
-            ("option_name", ColType::Text),
-            ("option_value", ColType::Text),
-        ],
-    );
+    let definition = schema::require("foreign_server_options", true);
     let capacity = storage
         .foreign_servers(txid)
         .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
@@ -31696,16 +30447,7 @@ fn info_foreign_tables<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "foreign_tables",
-        &[
-            ("foreign_table_catalog", ColType::Text),
-            ("foreign_table_schema", ColType::Text),
-            ("foreign_table_name", ColType::Text),
-            ("foreign_server_catalog", ColType::Text),
-            ("foreign_server_name", ColType::Text),
-        ],
-    );
+    let definition = schema::require("foreign_tables", true);
     let capacity = storage.foreign_tables(txid).count();
     let rows = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
@@ -31746,16 +30488,7 @@ fn info_foreign_table_options<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "foreign_table_options",
-        &[
-            ("foreign_table_catalog", ColType::Text),
-            ("foreign_table_schema", ColType::Text),
-            ("foreign_table_name", ColType::Text),
-            ("option_name", ColType::Text),
-            ("option_value", ColType::Text),
-        ],
-    );
+    let definition = schema::require("foreign_table_options", true);
     let capacity = storage
         .foreign_tables(txid)
         .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
@@ -31793,17 +30526,7 @@ fn info_column_options<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "column_options",
-        &[
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("column_name", ColType::Text),
-            ("option_name", ColType::Text),
-            ("option_value", ColType::Text),
-        ],
-    );
+    let definition = schema::require("column_options", true);
     let capacity = storage
         .foreign_tables(txid)
         .map(|(_, entry)| entry.definition_for(txid).column_options.entries().len())
@@ -31848,14 +30571,7 @@ fn info_user_mappings<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "user_mappings",
-        &[
-            ("authorization_identifier", ColType::Text),
-            ("foreign_server_catalog", ColType::Text),
-            ("foreign_server_name", ColType::Text),
-        ],
-    );
+    let definition = schema::require("user_mappings", true);
     let capacity = storage.foreign_user_mappings(txid).count();
     let rows = arena
         .alloc_slice_with(capacity, |_| &[] as &[Datum])
@@ -31904,16 +30620,7 @@ fn info_user_mapping_options<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "user_mapping_options",
-        &[
-            ("authorization_identifier", ColType::Text),
-            ("foreign_server_catalog", ColType::Text),
-            ("foreign_server_name", ColType::Text),
-            ("option_name", ColType::Text),
-            ("option_value", ColType::Text),
-        ],
-    );
+    let definition = schema::require("user_mapping_options", true);
     let capacity = storage
         .foreign_user_mappings(txid)
         .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
@@ -31973,15 +30680,7 @@ fn info_tables<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "tables",
-        &[
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("table_type", ColType::Text),
-        ],
-    );
+    let def = schema::require("tables", true);
     let visible_tables = (0..storage.table_count())
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
         .count();
@@ -32072,21 +30771,7 @@ fn info_routines<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "routines",
-        &[
-            ("specific_catalog", ColType::Text),
-            ("specific_schema", ColType::Text),
-            ("specific_name", ColType::Text),
-            ("routine_catalog", ColType::Text),
-            ("routine_schema", ColType::Text),
-            ("routine_name", ColType::Text),
-            ("routine_type", ColType::Text),
-            ("data_type", ColType::Text),
-            ("external_language", ColType::Text),
-            ("routine_definition", ColType::Text),
-        ],
-    );
+    let definition = schema::require("routines", true);
     let count = (0..storage.routine_count())
         .filter(|slot| {
             storage.routine_slot_visible_to(*slot, txid)
@@ -32144,24 +30829,13 @@ fn info_routine_privileges<'a>(
     arena: &'a Arena,
     include_public: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
+    let definition = schema::require(
         if include_public {
             "routine_privileges"
         } else {
             "role_routine_grants"
         },
-        &[
-            ("grantor", ColType::Text),
-            ("grantee", ColType::Text),
-            ("specific_catalog", ColType::Text),
-            ("specific_schema", ColType::Text),
-            ("specific_name", ColType::Text),
-            ("routine_catalog", ColType::Text),
-            ("routine_schema", ColType::Text),
-            ("routine_name", ColType::Text),
-            ("privilege_type", ColType::Text),
-            ("is_grantable", ColType::Text),
-        ],
+        true,
     );
     let capacity = storage.routine_count() + storage.acl_entry_count();
     let output = arena
@@ -32249,21 +30923,7 @@ fn info_parameters<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "parameters",
-        &[
-            ("specific_catalog", ColType::Text),
-            ("specific_schema", ColType::Text),
-            ("specific_name", ColType::Text),
-            ("ordinal_position", ColType::Int4),
-            ("parameter_mode", ColType::Text),
-            ("parameter_name", ColType::Text),
-            ("data_type", ColType::Text),
-            ("udt_catalog", ColType::Text),
-            ("udt_schema", ColType::Text),
-            ("udt_name", ColType::Text),
-        ],
-    );
+    let definition = schema::require("parameters", true);
     let count = (0..storage.routine_count())
         .filter(|slot| storage.routine_slot_visible_to(*slot, txid))
         .map(|slot| storage.routine_for(slot, txid).parameter_count)
@@ -32315,21 +30975,7 @@ fn info_views<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "views",
-        &[
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("view_definition", ColType::Text),
-            ("check_option", ColType::Text),
-            ("is_updatable", ColType::Text),
-            ("is_insertable_into", ColType::Text),
-            ("is_trigger_updatable", ColType::Text),
-            ("is_trigger_deletable", ColType::Text),
-            ("is_trigger_insertable_into", ColType::Text),
-        ],
-    );
+    let def = schema::require("views", true);
     let count = storage.views_visible_to(txid).count();
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -32374,17 +31020,7 @@ fn info_view_table_usage<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "view_table_usage",
-        &[
-            ("view_catalog", ColType::Text),
-            ("view_schema", ColType::Text),
-            ("view_name", ColType::Text),
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-        ],
-    );
+    let def = schema::require("view_table_usage", true);
     let mut count = 0usize;
     for (view_slot, _) in storage.views_visible_to(txid) {
         for dependency in storage.view_dependencies(view_slot).entries() {
@@ -32454,18 +31090,7 @@ fn info_view_column_usage<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "view_column_usage",
-        &[
-            ("view_catalog", ColType::Text),
-            ("view_schema", ColType::Text),
-            ("view_name", ColType::Text),
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("column_name", ColType::Text),
-        ],
-    );
+    let def = schema::require("view_column_usage", true);
     let mut count = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
         for dependency in storage.view_dependencies(view_slot).entries() {
@@ -32594,55 +31219,7 @@ fn info_columns<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "columns",
-        &[
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("column_name", ColType::Text),
-            ("ordinal_position", ColType::Int4),
-            ("column_default", ColType::Text),
-            ("is_nullable", ColType::Text),
-            ("data_type", ColType::Text),
-            ("character_maximum_length", ColType::Int4),
-            ("character_octet_length", ColType::Int4),
-            ("numeric_precision", ColType::Int4),
-            ("numeric_precision_radix", ColType::Int4),
-            ("numeric_scale", ColType::Int4),
-            ("datetime_precision", ColType::Int4),
-            ("interval_type", ColType::Text),
-            ("interval_precision", ColType::Int4),
-            ("character_set_catalog", ColType::Text),
-            ("character_set_schema", ColType::Text),
-            ("character_set_name", ColType::Text),
-            ("collation_catalog", ColType::Text),
-            ("collation_schema", ColType::Text),
-            ("collation_name", ColType::Text),
-            ("domain_catalog", ColType::Text),
-            ("domain_schema", ColType::Text),
-            ("domain_name", ColType::Text),
-            ("udt_catalog", ColType::Text),
-            ("udt_schema", ColType::Text),
-            ("udt_name", ColType::Text),
-            ("scope_catalog", ColType::Text),
-            ("scope_schema", ColType::Text),
-            ("scope_name", ColType::Text),
-            ("maximum_cardinality", ColType::Int4),
-            ("dtd_identifier", ColType::Text),
-            ("is_self_referencing", ColType::Text),
-            ("is_identity", ColType::Text),
-            ("identity_generation", ColType::Text),
-            ("identity_start", ColType::Text),
-            ("identity_increment", ColType::Text),
-            ("identity_maximum", ColType::Text),
-            ("identity_minimum", ColType::Text),
-            ("identity_cycle", ColType::Text),
-            ("is_generated", ColType::Text),
-            ("generation_expression", ColType::Text),
-            ("is_updatable", ColType::Text),
-        ],
-    );
+    let def = schema::require("columns", true);
     let table_columns = (0..storage.table_count())
         .filter(|slot| storage.table_slot_visible_to(*slot, txid))
         .map(|slot| storage.table_def(slot, txid).columns().len())
@@ -33072,22 +31649,7 @@ fn info_table_constraints<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "table_constraints",
-        &[
-            ("constraint_catalog", ColType::Text),
-            ("constraint_schema", ColType::Text),
-            ("constraint_name", ColType::Text),
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("constraint_type", ColType::Text),
-            ("is_deferrable", ColType::Text),
-            ("initially_deferred", ColType::Text),
-            ("enforced", ColType::Text),
-            ("nulls_distinct", ColType::Text),
-        ],
-    );
+    let definition = schema::require("table_constraints", true);
     const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
         * (crate::storage::MAX_COLUMNS * 2
             + crate::storage::MAX_UNIQUES
@@ -33301,20 +31863,7 @@ fn info_key_column_usage<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "key_column_usage",
-        &[
-            ("constraint_catalog", ColType::Text),
-            ("constraint_schema", ColType::Text),
-            ("constraint_name", ColType::Text),
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("column_name", ColType::Text),
-            ("ordinal_position", ColType::Int4),
-            ("position_in_unique_constraint", ColType::Int4),
-        ],
-    );
+    let definition = schema::require("key_column_usage", true);
     const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
         * (crate::storage::MAX_COLUMNS
             + crate::storage::MAX_UNIQUES * crate::storage::MAX_INDEX_COLS
@@ -33407,18 +31956,7 @@ fn info_constraint_column_usage<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "constraint_column_usage",
-        &[
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("column_name", ColType::Text),
-            ("constraint_catalog", ColType::Text),
-            ("constraint_schema", ColType::Text),
-            ("constraint_name", ColType::Text),
-        ],
-    );
+    let definition = schema::require("constraint_column_usage", true);
     let mut total = 0usize;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {
@@ -33541,23 +32079,7 @@ fn info_sequences<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "sequences",
-        &[
-            ("sequence_catalog", ColType::Text),
-            ("sequence_schema", ColType::Text),
-            ("sequence_name", ColType::Text),
-            ("data_type", ColType::Text),
-            ("numeric_precision", ColType::Int4),
-            ("numeric_precision_radix", ColType::Int4),
-            ("numeric_scale", ColType::Int4),
-            ("start_value", ColType::Text),
-            ("minimum_value", ColType::Text),
-            ("maximum_value", ColType::Text),
-            ("increment", ColType::Text),
-            ("cycle_option", ColType::Text),
-        ],
-    );
+    let definition = schema::require("sequences", true);
     let mut output: [&[Datum]; 256] = [&[]; 256];
     let mut count = 0usize;
     for slot in 0..storage.sequence_count() {
@@ -33607,19 +32129,7 @@ fn info_usage_privileges<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "usage_privileges",
-        &[
-            ("grantor", ColType::Text),
-            ("grantee", ColType::Text),
-            ("object_catalog", ColType::Text),
-            ("object_schema", ColType::Text),
-            ("object_name", ColType::Text),
-            ("object_type", ColType::Text),
-            ("privilege_type", ColType::Text),
-            ("is_grantable", ColType::Text),
-        ],
-    );
+    let definition = schema::require("usage_privileges", true);
     let capacity = storage
         .sequence_count()
         .saturating_add(storage.domain_count().saturating_mul(2))
@@ -33743,19 +32253,7 @@ fn info_relation_privileges<'a>(
     relation_name: &str,
     include_public: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        relation_name,
-        &[
-            ("grantor", ColType::Text),
-            ("grantee", ColType::Text),
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("privilege_type", ColType::Text),
-            ("is_grantable", ColType::Text),
-            ("with_hierarchy", ColType::Text),
-        ],
-    );
+    let definition = schema::require(relation_name, true);
     let capacity = 8usize.saturating_mul(
         storage
             .table_count()
@@ -33924,22 +32422,13 @@ fn info_column_privileges<'a>(
     arena: &'a Arena,
     include_public: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
+    let definition = schema::require(
         if include_public {
             "column_privileges"
         } else {
             "role_column_grants"
         },
-        &[
-            ("grantor", ColType::Text),
-            ("grantee", ColType::Text),
-            ("table_catalog", ColType::Text),
-            ("table_schema", ColType::Text),
-            ("table_name", ColType::Text),
-            ("column_name", ColType::Text),
-            ("privilege_type", ColType::Text),
-            ("is_grantable", ColType::Text),
-        ],
+        true,
     );
     let mut output_count = 0usize;
     for slot in 0..storage.table_count() {
@@ -34257,20 +32746,7 @@ fn info_referential_constraints<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "referential_constraints",
-        &[
-            ("constraint_catalog", ColType::Text),
-            ("constraint_schema", ColType::Text),
-            ("constraint_name", ColType::Text),
-            ("unique_constraint_catalog", ColType::Text),
-            ("unique_constraint_schema", ColType::Text),
-            ("unique_constraint_name", ColType::Text),
-            ("match_option", ColType::Text),
-            ("update_rule", ColType::Text),
-            ("delete_rule", ColType::Text),
-        ],
-    );
+    let definition = schema::require("referential_constraints", true);
     const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES * crate::storage::MAX_FKEYS;
     let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
     let mut count = 0;
@@ -34312,38 +32788,7 @@ fn info_domains<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "domains",
-        &[
-            ("domain_catalog", ColType::Text),
-            ("domain_schema", ColType::Text),
-            ("domain_name", ColType::Text),
-            ("data_type", ColType::Text),
-            ("character_maximum_length", ColType::Int4),
-            ("character_octet_length", ColType::Int4),
-            ("character_set_catalog", ColType::Text),
-            ("character_set_schema", ColType::Text),
-            ("character_set_name", ColType::Text),
-            ("collation_catalog", ColType::Text),
-            ("collation_schema", ColType::Text),
-            ("collation_name", ColType::Text),
-            ("numeric_precision", ColType::Int4),
-            ("numeric_precision_radix", ColType::Int4),
-            ("numeric_scale", ColType::Int4),
-            ("datetime_precision", ColType::Int4),
-            ("interval_type", ColType::Text),
-            ("interval_precision", ColType::Int4),
-            ("domain_default", ColType::Text),
-            ("udt_catalog", ColType::Text),
-            ("udt_schema", ColType::Text),
-            ("udt_name", ColType::Text),
-            ("scope_catalog", ColType::Text),
-            ("scope_schema", ColType::Text),
-            ("scope_name", ColType::Text),
-            ("maximum_cardinality", ColType::Int4),
-            ("dtd_identifier", ColType::Text),
-        ],
-    );
+    let definition = schema::require("domains", true);
     let visible_domains = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
         .count();
@@ -34421,19 +32866,7 @@ fn info_domain_constraints<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "domain_constraints",
-        &[
-            ("constraint_catalog", ColType::Text),
-            ("constraint_schema", ColType::Text),
-            ("constraint_name", ColType::Text),
-            ("domain_catalog", ColType::Text),
-            ("domain_schema", ColType::Text),
-            ("domain_name", ColType::Text),
-            ("is_deferrable", ColType::Text),
-            ("initially_deferred", ColType::Text),
-        ],
-    );
+    let definition = schema::require("domain_constraints", true);
     let capacity = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
         .map(|slot| {
@@ -34493,15 +32926,7 @@ fn info_check_constraints<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "check_constraints",
-        &[
-            ("constraint_catalog", ColType::Text),
-            ("constraint_schema", ColType::Text),
-            ("constraint_name", ColType::Text),
-            ("check_clause", ColType::Text),
-        ],
-    );
+    let definition = schema::require("check_constraints", true);
     let table_capacity = (0..storage.table_count())
         .filter(|&slot| storage.table_slot_visible_to(slot, txid))
         .map(|slot| {
@@ -34615,31 +33040,12 @@ fn info_column_type_usage<'a>(
     arena: &'a Arena,
     usage: InformationSchemaTypeUsage,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
+    let definition = schema::require(
         match usage {
             InformationSchemaTypeUsage::Domain => "column_domain_usage",
             InformationSchemaTypeUsage::UnderlyingType => "column_udt_usage",
         },
-        match usage {
-            InformationSchemaTypeUsage::Domain => &[
-                ("domain_catalog", ColType::Text),
-                ("domain_schema", ColType::Text),
-                ("domain_name", ColType::Text),
-                ("table_catalog", ColType::Text),
-                ("table_schema", ColType::Text),
-                ("table_name", ColType::Text),
-                ("column_name", ColType::Text),
-            ],
-            InformationSchemaTypeUsage::UnderlyingType => &[
-                ("udt_catalog", ColType::Text),
-                ("udt_schema", ColType::Text),
-                ("udt_name", ColType::Text),
-                ("table_catalog", ColType::Text),
-                ("table_schema", ColType::Text),
-                ("table_name", ColType::Text),
-                ("column_name", ColType::Text),
-            ],
-        },
+        true,
     );
     let table_capacity = storage
         .table_count()
@@ -34785,17 +33191,7 @@ fn info_domain_udt_usage<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "domain_udt_usage",
-        &[
-            ("udt_catalog", ColType::Text),
-            ("udt_schema", ColType::Text),
-            ("udt_name", ColType::Text),
-            ("domain_catalog", ColType::Text),
-            ("domain_schema", ColType::Text),
-            ("domain_name", ColType::Text),
-        ],
-    );
+    let definition = schema::require("domain_udt_usage", true);
     let visible_domains = (0..storage.domain_count())
         .filter(|&slot| storage.domain_slot_visible_to(slot, txid))
         .count();
@@ -34891,18 +33287,7 @@ fn info_schemata<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let def = def_of(
-        "schemata",
-        &[
-            ("catalog_name", ColType::Text),
-            ("schema_name", ColType::Text),
-            ("schema_owner", ColType::Text),
-            ("default_character_set_catalog", ColType::Text),
-            ("default_character_set_schema", ColType::Text),
-            ("default_character_set_name", ColType::Text),
-            ("sql_path", ColType::Text),
-        ],
-    );
+    let def = schema::require("schemata", true);
     let out = arena
         .alloc_slice_with(storage.schema_count() + 2, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -34976,15 +33361,7 @@ fn info_collations<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "collations",
-        &[
-            ("collation_catalog", ColType::Text),
-            ("collation_schema", ColType::Text),
-            ("collation_name", ColType::Text),
-            ("pad_attribute", ColType::Text),
-        ],
-    );
+    let definition = schema::require("collations", true);
     let output = arena
         .alloc_slice_with(
             crate::sql::ast::Collation::BUILTIN.len() + storage.collation_capacity(),
@@ -35024,17 +33401,7 @@ fn info_collation_character_set_applicability<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
-        "collation_character_set_applicability",
-        &[
-            ("collation_catalog", ColType::Text),
-            ("collation_schema", ColType::Text),
-            ("collation_name", ColType::Text),
-            ("character_set_catalog", ColType::Text),
-            ("character_set_schema", ColType::Text),
-            ("character_set_name", ColType::Text),
-        ],
-    );
+    let definition = schema::require("collation_character_set_applicability", true);
     let output = arena
         .alloc_slice_with(
             crate::sql::ast::Collation::BUILTIN.len() + storage.collation_capacity(),
@@ -35084,7 +33451,7 @@ fn info_enabled_roles<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of("enabled_roles", &[("role_name", ColType::Text)]);
+    let definition = schema::require("enabled_roles", true);
     let output = arena
         .alloc_slice_with(storage.role_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
@@ -35108,17 +33475,13 @@ fn info_applicable_roles<'a>(
     arena: &'a Arena,
     administrators_only: bool,
 ) -> Result<SynthTable<'a>, SqlError> {
-    let definition = def_of(
+    let definition = schema::require(
         if administrators_only {
             "administrable_role_authorizations"
         } else {
             "applicable_roles"
         },
-        &[
-            ("grantee", ColType::Text),
-            ("role_name", ColType::Text),
-            ("is_grantable", ColType::Text),
-        ],
+        true,
     );
     let output = arena
         .alloc_slice_with(storage.role_membership_count() + 1, |_| &[] as &[Datum])

@@ -30,6 +30,9 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
   duplicate matches, residual ON predicates, and LEFT JOIN preservation share
   one execution path. The fixed build-entry ceiling still bounds eligibility;
   larger builds choose a nested-loop plan before execution.
+- Schema-only catalog resolution reads shared definitions without constructing
+  rows or recursively describing catalog-backed views. Resolved view OID
+  lookups do not enumerate unrelated indexes.
 
 ## Running the suite
 

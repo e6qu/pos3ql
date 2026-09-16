@@ -122,6 +122,24 @@ ALTER TABLE differential_diamond_root ADD COLUMN amount integer DEFAULT 7 NOT NU
 ALTER TABLE differential_diamond_root RENAME COLUMN amount TO total;
 SELECT id, extra, total FROM ONLY differential_diamond_leaf;
 
+CREATE TABLE differential_schema_source (value integer);
+CREATE VIEW differential_schema_attributes AS
+ SELECT attname, atttypid FROM pg_attribute
+ WHERE attrelid = 'differential_schema_source'::regclass AND attnum > 0;
+CREATE VIEW differential_schema_classes AS SELECT oid, relname FROM pg_class;
+CREATE VIEW differential_schema_columns AS
+ SELECT column_name FROM information_schema.columns
+ WHERE table_name = 'differential_schema_source';
+SELECT attname, atttypid FROM differential_schema_attributes;
+SELECT column_name FROM differential_schema_columns;
+SELECT attname FROM pg_attribute
+ WHERE attrelid = 'differential_schema_attributes'::regclass AND attnum > 0
+ ORDER BY attnum;
+SELECT column_name FROM information_schema.columns
+ WHERE table_name = 'differential_schema_attributes' ORDER BY ordinal_position;
+SELECT relname FROM differential_schema_classes
+ WHERE oid = 'differential_schema_source'::regclass;
+
 CREATE TABLE differential_hash_source (id int, payload text, active bool);
 BEGIN;
 CREATE SEQUENCE differential_transaction_sequence START WITH 7;

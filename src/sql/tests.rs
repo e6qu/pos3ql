@@ -15774,18 +15774,20 @@ fn catalog_oid_columns_unify_with_regclass_set_operands() {
 fn catalog_schema_resolution_retains_only_its_owned_definition() {
     let (engine, mut budget) = test_engine();
     let arena = Arena::new(&mut budget, "catalog schema scratch", 2 << 20).unwrap();
-    for catalog in ["pg_amop", "pg_depend", "pg_partitioned_table"] {
+    for catalog in [
+        "pg_amop",
+        "pg_depend",
+        "pg_partitioned_table",
+        "pg_class",
+        "pg_constraint",
+        "pg_attrdef",
+    ] {
         let mark = arena.mark();
         let before = arena.used();
         crate::mem::guard::forbid_alloc(|| {
-            let shape = crate::sql::catalog::synthesize_definition(
-                &engine.storage,
-                Some("pg_catalog"),
-                catalog,
-                0,
-                &arena,
-            )
-            .unwrap();
+            let shape =
+                crate::sql::catalog::synthesize_definition(Some("pg_catalog"), catalog, &arena)
+                    .unwrap();
             assert!(shape.rows.is_empty());
             assert_eq!(shape.def.name.as_str(), catalog);
             assert_eq!(
@@ -15802,7 +15804,11 @@ fn catalog_schema_resolution_retains_only_its_owned_definition() {
             .unwrap();
             assert_eq!(shape.hidden_columns, materialized.hidden_columns);
             assert_eq!(shape.def.n_columns, materialized.def.n_columns);
-            for (actual, expected) in shape.def.columns().iter().zip(materialized.def.columns()) {
+            let width = shape.def.n_columns + shape.hidden_columns;
+            for (actual, expected) in shape.def.columns[..width]
+                .iter()
+                .zip(&materialized.def.columns[..width])
+            {
                 assert_eq!(actual.name, expected.name);
                 assert_eq!(actual.ctype, expected.ctype);
                 assert_eq!(actual.type_mod, expected.type_mod);
@@ -15812,6 +15818,45 @@ fn catalog_schema_resolution_retains_only_its_owned_definition() {
         // Every descriptor and row from this iteration was consumed above.
         unsafe { arena.rewind_to(mark) };
     }
+}
+
+#[test]
+fn catalog_backed_views_describe_without_constructing_catalog_rows() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE schema_only_source (value integer);
+         CREATE VIEW schema_only_attributes AS
+           SELECT attname, atttypid FROM pg_attribute
+            WHERE attrelid = 'schema_only_source'::regclass AND attnum > 0;
+         CREATE VIEW schema_only_classes AS SELECT oid, relname FROM pg_class;
+         CREATE VIEW schema_only_columns AS
+           SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'schema_only_source';
+         SELECT attname, atttypid FROM schema_only_attributes;
+         SELECT column_name FROM schema_only_columns;
+         SELECT attname FROM pg_attribute
+          WHERE attrelid = 'schema_only_attributes'::regclass AND attnum > 0
+          ORDER BY attnum;
+         SELECT column_name FROM information_schema.columns
+          WHERE table_name = 'schema_only_attributes' ORDER BY ordinal_position;
+         SELECT relname FROM schema_only_classes WHERE oid = 'schema_only_source'::regclass;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "value|23",
+            "value",
+            "attname",
+            "atttypid",
+            "attname",
+            "atttypid",
+            "schema_only_source"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[test]

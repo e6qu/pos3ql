@@ -740,13 +740,7 @@ impl<'d> QueryScope<'d> {
         let synth = if materialize {
             crate::sql::catalog::synthesize(storage, tref.schema, tref.table, txid, arena)?
         } else {
-            crate::sql::catalog::synthesize_definition(
-                storage,
-                tref.schema,
-                tref.table,
-                txid,
-                arena,
-            )?
+            crate::sql::catalog::synthesize_definition(tref.schema, tref.table, arena)?
         };
         let exposed = tref.alias.unwrap_or(tref.table);
         if self.names[..self.n].contains(&exposed) {

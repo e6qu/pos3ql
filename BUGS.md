@@ -7,7 +7,8 @@ work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria. The
 user-type-capacity, OID-band, wide-schema, WAL/checkpoint-width, catalog-shape,
-bounded-scratch, inheritance, derived-join/hidden-field, and recovery audits
+bounded-scratch, inheritance, derived-join/hidden-field, catalog-backed-view
+description, and recovery audits
 found no external blocker.
 
 | ID | Status | Found | Description | Reproducer | Blocker |

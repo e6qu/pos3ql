@@ -98,7 +98,10 @@ storage. RAM and local disk are bounded, disposable caches.
   Wide table/domain WAL staging borrows definitions, decoder branches isolate
   fixed scratch, and manifest replay transfers pending table ownership at one
   choke point rather than reserving a copy in every branch. Schema-only catalog
-  resolution and procedural count passes recycle temporary query state.
+  resolution reads one shared, storage-independent definition rather than
+  constructing and discarding rows. Catalog-backed view descriptions cannot
+  recursively materialize their own catalogs. Procedural count passes recycle
+  temporary query state.
   Inherited ALTER uses a bounded parent-first plan rather than recursive
   rewrite frames, visiting diamond descendants once. Empty table definitions
   accept PostgreSQL's zero-column syntax without accepting trailing commas.
@@ -108,7 +111,8 @@ storage. RAM and local disk are bounded, disposable caches.
   `pg_constraint` and `pg_attrdef` expose PostgreSQL 18 column order and types,
   with system `tableoid` addressable but excluded from star expansion.
   Hash-source decoding includes addressable hidden fields on both sides.
-  The shared catalog encoding boundary canonicalizes OID tags. Sequence state
+  The shared catalog encoding boundary canonicalizes OID tags, and resolved
+  view identities bypass unrelated index enumeration. Sequence state
   introspection shares one nullable OID parser and honors transaction-visible
   creation and restart state in SELECT records and FROM functions.
   Implicit index identities reserve the complete enforcer

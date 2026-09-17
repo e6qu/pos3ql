@@ -1955,6 +1955,7 @@ pub fn drop_user_mapping(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drop_foreign_table_slot(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -1962,6 +1963,7 @@ fn drop_foreign_table_slot(
     binding_slot: usize,
     definition: crate::storage::foreign::ForeignTableDefinition,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let table = *storage.table_def(definition.table as usize, txn.txid);
@@ -1982,6 +1984,7 @@ fn drop_foreign_table_slot(
             &statement,
             Some(crate::storage::TableKind::Foreign),
             "DROP FOREIGN TABLE",
+            arena,
             responder,
         )
     });
@@ -2014,6 +2017,7 @@ fn mark_foreign_server_drop(
     txn: &mut TxnState,
     slot: usize,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     if let Err(error) = storage.require_not_extension_member(
@@ -2049,7 +2053,9 @@ fn mark_foreign_server_drop(
         while let Some((binding, definition)) =
             storage.first_foreign_table_for_server(slot as u16, txn.txid)
         {
-            match drop_foreign_table_slot(storage, wal, txn, binding, definition, true, responder) {
+            match drop_foreign_table_slot(
+                storage, wal, txn, binding, definition, true, arena, responder,
+            ) {
                 Ok(Ok(())) => {}
                 other => return other,
             }
@@ -2071,6 +2077,7 @@ fn mark_foreign_server_drop(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn drop_foreign_server(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -2078,6 +2085,7 @@ pub fn drop_foreign_server(
     names: &[&str],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -2104,7 +2112,7 @@ pub fn drop_foreign_server(
         ) {
             return sql_fail(error);
         }
-        match mark_foreign_server_drop(storage, wal, txn, slot, cascade, responder) {
+        match mark_foreign_server_drop(storage, wal, txn, slot, cascade, arena, responder) {
             Ok(Ok(())) => {}
             other => return other,
         }
@@ -2113,6 +2121,7 @@ pub fn drop_foreign_server(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn drop_foreign_data_wrapper(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -2120,6 +2129,7 @@ pub fn drop_foreign_data_wrapper(
     names: &[&str],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -2175,7 +2185,7 @@ pub fn drop_foreign_data_wrapper(
             while let Some((server, _)) =
                 storage.first_foreign_server_for_wrapper(slot as u16, txn.txid)
             {
-                match mark_foreign_server_drop(storage, wal, txn, server, true, responder) {
+                match mark_foreign_server_drop(storage, wal, txn, server, true, arena, responder) {
                     Ok(Ok(())) => {}
                     other => return other,
                 }
@@ -2206,6 +2216,7 @@ pub fn drop_foreign_table(
     wal: &mut Wal,
     txn: &mut TxnState,
     statement: &DropTable<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let mut bindings = [usize::MAX; 16];
@@ -2234,6 +2245,7 @@ pub fn drop_foreign_table(
         statement,
         Some(crate::storage::TableKind::Foreign),
         "DROP FOREIGN TABLE",
+        arena,
         responder,
     ) {
         Ok(Ok(())) => {}
@@ -4933,6 +4945,7 @@ pub fn drop_table(
     wal: &mut Wal,
     txn: &mut TxnState,
     statement: &DropTable,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     drop_table_kind(
@@ -4942,10 +4955,12 @@ pub fn drop_table(
         statement,
         Some(crate::storage::TableKind::Local),
         "DROP TABLE",
+        arena,
         responder,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drop_table_kind(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -4953,6 +4968,7 @@ fn drop_table_kind(
     statement: &DropTable,
     expected_kind: Option<crate::storage::TableKind>,
     tag: &'static str,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let mut selected_tables = [usize::MAX; 16];
@@ -5123,7 +5139,7 @@ fn drop_table_kind(
                         cascade: statement.cascade,
                     };
                     let outcome = responder.without_command_complete(|responder| {
-                        drop_table_kind(storage, wal, txn, &child_drop, None, tag, responder)
+                        drop_table_kind(storage, wal, txn, &child_drop, None, tag, arena, responder)
                     });
                     match outcome {
                         Ok(Ok(())) => {}
@@ -5135,7 +5151,7 @@ fn drop_table_kind(
                     dependency.class == crate::storage::DependencyClass::Table
                         && dependency.slot as usize == index
                 };
-                let closure = stored_query_dependent_closure(storage, txn.txid, root);
+                let closure = stored_query_dependent_closure(storage, txn.txid, arena, root);
                 let StoredDependencyClosure {
                     views: dependent_views,
                     matviews: dependent_matviews,
@@ -5157,9 +5173,9 @@ fn drop_table_kind(
                         storage,
                         txn.txid,
                         policy_root,
-                        &dependent_views,
-                        &dependent_matviews,
-                        &dependent_routines,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
                     );
                 if has_dependents && !statement.cascade {
                     if let Err(error) = report_stored_query_dependents(
@@ -5174,13 +5190,14 @@ fn drop_table_kind(
                             suffix: crate::util::StackStr::new(),
                         },
                         StoredQuerySelection {
-                            views: &dependent_views,
-                            matviews: &dependent_matviews,
-                            routines: &dependent_routines,
-                            rules: &dependent_rules,
+                            views: dependent_views,
+                            matviews: dependent_matviews,
+                            routines: dependent_routines,
+                            rules: dependent_rules,
                             policy_root: Some(policy_root),
                         },
                         false,
+                        arena,
                         responder,
                     ) {
                         return sql_fail(error);
@@ -5204,13 +5221,14 @@ fn drop_table_kind(
                             suffix: crate::util::StackStr::new(),
                         },
                         StoredQuerySelection {
-                            views: &dependent_views,
-                            matviews: &dependent_matviews,
-                            routines: &dependent_routines,
-                            rules: &dependent_rules,
+                            views: dependent_views,
+                            matviews: dependent_matviews,
+                            routines: dependent_routines,
+                            rules: dependent_rules,
                             policy_root: Some(policy_root),
                         },
                         true,
+                        arena,
                         responder,
                     ) {
                         return sql_fail(error);
@@ -5220,9 +5238,9 @@ fn drop_table_kind(
                         wal,
                         txn,
                         policy_root,
-                        &dependent_views,
-                        &dependent_matviews,
-                        &dependent_routines,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
                     ) {
                         return sql_fail(error);
                     }
@@ -5230,10 +5248,10 @@ fn drop_table_kind(
                         storage,
                         wal,
                         txn,
-                        &dependent_views,
-                        &dependent_matviews,
-                        &dependent_routines,
-                        &dependent_rules,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
+                        dependent_rules,
                     ) {
                         return sql_fail(error);
                     }
@@ -8776,7 +8794,7 @@ pub fn drop_owned(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
-    use crate::storage::{AccessClass, AccessObject, DependencyClass, MAX_PUBLICATION_SCHEMAS};
+    use crate::storage::{AccessClass, AccessObject, DependencyClass};
     let mut owned_roles = [0u16; crate::sql::parser::MAX_LIST];
     let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
         Ok(count) => count,
@@ -8787,19 +8805,18 @@ pub fn drop_owned(
         return sql_fail(error);
     }
 
-    if storage.table_count() > MAX_DEPENDENT_STORED_QUERIES
-        || storage.view_count() > MAX_DEPENDENT_STORED_QUERIES
-        || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
-    {
-        return sql_fail(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "DROP OWNED dependency plan exceeds {} relation slots",
-            MAX_DEPENDENT_STORED_QUERIES
-        ));
-    }
-    let mut tables = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut views = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut matviews = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let tables = match dependency_flags(arena, storage.table_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
+    let views = match dependency_flags(arena, storage.view_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
+    let matviews = match dependency_flags(arena, storage.matview_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
     let sequences = match arena.alloc_slice_with(storage.sequence_count(), |_| false) {
         Ok(values) => values,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -8816,8 +8833,14 @@ pub fn drop_owned(
         Ok(values) => values,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut operators = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let routines = match dependency_flags(arena, storage.routine_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
+    let operators = match dependency_flags(arena, storage.operator_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
     let collations = match arena.alloc_slice_with(storage.collation_capacity(), |_| false) {
         Ok(values) => values,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -8839,7 +8862,10 @@ pub fn drop_owned(
         Ok(values) => values,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    let mut schemas = [false; MAX_PUBLICATION_SCHEMAS];
+    let schemas = match dependency_flags(arena, storage.schema_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
     for (class, selected) in [
         (AccessClass::Table, &mut tables[..]),
         (AccessClass::View, &mut views[..]),
@@ -8938,7 +8964,7 @@ pub fn drop_owned(
         matviews: dependent_matviews,
         routines: dependent_routines,
         rules: dependent_rules,
-    } = match stored_query_dependent_closure(storage, txn.txid, root) {
+    } = match stored_query_dependent_closure(storage, txn.txid, arena, root) {
         Ok(selection) => selection,
         Err(error) => return sql_fail(error),
     };
@@ -8951,33 +8977,33 @@ pub fn drop_owned(
                     txn.txid,
                     slot,
                     policy,
-                    &tables,
-                    &views,
+                    tables,
+                    views,
                     sequences,
                     domains,
                     enums,
                     composites,
-                    &routines,
-                    &operators,
+                    routines,
+                    operators,
                     text_search_objects,
-                    &dependent_views,
-                    &dependent_matviews,
-                    &dependent_routines,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
                 )
             });
     if !cascade
         && (dependent_views
             .iter()
-            .zip(views)
-            .any(|(dependent, owned)| *dependent && !owned)
+            .zip(views.iter())
+            .any(|(dependent, owned)| *dependent && !*owned)
             || dependent_matviews
                 .iter()
-                .zip(matviews)
-                .any(|(dependent, owned)| *dependent && !owned)
+                .zip(matviews.iter())
+                .any(|(dependent, owned)| *dependent && !*owned)
             || dependent_routines
                 .iter()
-                .zip(routines)
-                .any(|(dependent, owned)| *dependent && !owned)
+                .zip(routines.iter())
+                .any(|(dependent, owned)| *dependent && !*owned)
             || has_policy_dependents)
     {
         return sql_fail(sql_err!(
@@ -8995,18 +9021,18 @@ pub fn drop_owned(
                         txn.txid,
                         slot,
                         policy,
-                        &tables,
-                        &views,
+                        tables,
+                        views,
                         sequences,
                         domains,
                         enums,
                         composites,
-                        &routines,
-                        &operators,
+                        routines,
+                        operators,
                         text_search_objects,
-                        &dependent_views,
-                        &dependent_matviews,
-                        &dependent_routines,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
                     )
             };
             if selected && let Err(error) = drop_policy_slot(storage, wal, txn, slot) {
@@ -9015,20 +9041,24 @@ pub fn drop_owned(
         }
     }
     if cascade {
-        for slot in 0..views.len() {
-            views[slot] |= dependent_views[slot];
-            matviews[slot] |= dependent_matviews[slot];
-            routines[slot] |= dependent_routines[slot];
+        for (selected, dependent) in views.iter_mut().zip(dependent_views.iter()) {
+            *selected |= *dependent;
+        }
+        for (selected, dependent) in matviews.iter_mut().zip(dependent_matviews.iter()) {
+            *selected |= *dependent;
+        }
+        for (selected, dependent) in routines.iter_mut().zip(dependent_routines.iter()) {
+            *selected |= *dependent;
         }
     }
     if let Err(error) = drop_selected_stored_queries(
         storage,
         wal,
         txn,
-        &views,
-        &matviews,
-        &routines,
-        &dependent_rules,
+        views,
+        matviews,
+        routines,
+        dependent_rules,
     ) {
         return sql_fail(error);
     }
@@ -9125,7 +9155,7 @@ pub fn drop_owned(
                 "cannot drop owned operator because other objects depend on it"
             ));
         }
-        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid) {
+        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid, arena) {
             return sql_fail(error);
         }
         if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
@@ -9230,8 +9260,14 @@ pub fn drop_owned(
         }
     }
 
-    let mut table_schemas = [SqlName::EMPTY; MAX_DEPENDENT_STORED_QUERIES];
-    let mut table_names = [SqlName::EMPTY; MAX_DEPENDENT_STORED_QUERIES];
+    let table_schemas = match arena.alloc_slice_with(storage.table_count(), |_| SqlName::EMPTY) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let table_names = match arena.alloc_slice_with(storage.table_count(), |_| SqlName::EMPTY) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let mut table_name_count = 0usize;
     for (slot, selected) in tables
         .iter()
@@ -9264,7 +9300,11 @@ pub fn drop_owned(
         }
     }
     if table_name_count != 0 {
-        let mut qualified = [QualName::bare(""); MAX_DEPENDENT_STORED_QUERIES];
+        let qualified = match arena.alloc_slice_with(storage.table_count(), |_| QualName::bare(""))
+        {
+            Ok(values) => values,
+            Err(_) => return sql_fail(super::query::arena_full_pub()),
+        };
         for index in 0..table_name_count {
             qualified[index] = QualName {
                 schema: Some(table_schemas[index].as_str()),
@@ -9277,7 +9317,16 @@ pub fn drop_owned(
             cascade,
         };
         let outcome = responder.without_command_complete(|responder| {
-            drop_table_kind(storage, wal, txn, &statement, None, "DROP TABLE", responder)
+            drop_table_kind(
+                storage,
+                wal,
+                txn,
+                &statement,
+                None,
+                "DROP TABLE",
+                arena,
+                responder,
+            )
         });
         match outcome {
             Ok(Ok(())) => {}
@@ -9321,6 +9370,7 @@ pub fn drop_owned(
                         core::slice::from_ref(&qualified),
                         false,
                         cascade,
+                        arena,
                         responder,
                     ),
                     AccessClass::Domain => drop_domain(
@@ -9505,7 +9555,7 @@ pub fn drop_owned(
         if !selected || !storage.text_search_object(slot).visible_to(txn.txid) {
             continue;
         }
-        if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade) {
+        if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade, arena) {
             return sql_fail(error);
         }
     }
@@ -11493,7 +11543,7 @@ pub fn drop_schema(
         // Stored queries outside the dropped schemas follow their resolved
         // dependencies transitively, exactly as pg_depend drives CASCADE.
         if n_objects > 0 {
-            let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
                 in_listed(storage, dependency.schema.as_str())
             });
             let StoredDependencyClosure {
@@ -11580,9 +11630,9 @@ pub fn drop_schema(
                         storage,
                         txn.txid,
                         dependencies,
-                        &dependent_views,
-                        &dependent_matviews,
-                        &dependent_routines,
+                        dependent_views,
+                        dependent_matviews,
+                        dependent_routines,
                     ))
                     && let Err(error) = push(
                         SchemaObject::Policy {
@@ -11608,7 +11658,7 @@ pub fn drop_schema(
             matviews: dependent_matviews,
             routines: dependent_routines,
             rules: _dependent_rules,
-        } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             in_listed(storage, dependency.schema.as_str())
         }) {
             Ok(closure) => closure,
@@ -11638,9 +11688,9 @@ pub fn drop_schema(
                     storage,
                     txn.txid,
                     dependencies,
-                    &dependent_views,
-                    &dependent_matviews,
-                    &dependent_routines,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
                 ))
                 && let Err(error) = push(
                     SchemaObject::Policy {
@@ -12282,6 +12332,22 @@ pub fn drop_schema(
         _ => 3,
     };
     objects[..n_objects].sort_unstable_by_key(|object| drop_rank(object.as_ref().expect("filled")));
+    let no_views = match dependency_flags(arena, storage.view_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
+    let no_matviews = match dependency_flags(arena, storage.matview_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
+    let selected_routines = match dependency_flags(arena, storage.routine_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
+    let no_rules = match dependency_flags(arena, storage.rule_count()) {
+        Ok(values) => values,
+        Err(error) => return sql_fail(error),
+    };
     for o in objects[..n_objects].iter().flatten() {
         match o {
             SchemaObject::InboundFk { table, fk_index } => {
@@ -12356,29 +12422,26 @@ pub fn drop_schema(
                 if storage.routine(*routine).visible_to(txn.txid) {
                     let routine_oid =
                         crate::storage::routine_oid(&storage.routine_for(*routine, txn.txid));
-                    if let Err(error) =
-                        cascade_routine_cast_operator_dependents(storage, wal, txn, routine_oid)
-                    {
+                    if let Err(error) = cascade_routine_cast_operator_dependents(
+                        storage,
+                        wal,
+                        txn,
+                        routine_oid,
+                        arena,
+                    ) {
                         return sql_fail(error);
                     }
                 }
-                let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
-                let Some(selected) = routines.get_mut(*routine) else {
-                    return sql_fail(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "DROP SCHEMA routine dependency plan exceeds {} slots",
-                        routines.len()
-                    ));
-                };
-                *selected = true;
+                selected_routines.fill(false);
+                selected_routines[*routine] = true;
                 if let Err(error) = drop_selected_stored_queries(
                     storage,
                     wal,
                     txn,
-                    &[false; MAX_DEPENDENT_STORED_QUERIES],
-                    &[false; MAX_DEPENDENT_STORED_QUERIES],
-                    &routines,
-                    &[false; MAX_DEPENDENT_STORED_QUERIES],
+                    no_views,
+                    no_matviews,
+                    selected_routines,
+                    no_rules,
                 ) {
                     return sql_fail(error);
                 }
@@ -12450,7 +12513,7 @@ pub fn drop_schema(
             }
             SchemaObject::TextSearch(slot) => {
                 if storage.text_search_object(*slot).visible_to(txn.txid)
-                    && let Err(error) = drop_text_search_slot(storage, wal, txn, *slot, true)
+                    && let Err(error) = drop_text_search_slot(storage, wal, txn, *slot, true, arena)
                 {
                     return sql_fail(error);
                 }
@@ -12596,7 +12659,7 @@ pub fn drop_schema(
                 if storage.operator(*operator).visible_to(txn.txid) {
                     let operator_oid = storage.operator(*operator).oid();
                     if let Err(error) =
-                        cascade_operator_dependencies(storage, wal, txn, operator_oid)
+                        cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)
                     {
                         return sql_fail(error);
                     }
@@ -20584,6 +20647,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.wal,
                     txn,
                     command,
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropSchema {
@@ -20699,6 +20763,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateDatabase { name, options } => {
@@ -20886,6 +20951,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     identities,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateOperatorFamily { name, .. } => super::exec::create_operator_family(
@@ -21003,6 +21069,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         cascade: *cascade,
                         kind: crate::sql::ast::RoutineTargetKind::Function,
                     },
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropProcedure {
@@ -21019,6 +21086,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         cascade: *cascade,
                         kind: crate::sql::ast::RoutineTargetKind::Procedure,
                     },
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropRoutine {
@@ -21035,6 +21103,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         cascade: *cascade,
                         kind: crate::sql::ast::RoutineTargetKind::Either,
                     },
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropAggregate {
@@ -21048,6 +21117,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     aggregates,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateRole {
@@ -21263,6 +21333,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateCollation(command) => super::exec::create_collation(
@@ -21537,6 +21608,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     name,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateEventTrigger(command) => super::exec::create_event_trigger(
@@ -21597,6 +21669,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateForeignServer(command) => super::exec::create_foreign_server(
@@ -21625,6 +21698,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateUserMapping(command) => super::exec::create_user_mapping(
@@ -21661,6 +21735,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.wal,
                     txn,
                     command,
+                    context.arena,
                     responder,
                 ),
                 Stmt::AlterForeignTable(command) => super::exec::alter_foreign_table(
@@ -21731,6 +21806,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateSequence {
@@ -21778,6 +21854,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     names,
                     *if_exists,
                     *cascade,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateDomain(command) => super::exec::create_domain(
@@ -29539,6 +29616,7 @@ fn drop_text_search_slot(
     txn: &mut TxnState,
     slot: usize,
     cascade: bool,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let root = storage.text_search_object(slot).definition_for(txn.txid);
     if root.kind() == crate::sql::ast::TextSearchObjectKind::Configuration {
@@ -29547,7 +29625,7 @@ fn drop_text_search_slot(
             matviews,
             routines,
             rules,
-        } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        } = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             dependency.class == crate::storage::DependencyClass::TextSearchConfiguration
                 && dependency.slot as usize == slot
         })?;
@@ -29559,14 +29637,7 @@ fn drop_text_search_slot(
             || matviews.iter().any(|selected| *selected)
             || routines.iter().any(|selected| *selected)
             || rules.iter().any(|selected| *selected)
-            || policy_dependents_exist(
-                storage,
-                txn.txid,
-                policy_root,
-                &views,
-                &matviews,
-                &routines,
-            );
+            || policy_dependents_exist(storage, txn.txid, policy_root, views, matviews, routines);
         if has_stored_dependents && !cascade {
             return Err(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -29576,8 +29647,8 @@ fn drop_text_search_slot(
             ));
         }
         if has_stored_dependents {
-            drop_policy_dependents(storage, wal, txn, policy_root, &views, &matviews, &routines)?;
-            drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines, &rules)?;
+            drop_policy_dependents(storage, wal, txn, policy_root, views, matviews, routines)?;
+            drop_selected_stored_queries(storage, wal, txn, views, matviews, routines, rules)?;
         }
     }
     let direct_dependent = |candidate_slot, candidate| {
@@ -29635,7 +29706,7 @@ fn drop_text_search_slot(
             },
         );
         let Some(dependent) = dependent else { break };
-        drop_text_search_slot(storage, wal, txn, dependent, true)?;
+        drop_text_search_slot(storage, wal, txn, dependent, true, arena)?;
     }
     if let crate::storage::TextSearchDefinition::Dictionary { oid, .. } = root {
         loop {
@@ -29681,6 +29752,7 @@ pub fn drop_text_search(
     name: &QualName<'_>,
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder<'_>,
 ) -> Outcome {
     let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txn.txid)
@@ -29721,7 +29793,7 @@ pub fn drop_text_search(
     if let Err(error) = authority {
         return sql_fail(error);
     }
-    if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade) {
+    if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade, arena) {
         return sql_fail(error);
     }
     responder.command_complete(match kind {
@@ -29926,7 +29998,7 @@ pub fn drop_collation(
         matviews: dependent_matviews,
         routines: dependent_routines,
         rules: dependent_rules,
-    } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+    } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
         dependency.class == crate::storage::DependencyClass::Collation
             && dependency.slot as usize == slot
     }) {
@@ -29945,9 +30017,9 @@ pub fn drop_collation(
             storage,
             txn.txid,
             policy_root,
-            &dependent_views,
-            &dependent_matviews,
-            &dependent_routines,
+            dependent_views,
+            dependent_matviews,
+            dependent_routines,
         );
     if has_stored_dependents && !cascade {
         if let Err(error) = report_stored_query_dependents(
@@ -29962,13 +30034,14 @@ pub fn drop_collation(
                 suffix: crate::util::StackStr::new(),
             },
             StoredQuerySelection {
-                views: &dependent_views,
-                matviews: &dependent_matviews,
-                routines: &dependent_routines,
-                rules: &dependent_rules,
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+                rules: dependent_rules,
                 policy_root: Some(policy_root),
             },
             false,
+            arena,
             responder,
         ) {
             return sql_fail(error);
@@ -30132,13 +30205,14 @@ pub fn drop_collation(
                     suffix: crate::util::StackStr::new(),
                 },
                 StoredQuerySelection {
-                    views: &dependent_views,
-                    matviews: &dependent_matviews,
-                    routines: &dependent_routines,
-                    rules: &dependent_rules,
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
+                arena,
                 responder,
             ) {
                 return sql_fail(error);
@@ -30148,9 +30222,9 @@ pub fn drop_collation(
                 wal,
                 txn,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             ) {
                 return sql_fail(error);
             }
@@ -30158,10 +30232,10 @@ pub fn drop_collation(
                 storage,
                 wal,
                 txn,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
-                &dependent_rules,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
+                dependent_rules,
             ) {
                 return sql_fail(error);
             }
@@ -30338,13 +30412,14 @@ fn cascade_operator_dependencies(
     wal: &mut Wal,
     txn: &mut TxnState,
     operator_oid: i32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let StoredDependencyClosure {
         views,
         matviews,
         routines,
         rules,
-    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+    } = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
         dependency.class == crate::storage::DependencyClass::Operator
             && matches!(
                 dependency.identity,
@@ -30357,9 +30432,9 @@ fn cascade_operator_dependencies(
             class: crate::storage::DependencyClass::Operator,
             slot: operator_slot,
         };
-        drop_policy_dependents(storage, wal, txn, root, &views, &matviews, &routines)?;
+        drop_policy_dependents(storage, wal, txn, root, views, matviews, routines)?;
     }
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines, &rules)?;
+    drop_selected_stored_queries(storage, wal, txn, views, matviews, routines, rules)?;
     loop {
         let dependent = storage
             .operator_classes_visible_to(txn.txid)
@@ -30488,6 +30563,7 @@ pub(crate) fn alter_operator(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn drop_operators(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -30495,6 +30571,7 @@ pub(crate) fn drop_operators(
     identities: &[crate::sql::ast::OperatorIdentity<'_>],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for identity in identities {
@@ -30529,7 +30606,7 @@ pub(crate) fn drop_operators(
             matviews: dependent_matviews,
             routines: dependent_routines,
             rules: dependent_rules,
-        } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             dependency.class == crate::storage::DependencyClass::Operator
                 && matches!(
                     dependency.identity,
@@ -30552,9 +30629,9 @@ pub(crate) fn drop_operators(
                 storage,
                 txn.txid,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             );
         if (operator_has_dependents(storage, txn.txid, operator_oid) || has_stored_dependents)
             && !cascade
@@ -30572,13 +30649,14 @@ pub(crate) fn drop_operators(
                         suffix: crate::util::StackStr::new(),
                     },
                     StoredQuerySelection {
-                        views: &dependent_views,
-                        matviews: &dependent_matviews,
-                        routines: &dependent_routines,
-                        rules: &dependent_rules,
+                        views: dependent_views,
+                        matviews: dependent_matviews,
+                        routines: dependent_routines,
+                        rules: dependent_rules,
                         policy_root: Some(policy_root),
                     },
                     false,
+                    arena,
                     responder,
                 )
             {
@@ -30603,19 +30681,20 @@ pub(crate) fn drop_operators(
                     suffix: crate::util::StackStr::new(),
                 },
                 StoredQuerySelection {
-                    views: &dependent_views,
-                    matviews: &dependent_matviews,
-                    routines: &dependent_routines,
-                    rules: &dependent_rules,
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
+                arena,
                 responder,
             )
         {
             return sql_fail(error);
         }
-        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid) {
+        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid, arena) {
             return sql_fail(error);
         }
         if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
@@ -34040,6 +34119,7 @@ pub fn alter_aggregate(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn drop_aggregate(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -34047,6 +34127,7 @@ pub fn drop_aggregate(
     aggregates: &[super::ast::AggregateIdentity<'_>],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     drop_routine(
@@ -34059,6 +34140,7 @@ pub fn drop_aggregate(
             cascade,
             kind: crate::sql::ast::RoutineTargetKind::Aggregate,
         },
+        arena,
         responder,
     )
 }
@@ -34555,6 +34637,7 @@ fn cascade_routine_cast_operator_dependents(
     wal: &mut Wal,
     txn: &mut TxnState,
     routine_oid: i32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     loop {
         let dependent = storage
@@ -34591,7 +34674,7 @@ fn cascade_routine_cast_operator_dependents(
             });
         let Some(slot) = dependent else { break };
         let operator_oid = storage.operator(slot).oid();
-        cascade_operator_dependencies(storage, wal, txn, operator_oid)?;
+        cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)?;
         stage_operator_drop(storage, wal, txn, slot)?;
     }
     loop {
@@ -34610,6 +34693,7 @@ pub fn drop_routine(
     wal: &mut Wal,
     txn: &mut TxnState,
     command: DropRoutineCommand<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let DropRoutineCommand {
@@ -34742,9 +34826,9 @@ pub fn drop_routine(
         let StoredDependencyClosure {
             views: dependent_views,
             matviews: dependent_matviews,
-            routines: mut dependent_routines,
+            routines: dependent_routines,
             rules: dependent_rules,
-        } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        } = match stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             dependency.class == crate::storage::DependencyClass::Routine
                 && dependency.slot as usize == slot
         }) {
@@ -34765,9 +34849,9 @@ pub fn drop_routine(
                 storage,
                 txn.txid,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             );
         let dependency_suffix = match routine_dependency_suffix(storage, &routine) {
             Ok(suffix) => suffix,
@@ -34786,13 +34870,14 @@ pub fn drop_routine(
                     suffix: dependency_suffix,
                 },
                 StoredQuerySelection {
-                    views: &dependent_views,
-                    matviews: &dependent_matviews,
-                    routines: &dependent_routines,
-                    rules: &dependent_rules,
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 false,
+                arena,
                 responder,
             ) {
                 return sql_fail(error);
@@ -34816,13 +34901,14 @@ pub fn drop_routine(
                     suffix: dependency_suffix,
                 },
                 StoredQuerySelection {
-                    views: &dependent_views,
-                    matviews: &dependent_matviews,
-                    routines: &dependent_routines,
-                    rules: &dependent_rules,
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
+                arena,
                 responder,
             )
         {
@@ -34834,9 +34920,9 @@ pub fn drop_routine(
                 wal,
                 txn,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             )
         {
             return sql_fail(error);
@@ -34846,10 +34932,10 @@ pub fn drop_routine(
                 storage,
                 wal,
                 txn,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
-                &dependent_rules,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
+                dependent_rules,
             )
         {
             return sql_fail(error);
@@ -34864,7 +34950,7 @@ pub fn drop_routine(
         }
         if cascade
             && let Err(error) =
-                cascade_routine_cast_operator_dependents(storage, wal, txn, support_oid)
+                cascade_routine_cast_operator_dependents(storage, wal, txn, support_oid, arena)
         {
             return sql_fail(error);
         }
@@ -38541,6 +38627,7 @@ pub fn refresh_materialized_view(
 
 /// DROP MATERIALIZED VIEW [IF EXISTS]: drops the backing table and its matview
 /// catalog entry.
+#[allow(clippy::too_many_arguments)]
 pub fn drop_materialized_view(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -38548,6 +38635,7 @@ pub fn drop_materialized_view(
     names: &[crate::sql::ast::QualName],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -38610,7 +38698,7 @@ pub fn drop_materialized_view(
         ) {
             return sql_fail(error);
         }
-        let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             dependency.class == crate::storage::DependencyClass::Table
                 && dependency.slot as usize == idx
         });
@@ -38635,9 +38723,9 @@ pub fn drop_materialized_view(
                 storage,
                 txn.txid,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             );
         if has_dependents && !cascade {
             return sql_fail(sql_err!(
@@ -38652,9 +38740,9 @@ pub fn drop_materialized_view(
                 wal,
                 txn,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             ) {
                 return sql_fail(error);
             }
@@ -38662,10 +38750,10 @@ pub fn drop_materialized_view(
                 storage,
                 wal,
                 txn,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
-                &dependent_rules,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
+                dependent_rules,
             ) {
                 return sql_fail(error);
             }
@@ -39442,6 +39530,7 @@ pub fn alter_sequence(
 }
 
 /// DROP SEQUENCE [IF EXISTS].
+#[allow(clippy::too_many_arguments)]
 pub fn drop_sequence(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -39449,6 +39538,7 @@ pub fn drop_sequence(
     names: &[crate::sql::ast::QualName],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -39499,7 +39589,7 @@ pub fn drop_sequence(
             }
             (s.schema, s.name, s.persistence)
         };
-        let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
             dependency.class == crate::storage::DependencyClass::Sequence
                 && dependency.slot as usize == slot
         });
@@ -39524,9 +39614,9 @@ pub fn drop_sequence(
                 storage,
                 txn.txid,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             );
         if has_dependents && !cascade {
             if let Err(error) = report_stored_query_dependents(
@@ -39541,13 +39631,14 @@ pub fn drop_sequence(
                     suffix: crate::util::StackStr::new(),
                 },
                 StoredQuerySelection {
-                    views: &dependent_views,
-                    matviews: &dependent_matviews,
-                    routines: &dependent_routines,
-                    rules: &dependent_rules,
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 false,
+                arena,
                 responder,
             ) {
                 return sql_fail(error);
@@ -39571,13 +39662,14 @@ pub fn drop_sequence(
                     suffix: crate::util::StackStr::new(),
                 },
                 StoredQuerySelection {
-                    views: &dependent_views,
-                    matviews: &dependent_matviews,
-                    routines: &dependent_routines,
-                    rules: &dependent_rules,
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                    rules: dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
+                arena,
                 responder,
             ) {
                 return sql_fail(error);
@@ -39587,9 +39679,9 @@ pub fn drop_sequence(
                 wal,
                 txn,
                 policy_root,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
             ) {
                 return sql_fail(error);
             }
@@ -39597,10 +39689,10 @@ pub fn drop_sequence(
                 storage,
                 wal,
                 txn,
-                &dependent_views,
-                &dependent_matviews,
-                &dependent_routines,
-                &dependent_rules,
+                dependent_views,
+                dependent_matviews,
+                dependent_routines,
+                dependent_rules,
             ) {
                 return sql_fail(error);
             }
@@ -40014,6 +40106,7 @@ fn routine_uses_selected_type(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drop_type_dependent_routines(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -40022,6 +40115,7 @@ fn drop_type_dependent_routines(
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
     cascade: bool,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     macro_rules! uses {
         ($result:expr) => {
@@ -40092,7 +40186,7 @@ fn drop_type_dependent_routines(
                 });
             let Some(slot) = dependent else { break };
             let operator_oid = storage.operator(slot).oid();
-            cascade_operator_dependencies(storage, wal, txn, operator_oid)?;
+            cascade_operator_dependencies(storage, wal, txn, operator_oid, arena)?;
             stage_operator_drop(storage, wal, txn, slot)?;
         }
         loop {
@@ -40129,14 +40223,7 @@ fn drop_type_dependent_routines(
             stage_operator_family(storage, wal, txn, slot, family)?;
         }
     }
-    if storage.routine_count() > MAX_DEPENDENT_STORED_QUERIES {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "type dependency closure exceeds {} routine slots",
-            MAX_DEPENDENT_STORED_QUERIES
-        ));
-    }
-    let mut selected = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let selected = dependency_flags(arena, storage.routine_count())?;
     for (slot, selected_slot) in selected
         .iter_mut()
         .enumerate()
@@ -40194,7 +40281,7 @@ fn drop_type_dependent_routines(
         matviews,
         routines: dependent_routines,
         rules: dependent_rules,
-    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+    } = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
         dependency.class == crate::storage::DependencyClass::Routine
             && selected
                 .get(usize::from(dependency.slot))
@@ -40211,9 +40298,9 @@ fn drop_type_dependent_routines(
                     class: crate::storage::DependencyClass::Routine,
                     slot,
                 },
-                &views,
-                &matviews,
-                &dependent_routines,
+                views,
+                matviews,
+                dependent_routines,
             )?;
         }
     }
@@ -40224,10 +40311,10 @@ fn drop_type_dependent_routines(
         storage,
         wal,
         txn,
-        &views,
-        &matviews,
-        &selected,
-        &dependent_rules,
+        views,
+        matviews,
+        selected,
+        dependent_rules,
     )?;
 
     loop {
@@ -40255,6 +40342,7 @@ fn drop_type_dependent_routines(
             wal,
             txn,
             crate::storage::routine_oid(&routine),
+            arena,
         )?;
         let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
         let signature = encode_routine_signature(routine.arguments(), &mut signature)?;
@@ -40396,7 +40484,16 @@ fn drop_domain_selection(
 ) -> Result<(), SqlError> {
     let selected_count = selected.iter().filter(|&&yes| yes).count();
     if selected_count > 0 || selected_enum.is_some() {
-        drop_type_dependent_routines(storage, wal, txn, selected, selected_enum, None, cascade)?;
+        drop_type_dependent_routines(
+            storage,
+            wal,
+            txn,
+            selected,
+            selected_enum,
+            None,
+            cascade,
+            arena,
+        )?;
         apply_type_drop_to_stored_queries(
             storage,
             wal,
@@ -40405,6 +40502,7 @@ fn drop_domain_selection(
             selected_enum,
             None,
             cascade,
+            arena,
         )?;
     }
     for (slot, is_selected) in selected.iter().enumerate().take(storage.domain_count()) {
@@ -41668,14 +41766,14 @@ fn drop_composite_type(
         txn.txid,
         "type",
     )?;
-    drop_type_dependent_routines(storage, wal, txn, &[], None, Some(slot), cascade)?;
+    drop_type_dependent_routines(storage, wal, txn, &[], None, Some(slot), cascade, arena)?;
 
     let StoredDependencyClosure {
         views: dependent_views,
         matviews: dependent_matviews,
         routines: dependent_routines,
         rules: dependent_rules,
-    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+    } = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
         dependency.class == crate::storage::DependencyClass::Composite
             && dependency.slot as usize == slot
     })?;
@@ -41694,8 +41792,8 @@ fn drop_composite_type(
             name: definition.name,
         },
         CompositeTypeDependencySelection {
-            views: &dependent_views,
-            matviews: &dependent_matviews,
+            views: dependent_views,
+            matviews: dependent_matviews,
         },
         cascade,
         responder,
@@ -41703,9 +41801,9 @@ fn drop_composite_type(
         storage,
         txn.txid,
         policy_root,
-        &dependent_views,
-        &dependent_matviews,
-        &dependent_routines,
+        dependent_views,
+        dependent_matviews,
+        dependent_routines,
     );
     if has_dependents && !cascade {
         return Err(sql_err!(
@@ -41782,7 +41880,16 @@ fn drop_composite_type(
             cascade: true,
         };
         match responder.without_command_complete(|responder| {
-            drop_table_kind(storage, wal, txn, &statement, None, "DROP TABLE", responder)
+            drop_table_kind(
+                storage,
+                wal,
+                txn,
+                &statement,
+                None,
+                "DROP TABLE",
+                arena,
+                responder,
+            )
         }) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(error),
@@ -41841,18 +41948,18 @@ fn drop_composite_type(
             wal,
             txn,
             policy_root,
-            &dependent_views,
-            &dependent_matviews,
-            &dependent_routines,
+            dependent_views,
+            dependent_matviews,
+            dependent_routines,
         )?;
         drop_selected_stored_queries(
             storage,
             wal,
             txn,
-            &dependent_views,
-            &dependent_matviews,
-            &dependent_routines,
-            &dependent_rules,
+            dependent_views,
+            dependent_matviews,
+            dependent_routines,
+            dependent_rules,
         )?;
         drop_domain_selection(
             storage,
@@ -41913,8 +42020,8 @@ struct CompositeTypeDependencyRoot {
 
 #[derive(Clone, Copy)]
 struct CompositeTypeDependencySelection<'a> {
-    views: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &'a [bool],
+    matviews: &'a [bool],
 }
 
 fn report_composite_type_dependents(
@@ -42180,6 +42287,7 @@ fn reject_composite_attribute_type_with_dependents(
     storage: &Storage,
     composite_slot: usize,
     txid: u32,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let root = CompositeTypeDependencyRoot {
         slot: composite_slot,
@@ -42197,7 +42305,7 @@ fn reject_composite_attribute_type_with_dependents(
         matviews,
         routines,
         rules,
-    } = stored_query_dependent_closure(storage, txid, |dependency| {
+    } = stored_query_dependent_closure(storage, txid, arena, |dependency| {
         dependency.class == crate::storage::DependencyClass::Composite
             && dependency.slot as usize == composite_slot
     })?;
@@ -42214,6 +42322,7 @@ fn reject_composite_attribute_type_with_dependents(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_type_drop_to_stored_queries(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -42222,6 +42331,7 @@ fn apply_type_drop_to_stored_queries(
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
     cascade: bool,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     use crate::storage::DependencyClass;
     let root = |dependency: &crate::storage::StoredQueryDependency| match dependency.class {
@@ -42238,7 +42348,7 @@ fn apply_type_drop_to_stored_queries(
         matviews,
         routines: dependent_routines,
         rules: dependent_rules,
-    } = stored_query_dependent_closure(storage, txn.txid, root)?;
+    } = stored_query_dependent_closure(storage, txn.txid, arena, root)?;
     let has_policies = storage
         .policies_with_slots_visible_to(txn.txid)
         .any(|(slot, policy)| {
@@ -42250,9 +42360,9 @@ fn apply_type_drop_to_stored_queries(
                 selected_domains,
                 selected_enum,
                 selected_composite,
-                &views,
-                &matviews,
-                &dependent_routines,
+                views,
+                matviews,
+                dependent_routines,
             )
         });
     if !views.iter().any(|selected| *selected)
@@ -42281,9 +42391,9 @@ fn apply_type_drop_to_stored_queries(
                     selected_domains,
                     selected_enum,
                     selected_composite,
-                    &views,
-                    &matviews,
-                    &dependent_routines,
+                    views,
+                    matviews,
+                    dependent_routines,
                 )
         };
         if selected {
@@ -42294,10 +42404,10 @@ fn apply_type_drop_to_stored_queries(
         storage,
         wal,
         txn,
-        &views,
-        &matviews,
-        &dependent_routines,
-        &dependent_rules,
+        views,
+        matviews,
+        dependent_routines,
+        dependent_rules,
     )
 }
 
@@ -42310,9 +42420,9 @@ fn policy_depends_on_type_selection(
     selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
-    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &[bool],
+    matviews: &[bool],
+    routines: &[bool],
 ) -> bool {
     let dependencies = storage.policy_dependencies(slot, txid);
     dependencies.entries().iter().any(|dependency| {
@@ -42336,42 +42446,31 @@ fn policy_depends_on_type_selection(
     )
 }
 
-const MAX_DEPENDENT_STORED_QUERIES: usize = 128;
-
-struct StoredDependencyClosure {
-    views: [bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: [bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: [bool; MAX_DEPENDENT_STORED_QUERIES],
-    rules: [bool; MAX_DEPENDENT_STORED_QUERIES],
+struct StoredDependencyClosure<'a> {
+    views: &'a mut [bool],
+    matviews: &'a mut [bool],
+    routines: &'a mut [bool],
+    rules: &'a mut [bool],
 }
 
-fn stored_query_dependent_closure(
+fn dependency_flags(arena: &Arena, count: usize) -> Result<&mut [bool], SqlError> {
+    arena
+        .alloc_slice_with(count, |_| false)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
+fn stored_query_dependent_closure<'a>(
     storage: &Storage,
     txid: u32,
+    arena: &'a Arena,
     root: impl Fn(&crate::storage::StoredQueryDependency) -> bool,
-) -> Result<StoredDependencyClosure, SqlError> {
+) -> Result<StoredDependencyClosure<'a>, SqlError> {
     use crate::storage::DependencyClass;
-    if storage.view_count() > MAX_DEPENDENT_STORED_QUERIES
-        || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
-        || storage.routine_count() > MAX_DEPENDENT_STORED_QUERIES
-        || storage
-            .rules_visible_to(txid)
-            .filter(|(_, rule)| !rule.definition_for(txid).is_view_return())
-            .count()
-            > MAX_DEPENDENT_STORED_QUERIES
-    {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "stored-query dependency closure exceeds {} catalog slots",
-            MAX_DEPENDENT_STORED_QUERIES
-        ));
-    }
-    let mut views = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut matviews = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let mut rules = [false; MAX_DEPENDENT_STORED_QUERIES];
-    let selected_matview_owns_table = |selected: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-                                       table: usize| {
+    let views = dependency_flags(arena, storage.view_count())?;
+    let matviews = dependency_flags(arena, storage.matview_count())?;
+    let routines = dependency_flags(arena, storage.routine_count())?;
+    let rules = dependency_flags(arena, storage.rule_count())?;
+    let selected_matview_owns_table = |selected: &[bool], table: usize| {
         selected
             .iter()
             .copied()
@@ -42395,7 +42494,7 @@ fn stored_query_dependent_closure(
                         || (dependency.class == DependencyClass::View
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
-                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
+                            && selected_matview_owns_table(matviews, dependency.slot as usize))
                         || (dependency.class == DependencyClass::Routine
                             && routines[dependency.slot as usize])
                 });
@@ -42428,7 +42527,7 @@ fn stored_query_dependent_closure(
                         || (dependency.class == DependencyClass::View
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
-                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
+                            && selected_matview_owns_table(matviews, dependency.slot as usize))
                         || (dependency.class == DependencyClass::Routine
                             && routines[dependency.slot as usize])
                 });
@@ -42442,13 +42541,6 @@ fn stored_query_dependent_closure(
             if definition.is_view_return() {
                 continue;
             }
-            if slot >= rules.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "stored-query dependency closure exceeds {} rewrite-rule slots",
-                    MAX_DEPENDENT_STORED_QUERIES
-                ));
-            }
             if rules[slot] {
                 continue;
             }
@@ -42461,7 +42553,7 @@ fn stored_query_dependent_closure(
                         || (dependency.class == DependencyClass::View
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
-                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
+                            && selected_matview_owns_table(matviews, dependency.slot as usize))
                         || (dependency.class == DependencyClass::Routine
                             && routines[dependency.slot as usize])
                 });
@@ -42485,7 +42577,7 @@ fn stored_query_dependent_closure(
                         || (dependency.class == DependencyClass::View
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
-                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
+                            && selected_matview_owns_table(matviews, dependency.slot as usize))
                         || (dependency.class == DependencyClass::Routine
                             && routines[dependency.slot as usize])
                 });
@@ -42521,9 +42613,9 @@ fn policy_depends_on_selected_stored_query(
     storage: &Storage,
     txid: u32,
     dependencies: crate::storage::StoredQueryDependencyView<'_>,
-    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &[bool],
+    matviews: &[bool],
+    routines: &[bool],
 ) -> bool {
     dependencies
         .entries()
@@ -42556,18 +42648,18 @@ fn policy_depends_on_owned_selection(
     txid: u32,
     slot: usize,
     policy: &crate::storage::PolicyDef,
-    tables: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    tables: &[bool],
+    views: &[bool],
     sequences: &[bool],
     domains: &[bool],
     enums: &[bool],
     composites: &[bool],
-    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    operators: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &[bool],
+    operators: &[bool],
     text_search_objects: &[bool],
-    dependent_views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    dependent_matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    dependent_routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    dependent_views: &[bool],
+    dependent_matviews: &[bool],
+    dependent_routines: &[bool],
 ) -> bool {
     if tables
         .get(usize::from(policy.table))
@@ -42619,9 +42711,9 @@ fn policy_depends_on_dependency_drop(
     policy_slot: usize,
     policy: &crate::storage::PolicyDef,
     root: PolicyDependencySelection,
-    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &[bool],
+    matviews: &[bool],
+    routines: &[bool],
 ) -> bool {
     if matches!(
         root,
@@ -42654,9 +42746,9 @@ fn policy_dependents_exist(
     storage: &Storage,
     txid: u32,
     root: PolicyDependencySelection,
-    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &[bool],
+    matviews: &[bool],
+    routines: &[bool],
 ) -> bool {
     storage
         .policies_with_slots_visible_to(txid)
@@ -42672,9 +42764,9 @@ fn drop_policy_dependents(
     wal: &mut Wal,
     txn: &mut TxnState,
     root: PolicyDependencySelection,
-    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &[bool],
+    matviews: &[bool],
+    routines: &[bool],
 ) -> Result<(), SqlError> {
     for slot in 0..storage.policy_count() {
         let selected = {
@@ -42708,7 +42800,7 @@ fn apply_column_drop_dependencies(
         matviews,
         routines: dependent_routines,
         rules: dependent_rules,
-    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+    } = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
         dependency_references_table_column(dependency, table, column)
     })?;
     let has_stored_dependents = views.iter().any(|selected| *selected)
@@ -42720,9 +42812,9 @@ fn apply_column_drop_dependencies(
         storage,
         txn.txid,
         policy_root,
-        &views,
-        &matviews,
-        &dependent_routines,
+        views,
+        matviews,
+        dependent_routines,
     );
     let table_definition = *storage.table_def(table, txn.txid);
     stage_publication_column_drop_dependencies(
@@ -42837,13 +42929,14 @@ fn apply_column_drop_dependencies(
             suffix,
         },
         StoredQuerySelection {
-            views: &views,
-            matviews: &matviews,
-            routines: &dependent_routines,
-            rules: &dependent_rules,
+            views,
+            matviews,
+            routines: dependent_routines,
+            rules: dependent_rules,
             policy_root: Some(policy_root),
         },
         cascade,
+        arena,
         responder,
     )?;
     if !cascade {
@@ -42863,18 +42956,18 @@ fn apply_column_drop_dependencies(
         wal,
         txn,
         policy_root,
-        &views,
-        &matviews,
-        &dependent_routines,
+        views,
+        matviews,
+        dependent_routines,
     )?;
     drop_selected_stored_queries(
         storage,
         wal,
         txn,
-        &views,
-        &matviews,
-        &dependent_routines,
-        &dependent_rules,
+        views,
+        matviews,
+        dependent_routines,
+        dependent_rules,
     )
 }
 
@@ -43059,10 +43152,10 @@ fn routine_dependency_suffix(
 
 #[derive(Clone, Copy)]
 struct StoredQuerySelection<'a> {
-    views: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
-    rules: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &'a [bool],
+    matviews: &'a [bool],
+    routines: &'a [bool],
+    rules: &'a [bool],
     policy_root: Option<PolicyDependencySelection>,
 }
 
@@ -43084,6 +43177,7 @@ fn report_stored_query_dependents(
     root: StoredQueryRoot,
     selection: StoredQuerySelection<'_>,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
     use crate::storage::DependencyClass;
@@ -43122,16 +43216,22 @@ fn report_stored_query_dependents(
     // A dependency report is parent-before-child. Derive a bounded depth from
     // the same graph used for selection so a table→view→matview→view chain is
     // rendered in PostgreSQL's order.
-    let mut view_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
-    let mut matview_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
-    let mut routine_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
+    let view_depth = arena
+        .alloc_slice_with(storage.view_count(), |_| 0usize)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let matview_depth = arena
+        .alloc_slice_with(storage.matview_count(), |_| 0usize)
+        .map_err(|_| super::query::arena_full_pub())?;
+    let routine_depth = arena
+        .alloc_slice_with(storage.routine_count(), |_| 0usize)
+        .map_err(|_| super::query::arena_full_pub())?;
     loop {
         let mut changed = false;
         for slot in 0..storage.routine_count() {
             if !routines[slot] || routine_depth[slot] != 0 {
                 continue;
             }
-            let mut depth = 0u8;
+            let mut depth = 0usize;
             for dependency in storage.routine_dependencies_for(slot, txid).entries() {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
@@ -43189,7 +43289,7 @@ fn report_stored_query_dependents(
             if !views[slot] || view_depth[slot] != 0 {
                 continue;
             }
-            let mut depth = 0u8;
+            let mut depth = 0usize;
             for dependency in storage.view_dependencies(slot).entries() {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
@@ -43229,7 +43329,7 @@ fn report_stored_query_dependents(
             if !matviews[slot] || matview_depth[slot] != 0 {
                 continue;
             }
-            let mut depth = 0u8;
+            let mut depth = 0usize;
             for dependency in storage.matview_dependencies(slot).entries() {
                 let parent_depth = match dependency.class {
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
@@ -43377,7 +43477,7 @@ fn report_stored_query_dependents(
         }
         written += 1;
     }
-    for depth in 1..=MAX_DEPENDENT_STORED_QUERIES as u8 {
+    for depth in 1..=count {
         for slot in 0..storage.routine_count() {
             if !routines[slot] || routine_depth[slot] != depth {
                 continue;
@@ -43614,10 +43714,10 @@ fn drop_selected_stored_queries(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
-    rules: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    views: &[bool],
+    matviews: &[bool],
+    routines: &[bool],
+    rules: &[bool],
 ) -> Result<(), SqlError> {
     for slot in (0..rules.len()).rev() {
         if !rules[slot] || storage.rule_slot_visible_to(slot, txn.txid).is_none() {
@@ -44432,7 +44532,7 @@ fn alter_composite_type(
             replacement.name = altered.fields[index].name;
             replacement.not_null = altered.fields[index].not_null;
             if let Err(error) =
-                reject_composite_attribute_type_with_dependents(storage, slot, txn.txid)
+                reject_composite_attribute_type_with_dependents(storage, slot, txn.txid, arena)
             {
                 return sql_fail(error);
             }
@@ -45955,6 +46055,7 @@ fn resolve_sequence(
 }
 
 /// DROP VIEW [IF EXISTS].
+#[allow(clippy::too_many_arguments)]
 pub fn drop_view(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -45962,6 +46063,7 @@ pub fn drop_view(
     names: &[QualName],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     for name in names {
@@ -46009,7 +46111,7 @@ pub fn drop_view(
                     v.persistence == crate::storage::RelationPersistence::Temporary,
                 )
             };
-            let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            let closure = stored_query_dependent_closure(storage, txn.txid, arena, |dependency| {
                 dependency.class == crate::storage::DependencyClass::View
                     && dependency.slot as usize == slot
             });
@@ -46034,9 +46136,9 @@ pub fn drop_view(
                     storage,
                     txn.txid,
                     policy_root,
-                    &dependent_views,
-                    &dependent_matviews,
-                    &dependent_routines,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
                 );
             let has_triggers = storage.triggers_for_view(slot, txn.txid).next().is_some();
             if (has_dependents || has_triggers) && !cascade {
@@ -46052,9 +46154,9 @@ pub fn drop_view(
                     wal,
                     txn,
                     policy_root,
-                    &dependent_views,
-                    &dependent_matviews,
-                    &dependent_routines,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
                 ) {
                     return sql_fail(error);
                 }
@@ -46062,10 +46164,10 @@ pub fn drop_view(
                     storage,
                     wal,
                     txn,
-                    &dependent_views,
-                    &dependent_matviews,
-                    &dependent_routines,
-                    &dependent_rules,
+                    dependent_views,
+                    dependent_matviews,
+                    dependent_routines,
+                    dependent_rules,
                 ) {
                     return sql_fail(error);
                 }
@@ -49523,6 +49625,7 @@ pub fn create_access_method(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn drop_access_method(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -49530,6 +49633,7 @@ pub fn drop_access_method(
     names: &[&str],
     if_exists: bool,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let Some(current) = storage.current_role_slot(txn.txid) else {
@@ -49594,6 +49698,7 @@ pub fn drop_access_method(
                     &statement,
                     Some(crate::storage::TableKind::Local),
                     "DROP TABLE",
+                    arena,
                     responder,
                 )
             });

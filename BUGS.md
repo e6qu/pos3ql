@@ -17,6 +17,10 @@ statistics, and dependency images use startup-sized pools, the shared
 per-object dependency ceiling is configurable, and savepoint, exact-memory,
 configured-exhaustion, checkpoint-retry, and cold-recovery regressions cover
 them.
+The dependent-object planning audit found no external blocker: every stored
+query and ownership selection follows its independent configured catalog,
+including slots above 127, and allocation-forbidden rollback plus checkpoint
+retry and object-cold recovery qualify the complete cascade.
 The row-version and spill-generation audit also found no external blocker:
 both former eight-entry ceilings are startup-configurable, fully accounted,
 and covered across exhaustion, reuse, checkpoint publication, and empty-cache

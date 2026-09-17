@@ -9568,10 +9568,20 @@ fn run_with_fixed_memory(
     sql_text: &str,
     arena_bytes: usize,
 ) -> Vec<u8> {
+    run_with_fixed_memory_and_ddl_capacity(engine, budget, sql_text, arena_bytes, 64)
+}
+
+fn run_with_fixed_memory_and_ddl_capacity(
+    engine: &mut Engine,
+    budget: &Budget,
+    sql_text: &str,
+    arena_bytes: usize,
+    ddl_capacity: usize,
+) -> Vec<u8> {
     let mut request_budget = Budget::new(budget.remaining());
     let mut buffer = crate::mem::FixedBuf::new(&mut request_budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(&mut request_budget, "sql", arena_bytes).unwrap();
-    let mut txn = TxnState::new(&mut request_budget, 1024).unwrap();
+    let mut txn = TxnState::new_with_ddl_capacity(&mut request_budget, 1024, ddl_capacity).unwrap();
     let mut pool = test_pool(&mut request_budget);
     let mut cursors = test_cursors(&mut request_budget);
     let mut guc = GucState::new();
@@ -30282,6 +30292,292 @@ fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers
         ["15"]
     );
     drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn configured_dependency_plans_cross_old_catalog_ceiling_and_recover_cold() {
+    use core::fmt::Write as _;
+
+    const VIEW_COUNT: usize = 129;
+    const FILLER_ROUTINE_COUNT: usize = 128;
+
+    let mut config = test_config("catalog-sized-dependency-plans");
+    config.max_connections = 1;
+    config.max_tables = 140;
+    config.max_views = VIEW_COUNT;
+    config.max_materialized_views = 1;
+    config.max_routines = FILLER_ROUTINE_COUNT + 1;
+    config.max_rules = VIEW_COUNT + 3;
+    config.max_policies = 2;
+    config.max_ddl_per_transaction = 256;
+    config.table_rows = 8;
+    config.txn_rows = 512;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.checkpoint_manifest_bytes = 2 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("catalog-sized-dependency-plans-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 74);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    let owned = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE dp_owner;
+         CREATE TABLE dp_owned(id integer);
+         ALTER TABLE dp_owned OWNER TO dp_owner;",
+    );
+    assert!(
+        !message_types(&owned).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&owned)
+    );
+    let owned_rollback = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "BEGIN;
+         DROP OWNED BY dp_owner CASCADE;
+         SELECT count(*) FROM pg_class WHERE relname = 'dp_owned';
+         ROLLBACK;
+         SELECT count(*) FROM pg_class WHERE relname = 'dp_owned';",
+        2 << 20,
+    );
+    assert_eq!(
+        data_rows(&owned_rollback),
+        ["0", "1"],
+        "{}",
+        String::from_utf8_lossy(&owned_rollback)
+    );
+    let owned_drop = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP OWNED BY dp_owner CASCADE;
+         SELECT count(*) FROM pg_class WHERE relname = 'dp_owned';",
+    );
+    assert_eq!(
+        data_rows(&owned_drop),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&owned_drop)
+    );
+
+    let depth_root = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dp_depth_root(id integer);",
+    );
+    assert!(
+        !message_types(&depth_root).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&depth_root)
+    );
+    for first in (0..=FILLER_ROUTINE_COUNT).step_by(16) {
+        let mut routines = String::new();
+        for slot in first..(first + 16).min(FILLER_ROUTINE_COUNT + 1) {
+            if slot == 0 {
+                writeln!(
+                    routines,
+                    "CREATE FUNCTION dp_d_0() RETURNS bigint LANGUAGE SQL STABLE \
+                     BEGIN ATOMIC SELECT count(*) FROM dp_depth_root; END;"
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    routines,
+                    "CREATE FUNCTION dp_d_{slot}() RETURNS bigint LANGUAGE SQL STABLE \
+                     RETURN dp_d_{}();",
+                    slot - 1
+                )
+                .unwrap();
+            }
+        }
+        let created = run_with_arena_bytes(&mut engine, &mut budget, &routines, 2 << 20);
+        assert!(
+            !message_types(&created).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let depth_restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE dp_depth_root RESTRICT",
+    );
+    let depth_restricted = String::from_utf8_lossy(&depth_restricted);
+    assert!(depth_restricted.contains("2BP01"), "{depth_restricted}");
+    assert!(!depth_restricted.contains("54000"), "{depth_restricted}");
+    assert!(depth_restricted.contains("dp_d_128"), "{depth_restricted}");
+    let depth_cascade = run_with_ddl_capacity(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE dp_depth_root CASCADE;
+         SELECT count(*) FROM pg_proc WHERE proname LIKE 'dp_d_%';",
+        256,
+        2 << 20,
+    );
+    assert_eq!(
+        data_rows(&depth_cascade),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&depth_cascade)
+    );
+
+    let root_tables = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dp_root(id integer);
+         CREATE TABLE dp_rule_target(id integer);
+         CREATE TABLE dp_rule_sink(id integer);",
+    );
+    assert!(
+        !message_types(&root_tables).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&root_tables)
+    );
+    for first in (0..FILLER_ROUTINE_COUNT).step_by(16) {
+        let mut routines = String::new();
+        for slot in first..(first + 16).min(FILLER_ROUTINE_COUNT) {
+            writeln!(
+                routines,
+                "CREATE FUNCTION dp_f_{slot}() RETURNS integer LANGUAGE SQL IMMUTABLE RETURN {slot};"
+            )
+            .unwrap();
+        }
+        let created = run_with_arena_bytes(&mut engine, &mut budget, &routines, 2 << 20);
+        assert!(
+            !message_types(&created).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    for first in (0..VIEW_COUNT).step_by(16) {
+        let mut views = String::new();
+        for slot in first..(first + 16).min(VIEW_COUNT) {
+            writeln!(views, "CREATE VIEW dp_v_{slot} AS SELECT id FROM dp_root;").unwrap();
+        }
+        let created = run_with_arena_bytes(&mut engine, &mut budget, &views, 2 << 20);
+        assert!(
+            !message_types(&created).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let high_slot_dependents = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION dp_dep() RETURNS bigint LANGUAGE SQL STABLE
+           BEGIN ATOMIC SELECT count(*) FROM dp_root; END;
+         CREATE RULE dp_rule AS ON INSERT TO dp_rule_target DO ALSO
+           INSERT INTO dp_rule_sink SELECT id FROM dp_root;",
+    );
+    assert!(
+        !message_types(&high_slot_dependents).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&high_slot_dependents)
+    );
+
+    let restricted = run_with(&mut engine, &mut budget, "DROP TABLE dp_root RESTRICT");
+    let restricted = String::from_utf8_lossy(&restricted);
+    assert!(restricted.contains("2BP01"), "{restricted}");
+    assert!(!restricted.contains("54000"), "{restricted}");
+    assert!(restricted.contains("dp_v_128"), "{restricted}");
+    assert!(restricted.contains("dp_dep"), "{restricted}");
+    assert!(restricted.contains("dp_rule"), "{restricted}");
+
+    let rolled_back = run_with_fixed_memory_and_ddl_capacity(
+        &mut engine,
+        &budget,
+        "BEGIN;
+         DROP TABLE dp_root CASCADE;
+         SELECT count(*) FROM pg_views WHERE viewname LIKE 'dp_v_%';
+         SELECT count(*) FROM pg_proc WHERE proname = 'dp_dep';
+         SELECT count(*) FROM pg_rules WHERE rulename = 'dp_rule';
+         ROLLBACK;
+         SELECT count(*) FROM pg_views WHERE viewname LIKE 'dp_v_%';
+         SELECT count(*) FROM pg_proc WHERE proname = 'dp_dep';
+        SELECT count(*) FROM pg_rules WHERE rulename = 'dp_rule';",
+        2 << 20,
+        256,
+    );
+    assert_eq!(
+        data_rows(&rolled_back),
+        ["0", "0", "0", "129", "1", "1"],
+        "{}",
+        String::from_utf8_lossy(&rolled_back)
+    );
+
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+    assert!(engine.checkpoint().is_err());
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT count(*) FROM pg_views WHERE viewname LIKE 'dp_v_%';
+         SELECT count(*) FROM pg_proc WHERE proname = 'dp_dep';
+         SELECT count(*) FROM pg_rules WHERE rulename = 'dp_rule';",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        ["129", "1", "1"],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    let cascaded = run_with_ddl_capacity(
+        &mut cold,
+        &mut cold_budget,
+        "DROP TABLE dp_root CASCADE;
+         SELECT count(*) FROM pg_views WHERE viewname LIKE 'dp_v_%';
+         SELECT count(*) FROM pg_proc WHERE proname = 'dp_dep';
+         SELECT count(*) FROM pg_proc WHERE proname LIKE 'dp_f_%';
+         SELECT count(*) FROM pg_rules WHERE rulename = 'dp_rule';",
+        256,
+        2 << 20,
+    );
+    assert_eq!(
+        data_rows(&cascaded),
+        ["0", "0", "128", "0"],
+        "{}",
+        String::from_utf8_lossy(&cascaded)
+    );
+
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+    assert!(cold.checkpoint().is_err());
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    assert!(cold.checkpoint().unwrap());
+    drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut final_budget = Budget::new(1 << 30);
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    let durable = run_with(
+        &mut final_engine,
+        &mut final_budget,
+        "SELECT count(*) FROM pg_views WHERE viewname LIKE 'dp_v_%';
+         SELECT count(*) FROM pg_proc WHERE proname = 'dp_dep';
+         SELECT count(*) FROM pg_proc WHERE proname LIKE 'dp_f_%';
+         SELECT count(*) FROM pg_rules WHERE rulename = 'dp_rule';",
+    );
+    assert_eq!(
+        data_rows(&durable),
+        ["0", "0", "128", "0"],
+        "{}",
+        String::from_utf8_lossy(&durable)
+    );
+    drop(final_engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

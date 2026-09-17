@@ -410,7 +410,7 @@ use window::{
 /// scratch, so a query can use every configured relation slot without a
 /// second, smaller executor limit.
 pub const MAX_JOIN_TABLES: usize = 64;
-const MAX_AGGS: usize = 16;
+const MAX_AGGS: usize = super::parser::MAX_LIST;
 pub(crate) const MAX_ROUTINE_INVOCATIONS: usize = 1024;
 
 use core::cell::Cell;
@@ -706,10 +706,10 @@ impl<'a> RoutineInvocationState<'a> {
         Ok(())
     }
 }
-pub(super) const MAX_WINDOWS: usize = 16;
+pub(super) const MAX_WINDOWS: usize = super::parser::MAX_LIST;
 /// Maximum ORDER BY / PARTITION BY keys in one window clause.
-const MAX_WIN_KEYS: usize = 8;
-const MAX_SUBQUERIES: usize = 8;
+const MAX_WIN_KEYS: usize = super::parser::MAX_LIST * 2;
+const MAX_SUBQUERIES: usize = super::parser::MAX_LIST;
 const SUBQUERY_DEPTH: u32 = 4;
 
 type Outcome = Result<Result<(), SqlError>, WireFull>;

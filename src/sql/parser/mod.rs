@@ -26,13 +26,13 @@ pub const MAX_LIST: usize = 64;
 /// pg_dump locks its complete table set in one statement.
 pub const MAX_LOCK_TABLES: usize = crate::storage::MAX_PUBLICATION_TABLES;
 
-pub const MAX_CTES: usize = 16;
+pub const MAX_CTES: usize = MAX_LIST;
 /// Maximum number of `FOR UPDATE`/`FOR SHARE`/… clauses on one query.
-pub const MAX_LOCK_CLAUSES: usize = 8;
+pub const MAX_LOCK_CLAUSES: usize = MAX_LIST;
 /// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
-pub const MAX_WINDOW_DEFS: usize = 16;
+pub const MAX_WINDOW_DEFS: usize = MAX_LIST;
 /// Upper bound on warnings one statement's parse may raise.
-pub const MAX_PARSE_WARNINGS: usize = 8;
+pub const MAX_PARSE_WARNINGS: usize = MAX_LIST * 2;
 type OrderLimit<'a> = (
     &'a [OrderBy<'a>],
     Option<&'a Expr<'a>>,
@@ -59,7 +59,7 @@ fn push_mask(
     Ok(())
 }
 /// Upper bound on subcommands in one comma-separated ALTER TABLE.
-pub const MAX_ALTER_ACTIONS: usize = 32;
+pub const MAX_ALTER_ACTIONS: usize = MAX_LIST;
 
 /// PostgreSQL executes ALTER TABLE subcommands in a fixed pass order rather
 /// than the written order: drops first, then column-type changes, then column
@@ -5652,7 +5652,7 @@ impl<'a> Parser<'a> {
         let mut count = 0usize;
         loop {
             if count == MAX_ALTER_ACTIONS {
-                return Err(self.err_here("too many actions in one ALTER TABLE"));
+                return Err(self.limit("ALTER TABLE actions", MAX_ALTER_ACTIONS));
             }
             buffer[count] = self.alter_table_cmd(foreign)?;
             count += 1;
@@ -7872,7 +7872,7 @@ impl<'a> Parser<'a> {
                         sql_name,
                         nums[0],
                         if zoned { " WITH TIME ZONE" } else { "" }
-                    ));
+                    ))?;
                 }
                 let precision = nums[0].min(6) as u8;
                 // A plain `interval(p)` carries the full field range beside its
@@ -8118,13 +8118,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Records a warning for the engine to emit before this statement runs.
-    /// Overflowing the fixed buffer drops the extra warnings rather than
-    /// failing the statement — PostgreSQL still executes it too.
-    fn warn(&mut self, message: StackStr<96>) {
-        if self.n_warnings < MAX_PARSE_WARNINGS {
-            self.warnings[self.n_warnings] = message;
-            self.n_warnings += 1;
+    fn warn(&mut self, message: StackStr<96>) -> Result<(), ParseError> {
+        if self.n_warnings == MAX_PARSE_WARNINGS {
+            return Err(self.limit("parse warnings", MAX_PARSE_WARNINGS));
         }
+        self.warnings[self.n_warnings] = message;
+        self.n_warnings += 1;
+        Ok(())
     }
 
     /// Takes the warnings raised since the last call, in the order parsed.
@@ -10854,6 +10854,75 @@ mod tests {
                     .contains("IN list exceeds fixed limit")
             );
         });
+    }
+
+    #[test]
+    fn statement_width_has_one_exact_boundary_and_never_drops_warnings() {
+        let warned_columns = (0..MAX_LIST)
+            .map(|index| format!("column_{index} timestamp(7)"))
+            .collect::<Vec<_>>()
+            .join(",");
+        with_parser(
+            &format!("CREATE TABLE warning_width ({warned_columns})"),
+            |parser| {
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::CreateTable(_))
+                ));
+                let (warnings, count) = parser.take_warnings();
+                assert_eq!(count, MAX_PARSE_WARNINGS);
+                assert!(
+                    warnings[..count]
+                        .iter()
+                        .all(|warning| warning.as_str().contains("precision reduced"))
+                );
+            },
+        );
+
+        let ctes = (0..=MAX_LIST)
+            .map(|index| format!("cte_{index} AS (SELECT {index})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let lock_clauses = std::iter::repeat_n("FOR SHARE", MAX_LIST + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let windows = (0..=MAX_LIST)
+            .map(|index| format!("window_{index} AS ()"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let actions = (0..=MAX_LIST)
+            .map(|index| format!("ADD COLUMN column_{index} integer"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let using_columns = (0..=MAX_LIST)
+            .map(|index| format!("column_{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (label, sql) in [
+            ("WITH list", format!("WITH {ctes} SELECT 1")),
+            ("locking clauses", format!("SELECT 1 {lock_clauses}")),
+            (
+                "WINDOW definitions",
+                format!("SELECT row_number() OVER window_0 WINDOW {windows}"),
+            ),
+            (
+                "ALTER TABLE actions",
+                format!("ALTER TABLE target {actions}"),
+            ),
+            (
+                "USING columns",
+                format!("SELECT * FROM left_side JOIN right_side USING ({using_columns})"),
+            ),
+        ] {
+            with_parser(&sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED, "{label}");
+                assert!(
+                    error.message.as_str().contains("fixed limit"),
+                    "{label}: {error:?}"
+                );
+            });
+        }
     }
 
     #[test]

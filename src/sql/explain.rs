@@ -23,7 +23,25 @@ use crate::storage::Storage;
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
 
-const MAX_PLAN_NODES: usize = 32;
+const MAX_EXPLAIN_STAGES: usize = 8;
+
+// A SELECT can expose one heap and one bitmap node per source plus every
+// operator stage. Composed set trees reserve the sum of their actual leaves,
+// so independently accepted widths never form a new fixed product ceiling.
+fn select_plan_capacity(statement: &Select<'_>) -> usize {
+    statement.from.as_ref().map_or(MAX_EXPLAIN_STAGES, |from| {
+        (from.joins.len() + 1) * 2 + MAX_EXPLAIN_STAGES
+    })
+}
+
+fn set_tree_plan_capacity(tree: &SetTree<'_>) -> usize {
+    match tree {
+        SetTree::Select(select) => select_plan_capacity(select),
+        SetTree::Op { left, right, .. } => {
+            1 + set_tree_plan_capacity(left) + set_tree_plan_capacity(right)
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct PlanNode {
@@ -69,19 +87,22 @@ pub(super) struct ExplainActual {
     pub(super) wal_bytes: u64,
 }
 
-pub(super) struct Plan {
-    nodes: [PlanNode; MAX_PLAN_NODES],
+pub(super) struct Plan<'a> {
+    nodes: &'a mut [PlanNode],
     count: usize,
     planning_micros: u64,
 }
 
-impl Plan {
-    fn new() -> Self {
-        Self {
-            nodes: [PlanNode::EMPTY; MAX_PLAN_NODES],
+impl<'a> Plan<'a> {
+    fn new(arena: &'a Arena, capacity: usize) -> Result<Self, SqlError> {
+        let nodes = arena
+            .alloc_slice_with(capacity, |_| PlanNode::EMPTY)
+            .map_err(|_| query::arena_full_pub())?;
+        Ok(Self {
+            nodes,
             count: 0,
             planning_micros: 0,
-        }
+        })
     }
 
     fn push(&mut self, node: PlanNode) -> Result<(), SqlError> {
@@ -89,16 +110,29 @@ impl Plan {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "EXPLAIN plan exceeds {} nodes",
-                MAX_PLAN_NODES
+                self.nodes.len()
             ));
         }
         self.nodes[self.count] = node;
         self.count += 1;
         Ok(())
     }
+
+    fn memory_kib(&self) -> (usize, usize) {
+        let header = core::mem::size_of::<Self>();
+        let node = core::mem::size_of::<PlanNode>();
+        (
+            header
+                .saturating_add(self.count.saturating_mul(node))
+                .div_ceil(1024),
+            header
+                .saturating_add(self.nodes.len().saturating_mul(node))
+                .div_ceil(1024),
+        )
+    }
 }
 
-fn push_scan(plan: &mut Plan, scan: PlanNode) -> Result<(), SqlError> {
+fn push_scan(plan: &mut Plan<'_>, scan: PlanNode) -> Result<(), SqlError> {
     let bitmap_index = scan.bitmap_index;
     let bitmap_depth = scan.depth.saturating_add(1);
     let bitmap_rows = scan.rows;
@@ -809,18 +843,21 @@ fn scan_node<'a>(
     })
 }
 
-pub(super) fn plan_select(
+pub(super) fn plan_select<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Select<'_>,
-    arena: &Arena,
-) -> Result<Plan, SqlError> {
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
-    let mut plan = Plan::new();
     let scope = match &statement.from {
         Some(from) => Some(QueryScope::resolve_schema(storage, from, txid, arena)?),
         None => None,
     };
+    let capacity = scope
+        .as_ref()
+        .map_or(MAX_EXPLAIN_STAGES, |scope| scope.n * 2 + MAX_EXPLAIN_STAGES);
+    let mut plan = Plan::new(arena, capacity)?;
     let (width, output) = projected_shape(statement, scope.as_ref(), storage, txid, arena)?;
     let ordered_index = if !statement.distinct
         && statement.distinct_on.is_empty()
@@ -952,10 +989,10 @@ pub(super) fn plan_select(
         }
     }
 
-    let mut stages = [PlanNode::EMPTY; 8];
+    let mut stages = [PlanNode::EMPTY; MAX_EXPLAIN_STAGES];
     let mut stage_count = 0usize;
     fn add_stage(
-        stages: &mut [PlanNode; 8],
+        stages: &mut [PlanNode; MAX_EXPLAIN_STAGES],
         count: &mut usize,
         stage: PlanNode,
     ) -> Result<(), SqlError> {
@@ -1211,7 +1248,7 @@ fn physical_scan_node(
 }
 
 fn push_set_tree(
-    plan: &mut Plan,
+    plan: &mut Plan<'_>,
     storage: &Storage,
     txid: u32,
     tree: &SetTree<'_>,
@@ -1273,16 +1310,19 @@ fn push_set_tree(
     }
 }
 
-pub(super) fn plan_set_query(
+pub(super) fn plan_set_query<'a>(
     storage: &Storage,
     txid: u32,
     query: &SetQuery<'_>,
-    arena: &Arena,
-) -> Result<Plan, SqlError> {
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
-    let mut plan = Plan::new();
     let wrapper_count =
         usize::from(!query.order_by.is_empty()) + usize::from(query.limit.is_some());
+    let mut plan = Plan::new(
+        arena,
+        wrapper_count.saturating_add(set_tree_plan_capacity(query.body)),
+    )?;
     for depth in 0..wrapper_count {
         plan.push(PlanNode {
             name: StackStr::from_str(if query.limit.is_some() && depth == 0 {
@@ -1327,12 +1367,12 @@ pub(super) fn plan_set_query(
     Ok(plan)
 }
 
-pub(super) fn plan_modification(
+pub(super) fn plan_modification<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Stmt<'_>,
-    arena: &Arena,
-) -> Result<Plan, SqlError> {
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
     let (verb, target, filtered, source, predicate, alias, joined) = match statement {
         Stmt::Insert(insert) => (
@@ -1393,7 +1433,14 @@ pub(super) fn plan_modification(
             target.name
         ));
     }
-    let mut plan = Plan::new();
+    let capacity = if let Some(from) = joined_from {
+        3 + (from.joins.len() + 1) * 2
+    } else if let Some(select) = source {
+        1 + select_plan_capacity(select)
+    } else {
+        3
+    };
+    let mut plan = Plan::new(arena, capacity)?;
     let mut name = StackStr::new();
     let _ = write!(name, "{verb}");
     let target_node = PlanNode {
@@ -1620,7 +1667,7 @@ fn text_line(
 }
 
 fn emit_text(
-    plan: &Plan,
+    plan: &Plan<'_>,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
     settings: &PlannerSettings,
@@ -1634,7 +1681,7 @@ fn emit_text(
 }
 
 pub(super) fn visit_text_rows<E>(
-    plan: &Plan,
+    plan: &Plan<'_>,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
     settings: &PlannerSettings,
@@ -1709,12 +1756,7 @@ pub(super) fn visit_text_rows<E>(
     }
     if options.memory {
         emit("Planning:")?;
-        let used = core::mem::size_of::<Plan>()
-            .saturating_sub(
-                (MAX_PLAN_NODES - plan.count).saturating_mul(core::mem::size_of::<PlanNode>()),
-            )
-            .div_ceil(1024);
-        let allocated = core::mem::size_of::<Plan>().div_ceil(1024);
+        let (used, allocated) = plan.memory_kib();
         let mut memory = StackStr::<512>::new();
         let _ = write!(
             memory,
@@ -1761,15 +1803,15 @@ pub(super) fn visit_text_rows<E>(
 }
 
 pub(super) fn plan_statement<'a>(
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
-    statement: &'a Stmt<'a>,
+    statement: &Stmt<'_>,
     arena: &'a Arena,
-) -> Result<Plan, SqlError> {
+) -> Result<Plan<'a>, SqlError> {
     match statement {
         Stmt::Select(select) => {
             let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
-                return plan_data_modifying_cte_select(select);
+                return plan_data_modifying_cte_select(select, arena);
             } else if select.with.is_empty() {
                 select
             } else {
@@ -1802,9 +1844,13 @@ pub(super) fn plan_statement<'a>(
 /// executing.  Planning must not run that write merely to discover its rows,
 /// so model the consumer and each producer from the parsed boundary; ANALYZE
 /// then executes the ordinary shared CTE path to obtain the actual metrics.
-fn plan_data_modifying_cte_select(select: &Select<'_>) -> Result<Plan, SqlError> {
+fn plan_data_modifying_cte_select<'a>(
+    select: &Select<'_>,
+    arena: &'a Arena,
+) -> Result<Plan<'a>, SqlError> {
     let started = std::time::Instant::now();
-    let mut plan = Plan::new();
+    let capacity = 1 + select.with.iter().filter(|cte| cte.dml.is_some()).count();
+    let mut plan = Plan::new(arena, capacity)?;
     plan.push(PlanNode {
         name: StackStr::from_str("CTE Scan"),
         rows: 1_000,
@@ -1902,7 +1948,7 @@ fn render_json_runtime(out: &mut StackStr<16_384>, options: ExplainOptions, actu
 }
 
 fn render_json_node(
-    plan: &Plan,
+    plan: &Plan<'_>,
     at: usize,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
@@ -2062,7 +2108,7 @@ fn render_xml_runtime(out: &mut StackStr<16_384>, options: ExplainOptions, actua
 /// rendering boundary keeps XML's nested `<Plans>` contract from depending on
 /// executor layout or a second heap-owned representation.
 fn render_xml_node(
-    plan: &Plan,
+    plan: &Plan<'_>,
     at: usize,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
@@ -2204,7 +2250,7 @@ fn render_yaml_runtime(
 }
 
 fn render_yaml_node(
-    plan: &Plan,
+    plan: &Plan<'_>,
     at: usize,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
@@ -2280,7 +2326,7 @@ fn render_yaml_node(
 }
 
 fn render_document(
-    plan: &Plan,
+    plan: &Plan<'_>,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
     settings: &PlannerSettings,
@@ -2304,13 +2350,7 @@ fn render_document(
                 let _ = write!(out, "}}");
             }
             if options.memory {
-                let used = core::mem::size_of::<Plan>()
-                    .saturating_sub(
-                        (MAX_PLAN_NODES - plan.count)
-                            .saturating_mul(core::mem::size_of::<PlanNode>()),
-                    )
-                    .div_ceil(1024);
-                let allocated = core::mem::size_of::<Plan>().div_ceil(1024);
+                let (used, allocated) = plan.memory_kib();
                 let _ = write!(
                     out,
                     ",\"Planning\":{{\"Memory Used\":{},\"Memory Allocated\":{}}}",
@@ -2358,13 +2398,7 @@ fn render_document(
                 render_xml_settings(&mut out, settings);
             }
             if options.memory {
-                let used = core::mem::size_of::<Plan>()
-                    .saturating_sub(
-                        (MAX_PLAN_NODES - plan.count)
-                            .saturating_mul(core::mem::size_of::<PlanNode>()),
-                    )
-                    .div_ceil(1024);
-                let allocated = core::mem::size_of::<Plan>().div_ceil(1024);
+                let (used, allocated) = plan.memory_kib();
                 let _ = write!(
                     out,
                     "<Planning><Memory-Used>{}</Memory-Used><Memory-Allocated>{}</Memory-Allocated></Planning>",
@@ -2412,13 +2446,7 @@ fn render_document(
                 }
             }
             if options.memory {
-                let used = core::mem::size_of::<Plan>()
-                    .saturating_sub(
-                        (MAX_PLAN_NODES - plan.count)
-                            .saturating_mul(core::mem::size_of::<PlanNode>()),
-                    )
-                    .div_ceil(1024);
-                let allocated = core::mem::size_of::<Plan>().div_ceil(1024);
+                let (used, allocated) = plan.memory_kib();
                 let _ = write!(
                     out,
                     "  Planning:\n    Memory Used: {}\n    Memory Allocated: {}\n",
@@ -2464,7 +2492,7 @@ fn render_document(
 }
 
 pub(super) fn visit_plan_rows(
-    plan: &Plan,
+    plan: &Plan<'_>,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
     settings: &PlannerSettings,
@@ -2478,7 +2506,7 @@ pub(super) fn visit_plan_rows(
 }
 
 pub(super) fn emit_plan(
-    plan: &Plan,
+    plan: &Plan<'_>,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
     settings: &PlannerSettings,

@@ -138,6 +138,14 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   preserved through record typing, catalogs, WAL, checkpoints, and object-cold
   recovery; wider PostgreSQL tables, composites, constraint collections, and
   LIST bounds remain loud program-limit errors rather than partial objects.
+- The bounded statement boundary is 64 Bind parameters, CTEs, row-locking
+  clauses, named windows, `ALTER TABLE` actions, `JOIN ... USING` columns,
+  aggregate calls, scalar subqueries, set-operation leaves, and independent
+  anonymous record shapes. Partition and ordering lists in one window may each
+  contain 64 expressions. Static description, execution, and `EXPLAIN` accept
+  the same maximum shapes; the plan tree uses the fixed statement arena.
+  Item 65 returns SQLSTATE `54000`, and maximum shapes are exercised before
+  and after empty-cache object recovery.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

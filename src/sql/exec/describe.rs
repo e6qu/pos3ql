@@ -1401,7 +1401,9 @@ impl RecordShapeField {
 // accepting a wider durable shape only to make it unusable in expressions
 // would violate the SQL boundary.
 const MAX_SHAPE_FIELDS: usize = crate::storage::MAX_COLUMNS;
-const MAX_TRANSIENT_SHAPES: usize = 32;
+// A projection can contain one independent anonymous record per accepted
+// expression, so static description must share the projection boundary.
+const MAX_TRANSIENT_SHAPES: usize = super::MAX_PROJ;
 
 const EMPTY_RECORD_SHAPE_FIELD: RecordShapeField = RecordShapeField {
     name: crate::util::StackStr::new(),

@@ -132,22 +132,54 @@ struct PrevSst {
     crc: u32,
 }
 
-/// One table's published SST list — a fixed, `Copy` array so the post-freeze
-/// checkpoint path never touches the allocator.
-#[derive(Clone, Copy)]
+/// One table's published SST list. Its backing slice is reserved at startup;
+/// checkpoint publication only mutates entries in place.
 struct SlotList {
-    ssts: [Option<PrevSst>; crate::storage::MAX_SPILL_SSTS],
+    ssts: Box<[Option<PrevSst>]>,
     n: usize,
 }
 
 impl SlotList {
-    const EMPTY: SlotList = SlotList {
-        ssts: [None; crate::storage::MAX_SPILL_SSTS],
-        n: 0,
-    };
+    fn new(capacity: usize) -> Self {
+        Self {
+            ssts: vec![None; capacity].into_boxed_slice(),
+            n: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ssts.fill(None);
+        self.n = 0;
+    }
+
+    fn copy_from(&mut self, source: &Self) {
+        debug_assert_eq!(self.ssts.len(), source.ssts.len());
+        self.ssts.copy_from_slice(&source.ssts);
+        self.n = source.n;
+    }
+
+    fn capacity(&self) -> usize {
+        self.ssts.len()
+    }
+
+    fn replace_pair(&mut self, at: usize, merged: Option<PrevSst>) {
+        debug_assert!(at + 1 < self.n);
+        let removed = if merged.is_some() { 1 } else { 2 };
+        let mut write = at;
+        if let Some(member) = merged {
+            self.ssts[write] = Some(member);
+            write += 1;
+        }
+        for read in at + 2..self.n {
+            self.ssts[write] = self.ssts[read];
+            write += 1;
+        }
+        self.n -= removed;
+        self.ssts[self.n..].fill(None);
+    }
 
     fn push(&mut self, p: PrevSst) -> bool {
-        if self.n == crate::storage::MAX_SPILL_SSTS {
+        if self.n == self.ssts.len() {
             return false;
         }
         self.ssts[self.n] = Some(p);
@@ -216,7 +248,8 @@ fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
     if !list.push(prior) {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "spill list exceeds its fixed capacity"
+            "spill list exceeds max_spill_generations_per_table ({})",
+            list.capacity()
         ));
     }
     Ok(())
@@ -233,8 +266,8 @@ impl TemporarySpiller {
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         crate::store::EphemeralBlockStore::budget_bytes(config.temporary_spill_bytes)
             + crate::storage::table_slot_capacity(config)
-                * crate::storage::MAX_SPILL_SSTS
-                * core::mem::size_of::<SstHandle>()
+                .saturating_mul(config.max_spill_generations_per_table)
+                .saturating_mul(core::mem::size_of::<SstHandle>())
             + SST_ARENA_BYTES
             + SstWriter::budget_bytes()
     }
@@ -252,7 +285,8 @@ impl TemporarySpiller {
         Ok(Self {
             blocks: std::rc::Rc::new(std::cell::RefCell::new(blocks)),
             handles: Vec::with_capacity(
-                crate::storage::table_slot_capacity(config) * crate::storage::MAX_SPILL_SSTS,
+                crate::storage::table_slot_capacity(config)
+                    .saturating_mul(config.max_spill_generations_per_table),
             ),
             sst_arena: Arena::new(budget, "temporary spill sst", SST_ARENA_BYTES)
                 .map_err(CheckpointSetupError::Budget)?,
@@ -286,7 +320,7 @@ impl TemporarySpiller {
         };
         let generation = storage.table(slot).generation;
         let delta = storage.table(slot).n_spill_ssts > 0
-            && storage.table(slot).n_spill_ssts < crate::storage::MAX_SPILL_SSTS
+            && storage.table(slot).n_spill_ssts < storage.table(slot).spill_ssts.len()
             && !storage.table(slot).tombstones_overflow;
 
         sort_scratch.clear();
@@ -300,9 +334,11 @@ impl TemporarySpiller {
             let resident = matches!(state.committed, Some(RowHome::Heap(_)))
                 || (state.committed.is_none() && state.committed_lsn != 0)
                 || (0..state.history.len()).any(|index| {
-                    state.history.get(index).is_some_and(|version| {
-                        version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
-                    })
+                    storage
+                        .row_history_get(state, index)
+                        .is_some_and(|version| {
+                            version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
+                        })
                 });
             if delta && !resident {
                 return Ok(ControlFlow::Continue(()));
@@ -310,7 +346,8 @@ impl TemporarySpiller {
             let marker = state
                 .committed
                 .or_else(|| {
-                    (0..state.history.len()).find_map(|index| state.history.get(index)?.home)
+                    (0..state.history.len())
+                        .find_map(|index| storage.row_history_get(state, index)?.home)
                 })
                 .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
             sort_scratch.push((rowid, marker)).map_err(|error| {
@@ -365,7 +402,7 @@ impl TemporarySpiller {
                 append_version(state.committed_lsn, state.committed)?;
             }
             for index in 0..state.history.len() {
-                if let Some(version) = state.history.get(index) {
+                if let Some(version) = storage.row_history_get(state, index) {
                     append_version(version.lsn, version.home)?;
                 }
             }
@@ -552,6 +589,10 @@ impl Checkpointer {
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping
+            + 2usize
+                .saturating_mul(table_capacity)
+                .saturating_mul(config.max_spill_generations_per_table)
+                .saturating_mul(core::mem::size_of::<Option<PrevSst>>())
             + table_capacity
                 * crate::storage::MAX_VALUE_ENFORCERS
                 * core::mem::size_of::<ValueInstall>()
@@ -645,7 +686,7 @@ impl Checkpointer {
                     && self
                         .prev_ssts
                         .get(slot)
-                        .is_some_and(|list| list.n == crate::storage::MAX_SPILL_SSTS)
+                        .is_some_and(|list| list.n == list.capacity())
             });
         for slot in 0..storage.physical_table_count() {
             if !storage.table(slot).live
@@ -657,9 +698,7 @@ impl Checkpointer {
             let Some(list) = self.prev_ssts.get(slot) else {
                 continue;
             };
-            if must_free_full_list
-                && (!storage.table(slot).dirty || list.n != crate::storage::MAX_SPILL_SSTS)
-            {
+            if must_free_full_list && (!storage.table(slot).dirty || list.n != list.capacity()) {
                 continue;
             }
             if list.n < MERGE_TRIGGER {
@@ -927,6 +966,21 @@ impl Checkpointer {
                 CheckpointSetupError::ObjectStore(format!("block cache stack: {e:?}"))
             })?,
         ));
+        budget
+            .draw_array(
+                2usize
+                    .saturating_mul(table_capacity)
+                    .saturating_mul(config.max_spill_generations_per_table),
+                core::mem::size_of::<Option<PrevSst>>(),
+                "checkpoint spill-generation rosters",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
+        let prev_ssts = (0..table_capacity)
+            .map(|_| SlotList::new(config.max_spill_generations_per_table))
+            .collect::<Vec<_>>();
+        let prev_scratch = (0..table_capacity)
+            .map(|_| SlotList::new(config.max_spill_generations_per_table))
+            .collect::<Vec<_>>();
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
@@ -946,8 +1000,8 @@ impl Checkpointer {
             manifest_lsn: 0,
             commit_head_etag: None,
             commit_head: None,
-            prev_ssts: Vec::with_capacity(table_capacity),
-            prev_scratch: Vec::with_capacity(table_capacity),
+            prev_ssts,
+            prev_scratch,
             commit_scratch: Vec::with_capacity(config.checkpoint_commit_batches),
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             sweeping: false,
@@ -6145,8 +6199,10 @@ impl Checkpointer {
                     .ok_or(CheckpointSetupError::Corrupt(
                         "dsst references unknown table",
                     ))?;
-            if self.prev_ssts.len() <= slot {
-                self.prev_ssts.resize(slot + 1, SlotList::EMPTY);
+            if slot >= self.prev_ssts.len() {
+                return Err(CheckpointSetupError::Corrupt(
+                    "dsst table slot exceeds configured table capacity",
+                ));
             }
             let expect = self.prev_ssts[slot].n;
             if let Some(handle) = handle {
@@ -6155,31 +6211,21 @@ impl Checkpointer {
                         "dsst list index out of order",
                     ));
                 }
-                self.rehydrate_block_sst(storage, slot, *idx as u8, *count, handle)?;
+                self.rehydrate_block_sst(storage, slot, *idx as u32, *count, handle)?;
                 if !self.prev_ssts[slot].push(PrevSst {
                     handle: *handle,
                     count: *count,
                     crc: *crc,
                 }) {
                     return Err(CheckpointSetupError::Corrupt(
-                        "dsst list longer than the engine supports",
+                        "dsst list exceeds max_spill_generations_per_table",
                     ));
                 }
             }
         }
         for (slot, list) in self.prev_ssts.iter().enumerate() {
             if list.n > 0 {
-                let mut handles = [None; crate::storage::MAX_SPILL_SSTS];
-                let mut n = 0usize;
-                for p in list.iter() {
-                    handles[n] = Some(p.handle);
-                    n += 1;
-                }
-                let handles: [SstHandle; crate::storage::MAX_SPILL_SSTS] =
-                    core::array::from_fn(|i| {
-                        handles[i].unwrap_or(list.ssts[0].expect("non-empty").handle)
-                    });
-                storage.set_spill_list(slot, &handles[..n]);
+                storage.set_spill_list_from_iter(slot, list.n, list.iter().map(|p| p.handle));
             }
         }
         // Named indexes are serialized after tables, so establish the final
@@ -6304,7 +6350,7 @@ impl Checkpointer {
         &mut self,
         storage: &mut Storage,
         slot: usize,
-        sst_index: u8,
+        sst_index: u32,
         count: u64,
         handle: &SstHandle,
     ) -> Result<(), CheckpointSetupError> {
@@ -6458,7 +6504,7 @@ impl Checkpointer {
                     && self
                         .prev_ssts
                         .get(slot)
-                        .is_some_and(|list| list.n == crate::storage::MAX_SPILL_SSTS)
+                        .is_some_and(|list| list.n == list.capacity())
             });
         if pinned_full_list {
             if self.merge_job.is_none() && self.merge_candidate(storage).is_none() {
@@ -6527,7 +6573,7 @@ impl Checkpointer {
     /// retired identity is now an orphan and is discarded before publish.
     fn reconcile_published_spill_lists(&mut self, storage: &Storage) {
         for slot in 0..storage.physical_table_count() {
-            let Some(published) = self.prev_ssts.get(slot).copied() else {
+            let Some(published) = self.prev_ssts.get(slot) else {
                 continue;
             };
             if published.n == 0 {
@@ -6544,9 +6590,9 @@ impl Checkpointer {
                 continue;
             }
 
-            self.prev_ssts[slot] = SlotList::EMPTY;
+            self.prev_ssts[slot].clear();
             if slot < self.prev_scratch.len() {
-                self.prev_scratch[slot] = SlotList::EMPTY;
+                self.prev_scratch[slot].clear();
             }
             self.pending_installs
                 .retain(|(pending_slot, _)| *pending_slot != slot);
@@ -7131,7 +7177,7 @@ impl Checkpointer {
                 // A dropped table's recorded list must not linger into the
                 // GC keep-set the swap below publishes.
                 if slot < self.prev_scratch.len() {
-                    self.prev_scratch[slot] = SlotList::EMPTY;
+                    self.prev_scratch[slot].clear();
                 }
                 continue;
             }
@@ -7470,20 +7516,11 @@ impl Checkpointer {
             // A slot not sliced this sweep carries its published list
             // forward untouched — the table is clean, so today's list is
             // yesterday's. A sliced slot's list was recorded by its beat.
-            if self.prev_scratch.len() <= slot {
-                self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
-            }
             if !self.sliced_this_sweep.get(slot).copied().unwrap_or(false)
                 && slot < self.prev_scratch.len()
             {
-                self.prev_scratch[slot] =
-                    self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
+                self.prev_scratch[slot].copy_from(&self.prev_ssts[slot]);
             }
-            let mut new_list = self
-                .prev_scratch
-                .get(slot)
-                .copied()
-                .unwrap_or(SlotList::EMPTY);
             // A merge finished since the last publish composes here: its
             // pair still present at its position (a delta only appends at
             // the tail, so positions are stable under it) means the merged
@@ -7491,35 +7528,25 @@ impl Checkpointer {
             // merged blocks simply sweep as orphans. Recomputed from the
             // carried base on every attempt, so a publish retried after a
             // mid-CAS failure applies it exactly once.
-            if let Some(done) = &self.merge_done
-                && done.slot == slot
-                && pair_at(&new_list, done.at) == Some((done.old0.handle, done.old1.handle))
-            {
-                let mut list = SlotList::EMPTY;
-                for p in new_list.iter().take(done.at) {
-                    let _ = list.push(*p);
-                }
-                if let Some(m) = done.merged {
-                    let _ = list.push(m);
-                }
-                for p in new_list.iter().skip(done.at + 2) {
-                    let _ = list.push(*p);
-                }
+            let completed = self.merge_done.as_ref().and_then(|done| {
+                (done.slot == slot
+                    && pair_at(&self.prev_scratch[slot], done.at)
+                        == Some((done.old0.handle, done.old1.handle)))
+                .then_some((done.at, done.merged))
+            });
+            if let Some((at, merged)) = completed {
+                self.prev_scratch[slot].replace_pair(at, merged);
                 self.pending_installs
                     .retain(|(s, i)| !(*s == slot && matches!(i, SlotInstall::MergePair { .. })));
                 self.pending_installs.push((
                     slot,
                     SlotInstall::MergePair {
-                        at: done.at,
-                        handle: done.merged.map(|m| m.handle),
+                        at,
+                        handle: merged.map(|member| member.handle),
                     },
                 ));
-                new_list = list;
-                if slot < self.prev_scratch.len() {
-                    self.prev_scratch[slot] = new_list;
-                }
             }
-            for (idx, p) in new_list.iter().enumerate() {
+            for (idx, p) in self.prev_scratch[slot].iter().enumerate() {
                 let h = p.handle;
                 let (mut ih, mut fh, mut rh) = ([0u8; 64], [0u8; 64], [0u8; 64]);
                 h.index.write_key(&mut ih);
@@ -7538,7 +7565,7 @@ impl Checkpointer {
                     ),
                 )?;
             }
-            if new_list.n == 0 {
+            if self.prev_scratch[slot].n == 0 {
                 // An empty table still records its (zero-row) state so the
                 // loader creates it.
                 write_manifest(
@@ -9932,26 +9959,17 @@ impl Checkpointer {
         self.pending_installs.retain(|(s, _)| *s != slot);
         self.pending_value_installs
             .retain(|install| install.slot != slot);
-        let mut base_list = self.prev_ssts.get(slot).copied().unwrap_or(SlotList::EMPTY);
+        self.prev_scratch[slot].copy_from(&self.prev_ssts[slot]);
         // A completed paced merge is part of this publish's base before a
         // dirty table decides whether its new versions fit as a delta.
         let completed = self.merge_done.as_ref().and_then(|done| {
             (done.slot == slot
-                && pair_at(&base_list, done.at) == Some((done.old0.handle, done.old1.handle)))
+                && pair_at(&self.prev_scratch[slot], done.at)
+                    == Some((done.old0.handle, done.old1.handle)))
             .then_some((done.at, done.merged))
         });
         if let Some((at, merged)) = completed {
-            let mut list = SlotList::EMPTY;
-            for prior in base_list.iter().take(at) {
-                push_slot_list(&mut list, *prior)?;
-            }
-            if let Some(prior) = merged {
-                push_slot_list(&mut list, prior)?;
-            }
-            for prior in base_list.iter().skip(at + 2) {
-                push_slot_list(&mut list, *prior)?;
-            }
-            base_list = list;
+            self.prev_scratch[slot].replace_pair(at, merged);
             self.pending_installs.push((
                 slot,
                 SlotInstall::MergePair {
@@ -9961,14 +9979,14 @@ impl Checkpointer {
             ));
         }
         // A clean table carries its whole SST list forward untouched.
-        let clean = !storage.table(slot).dirty && base_list.n > 0;
+        let clean = !storage.table(slot).dirty && self.prev_scratch[slot].n > 0;
         // A dirty table with spilled SSTs and room flushes a *delta*:
         // its heap-resident committed rows plus the tombstones recorded
         // since the last checkpoint. Otherwise it rewrites fully.
         let delta = !clean
             && storage.table(slot).dirty
-            && base_list.n > 0
-            && base_list.n < crate::storage::MAX_SPILL_SSTS
+            && self.prev_scratch[slot].n > 0
+            && self.prev_scratch[slot].n < self.prev_scratch[slot].capacity()
             && !storage.table(slot).tombstones_overflow;
         if storage.has_active_snapshots()
             && !clean
@@ -9982,9 +10000,7 @@ impl Checkpointer {
             ));
         }
 
-        let new_list: SlotList = if clean {
-            base_list
-        } else {
+        if !clean {
             // Collect rowids; each rowid expands to its current image plus
             // every snapshot-retained committed version. The scratch remains
             // one entry per row even when object capacity holds a long chain.
@@ -10000,9 +10016,12 @@ impl Checkpointer {
                 let resident = matches!(state.committed, Some(RowHome::Heap(_)))
                     || (state.committed.is_none() && state.committed_lsn != 0)
                     || (0..state.history.len()).any(|index| {
-                        state.history.get(index).is_some_and(|version| {
-                            version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
-                        })
+                        storage
+                            .row_history_get(state, index)
+                            .is_some_and(|version| {
+                                version.home.is_none()
+                                    || matches!(version.home, Some(RowHome::Heap(_)))
+                            })
                     });
                 if delta && !resident {
                     return Ok(ControlFlow::Continue(()));
@@ -10010,7 +10029,8 @@ impl Checkpointer {
                 let marker = state
                     .committed
                     .or_else(|| {
-                        (0..state.history.len()).find_map(|index| state.history.get(index)?.home)
+                        (0..state.history.len())
+                            .find_map(|index| storage.row_history_get(state, index)?.home)
                     })
                     .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
                 sort_scratch.push((rowid, marker)).map_err(|e| {
@@ -10086,7 +10106,7 @@ impl Checkpointer {
                     append_version(state.committed_lsn, state.committed)?;
                 }
                 for index in 0..state.history.len() {
-                    if let Some(version) = state.history.get(index) {
+                    if let Some(version) = storage.row_history_get(state, index) {
                         append_version(version.lsn, version.home)?;
                     }
                 }
@@ -10102,8 +10122,7 @@ impl Checkpointer {
             // consistent with the still-current manifest.
             match (delta, handle) {
                 (true, Some(h)) => {
-                    let mut list = base_list;
-                    if !list.push(PrevSst {
+                    if !self.prev_scratch[slot].push(PrevSst {
                         handle: h,
                         count,
                         crc,
@@ -10111,35 +10130,25 @@ impl Checkpointer {
                         return Err(sql_err!(SQLSTATE_IO, "delta flush into a full spill list"));
                     }
                     self.pending_installs.push((slot, SlotInstall::Append(h)));
-                    list
                 }
                 (true, None) => {
                     // Dirty but nothing new to flush (e.g. the change was
                     // rolled back): the list stands.
-                    base_list
                 }
                 (false, Some(h)) => {
                     self.pending_installs.push((slot, SlotInstall::Collapse(h)));
-                    let mut list = SlotList::EMPTY;
+                    self.prev_scratch[slot].clear();
                     push_slot_list(
-                        &mut list,
+                        &mut self.prev_scratch[slot],
                         PrevSst {
                             handle: h,
                             count,
                             crc,
                         },
                     )?;
-                    list
                 }
-                (false, None) => SlotList::EMPTY,
+                (false, None) => self.prev_scratch[slot].clear(),
             }
-        };
-
-        if self.prev_scratch.len() <= slot {
-            self.prev_scratch.resize(slot + 1, SlotList::EMPTY);
-        }
-        if slot < self.prev_scratch.len() {
-            self.prev_scratch[slot] = new_list;
         }
         self.build_value_indexes(storage, slot)?;
         Ok(())

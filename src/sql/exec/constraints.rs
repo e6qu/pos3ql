@@ -570,7 +570,7 @@ fn enforce_expression_index_uniqueness<'a>(
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = state.pending.last() else {
+        let Some(pending) = storage.row_pending_last(*state) else {
             continue;
         };
         let Some(location) = pending.loc else {
@@ -760,7 +760,7 @@ fn pending_scan_uniqueness(
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = state.pending.last() else {
+        let Some(pending) = storage.row_pending_last(*state) else {
             continue;
         };
         let Some(loc) = pending.loc else {
@@ -841,7 +841,7 @@ pub(crate) fn enforce_partial_index_uniqueness(
         if Some(rowid) == self_rowid {
             continue;
         }
-        let Some(pending) = state.pending.last() else {
+        let Some(pending) = storage.row_pending_last(*state) else {
             continue;
         };
         let Some(location) = pending.loc else {

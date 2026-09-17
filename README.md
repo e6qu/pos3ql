@@ -149,6 +149,16 @@ and routine-dependency pools use that transaction bound together with
 startup-memory choice rather than a compiled inline-array ceiling and may be
 raised when workloads repeatedly change one object in a transaction.
 
+Row MVCC history is independently sized by `max_row_versions_per_row`
+(default 8). Startup reserves global pending-command and committed-snapshot
+pools from that bound and the configured transaction and row capacities.
+Released entries return to constant-time free lists; reaching either the
+per-row limit or a global pool reports a named program-limit error before
+commit. `max_spill_generations_per_table` (default 8, minimum 2) controls the
+immutable-generation fan-out retained for each table. Storage, checkpoint,
+merge, temporary-spill, and cold-read rosters all use that single startup
+setting; a manifest whose roster exceeds it is rejected rather than truncated.
+
 Atomic transaction bookkeeping is independently startup-sized by
 `max_savepoints_per_transaction` (default 16),
 `max_deferred_constraints_per_transaction` (128), `deferred_trigger_bytes`

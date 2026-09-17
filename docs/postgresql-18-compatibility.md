@@ -101,9 +101,11 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   classes execute the same `<-> point` K-nearest-neighbor boundary.
   Geometric predicate navigation uses the same immutable bounding-box tree
   boundary, including both point classes, box and polygon. Network, range,
-  full-text, and GIN posting navigation are implemented. Ranked
-  nearest-neighbor traversal, PostgreSQL page layout and posting-list format,
-  and native/custom callbacks are not implemented.
+  full-text, GIN posting, and ranked nearest-neighbor navigation are
+  implemented. Finite unfiltered limits prune by conservative node distance;
+  residual filters, row security, locking, ties, and unbounded orders retain
+  complete exact ordering. PostgreSQL page layout and posting-list format, and
+  native/custom callbacks are not implemented.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not
   exist. Query execution is currently serialized through one server process.

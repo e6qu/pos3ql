@@ -88,7 +88,10 @@ Legacy generations remain readable and are upgraded by the next checkpoint.
 The durable node format and memory bounds are documented in
 [docs/index-navigation.md](docs/index-navigation.md).
 Network, range, full-text, and GIN posting navigation are implemented. Ranked
-nearest-neighbor node traversal remains production-roadmap work.
+nearest-neighbor GiST/SP-GiST limits use conservative point-to-box lower bounds
+to prune immutable siblings while retaining exact distance and MVCC checks.
+Queries with residual filtering, row security, locking, ties, no finite limit,
+or an unrankable origin retain the complete exact ordering path.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

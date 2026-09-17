@@ -110,6 +110,21 @@ through `176_gin_postings.sql`. Warm-memory and cold-object performance
 artifacts cover every signature, posting, and interval operator-class path
 independently.
 
-Ranked nearest-neighbor node traversal remains in [PLAN.md](../PLAN.md).
-Unfiltered nearest-neighbor queries currently order complete compact candidate
-sets; geometric predicates prune candidates without changing that limit boundary.
+Finite unfiltered `<-> point` limits on built-in geometric GiST and SP-GiST
+classes use a bounded depth-first branch-and-bound cursor. Children are visited
+in increasing point-to-box lower-bound order; a fixed statement-arena max-heap
+retains only `LIMIT + OFFSET` row identities and tightens the pruning radius.
+Committed resident keys are ranked first, stale durable versions are rejected
+through the ordinary MVCC boundary, NULL keys remain last, and only winning
+key/INCLUDE payloads are re-read from their remembered immutable leaves. Leaf
+re-reads normally hit the bounded cache populated by traversal and do not add
+object requests. The frontier remains bounded by tree depth and fan-out rather
+than generation width, and traversal performs no post-startup heap allocation.
+
+A lower bound is widened for PostgreSQL's geometric tolerance and can only
+retain extra nodes. Exact `<->` evaluation owns the final order. Legacy rosters,
+non-finite origins, absent or unbounded limits, residual predicates, row-level
+security, row locking, `WITH TIES`, and oversized top-k scratch requests decline
+ranking and use the existing complete exact path. This conservative fallback is
+part of correctness: filtering or lock skipping below `LIMIT` must never turn a
+physical top-k cutoff into a short result.

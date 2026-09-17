@@ -26690,6 +26690,168 @@ impl Storage {
         Ok(true)
     }
 
+    /// Visits a spatial navigation generation in lower-bound sibling order.
+    /// The committed resident overlay is offered first so a caller can tighten
+    /// its top-k radius before reading immutable objects. The bound predicate
+    /// is re-evaluated by the cursor as that radius changes.
+    pub(crate) fn rank_value_index_binding(
+        &self,
+        table_index: usize,
+        binding: usize,
+        intersects: impl FnMut(u8, crate::store::SpatialBounds) -> bool,
+        priority: impl FnMut(u8, crate::store::SpatialBounds) -> f64,
+        mut visit: impl FnMut(
+            Option<(crate::store::BlockId, bool)>,
+            u64,
+            u64,
+            &[u8],
+            &[u8],
+        ) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        let table = &self.tables[table_index];
+        let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
+            return Ok(false);
+        };
+        if self.commit_snapshot < handle.published_lsn {
+            return Ok(false);
+        }
+        let Some(spill) = &self.spill else {
+            return Ok(false);
+        };
+        let Some(mut scratch) = spill
+            .value_scratch
+            .as_ref()
+            .expect("durable value indexes have reader scratch")
+            .iter()
+            .find_map(|candidate| candidate.try_borrow_mut().ok())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "persistent value scans nested deeper than reader scratch"
+            ));
+        };
+
+        // New committed keys are not in the immutable generation. Rank them
+        // before opening the tree so they participate in the initial cutoff.
+        for (&rowid, state) in table.rows.iter() {
+            if state.committed_lsn <= handle.published_lsn {
+                continue;
+            }
+            let Some(home) = state.committed else {
+                continue;
+            };
+            let key_buffer = &mut scratch.roster;
+            let Some((key_len, payload_len, _)) =
+                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?
+            else {
+                continue;
+            };
+            visit(
+                None,
+                rowid,
+                state.committed_lsn,
+                &key_buffer[..key_len],
+                &key_buffer[key_len..key_len + payload_len],
+            )?;
+        }
+
+        let callback_error = std::cell::RefCell::new(None);
+        let complete = {
+            let ValueIndexScratch { roster, data, .. } = &mut *scratch;
+            crate::store::ValueIndexReader::over(roster, data)
+                .ranked_covering(
+                    &mut *spill
+                        .blocks
+                        .as_ref()
+                        .expect("value-index generations are durable")
+                        .borrow_mut(),
+                    &handle,
+                    intersects,
+                    priority,
+                    |id, covering, _, rowid, lsn, key, payload| {
+                        if callback_error.borrow().is_none()
+                            && let Err(error) =
+                                visit(Some((id, covering)), rowid, lsn, key, payload)
+                        {
+                            *callback_error.borrow_mut() = Some(error);
+                        }
+                    },
+                )
+                .map_err(value_index_read_error)?
+        };
+        if let Some(error) = callback_error.into_inner() {
+            return Err(error);
+        }
+        Ok(complete)
+    }
+
+    /// Supplies the exact key and INCLUDE payload retained by a ranked
+    /// candidate. Immutable candidates are found in their remembered leaf;
+    /// resident candidates are regenerated from their committed row image.
+    pub(crate) fn read_ranked_value_binding_entry(
+        &self,
+        table_index: usize,
+        binding: usize,
+        source: Option<(crate::store::BlockId, bool)>,
+        rowid: u64,
+        lsn: u64,
+        mut visit: impl FnMut(&[u8], &[u8]),
+    ) -> Result<bool, SqlError> {
+        let Some(spill) = &self.spill else {
+            return Ok(false);
+        };
+        let Some(mut scratch) = spill
+            .value_scratch
+            .as_ref()
+            .expect("durable value indexes have reader scratch")
+            .iter()
+            .find_map(|candidate| candidate.try_borrow_mut().ok())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "persistent value scans nested deeper than reader scratch"
+            ));
+        };
+        if let Some((id, covering)) = source {
+            let ValueIndexScratch { roster, data, .. } = &mut *scratch;
+            return crate::store::ValueIndexReader::over(roster, data)
+                .leaf_entry(
+                    &mut *spill
+                        .blocks
+                        .as_ref()
+                        .expect("value-index generations are durable")
+                        .borrow_mut(),
+                    id,
+                    covering,
+                    rowid,
+                    lsn,
+                    visit,
+                )
+                .map_err(value_index_read_error);
+        }
+        let table = &self.tables[table_index];
+        let Some(state) = table.rows.get(&rowid) else {
+            return Ok(false);
+        };
+        if state.committed_lsn != lsn {
+            return Ok(false);
+        }
+        let Some(home) = state.committed else {
+            return Ok(false);
+        };
+        let key_buffer = &mut scratch.roster;
+        let Some((key_len, payload_len, _)) =
+            self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?
+        else {
+            return Ok(false);
+        };
+        visit(
+            &key_buffer[..key_len],
+            &key_buffer[key_len..key_len + payload_len],
+        );
+        Ok(true)
+    }
+
     /// Probes one exact lossy token in an immutable GIN posting generation,
     /// then scans the committed resident overlay for the same token. Returned
     /// row identities remain subject to the ordinary SQL and MVCC rechecks.

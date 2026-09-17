@@ -117,6 +117,13 @@ pub struct Config {
     /// Fixed number of named index catalog slots. Physical acceleration
     /// bindings draw separately from `max_value_indexes`.
     pub max_indexes: usize,
+    /// Cluster-wide extended-statistics catalog slots. A relation can consume
+    /// any available slots; there is no separate per-relation ceiling.
+    pub max_extended_statistics: usize,
+    max_extended_statistics_explicit: bool,
+    /// Unsummarized logical ranges retained for each BRIN index. The backing
+    /// storage is reserved for every index at startup.
+    pub max_brin_unsummarized_ranges_per_index: usize,
     /// Fixed number of ordinary view catalog slots.
     pub max_views: usize,
     /// Fixed number of materialized-view catalog slots. Their backing tables
@@ -360,6 +367,9 @@ impl Config {
             max_default_acl_entries: 256,
             max_parameter_acl_entries: 128,
             max_indexes: 32,
+            max_extended_statistics: 256,
+            max_extended_statistics_explicit: false,
+            max_brin_unsummarized_ranges_per_index: 64,
             max_views: 32,
             max_materialized_views: 32,
             max_routines: 32,
@@ -438,6 +448,20 @@ impl Config {
             #[cfg(test)]
             test_data_dir_cleanup: None,
         }
+    }
+
+    pub(crate) fn extended_statistics_capacity(&self) -> usize {
+        if self.max_extended_statistics_explicit {
+            self.max_extended_statistics
+        } else {
+            self.max_tables.saturating_mul(8).min(usize::from(u16::MAX))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_extended_statistics_capacity(&mut self, capacity: usize) {
+        self.max_extended_statistics = capacity;
+        self.max_extended_statistics_explicit = true;
     }
 
     #[cfg(test)]
@@ -698,6 +722,15 @@ impl Config {
                 }
                 "max_indexes" => {
                     config.max_indexes =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_extended_statistics" => {
+                    config.max_extended_statistics =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize;
+                    config.max_extended_statistics_explicit = true;
+                }
+                "max_brin_unsummarized_ranges_per_index" => {
+                    config.max_brin_unsummarized_ranges_per_index =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_views" => {
@@ -994,6 +1027,14 @@ impl Config {
                     *capacity = inherited_capacity;
                 }
             }
+            if !seen
+                .iter()
+                .any(|setting| setting == "max_extended_statistics")
+            {
+                config.max_extended_statistics = inherited_capacity
+                    .saturating_mul(8)
+                    .min(usize::from(u16::MAX));
+            }
         }
 
         // With object storage enabled it is the durable authority, not an
@@ -1120,6 +1161,7 @@ impl Config {
             config.max_default_acl_entries,
             config.max_parameter_acl_entries,
             config.max_indexes,
+            config.max_extended_statistics,
             config.max_views,
             config.max_materialized_views,
             config.max_routines,
@@ -1255,6 +1297,7 @@ impl Config {
             ("max_enums", config.max_enums),
             ("max_composites", config.max_composites),
             ("max_indexes", config.max_indexes),
+            ("max_extended_statistics", config.max_extended_statistics),
             ("max_views", config.max_views),
             ("max_materialized_views", config.max_materialized_views),
             ("max_routines", config.max_routines),
@@ -1279,6 +1322,17 @@ impl Config {
                     format!("{name} exceeds the 65535-slot catalog representation"),
                 ));
             }
+        }
+        if config.max_brin_unsummarized_ranges_per_index == 0
+            || config.max_brin_unsummarized_ranges_per_index > usize::from(u8::MAX)
+        {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "max_brin_unsummarized_ranges_per_index must be between 1 and {}",
+                    u8::MAX
+                ),
+            ));
         }
         for (name, capacity) in [
             ("max_schemas", config.max_schemas),
@@ -1664,6 +1718,8 @@ max_acl_entries = 800
 max_column_acl_entries = 1200
 max_default_acl_entries = 500
 max_parameter_acl_entries = 300
+max_extended_statistics = 333
+max_brin_unsummarized_ranges_per_index = 200
 memtable_bytes = 16MiB   # small for tests
 temporary_spill_bytes = 32MiB
 checkpoint_manifest_bytes = 2MiB
@@ -1698,6 +1754,8 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_column_acl_entries, 1200);
         assert_eq!(c.max_default_acl_entries, 500);
         assert_eq!(c.max_parameter_acl_entries, 300);
+        assert_eq!(c.max_extended_statistics, 333);
+        assert_eq!(c.max_brin_unsummarized_ranges_per_index, 200);
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.temporary_spill_bytes, 32 * MIB);
         assert_eq!(c.checkpoint_manifest_bytes, 2 * MIB);
@@ -1858,6 +1916,9 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_default_acl_entries = 0\n").is_err());
         assert!(Config::parse("max_parameter_acl_entries = 0\n").is_err());
         assert!(Config::parse("max_indexes = 0\n").is_err());
+        assert!(Config::parse("max_extended_statistics = 0\n").is_err());
+        assert!(Config::parse("max_brin_unsummarized_ranges_per_index = 0\n").is_err());
+        assert!(Config::parse("max_brin_unsummarized_ranges_per_index = 256\n").is_err());
         for name in [
             "max_views",
             "max_materialized_views",
@@ -1898,6 +1959,7 @@ sql_arena_bytes = 4096
         for name in [
             "max_databases",
             "max_indexes",
+            "max_extended_statistics",
             "max_materialized_views",
             "max_routines",
             "max_casts",
@@ -1981,6 +2043,7 @@ sql_arena_bytes = 4096
     fn table_derived_catalog_capacities_are_independent_with_compatible_defaulting() {
         let inherited = Config::parse("max_tables = 7\n").unwrap();
         assert_eq!(inherited.max_tables, 7);
+        assert_eq!(inherited.max_extended_statistics, 56);
         assert_eq!(
             [
                 inherited.max_indexes,
@@ -2000,6 +2063,7 @@ sql_arena_bytes = 4096
         let independent = Config::parse(
             "max_tables = 7\n\
              max_indexes = 11\n\
+             max_extended_statistics = 21\n\
              max_views = 12\n\
              max_materialized_views = 13\n\
              max_routines = 14\n\
@@ -2012,6 +2076,7 @@ sql_arena_bytes = 4096
         )
         .unwrap();
         assert_eq!(independent.max_tables, 7);
+        assert_eq!(independent.max_extended_statistics, 21);
         assert_eq!(
             [
                 independent.max_indexes,

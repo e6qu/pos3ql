@@ -4824,6 +4824,10 @@ impl Engine {
             {
                 continue;
             }
+            let ranges = self.storage.brin_unsummarized_ranges(slot);
+            let mut unsummarized_ranges = [0u64; crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES];
+            unsummarized_ranges[..ranges.len()].copy_from_slice(&ranges);
+            drop(ranges);
             let lsn = self.storage.lsn() + 1;
             if let Err(error) = self.wal.stage(
                 txn.txid,
@@ -4832,7 +4836,7 @@ impl Engine {
                     index_created_at: state.index_created_at,
                     pages_per_range: state.pages_per_range,
                     summarized_until_page: state.summarized_until_page,
-                    unsummarized_ranges: state.ranges,
+                    unsummarized_ranges,
                     range_count: state.count,
                 },
             ) {

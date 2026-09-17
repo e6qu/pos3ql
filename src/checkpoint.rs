@@ -9254,11 +9254,14 @@ impl Checkpointer {
                 StackStr::<{ crate::storage::MAX_INDEX_COLS * 64 }>::new();
             let mut statistics = StackStr::<{ crate::storage::MAX_INDEX_COLS * 8 }>::new();
             let maintenance = storage.brin_maintenance_state(index_slot);
-            let mut unsummarized_ranges = StackStr::<1400>::new();
-            for range in &maintenance.ranges[..usize::from(maintenance.count)] {
+            let ranges = storage.brin_unsummarized_ranges(index_slot);
+            let mut unsummarized_ranges =
+                StackStr::<{ crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES * 22 }>::new();
+            for range in ranges.iter() {
                 let _ = write!(unsummarized_ranges, " {range}");
             }
-            let mut maintenance_suffix = StackStr::<1500>::new();
+            let mut maintenance_suffix =
+                StackStr::<{ crate::storage::MAX_BRIN_UNSUMMARIZED_RANGES * 22 + 100 }>::new();
             if index.method == crate::sql::ast::IndexAccessMethod::Brin {
                 let _ = write!(
                     maintenance_suffix,

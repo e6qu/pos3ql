@@ -19,6 +19,10 @@ The row-version and spill-generation audit also found no external blocker:
 both former eight-entry ceilings are startup-configurable, fully accounted,
 and covered across exhaustion, reuse, checkpoint publication, and empty-cache
 recovery.
+The extended-statistics and BRIN-maintenance capacity audit found no external
+blocker: the former table-derived ceiling and per-index inline array are
+replaced by configured startup pools and qualified with maximum trigger
+catalogs through checkpoint retry and object-cold recovery.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

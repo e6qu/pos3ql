@@ -49399,6 +49399,162 @@ fn hash_indexes_drive_exact_queries_joins_dml_and_cold_recovery() {
 }
 
 #[test]
+fn configured_statistics_and_brin_ranges_cross_old_per_object_bounds() {
+    use core::fmt::Write as _;
+
+    const STATISTICS: usize = 10;
+    const RANGES: usize = 70;
+    const TRIGGERS: usize = 70;
+    let mut config = test_config("configured-statistics-brin-capacities");
+    config.max_tables = 1;
+    config.table_rows = 10_000;
+    config.txn_rows = 10_000;
+    config.max_indexes = 1;
+    config.max_routines = 1;
+    config.max_triggers = TRIGGERS;
+    config.set_extended_statistics_capacity(STATISTICS);
+    config.max_brin_unsummarized_ranges_per_index = RANGES;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("configured-statistics-brin-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 73);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE configured_capacity_rows(a integer, b integer);
+         CREATE FUNCTION configured_capacity_trigger() RETURNS trigger
+           LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$",
+        8 << 20,
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for first in (1..=9000).step_by(1000) {
+        let inserted = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO configured_capacity_rows SELECT g, g % 17 \
+                 FROM generate_series({first}, {}) AS g",
+                first + 999
+            ),
+            8 << 20,
+        );
+        assert!(
+            !message_types(&inserted).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&inserted)
+        );
+    }
+    let indexed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX configured_capacity_brin ON configured_capacity_rows
+         USING brin (a) WITH (pages_per_range=1)",
+    );
+    assert!(!message_types(&indexed).contains(&b'E'));
+    let mut definitions = String::new();
+    for slot in 0..STATISTICS {
+        writeln!(
+            definitions,
+            "CREATE STATISTICS configured_capacity_statistics_{slot} (ndistinct) \
+             ON a, b FROM configured_capacity_rows;"
+        )
+        .unwrap();
+    }
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &definitions, 8 << 20);
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    for first in (0..TRIGGERS).step_by(32) {
+        definitions.clear();
+        for slot in first..(first + 32).min(TRIGGERS) {
+            writeln!(
+                definitions,
+                "CREATE TRIGGER configured_capacity_trigger_{slot} BEFORE INSERT \
+                 ON configured_capacity_rows FOR EACH ROW \
+                 EXECUTE FUNCTION configured_capacity_trigger();"
+            )
+            .unwrap();
+        }
+        let created = run_with_arena_bytes(&mut engine, &mut budget, &definitions, 8 << 20);
+        assert!(
+            !message_types(&created).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let overflow = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE STATISTICS configured_capacity_statistics_overflow (ndistinct)
+         ON a, b FROM configured_capacity_rows",
+    );
+    assert!(String::from_utf8_lossy(&overflow).contains("54000"));
+    let overflow = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRIGGER configured_capacity_trigger_overflow BEFORE INSERT
+         ON configured_capacity_rows FOR EACH ROW
+         EXECUTE FUNCTION configured_capacity_trigger()",
+    );
+    assert!(String::from_utf8_lossy(&overflow).contains("54000"));
+
+    let desummarized = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "SELECT count(brin_desummarize_range('configured_capacity_brin'::regclass, g))
+           FROM generate_series(0, 69) AS g",
+        8 << 20,
+    );
+    assert_eq!(data_rows(&desummarized), ["70"]);
+    let overflow = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT brin_desummarize_range('configured_capacity_brin'::regclass, 70)",
+    );
+    assert!(String::from_utf8_lossy(&overflow).contains("54000"));
+
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+    assert!(engine.checkpoint().is_err());
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    let cold = run_with(
+        &mut recovered,
+        &mut recovery_budget,
+        "SELECT count(*) FROM pg_statistic_ext
+          WHERE stxname LIKE 'configured_capacity_statistics_%';
+         SELECT count(*) FROM pg_trigger
+          WHERE tgname LIKE 'configured_capacity_trigger_%';
+         SELECT brin_summarize_new_values('configured_capacity_brin'::regclass);
+         INSERT INTO configured_capacity_rows VALUES (9001, 1);
+         SELECT count(*), min(a), max(a) FROM configured_capacity_rows",
+    );
+    assert_eq!(data_rows(&cold), ["10", "70", "70", "9001|1|9001"]);
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn brin_indexes_drive_range_expression_dml_and_cold_object_scans() {
     let mut config = test_config("physical-brin-indexes");
     config.object_store_on = true;

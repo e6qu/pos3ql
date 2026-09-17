@@ -2409,8 +2409,7 @@ pub struct Table {
     /// resolving and decoding against `def`; the owner resolves against the
     /// latest pending definition. RowState's command versions carry the
     /// matching transformed row encodings.
-    pending_def_slots: [u32; MAX_PENDING_TABLE_DEFS],
-    n_pending_defs: u8,
+    pending_def_tail: Option<u32>,
     pending_def_txid: Option<u32>,
     /// Monotonic creation stamp (catalog sequence), giving dependency
     /// reports PostgreSQL's OID ordering.
@@ -2447,8 +2446,7 @@ pub struct Table {
     /// Transaction-private pg_statistic versions. The large images live in a
     /// startup-sized storage slab; the table retains only slot handles so SQL
     /// transaction/savepoint undo records stay compact.
-    pending_statistics_slots: [u32; MAX_PENDING_TABLE_DEFS],
-    n_pending_statistics: u8,
+    pending_statistics_tail: Option<u32>,
     pending_statistics_txid: Option<u32>,
     /// Per-column sequence state for serial/identity columns: the last value
     /// a *default* assignment handed out. PostgreSQL's sequence, not a max
@@ -2565,6 +2563,8 @@ pub(crate) struct TableStatistics {
 #[derive(Debug, Clone, Copy)]
 struct PendingTableStatisticsSlot {
     used: bool,
+    previous: Option<u32>,
+    depth: u32,
     statistics: TableStatistics,
 }
 
@@ -3350,6 +3350,8 @@ pub(crate) struct PendingExtendedStatisticsKeys {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingExtendedStatisticsDataSlot {
     used: bool,
+    previous: Option<u32>,
+    depth: u32,
     data: ExtendedStatisticsData,
 }
 
@@ -3367,8 +3369,7 @@ pub(crate) struct ExtendedStatisticsDef {
     pub(crate) kinds: crate::sql::ast::StatisticsKinds,
     pub(crate) expression_only: bool,
     pub(crate) data: ExtendedStatisticsData,
-    pending_data_slots: [u32; MAX_PENDING_TABLE_DEFS],
-    n_pending_data: u8,
+    pending_data_tail: Option<u32>,
     pending_data_txid: Option<u32>,
     pub(crate) ddl_state: CatalogDdlState,
 }
@@ -3404,8 +3405,7 @@ impl ExtendedStatisticsDef {
         kinds: crate::sql::ast::StatisticsKinds::EXPRESSION,
         expression_only: false,
         data: ExtendedStatisticsData::EMPTY,
-        pending_data_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
-        n_pending_data: 0,
+        pending_data_tail: None,
         pending_data_txid: None,
         ddl_state: CatalogDdlState::Absent,
     };
@@ -3541,20 +3541,43 @@ impl CatalogDdlState {
     }
 }
 
-/// The maximum number of ALTER TABLE commands one transaction may apply to a
-/// single table. This is a static-memory bound, not an accept-and-ignore limit.
-pub(crate) const MAX_PENDING_TABLE_DEFS: usize = 8;
+fn catalog_transaction_capacity(config: &Config) -> usize {
+    config.max_connections as usize + config.max_prepared_transactions + config.max_subscriptions
+}
+
+/// A pending-image pool cannot need more than every eligible object retaining
+/// one transaction's complete budget, or every transaction owner spending its
+/// complete budget. Reserving the smaller bound remains exact without a hidden
+/// per-object limit.
+fn pending_table_definition_capacity(config: &Config) -> usize {
+    table_slot_capacity(config)
+        .saturating_mul(config.max_catalog_versions_per_object)
+        .min(catalog_transaction_capacity(config).saturating_mul(config.max_ddl_per_transaction))
+}
+
+fn pending_table_statistics_capacity(config: &Config) -> usize {
+    table_slot_capacity(config)
+        .saturating_mul(config.max_catalog_versions_per_object)
+        .min(
+            catalog_transaction_capacity(config).saturating_mul(config.max_analyze_per_transaction),
+        )
+}
 
 fn pending_extended_statistics_capacity(config: &Config) -> usize {
-    let object_bound = config
+    config
         .max_tables
         .saturating_mul(MAX_EXTENDED_STATISTICS_PER_TABLE)
-        .saturating_mul(MAX_PENDING_TABLE_DEFS);
-    let transaction_bound = (config.max_connections as usize
-        + config.max_prepared_transactions
-        + config.max_subscriptions)
-        .saturating_mul(config.max_analyze_per_transaction);
-    object_bound.min(transaction_bound)
+        .saturating_mul(config.max_catalog_versions_per_object)
+        .min(
+            catalog_transaction_capacity(config).saturating_mul(config.max_analyze_per_transaction),
+        )
+}
+
+fn pending_routine_dependency_capacity(config: &Config) -> usize {
+    config
+        .max_routines
+        .saturating_mul(config.max_catalog_versions_per_object)
+        .min(catalog_transaction_capacity(config).saturating_mul(config.max_ddl_per_transaction))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3573,6 +3596,8 @@ struct PendingTableDef {
 #[derive(Debug, Clone, Copy)]
 struct PendingTableDefSlot {
     used: bool,
+    previous: Option<u32>,
+    depth: u32,
     version: PendingTableDef,
 }
 
@@ -3608,7 +3633,10 @@ impl Table {
     /// Whether the slot is free for a fresh CREATE: no committed table, no
     /// pending DDL, and no retained rows.
     fn is_free(&self) -> bool {
-        !self.live && self.pending_ddl.is_none() && self.n_pending_defs == 0 && self.rows.is_empty()
+        !self.live
+            && self.pending_ddl.is_none()
+            && self.pending_def_tail.is_none()
+            && self.rows.is_empty()
     }
 }
 
@@ -3743,6 +3771,7 @@ struct PendingRoutineDependencies {
     used: bool,
     txid: u32,
     routine: u16,
+    depth: u32,
     dependencies: StoredQueryDependencies,
 }
 
@@ -3751,6 +3780,7 @@ impl PendingRoutineDependencies {
         used: false,
         txid: 0,
         routine: u16::MAX,
+        depth: 0,
         dependencies: StoredQueryDependencies::EMPTY,
     };
 }
@@ -11090,6 +11120,7 @@ pub struct Storage {
     large_objects: FixedVec<LargeObjectDef>,
     next_large_object_oid: Option<LargeObjectOid>,
     large_object_page_table: u32,
+    max_catalog_versions_per_object: u32,
     pending_table_defs: FixedVec<PendingTableDefSlot>,
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
@@ -14125,10 +14156,8 @@ impl Storage {
             + table_slot_capacity(config)
                 * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + config.max_views * size_of::<ViewDef>()
-            + config.max_routines
-                * (size_of::<RoutineDef>()
-                    + size_of::<StoredQueryDependencies>()
-                    + MAX_PENDING_TABLE_DEFS * size_of::<PendingRoutineDependencies>())
+            + config.max_routines * (size_of::<RoutineDef>() + size_of::<StoredQueryDependencies>())
+            + pending_routine_dependency_capacity(config) * size_of::<PendingRoutineDependencies>()
             + config.max_casts * size_of::<CastDef>()
             + config.max_operators * size_of::<OperatorDef>()
             + config.max_operator_families * size_of::<OperatorFamilyDef>()
@@ -14156,12 +14185,8 @@ impl Storage {
                 * config.subscription_relation_capacity
                 * size_of::<SubscriptionRelation>()
             + foreign::ForeignCatalog::budget_bytes(config)
-            + table_slot_capacity(config)
-                * MAX_PENDING_TABLE_DEFS
-                * size_of::<PendingTableDefSlot>()
-            + table_slot_capacity(config)
-                * MAX_PENDING_TABLE_DEFS
-                * size_of::<PendingTableStatisticsSlot>()
+            + pending_table_definition_capacity(config) * size_of::<PendingTableDefSlot>()
+            + pending_table_statistics_capacity(config) * size_of::<PendingTableStatisticsSlot>()
             + config.max_large_objects * size_of::<LargeObjectDef>()
             + pending_extended_statistics_capacity(config)
                 * size_of::<PendingExtendedStatisticsDataSlot>()
@@ -14245,12 +14270,12 @@ impl Storage {
         let pending_table_defs = FixedVec::new(
             budget,
             "pending_table_defs",
-            table_capacity * MAX_PENDING_TABLE_DEFS,
+            pending_table_definition_capacity(config),
         )?;
         let pending_table_statistics = FixedVec::new(
             budget,
             "pending_table_statistics",
-            table_capacity * MAX_PENDING_TABLE_DEFS,
+            pending_table_statistics_capacity(config),
         )?;
         for slot in 0..table_capacity {
             tables
@@ -14263,8 +14288,7 @@ impl Storage {
                         ..TableDef::empty()
                     },
                     ownership: Ownership::BOOTSTRAP,
-                    pending_def_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
-                    n_pending_defs: 0,
+                    pending_def_tail: None,
                     pending_def_txid: None,
                     rows: FixedMap::new(
                         budget,
@@ -14284,8 +14308,7 @@ impl Storage {
                     statistics: TableStatistics::EMPTY,
                     statistics_dirty: false,
                     statistics_wal_dirty: false,
-                    pending_statistics_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
-                    n_pending_statistics: 0,
+                    pending_statistics_tail: None,
                     pending_statistics_txid: None,
                     serial_last: [0; MAX_COLUMNS],
                     serial_dirty: false,
@@ -14515,9 +14538,9 @@ impl Storage {
         let mut pending_routine_dependencies = FixedVec::new(
             budget,
             "pending_routine_dependencies",
-            config.max_routines * MAX_PENDING_TABLE_DEFS,
+            pending_routine_dependency_capacity(config),
         )?;
-        for _ in 0..config.max_routines * MAX_PENDING_TABLE_DEFS {
+        for _ in 0..pending_routine_dependency_capacity(config) {
             pending_routine_dependencies
                 .push(PendingRoutineDependencies::EMPTY)
                 .expect("sized to pending routine definitions");
@@ -15074,6 +15097,7 @@ impl Storage {
             large_objects,
             next_large_object_oid: LargeObjectOid::parse(16_384),
             large_object_page_table,
+            max_catalog_versions_per_object: config.max_catalog_versions_per_object as u32,
             pending_table_defs,
             pending_table_statistics,
             views,
@@ -16876,7 +16900,7 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.pending_keys = None;
-                definition.n_pending_data = 0;
+                definition.pending_data_tail = None;
                 definition.pending_data_txid = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.extended_statistics[target_slot] = definition;
@@ -21788,10 +21812,12 @@ impl Storage {
             }
             let mut definition = table.def;
             rename_table_sql_identity(&mut definition, prior, name)?;
-            for position in 0..table.n_pending_defs as usize {
-                let pending_slot = table.pending_def_slots[position] as usize;
-                let mut definition = self.pending_table_defs[pending_slot].version.def;
+            let mut tail = table.pending_def_tail;
+            while let Some(pending_slot) = tail {
+                let pending = &self.pending_table_defs[pending_slot as usize];
+                let mut definition = pending.version.def;
                 rename_table_sql_identity(&mut definition, prior, name)?;
+                tail = pending.previous;
             }
         }
         for definition in self.domains.iter().filter(|definition| {
@@ -21840,10 +21866,10 @@ impl Storage {
             }
             rename_table_sql_identity(&mut table.def, prior, name)?;
             table.mark_dirty();
-            let pending_count = table.n_pending_defs as usize;
-            for pending_position in 0..pending_count {
-                let pending_slot = table.pending_def_slots[pending_position] as usize;
-                let pending = &mut self.pending_table_defs[pending_slot].version;
+            let mut tail = table.pending_def_tail;
+            while let Some(pending_slot) = tail {
+                let entry = &mut self.pending_table_defs[pending_slot as usize];
+                let pending = &mut entry.version;
                 rename_schema_name(&mut pending.def.schema, prior, name);
                 for column in pending.def.columns.iter_mut().take(pending.def.n_columns) {
                     rename_user_type_schema(&mut column.user_type, prior, name);
@@ -21852,6 +21878,7 @@ impl Storage {
                     rename_schema_name(&mut key.parent_schema, prior, name);
                 }
                 rename_table_sql_identity(&mut pending.def, prior, name)?;
+                tail = entry.previous;
             }
         }
 
@@ -24260,10 +24287,9 @@ impl Storage {
 
     pub(crate) fn table_statistics(&self, table_slot: usize, txid: u32) -> TableStatistics {
         if self.tables[table_slot].pending_statistics_txid == Some(txid)
-            && let Some(position) = self.tables[table_slot].n_pending_statistics.checked_sub(1)
+            && let Some(slot) = self.tables[table_slot].pending_statistics_tail
         {
-            let slot = self.tables[table_slot].pending_statistics_slots[position as usize] as usize;
-            return self.pending_table_statistics[slot].statistics;
+            return self.pending_table_statistics[slot as usize].statistics;
         }
         self.tables[table_slot].statistics
     }
@@ -24274,13 +24300,9 @@ impl Storage {
         txid: u32,
     ) -> Option<TableStatistics> {
         (self.tables[table_slot].pending_statistics_txid == Some(txid))
-            .then(|| self.tables[table_slot].n_pending_statistics.checked_sub(1))
+            .then(|| self.tables[table_slot].pending_statistics_tail)
             .flatten()
-            .map(|position| {
-                let slot =
-                    self.tables[table_slot].pending_statistics_slots[position as usize] as usize;
-                self.pending_table_statistics[slot].statistics
-            })
+            .map(|slot| self.pending_table_statistics[slot as usize].statistics)
     }
 
     fn write_table_statistics(
@@ -24298,14 +24320,21 @@ impl Storage {
                 self.tables[table_slot].def.name.as_str()
             ));
         }
-        if self.tables[table_slot].n_pending_statistics as usize == MAX_PENDING_TABLE_DEFS {
+        let previous = self.tables[table_slot].pending_statistics_tail;
+        if previous.is_some_and(|slot| {
+            self.pending_table_statistics[slot as usize].depth
+                >= self.max_catalog_versions_per_object
+        }) {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "one transaction analyzes relation \"{}\" more than {} times",
+                "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
                 self.tables[table_slot].def.name.as_str(),
-                MAX_PENDING_TABLE_DEFS
+                self.max_catalog_versions_per_object
             ));
         }
+        let depth = previous.map_or(1, |slot| {
+            self.pending_table_statistics[slot as usize].depth + 1
+        });
         let slot = match self
             .pending_table_statistics
             .iter()
@@ -24314,6 +24343,8 @@ impl Storage {
             Some(slot) => {
                 self.pending_table_statistics[slot] = PendingTableStatisticsSlot {
                     used: true,
+                    previous,
+                    depth,
                     statistics,
                 };
                 slot
@@ -24323,6 +24354,8 @@ impl Storage {
                 self.pending_table_statistics
                     .push(PendingTableStatisticsSlot {
                         used: true,
+                        previous,
+                        depth,
                         statistics,
                     })
                     .map_err(|_| {
@@ -24334,9 +24367,7 @@ impl Storage {
                 slot
             }
         };
-        let position = self.tables[table_slot].n_pending_statistics as usize;
-        self.tables[table_slot].pending_statistics_slots[position] = slot as u32;
-        self.tables[table_slot].n_pending_statistics += 1;
+        self.tables[table_slot].pending_statistics_tail = Some(slot as u32);
         self.tables[table_slot].pending_statistics_txid = Some(txid);
         Ok(())
     }
@@ -24345,26 +24376,24 @@ impl Storage {
         if self.tables[table_slot].pending_statistics_txid != Some(txid) {
             return;
         }
-        let Some(position) = self.tables[table_slot].n_pending_statistics.checked_sub(1) else {
+        let Some(slot) = self.tables[table_slot].pending_statistics_tail else {
             return;
         };
-        let slot = self.tables[table_slot].pending_statistics_slots[position as usize] as usize;
-        self.pending_table_statistics[slot].used = false;
-        self.tables[table_slot].pending_statistics_slots[position as usize] = u32::MAX;
-        self.tables[table_slot].n_pending_statistics = position;
-        if position == 0 {
+        let previous = self.pending_table_statistics[slot as usize].previous;
+        self.pending_table_statistics[slot as usize].used = false;
+        self.tables[table_slot].pending_statistics_tail = previous;
+        if previous.is_none() {
             self.tables[table_slot].pending_statistics_txid = None;
         }
     }
 
     fn clear_pending_table_statistics(&mut self, table_slot: usize) {
-        let count = self.tables[table_slot].n_pending_statistics as usize;
-        for position in 0..count {
-            let slot = self.tables[table_slot].pending_statistics_slots[position] as usize;
-            self.pending_table_statistics[slot].used = false;
-            self.tables[table_slot].pending_statistics_slots[position] = u32::MAX;
+        let mut tail = self.tables[table_slot].pending_statistics_tail.take();
+        while let Some(slot) = tail {
+            let entry = &mut self.pending_table_statistics[slot as usize];
+            tail = entry.previous;
+            entry.used = false;
         }
-        self.tables[table_slot].n_pending_statistics = 0;
         self.tables[table_slot].pending_statistics_txid = None;
     }
 
@@ -27681,19 +27710,17 @@ impl Storage {
 
     fn pending_table_def(&self, index: usize) -> Option<&PendingTableDef> {
         let table = &self.tables[index];
-        let position = table.n_pending_defs.checked_sub(1)? as usize;
-        let slot = table.pending_def_slots[position] as usize;
+        let slot = table.pending_def_tail? as usize;
         Some(&self.pending_table_defs[slot].version)
     }
 
     fn clear_pending_table_defs(&mut self, index: usize) {
-        let count = self.tables[index].n_pending_defs as usize;
-        for position in 0..count {
-            let slot = self.tables[index].pending_def_slots[position] as usize;
-            self.pending_table_defs[slot].used = false;
-            self.tables[index].pending_def_slots[position] = u32::MAX;
+        let mut tail = self.tables[index].pending_def_tail.take();
+        while let Some(slot) = tail {
+            let entry = &mut self.pending_table_defs[slot as usize];
+            tail = entry.previous;
+            entry.used = false;
         }
-        self.tables[index].n_pending_defs = 0;
         self.tables[index].pending_def_txid = None;
     }
 
@@ -27714,13 +27741,6 @@ impl Storage {
                 crate::sql::eval::sqlstate::INTERNAL_LOCK_WAIT,
                 "statement is waiting for concurrent DDL on \"{}\"",
                 self.tables[index].def.name.as_str()
-            ));
-        }
-        if self.tables[index].n_pending_defs as usize == MAX_PENDING_TABLE_DEFS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "one transaction applies more than {} table-definition versions to one table",
-                MAX_PENDING_TABLE_DEFS
             ));
         }
         let current = *self.table_def(index, txid);
@@ -27756,10 +27776,24 @@ impl Storage {
             rewrites_rows: rewrites_rows
                 || prior.is_some_and(|version| version.txid == txid && version.rewrites_rows),
         };
+        let previous = self.tables[index].pending_def_tail;
+        if previous.is_some_and(|slot| {
+            self.pending_table_defs[slot as usize].depth >= self.max_catalog_versions_per_object
+        }) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "relation \"{}\" exceeds max_catalog_versions_per_object ({})",
+                self.tables[index].def.name.as_str(),
+                self.max_catalog_versions_per_object
+            ));
+        }
+        let depth = previous.map_or(1, |slot| self.pending_table_defs[slot as usize].depth + 1);
         let slot = match self.pending_table_defs.iter().position(|entry| !entry.used) {
             Some(slot) => {
                 self.pending_table_defs[slot] = PendingTableDefSlot {
                     used: true,
+                    previous,
+                    depth,
                     version,
                 };
                 slot
@@ -27769,6 +27803,8 @@ impl Storage {
                 self.pending_table_defs
                     .push(PendingTableDefSlot {
                         used: true,
+                        previous,
+                        depth,
                         version,
                     })
                     .map_err(|_| {
@@ -27780,9 +27816,7 @@ impl Storage {
                 slot
             }
         };
-        let position = self.tables[index].n_pending_defs as usize;
-        self.tables[index].pending_def_slots[position] = slot as u32;
-        self.tables[index].n_pending_defs += 1;
+        self.tables[index].pending_def_tail = Some(slot as u32);
         self.tables[index].pending_def_txid = Some(txid);
         self.refresh_table_comment_identity(index, txid);
         Ok(())
@@ -27792,14 +27826,13 @@ impl Storage {
         if self.tables[index].pending_def_txid != Some(txid) {
             return;
         }
-        let Some(position) = self.tables[index].n_pending_defs.checked_sub(1) else {
+        let Some(slot) = self.tables[index].pending_def_tail else {
             return;
         };
-        let slot = self.tables[index].pending_def_slots[position as usize] as usize;
-        self.pending_table_defs[slot].used = false;
-        self.tables[index].pending_def_slots[position as usize] = u32::MAX;
-        self.tables[index].n_pending_defs = position;
-        if position == 0 {
+        let previous = self.pending_table_defs[slot as usize].previous;
+        self.pending_table_defs[slot as usize].used = false;
+        self.tables[index].pending_def_tail = previous;
+        if previous.is_none() {
             self.tables[index].pending_def_txid = None;
         }
         self.refresh_table_comment_identity(index, txid);
@@ -35373,6 +35406,24 @@ impl Storage {
         txid: u32,
         dependencies: StoredQueryDependencies,
     ) -> Result<u32, SqlError> {
+        let previous = self.routines[routine]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| pending.dependency_slot);
+        if previous.is_some_and(|slot| {
+            self.pending_routine_dependencies[slot as usize].depth
+                >= self.max_catalog_versions_per_object
+        }) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine \"{}\" exceeds max_catalog_versions_per_object ({})",
+                self.routines[routine].name.as_str(),
+                self.max_catalog_versions_per_object
+            ));
+        }
+        let depth = previous.map_or(1, |slot| {
+            self.pending_routine_dependencies[slot as usize].depth + 1
+        });
         let Some(slot) = self
             .pending_routine_dependencies
             .iter()
@@ -35387,6 +35438,7 @@ impl Storage {
             used: true,
             txid,
             routine: routine as u16,
+            depth,
             dependencies,
         };
         Ok(slot as u32)
@@ -36768,8 +36820,7 @@ impl Storage {
             kinds: spec.kinds,
             expression_only: spec.expression_only,
             data: ExtendedStatisticsData::EMPTY,
-            pending_data_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
-            n_pending_data: 0,
+            pending_data_tail: None,
             pending_data_txid: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
@@ -36922,10 +36973,9 @@ impl Storage {
     ) -> ExtendedStatisticsData {
         let statistics = &self.extended_statistics[slot];
         if statistics.pending_data_txid == Some(txid)
-            && let Some(position) = statistics.n_pending_data.checked_sub(1)
+            && let Some(pending) = statistics.pending_data_tail
         {
-            let pending = statistics.pending_data_slots[position as usize] as usize;
-            return self.pending_extended_statistics_data[pending].data;
+            return self.pending_extended_statistics_data[pending as usize].data;
         }
         statistics.data
     }
@@ -36955,13 +37005,21 @@ impl Storage {
                 statistics.definition_for(txid).name.as_str()
             ));
         }
-        if statistics.n_pending_data as usize == MAX_PENDING_TABLE_DEFS {
+        let previous = statistics.pending_data_tail;
+        if previous.is_some_and(|pending| {
+            self.pending_extended_statistics_data[pending as usize].depth
+                >= self.max_catalog_versions_per_object
+        }) {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "one transaction analyzes statistics object more than {} times",
-                MAX_PENDING_TABLE_DEFS
+                "statistics object \"{}\" exceeds max_catalog_versions_per_object ({})",
+                statistics.definition_for(txid).name.as_str(),
+                self.max_catalog_versions_per_object
             ));
         }
+        let depth = previous.map_or(1, |pending| {
+            self.pending_extended_statistics_data[pending as usize].depth + 1
+        });
         let pending = match self
             .pending_extended_statistics_data
             .iter()
@@ -36969,13 +37027,23 @@ impl Storage {
         {
             Some(pending) => {
                 self.pending_extended_statistics_data[pending] =
-                    PendingExtendedStatisticsDataSlot { used: true, data };
+                    PendingExtendedStatisticsDataSlot {
+                        used: true,
+                        previous,
+                        depth,
+                        data,
+                    };
                 pending
             }
             None => {
                 let pending = self.pending_extended_statistics_data.len();
                 self.pending_extended_statistics_data
-                    .push(PendingExtendedStatisticsDataSlot { used: true, data })
+                    .push(PendingExtendedStatisticsDataSlot {
+                        used: true,
+                        previous,
+                        depth,
+                        data,
+                    })
                     .map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -36986,9 +37054,7 @@ impl Storage {
             }
         };
         let statistics = &mut self.extended_statistics[slot];
-        let position = statistics.n_pending_data as usize;
-        statistics.pending_data_slots[position] = pending as u32;
-        statistics.n_pending_data += 1;
+        statistics.pending_data_tail = Some(pending as u32);
         statistics.pending_data_txid = Some(txid);
         Ok(())
     }
@@ -36998,26 +37064,25 @@ impl Storage {
         if statistics.pending_data_txid != Some(txid) {
             return;
         }
-        let Some(position) = statistics.n_pending_data.checked_sub(1) else {
+        let Some(pending) = statistics.pending_data_tail else {
             return;
         };
-        let pending = statistics.pending_data_slots[position as usize] as usize;
-        self.pending_extended_statistics_data[pending].used = false;
-        statistics.pending_data_slots[position as usize] = u32::MAX;
-        statistics.n_pending_data = position;
-        if position == 0 {
+        let previous = self.pending_extended_statistics_data[pending as usize].previous;
+        self.pending_extended_statistics_data[pending as usize].used = false;
+        statistics.pending_data_tail = previous;
+        if previous.is_none() {
             statistics.pending_data_txid = None;
         }
     }
 
     fn clear_pending_extended_statistics_data(&mut self, slot: usize) {
         let statistics = &mut self.extended_statistics[slot];
-        for position in 0..statistics.n_pending_data as usize {
-            let pending = statistics.pending_data_slots[position] as usize;
-            self.pending_extended_statistics_data[pending].used = false;
-            statistics.pending_data_slots[position] = u32::MAX;
+        let mut tail = statistics.pending_data_tail.take();
+        while let Some(pending) = tail {
+            let entry = &mut self.pending_extended_statistics_data[pending as usize];
+            tail = entry.previous;
+            entry.used = false;
         }
-        statistics.n_pending_data = 0;
         statistics.pending_data_txid = None;
     }
 
@@ -43221,6 +43286,7 @@ mod tests {
         config.max_views = 3;
         config.max_materialized_views = 4;
         config.max_routines = 5;
+        config.max_catalog_versions_per_object = 3;
         config.max_casts = 6;
         config.max_operators = 7;
         config.max_operator_families = 8;
@@ -43239,6 +43305,14 @@ mod tests {
         storage.configure_collation(&config, &mut budget).unwrap();
 
         assert_eq!(storage.tables.len(), 3); // two relations plus large-object pages
+        assert_eq!(
+            storage.pending_table_defs.capacity(),
+            pending_table_definition_capacity(&config)
+        );
+        assert_eq!(
+            storage.pending_table_statistics.capacity(),
+            pending_table_statistics_capacity(&config)
+        );
         assert_eq!(storage.databases.len(), 6);
         assert_eq!(storage.database_cumulative_statistics.borrow().len(), 6);
         assert_eq!(storage.schemas.len(), 17);
@@ -43262,7 +43336,7 @@ mod tests {
         assert_eq!(storage.routine_dependencies.len(), 5);
         assert_eq!(
             storage.pending_routine_dependencies.len(),
-            5 * MAX_PENDING_TABLE_DEFS
+            pending_routine_dependency_capacity(&config)
         );
         assert_eq!(storage.casts.len(), 6);
         assert_eq!(storage.operators.len(), 7);
@@ -43275,6 +43349,10 @@ mod tests {
         assert_eq!(storage.conversions.len(), 13);
         assert_eq!(storage.text_search_objects.len(), 27);
         assert_eq!(storage.event_triggers.len(), 14);
+        assert_eq!(
+            storage.pending_extended_statistics_data.capacity(),
+            pending_extended_statistics_capacity(&config)
+        );
         assert_eq!(storage.tablespaces.len(), 15);
         assert_eq!(storage.comments.len(), 16);
         assert_eq!(

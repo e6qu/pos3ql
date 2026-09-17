@@ -11,7 +11,10 @@ interval index-navigation,
 checkpoint-maintenance capacity and publication handoff, concurrent-harness
 port, integration-scratch, accepted-definition list, and statement-width
 audits have no external blocker; their fixes are qualified in the
-implementation and regression suites.
+implementation and regression suites. The catalog-version pool audit likewise
+found no external blocker: the per-object table-definition, statistics, and
+routine-dependency ceiling is startup-configurable and covered by savepoint,
+exact-memory, and cold-recovery regressions.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

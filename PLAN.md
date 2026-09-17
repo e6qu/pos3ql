@@ -189,6 +189,16 @@ storage. RAM and local disk are bounded, disposable caches.
 The atomic-transaction capacity audit is implemented: savepoints, deferred
 constraint and trigger metadata, retained trigger rows, and statistics undo
 have named startup capacities shared by connection, prepared, and apply slots.
+Transaction-private table definitions, table statistics, extended-statistics
+data, and routine dependency images now use startup-sized global pools keyed to
+`max_ddl_per_transaction`, `max_analyze_per_transaction`, and the explicit
+`max_catalog_versions_per_object`; no object retains a compiled eight-version
+inline array. Compact backward chains make
+latest-version reads, savepoint rollback, commit cleanup, and slot reuse
+constant-space operations. Regressions stage more than eight versions of one
+object, roll later versions back, commit, publish a checkpoint, discard both
+local cache tiers, and verify the surviving catalog state from object storage
+with runtime allocation forbidden.
 Deep savepoints preserve GUC, foreign-query, large-object, and cumulative
 statistics state without 8-bit nesting or truncated name lists. TRUNCATE closes
 inheritance, partition, and foreign-key fan-out over every configured table;
@@ -259,7 +269,7 @@ Replace remaining compile-time per-object inline ceilings with startup-sized
 pools or bounded chunked structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
 catalog construction, and execution scratch. Exercise maximum-capacity
-routine, trigger, policy, transaction, spill, and remaining per-object
+trigger, transaction, row-version, spill, and remaining per-object
 structures through checkpoint retry and object-cold recovery while checking
 exact startup memory accounting and loud exhaustion.
 

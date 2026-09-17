@@ -4680,14 +4680,17 @@ fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
             .table(durable_slot)
             .rows
             .iter()
-            .any(|(_, state)| state.pending.last().is_some_and(|pending| {
-                pending.txid
-                    == recovered
-                        .prepared_transactions
-                        .slot(recovered_slot)
-                        .metadata()
-                        .transaction_id
-            })),
+            .any(|(_, state)| recovered
+                .storage
+                .row_pending_last(*state)
+                .is_some_and(|pending| {
+                    pending.txid
+                        == recovered
+                            .prepared_transactions
+                            .slot(recovered_slot)
+                            .metadata()
+                            .transaction_id
+                })),
         "prepared row overlays recovered"
     );
     assert_eq!(
@@ -9882,6 +9885,132 @@ fn configured_catalog_version_pools_cover_one_object_and_savepoint_reuse() {
         String::from_utf8_lossy(&dependency_error)
     );
     drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn configured_row_version_pools_cover_command_history_snapshots_and_cold_recovery() {
+    let mut config = test_config("configured-row-version-pools");
+    config.max_row_versions_per_row = 12;
+    config.txn_rows = 64;
+    config.table_rows = 32;
+    config.value_index_rows = 32;
+    config.memtable_bytes = 4 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("row-version-pools-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = ConfiguredTransactionSession::new(&config, &mut budget);
+    let mut writer = ConfiguredTransactionSession::new(&config, &mut budget);
+    writer.success(
+        &mut engine,
+        "CREATE TABLE row_version_pool(id integer PRIMARY KEY, value integer); \
+         INSERT INTO row_version_pool VALUES (1, 0)",
+        false,
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT value FROM row_version_pool",
+            false,
+        )),
+        ["0"]
+    );
+    for value in 1..=10 {
+        writer.success(
+            &mut engine,
+            &format!("UPDATE row_version_pool SET value = {value} WHERE id = 1"),
+            false,
+        );
+    }
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT value FROM row_version_pool; COMMIT",
+            false,
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT value FROM row_version_pool",
+            false,
+        )),
+        ["10"]
+    );
+
+    writer.success(&mut engine, "BEGIN", false);
+    for _ in 0..10 {
+        writer.success(
+            &mut engine,
+            "UPDATE row_version_pool SET value = value + 1 WHERE id = 1",
+            false,
+        );
+    }
+    writer.success(&mut engine, "SAVEPOINT row_version_reuse", false);
+    for _ in 0..2 {
+        writer.success(
+            &mut engine,
+            "UPDATE row_version_pool SET value = value + 1 WHERE id = 1",
+            false,
+        );
+    }
+    let exhausted = writer.execute(
+        &mut engine,
+        "UPDATE row_version_pool SET value = value + 1 WHERE id = 1",
+        false,
+    );
+    assert!(
+        String::from_utf8_lossy(&exhausted).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&exhausted)
+    );
+    writer.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT row_version_reuse; \
+         UPDATE row_version_pool SET value = value + 10 WHERE id = 1; \
+         UPDATE row_version_pool SET value = value + 10 WHERE id = 1; COMMIT",
+        false,
+    );
+    assert_eq!(
+        data_rows(&reader.success(
+            &mut engine,
+            "SELECT value FROM row_version_pool; COMMIT",
+            false,
+        )),
+        ["10"]
+    );
+    assert_eq!(
+        data_rows(&writer.success(&mut engine, "SELECT value FROM row_version_pool", false,)),
+        ["40"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(reader);
+    drop(writer);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut recovered,
+            &recovered_budget,
+            "SELECT value FROM row_version_pool",
+            1 << 20,
+        )),
+        ["40"]
+    );
+    drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -47960,17 +48089,18 @@ fn parked_statement_rewinds_partial_rows_before_replay() {
     );
     assert!(blocked.is_empty(), "{blocked}");
     assert!(
-        engine
-            .storage
-            .table(engine.storage.find_table("public", "replay_rows").unwrap())
-            .rows
-            .iter()
-            .all(|(_, state)| {
-                state
-                    .pending
-                    .last()
-                    .is_none_or(|pending| pending.txid != waiter.txid)
-            }),
+        {
+            let storage = &engine.storage;
+            storage
+                .table(engine.storage.find_table("public", "replay_rows").unwrap())
+                .rows
+                .iter()
+                .all(|(_, state)| {
+                    storage
+                        .row_pending_last(*state)
+                        .is_none_or(|pending| pending.txid != waiter.txid)
+                })
+        },
         "the parked statement must leave no partial pending row"
     );
     run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
@@ -56995,6 +57125,86 @@ fn checkpoint_does_not_carry_spilled_rows_across_reused_table_slots() {
 }
 
 #[test]
+fn configured_spill_generation_rosters_survive_more_than_eight_cold_deltas() {
+    let mut config = test_config("configured-spill-generation-rosters");
+    config.max_spill_generations_per_table = 12;
+    config.checkpoint_merge_entries = 1;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("spill-generation-rosters-{}", std::process::id());
+    config.table_rows = 32;
+    config.value_index_rows = 32;
+    config.memtable_bytes = 2 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE deep_spill_roster(id integer PRIMARY KEY, value integer); \
+         INSERT INTO deep_spill_roster VALUES (1, 1)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    for value in 2..=10 {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("UPDATE deep_spill_roster SET value = {value} WHERE id = 1"),
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    let table = engine
+        .storage
+        .find_table("public", "deep_spill_roster")
+        .unwrap();
+    assert_eq!(engine.storage.spill_generation_count(table), 10);
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(table),
+        10
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_table = recovered
+        .storage
+        .find_table("public", "deep_spill_roster")
+        .unwrap();
+    assert_eq!(
+        recovered.storage.spill_generation_count(recovered_table),
+        10
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut recovered,
+            &recovered_budget,
+            "SELECT value FROM deep_spill_roster",
+            1 << 20,
+        )),
+        ["10"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn temporary_rows_spill_locally_without_object_publication() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -63024,6 +63234,56 @@ fn repeatable_read_retains_committed_row_history() {
         )),
         ["after"]
     );
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM snapshot_rows WHERE id = 2",
+        )),
+        ["after"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "DELETE FROM snapshot_rows WHERE id = 2",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM snapshot_rows WHERE id = 2",
+        )),
+        ["after"],
+        "repeatable-read snapshot must retain a later-deleted row"
+    );
+    run_txn(&mut engine, &mut budget, &mut reader, "ROLLBACK");
+    assert!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            "SELECT value FROM snapshot_rows WHERE id = 2",
+        ))
+        .is_empty()
+    );
+    let table = engine
+        .storage
+        .find_table("public", "snapshot_rows")
+        .unwrap();
+    assert!(
+        engine.storage.table(table).rows.is_empty(),
+        "the final snapshot release must reclaim a non-spilled delete marker"
+    );
 }
 
 #[test]
@@ -65067,7 +65327,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
     // The window working set (all 20000 rows across every spec) is over twice
     // this arena, so only the spilled path can evaluate the queries below;
     // per-partition compute_window stays O(partition).
-    config.work_arena_bytes = 2 << 20;
+    config.work_arena_bytes = 3 << 20;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));

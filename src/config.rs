@@ -57,6 +57,12 @@ pub struct Config {
     pub max_ddl_per_transaction: usize,
     /// Successive transaction-private images retained for one catalog object.
     pub max_catalog_versions_per_object: usize,
+    /// Pending command images and committed snapshot images retained for one
+    /// row. The backing pools are reserved globally at startup.
+    pub max_row_versions_per_row: usize,
+    /// Immutable row generations retained per table before merge pressure
+    /// must free a slot for the next delta checkpoint.
+    pub max_spill_generations_per_table: usize,
     pub max_savepoints_per_transaction: usize,
     pub max_deferred_constraints_per_transaction: usize,
     pub deferred_trigger_bytes: usize,
@@ -328,6 +334,8 @@ impl Config {
             txn_rows: 8192,
             max_ddl_per_transaction: 256,
             max_catalog_versions_per_object: 8,
+            max_row_versions_per_row: 8,
+            max_spill_generations_per_table: 8,
             max_savepoints_per_transaction: 16,
             max_deferred_constraints_per_transaction: 128,
             deferred_trigger_bytes: 256 * KIB,
@@ -587,6 +595,14 @@ impl Config {
                 }
                 "max_catalog_versions_per_object" => {
                     config.max_catalog_versions_per_object =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_row_versions_per_row" => {
+                    config.max_row_versions_per_row =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_spill_generations_per_table" => {
+                    config.max_spill_generations_per_table =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_savepoints_per_transaction" => {
@@ -1183,6 +1199,7 @@ impl Config {
                 "max_catalog_versions_per_object",
                 config.max_catalog_versions_per_object,
             ),
+            ("max_row_versions_per_row", config.max_row_versions_per_row),
             (
                 "max_deferred_constraints_per_transaction",
                 config.max_deferred_constraints_per_transaction,
@@ -1199,6 +1216,17 @@ impl Config {
                     format!("{name} must be between 1 and {}", u32::MAX),
                 ));
             }
+        }
+        if config.max_spill_generations_per_table < 2
+            || config.max_spill_generations_per_table > u32::MAX as usize
+        {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "max_spill_generations_per_table must be between 2 and {}",
+                    u32::MAX
+                ),
+            ));
         }
         if config.max_large_objects == 0
             || config.large_object_pages == 0
@@ -1528,6 +1556,8 @@ mod tests {
     fn transaction_capacities_are_validated_and_exactly_budgeted() {
         let config = Config::parse(
             "max_catalog_versions_per_object = 33\n\
+             max_row_versions_per_row = 34\n\
+             max_spill_generations_per_table = 35\n\
              max_savepoints_per_transaction = 257\n\
              max_deferred_constraints_per_transaction = 1024\n\
              deferred_trigger_bytes = 1MiB\n\
@@ -1535,6 +1565,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.max_catalog_versions_per_object, 33);
+        assert_eq!(config.max_row_versions_per_row, 34);
+        assert_eq!(config.max_spill_generations_per_table, 35);
         assert_eq!(config.max_savepoints_per_transaction, 257);
         assert_eq!(config.max_deferred_constraints_per_transaction, 1024);
         assert_eq!(config.deferred_trigger_bytes, MIB);
@@ -1547,6 +1579,7 @@ mod tests {
         assert_eq!(transaction.truncate_table_capacity(), config.max_tables + 1);
         for key in [
             "max_catalog_versions_per_object",
+            "max_row_versions_per_row",
             "max_savepoints_per_transaction",
             "max_deferred_constraints_per_transaction",
             "deferred_trigger_bytes",
@@ -1556,6 +1589,17 @@ mod tests {
             assert!(Config::parse(&format!("{key} = 4294967296\n")).is_err());
             assert!(Config::parse(&format!("{key} = 1\n{key} = 2\n")).is_err());
         }
+        for value in ["0", "1", "4294967296"] {
+            assert!(
+                Config::parse(&format!("max_spill_generations_per_table = {value}\n")).is_err()
+            );
+        }
+        assert!(
+            Config::parse(
+                "max_spill_generations_per_table = 2\nmax_spill_generations_per_table = 3\n"
+            )
+            .is_err()
+        );
         let guc_bytes = crate::sql::guc::GucState::extra_savepoint_budget_bytes(257)
             + crate::sql::guc::SeqSession::extra_budget_bytes(config.max_sequences);
         let mut budget = crate::mem::budget::Budget::new(guc_bytes);
@@ -1600,6 +1644,8 @@ listen_addr = 0.0.0.0:5432
 max_connections = 128
 max_ddl_per_transaction = 192
 max_catalog_versions_per_object = 24
+max_row_versions_per_row = 25
+max_spill_generations_per_table = 26
 max_prepared_transactions = 11
 max_locks_per_transaction = 96
 max_replication_slots = 12
@@ -1632,6 +1678,8 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_connections, 128);
         assert_eq!(c.max_ddl_per_transaction, 192);
         assert_eq!(c.max_catalog_versions_per_object, 24);
+        assert_eq!(c.max_row_versions_per_row, 25);
+        assert_eq!(c.max_spill_generations_per_table, 26);
         assert_eq!(c.max_prepared_transactions, 11);
         assert_eq!(c.max_locks_per_transaction, 96);
         assert_eq!(c.max_replication_slots, 12);

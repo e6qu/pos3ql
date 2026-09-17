@@ -15,6 +15,10 @@ implementation and regression suites. The catalog-version pool audit likewise
 found no external blocker: the per-object table-definition, statistics, and
 routine-dependency ceiling is startup-configurable and covered by savepoint,
 exact-memory, and cold-recovery regressions.
+The row-version and spill-generation audit also found no external blocker:
+both former eight-entry ceilings are startup-configurable, fully accounted,
+and covered across exhaustion, reuse, checkpoint publication, and empty-cache
+recovery.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

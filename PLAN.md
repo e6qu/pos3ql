@@ -71,6 +71,16 @@ storage. RAM and local disk are bounded, disposable caches.
   construct rows from their transaction-visible cardinality instead of hidden
   static arrays. An empty stored-query dependency graph no longer imposes an
   unrelated 128-table drop limit.
+  Row MVCC command history and committed snapshot history use startup-sized
+  global pools governed by `max_row_versions_per_row`, with constant-time slot
+  reuse and explicit per-row and global exhaustion. Per-table immutable SST
+  rosters, checkpoint publication and retry scratch, paced merge state,
+  temporary spill, and cold-read cursors share
+  `max_spill_generations_per_table`; no path retains or truncates to a compiled
+  eight-generation list. Regressions cross the old boundary through command
+  snapshots, savepoint rollback and reuse, active repeatable-read snapshots,
+  ten durable deltas, checkpoint publication, empty-cache recovery, and exact
+  startup accounting.
 - Database and schema catalogs are independently startup-sized through
   `max_databases` and `max_schemas`, with their complete memory cost charged
   before serving. Database connection counters, cumulative statistics,
@@ -269,9 +279,10 @@ Replace remaining compile-time per-object inline ceilings with startup-sized
 pools or bounded chunked structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
 catalog construction, and execution scratch. Exercise maximum-capacity
-trigger, transaction, row-version, spill, and remaining per-object
-structures through checkpoint retry and object-cold recovery while checking
-exact startup memory accounting and loud exhaustion.
+trigger and remaining per-object structures through checkpoint retry and
+object-cold recovery while checking exact startup memory accounting and loud
+exhaustion. Row-version chains and spill-generation rosters are complete and
+belong to the implemented baseline above.
 
 ### Multi-core execution
 

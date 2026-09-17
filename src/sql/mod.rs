@@ -239,7 +239,7 @@ pub struct Engine {
     /// cannot erase the AFTER STATEMENT transition relation.
     copy_transition_scratch: exec::DmlScratch,
     /// Scratch for heap compaction: every live row image across tables.
-    compact_scratch: FixedVec<(u32, u64, u8, RowLoc)>,
+    compact_scratch: FixedVec<(u32, u64, crate::storage::RowHeapImage, RowLoc)>,
     /// Shared execution arena: one query's materialized rows (ORDER BY /
     /// DISTINCT / GROUP BY buffers) live here, separate from the small
     /// per-connection AST arena. Single-threaded execution means one
@@ -2794,11 +2794,12 @@ impl Engine {
         Storage::extra_budget_bytes(config)
             + exec::record_shape_pool_bytes(config.max_composites)
             + 2 * config.table_rows * size_of::<exec::PhysicalRow>()
-            + (1 + crate::storage::MAX_PENDING_ROW_VERSIONS
-                + crate::storage::MAX_COMMITTED_ROW_VERSIONS)
-                * config.max_tables
-                * config.table_rows
-                * size_of::<(u32, u64, u8, RowLoc)>()
+            + crate::storage::row_heap_image_capacity(config).saturating_mul(size_of::<(
+                u32,
+                u64,
+                crate::storage::RowHeapImage,
+                RowLoc,
+            )>())
             + config.work_arena_bytes
             + config.wal_buffer_bytes
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
@@ -2822,9 +2823,15 @@ impl Engine {
                 TemporarySpiller::budget_bytes(config)
             }
             + if config.object_store_on {
-                crate::storage::SpillReader::budget_bytes(true)
+                crate::storage::SpillReader::budget_bytes(
+                    true,
+                    config.max_spill_generations_per_table,
+                )
             } else if config.temporary_spill_bytes != 0 {
-                crate::storage::SpillReader::budget_bytes(false)
+                crate::storage::SpillReader::budget_bytes(
+                    false,
+                    config.max_spill_generations_per_table,
+                )
             } else {
                 0
             }
@@ -2883,6 +2890,7 @@ impl Engine {
         if ckpt.is_some() || temporary_spiller.is_some() {
             let reader = crate::storage::SpillReader::new(
                 budget,
+                config.max_spill_generations_per_table,
                 ckpt.as_ref().map(Checkpointer::block_stack),
                 temporary_spiller
                     .as_ref()
@@ -3084,10 +3092,7 @@ impl Engine {
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
-                (1 + crate::storage::MAX_PENDING_ROW_VERSIONS
-                    + crate::storage::MAX_COMMITTED_ROW_VERSIONS)
-                    * config.max_tables
-                    * config.table_rows,
+                crate::storage::row_heap_image_capacity(config),
             )?,
             work: Arena::new(budget, "work_arena", config.work_arena_bytes)?,
             next_txid: recovered_transaction_id,
@@ -4664,7 +4669,7 @@ impl Engine {
             let Some(state) = self.storage.row_state(table as usize, rowid)? else {
                 continue;
             };
-            let Some(p) = state.pending.last() else {
+            let Some(p) = self.storage.row_pending_last(state) else {
                 continue;
             };
             let t = self.storage.table(table as usize);
@@ -12631,7 +12636,7 @@ impl Engine {
             let Some(state) = self.storage.row_state(table as usize, rowid)? else {
                 continue;
             };
-            let Some(pending) = state.pending.last() else {
+            let Some(pending) = self.storage.row_pending_last(state) else {
                 continue;
             };
             let table_definition = self.storage.table_def(table as usize, txn.txid);

@@ -63614,7 +63614,7 @@ fn alter_table_relation(
         .table(table_index)
         .rows
         .iter()
-        .any(|(_, state)| state.locked_by_other(txn.txid).is_some())
+        .any(|(_, state)| storage.row_locked_by_other(*state, txn.txid).is_some())
     {
         return sql_fail(sql_err!(
             crate::sql::eval::sqlstate::LOCK_NOT_AVAILABLE,

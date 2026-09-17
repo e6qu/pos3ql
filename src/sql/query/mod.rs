@@ -352,7 +352,7 @@ fn collect_stored_query_composite_field_rename_select<'a>(
 pub(crate) fn stored_query_composite_field_rename_sites<'a>(
     sql: &'a str,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     rename: &StoredQueryCompositeFieldRename<'a>,
     sites: &mut [bool],
 ) -> Result<usize, SqlError> {
@@ -1026,7 +1026,7 @@ fn execute_routine_query_under<'a>(
     recycling: bool,
     stored: Option<(
         crate::storage::PathContext,
-        &'a crate::storage::StoredQueryDependencies,
+        crate::storage::StoredQueryDependencyView<'a>,
     )>,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
@@ -4769,12 +4769,12 @@ pub fn describe_query_under<'a>(
     describe_select(select, storage, txid, arena, out)
 }
 
-pub fn describe_stored_query<'a>(
+pub(crate) fn describe_stored_query<'a>(
     sql: &'a str,
     storage: &'a Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     out: &mut [ColDesc<'a>],
 ) -> Result<usize, SqlError> {

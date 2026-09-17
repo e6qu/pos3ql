@@ -20164,7 +20164,7 @@ fn pg_depend<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let def = schema::require("pg_depend", false);
-    let dependency_capacity = |dependencies: &crate::storage::StoredQueryDependencies| {
+    let dependency_capacity = |dependencies: crate::storage::StoredQueryDependencyView<'_>| {
         dependencies
             .entries()
             .iter()
@@ -20214,7 +20214,7 @@ fn pg_depend<'a>(
         .sum::<usize>();
     let rule_dependencies = storage
         .rules_visible_to(txid)
-        .map(|(_, rule)| 1 + dependency_capacity(&rule.definition_for(txid).dependencies))
+        .map(|(slot, _)| 1 + dependency_capacity(storage.rule_dependencies(slot, txid)))
         .sum::<usize>();
     let matview_dependencies = storage
         .matviews_visible_to(txid)
@@ -20696,7 +20696,7 @@ fn pg_depend<'a>(
             }
         }
     }
-    for (_, rule) in storage.rules_visible_to(txid) {
+    for (slot, rule) in storage.rules_visible_to(txid) {
         let definition = rule.definition_for(txid);
         if matches!(definition.event, crate::storage::RewriteEvent::Select) {
             continue;
@@ -20706,7 +20706,7 @@ fn pg_depend<'a>(
             crate::storage::RuleTarget::View(slot) => view_oid(usize::from(slot)),
         };
         push(2618, rule.oid(), PG_CLASS_OID, relation_oid, 0, "i")?;
-        for dependency in definition.dependencies.entries() {
+        for dependency in storage.rule_dependencies(slot, txid).entries() {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };

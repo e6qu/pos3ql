@@ -212,15 +212,23 @@ The atomic-transaction capacity audit is implemented: savepoints, deferred
 constraint and trigger metadata, retained trigger rows, and statistics undo
 have named startup capacities shared by connection, prepared, and apply slots.
 Transaction-private table definitions, table statistics, extended-statistics
-data, and routine dependency images now use startup-sized global pools keyed to
-`max_ddl_per_transaction`, `max_analyze_per_transaction`, and the explicit
-`max_catalog_versions_per_object`; no object retains a compiled eight-version
-inline array. Compact backward chains make
-latest-version reads, savepoint rollback, commit cleanup, and slot reuse
-constant-space operations. Regressions stage more than eight versions of one
+data, and stored-query dependency images now use startup-sized global pools
+keyed to `max_ddl_per_transaction`, `max_analyze_per_transaction`, and the
+explicit `max_catalog_versions_per_object`; no object retains a compiled
+eight-version inline array. Rules, policies, routines, materialized views, and
+view return rules share one contiguous dependency pool governed by
+`max_stored_query_dependencies_per_object` (durable maximum 255), rather than
+embedding a 64-entry image in each catalog object and pending version. WAL,
+checkpoints, template cloning, dependency cascades, catalog reporting, and
+execution all consume the same borrowed image contract. Compact backward
+chains make latest-version reads, savepoint rollback, commit cleanup, and slot
+reuse constant-space operations. Regressions stage more than eight versions of one
 object, roll later versions back, commit, publish a checkpoint, discard both
 local cache tiers, and verify the surviving catalog state from object storage
-with runtime allocation forbidden.
+with runtime allocation forbidden. A separate regression crosses the former
+64-dependency ceiling, proves configured exhaustion is atomic, retries an
+ambiguous checkpoint publication, and executes the recovered definition from
+empty local caches.
 Deep savepoints preserve GUC, foreign-query, large-object, and cumulative
 statistics state without 8-bit nesting or truncated name lists. TRUNCATE closes
 inheritance, partition, and foreign-key fan-out over every configured table;
@@ -290,12 +298,10 @@ original and cold-recovery caches on scope exit, including assertion failures.
 Replace remaining compile-time per-object inline ceilings with startup-sized
 pools or bounded chunked structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
-catalog construction, and execution scratch. Stored-query dependency sets are
-the next known arbitrary inline catalog ceiling; replace their 64-entry images
-across views, rules, policies, materialized views, routines, WAL, and
-checkpoints with startup-sized pooled storage. Exercise every remaining
+catalog construction, and execution scratch. Exercise every remaining
 per-object structure through checkpoint retry and object-cold recovery while
-checking exact startup memory accounting and loud exhaustion. Row-version
+checking exact startup memory accounting and loud exhaustion. Stored-query
+dependency images, row-version
 chains, spill-generation rosters, extended-statistics catalogs, BRIN range
 maintenance, and maximum-capacity trigger qualification are complete and
 belong to the implemented baseline above.

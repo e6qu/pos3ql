@@ -3950,8 +3950,8 @@ impl Checkpointer {
                                 action_count: action_count as u8,
                                 returning_action,
                                 creation_path,
-                                dependencies,
                             },
+                            dependencies,
                         )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
@@ -8458,7 +8458,7 @@ impl Checkpointer {
                     spans.as_str(),
                     definition.returning_action.map_or(u16::MAX, u16::from),
                     ManifestName(definition.creation_path.as_str()),
-                    ManifestDependencies(&definition.dependencies),
+                    ManifestDependencies(storage.rule_dependencies(slot, 0)),
                 ),
             )?;
         }
@@ -8945,7 +8945,7 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, policy) in storage.checkpoint_policies() {
+        for (slot, policy) in storage.checkpoint_policies() {
             write_database_context(
                 &mut self.manifest_buf,
                 &mut database_context,
@@ -9012,7 +9012,7 @@ impl Checkpointer {
                     } else {
                         "-"
                     },
-                    ManifestDependencies(&definition.dependencies),
+                    ManifestDependencies(storage.policy_dependencies(slot, 0)),
                 ),
             )?;
         }
@@ -11416,9 +11416,9 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
                         .map_err(|_| CheckpointSetupError::Corrupt("policy roles"))?,
                     using,
                     with_check,
-                    dependencies,
                 },
             },
+            dependencies,
         )
         .map_err(|error| {
             CheckpointSetupError::ObjectStore(format!(
@@ -12275,7 +12275,7 @@ fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     Ok(())
 }
 
-struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);
+struct ManifestDependencies<'a>(crate::storage::StoredQueryDependencyView<'a>);
 
 struct ManifestViewColumns(crate::storage::ViewColumns);
 
@@ -12497,7 +12497,8 @@ fn parse_stored_query_dependencies(
             "too many stored-query dependencies",
         ));
     }
-    let mut dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+    let mut dependencies =
+        crate::storage::StoredQueryDependencies::with_recovery_limit(count.max(1));
     for _ in 0..count {
         let code: u8 = parse_field(words.next(), "stored-query dependency class")?;
         let class = crate::storage::DependencyClass::from_code(code).ok_or(
@@ -13059,7 +13060,7 @@ mod stored_dependency_tests {
                 referenced_columns: 0,
             })
             .unwrap();
-        let encoded = format!("{}", ManifestDependencies(&dependencies));
+        let encoded = format!("{}", ManifestDependencies(dependencies.view()));
         let mut words = encoded.split(' ');
         assert_eq!(
             parse_stored_query_dependencies(&mut words).unwrap(),

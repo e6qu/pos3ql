@@ -8945,10 +8945,11 @@ pub fn drop_owned(
     let has_policy_dependents =
         storage
             .policies_with_slots_visible_to(txn.txid)
-            .any(|(_, policy)| {
+            .any(|(slot, policy)| {
                 policy_depends_on_owned_selection(
                     storage,
                     txn.txid,
+                    slot,
                     policy,
                     &tables,
                     &views,
@@ -8992,6 +8993,7 @@ pub fn drop_owned(
                     && policy_depends_on_owned_selection(
                         storage,
                         txn.txid,
+                        slot,
                         policy,
                         &tables,
                         &views,
@@ -11567,7 +11569,7 @@ pub fn drop_schema(
                 {
                     continue;
                 }
-                let dependencies = &policy.definition_for(txn.txid).dependencies;
+                let dependencies = storage.policy_dependencies(policy_slot, txn.txid);
                 let direct_dependency = dependencies
                     .entries()
                     .iter()
@@ -11625,7 +11627,7 @@ pub fn drop_schema(
             {
                 continue;
             }
-            let dependencies = &policy.definition_for(txn.txid).dependencies;
+            let dependencies = storage.policy_dependencies(policy_slot, txn.txid);
             let direct_dependency = dependencies
                 .entries()
                 .iter()
@@ -26941,10 +26943,10 @@ fn policy_expression_source(
 fn validate_policy_definition(
     storage: &Storage,
     table: usize,
-    definition: &mut crate::storage::PolicyDefinition,
+    definition: &crate::storage::PolicyDefinition,
     txid: u32,
     arena: &Arena,
-) -> Result<(), SqlError> {
+) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
     use core::fmt::Write as _;
     let table_def = storage.table_def(table, txid);
     let mut sql = crate::util::StackStr::<2304>::new();
@@ -27004,17 +27006,17 @@ fn validate_policy_definition(
             ));
         }
     }
-    definition.dependencies =
+    let dependencies =
         super::query::stored_query_dependencies(sql, storage, txid, *storage.path(), arena)?;
     if storage.table_def(table, txid).persistence != crate::storage::RelationPersistence::Temporary
-        && stored_query_uses_temporary_relation(storage, &definition.dependencies, txid)
+        && stored_query_uses_temporary_relation(storage, dependencies.view(), txid)
     {
         return Err(sql_err!(
             sqlstate::INVALID_TABLE_DEFINITION,
             "permanent policies cannot reference temporary relations"
         ));
     }
-    Ok(())
+    Ok(dependencies)
 }
 
 fn policy_table(
@@ -27076,7 +27078,7 @@ pub fn create_policy(
             (crate::storage::PolicyCommandKind::Delete, using, None)
         }
     };
-    let mut definition = crate::storage::PolicyDefinition {
+    let definition = crate::storage::PolicyDefinition {
         roles,
         using: match policy_expression_source(using) {
             Ok(source) => source,
@@ -27086,12 +27088,12 @@ pub fn create_policy(
             Ok(source) => source,
             Err(error) => return sql_fail(error),
         },
-        dependencies: crate::storage::StoredQueryDependencies::EMPTY,
     };
-    if let Err(error) = validate_policy_definition(storage, table, &mut definition, txn.txid, arena)
-    {
-        return sql_fail(error);
-    }
+    let dependencies =
+        match validate_policy_definition(storage, table, &definition, txn.txid, arena) {
+            Ok(dependencies) => dependencies,
+            Err(error) => return sql_fail(error),
+        };
     let name = match SqlName::parse(policy.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -27107,6 +27109,7 @@ pub fn create_policy(
             ),
             definition,
         },
+        &dependencies,
         txn.txid,
     ) {
         Ok(slot) => slot,
@@ -27139,9 +27142,7 @@ pub fn create_policy(
                 role_count: definition.roles.entries().len(),
                 using: definition.using.as_ref().map(|source| source.as_str()),
                 with_check: definition.with_check.as_ref().map(|source| source.as_str()),
-                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                    &definition.dependencies,
-                ),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         )
     };
@@ -27211,11 +27212,12 @@ pub fn alter_policy(
             Err(error) => return sql_fail(error),
         };
     }
-    if let Err(error) = validate_policy_definition(storage, table, &mut definition, txn.txid, arena)
-    {
-        return sql_fail(error);
-    }
-    let prior = match storage.alter_policy(slot, definition, txn.txid) {
+    let dependencies =
+        match validate_policy_definition(storage, table, &definition, txn.txid, arena) {
+            Ok(dependencies) => dependencies,
+            Err(error) => return sql_fail(error),
+        };
+    let prior = match storage.alter_policy(slot, definition, &dependencies, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -27244,9 +27246,7 @@ pub fn alter_policy(
                 role_count: definition.roles.entries().len(),
                 using: definition.using.as_ref().map(|source| source.as_str()),
                 with_check: definition.with_check.as_ref().map(|source| source.as_str()),
-                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                    &definition.dependencies,
-                ),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         )
     };
@@ -32000,7 +32000,10 @@ pub fn create_routine(
             ));
         }
     }
-    let mut dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+    let mut dependencies = match storage.empty_stored_query_dependencies(arena) {
+        Ok(dependencies) => dependencies,
+        Err(error) => return sql_fail(error),
+    };
     let mut creation_path = StackStr::<128>::new();
     let _formal_scope = enter_routine_parameter_types(&arguments[..argument_count]);
     match kind {
@@ -32248,7 +32251,7 @@ pub fn create_routine(
             "search_path is too long to store with a routine"
         ));
     }
-    if stored_query_uses_temporary_relation(storage, &dependencies, txn.txid) {
+    if stored_query_uses_temporary_relation(storage, dependencies.view(), txn.txid) {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "routines depending on temporary relations are not supported"
@@ -32346,7 +32349,7 @@ pub fn create_routine(
                 creation_path,
                 dependency_slot: u32::MAX,
             };
-            let prior = match storage.replace_routine(slot, pending, dependencies) {
+            let prior = match storage.replace_routine(slot, pending, dependencies.view()) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -33135,7 +33138,7 @@ pub fn create_aggregate(
             let prior = match storage.replace_routine(
                 slot,
                 pending,
-                crate::storage::StoredQueryDependencies::EMPTY,
+                crate::storage::StoredQueryDependencies::EMPTY.view(),
             ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
@@ -34329,8 +34332,7 @@ pub fn alter_routine(
             creation_path: routine.creation_path,
             dependency_slot: u32::MAX,
         };
-        let dependencies = *storage.routine_dependencies_for(slot, txn.txid);
-        let prior = match storage.replace_routine(slot, pending, dependencies) {
+        let prior = match storage.replace_routine_preserving_dependencies(slot, pending) {
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
@@ -35115,7 +35117,8 @@ pub fn create_view(
         Ok(dependencies) => dependencies,
         Err(error) => return sql_fail(error),
     };
-    let inferred_temporary = stored_query_uses_temporary_relation(storage, &dependencies, txn.txid);
+    let inferred_temporary =
+        stored_query_uses_temporary_relation(storage, dependencies.view(), txn.txid);
     let persistence = match (requested_persistence, inferred_temporary) {
         (super::ast::RelationPersistence::Unlogged, _) => {
             return sql_fail(sql_err!(
@@ -35320,7 +35323,7 @@ pub fn create_view(
                             super::ast::ViewCheckOption::Cascaded => 2,
                         }),
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                            &dependencies,
+                            storage.view_dependencies(new_slot),
                         ),
                     },
                 )
@@ -35374,7 +35377,7 @@ pub fn create_view(
 
 fn stored_query_uses_temporary_relation(
     storage: &Storage,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     txid: u32,
 ) -> bool {
     dependencies
@@ -35920,12 +35923,16 @@ fn rewrite_view_column_dependents(
         {
             continue;
         }
-        let dependencies = *storage.view_dependencies(view_slot);
-        let references_column = dependencies.entries().iter().any(|dependency| {
-            dependency.class == crate::storage::DependencyClass::View
-                && usize::from(dependency.slot) == source_view
-                && dependency.referenced_columns & (1u64 << source_column) != 0
-        });
+        let references_column =
+            storage
+                .view_dependencies(view_slot)
+                .entries()
+                .iter()
+                .any(|dependency| {
+                    dependency.class == crate::storage::DependencyClass::View
+                        && usize::from(dependency.slot) == source_view
+                        && dependency.referenced_columns & (1u64 << source_column) != 0
+                });
         if !references_column {
             continue;
         }
@@ -35950,7 +35957,7 @@ fn rewrite_view_column_dependents(
             path,
             arena,
         )?;
-        if rebound != dependencies {
+        if rebound.entries() != storage.view_dependencies(view_slot).entries() {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "view column rename would change a dependent view binding"
@@ -35967,7 +35974,7 @@ fn rewrite_view_column_dependents(
                 query: crate::storage::StoredQueryDefinition {
                     sql: rewritten,
                     creation_path,
-                    dependencies,
+                    dependencies: rebound,
                 },
                 options: crate::storage::ViewOptions {
                     ..view.options_for(txn.txid)
@@ -35997,7 +36004,9 @@ fn rewrite_view_column_dependents(
                     check_option: view
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
-                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                        storage.view_dependencies(new_slot),
+                    ),
                 },
             )
         };
@@ -36181,7 +36190,13 @@ fn stored_rule_definition(
     target: crate::storage::RuleTarget,
     raw_path: &str,
     arena: &Arena,
-) -> Result<crate::storage::RuleDefinition, SqlError> {
+) -> Result<
+    (
+        crate::storage::RuleDefinition,
+        crate::storage::StoredQueryDependencies,
+    ),
+    SqlError,
+> {
     use core::fmt::Write;
     let event = match rule.event {
         crate::sql::ast::RuleEvent::Select => crate::storage::RewriteEvent::Select,
@@ -36467,7 +36482,7 @@ fn stored_rule_definition(
         &condition_columns,
     )?;
     if !storage.access_object_is_temporary(target.access_object(), txn.txid)
-        && stored_query_uses_temporary_relation(storage, &dependencies, txn.txid)
+        && stored_query_uses_temporary_relation(storage, dependencies.view(), txn.txid)
     {
         return Err(sql_err!(
             sqlstate::INVALID_TABLE_DEFINITION,
@@ -36481,7 +36496,7 @@ fn stored_rule_definition(
             storage,
             txn.txid,
             path,
-            &dependencies,
+            dependencies.view(),
             arena,
             crate::sql::eval::NO_PARAMS,
             None,
@@ -36493,20 +36508,22 @@ fn stored_rule_definition(
             condition_columns.new,
         )?;
     }
-    Ok(crate::storage::RuleDefinition {
-        name: SqlName::parse(rule.name)?,
-        target,
-        event,
-        mode,
-        enabled: crate::storage::RuleEnabled::Origin,
-        source,
-        condition,
-        actions,
-        action_count: rule.actions.len() as u8,
-        returning_action,
-        creation_path,
+    Ok((
+        crate::storage::RuleDefinition {
+            name: SqlName::parse(rule.name)?,
+            target,
+            event,
+            mode,
+            enabled: crate::storage::RuleEnabled::Origin,
+            source,
+            condition,
+            actions,
+            action_count: rule.actions.len() as u8,
+            returning_action,
+            creation_path,
+        },
         dependencies,
-    })
+    ))
 }
 
 pub fn create_rule(
@@ -36525,15 +36542,17 @@ pub fn create_rule(
     if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
         return sql_fail(error);
     }
-    let definition = match stored_rule_definition(storage, txn, rule, target, raw_path, arena) {
-        Ok(definition) => definition,
-        Err(error) => return sql_fail(error),
-    };
+    let (definition, dependencies) =
+        match stored_rule_definition(storage, txn, rule, target, raw_path, arena) {
+            Ok(definition) => definition,
+            Err(error) => return sql_fail(error),
+        };
     let existing = storage.rule_slot(target, rule.name, txn.txid);
-    let (slot, prior) = match storage.create_rule(definition, rule.or_replace, txn.txid) {
-        Ok(created) => created,
-        Err(error) => return sql_fail(error),
-    };
+    let (slot, prior) =
+        match storage.create_rule(definition, dependencies.view(), rule.or_replace, txn.txid) {
+            Ok(created) => created,
+            Err(error) => return sql_fail(error),
+        };
     let prior_table_rule_txid = existing
         .is_none()
         .then(|| storage.begin_rule_history(target, txn.txid))
@@ -36809,7 +36828,7 @@ fn stage_rule(
             returning_action: definition.returning_action,
             path: definition.creation_path.as_str(),
             dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                &definition.dependencies,
+                storage.rule_dependencies(slot, txn.txid),
             ),
         },
     )?;
@@ -37947,7 +37966,7 @@ pub fn create_table_as(
                 Ok(dependencies) => dependencies,
                 Err(error) => return sql_fail(error),
             };
-        if stored_query_uses_temporary_relation(storage, &dependencies, txn.txid) {
+        if stored_query_uses_temporary_relation(storage, dependencies.view(), txn.txid) {
             return sql_fail(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "materialized views must not use temporary tables or views"
@@ -38227,7 +38246,7 @@ pub fn create_table_as(
                         sql,
                         path: raw_path,
                         dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                            &dependencies,
+                            storage.matview_dependencies(slot),
                         ),
                         populated: with_data,
                     },
@@ -42222,10 +42241,11 @@ fn apply_type_drop_to_stored_queries(
     } = stored_query_dependent_closure(storage, txn.txid, root)?;
     let has_policies = storage
         .policies_with_slots_visible_to(txn.txid)
-        .any(|(_, policy)| {
+        .any(|(slot, policy)| {
             policy_depends_on_type_selection(
                 storage,
                 txn.txid,
+                slot,
                 policy,
                 selected_domains,
                 selected_enum,
@@ -42256,6 +42276,7 @@ fn apply_type_drop_to_stored_queries(
                 && policy_depends_on_type_selection(
                     storage,
                     txn.txid,
+                    slot,
                     policy,
                     selected_domains,
                     selected_enum,
@@ -42284,7 +42305,8 @@ fn apply_type_drop_to_stored_queries(
 fn policy_depends_on_type_selection(
     storage: &Storage,
     txid: u32,
-    policy: &crate::storage::PolicyDef,
+    slot: usize,
+    _policy: &crate::storage::PolicyDef,
     selected_domains: &[bool],
     selected_enum: Option<usize>,
     selected_composite: Option<usize>,
@@ -42292,7 +42314,7 @@ fn policy_depends_on_type_selection(
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> bool {
-    let dependencies = &policy.definition_for(txid).dependencies;
+    let dependencies = storage.policy_dependencies(slot, txid);
     dependencies.entries().iter().any(|dependency| {
         use crate::storage::DependencyClass;
         match dependency.class {
@@ -42430,15 +42452,19 @@ fn stored_query_dependent_closure(
             if rules[slot] {
                 continue;
             }
-            let hit = definition.dependencies.entries().iter().any(|dependency| {
-                root(dependency)
-                    || (dependency.class == DependencyClass::View
-                        && views[dependency.slot as usize])
-                    || (dependency.class == DependencyClass::Table
-                        && selected_matview_owns_table(&matviews, dependency.slot as usize))
-                    || (dependency.class == DependencyClass::Routine
-                        && routines[dependency.slot as usize])
-            });
+            let hit = storage
+                .rule_dependencies(slot, txid)
+                .entries()
+                .iter()
+                .any(|dependency| {
+                    root(dependency)
+                        || (dependency.class == DependencyClass::View
+                            && views[dependency.slot as usize])
+                        || (dependency.class == DependencyClass::Table
+                            && selected_matview_owns_table(&matviews, dependency.slot as usize))
+                        || (dependency.class == DependencyClass::Routine
+                            && routines[dependency.slot as usize])
+                });
             if hit {
                 rules[slot] = true;
                 changed = true;
@@ -42494,7 +42520,7 @@ fn dependency_references_table_column(
 fn policy_depends_on_selected_stored_query(
     storage: &Storage,
     txid: u32,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
@@ -42528,6 +42554,7 @@ fn policy_depends_on_selected_stored_query(
 fn policy_depends_on_owned_selection(
     storage: &Storage,
     txid: u32,
+    slot: usize,
     policy: &crate::storage::PolicyDef,
     tables: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
@@ -42549,9 +42576,8 @@ fn policy_depends_on_owned_selection(
     {
         return false;
     }
-    policy
-        .definition_for(txid)
-        .dependencies
+    storage
+        .policy_dependencies(slot, txid)
         .entries()
         .iter()
         .any(|dependency| {
@@ -42576,16 +42602,21 @@ fn policy_depends_on_owned_selection(
         || policy_depends_on_selected_stored_query(
             storage,
             txid,
-            &policy.definition_for(txid).dependencies,
+            storage.policy_dependencies(slot, txid),
             dependent_views,
             dependent_matviews,
             dependent_routines,
         )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "policy dependency selection carries the bounded closure for each stored-query class"
+)]
 fn policy_depends_on_dependency_drop(
     storage: &Storage,
     txid: u32,
+    policy_slot: usize,
     policy: &crate::storage::PolicyDef,
     root: PolicyDependencySelection,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
@@ -42601,7 +42632,7 @@ fn policy_depends_on_dependency_drop(
     ) {
         return false;
     }
-    let dependencies = &policy.definition_for(txid).dependencies;
+    let dependencies = storage.policy_dependencies(policy_slot, txid);
     dependencies.entries().iter().any(|dependency| match root {
         PolicyDependencySelection::Catalog { class, slot } => {
             dependency.class == class && usize::from(dependency.slot) == slot
@@ -42629,9 +42660,9 @@ fn policy_dependents_exist(
 ) -> bool {
     storage
         .policies_with_slots_visible_to(txid)
-        .any(|(_, policy)| {
+        .any(|(slot, policy)| {
             policy_depends_on_dependency_drop(
-                storage, txid, policy, root, views, matviews, routines,
+                storage, txid, slot, policy, root, views, matviews, routines,
             )
         })
 }
@@ -42650,7 +42681,7 @@ fn drop_policy_dependents(
             let policy = storage.policy(slot);
             policy.visible_to(txn.txid)
                 && policy_depends_on_dependency_drop(
-                    storage, txn.txid, policy, root, views, matviews, routines,
+                    storage, txn.txid, slot, policy, root, views, matviews, routines,
                 )
         };
         if selected {
@@ -43062,11 +43093,12 @@ fn report_stored_query_dependents(
     let matviews = selection.matviews;
     let routines = selection.routines;
     let rules = selection.rules;
-    let policy_selected = |policy: &crate::storage::PolicyDef| {
+    let policy_selected = |slot: usize, policy: &crate::storage::PolicyDef| {
         selection.policy_root.is_some_and(|root| {
             policy_depends_on_dependency_drop(
                 storage,
                 txid,
+                slot,
                 policy,
                 root,
                 views,
@@ -43081,7 +43113,7 @@ fn report_stored_query_dependents(
         + rules.iter().filter(|selected| **selected).count()
         + storage
             .policies_with_slots_visible_to(txid)
-            .filter(|(_, policy)| policy_selected(policy))
+            .filter(|(slot, policy)| policy_selected(*slot, policy))
             .count();
     if count == 0 {
         return Ok(());
@@ -43307,7 +43339,7 @@ fn report_stored_query_dependents(
     }
     for (_, policy) in storage
         .policies_with_slots_visible_to(txid)
-        .filter(|(_, policy)| policy_selected(policy))
+        .filter(|(slot, policy)| policy_selected(*slot, policy))
     {
         let table = storage.table_def(usize::from(policy.table), txid);
         let _ = write!(
@@ -44558,8 +44590,9 @@ fn rewrite_table_policy_column_references(
                 .transpose()?;
             shape = renamed;
         }
-        validate_policy_definition(storage, table, &mut definition, txn.txid, arena)?;
-        let prior = storage.alter_policy(slot, definition, txn.txid)?;
+        let dependencies =
+            validate_policy_definition(storage, table, &definition, txn.txid, arena)?;
+        let prior = storage.alter_policy(slot, definition, &dependencies, txn.txid)?;
         let table_definition = storage.table_def(table, txn.txid);
         let table_schema = table_definition.schema;
         let table_name = table_definition.name;
@@ -44578,9 +44611,7 @@ fn rewrite_table_policy_column_references(
                 role_count: definition.roles.entries().len(),
                 using: definition.using.as_ref().map(|source| source.as_str()),
                 with_check: definition.with_check.as_ref().map(|source| source.as_str()),
-                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
-                    &definition.dependencies,
-                ),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         ) {
             storage.rollback_policy_alter(slot, prior);
@@ -45200,7 +45231,6 @@ fn rewrite_composite_dependent_views(
             continue;
         }
         let view = storage.view(view_slot).clone();
-        let dependencies = *storage.view_dependencies(view_slot);
         let view_sql =
             StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(storage.view_sql(view_slot));
         let creation_path = StackStr::<128>::from_str(storage.view_creation_path(view_slot));
@@ -45210,7 +45240,7 @@ fn rewrite_composite_dependent_views(
         let site_count = super::query::stored_query_composite_field_rename_sites(
             view_sql.as_str(),
             path,
-            &dependencies,
+            storage.view_dependencies(view_slot),
             &super::query::StoredQueryCompositeFieldRename {
                 storage,
                 txid: txn.txid,
@@ -45276,7 +45306,9 @@ fn rewrite_composite_dependent_views(
                     check_option: view
                         .check_option_for(txn.txid)
                         .map_or(0, |option| option.code()),
-                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                        storage.view_dependencies(new_slot),
+                    ),
                 },
             )
         };

@@ -3667,9 +3667,11 @@ fn pending_extended_statistics_capacity(config: &Config) -> usize {
         )
 }
 
-fn pending_routine_dependency_capacity(config: &Config) -> usize {
+fn pending_stored_query_dependency_capacity(config: &Config) -> usize {
     config
-        .max_routines
+        .max_rules
+        .saturating_add(config.max_policies)
+        .saturating_add(config.max_routines)
         .saturating_mul(config.max_catalog_versions_per_object)
         .min(catalog_transaction_capacity(config).saturating_mul(config.max_ddl_per_transaction))
 }
@@ -3760,7 +3762,9 @@ pub(crate) const VIEW_SQL_MAX: usize = 2048;
 pub(crate) const RULE_SQL_MAX: usize = VIEW_SQL_MAX;
 pub(crate) const MAX_RULE_ACTIONS: usize = crate::sql::parser::MAX_LIST;
 
-pub(crate) const MAX_STORED_QUERY_DEPENDENCIES: usize = 64;
+/// Durable stored-query dependency counts use one byte. Runtime configuration
+/// may reserve any smaller per-image capacity.
+pub(crate) const MAX_STORED_QUERY_DEPENDENCIES: usize = u8::MAX as usize;
 
 /// Sequence relation OIDs occupy `[95_000, 100_000)`, immediately below the
 /// view relation range. The startup parser rejects capacities beyond it.
@@ -3875,39 +3879,189 @@ impl StoredQueryDependency {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredQueryDependencies {
-    entries: [StoredQueryDependency; MAX_STORED_QUERY_DEPENDENCIES],
-    len: u8,
+const INLINE_STORED_QUERY_DEPENDENCIES: usize = 64;
+
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Inline storage avoids runtime heap allocation.
+enum StoredQueryDependencyEntries {
+    Inline([StoredQueryDependency; INLINE_STORED_QUERY_DEPENDENCIES]),
+    Arena {
+        entries: core::ptr::NonNull<StoredQueryDependency>,
+        capacity: u8,
+    },
+    Owned(Box<[StoredQueryDependency]>),
 }
+
+#[derive(Debug)]
+pub struct StoredQueryDependencies {
+    entries: StoredQueryDependencyEntries,
+    len: u8,
+    limit: u8,
+}
+
+impl Clone for StoredQueryDependencies {
+    fn clone(&self) -> Self {
+        let entries = match &self.entries {
+            StoredQueryDependencyEntries::Inline(entries) => {
+                StoredQueryDependencyEntries::Inline(*entries)
+            }
+            StoredQueryDependencyEntries::Arena { entries, capacity } => {
+                StoredQueryDependencyEntries::Arena {
+                    entries: *entries,
+                    capacity: *capacity,
+                }
+            }
+            StoredQueryDependencyEntries::Owned(entries) => {
+                StoredQueryDependencyEntries::Owned(entries.clone())
+            }
+        };
+        Self {
+            entries,
+            len: self.len,
+            limit: self.limit,
+        }
+    }
+}
+
+impl PartialEq for StoredQueryDependencies {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries() == other.entries()
+    }
+}
+
+impl Eq for StoredQueryDependencies {}
 
 #[derive(Debug, Clone, Copy)]
-struct PendingRoutineDependencies {
+struct PendingStoredQueryDependencies {
     used: bool,
-    txid: u32,
-    routine: u16,
+    owner: StoredQueryDependencyOwner,
+    previous: Option<u32>,
     depth: u32,
-    dependencies: StoredQueryDependencies,
+    count: u8,
 }
 
-impl PendingRoutineDependencies {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredQueryDependencyOwner {
+    Rule(u16),
+    Policy(u16),
+    Routine(u16),
+}
+
+impl PendingStoredQueryDependencies {
     const EMPTY: Self = Self {
         used: false,
-        txid: 0,
-        routine: u16::MAX,
+        owner: StoredQueryDependencyOwner::Rule(u16::MAX),
+        previous: None,
         depth: 0,
-        dependencies: StoredQueryDependencies::EMPTY,
+        count: 0,
     };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoredQueryDependencyView<'a> {
+    entries: &'a [StoredQueryDependency],
+}
+
+impl<'a> StoredQueryDependencyView<'a> {
+    pub(crate) const fn new(entries: &'a [StoredQueryDependency]) -> Self {
+        Self { entries }
+    }
+
+    pub(crate) fn entries(self) -> &'a [StoredQueryDependency] {
+        self.entries
+    }
 }
 
 impl StoredQueryDependencies {
     pub(crate) const EMPTY: Self = Self {
-        entries: [StoredQueryDependency::EMPTY; MAX_STORED_QUERY_DEPENDENCIES],
+        entries: StoredQueryDependencyEntries::Inline(
+            [StoredQueryDependency::EMPTY; INLINE_STORED_QUERY_DEPENDENCIES],
+        ),
         len: 0,
+        limit: INLINE_STORED_QUERY_DEPENDENCIES as u8,
     };
 
+    /// Recovery-only constructor. Runtime capture uses statement-arena storage.
+    pub(crate) fn with_recovery_limit(limit: usize) -> Self {
+        debug_assert!((1..=MAX_STORED_QUERY_DEPENDENCIES).contains(&limit));
+        if limit <= INLINE_STORED_QUERY_DEPENDENCIES {
+            return Self {
+                limit: limit as u8,
+                ..Self::EMPTY
+            };
+        }
+        Self {
+            entries: StoredQueryDependencyEntries::Owned(
+                vec![StoredQueryDependency::EMPTY; limit].into_boxed_slice(),
+            ),
+            len: 0,
+            limit: limit as u8,
+        }
+    }
+
+    pub(crate) fn with_arena_limit(
+        limit: usize,
+        arena: &crate::mem::arena::Arena,
+    ) -> Result<Self, crate::mem::arena::ArenaFull> {
+        debug_assert!((1..=MAX_STORED_QUERY_DEPENDENCIES).contains(&limit));
+        if limit <= INLINE_STORED_QUERY_DEPENDENCIES {
+            return Ok(Self {
+                limit: limit as u8,
+                ..Self::EMPTY
+            });
+        }
+        let entries = arena.alloc_slice_with(limit, |_| StoredQueryDependency::EMPTY)?;
+        Ok(Self {
+            entries: StoredQueryDependencyEntries::Arena {
+                entries: core::ptr::NonNull::new(entries.as_mut_ptr())
+                    .expect("a nonempty arena slice has a pointer"),
+                capacity: limit as u8,
+            },
+            len: 0,
+            limit: limit as u8,
+        })
+    }
+
+    pub(crate) fn view(&self) -> StoredQueryDependencyView<'_> {
+        StoredQueryDependencyView::new(self.entries())
+    }
+
+    /// Recovery-only copy used before the runtime allocation freeze.
+    pub(crate) fn from_recovery_view(view: StoredQueryDependencyView<'_>, limit: usize) -> Self {
+        debug_assert!(view.entries().len() <= limit);
+        let mut dependencies = Self::with_recovery_limit(limit);
+        dependencies.entry_storage_mut()[..view.entries().len()].copy_from_slice(view.entries());
+        dependencies.len = view.entries().len() as u8;
+        dependencies
+    }
+
     pub fn entries(&self) -> &[StoredQueryDependency] {
-        &self.entries[..self.len as usize]
+        &self.entry_storage()[..self.len as usize]
+    }
+
+    fn entry_storage(&self) -> &[StoredQueryDependency] {
+        match &self.entries {
+            StoredQueryDependencyEntries::Inline(entries) => entries,
+            StoredQueryDependencyEntries::Arena { entries, capacity } => unsafe {
+                // SAFETY: `with_arena_limit` obtains this pointer from one allocation of
+                // `capacity` initialized entries. Statement-arena-backed lists are consumed
+                // before that arena is reset, and mutation is confined to capture.
+                core::slice::from_raw_parts(entries.as_ptr(), usize::from(*capacity))
+            },
+            StoredQueryDependencyEntries::Owned(entries) => entries,
+        }
+    }
+
+    fn entry_storage_mut(&mut self) -> &mut [StoredQueryDependency] {
+        match &mut self.entries {
+            StoredQueryDependencyEntries::Inline(entries) => entries,
+            StoredQueryDependencyEntries::Arena { entries, capacity } => unsafe {
+                // SAFETY: as above; callers mutate only the uniquely captured list before
+                // exposing a view or moving it into a catalog operation.
+                core::slice::from_raw_parts_mut(entries.as_ptr(), usize::from(*capacity))
+            },
+            StoredQueryDependencyEntries::Owned(entries) => entries,
+        }
     }
 
     pub fn push(&mut self, dependency: StoredQueryDependency) -> Result<(), SqlError> {
@@ -3927,14 +4081,15 @@ impl StoredQueryDependencies {
         }) {
             return Ok(());
         }
-        if self.len as usize == MAX_STORED_QUERY_DEPENDENCIES {
+        if self.len == self.limit {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "stored query depends on more than {} catalog objects",
-                MAX_STORED_QUERY_DEPENDENCIES
+                self.limit
             ));
         }
-        self.entries[self.len as usize] = dependency;
+        let len = usize::from(self.len);
+        self.entry_storage_mut()[len] = dependency;
         self.len += 1;
         Ok(())
     }
@@ -3957,10 +4112,11 @@ impl StoredQueryDependencies {
                 "stored query references a column beyond the static attribute bound"
             )
         })?;
+        let len = usize::from(self.len);
         let dependency = self
-            .entries
+            .entry_storage_mut()
             .iter_mut()
-            .take(self.len as usize)
+            .take(len)
             .find(|entry| entry.class == class && entry.slot as usize == slot)
             .ok_or_else(|| {
                 sql_err!(
@@ -3984,14 +4140,15 @@ impl StoredQueryDependencies {
                 "stored-query dependency has an invalid catalog identity"
             ));
         }
-        if self.len as usize == MAX_STORED_QUERY_DEPENDENCIES {
+        if self.len == self.limit {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "stored query depends on more than {} catalog objects",
-                MAX_STORED_QUERY_DEPENDENCIES
+                self.limit
             ));
         }
-        self.entries[self.len as usize] = StoredQueryDependency {
+        let len = usize::from(self.len);
+        self.entry_storage_mut()[len] = StoredQueryDependency {
             class: dependency.class,
             slot: u16::MAX,
             identity: dependency.identity,
@@ -4013,13 +4170,15 @@ impl StoredQueryDependencies {
         schema: SqlName,
         name: SqlName,
     ) {
-        for entry in &mut self.entries[..self.len as usize] {
-            if entry.class == class && entry.slot as usize == old_slot {
-                entry.slot = new_slot as u16;
-                entry.schema = schema;
-                entry.name = name;
-            }
-        }
+        let len = usize::from(self.len);
+        replace_dependency_slot(
+            &mut self.entry_storage_mut()[..len],
+            class,
+            old_slot,
+            new_slot,
+            schema,
+            name,
+        );
     }
 
     pub fn rename(
@@ -4030,29 +4189,63 @@ impl StoredQueryDependencies {
         schema: SqlName,
         name: SqlName,
     ) {
-        for entry in &mut self.entries[..self.len as usize] {
-            let serialized_match = entry.slot == u16::MAX
-                && old_identity.is_some_and(|(old_schema, old_name)| {
-                    entry.schema == old_schema && entry.name == old_name
-                });
-            if entry.class == class && (entry.slot as usize == slot || serialized_match) {
-                entry.slot = slot as u16;
-                entry.schema = schema;
-                entry.name = name;
-            }
+        let len = usize::from(self.len);
+        rename_dependency(
+            &mut self.entry_storage_mut()[..len],
+            class,
+            slot,
+            old_identity,
+            schema,
+            name,
+        );
+    }
+}
+
+fn replace_dependency_slot(
+    entries: &mut [StoredQueryDependency],
+    class: DependencyClass,
+    old_slot: usize,
+    new_slot: usize,
+    schema: SqlName,
+    name: SqlName,
+) {
+    for entry in entries {
+        if entry.class == class && usize::from(entry.slot) == old_slot {
+            entry.slot = new_slot as u16;
+            entry.schema = schema;
+            entry.name = name;
         }
     }
+}
 
-    /// Namespace identity is part of both sides of a captured dependency:
-    /// the stored object may have moved, and so may the object it references.
-    pub(crate) fn rename_schema(&mut self, old: SqlName, new: SqlName) {
-        for entry in &mut self.entries[..self.len as usize] {
-            if entry.schema == old {
-                entry.schema = new;
-            }
-            if entry.referenced_schema == old {
-                entry.referenced_schema = new;
-            }
+fn rename_dependency(
+    entries: &mut [StoredQueryDependency],
+    class: DependencyClass,
+    slot: usize,
+    old_identity: Option<(SqlName, SqlName)>,
+    schema: SqlName,
+    name: SqlName,
+) {
+    for entry in entries {
+        let serialized_match = entry.slot == u16::MAX
+            && old_identity.is_some_and(|(old_schema, old_name)| {
+                entry.schema == old_schema && entry.name == old_name
+            });
+        if entry.class == class && (usize::from(entry.slot) == slot || serialized_match) {
+            entry.slot = slot as u16;
+            entry.schema = schema;
+            entry.name = name;
+        }
+    }
+}
+
+fn rename_dependency_schema(entries: &mut [StoredQueryDependency], old: SqlName, new: SqlName) {
+    for entry in entries {
+        if entry.schema == old {
+            entry.schema = new;
+        }
+        if entry.referenced_schema == old {
+            entry.referenced_schema = new;
         }
     }
 }
@@ -4203,7 +4396,6 @@ pub(crate) struct RuleDefinition {
     /// rediscover PostgreSQL's one-returning-rule invariant from SQL text.
     pub returning_action: Option<u8>,
     pub creation_path: StackStr<128>,
-    pub dependencies: StoredQueryDependencies,
 }
 
 impl RuleDefinition {
@@ -4219,7 +4411,6 @@ impl RuleDefinition {
         action_count: 0,
         returning_action: None,
         creation_path: StackStr::new(),
-        dependencies: StoredQueryDependencies::EMPTY,
     };
 
     pub(crate) fn condition_sql(&self) -> Option<&str> {
@@ -4246,6 +4437,7 @@ impl RuleDefinition {
 pub(crate) struct PendingRuleDefinition {
     pub txid: u32,
     pub definition: RuleDefinition,
+    dependency_slot: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6477,7 +6669,7 @@ impl OperatorClassDef {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct RoutineSpec {
     pub identity: RoutineIdentity,
     pub schema: SqlName,
@@ -7913,13 +8105,13 @@ pub(crate) struct PolicyDefinition {
     pub(crate) roles: PolicyRoles,
     pub(crate) using: Option<StackStr<POLICY_EXPRESSION_MAX>>,
     pub(crate) with_check: Option<StackStr<POLICY_EXPRESSION_MAX>>,
-    pub(crate) dependencies: StoredQueryDependencies,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingPolicyDefinition {
     pub(crate) txid: u32,
     pub(crate) definition: PolicyDefinition,
+    dependency_slot: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7947,7 +8139,6 @@ impl PolicyDef {
             roles: PolicyRoles::PUBLIC,
             using: None,
             with_check: None,
-            dependencies: StoredQueryDependencies::EMPTY,
         },
         pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
@@ -11255,8 +11446,11 @@ pub struct Storage {
     conversions: FixedVec<ConversionDef>,
     text_search_objects: FixedVec<TextSearchDef>,
     event_triggers: FixedVec<EventTriggerDef>,
-    routine_dependencies: FixedVec<StoredQueryDependencies>,
-    pending_routine_dependencies: FixedVec<PendingRoutineDependencies>,
+    stored_query_dependencies: FixedVec<StoredQueryDependency>,
+    stored_query_dependency_counts: FixedVec<u8>,
+    stored_query_dependencies_per_image: usize,
+    pending_stored_query_dependencies: FixedVec<PendingStoredQueryDependencies>,
+    stored_query_dependency_pending_base: usize,
     triggers: FixedVec<TriggerDef>,
     partition_trigger_states: FixedVec<PartitionTriggerState>,
     policies: FixedVec<PolicyDef>,
@@ -11271,7 +11465,6 @@ pub struct Storage {
     foreign_statement_context: RefCell<ForeignStatementContext>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
-    matview_dependencies: FixedVec<StoredQueryDependencies>,
     sequences: FixedVec<SequenceDef>,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
@@ -11895,18 +12088,26 @@ impl core::ops::DerefMut for RelationBlockStore<'_> {
 }
 
 #[inline(never)]
-fn stored_query_dependency_slots(
-    budget: &mut Budget,
-    name: &'static str,
-    count: usize,
-) -> Result<FixedVec<StoredQueryDependencies>, BudgetError> {
-    let mut slots = FixedVec::new(budget, name, count)?;
-    for _ in 0..count {
-        slots
-            .push(StoredQueryDependencies::EMPTY)
-            .expect("sized to catalog slots");
-    }
-    Ok(slots)
+fn stored_query_dependency_image_capacity(config: &Config) -> usize {
+    config
+        .max_rules
+        .saturating_add(config.max_policies)
+        .saturating_add(config.max_routines)
+        .saturating_add(config.max_materialized_views)
+        .saturating_add(pending_stored_query_dependency_capacity(config))
+}
+
+pub(crate) fn stored_query_dependency_budget_bytes(config: &Config) -> usize {
+    stored_query_dependency_image_capacity(config)
+        .saturating_mul(config.max_stored_query_dependencies_per_object)
+        .saturating_mul(size_of::<StoredQueryDependency>())
+        + (config.max_rules
+            + config.max_policies
+            + config.max_routines
+            + config.max_materialized_views)
+            * size_of::<u8>()
+        + pending_stored_query_dependency_capacity(config)
+            * size_of::<PendingStoredQueryDependencies>()
 }
 
 fn rename_schema_name(value: &mut SqlName, old: SqlName, new: SqlName) {
@@ -14096,87 +14297,357 @@ impl Storage {
         self.foreign.rollback_owner(class, slot, prior);
     }
 
+    pub(crate) fn empty_stored_query_dependencies(
+        &self,
+        arena: &crate::mem::arena::Arena,
+    ) -> Result<StoredQueryDependencies, SqlError> {
+        StoredQueryDependencies::with_arena_limit(self.stored_query_dependencies_per_image, arena)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::OUT_OF_MEMORY,
+                    "SQL statement arena is full while capturing stored-query dependencies"
+                )
+            })
+    }
+
+    fn committed_dependency_image(&self, owner: StoredQueryDependencyOwner) -> usize {
+        match owner {
+            StoredQueryDependencyOwner::Rule(slot) => usize::from(slot),
+            StoredQueryDependencyOwner::Policy(slot) => self.rules.len() + usize::from(slot),
+            StoredQueryDependencyOwner::Routine(slot) => {
+                self.rules.len() + self.policies.len() + usize::from(slot)
+            }
+        }
+    }
+
+    fn matview_dependency_image(&self, slot: usize) -> usize {
+        self.rules.len() + self.policies.len() + self.routines.len() + slot
+    }
+
+    fn dependency_image(&self, image: usize, count: u8) -> StoredQueryDependencyView<'_> {
+        let start = image * self.stored_query_dependencies_per_image;
+        StoredQueryDependencyView::new(
+            &self.stored_query_dependencies[start..start + usize::from(count)],
+        )
+    }
+
+    fn dependency_image_mut(&mut self, image: usize, count: u8) -> &mut [StoredQueryDependency] {
+        let start = image * self.stored_query_dependencies_per_image;
+        &mut self.stored_query_dependencies[start..start + usize::from(count)]
+    }
+
+    fn committed_dependencies_mut(
+        &mut self,
+        owner: StoredQueryDependencyOwner,
+    ) -> &mut [StoredQueryDependency] {
+        let image = self.committed_dependency_image(owner);
+        self.dependency_image_mut(image, self.stored_query_dependency_counts[image])
+    }
+
+    fn write_dependency_image(
+        &mut self,
+        image: usize,
+        dependencies: StoredQueryDependencyView<'_>,
+    ) -> Result<u8, SqlError> {
+        if dependencies.entries().len() > self.stored_query_dependencies_per_image {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query depends on more than {} catalog objects",
+                self.stored_query_dependencies_per_image
+            ));
+        }
+        let start = image * self.stored_query_dependencies_per_image;
+        let target = &mut self.stored_query_dependencies
+            [start..start + self.stored_query_dependencies_per_image];
+        target.fill(StoredQueryDependency::EMPTY);
+        target[..dependencies.entries().len()].copy_from_slice(dependencies.entries());
+        Ok(dependencies.entries().len() as u8)
+    }
+
+    fn write_committed_dependencies(
+        &mut self,
+        owner: StoredQueryDependencyOwner,
+        dependencies: StoredQueryDependencyView<'_>,
+    ) -> Result<(), SqlError> {
+        let image = self.committed_dependency_image(owner);
+        let count = self.write_dependency_image(image, dependencies)?;
+        self.stored_query_dependency_counts[image] = count;
+        Ok(())
+    }
+
+    fn clear_committed_dependencies(&mut self, owner: StoredQueryDependencyOwner) {
+        let image = self.committed_dependency_image(owner);
+        self.stored_query_dependency_counts[image] = 0;
+    }
+
+    fn copy_dependency_image(&mut self, source_image: usize, target_image: usize) {
+        let count = self.stored_query_dependency_counts[source_image];
+        let source = source_image * self.stored_query_dependencies_per_image;
+        let target = target_image * self.stored_query_dependencies_per_image;
+        self.stored_query_dependencies
+            .copy_within(source..source + usize::from(count), target);
+        self.stored_query_dependency_counts[target_image] = count;
+    }
+
+    fn copy_committed_dependencies(
+        &mut self,
+        source: StoredQueryDependencyOwner,
+        target: StoredQueryDependencyOwner,
+    ) {
+        self.copy_dependency_image(
+            self.committed_dependency_image(source),
+            self.committed_dependency_image(target),
+        );
+    }
+
+    fn committed_dependencies(
+        &self,
+        owner: StoredQueryDependencyOwner,
+    ) -> StoredQueryDependencyView<'_> {
+        let image = self.committed_dependency_image(owner);
+        self.dependency_image(image, self.stored_query_dependency_counts[image])
+    }
+
+    fn allocate_pending_stored_query_dependencies(
+        &mut self,
+        owner: StoredQueryDependencyOwner,
+        _txid: u32,
+        previous: Option<u32>,
+        dependencies: StoredQueryDependencyView<'_>,
+    ) -> Result<u32, SqlError> {
+        if previous.is_some_and(|slot| {
+            self.pending_stored_query_dependencies[slot as usize].depth
+                >= self.max_catalog_versions_per_object
+        }) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query exceeds max_catalog_versions_per_object ({})",
+                self.max_catalog_versions_per_object
+            ));
+        }
+        let Some(slot) = self
+            .pending_stored_query_dependencies
+            .iter()
+            .position(|pending| !pending.used)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pending stored-query dependency pool is exhausted"
+            ));
+        };
+        let depth = previous.map_or(1, |previous| {
+            self.pending_stored_query_dependencies[previous as usize].depth + 1
+        });
+        let image = self.stored_query_dependency_pending_base + slot;
+        let count = self.write_dependency_image(image, dependencies)?;
+        self.pending_stored_query_dependencies[slot] = PendingStoredQueryDependencies {
+            used: true,
+            owner,
+            previous,
+            depth,
+            count,
+        };
+        Ok(slot as u32)
+    }
+
+    fn allocate_pending_stored_query_dependencies_from_current(
+        &mut self,
+        owner: StoredQueryDependencyOwner,
+        previous: Option<u32>,
+    ) -> Result<u32, SqlError> {
+        if previous.is_some_and(|slot| {
+            self.pending_stored_query_dependencies[slot as usize].depth
+                >= self.max_catalog_versions_per_object
+        }) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored query exceeds max_catalog_versions_per_object ({})",
+                self.max_catalog_versions_per_object
+            ));
+        }
+        let Some(slot) = self
+            .pending_stored_query_dependencies
+            .iter()
+            .position(|pending| !pending.used)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pending stored-query dependency pool is exhausted"
+            ));
+        };
+        let depth = previous.map_or(1, |previous| {
+            self.pending_stored_query_dependencies[previous as usize].depth + 1
+        });
+        let (source_image, count) = previous.map_or_else(
+            || {
+                let image = self.committed_dependency_image(owner);
+                (image, self.stored_query_dependency_counts[image])
+            },
+            |previous| {
+                (
+                    self.stored_query_dependency_pending_base + previous as usize,
+                    self.pending_stored_query_dependencies[previous as usize].count,
+                )
+            },
+        );
+        let target_image = self.stored_query_dependency_pending_base + slot;
+        let source = source_image * self.stored_query_dependencies_per_image;
+        let target = target_image * self.stored_query_dependencies_per_image;
+        self.stored_query_dependencies
+            .copy_within(source..source + usize::from(count), target);
+        self.pending_stored_query_dependencies[slot] = PendingStoredQueryDependencies {
+            used: true,
+            owner,
+            previous,
+            depth,
+            count,
+        };
+        Ok(slot as u32)
+    }
+
+    fn pending_dependencies(&self, slot: u32) -> StoredQueryDependencyView<'_> {
+        let pending = self.pending_stored_query_dependencies[slot as usize];
+        self.dependency_image(
+            self.stored_query_dependency_pending_base + slot as usize,
+            pending.count,
+        )
+    }
+
+    fn pending_dependencies_mut(&mut self, slot: u32) -> &mut [StoredQueryDependency] {
+        let pending = self.pending_stored_query_dependencies[slot as usize];
+        self.dependency_image_mut(
+            self.stored_query_dependency_pending_base + slot as usize,
+            pending.count,
+        )
+    }
+
+    fn release_pending_dependencies(&mut self, slot: u32) -> Option<u32> {
+        let pending = self.pending_stored_query_dependencies[slot as usize];
+        self.pending_stored_query_dependencies[slot as usize] =
+            PendingStoredQueryDependencies::EMPTY;
+        pending.previous
+    }
+
+    fn clear_pending_dependency_chain(&mut self, mut tail: Option<u32>) {
+        while let Some(slot) = tail {
+            tail = self.release_pending_dependencies(slot);
+        }
+    }
+
+    fn commit_pending_dependencies(&mut self, owner: StoredQueryDependencyOwner, tail: u32) {
+        let pending = self.pending_stored_query_dependencies[tail as usize];
+        debug_assert_eq!(pending.owner, owner);
+        let source_image = self.stored_query_dependency_pending_base + tail as usize;
+        let target_image = self.committed_dependency_image(owner);
+        let source = source_image * self.stored_query_dependencies_per_image;
+        let target = target_image * self.stored_query_dependencies_per_image;
+        self.stored_query_dependencies
+            .copy_within(source..source + usize::from(pending.count), target);
+        self.stored_query_dependency_counts[target_image] = pending.count;
+        self.clear_pending_dependency_chain(Some(tail));
+    }
+
     pub fn rebind_stored_query_dependencies(
         &self,
         serialized: StoredQueryDependencies,
         txid: u32,
     ) -> Result<StoredQueryDependencies, SqlError> {
-        let mut rebound = StoredQueryDependencies::EMPTY;
+        let mut rebound =
+            StoredQueryDependencies::with_recovery_limit(self.stored_query_dependencies_per_image);
         for dependency in serialized.entries() {
-            let schema = dependency.schema.as_str();
-            let name = dependency.name.as_str();
-            let slot = match dependency.class {
-                DependencyClass::Table => self.find_visible(schema, name, txid),
-                DependencyClass::View => self.views.iter().position(|view| {
-                    view.database == self.current_database
-                        && view.visible_to(txid)
-                        && view.schema_for(txid).as_str() == schema
-                        && view.name_for(txid).as_str() == name
-                }),
-                DependencyClass::Domain => self.domain_slot(schema, name, txid),
-                DependencyClass::Enum => self.enum_slot(schema, name, txid),
-                DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
-                DependencyClass::Composite => self.composite_slot(schema, name, txid),
-                DependencyClass::Routine => match dependency.identity {
-                    StoredDependencyIdentity::RoutineOid(oid) => {
-                        self.routine_slot_by_oid(oid, txid)
-                    }
-                    StoredDependencyIdentity::Name => None,
-                    StoredDependencyIdentity::OperatorOid(_) => None,
-                },
-                DependencyClass::Operator => match dependency.identity {
-                    StoredDependencyIdentity::OperatorOid(oid) => {
-                        self.operator_slot_by_oid(oid, txid)
-                    }
-                    StoredDependencyIdentity::Name | StoredDependencyIdentity::RoutineOid(_) => {
-                        None
-                    }
-                },
-                DependencyClass::Collation => {
-                    self.collation_slot(schema, name, txid).or_else(|| {
-                        let slot = usize::from(dependency.slot);
-                        self.collations
-                            .get(slot)
-                            .is_some_and(|collation| {
-                                collation.database == self.current_database
-                                    && collation.visible_to(txid)
-                            })
-                            .then_some(slot)
-                    })
-                }
-                DependencyClass::TextSearchConfiguration => self.text_search_slot(
-                    crate::sql::ast::TextSearchObjectKind::Configuration,
-                    schema,
-                    name,
-                    txid,
-                ),
-            }
-            .ok_or_else(|| {
-                sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "stored-query dependency {}.{} does not exist",
-                    schema,
-                    name
-                )
-            })?;
-            let (schema, name) = if dependency.class == DependencyClass::Collation {
-                let definition = self.collations[slot].definition_for(txid);
-                (definition.schema, definition.name)
-            } else {
-                (dependency.schema, dependency.name)
-            };
-            rebound.push(StoredQueryDependency {
-                class: dependency.class,
-                slot: slot as u16,
-                identity: dependency.identity,
-                referenced_columns: dependency.referenced_columns,
-                schema,
-                name,
-                referenced_schema: dependency.referenced_schema,
-                referenced_name: dependency.referenced_name,
-            })?;
+            rebound.push(self.rebound_stored_query_dependency(*dependency, txid)?)?;
         }
         Ok(rebound)
+    }
+
+    fn rebound_stored_query_dependency(
+        &self,
+        dependency: StoredQueryDependency,
+        txid: u32,
+    ) -> Result<StoredQueryDependency, SqlError> {
+        let schema = dependency.schema.as_str();
+        let name = dependency.name.as_str();
+        let slot = match dependency.class {
+            DependencyClass::Table => self.find_visible(schema, name, txid),
+            DependencyClass::View => self.views.iter().position(|view| {
+                view.database == self.current_database
+                    && view.visible_to(txid)
+                    && view.schema_for(txid).as_str() == schema
+                    && view.name_for(txid).as_str() == name
+            }),
+            DependencyClass::Domain => self.domain_slot(schema, name, txid),
+            DependencyClass::Enum => self.enum_slot(schema, name, txid),
+            DependencyClass::Sequence => self.sequence_slot(schema, name, txid),
+            DependencyClass::Composite => self.composite_slot(schema, name, txid),
+            DependencyClass::Routine => match dependency.identity {
+                StoredDependencyIdentity::RoutineOid(oid) => self.routine_slot_by_oid(oid, txid),
+                StoredDependencyIdentity::Name | StoredDependencyIdentity::OperatorOid(_) => None,
+            },
+            DependencyClass::Operator => match dependency.identity {
+                StoredDependencyIdentity::OperatorOid(oid) => self.operator_slot_by_oid(oid, txid),
+                StoredDependencyIdentity::Name | StoredDependencyIdentity::RoutineOid(_) => None,
+            },
+            DependencyClass::Collation => self.collation_slot(schema, name, txid).or_else(|| {
+                let slot = usize::from(dependency.slot);
+                self.collations
+                    .get(slot)
+                    .is_some_and(|collation| {
+                        collation.database == self.current_database && collation.visible_to(txid)
+                    })
+                    .then_some(slot)
+            }),
+            DependencyClass::TextSearchConfiguration => self.text_search_slot(
+                crate::sql::ast::TextSearchObjectKind::Configuration,
+                schema,
+                name,
+                txid,
+            ),
+        }
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "stored-query dependency {}.{} does not exist",
+                schema,
+                name
+            )
+        })?;
+        let (schema, name) = if dependency.class == DependencyClass::Collation {
+            let definition = self.collations[slot].definition_for(txid);
+            (definition.schema, definition.name)
+        } else {
+            (dependency.schema, dependency.name)
+        };
+        Ok(StoredQueryDependency {
+            class: dependency.class,
+            slot: slot as u16,
+            identity: dependency.identity,
+            referenced_columns: dependency.referenced_columns,
+            schema,
+            name,
+            referenced_schema: dependency.referenced_schema,
+            referenced_name: dependency.referenced_name,
+        })
+    }
+
+    fn rebind_stored_query_dependency_image(
+        &mut self,
+        image: usize,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let start = image * self.stored_query_dependencies_per_image;
+        let count = usize::from(self.stored_query_dependency_counts[image]);
+        for offset in 0..count {
+            self.rebound_stored_query_dependency(
+                self.stored_query_dependencies[start + offset],
+                txid,
+            )?;
+        }
+        for offset in 0..count {
+            let dependency = self.stored_query_dependencies[start + offset];
+            self.stored_query_dependencies[start + offset] =
+                self.rebound_stored_query_dependency(dependency, txid)?;
+        }
+        Ok(())
     }
 
     pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
@@ -14188,36 +14659,41 @@ impl Storage {
             if self.rules[slot].database == self.current_database
                 && self.rules[slot].visible_to(txid)
             {
-                let serialized = self.rules[slot].definition.dependencies;
-                self.rules[slot].definition.dependencies =
-                    self.rebind_stored_query_dependencies(serialized, txid)?;
+                let owner = StoredQueryDependencyOwner::Rule(slot as u16);
+                self.rebind_stored_query_dependency_image(
+                    self.committed_dependency_image(owner),
+                    txid,
+                )?;
             }
         }
         for slot in 0..self.matviews.len() {
             if self.matviews[slot].database == self.current_database
                 && self.matviews[slot].visible_to(txid)
             {
-                let serialized = self.matview_dependencies[slot];
-                self.matview_dependencies[slot] =
-                    self.rebind_stored_query_dependencies(serialized, txid)?;
+                let image = self.matview_dependency_image(slot);
+                self.rebind_stored_query_dependency_image(image, txid)?;
             }
         }
         for slot in 0..self.policies.len() {
             if self.policies[slot].database == self.current_database
                 && self.policies[slot].visible_to(txid)
             {
-                let serialized = self.policies[slot].definition.dependencies;
-                self.policies[slot].definition.dependencies =
-                    self.rebind_stored_query_dependencies(serialized, txid)?;
+                let owner = StoredQueryDependencyOwner::Policy(slot as u16);
+                self.rebind_stored_query_dependency_image(
+                    self.committed_dependency_image(owner),
+                    txid,
+                )?;
             }
         }
         for slot in 0..self.routines.len() {
             if self.routines[slot].database == self.current_database
                 && self.routines[slot].visible_to(txid)
             {
-                let serialized = self.routine_dependencies[slot];
-                self.routine_dependencies[slot] =
-                    self.rebind_stored_query_dependencies(serialized, txid)?;
+                let owner = StoredQueryDependencyOwner::Routine(slot as u16);
+                self.rebind_stored_query_dependency_image(
+                    self.committed_dependency_image(owner),
+                    txid,
+                )?;
             }
         }
         Ok(())
@@ -14233,24 +14709,23 @@ impl Storage {
     ) {
         for rule_slot in 0..self.rules.len() {
             if self.rules[rule_slot].ddl_state != CatalogDdlState::Absent {
-                self.rules[rule_slot].definition.dependencies.rename(
+                rename_dependency(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Rule(
+                        rule_slot as u16,
+                    )),
                     class,
                     slot,
                     old_identity,
                     schema,
                     name,
                 );
-                if let Some(pending) = &mut self.rules[rule_slot].pending {
-                    pending
-                        .definition
-                        .dependencies
-                        .rename(class, slot, old_identity, schema, name);
-                }
             }
         }
         for matview_slot in 0..self.matviews.len() {
             if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
-                self.matview_dependencies[matview_slot].rename(
+                let image = self.matview_dependency_image(matview_slot);
+                rename_dependency(
+                    self.dependency_image_mut(image, self.stored_query_dependency_counts[image]),
                     class,
                     slot,
                     old_identity,
@@ -14259,23 +14734,26 @@ impl Storage {
                 );
             }
         }
-        for policy in self.policies.iter_mut() {
-            if policy.ddl_state != CatalogDdlState::Absent {
-                policy
-                    .definition
-                    .dependencies
-                    .rename(class, slot, old_identity, schema, name);
-                if let Some(pending) = &mut policy.pending_definition {
-                    pending
-                        .definition
-                        .dependencies
-                        .rename(class, slot, old_identity, schema, name);
-                }
+        for policy_slot in 0..self.policies.len() {
+            if self.policies[policy_slot].ddl_state != CatalogDdlState::Absent {
+                rename_dependency(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Policy(
+                        policy_slot as u16,
+                    )),
+                    class,
+                    slot,
+                    old_identity,
+                    schema,
+                    name,
+                );
             }
         }
         for routine_slot in 0..self.routines.len() {
             if self.routines[routine_slot].ddl_state != CatalogDdlState::Absent {
-                self.routine_dependencies[routine_slot].rename(
+                rename_dependency(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Routine(
+                        routine_slot as u16,
+                    )),
                     class,
                     slot,
                     old_identity,
@@ -14284,11 +14762,16 @@ impl Storage {
                 );
             }
         }
-        for pending in self.pending_routine_dependencies.iter_mut() {
-            if pending.used {
-                pending
-                    .dependencies
-                    .rename(class, slot, old_identity, schema, name);
+        for pending_slot in 0..self.pending_stored_query_dependencies.len() {
+            if self.pending_stored_query_dependencies[pending_slot].used {
+                rename_dependency(
+                    self.pending_dependencies_mut(pending_slot as u32),
+                    class,
+                    slot,
+                    old_identity,
+                    schema,
+                    name,
+                );
             }
         }
     }
@@ -14303,49 +14786,69 @@ impl Storage {
     ) {
         for rule_slot in 0..self.rules.len() {
             if self.rules[rule_slot].ddl_state != CatalogDdlState::Absent {
-                self.rules[rule_slot]
-                    .definition
-                    .dependencies
-                    .replace_slot(class, old_slot, new_slot, schema, name);
-                if let Some(pending) = &mut self.rules[rule_slot].pending {
-                    pending
-                        .definition
-                        .dependencies
-                        .replace_slot(class, old_slot, new_slot, schema, name);
-                }
+                replace_dependency_slot(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Rule(
+                        rule_slot as u16,
+                    )),
+                    class,
+                    old_slot,
+                    new_slot,
+                    schema,
+                    name,
+                );
             }
         }
         for matview_slot in 0..self.matviews.len() {
             if self.matviews[matview_slot].ddl_state != CatalogDdlState::Absent {
-                self.matview_dependencies[matview_slot]
-                    .replace_slot(class, old_slot, new_slot, schema, name);
+                let image = self.matview_dependency_image(matview_slot);
+                replace_dependency_slot(
+                    self.dependency_image_mut(image, self.stored_query_dependency_counts[image]),
+                    class,
+                    old_slot,
+                    new_slot,
+                    schema,
+                    name,
+                );
             }
         }
-        for policy in self.policies.iter_mut() {
-            if policy.ddl_state != CatalogDdlState::Absent {
-                policy
-                    .definition
-                    .dependencies
-                    .replace_slot(class, old_slot, new_slot, schema, name);
-                if let Some(pending) = &mut policy.pending_definition {
-                    pending
-                        .definition
-                        .dependencies
-                        .replace_slot(class, old_slot, new_slot, schema, name);
-                }
+        for policy_slot in 0..self.policies.len() {
+            if self.policies[policy_slot].ddl_state != CatalogDdlState::Absent {
+                replace_dependency_slot(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Policy(
+                        policy_slot as u16,
+                    )),
+                    class,
+                    old_slot,
+                    new_slot,
+                    schema,
+                    name,
+                );
             }
         }
         for routine_slot in 0..self.routines.len() {
             if self.routines[routine_slot].ddl_state != CatalogDdlState::Absent {
-                self.routine_dependencies[routine_slot]
-                    .replace_slot(class, old_slot, new_slot, schema, name);
+                replace_dependency_slot(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Routine(
+                        routine_slot as u16,
+                    )),
+                    class,
+                    old_slot,
+                    new_slot,
+                    schema,
+                    name,
+                );
             }
         }
-        for pending in self.pending_routine_dependencies.iter_mut() {
-            if pending.used {
-                pending
-                    .dependencies
-                    .replace_slot(class, old_slot, new_slot, schema, name);
+        for pending_slot in 0..self.pending_stored_query_dependencies.len() {
+            if self.pending_stored_query_dependencies[pending_slot].used {
+                replace_dependency_slot(
+                    self.pending_dependencies_mut(pending_slot as u32),
+                    class,
+                    old_slot,
+                    new_slot,
+                    schema,
+                    name,
+                );
             }
         }
     }
@@ -14364,8 +14867,8 @@ impl Storage {
             + committed_row_version_capacity(config)
                 .saturating_mul(size_of::<CommittedVersionSlot>())
             + config.max_views * size_of::<ViewDef>()
-            + config.max_routines * (size_of::<RoutineDef>() + size_of::<StoredQueryDependencies>())
-            + pending_routine_dependency_capacity(config) * size_of::<PendingRoutineDependencies>()
+            + config.max_routines * size_of::<RoutineDef>()
+            + stored_query_dependency_budget_bytes(config)
             + config.max_casts * size_of::<CastDef>()
             + config.max_operators * size_of::<OperatorDef>()
             + config.max_operator_families * size_of::<OperatorFamilyDef>()
@@ -14375,8 +14878,7 @@ impl Storage {
             + config.max_policies * size_of::<PolicyDef>()
             + config.extended_statistics_capacity() * size_of::<ExtendedStatisticsDef>()
             + config.max_publications * size_of::<PublicationDef>()
-            + config.max_materialized_views
-                * (size_of::<MatviewDef>() + size_of::<StoredQueryDependencies>())
+            + config.max_materialized_views * size_of::<MatviewDef>()
             + config.max_indexes * (size_of::<IndexDef>() + size_of::<BrinMaintenanceState>())
             + config
                 .max_indexes
@@ -14759,17 +15261,40 @@ impl Storage {
                 .push(EventTriggerDef::EMPTY)
                 .expect("sized to event trigger capacity");
         }
-        let routine_dependencies =
-            stored_query_dependency_slots(budget, "routine_dependencies", config.max_routines)?;
-        let mut pending_routine_dependencies = FixedVec::new(
+        let committed_dependency_images = config
+            .max_rules
+            .saturating_add(config.max_policies)
+            .saturating_add(config.max_routines)
+            .saturating_add(config.max_materialized_views);
+        let dependency_images = stored_query_dependency_image_capacity(config);
+        let dependency_entries =
+            dependency_images.saturating_mul(config.max_stored_query_dependencies_per_object);
+        let mut stored_query_dependencies =
+            FixedVec::new(budget, "stored_query_dependencies", dependency_entries)?;
+        for _ in 0..dependency_entries {
+            stored_query_dependencies
+                .push(StoredQueryDependency::EMPTY)
+                .expect("sized to every stored-query dependency image");
+        }
+        let mut stored_query_dependency_counts = FixedVec::new(
             budget,
-            "pending_routine_dependencies",
-            pending_routine_dependency_capacity(config),
+            "stored_query_dependency_counts",
+            committed_dependency_images,
         )?;
-        for _ in 0..pending_routine_dependency_capacity(config) {
-            pending_routine_dependencies
-                .push(PendingRoutineDependencies::EMPTY)
-                .expect("sized to pending routine definitions");
+        for _ in 0..committed_dependency_images {
+            stored_query_dependency_counts
+                .push(0)
+                .expect("sized to committed stored-query dependency images");
+        }
+        let mut pending_stored_query_dependencies = FixedVec::new(
+            budget,
+            "pending_stored_query_dependencies",
+            pending_stored_query_dependency_capacity(config),
+        )?;
+        for _ in 0..pending_stored_query_dependency_capacity(config) {
+            pending_stored_query_dependencies
+                .push(PendingStoredQueryDependencies::EMPTY)
+                .expect("sized to pending stored-query dependency images");
         }
         let mut triggers = FixedVec::new(budget, "triggers", config.max_triggers)?;
         for _ in 0..config.max_triggers {
@@ -14922,11 +15447,6 @@ impl Storage {
                 })
                 .expect("sized to max_materialized_views");
         }
-        let matview_dependencies = stored_query_dependency_slots(
-            budget,
-            "matview_dependencies",
-            config.max_materialized_views,
-        )?;
         let mut sequences = FixedVec::new(budget, "sequences", config.max_sequences)?;
         for _ in 0..config.max_sequences {
             sequences
@@ -15353,8 +15873,11 @@ impl Storage {
             conversions,
             text_search_objects,
             event_triggers,
-            routine_dependencies,
-            pending_routine_dependencies,
+            stored_query_dependencies,
+            stored_query_dependency_counts,
+            stored_query_dependencies_per_image: config.max_stored_query_dependencies_per_object,
+            pending_stored_query_dependencies,
+            stored_query_dependency_pending_base: committed_dependency_images,
             triggers,
             partition_trigger_states,
             policies,
@@ -15377,7 +15900,6 @@ impl Storage {
             }),
             subscription_relations,
             matviews,
-            matview_dependencies,
             sequences,
             domains,
             enums,
@@ -16752,6 +17274,10 @@ impl Storage {
                 rule.pending = None;
                 rule.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.rules[target_slot] = rule;
+                self.copy_committed_dependencies(
+                    StoredQueryDependencyOwner::Rule(source_slot as u16),
+                    StoredQueryDependencyOwner::Rule(target_slot as u16),
+                );
                 if rule.definition.event == RewriteEvent::Select
                     && rule.definition.name.as_str() == "_RETURN"
                 {
@@ -16786,7 +17312,10 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.matviews[target_slot] = definition;
-                self.matview_dependencies[target_slot] = self.matview_dependencies[source_slot];
+                self.copy_dependency_image(
+                    self.matview_dependency_image(source_slot),
+                    self.matview_dependency_image(target_slot),
+                );
             }
 
             for source_slot in 0..self.routines.len() {
@@ -16808,7 +17337,10 @@ impl Storage {
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.routines[target_slot] = definition;
-                self.routine_dependencies[target_slot] = self.routine_dependencies[source_slot];
+                self.copy_committed_dependencies(
+                    StoredQueryDependencyOwner::Routine(source_slot as u16),
+                    StoredQueryDependencyOwner::Routine(target_slot as u16),
+                );
             }
 
             for source_slot in 0..self.access_methods.len() {
@@ -17043,6 +17575,10 @@ impl Storage {
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.policies[target_slot] = definition;
+                self.copy_committed_dependencies(
+                    StoredQueryDependencyOwner::Policy(source_slot as u16),
+                    StoredQueryDependencyOwner::Policy(target_slot as u16),
+                );
             }
 
             for source_slot in 0..self.triggers.len() {
@@ -17653,18 +18189,33 @@ impl Storage {
                 slot.active = false;
             }
         }
-        for (slot, dependency) in self.matview_dependencies.iter_mut().enumerate() {
+        for slot in 0..self.matviews.len() {
             if self.matviews[slot].database == DatabaseOid::POSTGRES
                 && self.matviews[slot].ddl_state == CatalogDdlState::Absent
             {
-                *dependency = StoredQueryDependencies::EMPTY;
+                let image = self.matview_dependency_image(slot);
+                self.stored_query_dependency_counts[image] = 0;
             }
         }
-        for (slot, dependency) in self.routine_dependencies.iter_mut().enumerate() {
+        for slot in 0..self.routines.len() {
             if self.routines[slot].database == DatabaseOid::POSTGRES
                 && self.routines[slot].ddl_state == CatalogDdlState::Absent
             {
-                *dependency = StoredQueryDependencies::EMPTY;
+                self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
+            }
+        }
+        for slot in 0..self.rules.len() {
+            if self.rules[slot].database == DatabaseOid::POSTGRES
+                && self.rules[slot].ddl_state == CatalogDdlState::Absent
+            {
+                self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
+            }
+        }
+        for slot in 0..self.policies.len() {
+            if self.policies[slot].database == DatabaseOid::POSTGRES
+                && self.policies[slot].ddl_state == CatalogDdlState::Absent
+            {
+                self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
             }
         }
     }
@@ -22341,45 +22892,70 @@ impl Storage {
             definition.database == self.current_database
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
-            definition
-                .definition
-                .dependencies
-                .rename_schema(prior, name);
             rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
             rename_schema_qualified_sql(&mut definition.definition.source, prior, name)?;
             if let Some(pending) = &mut definition.pending {
-                pending.definition.dependencies.rename_schema(prior, name);
                 rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
                 rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
             }
         }
-        for (slot, definition) in self.matviews.iter_mut().enumerate() {
+        for definition in self.matviews.iter_mut() {
             if definition.database == self.current_database
                 && definition.ddl_state != CatalogDdlState::Absent
             {
                 rename_schema_path(&mut definition.creation_path, prior, name)?;
                 rename_schema_qualified_sql(&mut definition.sql, prior, name)?;
-                self.matview_dependencies[slot].rename_schema(prior, name);
             }
         }
-        for definition in self.policies.iter_mut().filter(|definition| {
-            definition.database == self.current_database
-                && definition.ddl_state != CatalogDdlState::Absent
-        }) {
-            definition
-                .definition
-                .dependencies
-                .rename_schema(prior, name);
-            if let Some(pending) = &mut definition.pending_definition {
-                pending.definition.dependencies.rename_schema(prior, name);
+        for slot in 0..self.rules.len() {
+            if self.rules[slot].database == self.current_database
+                && self.rules[slot].ddl_state != CatalogDdlState::Absent
+            {
+                rename_dependency_schema(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Rule(slot as u16)),
+                    prior,
+                    name,
+                );
             }
         }
-        for dependencies in self.routine_dependencies.iter_mut() {
-            dependencies.rename_schema(prior, name);
+        for slot in 0..self.matviews.len() {
+            if self.matviews[slot].database == self.current_database
+                && self.matviews[slot].ddl_state != CatalogDdlState::Absent
+            {
+                let image = self.matview_dependency_image(slot);
+                let count = self.stored_query_dependency_counts[image];
+                rename_dependency_schema(self.dependency_image_mut(image, count), prior, name);
+            }
         }
-        for pending in self.pending_routine_dependencies.iter_mut() {
-            if pending.used {
-                pending.dependencies.rename_schema(prior, name);
+        for slot in 0..self.policies.len() {
+            if self.policies[slot].database == self.current_database
+                && self.policies[slot].ddl_state != CatalogDdlState::Absent
+            {
+                rename_dependency_schema(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Policy(
+                        slot as u16,
+                    )),
+                    prior,
+                    name,
+                );
+            }
+        }
+        for slot in 0..self.routines.len() {
+            if self.routines[slot].database == self.current_database
+                && self.routines[slot].ddl_state != CatalogDdlState::Absent
+            {
+                rename_dependency_schema(
+                    self.committed_dependencies_mut(StoredQueryDependencyOwner::Routine(
+                        slot as u16,
+                    )),
+                    prior,
+                    name,
+                );
+            }
+        }
+        for slot in 0..self.pending_stored_query_dependencies.len() {
+            if self.pending_stored_query_dependencies[slot].used {
+                rename_dependency_schema(self.pending_dependencies_mut(slot as u32), prior, name);
             }
         }
         for comment in self.comments.iter_mut() {
@@ -28799,10 +29375,10 @@ impl Storage {
         self.views[slot].database == self.current_database && self.views[slot].visible_to(txid)
     }
 
-    pub(crate) fn view_dependencies(&self, slot: usize) -> &StoredQueryDependencies {
-        &self.rules[usize::from(self.views[slot].return_rule)]
-            .definition
-            .dependencies
+    pub(crate) fn view_dependencies(&self, slot: usize) -> StoredQueryDependencyView<'_> {
+        self.committed_dependencies(StoredQueryDependencyOwner::Rule(
+            self.views[slot].return_rule,
+        ))
     }
 
     pub(crate) fn view_return_rule(&self, slot: usize) -> usize {
@@ -30433,8 +31009,9 @@ impl Storage {
         &self.matviews[slot]
     }
 
-    pub(crate) fn matview_dependencies(&self, slot: usize) -> &StoredQueryDependencies {
-        &self.matview_dependencies[slot]
+    pub(crate) fn matview_dependencies(&self, slot: usize) -> StoredQueryDependencyView<'_> {
+        let image = self.matview_dependency_image(slot);
+        self.dependency_image(image, self.stored_query_dependency_counts[image])
     }
 
     pub(crate) fn matview_count(&self) -> usize {
@@ -30525,6 +31102,8 @@ impl Storage {
             class: AccessClass::MaterializedView,
             slot: new as u16,
         });
+        let image = self.matview_dependency_image(new);
+        let dependency_count = self.write_dependency_image(image, query.dependencies.view())?;
         self.catalog_seq += 1;
         self.matviews[new] = MatviewDef {
             database: self.current_database,
@@ -30536,7 +31115,7 @@ impl Storage {
             populated,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        self.matview_dependencies[new] = query.dependencies;
+        self.stored_query_dependency_counts[image] = dependency_count;
         Ok(new)
     }
 
@@ -30582,6 +31161,8 @@ impl Storage {
         let (schema, name) = (definition.schema, definition.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.commit_drop();
+        let image = self.matview_dependency_image(slot);
+        self.stored_query_dependency_counts[image] = 0;
         self.clear_extension_dependencies_for_object(AccessObject {
             class: AccessClass::MaterializedView,
             slot: slot as u16,
@@ -30590,6 +31171,8 @@ impl Storage {
 
     pub fn rollback_matview_create(&mut self, slot: usize) {
         self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.rollback_create();
+        let image = self.matview_dependency_image(slot);
+        self.stored_query_dependency_counts[image] = 0;
     }
 
     pub fn rollback_matview_drop(&mut self, slot: usize, txid: u32) {
@@ -33718,9 +34301,13 @@ impl Storage {
             action_count: 1,
             returning_action: None,
             creation_path: definition.query.creation_path,
-            dependencies: definition.query.dependencies,
         };
-        let (rule, prior) = match self.create_rule(rule_definition, false, txid) {
+        let (rule, prior) = match self.create_rule(
+            rule_definition,
+            definition.query.dependencies.view(),
+            false,
+            txid,
+        ) {
             Ok(created) => created,
             Err(error) => {
                 self.views[new].ddl_state = CatalogDdlState::Absent;
@@ -35819,59 +36406,14 @@ impl Storage {
         &self,
         slot: usize,
         txid: u32,
-    ) -> &StoredQueryDependencies {
+    ) -> StoredQueryDependencyView<'_> {
         if let Some(pending) = self.routines[slot]
             .pending_definition
             .filter(|pending| pending.txid == txid)
         {
-            return &self.pending_routine_dependencies[pending.dependency_slot as usize]
-                .dependencies;
+            return self.pending_dependencies(pending.dependency_slot);
         }
-        &self.routine_dependencies[slot]
-    }
-
-    fn allocate_pending_routine_dependencies(
-        &mut self,
-        routine: usize,
-        txid: u32,
-        dependencies: StoredQueryDependencies,
-    ) -> Result<u32, SqlError> {
-        let previous = self.routines[routine]
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .map(|pending| pending.dependency_slot);
-        if previous.is_some_and(|slot| {
-            self.pending_routine_dependencies[slot as usize].depth
-                >= self.max_catalog_versions_per_object
-        }) {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "routine \"{}\" exceeds max_catalog_versions_per_object ({})",
-                self.routines[routine].name.as_str(),
-                self.max_catalog_versions_per_object
-            ));
-        }
-        let depth = previous.map_or(1, |slot| {
-            self.pending_routine_dependencies[slot as usize].depth + 1
-        });
-        let Some(slot) = self
-            .pending_routine_dependencies
-            .iter()
-            .position(|pending| !pending.used)
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many pending routine definitions"
-            ));
-        };
-        self.pending_routine_dependencies[slot] = PendingRoutineDependencies {
-            used: true,
-            txid,
-            routine: routine as u16,
-            depth,
-            dependencies,
-        };
-        Ok(slot as u32)
+        self.committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16))
     }
 
     pub(crate) fn create_routine(
@@ -36097,7 +36639,10 @@ impl Storage {
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
-        self.routine_dependencies[slot] = dependencies;
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Routine(slot as u16),
+            dependencies.view(),
+        )?;
         Ok(slot)
     }
 
@@ -36114,14 +36659,14 @@ impl Storage {
 
     pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_create();
-        self.routine_dependencies[slot] = StoredQueryDependencies::EMPTY;
+        self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
     }
 
     pub(crate) fn replace_routine(
         &mut self,
         slot: usize,
         mut definition: PendingRoutineDefinition,
-        dependencies: StoredQueryDependencies,
+        dependencies: StoredQueryDependencyView<'_>,
     ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
         let name = self.routines[slot].name;
         if let Some(pending) = self.routines[slot].pending_definition
@@ -36129,8 +36674,41 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
-        definition.dependency_slot =
-            self.allocate_pending_routine_dependencies(slot, definition.txid, dependencies)?;
+        let previous = self.routines[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == definition.txid)
+            .map(|pending| pending.dependency_slot);
+        definition.dependency_slot = self.allocate_pending_stored_query_dependencies(
+            StoredQueryDependencyOwner::Routine(slot as u16),
+            definition.txid,
+            previous,
+            dependencies,
+        )?;
+        let routine = &mut self.routines[slot];
+        let prior = routine.pending_definition;
+        routine.pending_definition = Some(definition);
+        Ok(prior)
+    }
+
+    pub(crate) fn replace_routine_preserving_dependencies(
+        &mut self,
+        slot: usize,
+        mut definition: PendingRoutineDefinition,
+    ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
+        let name = self.routines[slot].name;
+        if let Some(pending) = self.routines[slot].pending_definition
+            && pending.txid != definition.txid
+        {
+            return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
+        }
+        let previous = self.routines[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == definition.txid)
+            .map(|pending| pending.dependency_slot);
+        definition.dependency_slot = self.allocate_pending_stored_query_dependencies_from_current(
+            StoredQueryDependencyOwner::Routine(slot as u16),
+            previous,
+        )?;
         let routine = &mut self.routines[slot];
         let prior = routine.pending_definition;
         routine.pending_definition = Some(definition);
@@ -36141,8 +36719,10 @@ impl Storage {
         if let Some(pending) = self.routines[slot].pending_definition
             && pending.txid == txid
         {
-            self.routine_dependencies[slot] =
-                self.pending_routine_dependencies[pending.dependency_slot as usize].dependencies;
+            self.commit_pending_dependencies(
+                StoredQueryDependencyOwner::Routine(slot as u16),
+                pending.dependency_slot,
+            );
             let routine = &mut self.routines[slot];
             routine.arguments = pending.arguments;
             routine.argument_count = pending.argument_count;
@@ -36159,14 +36739,6 @@ impl Storage {
             routine.body = pending.body;
             routine.creation_path = pending.creation_path;
             routine.pending_definition = None;
-            for dependency in self.pending_routine_dependencies.iter_mut() {
-                if dependency.used
-                    && dependency.txid == txid
-                    && usize::from(dependency.routine) == slot
-                {
-                    *dependency = PendingRoutineDependencies::EMPTY;
-                }
-            }
         }
     }
 
@@ -36176,8 +36748,7 @@ impl Storage {
         prior: Option<PendingRoutineDefinition>,
     ) {
         if let Some(current) = self.routines[slot].pending_definition {
-            self.pending_routine_dependencies[current.dependency_slot as usize] =
-                PendingRoutineDependencies::EMPTY;
+            self.release_pending_dependencies(current.dependency_slot);
         }
         self.routines[slot].pending_definition = prior;
     }
@@ -36194,13 +36765,12 @@ impl Storage {
         let object = Self::routine_access_object(slot);
         self.clear_object_acl_entries(object);
         self.clear_extension_dependencies_for_object(object);
-        self.routine_dependencies[slot] = StoredQueryDependencies::EMPTY;
+        self.clear_committed_dependencies(StoredQueryDependencyOwner::Routine(slot as u16));
         self.drop_comments_by_subid(CommentClass::Routine, oid);
-        for dependency in self.pending_routine_dependencies.iter_mut() {
-            if dependency.used && usize::from(dependency.routine) == slot {
-                *dependency = PendingRoutineDependencies::EMPTY;
-            }
-        }
+        let pending = self.routines[slot]
+            .pending_definition
+            .map(|pending| pending.dependency_slot);
+        self.clear_pending_dependency_chain(pending);
     }
 
     pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
@@ -36213,6 +36783,20 @@ impl Storage {
 
     pub(crate) fn policy_count(&self) -> usize {
         self.policies.len()
+    }
+
+    pub(crate) fn policy_dependencies(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> StoredQueryDependencyView<'_> {
+        if let Some(pending) = self.policies[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+        {
+            return self.pending_dependencies(pending.dependency_slot);
+        }
+        self.committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16))
     }
 
     pub(crate) fn policies_for_table(
@@ -36256,7 +36840,12 @@ impl Storage {
             .find_map(|(slot, policy)| (policy.name.as_str() == name).then_some(slot))
     }
 
-    pub(crate) fn create_policy(&mut self, spec: PolicySpec, txid: u32) -> Result<usize, SqlError> {
+    pub(crate) fn create_policy(
+        &mut self,
+        spec: PolicySpec,
+        dependencies: &StoredQueryDependencies,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
         if spec.table >= self.tables.len()
             || spec.definition.roles.entries().is_empty()
             || (matches!(spec.command, PolicyCommandKind::Insert)
@@ -36309,6 +36898,10 @@ impl Storage {
             pending_definition: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Policy(slot as u16),
+            dependencies.view(),
+        )?;
         Ok(slot)
     }
 
@@ -36316,6 +36909,7 @@ impl Storage {
         &mut self,
         slot: usize,
         definition: PolicyDefinition,
+        dependencies: &StoredQueryDependencies,
         txid: u32,
     ) -> Result<Option<PendingPolicyDefinition>, SqlError> {
         if matches!(self.policies[slot].command, PolicyCommandKind::Insert)
@@ -36340,7 +36934,20 @@ impl Storage {
             ));
         }
         let prior = self.policies[slot].pending_definition;
-        self.policies[slot].pending_definition = Some(PendingPolicyDefinition { txid, definition });
+        let previous = prior
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| pending.dependency_slot);
+        let dependency_slot = self.allocate_pending_stored_query_dependencies(
+            StoredQueryDependencyOwner::Policy(slot as u16),
+            txid,
+            previous,
+            dependencies.view(),
+        )?;
+        self.policies[slot].pending_definition = Some(PendingPolicyDefinition {
+            txid,
+            definition,
+            dependency_slot,
+        });
         Ok(prior)
     }
 
@@ -36354,15 +36961,19 @@ impl Storage {
 
     pub(crate) fn rollback_policy_create(&mut self, slot: usize) {
         self.policies[slot].ddl_state = self.policies[slot].ddl_state.rollback_create();
+        self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
     }
 
     pub(crate) fn commit_policy_alter(&mut self, slot: usize, txid: u32) {
-        let policy = &mut self.policies[slot];
-        if let Some(pending) = policy.pending_definition
+        if let Some(pending) = self.policies[slot].pending_definition
             && pending.txid == txid
         {
-            policy.definition = pending.definition;
-            policy.pending_definition = None;
+            self.commit_pending_dependencies(
+                StoredQueryDependencyOwner::Policy(slot as u16),
+                pending.dependency_slot,
+            );
+            self.policies[slot].definition = pending.definition;
+            self.policies[slot].pending_definition = None;
         }
     }
 
@@ -36371,13 +36982,21 @@ impl Storage {
         slot: usize,
         prior: Option<PendingPolicyDefinition>,
     ) {
+        if let Some(current) = self.policies[slot].pending_definition {
+            self.release_pending_dependencies(current.dependency_slot);
+        }
         self.policies[slot].pending_definition = prior;
     }
 
     pub(crate) fn commit_policy_drop(&mut self, slot: usize) {
         let oid = policy_oid(&self.policies[slot]) as u32;
         self.policies[slot].ddl_state = self.policies[slot].ddl_state.commit_drop();
+        let pending = self.policies[slot]
+            .pending_definition
+            .map(|pending| pending.dependency_slot);
         self.policies[slot].pending_definition = None;
+        self.clear_pending_dependency_chain(pending);
+        self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
         self.drop_comments_by_subid(CommentClass::Policy, oid);
     }
 
@@ -36390,22 +37009,35 @@ impl Storage {
             let policy = self.policies[slot];
             if policy.ddl_state != CatalogDdlState::Absent && usize::from(policy.table) == table {
                 self.policies[slot].ddl_state = CatalogDdlState::Absent;
+                let pending = self.policies[slot]
+                    .pending_definition
+                    .map(|pending| pending.dependency_slot);
                 self.policies[slot].pending_definition = None;
+                self.clear_pending_dependency_chain(pending);
+                self.clear_committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16));
                 self.drop_comments_by_subid(CommentClass::Policy, policy_oid(&policy) as u32);
             }
         }
     }
 
-    pub(crate) fn replay_set_policy(&mut self, spec: PolicySpec) -> Result<(), SqlError> {
+    pub(crate) fn replay_set_policy(
+        &mut self,
+        spec: PolicySpec,
+        dependencies: StoredQueryDependencies,
+    ) -> Result<(), SqlError> {
         if let Some(slot) = self.policy_slot_on(spec.table, spec.name.as_str(), 0) {
             let policy = &mut self.policies[slot];
             policy.command = spec.command;
             policy.permissive = spec.permissive;
             policy.definition = spec.definition;
             policy.pending_definition = None;
+            self.write_committed_dependencies(
+                StoredQueryDependencyOwner::Policy(slot as u16),
+                dependencies.view(),
+            )?;
             return Ok(());
         }
-        let slot = self.create_policy(spec, 0)?;
+        let slot = self.create_policy(spec, &dependencies, 0)?;
         self.commit_policy_create(slot);
         Ok(())
     }
@@ -36421,8 +37053,9 @@ impl Storage {
         &mut self,
         created_at: u64,
         spec: PolicySpec,
+        dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
-        self.replay_set_policy(spec)?;
+        self.replay_set_policy(spec, dependencies)?;
         let slot = self
             .policy_slot_on(spec.table, spec.name.as_str(), 0)
             .expect("restored policy is installed");
@@ -37065,7 +37698,10 @@ impl Storage {
                 self.routines[slot].body_kind = definition.body_kind;
                 self.routines[slot].body = definition.body;
                 self.routines[slot].creation_path = definition.creation_path;
-                self.routine_dependencies[slot] = dependencies;
+                self.write_committed_dependencies(
+                    StoredQueryDependencyOwner::Routine(slot as u16),
+                    dependencies.view(),
+                )?;
                 self.routines[slot].ownership = definition.ownership;
                 self.routines[slot].pending_definition = None;
                 return Ok(());
@@ -41605,6 +42241,20 @@ impl Storage {
         self.rules[slot]
     }
 
+    pub(crate) fn rule_dependencies(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> StoredQueryDependencyView<'_> {
+        if let Some(pending) = self.rules[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+        {
+            return self.pending_dependencies(pending.dependency_slot);
+        }
+        self.committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16))
+    }
+
     pub(crate) fn rule_slot_visible_to(&self, slot: usize, txid: u32) -> Option<RuleDef> {
         self.rules
             .get(slot)
@@ -41696,6 +42346,7 @@ impl Storage {
     pub(crate) fn create_rule(
         &mut self,
         definition: RuleDefinition,
+        dependencies: StoredQueryDependencyView<'_>,
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<PendingRuleDefinition>), SqlError> {
@@ -41716,7 +42367,20 @@ impl Storage {
                     definition.name.as_str(),
                 ));
             }
-            self.rules[slot].pending = Some(PendingRuleDefinition { txid, definition });
+            let previous = prior
+                .filter(|pending| pending.txid == txid)
+                .map(|pending| pending.dependency_slot);
+            let dependency_slot = self.allocate_pending_stored_query_dependencies(
+                StoredQueryDependencyOwner::Rule(slot as u16),
+                txid,
+                previous,
+                dependencies,
+            )?;
+            self.rules[slot].pending = Some(PendingRuleDefinition {
+                txid,
+                definition,
+                dependency_slot,
+            });
             return Ok((slot, prior));
         }
         let slot = self
@@ -41738,6 +42402,10 @@ impl Storage {
             pending: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Rule(slot as u16),
+            dependencies,
+        )?;
         Ok((slot, None))
     }
 
@@ -41766,7 +42434,18 @@ impl Storage {
             ));
         }
         let old = self.rules[slot].definition_for(txid);
-        self.rules[slot].pending = Some(PendingRuleDefinition { txid, definition });
+        let previous = prior
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| pending.dependency_slot);
+        let dependency_slot = self.allocate_pending_stored_query_dependencies_from_current(
+            StoredQueryDependencyOwner::Rule(slot as u16),
+            previous,
+        )?;
+        self.rules[slot].pending = Some(PendingRuleDefinition {
+            txid,
+            definition,
+            dependency_slot,
+        });
         if old.name != definition.name {
             let subid = definition.target.comment_subid();
             for comment in self.comments.iter_mut().filter(|comment| {
@@ -41807,6 +42486,7 @@ impl Storage {
             self.tables[usize::from(table)].pending_has_rules_txid = prior_table_rule_txid;
         }
         self.rules[slot].ddl_state = self.rules[slot].ddl_state.rollback_create();
+        self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
     }
 
     pub(crate) fn begin_rule_history(&mut self, target: RuleTarget, txid: u32) -> Option<u32> {
@@ -41826,6 +42506,10 @@ impl Storage {
         if let Some(pending) = self.rules[slot].pending
             && pending.txid == txid
         {
+            self.commit_pending_dependencies(
+                StoredQueryDependencyOwner::Rule(slot as u16),
+                pending.dependency_slot,
+            );
             let old = self.rules[slot].definition;
             self.rules[slot].definition = pending.definition;
             self.rules[slot].pending = None;
@@ -41855,6 +42539,7 @@ impl Storage {
         let committed = self.rules[slot].definition;
         let restored = prior.map_or(committed, |pending| pending.definition);
         if let Some(current) = current {
+            self.release_pending_dependencies(current.dependency_slot);
             let subid = current.definition.target.comment_subid();
             for comment in self.comments.iter_mut().filter(|comment| {
                 comment.used
@@ -41888,8 +42573,13 @@ impl Storage {
                 *comment = CommentEntry::empty();
             }
         }
+        let pending = self.rules[slot]
+            .pending
+            .map(|pending| pending.dependency_slot);
         self.rules[slot].pending = None;
         self.rules[slot].ddl_state = self.rules[slot].ddl_state.commit_drop();
+        self.clear_pending_dependency_chain(pending);
+        self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
     }
 
     /// Rules are internal relation dependents. Session teardown drops a
@@ -41915,8 +42605,13 @@ impl Storage {
                     *comment = CommentEntry::empty();
                 }
             }
+            let pending = self.rules[slot]
+                .pending
+                .map(|pending| pending.dependency_slot);
             self.rules[slot].pending = None;
             self.rules[slot].ddl_state = CatalogDdlState::Absent;
+            self.clear_pending_dependency_chain(pending);
+            self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
         }
     }
 
@@ -41929,6 +42624,7 @@ impl Storage {
         slot: usize,
         created_at: u64,
         definition: RuleDefinition,
+        dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
         if slot >= self.rules.len() {
             return Err(sql_err!(
@@ -41966,6 +42662,10 @@ impl Storage {
                         )
                     })?;
                 self.rules[free] = occupied;
+                self.copy_committed_dependencies(
+                    StoredQueryDependencyOwner::Rule(slot as u16),
+                    StoredQueryDependencyOwner::Rule(free as u16),
+                );
                 if let RuleTarget::View(view) = occupied_definition.target
                     && self.views[usize::from(view)].return_rule == slot as u16
                 {
@@ -41980,6 +42680,10 @@ impl Storage {
             pending: None,
             ddl_state: CatalogDdlState::Present,
         };
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Rule(slot as u16),
+            dependencies.view(),
+        )?;
         if let RuleTarget::Table(table) = definition.target {
             self.tables[usize::from(table)].def.has_rules = true;
         }
@@ -42001,6 +42705,7 @@ impl Storage {
                 }
             }
             self.rules[slot] = RuleDef::EMPTY;
+            self.clear_committed_dependencies(StoredQueryDependencyOwner::Rule(slot as u16));
         }
     }
 
@@ -43742,7 +44447,8 @@ mod tests {
         let _ = (view_shape, matview_shape);
         assert!(
             size_of::<StoredQueryDependencies>()
-                >= MAX_STORED_QUERY_DEPENDENCIES * size_of::<StoredQueryDependency>()
+                < MAX_STORED_QUERY_DEPENDENCIES * size_of::<StoredQueryDependency>(),
+            "the durable maximum must not inflate every executor frame"
         );
     }
 
@@ -43769,6 +44475,9 @@ mod tests {
         config.max_views = 3;
         config.max_materialized_views = 4;
         config.max_routines = 5;
+        config.max_rules = 7;
+        config.max_policies = 8;
+        config.max_stored_query_dependencies_per_object = 73;
         config.max_catalog_versions_per_object = 3;
         config.max_row_versions_per_row = 11;
         config.max_spill_generations_per_table = 12;
@@ -43834,12 +44543,19 @@ mod tests {
         assert_eq!(storage.brin_unsummarized_ranges.borrow().len(), 6 * 70);
         assert_eq!(storage.views.len(), 3);
         assert_eq!(storage.matviews.len(), 4);
-        assert_eq!(storage.matview_dependencies.len(), 4);
         assert_eq!(storage.routines.len(), 5);
-        assert_eq!(storage.routine_dependencies.len(), 5);
+        let committed_dependency_images = 7 + 8 + 5 + 4;
         assert_eq!(
-            storage.pending_routine_dependencies.len(),
-            pending_routine_dependency_capacity(&config)
+            storage.pending_stored_query_dependencies.len(),
+            pending_stored_query_dependency_capacity(&config)
+        );
+        assert_eq!(
+            storage.stored_query_dependency_counts.len(),
+            committed_dependency_images
+        );
+        assert_eq!(
+            storage.stored_query_dependencies.len(),
+            (committed_dependency_images + pending_stored_query_dependency_capacity(&config)) * 73
         );
         assert_eq!(storage.casts.len(), 6);
         assert_eq!(storage.operators.len(), 7);

@@ -152,11 +152,14 @@ and cold recovery use the same configured bound.
 `max_ddl_per_transaction` sizes catalog undo, commit, prepared-transaction,
 subscription-apply, and logical-decoding state together. It is reserved for
 every transaction slot at startup; exhaustion aborts the current statement or
-transaction instead of partially applying bulk DDL. Pending table-definition
-and routine-dependency pools use that transaction bound together with
-`max_catalog_versions_per_object` (default 8). The latter is an explicit
-startup-memory choice rather than a compiled inline-array ceiling and may be
-raised when workloads repeatedly change one object in a transaction.
+transaction instead of partially applying bulk DDL. Stored-query dependencies
+for views, materialized views, rules, policies, and routines use one contiguous
+startup pool, with `max_stored_query_dependencies_per_object` (default 64,
+durable maximum 255) as the sole per-object bound. Their pending versions and
+pending table definitions use the transaction bound together with
+`max_catalog_versions_per_object` (default 8). These are explicit startup-memory
+choices rather than compiled inline-array ceilings and may be raised for wider
+stored queries or workloads that repeatedly change one object in a transaction.
 
 Row MVCC history is independently sized by `max_row_versions_per_row`
 (default 8). Startup reserves global pending-command and committed-snapshot

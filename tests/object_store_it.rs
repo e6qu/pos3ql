@@ -102,6 +102,8 @@ fn engine_config(run: &str, data_dir: &str) -> Option<(Config, TestDirectory)> {
     config.max_views = 8;
     config.max_materialized_views = 8;
     config.max_routines = 8;
+    config.max_rules = 8;
+    config.max_policies = 8;
     config.max_casts = 8;
     config.max_operators = 8;
     config.max_operator_families = 8;

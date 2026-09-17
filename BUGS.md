@@ -11,10 +11,12 @@ interval index-navigation,
 checkpoint-maintenance capacity and publication handoff, concurrent-harness
 port, integration-scratch, accepted-definition list, and statement-width
 audits have no external blocker; their fixes are qualified in the
-implementation and regression suites. The catalog-version pool audit likewise
-found no external blocker: the per-object table-definition, statistics, and
-routine-dependency ceiling is startup-configurable and covered by savepoint,
-exact-memory, and cold-recovery regressions.
+implementation and regression suites. The catalog-version and stored-query
+dependency audits likewise found no external blocker: table definitions,
+statistics, and dependency images use startup-sized pools, the shared
+per-object dependency ceiling is configurable, and savepoint, exact-memory,
+configured-exhaustion, checkpoint-retry, and cold-recovery regressions cover
+them.
 The row-version and spill-generation audit also found no external blocker:
 both former eight-entry ceilings are startup-configurable, fully accounted,
 and covered across exhaustion, reuse, checkpoint publication, and empty-cache

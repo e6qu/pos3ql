@@ -124,6 +124,9 @@ pub struct Config {
     /// Unsummarized logical ranges retained for each BRIN index. The backing
     /// storage is reserved for every index at startup.
     pub max_brin_unsummarized_ranges_per_index: usize,
+    /// Catalog objects referenced by one stored query. Entry storage for
+    /// every committed and transaction-private image is reserved at startup.
+    pub max_stored_query_dependencies_per_object: usize,
     /// Fixed number of ordinary view catalog slots.
     pub max_views: usize,
     /// Fixed number of materialized-view catalog slots. Their backing tables
@@ -370,6 +373,7 @@ impl Config {
             max_extended_statistics: 256,
             max_extended_statistics_explicit: false,
             max_brin_unsummarized_ranges_per_index: 64,
+            max_stored_query_dependencies_per_object: 64,
             max_views: 32,
             max_materialized_views: 32,
             max_routines: 32,
@@ -731,6 +735,10 @@ impl Config {
                 }
                 "max_brin_unsummarized_ranges_per_index" => {
                     config.max_brin_unsummarized_ranges_per_index =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_stored_query_dependencies_per_object" => {
+                    config.max_stored_query_dependencies_per_object =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_views" => {
@@ -1334,6 +1342,17 @@ impl Config {
                 ),
             ));
         }
+        if config.max_stored_query_dependencies_per_object == 0
+            || config.max_stored_query_dependencies_per_object > usize::from(u8::MAX)
+        {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "max_stored_query_dependencies_per_object must be between 1 and {}",
+                    u8::MAX
+                ),
+            ));
+        }
         for (name, capacity) in [
             ("max_schemas", config.max_schemas),
             ("max_collations", config.max_collations),
@@ -1705,6 +1724,7 @@ max_locks_per_transaction = 96
 max_replication_slots = 12
 max_subscriptions = 7
 max_rules = 19
+max_stored_query_dependencies_per_object = 73
 max_databases = 48
 max_schemas = 200
 max_sequences = 300
@@ -1741,6 +1761,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_replication_slots, 12);
         assert_eq!(c.max_subscriptions, 7);
         assert_eq!(c.max_rules, 19);
+        assert_eq!(c.max_stored_query_dependencies_per_object, 73);
         assert_eq!(c.max_databases, 48);
         assert_eq!(c.max_schemas, 200);
         assert_eq!(c.max_sequences, 300);
@@ -1900,6 +1921,8 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_ddl_per_transaction = 0\n").is_err());
         assert!(Config::parse("max_ddl_per_transaction = 257\n").is_err());
         assert!(Config::parse("max_rules = 0\n").is_err());
+        assert!(Config::parse("max_stored_query_dependencies_per_object = 0\n").is_err());
+        assert!(Config::parse("max_stored_query_dependencies_per_object = 256\n").is_err());
         assert!(Config::parse("max_tables = 0\n").is_err());
         assert!(Config::parse("max_databases = 2\n").is_err());
         assert!(Config::parse("max_schemas = 2\n").is_err());
@@ -2104,7 +2127,7 @@ sql_arena_bytes = 4096
     }
 
     #[test]
-    fn policy_catalog_capacity_is_independent_and_exactly_budgeted() {
+    fn policy_catalog_capacity_budgets_policy_and_dependency_pools() {
         let defaults = Config::parse("max_tables = 7\n").unwrap();
         assert_eq!(defaults.max_policies, 256);
         let mut larger = defaults.clone();
@@ -2113,6 +2136,8 @@ sql_arena_bytes = 4096
             crate::storage::Storage::extra_budget_bytes(&larger)
                 - crate::storage::Storage::extra_budget_bytes(&defaults),
             41 * core::mem::size_of::<crate::storage::PolicyDef>()
+                + crate::storage::stored_query_dependency_budget_bytes(&larger)
+                - crate::storage::stored_query_dependency_budget_bytes(&defaults)
         );
         assert_eq!(
             Config::parse("max_policies = 1025\n").unwrap().max_policies,

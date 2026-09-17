@@ -10539,7 +10539,9 @@ impl Engine {
         }
         let insert_event = event == crate::storage::RewriteEvent::Insert;
         let mut original_filter: Option<&Expr<'a>> = None;
-        for (_, rule) in storage.firing_rules_for(target, event, txn.replication_apply, txn.txid) {
+        for (rule_slot, rule) in
+            storage.firing_rules_for(target, event, txn.replication_apply, txn.txid)
+        {
             let definition = rule.definition_for(txn.txid);
             if definition.mode != crate::storage::RewriteMode::Instead
                 || definition.condition.is_none()
@@ -10572,7 +10574,7 @@ impl Engine {
                 storage,
                 txn.txid,
                 path,
-                &definition.dependencies,
+                storage.rule_dependencies(rule_slot, txn.txid),
                 arena,
                 params,
                 Some(&sequence::SeqEval::new(
@@ -10647,7 +10649,9 @@ impl Engine {
                         .as_str()
                         .cmp(right.definition_for(txn.txid).name.as_str())
                 });
-            let Some((_, rule)) = selected else { break };
+            let Some((rule_slot, rule)) = selected else {
+                break;
+            };
             let definition = rule.definition_for(txn.txid);
             last_name = Some(definition.name);
             if let Err(error) = txn.enter_rule(rule.oid(), relation.name) {
@@ -10675,7 +10679,7 @@ impl Engine {
                             storage,
                             txn.txid,
                             path,
-                            &definition.dependencies,
+                            storage.rule_dependencies(rule_slot, txn.txid),
                             arena,
                             params,
                             Some(&sequence::SeqEval::new(
@@ -10711,7 +10715,7 @@ impl Engine {
                         storage,
                         txn.txid,
                         path,
-                        &definition.dependencies,
+                        storage.rule_dependencies(rule_slot, txn.txid),
                         arena,
                         params,
                         Some(&sequence::SeqEval::new(
@@ -19045,27 +19049,31 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     })? as u16
                 };
             }
-            storage.replay_set_policy(crate::storage::PolicySpec {
-                name: crate::storage::SqlName::parse(name)?,
-                table: table_slot,
-                command: crate::storage::PolicyCommandKind::from_code(command).ok_or_else(
-                    || {
-                        sql_err!(
-                            sqlstate::DATA_EXCEPTION,
-                            "journal policy has invalid command"
-                        )
+            let dependencies =
+                storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
+            storage.replay_set_policy(
+                crate::storage::PolicySpec {
+                    name: crate::storage::SqlName::parse(name)?,
+                    table: table_slot,
+                    command: crate::storage::PolicyCommandKind::from_code(command).ok_or_else(
+                        || {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "journal policy has invalid command"
+                            )
+                        },
+                    )?,
+                    permissive,
+                    definition: crate::storage::PolicyDefinition {
+                        roles: crate::storage::PolicyRoles::from_slice(&role_slots[..role_count])?,
+                        using: using.map(crate::storage::policy_expression).transpose()?,
+                        with_check: with_check
+                            .map(crate::storage::policy_expression)
+                            .transpose()?,
                     },
-                )?,
-                permissive,
-                definition: crate::storage::PolicyDefinition {
-                    roles: crate::storage::PolicyRoles::from_slice(&role_slots[..role_count])?,
-                    using: using.map(crate::storage::policy_expression).transpose()?,
-                    with_check: with_check
-                        .map(crate::storage::policy_expression)
-                        .transpose()?,
-                    dependencies: dependencies.materialize()?,
                 },
-            })?;
+                dependencies,
+            )?;
         }
         WalOp::DropPolicy {
             schema,
@@ -19718,8 +19726,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     action_count,
                     returning_action,
                     creation_path,
-                    dependencies,
                 },
+                dependencies,
             )?;
         }
         WalOp::DropRule {

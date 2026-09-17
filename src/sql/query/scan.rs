@@ -174,7 +174,7 @@ pub(crate) fn plan_row_security<'a>(
         .map_err(|_| arena_full())?;
     let mut count = 0usize;
     let mut permissive_always = false;
-    for (_, policy) in storage.policies_for_table(table, txid) {
+    for (slot, policy) in storage.policies_for_table(table, txid) {
         if !policy.command.applies_to(command) {
             continue;
         }
@@ -202,7 +202,7 @@ pub(crate) fn plan_row_security<'a>(
                         expression,
                         storage,
                         txid,
-                        &policy_definition.dependencies,
+                        storage.policy_dependencies(slot, txid),
                         arena,
                     )?,
                     permissive: policy.permissive,

@@ -5353,7 +5353,7 @@ mod tests {
         config.large_object_pages = 64;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5449,7 +5449,7 @@ mod tests {
         config.table_rows = 256;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;

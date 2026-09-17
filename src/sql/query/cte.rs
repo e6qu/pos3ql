@@ -51,7 +51,7 @@ pub(crate) fn expand_stored_query<'a>(
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     expand_ctes_with_path(
@@ -76,7 +76,7 @@ pub(crate) fn expand_stored_query_exec<'a>(
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
@@ -106,7 +106,7 @@ pub(crate) fn expand_stored_expression<'a>(
     expression: &'a Expr<'a>,
     storage: &Storage,
     txid: u32,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
     subst_expr(
@@ -135,7 +135,7 @@ fn expand_ctes_with_path<'a>(
     storage: &Storage,
     txid: u32,
     path: Option<crate::storage::PathContext>,
-    dependencies: Option<&crate::storage::StoredQueryDependencies>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'_>>,
     depth: u32,
     authorization_role: Option<u16>,
     arena: &'a Arena,
@@ -322,7 +322,7 @@ pub(crate) fn expand_stored_statement_exec<'a>(
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
@@ -350,7 +350,7 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
@@ -390,7 +390,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
@@ -1143,7 +1143,7 @@ fn expand_stored_statement_with_transition<'a>(
     storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
@@ -1543,7 +1543,7 @@ fn with_exec_context<'a, 's, 'e, R>(
     sequences: Option<&'e dyn SequenceAccess>,
     depth: u32,
     path: Option<crate::storage::PathContext>,
-    dependencies: Option<&'s crate::storage::StoredQueryDependencies>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
     authorization_role: Option<u16>,
     root_references: impl Fn(&str) -> usize,
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'e>) -> Result<R, SqlError>,
@@ -1849,7 +1849,7 @@ pub(super) fn expand_set_tree_exec<'a>(
 
 pub(super) struct StoredExecutionContext<'storage, 'params, 'a> {
     path: crate::storage::PathContext,
-    dependencies: &'storage crate::storage::StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'storage>,
     params: &'params [Datum<'a>],
     sequences: Option<&'params dyn SequenceAccess>,
 }
@@ -1857,7 +1857,7 @@ pub(super) struct StoredExecutionContext<'storage, 'params, 'a> {
 impl<'storage, 'params, 'a> StoredExecutionContext<'storage, 'params, 'a> {
     pub(super) fn new(
         path: crate::storage::PathContext,
-        dependencies: &'storage crate::storage::StoredQueryDependencies,
+        dependencies: crate::storage::StoredQueryDependencyView<'storage>,
         params: &'params [Datum<'a>],
         sequences: Option<&'params dyn SequenceAccess>,
     ) -> Self {
@@ -1976,7 +1976,7 @@ struct Subst<'c, 'a, 's, 'e> {
     /// are rewritten fully qualified under it, so the surrounding statement's
     /// path cannot re-bind them. `None` at the statement level.
     path: Option<crate::storage::PathContext>,
-    dependencies: Option<&'s crate::storage::StoredQueryDependencies>,
+    dependencies: Option<crate::storage::StoredQueryDependencyView<'s>>,
     /// Privilege identity inherited while expanding a stored view body.
     /// `None` means the current effective role at the statement boundary.
     authorization_role: Option<u16>,

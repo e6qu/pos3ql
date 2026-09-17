@@ -114,6 +114,11 @@ fn vopr_config(seed: u64) -> Config {
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.max_tables = 4;
+    config.max_views = 4;
+    config.max_materialized_views = 4;
+    config.max_routines = 4;
+    config.max_rules = 4;
+    config.max_policies = 4;
     // Far below the live row count the workload sustains (hundreds): the
     // overlay must constantly shed entries and serve entry-less rows from
     // the bucket, or nothing here passes.

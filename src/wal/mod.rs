@@ -263,7 +263,7 @@ fn append_stored_dependency_name(buffer: &mut FixedBuf, name: &str) -> bool {
 /// variant's stack footprint.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WalStoredQueryDependencies<'a> {
-    Captured(&'a StoredQueryDependencies),
+    Captured(crate::storage::StoredQueryDependencyView<'a>),
     Encoded(&'a [u8]),
 }
 
@@ -320,7 +320,10 @@ impl WalStoredQueryDependencies<'_> {
     #[inline(never)]
     pub(crate) fn materialize(self) -> Result<StoredQueryDependencies, SqlError> {
         match self {
-            Self::Captured(dependencies) => Ok(*dependencies),
+            Self::Captured(dependencies) => Ok(StoredQueryDependencies::from_recovery_view(
+                dependencies,
+                dependencies.entries().len().max(1),
+            )),
             Self::Encoded(bytes) => decode_stored_query_dependencies(bytes).ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -5914,7 +5917,7 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     let has_columns = payload[0] == 0xff;
     let count = payload[has_columns as usize] as usize;
     let mut at = if has_columns { 2 } else { 1 };
-    let mut dependencies = StoredQueryDependencies::EMPTY;
+    let mut dependencies = StoredQueryDependencies::with_recovery_limit(count.max(1));
     for _ in 0..count {
         let class = DependencyClass::from_code(payload[at])?;
         at += 1;
@@ -11933,7 +11936,7 @@ mod tests {
             .unwrap();
         let mut budget = crate::mem::budget::Budget::new(1024);
         let mut encoded = FixedBuf::new(&mut budget, "wal dependency test", 256).unwrap();
-        assert!(WalStoredQueryDependencies::Captured(&dependencies).append(&mut encoded));
+        assert!(WalStoredQueryDependencies::Captured(dependencies.view()).append(&mut encoded));
         assert_eq!(
             WalStoredQueryDependencies::Encoded(encoded.readable())
                 .materialize()
@@ -12888,7 +12891,7 @@ mod tests {
                 role_count: 1,
                 using: Some("tenant = 'reader'"),
                 with_check: Some("tenant = current_user"),
-                dependencies: WalStoredQueryDependencies::Captured(&dependencies),
+                dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         ));
         let Some(WalOp::SetPolicy {
@@ -12922,7 +12925,7 @@ mod tests {
                 security_invoker: true,
                 security_barrier: 1,
                 check_option: 2,
-                dependencies: WalStoredQueryDependencies::Captured(&dependencies),
+                dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
             },
         ));
         let Some(WalOp::CreateView {
@@ -14096,7 +14099,7 @@ mod tests {
         let operation = WalOp::CreateRoutine {
             definition: &definition,
             dependencies: WalStoredQueryDependencies::Captured(
-                &crate::storage::StoredQueryDependencies::EMPTY,
+                crate::storage::StoredQueryDependencies::EMPTY.view(),
             ),
         };
         let mut budget = Budget::new(4096);
@@ -14238,7 +14241,7 @@ mod tests {
         let operation = WalOp::CreateRoutine {
             definition: &definition,
             dependencies: WalStoredQueryDependencies::Captured(
-                &crate::storage::StoredQueryDependencies::EMPTY,
+                crate::storage::StoredQueryDependencies::EMPTY.view(),
             ),
         };
         let mut budget = Budget::new(128 << 10);

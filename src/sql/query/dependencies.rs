@@ -92,7 +92,7 @@ pub(super) fn collect(
     arena: &Arena,
 ) -> Result<StoredQueryDependencies, SqlError> {
     let select = crate::sql::parser::parse_query(sql, arena)?;
-    let mut dependencies = StoredQueryDependencies::EMPTY;
+    let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
     collect_select(
         select,
         storage,
@@ -112,7 +112,7 @@ pub(super) fn collect_routine_program(
     path: PathContext,
     arena: &Arena,
 ) -> Result<StoredQueryDependencies, SqlError> {
-    let mut dependencies = StoredQueryDependencies::EMPTY;
+    let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
     for step in program.preceding {
         if let super::RoutinePrelude::Statement(statement) = step {
             collect_statement(
@@ -165,7 +165,7 @@ pub(super) fn collect_rule_actions(
     arena: &Arena,
     transition: &dyn ColTypeResolver,
 ) -> Result<StoredQueryDependencies, SqlError> {
-    let mut dependencies = StoredQueryDependencies::EMPTY;
+    let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
     for action in actions {
         collect_statement(
             action.statement,
@@ -187,10 +187,10 @@ pub(super) fn collect_dml_input(
     arena: &Arena,
 ) -> Result<(StoredQueryDependencies, StoredQueryDependencies), SqlError> {
     let context = CollectionContext::ordinary(&path);
-    let mut dependencies = StoredQueryDependencies::EMPTY;
+    let mut dependencies = storage.empty_stored_query_dependencies(arena)?;
     collect_statement(statement, storage, txid, &mut dependencies, arena, context)?;
 
-    let mut sources = StoredQueryDependencies::EMPTY;
+    let mut sources = storage.empty_stored_query_dependencies(arena)?;
     match statement {
         Stmt::Insert(insert) => {
             if let Some(select) = insert.select {
@@ -1431,7 +1431,7 @@ pub(super) fn stored_routine_dependency_for_call(
     variadic: bool,
     storage: &Storage,
     txid: u32,
-    dependencies: &StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
 ) -> Result<Option<StoredQueryDependency>, SqlError> {
     let (referenced_schema, referenced_name) = name.split_once('.').unwrap_or(("", name));
     let mut candidates = dependencies.entries().iter().copied().filter(|dependency| {
@@ -1519,7 +1519,7 @@ pub(super) fn stored_operator_dependency_for_call(
     args: &[&Expr<'_>],
     storage: &Storage,
     txid: u32,
-    dependencies: &StoredQueryDependencies,
+    dependencies: crate::storage::StoredQueryDependencyView<'_>,
 ) -> Result<Option<StoredQueryDependency>, SqlError> {
     let Some((schema, operator_name)) = crate::sql::ast::catalog_operator_call(name) else {
         return Ok(None);

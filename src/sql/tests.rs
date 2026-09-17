@@ -12607,7 +12607,7 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     );
     drop(engine);
 
-    let mut recovered_budget = Budget::new(1 << 28);
+    let mut recovered_budget = Budget::new(1 << 29);
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     assert_eq!(
         recovered
@@ -12629,7 +12629,7 @@ fn logical_replication_slot_survives_wal_and_checkpoint_recovery_body() {
     drop(recovered);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut checkpoint_budget = Budget::new(1 << 28);
+    let mut checkpoint_budget = Budget::new(1 << 29);
     let mut checkpoint_recovered = Engine::new(&config, &mut checkpoint_budget).unwrap();
     let output = run_with(
         &mut checkpoint_recovered,
@@ -30111,6 +30111,182 @@ fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
 }
 
 #[test]
+fn configured_stored_query_dependency_pool_crosses_old_inline_limit_and_recovers_cold() {
+    use core::fmt::Write as _;
+
+    const DEPENDENCIES: usize = 70;
+
+    let mut config = test_config("stored-query-dependency-pool");
+    config.max_connections = 1;
+    config.max_tables = 64;
+    config.max_routines = 8;
+    config.max_rules = 4;
+    config.max_policies = 2;
+    config.max_ddl_per_transaction = 96;
+    config.max_stored_query_dependencies_per_object = DEPENDENCIES;
+    config.table_rows = 8;
+    config.txn_rows = 128;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.checkpoint_manifest_bytes = 2 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("stored-query-dependency-pool-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 73);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for first in (0..64).step_by(16) {
+        let mut tables = String::new();
+        for dependency in first..(first + 16).min(64) {
+            writeln!(
+                tables,
+                "CREATE TABLE pooled_dependency_{dependency}(value integer); \
+                 INSERT INTO pooled_dependency_{dependency} VALUES ({dependency});"
+            )
+            .unwrap();
+        }
+        let created = run_with_arena_bytes(&mut engine, &mut budget, &tables, 2 << 20);
+        assert!(
+            !message_types(&created).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let mut setup = String::new();
+    for dependency in 0..6 {
+        writeln!(
+            setup,
+            "CREATE FUNCTION pooled_dependency_helper_{dependency}() RETURNS integer \
+             LANGUAGE SQL RETURN {dependency};"
+        )
+        .unwrap();
+    }
+    let mut main_definition = String::from(
+        "CREATE FUNCTION pooled_dependencies() RETURNS bigint LANGUAGE SQL BEGIN ATOMIC SELECT \
+         pooled_dependency_helper_0() + pooled_dependency_helper_1() + \
+         pooled_dependency_helper_2() + pooled_dependency_helper_3() + \
+         pooled_dependency_helper_4() + pooled_dependency_helper_5() FROM ",
+    );
+    for dependency in 0..64 {
+        if dependency != 0 {
+            main_definition.push_str(", ");
+        }
+        write!(main_definition, "pooled_dependency_{dependency}").unwrap();
+    }
+    main_definition.push_str(" LIMIT 1; END");
+    setup.push_str(&main_definition);
+    let created = run_with_arena_bytes(&mut engine, &mut budget, &setup, 2 << 20);
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let routine_slot = engine
+        .storage
+        .routine_slot_by_declared_signature("public", "pooled_dependencies", &[], 0)
+        .unwrap();
+    assert_eq!(
+        engine
+            .storage
+            .routine_dependencies_for(routine_slot, 0)
+            .entries()
+            .len(),
+        DEPENDENCIES
+    );
+    let guarded_replacement = format!(
+        "BEGIN; {}; ROLLBACK",
+        main_definition.replacen("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1)
+    );
+    let guarded = run_with_fixed_memory(&mut engine, &budget, &guarded_replacement, 2 << 20);
+    assert!(
+        !message_types(&guarded).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&guarded)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pooled_dependencies()",
+        )),
+        ["15"]
+    );
+
+    let helper = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION pooled_dependency_helper_6() RETURNS integer \
+         LANGUAGE SQL RETURN 6",
+    );
+    assert!(!message_types(&helper).contains(&b'E'));
+    let mut replacement = String::from(
+        "CREATE OR REPLACE FUNCTION pooled_dependencies() RETURNS bigint LANGUAGE SQL \
+         BEGIN ATOMIC SELECT pooled_dependency_helper_0() + pooled_dependency_helper_1() + \
+         pooled_dependency_helper_2() + pooled_dependency_helper_3() + \
+         pooled_dependency_helper_4() + pooled_dependency_helper_5() + \
+         pooled_dependency_helper_6() FROM ",
+    );
+    for dependency in 0..64 {
+        if dependency != 0 {
+            replacement.push_str(", ");
+        }
+        write!(replacement, "pooled_dependency_{dependency}").unwrap();
+    }
+    replacement.push_str(" LIMIT 1; END");
+    let exhausted = run_with_arena_bytes(&mut engine, &mut budget, &replacement, 2 << 20);
+    let exhausted = String::from_utf8_lossy(&exhausted);
+    assert!(exhausted.contains("54000"), "{exhausted}");
+    assert!(
+        exhausted.contains("more than 70 catalog objects"),
+        "{exhausted}"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pooled_dependencies()",
+        )),
+        ["15"]
+    );
+
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
+    assert!(engine.checkpoint().is_err());
+    namespace.borrow_mut().faults.ambiguous_put_per_mille = 0;
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let routine_slot = cold
+        .storage
+        .routine_slot_by_declared_signature("public", "pooled_dependencies", &[], 0)
+        .unwrap();
+    assert_eq!(
+        cold.storage
+            .routine_dependencies_for(routine_slot, 0)
+            .entries()
+            .len(),
+        DEPENDENCIES
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT pooled_dependencies()",
+        )),
+        ["15"]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn sql_standard_routine_dependencies_enforce_drop_lifecycle() {
     let mut budget = Budget::new(1 << 28);
     let mut engine =
@@ -33205,7 +33381,7 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
     config.max_tables = 16;
     config.max_routines = 16;
     config.max_triggers = 16;
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -41336,7 +41512,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     config.object_store_bucket = format!("parameterized-range-join-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 29);
+    let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -41377,7 +41553,7 @@ fn parameterized_range_join_reads_cold_object_index_generations() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut replay_budget = Budget::new(1 << 29);
+    let mut replay_budget = Budget::new(1 << 30);
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
     let durable_slot = replayed
         .storage
@@ -52026,7 +52202,7 @@ fn startup_sized_policy_catalog_executes_above_old_cluster_and_table_bounds() {
     config.wal_upload_sync = true;
     config.object_store_bucket = format!("policy-catalog-capacity-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(512 << 20);
+    let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -52085,7 +52261,7 @@ fn startup_sized_policy_catalog_executes_above_old_cluster_and_table_bounds() {
     assert!(engine.checkpoint().unwrap());
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut cold_budget = Budget::new(512 << 20);
+    let mut cold_budget = Budget::new(1 << 30);
     let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
     let output = run_with_arena_bytes(
         &mut recovered,
@@ -53435,7 +53611,7 @@ fn startup_sized_metadata_catalogs_exhaust_and_survive_object_cold_recovery() {
 fn brin_without_a_range_reader_retains_the_authoritative_scan() {
     let mut config = test_config("brin-authoritative-fallback");
     config.temporary_spill_bytes = 4 << 20;
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -55468,7 +55644,7 @@ fn replica_identity_selection_survives_checkpoint_and_cold_restart() {
 fn joins_are_not_capped_at_eight_edges() {
     let mut config = test_config("wide-join");
     config.max_tables = 16;
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for table in 0..10 {
         let output = run_with(
@@ -61314,7 +61490,7 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     }
 
     let config = test_config("pgoutput-apply");
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -61762,7 +61938,7 @@ fn streamed_pgoutput_and_skip_share_the_exact_durable_frontier() {
     }
 
     let config = test_config("streamed-pgoutput-skip");
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -62001,7 +62177,7 @@ fn pgoutput_root_relation_apply_routes_moves_and_deletes_partition_rows() {
     }
 
     let config = test_config("pgoutput-partition-root-apply");
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(1 << 28);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -64331,7 +64507,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     }
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -64365,7 +64541,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut full_budget = Budget::new(1 << 28);
+    let mut full_budget = Budget::new(1 << 29);
     let mut full = Engine::new(&config, &mut full_budget).unwrap();
     let before_full = full.storage.block_io_stats();
     let full_result = run_with(
@@ -64388,7 +64564,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
     drop(full);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut selective_budget = Budget::new(1 << 28);
+    let mut selective_budget = Budget::new(1 << 29);
     let mut selective = Engine::new(&config, &mut selective_budget).unwrap();
     let before_plan = selective.storage.block_io_stats();
     let plan = data_rows(&run_with(
@@ -65666,7 +65842,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     config.max_tables = 16;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut connection_a = TxnState::new(&mut budget, 256).unwrap();
     let mut connection_b = TxnState::new(&mut budget, 256).unwrap();
@@ -65750,7 +65926,7 @@ fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_bod
     // Lose both local durability and every cache. The manifest plus uploaded
     // WAL segments in the provider-neutral object store are the authority.
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted_budget = Budget::new(1 << 29);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     for name in [
         "checkpoint_base",

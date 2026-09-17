@@ -139,6 +139,15 @@ storage. RAM and local disk are bounded, disposable caches.
   stride; constraint kinds and partition-trigger clones occupy disjoint OID
   bands. Finite index/trigger generation ranges reject exhaustion before
   installation, including replay, rather than saturating or failing on reads.
+- Statement breadth has one 64-item boundary across simple and extended
+  protocol parameters, CTEs, row locks, window definitions, `ALTER TABLE`
+  actions, `JOIN ... USING`, aggregates, scalar subqueries, set leaves, and
+  transient record shapes. Window partition and ordering lists each retain
+  their full 64 items. Parse notices cannot be silently dropped, and every
+  over-boundary path reports SQLSTATE `54000`. Planning and `EXPLAIN` cover the
+  same accepted joins and set trees from statement-arena storage rather than a
+  narrower inline array. Exact-boundary execution and complete plans are
+  qualified both live and after empty-cache object recovery.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those

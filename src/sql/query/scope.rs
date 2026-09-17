@@ -24,7 +24,7 @@ use super::{
 
 /// Upper bound on distinct USING/NATURAL-merged columns across a join tree
 /// (chained merges of the same name allocate a fresh entry per join).
-pub const MAX_MERGED_COLUMNS: usize = 32;
+pub const MAX_MERGED_COLUMNS: usize = crate::storage::MAX_COLUMNS;
 
 fn validate_table_sample(
     storage: &Storage,

@@ -13427,6 +13427,248 @@ fn maximum_definition_lists_survive_wal_checkpoint_and_cold_recovery() {
 }
 
 #[test]
+fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
+    const WIDTH: usize = crate::sql::parser::MAX_LIST;
+
+    let mut config = test_config("maximum-statement-width");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("maximum-statement-width-{}", std::process::id());
+    config.max_tables = 8;
+    config.table_rows = 128;
+    config.max_locks_per_transaction = WIDTH * 2;
+    config.wal_bytes = 8 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let column_definitions = (0..WIDTH)
+        .map(|index| format!("column_{index} integer"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let add_columns = (0..WIDTH)
+        .map(|index| format!("ADD COLUMN column_{index} integer"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let column_names = (0..WIDTH)
+        .map(|index| format!("column_{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let values = (0..WIDTH)
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let expected_columns = (0..WIDTH)
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join("|");
+
+    let setup = format!(
+        "CREATE TABLE statement_width_left (); \
+         ALTER TABLE statement_width_left {add_columns}; \
+         CREATE TABLE statement_width_right ({column_definitions}); \
+         INSERT INTO statement_width_left VALUES ({values}); \
+         INSERT INTO statement_width_right VALUES ({values}); \
+         CREATE TABLE statement_lock_source (value integer); \
+         INSERT INTO statement_lock_source VALUES (1)"
+    );
+
+    let ctes = (0..WIDTH)
+        .map(|index| format!("cte_{index}(value) AS (VALUES ({index}))"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let cte_query = format!("WITH {ctes} SELECT value FROM cte_{}", WIDTH - 1);
+
+    let aggregates = (0..WIDTH)
+        .map(|index| format!("count(value + {index})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let aggregate_query = format!("SELECT {aggregates} FROM (VALUES (1)) AS source(value)");
+    let expected_ones = std::iter::repeat_n("1", WIDTH)
+        .collect::<Vec<_>>()
+        .join("|");
+
+    let subqueries = (0..WIDTH)
+        .map(|index| format!("(SELECT {index})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let subquery_query = format!("SELECT {subqueries}");
+
+    let record_fields = (0..WIDTH)
+        .map(|index| format!("(ROW({index})).f1"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let record_query = format!("SELECT {record_fields}");
+
+    let window_items = (0..WIDTH)
+        .map(|index| format!("row_number() OVER window_{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let window_definitions = (0..WIDTH)
+        .map(|index| format!("window_{index} AS ()"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let window_query = format!(
+        "SELECT {window_items} FROM (VALUES (1)) AS source(value) WINDOW {window_definitions}"
+    );
+
+    let window_key_query = format!(
+        "SELECT row_number() OVER (PARTITION BY {column_names} ORDER BY {column_names}) \
+         FROM (VALUES ({values})) AS source({column_names})"
+    );
+
+    let set_query = (0..WIDTH)
+        .map(|index| {
+            let select = format!(
+                "SELECT {index} AS value FROM statement_lock_source AS set_left_{index} \
+                 CROSS JOIN statement_lock_source AS set_right_{index}"
+            );
+            if index == 0 {
+                select
+            } else {
+                format!("UNION ALL {select}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        + " ORDER BY value";
+
+    let joined_sources = (0..WIDTH)
+        .map(|index| {
+            if index == 0 {
+                format!("statement_lock_source AS source_{index}")
+            } else {
+                format!("CROSS JOIN statement_lock_source AS source_{index}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lock_clauses = (0..WIDTH)
+        .map(|index| format!("FOR SHARE OF source_{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lock_query = format!("SELECT 1 FROM {joined_sources} {lock_clauses}");
+    let explain_join_query = format!("EXPLAIN SELECT 1 FROM {joined_sources}");
+    let explain_set_query = format!("EXPLAIN {set_query}");
+
+    let using_query = format!(
+        "SELECT * FROM statement_width_left JOIN statement_width_right USING ({column_names})"
+    );
+    let expected_set = (0..WIDTH)
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>();
+    let queries = [
+        ("CTEs", cte_query, vec![(WIDTH - 1).to_string()]),
+        ("aggregates", aggregate_query, vec![expected_ones.clone()]),
+        ("subqueries", subquery_query, vec![expected_columns.clone()]),
+        (
+            "record shapes",
+            record_query,
+            vec![expected_columns.clone()],
+        ),
+        ("window definitions", window_query, vec![expected_ones]),
+        ("window keys", window_key_query, vec!["1".to_string()]),
+        ("set leaves", set_query, expected_set),
+        ("lock clauses", lock_query, vec!["1".to_string()]),
+        ("USING columns", using_query, vec![expected_columns]),
+    ];
+
+    let verify = |engine: &mut Engine, budget: &mut Budget, phase: &str| {
+        for (label, query, expected) in &queries {
+            let output = run_with(engine, budget, query);
+            assert_eq!(
+                data_rows(&output),
+                *expected,
+                "{phase} {label}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+
+        let join_plan = run_with(engine, budget, &explain_join_query);
+        let join_plan_rows = data_rows(&join_plan);
+        assert_eq!(
+            join_plan_rows
+                .iter()
+                .filter(|line| line.contains("Seq Scan on source_"))
+                .count(),
+            WIDTH,
+            "{phase} join EXPLAIN: {}",
+            String::from_utf8_lossy(&join_plan)
+        );
+
+        let set_plan = run_with(engine, budget, &explain_set_query);
+        let set_plan_rows = data_rows(&set_plan);
+        assert_eq!(
+            set_plan_rows
+                .iter()
+                .filter(|line| line.contains("Append"))
+                .count(),
+            WIDTH - 1,
+            "{phase} set EXPLAIN: {}",
+            String::from_utf8_lossy(&set_plan)
+        );
+        assert_eq!(
+            set_plan_rows
+                .iter()
+                .filter(|line| line.contains("Nested Loop"))
+                .count(),
+            WIDTH,
+            "{phase} set EXPLAIN: {}",
+            String::from_utf8_lossy(&set_plan)
+        );
+        assert_eq!(
+            set_plan_rows
+                .iter()
+                .filter(|line| {
+                    line.contains("Seq Scan on set_left_")
+                        || line.contains("Seq Scan on set_right_")
+                })
+                .count(),
+            WIDTH * 2,
+            "{phase} set EXPLAIN: {}",
+            String::from_utf8_lossy(&set_plan)
+        );
+    };
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup_output = run_with(&mut engine, &mut budget, &setup);
+    assert!(
+        !String::from_utf8_lossy(&setup_output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup_output)
+    );
+    verify(&mut engine, &mut budget, "live");
+    let oversized_set = (0..=WIDTH)
+        .map(|index| {
+            if index == 0 {
+                format!("SELECT {index}")
+            } else {
+                format!("UNION ALL SELECT {index}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let oversized_output = run_with(&mut engine, &mut budget, &oversized_set);
+    let oversized_text = String::from_utf8_lossy(&oversized_output);
+    assert!(oversized_text.contains("54000"), "{oversized_text}");
+    assert!(
+        oversized_text.contains("too many set-operation branches"),
+        "{oversized_text}"
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    verify(&mut cold, &mut cold_budget, "cold");
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn alter_view_rename_preserves_oid_comments_and_recovery() {
     let config = test_config("alter-view-rename");
     let mut budget = Budget::new(1 << 29);

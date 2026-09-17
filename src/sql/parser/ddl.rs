@@ -1548,7 +1548,7 @@ impl<'a> Parser<'a> {
             self.warn(stack_format!(
                 96,
                 "GLOBAL is deprecated in temporary table creation"
-            ));
+            ))?;
             Some("GLOBAL")
         } else if self.eat_ident("local")? {
             Some("LOCAL")
@@ -8070,7 +8070,7 @@ impl<'a> Parser<'a> {
             // a cast reports it once. Faithfully duplicated.
             for w in warnings_before..self.n_warnings.min(super::MAX_PARSE_WARNINGS) {
                 let again = self.warnings[w];
-                self.warn(again);
+                self.warn(again)?;
             }
             let mut not_null = false;
             let mut unique = false;

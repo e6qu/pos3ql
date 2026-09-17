@@ -30,8 +30,9 @@ use super::REPORTED_SERVER_VERSION;
 use super::respond::{MAX_RESULT_COLS, Responder, ResultFmt};
 use super::wire::{self, MsgIn, WireFull};
 
-/// Most parameters one Bind may carry.
-pub const MAX_BIND_PARAMS: usize = 32;
+/// Most parameters one Parse/Bind may carry. SQL PREPARE and the bounded
+/// parser use the same width, so the wire protocol cannot be a narrower gate.
+pub const MAX_BIND_PARAMS: usize = crate::sql::parser::MAX_LIST;
 
 /// Idle logical streams still need protocol traffic so a downstream can tell a
 /// quiet publisher from a dead connection. PostgreSQL's `k` frame carries that
@@ -2555,19 +2556,27 @@ impl Conn {
                     return ext_err(
                         &mut self.send,
                         &mut self.phase,
-                        sqlstate::SYNTAX_ERROR,
+                        e.sqlstate,
                         e.message.as_str(),
                     );
                 }
             }
             match parser.next_stmt() {
                 Ok(None) => {}
-                _ => {
+                Ok(Some(_)) => {
                     return ext_err(
                         &mut self.send,
                         &mut self.phase,
                         sqlstate::SYNTAX_ERROR,
                         "cannot insert multiple commands into a prepared statement",
+                    );
+                }
+                Err(e) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        e.sqlstate,
+                        e.message.as_str(),
                     );
                 }
             }
@@ -2578,7 +2587,8 @@ impl Conn {
                 &mut self.send,
                 &mut self.phase,
                 crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many parameters (the limit is 32)",
+                crate::stack_format!(96, "too many parameters (the limit is {})", MAX_BIND_PARAMS)
+                    .as_str(),
             );
         }
         if n_types > n_params as usize {
@@ -2776,7 +2786,12 @@ impl Conn {
                         &mut self.send,
                         &mut self.phase,
                         crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many parameters (the limit is 32)",
+                        crate::stack_format!(
+                            96,
+                            "too many parameters (the limit is {})",
+                            MAX_BIND_PARAMS
+                        )
+                        .as_str(),
                     );
                 }
             };
@@ -5130,6 +5145,163 @@ mod tests {
         message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
         message.extend_from_slice(payload);
         message
+    }
+
+    #[test]
+    fn parse_bind_and_execute_share_the_complete_statement_parameter_width() {
+        let directory =
+            std::env::temp_dir().join(format!("pos3ql-wide-bind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 128;
+        config.wal_bytes = 1 << 20;
+        config.wal_buffer_bytes = 1 << 16;
+        let mut budget = Budget::new(1 << 30);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let query = format!(
+            "SELECT {}",
+            (1..=MAX_BIND_PARAMS)
+                .map(|index| format!("${index}::integer"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"wide_statement\0");
+        parse.extend_from_slice(query.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&(MAX_BIND_PARAMS as i16).to_be_bytes());
+        for _ in 0..MAX_BIND_PARAMS {
+            parse.extend_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
+        }
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert_eq!(
+            connection.send.readable(),
+            &[wire::MSG_PARSE_COMPLETE, 0, 0, 0, 4]
+        );
+        connection.send.clear();
+
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"wide_portal\0wide_statement\0");
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&(MAX_BIND_PARAMS as i16).to_be_bytes());
+        for index in 0..MAX_BIND_PARAMS {
+            let value = index.to_string();
+            bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            bind.extend_from_slice(value.as_bytes());
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert_eq!(
+            connection.send.readable(),
+            &[wire::MSG_BIND_COMPLETE, 0, 0, 0, 4]
+        );
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"wide_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        let response = connection.send.readable();
+        assert_eq!(response[0], wire::MSG_DATA_ROW);
+        let frame_len = i32::from_be_bytes(response[1..5].try_into().unwrap()) as usize + 1;
+        let row = &response[..frame_len];
+        assert_eq!(
+            u16::from_be_bytes(row[5..7].try_into().unwrap()) as usize,
+            MAX_BIND_PARAMS
+        );
+        let mut at = 7usize;
+        for index in 0..MAX_BIND_PARAMS {
+            let len = i32::from_be_bytes(row[at..at + 4].try_into().unwrap()) as usize;
+            at += 4;
+            assert_eq!(&row[at..at + len], index.to_string().as_bytes());
+            at += len;
+        }
+        assert_eq!(at, frame_len);
+
+        connection.send.clear();
+        connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut too_wide_parse = Vec::new();
+        too_wide_parse.extend_from_slice(b"overwide_statement\0");
+        too_wide_parse
+            .extend_from_slice(format!("SELECT ${}::integer", MAX_BIND_PARAMS + 1).as_bytes());
+        too_wide_parse.push(0);
+        too_wide_parse.extend_from_slice(&0i16.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_PARSE, &too_wide_parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(
+            connection
+                .send
+                .readable()
+                .windows(5)
+                .any(|bytes| bytes == b"54000")
+        );
+
+        connection.send.clear();
+        connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut too_many = Vec::new();
+        too_many.extend_from_slice(b"overflow_portal\0wide_statement\0");
+        too_many.extend_from_slice(&0i16.to_be_bytes());
+        too_many.extend_from_slice(&((MAX_BIND_PARAMS + 1) as i16).to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_BIND, &too_many));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(
+            connection
+                .send
+                .readable()
+                .contains(&wire::MSG_ERROR_RESPONSE)
+        );
+        assert!(
+            connection
+                .send
+                .readable()
+                .windows(5)
+                .any(|bytes| bytes == b"54000")
+        );
+
+        drop(connection);
+        drop(engine);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn function_call(function: i32, arguments: &[&[u8]], binary_result: bool) -> Vec<u8> {

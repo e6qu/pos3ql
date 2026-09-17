@@ -200,6 +200,17 @@ clauses, and operator-family operator/support-function catalogs use that same
 before catalog mutation. Index key/include counts and `pg_partitioned_table`
 expose the same accepted shape after empty-cache recovery.
 
+Wide statements likewise use the parser's complete 64-item list boundary for
+simple and extended execution: Bind parameters, CTEs, row-locking clauses,
+window definitions, `ALTER TABLE` actions, `JOIN ... USING` columns, aggregate
+and scalar-subquery scratch, set-operation leaves, and anonymous record shapes
+are described, planned, executed, and explained at that width. A window may
+compose 64 partition keys with 64 ordering keys. `EXPLAIN` plan nodes live in
+the fixed statement arena rather than the worker stack, and over-boundary
+input returns SQLSTATE `54000` without dropping parse warnings or partially
+executing the statement. The maximum accepted shapes are qualified before and
+after empty-cache object recovery.
+
 Implicit index OIDs reserve the complete enforcer stride. Constraint kinds use
 disjoint catalog-local OID bands for every accepted table slot and position.
 Partition-trigger clone OIDs include the

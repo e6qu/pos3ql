@@ -21,7 +21,7 @@ use super::{
     select_into_rows, select_into_rows_recycling, sql_fail, sql_ok,
 };
 
-const MAX_SET_LEAVES: usize = 32;
+const MAX_SET_LEAVES: usize = crate::sql::parser::MAX_LIST;
 const MAX_SET_NODES: usize = MAX_SET_LEAVES * 2 - 1;
 
 struct DrySequence<'a>(&'a dyn SequenceAccess);

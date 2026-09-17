@@ -3346,8 +3346,8 @@ impl TableRef<'_> {
 }
 
 /// Upper bound on `USING (c1, ...)` column-list length (and thus on merged
-/// columns per join).
-pub const MAX_USING_COLUMNS: usize = 16;
+/// columns per join). A join can merge every column in the bounded row shape.
+pub const MAX_USING_COLUMNS: usize = crate::storage::MAX_COLUMNS;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Join<'a> {

@@ -660,6 +660,7 @@ pub(crate) fn materialized_rows<'a>(
     correlated: &'a [&'a Expr<'a>],
     base: &SubqueryValues<'a, 'a>,
     outer: Option<&dyn ColumnLookup<'a>>,
+    rank_window: Option<usize>,
 ) -> Result<MaterializedSelect<'a>, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
     let visible_collations = projected_collations(statement, scope)?;
@@ -701,7 +702,16 @@ pub(crate) fn materialized_rows<'a>(
             arena,
         )? {
             Some(ordered) => super::scan::ordered_indexed_candidates(
-                storage, scope, txid, ordered, arena, params, hooks,
+                storage,
+                scope,
+                txid,
+                ordered,
+                rank_window.filter(|_| {
+                    where_in_scan.is_none() && !statement.with_ties && statement.locking.is_empty()
+                }),
+                arena,
+                params,
+                hooks,
             )?,
             None => None,
         }
@@ -1332,7 +1342,19 @@ pub(crate) fn external_materialized_into<'a>(
             arena,
         )? {
             Some(ordered) => super::scan::ordered_indexed_candidates(
-                storage, scope, txid, ordered, arena, params, hooks,
+                storage,
+                scope,
+                txid,
+                ordered,
+                (statement.limit.is_some()
+                    && limit != u64::MAX
+                    && !statement.with_ties
+                    && statement.locking.is_empty()
+                    && plan.where_in_scan.is_none())
+                .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
+                arena,
+                params,
+                hooks,
             )?,
             None => None,
         }
@@ -1776,7 +1798,22 @@ pub(crate) fn materialized_select<'a>(
         );
     }
     let (rows, width, deferred, identities_at) = match materialized_rows(
-        storage, scope, from, txid, statement, arena, params, hooks, correlated, base, None,
+        storage,
+        scope,
+        from,
+        txid,
+        statement,
+        arena,
+        params,
+        hooks,
+        correlated,
+        base,
+        None,
+        (statement.limit.is_some()
+            && limit != u64::MAX
+            && !statement.with_ties
+            && statement.locking.is_empty())
+        .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
     ) {
         Ok(x) => x,
         Err(e) => return sql_fail(e),

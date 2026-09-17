@@ -2704,7 +2704,7 @@ fn indexed_candidates<'a>(
     let slot = scope.slots[0];
     let definition = scope.defs[0].expect("physical table has definition");
     indexed_candidates_for_plan(
-        storage, 0, slot, definition, txid, plan, None, arena, params, &NoColumns, hooks,
+        storage, 0, slot, definition, txid, plan, None, None, arena, params, &NoColumns, hooks,
     )
 }
 
@@ -2714,12 +2714,19 @@ pub(super) fn ordered_indexed_candidates<'a>(
     scope: &QueryScope<'a>,
     txid: u32,
     plan: OrderedIndexAccessPlan<'a>,
+    rank_window: Option<usize>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
     let slot = scope.slots[0];
     let definition = scope.defs[0].expect("physical table has definition");
+    let rank_window = rank_window.filter(|_| {
+        storage.current_role_slot(txid).is_some_and(|current_role| {
+            let role = scope.authorization_roles[0].map_or(current_role, usize::from);
+            !storage.row_security_applies(slot, role, txid)
+        })
+    });
     indexed_candidates_for_plan(
         storage,
         0,
@@ -2728,6 +2735,7 @@ pub(super) fn ordered_indexed_candidates<'a>(
         txid,
         plan.access,
         Some(plan),
+        rank_window,
         arena,
         params,
         &NoColumns,
@@ -2753,7 +2761,7 @@ pub(crate) fn dml_indexed_candidates<'a>(
         return Ok(None);
     };
     indexed_candidates_for_plan(
-        storage, 0, slot, definition, txid, plan, None, arena, params, &NoColumns, hooks,
+        storage, 0, slot, definition, txid, plan, None, None, arena, params, &NoColumns, hooks,
     )
 }
 
@@ -2786,6 +2794,326 @@ fn walk_posting_candidates(
     })
 }
 
+#[derive(Clone, Copy)]
+struct RankedKnnCandidate {
+    source: Option<(crate::store::BlockId, bool)>,
+    rowid: u64,
+    commit_lsn: u64,
+    distance: f64,
+    is_null: bool,
+}
+
+impl RankedKnnCandidate {
+    const EMPTY: Self = Self {
+        source: None,
+        rowid: 0,
+        commit_lsn: 0,
+        distance: 0.0,
+        is_null: false,
+    };
+}
+
+fn compare_ranked_knn(
+    left: &RankedKnnCandidate,
+    right: &RankedKnnCandidate,
+) -> core::cmp::Ordering {
+    match (left.is_null, right.is_null) {
+        (true, true) => left.rowid.cmp(&right.rowid),
+        (true, false) => core::cmp::Ordering::Greater,
+        (false, true) => core::cmp::Ordering::Less,
+        (false, false) => left
+            .distance
+            .total_cmp(&right.distance)
+            .then_with(|| left.rowid.cmp(&right.rowid)),
+    }
+}
+
+fn ranked_knn_sift_down(heap: &mut [RankedKnnCandidate], mut parent: usize) {
+    loop {
+        let left = parent * 2 + 1;
+        if left >= heap.len() {
+            return;
+        }
+        let right = left + 1;
+        let child = if right < heap.len() && compare_ranked_knn(&heap[right], &heap[left]).is_gt() {
+            right
+        } else {
+            left
+        };
+        if !compare_ranked_knn(&heap[child], &heap[parent]).is_gt() {
+            return;
+        }
+        heap.swap(parent, child);
+        parent = child;
+    }
+}
+
+fn ranked_knn_offer(
+    heap: &mut [RankedKnnCandidate],
+    len: &mut usize,
+    candidate: RankedKnnCandidate,
+) {
+    if let Some(existing) = heap[..*len]
+        .iter()
+        .position(|entry| entry.rowid == candidate.rowid)
+    {
+        if compare_ranked_knn(&candidate, &heap[existing]).is_lt() {
+            heap[existing] = candidate;
+            // Rebuilding a bounded top-k heap keeps duplicate replacement
+            // simple; duplicate versions are exceptional, not the hot path.
+            for parent in (0..*len / 2).rev() {
+                ranked_knn_sift_down(&mut heap[..*len], parent);
+            }
+        }
+        return;
+    }
+    if *len < heap.len() {
+        let mut child = *len;
+        heap[child] = candidate;
+        *len += 1;
+        while child != 0 {
+            let parent = (child - 1) / 2;
+            if !compare_ranked_knn(&heap[child], &heap[parent]).is_gt() {
+                break;
+            }
+            heap.swap(child, parent);
+            child = parent;
+        }
+    } else if compare_ranked_knn(&candidate, &heap[0]).is_lt() {
+        heap[0] = candidate;
+        ranked_knn_sift_down(heap, 0);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranked_knn_candidates<'a>(
+    storage: &'a Storage,
+    table: usize,
+    slot: usize,
+    txid: u32,
+    plan: IndexAccessPlan<'a>,
+    ordered: OrderedIndexAccessPlan<'a>,
+    knn: KnnOrder<'a>,
+    origin: Datum<'a>,
+    window: usize,
+    arena: &'a Arena,
+) -> Result<Option<IndexedCandidates<'a>>, SqlError> {
+    let Some(navigation) =
+        storage
+            .value_binding_navigation(slot, plan.binding)
+            .filter(|navigation| {
+                navigation.kind == crate::store::NavigationKind::Spatial
+                    && usize::from(navigation.position) == knn.key_position
+            })
+    else {
+        return Ok(None);
+    };
+    if !storage.value_binding_durable_complete(slot, plan.binding) {
+        return Ok(None);
+    }
+    if window == 0 {
+        return Ok(Some(IndexedCandidates {
+            table,
+            index_oid: ordered.index_oid,
+            scan_executed: false,
+            index_entries: 0,
+            preserves_order: true,
+            rowids: &[],
+            columns: plan.columns,
+            n_columns: plan.n_columns,
+            expression_mask: plan.expression_mask,
+            key_types: plan.key_types,
+            include_mask: ordered.include_mask,
+            payload_mask: storage.value_binding_include_mask(slot, plan.binding),
+            keys: Some(&[]),
+            encoded_keys: &[],
+        }));
+    }
+    let origin_bounds = crate::sql::geometry::index_bounds(origin)?;
+    if !matches!(origin_bounds, crate::store::NavigationSummary::Finite(_)) {
+        return Ok(None);
+    }
+    let ranked_mark = arena.mark();
+    let Ok(heap) = arena.alloc_slice_with(window, |_| RankedKnnCandidate::EMPTY) else {
+        // A very large LIMIT remains semantically valid through the complete
+        // ordered scan; top-k navigation must not turn it into an error.
+        return Ok(None);
+    };
+    let cutoff = core::cell::Cell::new(f64::INFINITY);
+    let mut len = 0usize;
+    let mut scanned = 0usize;
+    let complete = storage.rank_value_index_binding(
+        slot,
+        plan.binding,
+        |position, summary| {
+            if position != navigation.position {
+                return true;
+            }
+            crate::sql::geometry::index_distance_lower_bound(summary, origin_bounds) <= cutoff.get()
+        },
+        |position, summary| {
+            if position == navigation.position {
+                crate::sql::geometry::index_distance_lower_bound(summary, origin_bounds)
+            } else {
+                0.0
+            }
+        },
+        |source, rowid, commit_lsn, key, _| {
+            scanned += 1;
+            if let Some(state) = storage.resident_row_state(slot, rowid)
+                && (state.committed_lsn != commit_lsn
+                    || storage
+                        .visible_row_home(slot, rowid, state, txid)?
+                        .is_none())
+            {
+                return Ok(());
+            }
+            let mut decoded = [Datum::Null; MAX_INDEX_COLS];
+            rowenc::decode(
+                key,
+                &plan.key_types[..plan.n_columns],
+                &mut decoded[..plan.n_columns],
+            )?;
+            let (distance, is_null) = match crate::sql::eval::binary(
+                BinaryOp::TextSearchPhrase,
+                decoded[knn.key_position],
+                origin,
+                false,
+                false,
+                arena,
+            )? {
+                Datum::Float8(distance) => (distance, false),
+                Datum::Null => (0.0, true),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "index ordering operator did not return double precision"
+                    ));
+                }
+            };
+            ranked_knn_offer(
+                heap,
+                &mut len,
+                RankedKnnCandidate {
+                    source,
+                    rowid,
+                    commit_lsn,
+                    distance,
+                    is_null,
+                },
+            );
+            cutoff.set(
+                if len == heap.len() && !heap[0].is_null && heap[0].distance.is_finite() {
+                    heap[0].distance
+                } else {
+                    f64::INFINITY
+                },
+            );
+            Ok(())
+        },
+    )?;
+    if !complete {
+        // SAFETY: the ranked heap and any exact-distance scratch allocated
+        // after `ranked_mark` are local to this declined optimization.
+        unsafe { arena.rewind_to(ranked_mark) };
+        return Ok(None);
+    }
+    heap[..len].sort_unstable_by(compare_ranked_knn);
+
+    let mut entry_bytes = 0usize;
+    for candidate in &heap[..len] {
+        let mut found = false;
+        let present = storage.read_ranked_value_binding_entry(
+            slot,
+            plan.binding,
+            candidate.source,
+            candidate.rowid,
+            candidate.commit_lsn,
+            |key, payload| {
+                found = true;
+                entry_bytes = entry_bytes
+                    .checked_add(key.len())
+                    .and_then(|bytes| bytes.checked_add(payload.len()))
+                    .unwrap_or(usize::MAX);
+            },
+        )?;
+        if !present || !found || entry_bytes == usize::MAX {
+            return Err(sql_err!(
+                sqlstate::IO_ERROR,
+                "ranked index candidate is missing or corrupt"
+            ));
+        }
+    }
+    let encoded = arena
+        .alloc_slice_with(entry_bytes, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    let keys = arena
+        .alloc_slice_with(len, |_| IndexKeyCandidate {
+            rowid: 0,
+            commit_lsn: 0,
+            key_at: 0,
+            key_len: 0,
+            payload_at: 0,
+            payload_len: 0,
+            knn_distance: 0.0,
+            knn_null: false,
+        })
+        .map_err(|_| arena_full())?;
+    let rowids = arena
+        .alloc_slice_with(len, |_| 0u64)
+        .map_err(|_| arena_full())?;
+    let mut entry_at = 0usize;
+    for (index, candidate) in heap[..len].iter().enumerate() {
+        let present = storage.read_ranked_value_binding_entry(
+            slot,
+            plan.binding,
+            candidate.source,
+            candidate.rowid,
+            candidate.commit_lsn,
+            |key, payload| {
+                encoded[entry_at..entry_at + key.len()].copy_from_slice(key);
+                let payload_at = entry_at + key.len();
+                encoded[payload_at..payload_at + payload.len()].copy_from_slice(payload);
+                keys[index] = IndexKeyCandidate {
+                    rowid: candidate.rowid,
+                    commit_lsn: candidate.commit_lsn,
+                    key_at: entry_at,
+                    key_len: key.len(),
+                    payload_at,
+                    payload_len: payload.len(),
+                    knn_distance: candidate.distance,
+                    knn_null: candidate.is_null,
+                };
+                entry_at = payload_at + payload.len();
+            },
+        )?;
+        if !present {
+            return Err(sql_err!(
+                sqlstate::IO_ERROR,
+                "ranked index candidate disappeared while materializing"
+            ));
+        }
+        rowids[index] = candidate.rowid;
+    }
+    debug_assert_eq!(entry_at, entry_bytes);
+    Ok(Some(IndexedCandidates {
+        table,
+        index_oid: ordered.index_oid,
+        scan_executed: true,
+        index_entries: scanned,
+        preserves_order: true,
+        rowids,
+        columns: plan.columns,
+        n_columns: plan.n_columns,
+        expression_mask: plan.expression_mask,
+        key_types: plan.key_types,
+        include_mask: ordered.include_mask,
+        payload_mask: storage.value_binding_include_mask(slot, plan.binding),
+        keys: Some(keys),
+        encoded_keys: encoded,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn indexed_candidates_for_plan<'a>(
     storage: &'a Storage,
@@ -2795,6 +3123,7 @@ fn indexed_candidates_for_plan<'a>(
     txid: u32,
     plan: IndexAccessPlan<'a>,
     ordered_plan: Option<OrderedIndexAccessPlan<'a>>,
+    rank_window: Option<usize>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     columns: &impl ColumnLookup<'a>,
@@ -3124,6 +3453,15 @@ fn indexed_candidates_for_plan<'a>(
     } else {
         None
     };
+    if plan.n_constraints == 0
+        && let (Some(window), Some((knn, origin)), Some(ordered)) =
+            (rank_window, knn_origin, ordered_plan)
+        && let Some(candidates) = ranked_knn_candidates(
+            storage, table, slot, txid, plan, ordered, knn, origin, window, arena,
+        )?
+    {
+        return Ok(Some(candidates));
+    }
     let probe_hash = hash.filter(|_| !retain_keys);
     let posting_probe = storage
         .value_binding_navigation(slot, plan.binding)
@@ -5994,6 +6332,7 @@ fn scan_source_mode<'a>(
                     scope.defs[order[depth]].expect("resolved"),
                     txid,
                     plan,
+                    None,
                     None,
                     arena,
                     params,

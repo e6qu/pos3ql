@@ -132,8 +132,9 @@ fixture uses a descending btree with `INCLUDE (payload)` and projects both key
 and payload, so its zero-fetch gate exercises durable covering-index behavior
 rather than only key decoding. The GiST and SP-GiST K-nearest-neighbor fixtures
 likewise carry their projected identifier and payload in the immutable index
-generation; their warm and cold gates reject both an added Sort and any base
-tuple fetch. The
+generation; their warm and cold performance gates reject an added Sort or a
+base-tuple fetch, while the cold-object correctness regression rejects
+complete-generation reads for finite limits. The
 ungrouped durable shape is two PUTs per transaction: an immutable journal
 object and a compare-and-swap commit-head update.
 
@@ -159,14 +160,16 @@ probes have the same warm and empty-cache access-path gates. Built-in geometric
 GiST and SP-GiST classes now provide PostgreSQL-compatible `<-> point` ordering over
 compact immutable keys, including covering scans. Geometric predicates now
 prune immutable bounding-box trees; the suite records their warm and cold
-point-in-box workloads before nearest-neighbor probes warm the complete key
-generation. Three-level fixed-allocation regressions and eight-class cold-read
-bounds qualify navigation without a timing claim. Network, range, full-text,
-and GIN posting navigation are now implemented; ranked nearest-neighbor
-traversal remains.
-The known structural limits remain global query serialization,
-ranked nearest-neighbor tree navigation,
-and the remaining per-object inline ceilings. Role, type, sequence, and ACL
+point-in-box and ranked-limit workloads independently. Three-level
+fixed-allocation regressions and cold-read bounds qualify navigation without a
+timing claim. Network, range, full-text,
+GIN posting, and ranked nearest-neighbor navigation are now implemented.
+Ranked GiST/SP-GiST limits retain only the requested window, use MVCC-safe
+overlay-aware cutoffs, and rehydrate winning covering entries without reading
+the complete generation. Residual-filter and locking shapes conservatively
+retain complete exact ordering.
+The known structural limits remain global query serialization and the
+remaining per-object inline ceilings. Role, type, sequence, and ACL
 catalog pools are startup-sized within their documented identity widths.
 Wide constraints, composites, partition definitions, and index tuples
 already share their documented SQL, WAL, checkpoint, and recovery bounds.

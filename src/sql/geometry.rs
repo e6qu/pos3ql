@@ -92,6 +92,46 @@ pub(crate) fn index_bounds_intersect(
     }
 }
 
+/// Conservative distance from a point probe to every geometry enclosed by a
+/// navigation summary. It may underestimate PostgreSQL's exact operator but
+/// must never overestimate it: ranked traversal prunes a subtree only after
+/// this lower bound is worse than the current top-k radius.
+pub(crate) fn index_distance_lower_bound(
+    bounds: crate::store::SpatialBounds,
+    origin: crate::store::SpatialBounds,
+) -> f64 {
+    use crate::store::SpatialBounds;
+    let (SpatialBounds::Finite(bounds), SpatialBounds::Finite(origin)) = (bounds, origin) else {
+        return if matches!(bounds, SpatialBounds::Empty) {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+    };
+    let [minimum_x, minimum_y, maximum_x, maximum_y] = bounds.coordinates();
+    let [x, y, end_x, end_y] = origin.coordinates();
+    if x != end_x || y != end_y {
+        return 0.0;
+    }
+    let dx = if x < minimum_x {
+        minimum_x - x
+    } else if x > maximum_x {
+        x - maximum_x
+    } else {
+        0.0
+    };
+    let dy = if y < minimum_y {
+        minimum_y - y
+    } else if y > maximum_y {
+        y - maximum_y
+    } else {
+        0.0
+    };
+    // Geometric comparisons use PostgreSQL's fuzzy epsilon. Widen the bound
+    // by that tolerance and one representable step before using it to prune.
+    (dx.hypot(dy) - EPSILON).max(0.0).next_down()
+}
+
 fn fp_zero(value: f64) -> bool {
     value.abs() <= EPSILON
 }
@@ -744,6 +784,67 @@ mod tests {
                 text: "garbage"
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn ranked_navigation_bounds_never_exceed_exact_distance() {
+        use GeometryKind::*;
+        let shapes = [
+            (Point, "(4,5)"),
+            (Box, "(7,8),(4,5)"),
+            (Polygon, "((4,5),(7,5),(4,8))"),
+            (Circle, "<(5,6),1>"),
+        ];
+        let origins = ["(0,0)", "(5,6)", "(20,-3)"];
+        let arena = Arena::new(
+            &mut crate::mem::Budget::new(1 << 20),
+            "ranked geometry navigation",
+            1 << 20,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            for &(kind, text) in &shapes {
+                let shape = Datum::Geometry { kind, text };
+                for &origin_text in &origins {
+                    let origin = Datum::Geometry {
+                        kind: Point,
+                        text: origin_text,
+                    };
+                    let Datum::Float8(exact) = crate::sql::eval::funcs::geometry::operator(
+                        "<->",
+                        &[shape, origin],
+                        &[kind.oid(), Point.oid()],
+                        &arena,
+                    )
+                    .unwrap()
+                    .unwrap() else {
+                        panic!("geometric distance must be double precision");
+                    };
+                    let lower = index_distance_lower_bound(
+                        index_bounds(shape).unwrap(),
+                        index_bounds(origin).unwrap(),
+                    );
+                    assert!(
+                        lower <= exact,
+                        "{kind:?} {text} from {origin_text}: {lower} > {exact}"
+                    );
+                }
+            }
+        });
+        assert_eq!(
+            index_distance_lower_bound(
+                crate::store::SpatialBounds::Empty,
+                crate::store::SpatialBounds::new(0.0, 0.0, 0.0, 0.0),
+            ),
+            f64::INFINITY
+        );
+        assert_eq!(
+            index_distance_lower_bound(
+                crate::store::SpatialBounds::Unbounded,
+                crate::store::SpatialBounds::new(0.0, 0.0, 0.0, 0.0),
+            ),
+            0.0
         );
     }
 }

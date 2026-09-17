@@ -515,6 +515,33 @@ impl NavigationCursor {
         intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
         visit_node: &mut impl FnMut(BlockId) -> bool,
     ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
+        self.next_inner(store, scratch, intersects, visit_node, None)
+    }
+
+    /// Visits the same prunable tree as [`Self::next`], but descends each
+    /// node's children in increasing lower-bound order. This is a bounded
+    /// depth-first branch-and-bound cursor: the ordinary `intersects` gate is
+    /// re-evaluated when a queued child is reached, so a tighter top-k radius
+    /// can discard siblings without a frontier proportional to tree width.
+    pub(crate) fn next_ranked(
+        &mut self,
+        store: &mut dyn BlockStore,
+        scratch: &mut [u8],
+        intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
+        visit_node: &mut impl FnMut(BlockId) -> bool,
+        priority: &mut impl FnMut(u8, NavigationSummary) -> f64,
+    ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
+        self.next_inner(store, scratch, intersects, visit_node, Some(priority))
+    }
+
+    fn next_inner(
+        &mut self,
+        store: &mut dyn BlockStore,
+        scratch: &mut [u8],
+        intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
+        visit_node: &mut impl FnMut(BlockId) -> bool,
+        mut priority: Option<&mut dyn FnMut(u8, NavigationSummary) -> f64>,
+    ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
         while self.count != 0 {
             self.count -= 1;
             let pending = self.pending[self.count];
@@ -578,7 +605,11 @@ impl NavigationCursor {
             }
             let mut entries = 0u64;
             let mut summary = NavigationSummary::Empty;
-            for index in (0..count).rev() {
+            let mut children = [PendingReference {
+                reference: NavigationReference::EMPTY,
+                height: None,
+            }; FANOUT];
+            for (index, child) in children.iter_mut().enumerate().take(count) {
                 let at = HEADER + index * REFERENCE;
                 let reference = NavigationReference::decode(&scratch[at..at + REFERENCE])?;
                 if kind == BlockType::ValueIndexPostingV1
@@ -590,17 +621,47 @@ impl NavigationCursor {
                     .checked_add(reference.entries)
                     .ok_or(ValueIndexError::Corrupt)?;
                 summary = summary.union(reference.summary);
-                self.pending[self.count] = PendingReference {
+                *child = PendingReference {
                     reference,
                     height: Some(height),
                 };
-                self.count += 1;
             }
             if ((pending.height.is_some() || self.root_entries_known)
                 && entries != pending.reference.entries)
                 || (pending.height.is_some() && summary != pending.reference.summary)
             {
                 return Err(ValueIndexError::Corrupt);
+            }
+            if let Some(priority) = priority.as_deref_mut() {
+                let position = self.position.ok_or(ValueIndexError::Corrupt)?;
+                let mut ranks = [0.0; FANOUT];
+                for (rank, child) in ranks.iter_mut().zip(&children).take(count) {
+                    *rank = priority(position, child.reference.summary);
+                    if rank.is_nan() {
+                        return Err(ValueIndexError::Corrupt);
+                    }
+                }
+                // FANOUT is 32. An in-place insertion sort keeps the cursor's
+                // storage independent of generation width and preserves disk
+                // order for equal lower bounds.
+                for right in 1..count {
+                    let child = children[right];
+                    let rank = ranks[right];
+                    let mut left = right;
+                    while left != 0 && ranks[left - 1].total_cmp(&rank).is_gt() {
+                        children[left] = children[left - 1];
+                        ranks[left] = ranks[left - 1];
+                        left -= 1;
+                    }
+                    children[left] = child;
+                    ranks[left] = rank;
+                }
+            }
+            // The cursor is a LIFO stack. Reverse insertion makes the lowest
+            // ranked (or first physical) child the next one visited.
+            for child in children[..count].iter().rev() {
+                self.pending[self.count] = *child;
+                self.count += 1;
             }
         }
         Ok(None)
@@ -713,6 +774,88 @@ mod tests {
             leaves += 1;
         }
         assert_eq!(leaves, 1057);
+    }
+
+    #[test]
+    fn ranked_tree_visits_nearest_leaf_first_and_tightens_without_allocation() {
+        let mut budget = Budget::new(16 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "ranked navigation", 8 << 20, 2048).unwrap();
+        let mut writer = NavigationWriter::new();
+        let mut scratch = vec![0; super::super::MAX_PAYLOAD];
+        writer.reset(0, true, false);
+        let root = crate::mem::guard::forbid_alloc(|| {
+            // Reverse physical order ensures ordinary DFS reaches the far end
+            // first; ranked sibling ordering must still choose zero.
+            for index in (0..1057u64).rev() {
+                let id = store
+                    .put(&index.to_le_bytes(), BlockType::ValueIndexData, 0)
+                    .unwrap();
+                let x = index as f64;
+                writer
+                    .append(&mut store, id, 1, SpatialBounds::new(x, 0.0, x, 0.0))
+                    .unwrap();
+            }
+            writer.finish(&mut store).unwrap()
+        });
+        let cutoff = core::cell::Cell::new(f64::INFINITY);
+        let lower = |summary| match summary {
+            SpatialBounds::Finite(bounds) => bounds.coordinates()[0],
+            SpatialBounds::Empty => f64::INFINITY,
+            _ => 0.0,
+        };
+        let before = store.reads();
+        let mut nodes = 0;
+        let mut cursor = NavigationCursor::new(root, 1057);
+        crate::mem::guard::forbid_alloc(|| {
+            let (id, entries, covering) = cursor
+                .next_ranked(
+                    &mut store,
+                    &mut scratch,
+                    &mut |position, summary| {
+                        assert_eq!(position, 0);
+                        lower(summary) <= cutoff.get()
+                    },
+                    &mut |_| {
+                        nodes += 1;
+                        true
+                    },
+                    &mut |position, summary| {
+                        assert_eq!(position, 0);
+                        lower(summary)
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(entries, 1);
+            assert!(covering);
+            let (len, kind) = store.get(&id, &mut scratch).unwrap();
+            assert_eq!(kind, BlockType::ValueIndexData);
+            assert_eq!(len, 8);
+            assert_eq!(u64::from_le_bytes(scratch[..8].try_into().unwrap()), 0);
+            cutoff.set(0.0);
+            assert!(
+                cursor
+                    .next_ranked(
+                        &mut store,
+                        &mut scratch,
+                        &mut |_, summary| lower(summary) <= cutoff.get(),
+                        &mut |_| {
+                            nodes += 1;
+                            true
+                        },
+                        &mut |_, summary| lower(summary),
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        assert_eq!(nodes, 3);
+        assert!(
+            store.reads() - before <= 4,
+            "{} reads",
+            store.reads() - before
+        );
     }
 
     #[test]

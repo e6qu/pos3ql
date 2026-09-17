@@ -7242,6 +7242,8 @@ fn select_into_rows_mode<'a>(
             )?;
             return Ok(());
         }
+        let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
+        let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
         let (rows, width, deferred, _identities_at) = materialized_rows(
             storage,
             &scope,
@@ -7254,9 +7256,12 @@ fn select_into_rows_mode<'a>(
             correlated,
             &outer_subs.base,
             outer,
+            (statement.limit.is_some()
+                && limit != u64::MAX
+                && !statement.with_ties
+                && statement.locking.is_empty())
+            .then_some(offset.saturating_add(limit).min(usize::MAX as u64) as usize),
         )?;
-        let limit = super::exec::eval_limit_pub(statement.limit, arena, params)?;
-        let offset = super::exec::eval_offset_pub(statement.offset, arena, params)?;
         // OFFSET rows flow through PostgreSQL's projection before Limit
         // discards them, so deferred items are evaluated for them too (their
         // errors surface); only rows past the offset are emitted.

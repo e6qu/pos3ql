@@ -48,6 +48,10 @@ SELECT id FROM knn_gist_rows ORDER BY shape <-> point '(0,0)', id LIMIT 3;
 SELECT id FROM knn_gist_rows ORDER BY radius <-> point '(0,0)', id LIMIT 3;
 SELECT id FROM knn_gist_rows WHERE active
  ORDER BY location <-> point '(0,0)', id LIMIT 3;
+-- A residual filter is evaluated before the limit. Implementations may use a
+-- ranked index only if filtered-out nearer rows cannot shorten the result.
+SELECT id FROM knn_gist_rows WHERE active
+ ORDER BY location <-> point '(3,0)' LIMIT 3;
 
 SELECT id FROM knn_spgist_rows ORDER BY quad <-> point '(0,0)', id LIMIT 3;
 SELECT id FROM knn_spgist_rows ORDER BY kd <-> point '(0,0)', id LIMIT 3;
@@ -59,6 +63,11 @@ PREPARE nearest_gist(point, integer) AS
 EXECUTE nearest_gist(point '(3,0)', 3);
 EXECUTE nearest_gist(point '(-3,0)', 2);
 DEALLOCATE nearest_gist;
+
+PREPARE nearest_window(point, integer, integer) AS
+    SELECT id FROM knn_gist_rows ORDER BY location <-> $1 LIMIT $2 OFFSET $3;
+EXECUTE nearest_window(point '(3,0)', 2, 1);
+DEALLOCATE nearest_window;
 
 -- These valid orders are deliberately outside the built-in ordering-operator
 -- path but must retain ordinary PostgreSQL result semantics.

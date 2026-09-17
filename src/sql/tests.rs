@@ -50261,6 +50261,117 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
 }
 
 #[test]
+fn ranked_knn_navigation_bounds_cold_object_reads_for_gist_and_spgist() {
+    let mut config = test_config("ranked-knn-navigation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 16 << 20;
+    config.wal_bytes = 32 << 20;
+    config.memtable_bytes = 32 << 20;
+    config.table_rows = 8192;
+    config.txn_rows = 16384;
+    config.value_index_rows = 16384;
+    config.max_indexes = 8;
+    config.max_value_indexes = 8;
+    config.object_store_bucket = format!("ranked-knn-navigation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut setup_session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let setup = setup_session.success(
+        &mut engine,
+        "CREATE TABLE ranked_gist(id integer, location point, payload text);
+         CREATE INDEX ranked_gist_location ON ranked_gist USING gist (location)
+             INCLUDE (id, payload);
+         CREATE TABLE ranked_spgist(id integer, location point, payload text);
+         CREATE INDEX ranked_spgist_location ON ranked_spgist
+             USING spgist (location kd_point_ops) INCLUDE (id, payload);
+         INSERT INTO ranked_gist
+             SELECT value, point(value * 100, value * 100), repeat('g', 256)
+               FROM generate_series(1,4096) source(value);
+         INSERT INTO ranked_spgist
+             SELECT value, point(value * 100, value * 100), repeat('s', 256)
+               FROM generate_series(1,4096) source(value);
+         ANALYZE ranked_gist;
+         ANALYZE ranked_spgist",
+        false,
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(setup_session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    for (table, marker) in [("ranked_gist", "g"), ("ranked_spgist", "s")] {
+        let before = cold.storage.block_io_stats();
+        let output = session.success(
+            &mut cold,
+            &format!(
+                "SELECT id, length(payload) FROM {table}
+                   ORDER BY location <-> point '(204801,204801)' LIMIT 3"
+            ),
+            false,
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["2048|256", "2049|256", "2047|256"],
+            "{marker}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        let traffic = cold.storage.block_io_stats().saturating_sub(before);
+        assert!(traffic.object_gets <= 6, "{table}: {traffic:?}");
+        assert!(traffic.object_read_bytes < 120_000, "{table}: {traffic:?}");
+    }
+
+    let prepared = data_rows(&session.success(
+        &mut cold,
+        "PREPARE ranked_window(point, integer, integer) AS
+             SELECT id FROM ranked_gist ORDER BY location <-> $1 LIMIT $2 OFFSET $3;
+         EXECUTE ranked_window(point '(204801,204801)', 3, 2);
+         DEALLOCATE ranked_window",
+        true,
+    ));
+    assert_eq!(prepared, ["2047", "2050", "2046"]);
+
+    let filtered = data_rows(&session.success(
+        &mut cold,
+        "SELECT id FROM ranked_gist WHERE id >= 2050
+           ORDER BY location <-> point '(204801,204801)' LIMIT 3",
+        false,
+    ));
+    assert_eq!(filtered, ["2050", "2051", "2052"]);
+
+    let row_security = data_rows(&session.success(
+        &mut cold,
+        "CREATE ROLE ranked_reader;
+         GRANT SELECT ON ranked_gist TO ranked_reader;
+         ALTER TABLE ranked_gist ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY ranked_visible ON ranked_gist USING (id >= 2050);
+         SET ROLE ranked_reader;
+         SELECT id FROM ranked_gist
+           ORDER BY location <-> point '(204801,204801)' LIMIT 3;
+         RESET ROLE",
+        false,
+    ));
+    assert_eq!(row_security, ["2050", "2051", "2052"]);
+
+    drop(session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
     let mut config = test_config("physical-gin-spgist-indexes");
     config.object_store_on = true;

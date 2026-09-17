@@ -682,6 +682,89 @@ impl<'a> ValueIndexReader<'a> {
         Ok(())
     }
 
+    /// Walks a navigation generation depth-first while ordering siblings by
+    /// a caller-supplied lower bound. `intersects` is evaluated again when a
+    /// queued child is reached, allowing a shrinking top-k radius to prune it.
+    /// Legacy rosters deliberately decline this optimization.
+    pub(crate) fn ranked_covering(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &ValueIndexHandle,
+        mut intersects: impl FnMut(u8, NavigationSummary) -> bool,
+        mut priority: impl FnMut(u8, NavigationSummary) -> f64,
+        mut visit: impl FnMut(BlockId, bool, u64, u64, u64, &[u8], &[u8]),
+    ) -> Result<bool, ValueIndexError> {
+        let (_, root_kind) = store.get(&handle.roster, self.roster)?;
+        if root_kind != BlockType::ValueIndexNavigationV1 {
+            return Ok(false);
+        }
+        let mut cursor = NavigationCursor::new(handle.roster, handle.entries);
+        while let Some((id, expected_entries, covering)) = cursor.next_ranked(
+            store,
+            self.roster,
+            &mut intersects,
+            &mut |_| true,
+            &mut priority,
+        )? {
+            let (len, kind) = store.get(&id, self.data)?;
+            if kind != BlockType::ValueIndexData {
+                return Err(ValueIndexError::Corrupt);
+            }
+            let mut entries = 0u64;
+            walk_data(
+                &self.data[..len],
+                covering,
+                |hash, rowid, lsn, key, payload| {
+                    entries += 1;
+                    visit(id, covering, hash, rowid, lsn, key, payload);
+                },
+            )?;
+            if entries != expected_entries {
+                return Err(ValueIndexError::Corrupt);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Re-reads one ranked candidate from its immutable leaf. Ranked scans
+    /// retain only leaf identity plus row/version identity while narrowing the
+    /// top-k set; selected key and INCLUDE bytes are copied exactly once after
+    /// the cutoff is final.
+    pub(crate) fn leaf_entry(
+        &mut self,
+        store: &mut dyn BlockStore,
+        id: BlockId,
+        covering: bool,
+        rowid: u64,
+        lsn: u64,
+        mut visit: impl FnMut(&[u8], &[u8]),
+    ) -> Result<bool, ValueIndexError> {
+        let (len, kind) = store.get(&id, self.data)?;
+        if kind != BlockType::ValueIndexData {
+            return Err(ValueIndexError::Corrupt);
+        }
+        let mut found = false;
+        let mut duplicate = false;
+        walk_data(
+            &self.data[..len],
+            covering,
+            |_, candidate_rowid, candidate_lsn, key, payload| {
+                if candidate_rowid == rowid && candidate_lsn == lsn {
+                    if found {
+                        duplicate = true;
+                    } else {
+                        found = true;
+                        visit(key, payload);
+                    }
+                }
+            },
+        )?;
+        if duplicate {
+            return Err(ValueIndexError::Corrupt);
+        }
+        Ok(found)
+    }
+
     fn walk_inner(
         &mut self,
         store: &mut dyn BlockStore,

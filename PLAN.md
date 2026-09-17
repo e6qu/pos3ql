@@ -187,6 +187,17 @@ garbage collection, and empty-cache recovery. Construction and traversal
 remain fixed-memory; legacy key generations remain readable. Qualification
 covers three-level pruning, malformed encodings, PostgreSQL's fuzzy geometry
 and non-finite values, and cold reads across every spatial class.
+Finite unfiltered GiST/SP-GiST `<-> point` limits use the same trees for
+ranked depth-first branch-and-bound traversal. Conservative point-to-box lower
+bounds order siblings and a fixed statement-arena max-heap retains only the
+`LIMIT + OFFSET` window. Committed overlays seed the cutoff, stale durable
+versions receive the normal MVCC rejection, NULLs retain PostgreSQL placement,
+and winning key/INCLUDE payloads are rehydrated from remembered leaves.
+Residual predicates, row security, locking, ties, unbounded limits, non-finite
+origins, legacy rosters, and oversized windows retain complete exact ordering.
+Three-level allocation-forbidden traversal, prepared windows, every geometric
+operator class, committed and transactional overlays, cold recovery, and
+bounded object GET/byte regressions qualify the ranked path.
 GIN array, `tsvector`, `jsonb_ops`, and `jsonb_path_ops` generations use
 dedicated immutable posting trees. Stable namespace-plus-hash token keys route
 array containment/overlap, JSON containment/existence, and exact positive
@@ -233,15 +244,6 @@ coordinate shared MVCC and locks, and pipeline object I/O while preserving
 publication order, group commit, cancellation, fairness, and explicit
 backpressure. Demonstrate useful scaling from one core through the supported
 worker limit under read-only, write-heavy, and mixed workloads.
-
-### Navigable specialized indexes
-
-Geometric, signature, interval, and GIN posting navigation is implemented.
-Unfiltered nearest-neighbor limits still materialize compact keys and need
-ranked node traversal with MVCC-safe limit and residual-filter handling.
-Preserve exact rechecks, fixed memory, rollback, publication, garbage
-collection, and cold recovery without PostgreSQL page layouts or native
-operator-class callbacks.
 
 ### Availability and operations
 

@@ -78,15 +78,17 @@ method-specific DDL/options, DML maintenance, WAL, checkpoints, cloning,
 partitions, reindexing, and empty-cache recovery share the same bounded index
 lifecycle. Built-in point, box, and polygon SP-GiST classes provide the same
 `<-> point` K-nearest-neighbor boundary. These paths evaluate immutable encoded
-keys exactly; they do not claim PostgreSQL page layout, GIN posting lists,
-PostgreSQL SP-GiST node layouts, or custom native callbacks. Geometric
+keys exactly. GIN generations extract exact lossy tokens into object-native
+posting trees and retain PostgreSQL SQL and MVCC rechecks; they do not claim
+PostgreSQL page layout or posting-list representation. None of these paths
+claims PostgreSQL SP-GiST node layouts or custom native callbacks. Geometric
 GiST/SP-GiST predicates use immutable bounding-box navigation with fixed-startup
 construction buffers, bounded traversal, exact rechecks, and covering payloads.
 Legacy generations remain readable and are upgraded by the next checkpoint.
 The durable node format and memory bounds are documented in
 [docs/index-navigation.md](docs/index-navigation.md).
-Network/range/full-text navigation, GIN posting extraction, and ranked
-nearest-neighbor node traversal remain production-roadmap work.
+Network, range, full-text, and GIN posting navigation are implemented. Ranked
+nearest-neighbor node traversal remains production-roadmap work.
 
 Catalog object introspection includes PostgreSQL 18 object identification,
 descriptions, reversible address records, search-path visibility predicates,

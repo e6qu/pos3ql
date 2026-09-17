@@ -2757,6 +2757,35 @@ pub(crate) fn dml_indexed_candidates<'a>(
     )
 }
 
+fn walk_posting_candidates(
+    storage: &Storage,
+    slot: usize,
+    binding: usize,
+    search: Datum<'_>,
+    operator: BinaryOp,
+    mut visit: impl FnMut(u64, u64) -> Result<(), SqlError>,
+) -> Result<Option<bool>, SqlError> {
+    let mut complete = true;
+    let mut error = None;
+    let probe = super::super::index_signature::posting_probe(search, operator, |token| {
+        if error.is_some() || !complete {
+            return;
+        }
+        match storage.probe_value_binding_posting(slot, binding, token, &mut visit) {
+            Ok(done) => complete = done,
+            Err(failure) => error = Some(failure),
+        }
+    });
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(match probe {
+        super::super::index_signature::PostingProbe::Never => Some(true),
+        super::super::index_signature::PostingProbe::Candidates => Some(complete),
+        super::super::index_signature::PostingProbe::Unusable => None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn indexed_candidates_for_plan<'a>(
     storage: &'a Storage,
@@ -3096,9 +3125,35 @@ fn indexed_candidates_for_plan<'a>(
         None
     };
     let probe_hash = hash.filter(|_| !retain_keys);
+    let posting_probe = storage
+        .value_binding_navigation(slot, plan.binding)
+        .filter(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+        .and_then(|navigation| {
+            let position = usize::from(navigation.position);
+            plan.constraints[position].map(|constraint| (values[0][position], constraint.operator))
+        });
+    if storage
+        .value_binding_navigation(slot, plan.binding)
+        .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+        && posting_probe.is_none()
+    {
+        return Ok(None);
+    }
     let mut count = 0usize;
     let mut entry_bytes = 0usize;
-    if let Some(hash) = probe_hash {
+    if let Some((search, operator)) = posting_probe {
+        let Some(complete) =
+            walk_posting_candidates(storage, slot, plan.binding, search, operator, |_, _| {
+                count += 1;
+                Ok(())
+            })?
+        else {
+            return Ok(None);
+        };
+        if !complete {
+            return Ok(None);
+        }
+    } else if let Some(hash) = probe_hash {
         let complete = storage.probe_value_binding(slot, plan.binding, hash, |_, _| {
             count += 1;
             Ok(())
@@ -3163,7 +3218,20 @@ fn indexed_candidates_for_plan<'a>(
     };
     let mut fill = 0usize;
     let mut entry_at = 0usize;
-    if let Some(hash) = probe_hash {
+    if let Some((search, operator)) = posting_probe {
+        let Some(complete) =
+            walk_posting_candidates(storage, slot, plan.binding, search, operator, |rowid, _| {
+                rowids[fill] = rowid;
+                fill += 1;
+                Ok(())
+            })?
+        else {
+            return Ok(None);
+        };
+        if !complete {
+            return Ok(None);
+        }
+    } else if let Some(hash) = probe_hash {
         let complete = storage.probe_value_binding(slot, plan.binding, hash, |rowid, _| {
             rowids[fill] = rowid;
             fill += 1;

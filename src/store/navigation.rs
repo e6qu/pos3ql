@@ -11,6 +11,8 @@ const PENDING: usize = 1 + (FANOUT - 1) * LEVELS;
 pub(crate) const SPATIAL_DATA_BYTES: usize = 16 * 1024;
 pub(crate) const SIGNATURE_DATA_BYTES: usize = 1024;
 pub(crate) const INTERVAL_DATA_BYTES: usize = 8 * 1024;
+pub(crate) const POSTING_DATA_BYTES: usize = 8 * 1024;
+pub(crate) const POSTING_KEY_BYTES: usize = 9;
 
 pub(crate) const INTERVAL_KEY_BYTES: usize = 15;
 const INTERVAL_HAS_EMPTY: u8 = 1;
@@ -141,6 +143,7 @@ pub(crate) enum NavigationKind {
     Spatial,
     Signature,
     Interval,
+    Posting,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +280,18 @@ impl NavigationSummary {
     }
 }
 
+fn valid_posting_summary(summary: NavigationSummary) -> bool {
+    let NavigationSummary::Interval(interval) = summary else {
+        return false;
+    };
+    if interval.has_empty() || !interval.has_values() {
+        return false;
+    }
+    let (lower, upper) = interval.bounds();
+    lower[POSTING_KEY_BYTES..].iter().all(|byte| *byte == 0)
+        && upper[POSTING_KEY_BYTES..].iter().all(|byte| *byte == 0)
+}
+
 #[derive(Clone, Copy)]
 struct NavigationReference {
     id: BlockId,
@@ -319,6 +334,7 @@ pub(crate) struct NavigationWriter {
     summaries: [NavigationSummary; LEVELS],
     position: u8,
     covering: bool,
+    block_type: BlockType,
 }
 
 impl NavigationWriter {
@@ -330,6 +346,7 @@ impl NavigationWriter {
             summaries: [NavigationSummary::Empty; LEVELS],
             position: 0,
             covering: false,
+            block_type: BlockType::ValueIndexNavigationV1,
         }
     }
 
@@ -337,12 +354,17 @@ impl NavigationWriter {
         NODE_BYTES * LEVELS
     }
 
-    pub(crate) fn reset(&mut self, position: u8, covering: bool) {
+    pub(crate) fn reset(&mut self, position: u8, covering: bool, posting: bool) {
         self.counts.fill(0);
         self.entries.fill(0);
         self.summaries.fill(NavigationSummary::Empty);
         self.position = position;
         self.covering = covering;
+        self.block_type = if posting {
+            BlockType::ValueIndexPostingV1
+        } else {
+            BlockType::ValueIndexNavigationV1
+        };
     }
 
     pub(crate) fn append(
@@ -352,7 +374,11 @@ impl NavigationWriter {
         entries: u64,
         summary: NavigationSummary,
     ) -> Result<(), ValueIndexError> {
-        if entries == 0 || id == BlockId([0; 32]) {
+        if entries == 0
+            || id == BlockId([0; 32])
+            || (self.block_type == BlockType::ValueIndexPostingV1
+                && !valid_posting_summary(summary))
+        {
             return Err(ValueIndexError::Corrupt);
         }
         self.push(
@@ -407,7 +433,7 @@ impl NavigationWriter {
         header[4..6].copy_from_slice(&(self.counts[level] as u16).to_le_bytes());
         let id = store.put(
             &self.nodes[at..at + HEADER + self.counts[level] * REFERENCE],
-            BlockType::ValueIndexNavigationV1,
+            self.block_type,
             0,
         )?;
         let reference = NavigationReference {
@@ -451,6 +477,7 @@ pub(crate) struct NavigationCursor {
     count: usize,
     position: Option<u8>,
     covering: Option<bool>,
+    node_kind: Option<BlockType>,
     root_entries_known: bool,
 }
 
@@ -464,6 +491,7 @@ impl NavigationCursor {
             count: 1,
             position: None,
             covering: None,
+            node_kind: None,
             root_entries_known: true,
         };
         result.pending[0].reference = NavigationReference {
@@ -507,16 +535,21 @@ impl NavigationCursor {
                 return Ok(None);
             }
             let (len, kind) = store.get(&pending.reference.id, scratch)?;
-            if kind != BlockType::ValueIndexNavigationV1
+            if !matches!(
+                kind,
+                BlockType::ValueIndexNavigationV1 | BlockType::ValueIndexPostingV1
+            ) || self.node_kind.is_some_and(|expected| expected != kind)
                 || len < HEADER
                 || scratch[0] != 1
                 || scratch[1] as usize >= LEVELS
                 || scratch[2] >= 32
                 || scratch[3] > 1
+                || (kind == BlockType::ValueIndexPostingV1 && scratch[3] != 0)
                 || scratch[6..8] != [0, 0]
             {
                 return Err(ValueIndexError::Corrupt);
             }
+            self.node_kind = Some(kind);
             let height = scratch[1];
             if pending
                 .height
@@ -548,6 +581,11 @@ impl NavigationCursor {
             for index in (0..count).rev() {
                 let at = HEADER + index * REFERENCE;
                 let reference = NavigationReference::decode(&scratch[at..at + REFERENCE])?;
+                if kind == BlockType::ValueIndexPostingV1
+                    && !valid_posting_summary(reference.summary)
+                {
+                    return Err(ValueIndexError::Corrupt);
+                }
                 entries = entries
                     .checked_add(reference.entries)
                     .ok_or(ValueIndexError::Corrupt)?;
@@ -606,7 +644,7 @@ mod tests {
         let mut store = MemoryBlockStore::new(&mut budget, "navigation", 8 << 20, 2048).unwrap();
         let mut writer = NavigationWriter::new();
         let mut scratch = vec![0; super::super::MAX_PAYLOAD];
-        writer.reset(2, true);
+        writer.reset(2, true, false);
         let root = crate::mem::guard::forbid_alloc(|| {
             for index in 0..1057u64 {
                 let id = store
@@ -685,7 +723,7 @@ mod tests {
         let mut writer = NavigationWriter::new();
         let mut scratch = vec![0; super::super::MAX_PAYLOAD];
         for entries in [0u64, 1, 32, 33, 64, 65, 0] {
-            writer.reset(0, false);
+            writer.reset(0, false, false);
             for index in 0..entries {
                 let id = store
                     .put(&index.to_le_bytes(), BlockType::ValueIndexData, 0)
@@ -715,7 +753,7 @@ mod tests {
             MemoryBlockStore::new(&mut budget, "signature tree", 8 << 20, 2048).unwrap();
         let mut writer = NavigationWriter::new();
         let mut scratch = vec![0; super::super::MAX_PAYLOAD];
-        writer.reset(0, false);
+        writer.reset(0, false, false);
         for index in 0..1057u64 {
             let id = store
                 .put(&index.to_le_bytes(), BlockType::ValueIndexData, 0)
@@ -756,11 +794,78 @@ mod tests {
     }
 
     #[test]
+    fn posting_navigation_rejects_mixed_node_kinds() {
+        let mut budget = Budget::new(8 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "mixed posting tree", 4 << 20, 128).unwrap();
+        let mut writer = NavigationWriter::new();
+        let mut scratch = vec![0; super::super::MAX_PAYLOAD];
+        writer.reset(0, false, true);
+        let bad_data = store
+            .put(b"bad summary", BlockType::ValueIndexData, 0)
+            .unwrap();
+        assert!(matches!(
+            writer.append(&mut store, bad_data, 1, NavigationSummary::Unbounded),
+            Err(ValueIndexError::Corrupt)
+        ));
+        for index in 0..33u64 {
+            let data = store
+                .put(&index.to_le_bytes(), BlockType::ValueIndexData, 0)
+                .unwrap();
+            let mut key = [0; INTERVAL_KEY_BYTES];
+            key[..8].copy_from_slice(&index.to_be_bytes());
+            writer
+                .append(
+                    &mut store,
+                    data,
+                    1,
+                    NavigationSummary::Interval(IntervalSummary::bounded(key, key)),
+                )
+                .unwrap();
+        }
+        let root = writer.finish(&mut store).unwrap();
+        let (root_len, root_kind) = store.get(&root, &mut scratch).unwrap();
+        assert_eq!(root_kind, BlockType::ValueIndexPostingV1);
+        assert_eq!(scratch[1], 1);
+        let mut root_bytes = [0; NODE_BYTES];
+        root_bytes[..root_len].copy_from_slice(&scratch[..root_len]);
+        let mut child_id = [0; 32];
+        child_id.copy_from_slice(&root_bytes[HEADER..HEADER + 32]);
+        let child_id = BlockId(child_id);
+        let (child_len, child_kind) = store.get(&child_id, &mut scratch).unwrap();
+        assert_eq!(child_kind, BlockType::ValueIndexPostingV1);
+        let mut child_bytes = [0; NODE_BYTES];
+        child_bytes[..child_len].copy_from_slice(&scratch[..child_len]);
+        for offset in 0..REFERENCE {
+            child_bytes.swap(HEADER + offset, HEADER + REFERENCE + offset);
+        }
+        let mixed_child = store
+            .put(
+                &child_bytes[..child_len],
+                BlockType::ValueIndexNavigationV1,
+                0,
+            )
+            .unwrap();
+        root_bytes[HEADER..HEADER + 32].copy_from_slice(&mixed_child.0);
+        let mixed_root = store
+            .put(&root_bytes[..root_len], BlockType::ValueIndexPostingV1, 0)
+            .unwrap();
+        let mut cursor = NavigationCursor::new(mixed_root, 33);
+        loop {
+            match cursor.next(&mut store, &mut scratch, &mut |_, _| true, &mut |_| true) {
+                Ok(Some(_)) => {}
+                Err(ValueIndexError::Corrupt) => break,
+                result => panic!("mixed tree was not rejected: {result:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn malformed_node_headers_counts_bounds_and_child_height_are_loud() {
         let mut budget = Budget::new(8 << 20);
         let mut store = MemoryBlockStore::new(&mut budget, "bad navigation", 4 << 20, 128).unwrap();
         let mut writer = NavigationWriter::new();
-        writer.reset(0, false);
+        writer.reset(0, false, false);
         let data = store.put(b"data", BlockType::ValueIndexData, 0).unwrap();
         for (id, entries) in [(data, 0), (BlockId([0; 32]), 1)] {
             assert!(matches!(

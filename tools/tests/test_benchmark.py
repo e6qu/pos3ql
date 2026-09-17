@@ -105,6 +105,10 @@ class BenchmarkTest(unittest.TestCase):
             "SELECT payload FROM benchmark_kv WHERE gin_tags @> ARRAY[331]",
         )
         self.assertEqual(
+            benchmark.workload_sql("gin-array-overlap", 7, 19, 1000),
+            "SELECT payload FROM benchmark_kv WHERE gin_tags && ARRAY[331,1331]",
+        )
+        self.assertEqual(
             benchmark.workload_sql("gin-tsvector", 7, 19, 1000),
             "SELECT payload FROM benchmark_kv WHERE gin_document @@ 'token331'::tsquery",
         )

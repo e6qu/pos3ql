@@ -14,7 +14,11 @@ pos3ql implements PostgreSQL 18 SQL/JSON as typed SQL and wire behavior, not as 
 
 Path parsing is bounded to 256 steps and subscripts, depth 128, and 65,536 canonical bytes. One execution produces at most 1,024 path items. These are startup-bounded statement-arena limits; overflow is a named program-limit error. Set-returning rows and relational operators additionally use the ordinary bounded materialization and spill paths.
 
-GIN JSONB indexing, native transforms, provider-specific storage, and PostgreSQL internal heap or index formats are not implemented. Syntax requiring those mechanisms is rejected rather than accepted without behavior.
+GIN `jsonb_ops` and `jsonb_path_ops` indexes execute through object-native
+posting generations with exact SQL rechecks. Native transforms,
+provider-specific storage, and PostgreSQL internal heap or index formats are
+not implemented. Syntax requiring those mechanisms is rejected rather than
+accepted without behavior.
 
 ## Provenance and verification
 

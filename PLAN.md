@@ -187,16 +187,18 @@ garbage collection, and empty-cache recovery. Construction and traversal
 remain fixed-memory; legacy key generations remain readable. Qualification
 covers three-level pruning, malformed encodings, PostgreSQL's fuzzy geometry
 and non-finite values, and cold reads across every spatial class.
-GIN array, `tsvector`, `jsonb_ops`, and `jsonb_path_ops` generations and GiST
-`tsvector` generations use the same immutable navigation format with 256-bit
-token signatures and smaller leaves. Array containment/overlap, JSON
-containment/existence, and exact boolean full-text requirements reject
-impossible subtrees before object reads while exact SQL and MVCC rechecks stay
-authoritative. Prefix, negation, JSONPath, numeric JSON, empty-token, and
-contained-by cases conservatively retain children. Empty-cache object-read
-budgets, transaction overlays, recovery, malformed summaries, PostgreSQL 18
-differential cases, and distinct warm/cold performance workloads qualify all
-five operator-class paths without runtime allocation.
+GIN array, `tsvector`, `jsonb_ops`, and `jsonb_path_ops` generations use
+dedicated immutable posting trees. Stable namespace-plus-hash token keys route
+array containment/overlap, JSON containment/existence, and exact positive
+full-text requirements to 8 KiB leaves; multiple disjunctive tokens are
+unioned and row identities deduplicated. Exact SQL and MVCC rechecks remain
+authoritative, so token collisions only add candidates. Prefix-only,
+negation-only, JSONPath, numeric-only JSON, empty-token, and contained-by cases
+decline posting navigation and retain ordinary execution. GiST `tsvector`
+continues to use 256-bit token signatures. Empty-cache object-read budgets,
+transaction overlays, rollback, repeated publication, recovery, malformed
+encodings, PostgreSQL 18 differential cases, and distinct warm/cold performance
+workloads qualify all five operator-class paths without runtime allocation.
 GiST range, multirange, and network generations and SP-GiST range and network
 generations use fixed-size ordered interval summaries in the same immutable
 tree. All six built-in range subtypes, empty and unbounded ranges, IPv4, and
@@ -234,9 +236,7 @@ worker limit under read-only, write-heavy, and mixed workloads.
 
 ### Navigable specialized indexes
 
-Geometric, signature, and interval navigation is implemented. Dedicated GIN
-posting structures can further reduce leaf rechecks and duplicate-value work
-beyond the implemented array, JSONB, and full-text signature pruning.
+Geometric, signature, interval, and GIN posting navigation is implemented.
 Unfiltered nearest-neighbor limits still materialize compact keys and need
 ranked node traversal with MVCC-safe limit and residual-filter handling.
 Preserve exact rechecks, fixed memory, rollback, publication, garbage

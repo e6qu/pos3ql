@@ -89,17 +89,20 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   implemented.
 - Modeled GIN indexes physically execute array containment/overlap,
   `tsvector` search, JSONB containment/existence, and jsonpath predicates as
-  bitmap plans. Modeled SP-GiST indexes physically execute network, range,
-  box, point, polygon, locale-independent text-order, and prefix predicates.
+  bitmap plans. Array, full-text, `jsonb_ops`, and `jsonb_path_ops` values are
+  extracted into dedicated object-native posting trees; exact SQL and MVCC
+  rechecks make token-hash collisions conservative. Modeled SP-GiST indexes
+  physically execute network, range, box, point, polygon, locale-independent
+  text-order, and prefix predicates.
   PostgreSQL 18.6's four GIN and seven SP-GiST classes, 11 families, 90
   strategy rows, 56 support rows, method-specific DDL/options, cloning,
   partition children, reindexing, DML, WAL, checkpoints, and object-cold
   recovery share one typed boundary. Built-in point, box, and polygon SP-GiST
   classes execute the same `<-> point` K-nearest-neighbor boundary.
   Geometric predicate navigation uses the same immutable bounding-box tree
-  boundary, including both point classes, box and polygon. GIN
-  posting-list extraction, network/range/full-text node navigation, ranked
-  nearest-neighbor traversal, PostgreSQL page layout,
+  boundary, including both point classes, box and polygon. Network, range,
+  full-text, and GIN posting navigation are implemented. Ranked
+  nearest-neighbor traversal, PostgreSQL page layout and posting-list format,
   and native/custom callbacks are not implemented.
 - PostgreSQL's cost model and exact `EXPLAIN` plan text are not compatibility
   complete. Parallel query, JIT, and PostgreSQL planner/executor hooks do not

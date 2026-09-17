@@ -241,6 +241,11 @@ def workload_sql(workload, worker, operation, rows):
         )
     if workload == "gin-array":
         return f"SELECT payload FROM benchmark_kv WHERE gin_tags @> ARRAY[{key}]"
+    if workload == "gin-array-overlap":
+        return (
+            "SELECT payload FROM benchmark_kv "
+            f"WHERE gin_tags && ARRAY[{key},{rows + key}]"
+        )
     if workload == "gin-tsvector":
         return (
             "SELECT payload FROM benchmark_kv "
@@ -673,6 +678,7 @@ def parse_args():
             "gist-spatial",
             "gist-knn",
             "gin-array",
+            "gin-array-overlap",
             "gin-tsvector",
             "gist-tsvector",
             "gin-jsonb",
@@ -734,6 +740,7 @@ def parse_args():
             "gist-spatial",
             "gist-knn",
             "gin-array",
+            "gin-array-overlap",
             "gin-tsvector",
             "gist-tsvector",
             "gin-jsonb",

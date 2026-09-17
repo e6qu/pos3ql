@@ -3,7 +3,9 @@
 use core::hash::Hasher as _;
 
 use crate::mem::fixed_map::Fnv1aHasher;
-use crate::store::{NavigationSummary, TokenSignature};
+use crate::store::{
+    INTERVAL_KEY_BYTES, IntervalSummary, NavigationSummary, POSTING_KEY_BYTES, TokenSignature,
+};
 
 use super::ast::BinaryOp;
 use super::types::Datum;
@@ -14,6 +16,55 @@ const JSON_KEY: u8 = 3;
 const JSON_STRING: u8 = 4;
 const JSON_LITERAL: u8 = 5;
 const JSON_EXISTS: u8 = 6;
+
+/// Exact lossy-token identity used by immutable GIN posting generations.
+/// Hash collisions only add candidates because SQL and MVCC rechecks remain
+/// authoritative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PostingToken {
+    namespace: u8,
+    hash: u64,
+}
+
+impl PostingToken {
+    pub(crate) const KEY_BYTES: usize = POSTING_KEY_BYTES;
+
+    const fn new(namespace: u8, hash: u64) -> Self {
+        Self { namespace, hash }
+    }
+
+    pub(crate) fn encode(self) -> [u8; Self::KEY_BYTES] {
+        let mut encoded = [0; Self::KEY_BYTES];
+        encoded[0] = self.namespace;
+        encoded[1..].copy_from_slice(&self.hash.to_be_bytes());
+        encoded
+    }
+
+    pub(crate) fn decode(encoded: &[u8]) -> Option<Self> {
+        (encoded.len() == Self::KEY_BYTES).then(|| Self {
+            namespace: encoded[0],
+            hash: u64::from_be_bytes(encoded[1..].try_into().expect("posting hash width")),
+        })
+    }
+
+    pub(crate) const fn hash(self) -> u64 {
+        self.hash
+    }
+
+    pub(crate) fn summary(self) -> NavigationSummary {
+        let encoded = self.encode();
+        let mut key = [0; INTERVAL_KEY_BYTES];
+        key[..Self::KEY_BYTES].copy_from_slice(&encoded);
+        NavigationSummary::Interval(IntervalSummary::bounded(key, key))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PostingProbe {
+    Never,
+    Candidates,
+    Unusable,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SignaturePredicate {
@@ -47,26 +98,42 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn datum_signature(datum: Datum<'_>) -> NavigationSummary {
-    let mut signature = TokenSignature::default();
+pub(crate) fn for_each_value_token(datum: Datum<'_>, mut emit: impl FnMut(PostingToken)) {
     match datum {
-        Datum::Null => return NavigationSummary::Empty,
+        Datum::Null => {}
         Datum::Array { element, raw } => {
             for index in 0..super::array::len(raw) {
                 let value = super::array::get(raw, element, index).unwrap_or(Datum::Null);
                 if !value.is_null() {
-                    signature.insert(ARRAY_ELEMENT, super::eval::hash_key(&[value], &[0]));
+                    emit(PostingToken::new(
+                        ARRAY_ELEMENT,
+                        super::eval::hash_key(&[value], &[0]),
+                    ));
                 }
             }
         }
         Datum::TsVector(vector) => {
             super::full_text::for_each_vector_lexeme_hash(vector.as_str(), |hash| {
-                signature.insert(TEXT_LEXEME, hash);
+                emit(PostingToken::new(TEXT_LEXEME, hash));
             });
         }
-        Datum::Json { text, jsonb: true } => json_signature(text, &mut signature),
-        _ => return NavigationSummary::Unbounded,
+        Datum::Json { text, jsonb: true } => json_tokens(text, emit),
+        _ => {}
     }
+}
+
+fn datum_signature(datum: Datum<'_>) -> NavigationSummary {
+    if datum.is_null() {
+        return NavigationSummary::Empty;
+    }
+    if !matches!(
+        datum,
+        Datum::Array { .. } | Datum::TsVector(_) | Datum::Json { jsonb: true, .. }
+    ) {
+        return NavigationSummary::Unbounded;
+    }
+    let mut signature = TokenSignature::default();
+    for_each_value_token(datum, |token| signature.insert(token.namespace, token.hash));
     NavigationSummary::Signature(signature)
 }
 
@@ -180,6 +247,114 @@ pub(crate) fn predicate(search: Datum<'_>, operator: BinaryOp) -> SignaturePredi
     }
 }
 
+/// Emits posting tokens whose union is a conservative candidate set for a
+/// GIN predicate. A conjunction needs only one positive exact token, while a
+/// disjunction needs a token restriction for every branch. Prefix and negated
+/// branches therefore participate only when another conjunct restricts them.
+pub(crate) fn posting_probe(
+    search: Datum<'_>,
+    operator: BinaryOp,
+    mut emit: impl FnMut(PostingToken),
+) -> PostingProbe {
+    let mut emitted = 0usize;
+    match search {
+        Datum::Array { element, raw }
+            if matches!(operator, BinaryOp::JsonExistsAny | BinaryOp::JsonExistsAll) =>
+        {
+            for index in 0..super::array::len(raw) {
+                let Some(Datum::Text(text) | Datum::Bpchar(text)) =
+                    super::array::get(raw, element, index)
+                else {
+                    continue;
+                };
+                let token = PostingToken::new(JSON_EXISTS, hash_bytes(text.as_bytes()));
+                if operator == BinaryOp::JsonExistsAny || emitted == 0 {
+                    emit(token);
+                    emitted += 1;
+                }
+            }
+            match (operator, emitted) {
+                (BinaryOp::JsonExistsAny, 0) => PostingProbe::Never,
+                (BinaryOp::JsonExistsAll, 0) => PostingProbe::Unusable,
+                _ => PostingProbe::Candidates,
+            }
+        }
+        Datum::Array { element, raw } => {
+            if operator == BinaryOp::ContainedBy {
+                return PostingProbe::Unusable;
+            }
+            for index in 0..super::array::len(raw) {
+                let value = super::array::get(raw, element, index).unwrap_or(Datum::Null);
+                if value.is_null() {
+                    continue;
+                }
+                let token = PostingToken::new(ARRAY_ELEMENT, super::eval::hash_key(&[value], &[0]));
+                if operator == BinaryOp::Overlaps || emitted == 0 {
+                    emit(token);
+                    emitted += 1;
+                }
+            }
+            match (operator, emitted) {
+                (BinaryOp::Overlaps, 0) => PostingProbe::Never,
+                (BinaryOp::Contains | BinaryOp::Eq, 0) => PostingProbe::Unusable,
+                (BinaryOp::Overlaps | BinaryOp::Contains | BinaryOp::Eq, _) => {
+                    PostingProbe::Candidates
+                }
+                _ => PostingProbe::Unusable,
+            }
+        }
+        Datum::TsQuery(query) if operator == BinaryOp::TextSearchMatch => {
+            let Some(indexable) = super::full_text::fold_query_lexemes(
+                query.as_str(),
+                |_, prefix| !prefix,
+                false,
+                |left, right| left || right,
+                |left, right| left && right,
+            ) else {
+                return PostingProbe::Never;
+            };
+            if !indexable {
+                return PostingProbe::Unusable;
+            }
+            let _ = super::full_text::fold_query_lexemes(
+                query.as_str(),
+                |hash, prefix| {
+                    if !prefix {
+                        emit(PostingToken::new(TEXT_LEXEME, hash));
+                        emitted += 1;
+                    }
+                },
+                (),
+                |_, _| (),
+                |_, _| (),
+            );
+            if emitted == 0 {
+                PostingProbe::Unusable
+            } else {
+                PostingProbe::Candidates
+            }
+        }
+        Datum::Json { text, jsonb: true } if operator == BinaryOp::Contains => {
+            // Every emitted JSON token is required by containment. Prefer the
+            // final token because canonical objects emit a key before its
+            // value, and values are commonly more selective than shared keys.
+            let mut selected = None;
+            json_tokens(text, |token| selected = Some(token));
+            if let Some(token) = selected {
+                emit(token);
+                PostingProbe::Candidates
+            } else {
+                PostingProbe::Unusable
+            }
+        }
+        Datum::Text(text) if operator == BinaryOp::JsonExists => {
+            emit(PostingToken::new(JSON_EXISTS, hash_bytes(text.as_bytes())));
+            PostingProbe::Candidates
+        }
+        _ => PostingProbe::Unusable,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct QueryRequirement {
     all: TokenSignature,
@@ -188,6 +363,12 @@ struct QueryRequirement {
 }
 
 fn json_signature(source: &str, signature: &mut TokenSignature) {
+    json_tokens(source, |token| {
+        signature.insert(token.namespace, token.hash)
+    });
+}
+
+fn json_tokens(source: &str, mut emit: impl FnMut(PostingToken)) {
     let bytes = source.as_bytes();
     let top_array = bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[');
     let mut depth = 0usize;
@@ -220,27 +401,27 @@ fn json_signature(source: &str, signature: &mut TokenSignature) {
                 let is_key =
                     bytes[at..].iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b':');
                 if is_key {
-                    signature.insert(JSON_KEY, hash);
+                    emit(PostingToken::new(JSON_KEY, hash));
                     if depth == 1 {
-                        signature.insert(JSON_EXISTS, hash);
+                        emit(PostingToken::new(JSON_EXISTS, hash));
                     }
                 } else {
-                    signature.insert(JSON_STRING, hash);
+                    emit(PostingToken::new(JSON_STRING, hash));
                     if depth == 0 || top_array && depth == 1 {
-                        signature.insert(JSON_EXISTS, hash);
+                        emit(PostingToken::new(JSON_EXISTS, hash));
                     }
                 }
             }
             b't' if bytes[at..].starts_with(b"true") => {
-                signature.insert(JSON_LITERAL, hash_bytes(b"true"));
+                emit(PostingToken::new(JSON_LITERAL, hash_bytes(b"true")));
                 at += 4;
             }
             b'f' if bytes[at..].starts_with(b"false") => {
-                signature.insert(JSON_LITERAL, hash_bytes(b"false"));
+                emit(PostingToken::new(JSON_LITERAL, hash_bytes(b"false")));
                 at += 5;
             }
             b'n' if bytes[at..].starts_with(b"null") => {
-                signature.insert(JSON_LITERAL, hash_bytes(b"null"));
+                emit(PostingToken::new(JSON_LITERAL, hash_bytes(b"null")));
                 at += 4;
             }
             _ => at += 1,
@@ -351,5 +532,76 @@ mod tests {
             )
             .may_match(indexed)
         );
+    }
+
+    #[test]
+    fn posting_probes_cover_positive_boolean_branches_without_false_negatives() {
+        let mut tokens = [PostingToken::new(0, 0); 8];
+        let mut count = 0usize;
+        let probe = posting_probe(
+            Datum::TsQuery(restore_query("'alpha' | 'beta'")),
+            BinaryOp::TextSearchMatch,
+            |token| {
+                tokens[count] = token;
+                count += 1;
+            },
+        );
+        assert_eq!(probe, PostingProbe::Candidates);
+        assert_eq!(count, 2);
+
+        count = 0;
+        assert_eq!(
+            posting_probe(
+                Datum::TsQuery(restore_query("'alpha' & !'beta'")),
+                BinaryOp::TextSearchMatch,
+                |token| {
+                    tokens[count] = token;
+                    count += 1;
+                },
+            ),
+            PostingProbe::Candidates
+        );
+        assert_eq!(count, 1);
+        assert_eq!(
+            posting_probe(
+                Datum::TsQuery(restore_query("!'alpha'")),
+                BinaryOp::TextSearchMatch,
+                |_| panic!("negation has no safe posting token"),
+            ),
+            PostingProbe::Unusable
+        );
+        assert_eq!(
+            posting_probe(
+                Datum::TsQuery(restore_query("'alpha':*")),
+                BinaryOp::TextSearchMatch,
+                |_| panic!("prefixes have no exact posting token"),
+            ),
+            PostingProbe::Unusable
+        );
+    }
+
+    #[test]
+    fn value_and_probe_tokens_share_exact_stable_encodings() {
+        let document = Datum::Json {
+            text: r#"{"escaped\nkey":"needle"}"#,
+            jsonb: true,
+        };
+        let mut indexed = [PostingToken::new(0, 0); 8];
+        let mut count = 0usize;
+        for_each_value_token(document, |token| {
+            indexed[count] = token;
+            count += 1;
+        });
+        let mut probe = None;
+        assert_eq!(
+            posting_probe(Datum::Text("escaped\nkey"), BinaryOp::JsonExists, |token| {
+                probe = Some(token)
+            },),
+            PostingProbe::Candidates
+        );
+        let probe = probe.expect("exists probe emits one token");
+        assert!(indexed[..count].contains(&probe));
+        assert_eq!(PostingToken::decode(&probe.encode()), Some(probe));
+        assert!(matches!(probe.summary(), NavigationSummary::Interval(_)));
     }
 }

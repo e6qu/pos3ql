@@ -26363,19 +26363,21 @@ impl Storage {
                 | Some(IndexOperatorClass::SpGist(
                     SpGistOperatorClass::Inet | SpGistOperatorClass::Range,
                 )) => NavigationKind::Interval,
-                Some(IndexOperatorClass::Gist(GistOperatorClass::TsVector))
-                | Some(IndexOperatorClass::Gin(
+                Some(IndexOperatorClass::Gist(GistOperatorClass::TsVector)) => {
+                    NavigationKind::Signature
+                }
+                Some(IndexOperatorClass::Gin(
                     GinOperatorClass::Array
                     | GinOperatorClass::TsVector
                     | GinOperatorClass::Jsonb
                     | GinOperatorClass::JsonbPath,
-                )) => NavigationKind::Signature,
+                )) => NavigationKind::Posting,
                 _ => return None,
             })
         };
-        // A generation has one summary position. Preserve whichever spatial
-        // or signature column the established position-order rule selected;
-        // otherwise adding an earlier interval silently de-optimizes it.
+        // A generation has one summary position. Preserve whichever spatial,
+        // signature, or posting column the established position-order rule
+        // selected; otherwise adding an earlier interval de-optimizes it.
         let classes = &index.resolved_operator_classes[..index.n_cols];
         if let Some((position, kind)) = classes.iter().enumerate().find_map(|(position, class)| {
             classify(*class)
@@ -26406,6 +26408,12 @@ impl Storage {
         navigation: crate::store::NavigationSpec,
         key: &[u8],
     ) -> Result<crate::store::NavigationSummary, SqlError> {
+        if navigation.kind == crate::store::NavigationKind::Posting {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "posting summaries require an encoded token"
+            ));
+        }
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
         if usize::from(navigation.position) >= enforcer.n_cols {
             return Err(sql_err!(
@@ -26429,7 +26437,36 @@ impl Storage {
             crate::store::NavigationKind::Interval => {
                 crate::sql::index_interval::summary(values[usize::from(navigation.position)])
             }
+            crate::store::NavigationKind::Posting => unreachable!("handled above"),
         }
+    }
+
+    pub(crate) fn for_each_value_binding_posting_token(
+        &self,
+        table_index: usize,
+        binding: usize,
+        key: &[u8],
+        emit: impl FnMut(crate::sql::index_signature::PostingToken),
+    ) -> Result<(), SqlError> {
+        let navigation = self
+            .value_binding_navigation(table_index, binding)
+            .filter(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "posting token extraction requires a GIN binding"
+                )
+            })?;
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        let position = usize::from(navigation.position);
+        let mut values = [Datum::Null; MAX_INDEX_COLS];
+        rowenc::decode(
+            key,
+            &enforcer.key_types[..enforcer.n_cols],
+            &mut values[..enforcer.n_cols],
+        )?;
+        crate::sql::index_signature::for_each_value_token(values[position], emit);
+        Ok(())
     }
 
     pub(crate) fn value_binding_collations(
@@ -26653,6 +26690,143 @@ impl Storage {
         Ok(true)
     }
 
+    /// Probes one exact lossy token in an immutable GIN posting generation,
+    /// then scans the committed resident overlay for the same token. Returned
+    /// row identities remain subject to the ordinary SQL and MVCC rechecks.
+    pub(crate) fn probe_value_binding_posting(
+        &self,
+        table_index: usize,
+        binding: usize,
+        token: crate::sql::index_signature::PostingToken,
+        mut visit: impl FnMut(u64, u64) -> Result<(), SqlError>,
+    ) -> Result<bool, SqlError> {
+        let table = &self.tables[table_index];
+        let Some(navigation) = self
+            .value_binding_navigation(table_index, binding)
+            .filter(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+        else {
+            return Ok(false);
+        };
+        let Some(handle) = table.enforcers[binding].and_then(|enforcer| enforcer.durable) else {
+            return Ok(false);
+        };
+        if self.commit_snapshot < handle.published_lsn {
+            return Ok(false);
+        }
+        let Some(spill) = &self.spill else {
+            return Ok(false);
+        };
+        let Some(mut scratch) = spill
+            .value_scratch
+            .as_ref()
+            .expect("durable value indexes have reader scratch")
+            .iter()
+            .find_map(|candidate| candidate.try_borrow_mut().ok())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "persistent value scans nested deeper than reader scratch"
+            ));
+        };
+        let (_, root_kind) = spill
+            .blocks
+            .as_ref()
+            .expect("value-index generations are durable")
+            .borrow_mut()
+            .get(&handle.roster, &mut scratch.roster)
+            .map_err(|error| value_index_read_error(crate::store::ValueIndexError::Store(error)))?;
+        match root_kind {
+            crate::store::BlockType::ValueIndexPostingV1 => {}
+            crate::store::BlockType::ValueIndexNavigationV1
+            | crate::store::BlockType::ValueIndexRoster => return Ok(false),
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::IO_ERROR,
+                    "persistent GIN posting root is corrupt"
+                ));
+            }
+        }
+        let encoded = token.encode();
+        let mut interval_key = [0; crate::store::INTERVAL_KEY_BYTES];
+        interval_key[..crate::sql::index_signature::PostingToken::KEY_BYTES]
+            .copy_from_slice(&encoded);
+        {
+            let ValueIndexScratch { roster, data, .. } = &mut *scratch;
+            let callback_error = std::cell::RefCell::new(None);
+            crate::store::ValueIndexReader::over(roster, data)
+                .range_covering_with_bounds(
+                    &mut *spill
+                        .blocks
+                        .as_ref()
+                        .expect("value-index generations are durable")
+                        .borrow_mut(),
+                    &handle,
+                    |position, summary| {
+                        if position != navigation.position {
+                            return true;
+                        }
+                        match summary {
+                            crate::store::NavigationSummary::Empty => false,
+                            crate::store::NavigationSummary::Interval(interval) => {
+                                interval.intersects(interval_key, interval_key)
+                            }
+                            _ => true,
+                        }
+                    },
+                    |key| {
+                        if key.len() != crate::sql::index_signature::PostingToken::KEY_BYTES {
+                            *callback_error.borrow_mut() = Some(sql_err!(
+                                sqlstate::IO_ERROR,
+                                "persistent GIN posting key is corrupt"
+                            ));
+                            return crate::store::ValueIndexPosition::Match;
+                        }
+                        match key.cmp(&encoded) {
+                            core::cmp::Ordering::Less => crate::store::ValueIndexPosition::Before,
+                            core::cmp::Ordering::Equal => crate::store::ValueIndexPosition::Match,
+                            core::cmp::Ordering::Greater => crate::store::ValueIndexPosition::After,
+                        }
+                    },
+                    |_, rowid, lsn, _, _| {
+                        if callback_error.borrow().is_none()
+                            && let Err(error) = visit(rowid, lsn)
+                        {
+                            *callback_error.borrow_mut() = Some(error);
+                        }
+                    },
+                )
+                .map_err(value_index_read_error)?;
+            if let Some(error) = callback_error.into_inner() {
+                return Err(error);
+            }
+        }
+        for (&rowid, state) in table.rows.iter() {
+            if state.committed_lsn <= handle.published_lsn {
+                continue;
+            }
+            let Some(home) = state.committed else {
+                continue;
+            };
+            let key_buffer = &mut scratch.roster;
+            let Some((key_len, _, _)) =
+                self.encode_value_binding_entry(table_index, binding, rowid, home, key_buffer)?
+            else {
+                continue;
+            };
+            let mut matches = false;
+            self.for_each_value_binding_posting_token(
+                table_index,
+                binding,
+                &key_buffer[..key_len],
+                |candidate| matches |= candidate == token,
+            )?;
+            if matches {
+                visit(rowid, state.committed_lsn)?;
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn value_binding_count(&self, table_index: usize) -> usize {
         self.tables[table_index].n_enforcers
     }
@@ -26827,6 +27001,11 @@ impl Storage {
         right: &[u8],
     ) -> Result<core::cmp::Ordering, SqlError> {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        if navigation
+            .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+        {
+            return Ok(left.cmp(right));
+        }
         if let Some(
             navigation @ crate::store::NavigationSpec {
                 kind: crate::store::NavigationKind::Spatial,

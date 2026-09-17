@@ -1,5 +1,7 @@
 //! Immutable SST publication and cold recovery through the manifest CAS.
 
+use core::cmp::Ordering;
+
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
@@ -58,6 +60,12 @@ fn value_sort_key(entry: &[u8]) -> Result<&[u8], SqlError> {
 fn value_sort_payload(entry: &[u8]) -> Result<&[u8], SqlError> {
     let key = value_sort_key(entry)?;
     Ok(&entry[VALUE_SORT_ENTRY_HEADER + key.len()..])
+}
+
+fn compare_posting_sort_entries(left: &[u8], right: &[u8]) -> Result<Ordering, SqlError> {
+    Ok(value_sort_key(left)?
+        .cmp(value_sort_key(right)?)
+        .then_with(|| left[8..24].cmp(&right[8..24])))
 }
 
 /// Identity of one immutable commit batch.  The LSN and checksum always
@@ -10135,6 +10143,11 @@ impl Checkpointer {
             value_sorter.reset();
             let navigation = storage.value_binding_navigation(slot, binding);
             let mut compare = |left: &[u8], right: &[u8]| {
+                if navigation.is_some_and(|navigation| {
+                    navigation.kind == crate::store::NavigationKind::Posting
+                }) {
+                    return compare_posting_sort_entries(left, right);
+                }
                 storage.compare_value_binding_keys(
                     slot,
                     binding,
@@ -10145,8 +10158,11 @@ impl Checkpointer {
             };
             let include_mask = storage.value_binding_include_mask(slot, binding);
             if let Some(spec) = navigation {
-                self.value_writer
-                    .reset_navigation(spec.position, spec.kind, include_mask != 0);
+                self.value_writer.reset_navigation(
+                    spec.position,
+                    spec.kind,
+                    include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
+                );
             } else {
                 self.value_writer.reset();
             }
@@ -10160,6 +10176,43 @@ impl Checkpointer {
                 else {
                     return Ok(ControlFlow::Continue(()));
                 };
+                if navigation.is_some_and(|navigation| {
+                    navigation.kind == crate::store::NavigationKind::Posting
+                }) {
+                    let mut token_error = None;
+                    storage.for_each_value_binding_posting_token(
+                        slot,
+                        binding,
+                        &key[..key_len],
+                        |token| {
+                            if token_error.is_some() {
+                                return;
+                            }
+                            let posting_key = token.encode();
+                            let entry_len = VALUE_SORT_ENTRY_HEADER + posting_key.len();
+                            sorted_entry[..8].copy_from_slice(&token.hash().to_le_bytes());
+                            sorted_entry[8..16].copy_from_slice(&rowid.to_le_bytes());
+                            sorted_entry[16..24]
+                                .copy_from_slice(&state.committed_lsn.to_le_bytes());
+                            sorted_entry[24..28]
+                                .copy_from_slice(&(posting_key.len() as u32).to_le_bytes());
+                            sorted_entry[28..32].fill(0);
+                            sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
+                                .copy_from_slice(&posting_key);
+                            if let Err(error) = value_sorter.push_encoded(
+                                &mut *self.blocks.borrow_mut(),
+                                &sorted_entry[..entry_len],
+                                &mut compare,
+                            ) {
+                                token_error = Some(error);
+                            }
+                        },
+                    )?;
+                    if let Some(error) = token_error {
+                        return Err(error);
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
                 let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + payload_len;
                 sorted_entry[..8].copy_from_slice(&hash.to_le_bytes());
                 sorted_entry[8..16].copy_from_slice(&rowid.to_le_bytes());
@@ -10178,12 +10231,32 @@ impl Checkpointer {
             let run = value_sorter.finish(&mut *self.blocks.borrow_mut(), &mut compare)?;
             if let Some(run) = run {
                 value_sort_reader.start(&mut *self.blocks.borrow_mut(), run)?;
+                let mut previous_posting = None;
                 while let Some(entry) = value_sort_reader.row() {
                     let key = value_sort_key(entry)?;
                     let payload = value_sort_payload(entry)?;
                     let hash = u64::from_le_bytes(entry[..8].try_into().unwrap());
                     let rowid = u64::from_le_bytes(entry[8..16].try_into().unwrap());
                     let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+                    let posting_token = if navigation.is_some_and(|navigation| {
+                        navigation.kind == crate::store::NavigationKind::Posting
+                    }) {
+                        Some(
+                            crate::sql::index_signature::PostingToken::decode(key).ok_or_else(
+                                || sql_err!(SQLSTATE_IO, "persistent GIN posting key is corrupt"),
+                            )?,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(token) = posting_token {
+                        let identity = (token.encode(), rowid, commit_lsn);
+                        if previous_posting == Some(identity) {
+                            value_sort_reader.advance(&mut *self.blocks.borrow_mut())?;
+                            continue;
+                        }
+                        previous_posting = Some(identity);
+                    }
                     let mut comparison_error = None;
                     let mut compare_keys = |left: &[u8], right: &[u8]| match storage
                         .compare_value_binding_keys(slot, binding, navigation, left, right)
@@ -10196,13 +10269,17 @@ impl Checkpointer {
                     };
                     let include_mask = storage.value_binding_include_mask(slot, binding);
                     let write = if let Some(spec) = navigation {
-                        let summary =
-                            storage.value_binding_navigation_summary(slot, binding, spec, key)?;
+                        let summary = posting_token.map_or_else(
+                            || storage.value_binding_navigation_summary(slot, binding, spec, key),
+                            |token| Ok(token.summary()),
+                        )?;
                         self.value_writer.append_navigation(
                             &mut *self.blocks.borrow_mut(),
                             (hash, rowid, commit_lsn),
                             key,
-                            (include_mask != 0).then_some(payload),
+                            (include_mask != 0
+                                && spec.kind != crate::store::NavigationKind::Posting)
+                                .then_some(payload),
                             summary,
                             &mut compare_keys,
                         )
@@ -12815,6 +12892,37 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn posting_sort_groups_duplicate_row_versions_after_their_token() {
+        fn entry(key: [u8; 9], rowid: u64, lsn: u64) -> [u8; VALUE_SORT_ENTRY_HEADER + 9] {
+            let mut entry = [0; VALUE_SORT_ENTRY_HEADER + 9];
+            entry[8..16].copy_from_slice(&rowid.to_le_bytes());
+            entry[16..24].copy_from_slice(&lsn.to_le_bytes());
+            entry[24..28].copy_from_slice(&9u32.to_le_bytes());
+            entry[VALUE_SORT_ENTRY_HEADER..].copy_from_slice(&key);
+            entry
+        }
+
+        let first = entry([1; 9], 7, 9);
+        let duplicate = entry([1; 9], 7, 9);
+        let other_row = entry([1; 9], 8, 9);
+        let other_token = entry([2; 9], 1, 1);
+        assert_eq!(
+            compare_posting_sort_entries(&first, &duplicate).unwrap(),
+            Ordering::Equal
+        );
+        assert!(
+            compare_posting_sort_entries(&first, &other_row)
+                .unwrap()
+                .is_lt()
+        );
+        assert!(
+            compare_posting_sort_entries(&other_row, &other_token)
+                .unwrap()
+                .is_lt()
+        );
+    }
 
     #[test]
     fn dsst_manifest_accepts_only_current_complete_formats() {

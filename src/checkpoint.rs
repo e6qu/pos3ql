@@ -467,8 +467,9 @@ pub(crate) struct Checkpointer {
     /// Pre-reserved scratch built during a checkpoint, then swapped into the
     /// fields above; keeps the post-freeze path allocation-free.
     prev_scratch: Vec<SlotList>,
-    /// Pre-reserved scratch for GC / WAL-segment sweeps.
-    doomed_scratch: Vec<StackStr<64>>,
+    /// Pre-reserved scratch for cold commit replay and object deletion batches.
+    commit_scratch: Vec<StackStr<64>>,
+    garbage_scratch: Vec<StackStr<64>>,
     /// Sliced-checkpoint sweep state: whether a sweep is mid-flight, the
     /// table generation each slot's slice captured, and which slots were
     /// sliced this sweep.
@@ -476,6 +477,8 @@ pub(crate) struct Checkpointer {
     /// A manifest is durable but its bounded garbage sweep still needs a
     /// retry. Its LSN is withheld until maintenance completes.
     published_lsn_pending_maintenance: Option<u64>,
+    legacy_garbage_pending: bool,
+    block_garbage_pending: bool,
     sliced_generation: Vec<u64>,
     sliced_this_sweep: Vec<bool>,
     /// The slice writer (reset per table) and the merge writer, which holds
@@ -512,12 +515,6 @@ pub(crate) enum CheckpointStep {
     Published { lsn: u64 },
 }
 
-/// Upper bounds reserved at startup so checkpoint-time bookkeeping never
-/// touches the allocator. Exhausting one is a named checkpoint error; success
-/// must mean every requested maintenance operation completed.
-const MAX_SWEEP_KEYS: usize = 4096;
-/// Block identities the GC keep-set can hold across every live SST.
-const MAX_KEEP_BLOCKS: usize = 64 * 1024;
 /// Scratch for one SST writer or reader: the writer's pending block, index and
 /// filter, or the reader's index/data/assembly blocks — reset per table.
 /// Sized for a reader and a writer living together (a paced merge streams
@@ -529,12 +526,6 @@ const SST_ARENA_BYTES: usize = 16 * 1024 * 1024;
 /// cycle, so read fan-out stays low without the monolithic full rewrite that
 /// a filled list used to force.
 const MERGE_TRIGGER: usize = 4;
-
-/// Merge id-scratch capacity, in (rowid, source) entries. Sized generously
-/// past a full table plus its tombstone backlog; a pair whose combined count
-/// exceeds it skips its merge that cycle. A filled list has one mandatory
-/// full-rewrite transition.
-const MERGE_SCRATCH_ENTRIES: usize = 512 * 1024;
 
 /// How far one merge beat may go — the pause a beat inserts between
 /// statements is a handful of block transfers, never a whole pair. Data
@@ -564,13 +555,14 @@ impl Checkpointer {
             + table_capacity
                 * crate::storage::MAX_VALUE_ENFORCERS
                 * core::mem::size_of::<ValueInstall>()
-            + MAX_KEEP_BLOCKS * core::mem::size_of::<BlockId>()
-            + MAX_SWEEP_KEYS
+            + config.checkpoint_live_blocks * core::mem::size_of::<BlockId>()
+            + config.checkpoint_garbage_batch_objects
                 * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
+            + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
             + manifest_capacity
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
-            + MERGE_SCRATCH_ENTRIES * core::mem::size_of::<(SstKey, u8)>()
+            + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
     /// One bounded step of the paced merge — the compaction work a beat may
@@ -680,7 +672,7 @@ impl Checkpointer {
                 .expect("trigger implies at least one pair");
             let old0 = list.ssts[at].expect("counted");
             let old1 = list.ssts[at + 1].expect("counted");
-            if (old0.count + old1.count) as usize > MERGE_SCRATCH_ENTRIES {
+            if (old0.count + old1.count) as usize > self.merge_scratch.capacity() {
                 continue;
             }
             if self.merge_overflow.get(slot).copied().flatten()
@@ -742,7 +734,7 @@ impl Checkpointer {
                 resume_lo,
                 MERGE_SCHEDULE_BEAT_BLOCKS,
                 &mut |key, tombstone| {
-                    if scratch.len() == MERGE_SCRATCH_ENTRIES {
+                    if scratch.len() == scratch.capacity() {
                         overflow = true;
                         return;
                     }
@@ -945,9 +937,9 @@ impl Checkpointer {
             pending_value_installs: Vec::with_capacity(
                 table_capacity * crate::storage::MAX_VALUE_ENFORCERS,
             ),
-            merge_scratch: Vec::with_capacity(MERGE_SCRATCH_ENTRIES),
-            roster_scratch: Vec::with_capacity(MAX_KEEP_BLOCKS),
-            doomed_blocks: Vec::with_capacity(MAX_SWEEP_KEYS),
+            merge_scratch: Vec::with_capacity(config.checkpoint_merge_entries),
+            roster_scratch: Vec::with_capacity(config.checkpoint_live_blocks),
+            doomed_blocks: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
             manifest_etag: None,
@@ -956,9 +948,12 @@ impl Checkpointer {
             commit_head: None,
             prev_ssts: Vec::with_capacity(table_capacity),
             prev_scratch: Vec::with_capacity(table_capacity),
-            doomed_scratch: Vec::with_capacity(MAX_SWEEP_KEYS),
+            commit_scratch: Vec::with_capacity(config.checkpoint_commit_batches),
+            garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             sweeping: false,
             published_lsn_pending_maintenance: None,
+            legacy_garbage_pending: false,
+            block_garbage_pending: false,
             sliced_generation: vec![0; table_capacity],
             sliced_this_sweep: vec![false; table_capacity],
             slice_writer: SstWriter::new(),
@@ -1123,13 +1118,13 @@ impl Checkpointer {
         floor: u64,
         mut apply: impl FnMut(u64, &[u8]) -> Result<(), SqlError>,
     ) -> Result<(), CheckpointSetupError> {
-        self.doomed_scratch.clear();
+        self.commit_scratch.clear();
         let mut batch = self.commit_head;
         while let Some(current) = batch {
-            if self.doomed_scratch.len() == self.doomed_scratch.capacity() {
+            if self.commit_scratch.len() == self.commit_scratch.capacity() {
                 return Err(CheckpointSetupError::ObjectStore(format!(
-                    "commit-head chain exceeds fixed limit {}",
-                    self.doomed_scratch.capacity()
+                    "commit-head chain exceeds checkpoint_commit_batches ({})",
+                    self.commit_scratch.capacity()
                 )));
             }
             let descriptor_key = crate::stack_format!(
@@ -1150,7 +1145,7 @@ impl Checkpointer {
                     "commit descriptor does not match its head",
                 ));
             }
-            self.doomed_scratch.push(crate::stack_format!(
+            self.commit_scratch.push(crate::stack_format!(
                 64,
                 "commits/{:020}-{:08x}.batch",
                 current.first_lsn,
@@ -1165,8 +1160,8 @@ impl Checkpointer {
                 break;
             }
         }
-        for index in (0..self.doomed_scratch.len()).rev() {
-            let key = self.doomed_scratch[index];
+        for index in (0..self.commit_scratch.len()).rev() {
+            let key = self.commit_scratch[index];
             // Ranged, buffer-sized windows: a segment is one committed WAL
             // batch, whose size is bounded by wal_buffer_bytes — which may
             // exceed the response buffer. An unranged GET would upload fine
@@ -1255,58 +1250,71 @@ impl Checkpointer {
     /// Deletes commit batches whose records are entirely covered by
     /// the current manifest LSN. Called after a checkpoint.
     pub(crate) fn prune_commit_batches(&mut self, up_to_lsn: u64) -> Result<(), SqlError> {
-        // Two passes because list borrows the client: collect keys into
-        // pre-reserved scratch (no allocation post-freeze — this runs inside a
-        // checkpoint). Keep the highest-keyed doomed segment so one straddling
-        // the checkpoint boundary is never lost.
-        self.doomed_scratch.clear();
-        let doomed = &mut self.doomed_scratch;
-        let mut overflow = false;
-        let mut max_key = StackStr::<64>::new();
-        self.client
-            .list("commits/", |k| {
-                let is_doomed = k
-                    .strip_prefix("commits/")
-                    .and_then(|x| x.strip_suffix(".batch"))
-                    .and_then(|d| d.split_once('-'))
-                    .and_then(|(first, _)| first.parse::<u64>().ok())
-                    .is_some_and(|first| first <= up_to_lsn);
-                if is_doomed {
-                    if k > max_key.as_str() {
+        // Listing borrows the client, so each pass collects one pre-reserved
+        // deletion batch and deletes it afterwards. Re-listing drains any
+        // larger history without turning the batch size into a scale ceiling.
+        // The highest doomed segment is always retained because it may
+        // straddle the checkpoint boundary.
+        loop {
+            self.garbage_scratch.clear();
+            let mut max_key = StackStr::<64>::new();
+            self.client
+                .list("commits/", |k| {
+                    let is_doomed = k
+                        .strip_prefix("commits/")
+                        .and_then(|x| x.strip_suffix(".batch"))
+                        .and_then(|d| d.split_once('-'))
+                        .and_then(|(first, _)| first.parse::<u64>().ok())
+                        .is_some_and(|first| first <= up_to_lsn);
+                    if is_doomed && k > max_key.as_str() {
                         max_key = crate::stack_format!(64, "{}", k);
                     }
-                    if doomed.len() < MAX_SWEEP_KEYS {
-                        doomed.push(crate::stack_format!(64, "{}", k));
-                    } else {
-                        overflow = true;
-                    }
-                }
-            })
-            .map_err(object_store_to_sql)?;
-        for i in 0..self.doomed_scratch.len() {
-            let key = self.doomed_scratch[i];
-            if key.as_str() == max_key.as_str() {
-                continue;
+                })
+                .map_err(object_store_to_sql)?;
+            if max_key.is_empty() {
+                return Ok(());
             }
+            // Select deletions in a second pass so progress does not depend
+            // on an implementation-specific listing order. In particular, a
+            // one-entry batch must not repeatedly select only the retained
+            // boundary object when more history follows it.
+            let doomed = &mut self.garbage_scratch;
+            let mut overflow = false;
             self.client
-                .delete(key.as_str())
+                .list("commits/", |k| {
+                    let is_doomed = k != max_key.as_str()
+                        && k.strip_prefix("commits/")
+                            .and_then(|x| x.strip_suffix(".batch"))
+                            .and_then(|d| d.split_once('-'))
+                            .and_then(|(first, _)| first.parse::<u64>().ok())
+                            .is_some_and(|first| first <= up_to_lsn);
+                    if is_doomed {
+                        if doomed.len() < doomed.capacity() {
+                            doomed.push(crate::stack_format!(64, "{}", k));
+                        } else {
+                            overflow = true;
+                        }
+                    }
+                })
                 .map_err(object_store_to_sql)?;
-            let descriptor = key
-                .as_str()
-                .strip_suffix(".batch")
-                .map(|stem| crate::stack_format!(72, "{}.head", stem))
-                .expect("listed commit batch has its checked suffix");
-            self.client
-                .delete(descriptor.as_str())
-                .map_err(object_store_to_sql)?;
+            for i in 0..self.garbage_scratch.len() {
+                let key = self.garbage_scratch[i];
+                self.client
+                    .delete(key.as_str())
+                    .map_err(object_store_to_sql)?;
+                let descriptor = key
+                    .as_str()
+                    .strip_suffix(".batch")
+                    .map(|stem| crate::stack_format!(72, "{}.head", stem))
+                    .expect("listed commit batch has its checked suffix");
+                self.client
+                    .delete(descriptor.as_str())
+                    .map_err(object_store_to_sql)?;
+            }
+            if !overflow {
+                return Ok(());
+            }
         }
-        if overflow {
-            return Err(sql_err!(
-                SQLSTATE_IO,
-                "commit-batch sweep exceeds fixed limit {MAX_SWEEP_KEYS}"
-            ));
-        }
-        Ok(())
     }
 
     /// Cold start: loads the manifest (if any) and rehydrates every SST
@@ -6367,12 +6375,11 @@ impl Checkpointer {
         Ok(())
     }
 
-    /// Uploads a full snapshot and publishes it. The caller resets the WAL
-    /// and compacts the heap afterwards. No-op when nothing changed.
-    /// The atomic form: drives beats to completion in one call — the
-    /// explicit `CHECKPOINT` statement and shutdown want to return only when
-    /// the manifest is published. Returns the published LSN, `None` when
-    /// there was nothing to do.
+    /// Uploads and publishes a full snapshot. The publication result is
+    /// returned immediately so the caller can make the matching local WAL,
+    /// heap, and overlay transition before another statement runs. Remote
+    /// garbage maintenance remains pending and is either paced by later beats
+    /// or drained explicitly by [`Self::finish_maintenance`].
     pub(crate) fn checkpoint(
         &mut self,
         storage: &mut Storage,
@@ -6393,13 +6400,32 @@ impl Checkpointer {
         self.sweeping
     }
 
-    /// One beat of the sliced checkpoint: write one table's SSTs, or — when
-    /// every table's slice is current — publish the manifest. Between beats
-    /// the engine serves statements, so a checkpoint no longer stalls every
-    /// connection for its whole duration; consistency holds because a table
-    /// that changes after its slice ([`Table::mark_dirty`] bumps its
-    /// generation) is re-sliced before the publish, and the publish itself
-    /// runs only in a beat where no table has an outdated slice.
+    /// Drains the bounded post-publication deletion batches synchronously.
+    /// Explicit `CHECKPOINT` and shutdown use this after applying their local
+    /// publication transition; ordinary event-loop beats use the paced path.
+    pub(crate) fn finish_maintenance(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        while self.published_lsn_pending_maintenance.is_some() {
+            if self.legacy_garbage_pending {
+                self.legacy_garbage_pending = !self.collect_garbage_batch()?;
+                continue;
+            }
+            if self.block_garbage_pending {
+                self.block_garbage_pending = !self.collect_block_garbage_batch(storage)?;
+                continue;
+            }
+            self.published_lsn_pending_maintenance = None;
+        }
+        Ok(())
+    }
+
+    /// One beat of the sliced checkpoint: write one table's SSTs, publish the
+    /// manifest once every slice is current, or delete one garbage batch after
+    /// publication. Between beats the engine serves statements, so a
+    /// checkpoint no longer stalls every connection for its whole duration;
+    /// consistency holds because a table that changes after its slice
+    /// ([`Table::mark_dirty`] bumps its generation) is re-sliced before the
+    /// publish, and the publish itself runs only in a beat where no table has
+    /// an outdated slice.
     ///
     /// A failed beat (an object-store error) leaves the sweep state where it
     /// stands; the next beat retries the same work — block writes are
@@ -6411,11 +6437,17 @@ impl Checkpointer {
         storage: &mut Storage,
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
-        if let Some(lsn) = self.published_lsn_pending_maintenance {
-            self.collect_garbage()?;
-            self.collect_block_garbage(storage)?;
+        if self.published_lsn_pending_maintenance.is_some() {
+            if self.legacy_garbage_pending {
+                self.legacy_garbage_pending = !self.collect_garbage_batch()?;
+                return Ok(CheckpointStep::Working);
+            }
+            if self.block_garbage_pending {
+                self.block_garbage_pending = !self.collect_block_garbage_batch(storage)?;
+                return Ok(CheckpointStep::Working);
+            }
             self.published_lsn_pending_maintenance = None;
-            return Ok(CheckpointStep::Published { lsn });
+            return Ok(CheckpointStep::Working);
         }
         self.reconcile_published_spill_lists(storage);
         let pinned_full_list = storage.has_active_snapshots()
@@ -6432,7 +6464,8 @@ impl Checkpointer {
             if self.merge_job.is_none() && self.merge_candidate(storage).is_none() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "historical snapshot pins a full SST generation list whose merge exceeds the fixed checkpoint scratch"
+                    "historical snapshot pins a full SST generation list whose merge exceeds checkpoint_merge_entries ({})",
+                    self.merge_scratch.capacity()
                 ));
             }
             self.merge_beat(storage)?;
@@ -9879,9 +9912,8 @@ impl Checkpointer {
         // Keep the LSN until bounded sweeps finish so the next beat resumes
         // cleanup instead of falsely reporting completion.
         self.published_lsn_pending_maintenance = Some(lsn);
-        self.collect_garbage()?;
-        self.collect_block_garbage(storage)?;
-        self.published_lsn_pending_maintenance = None;
+        self.legacy_garbage_pending = true;
+        self.block_garbage_pending = true;
         Ok(())
     }
 
@@ -10332,7 +10364,9 @@ impl Checkpointer {
     /// else under the prefix is an orphan from a superseded checkpoint or an
     /// interrupted write, and is deleted. An undersized keep-set is a loud
     /// error rather than a successful checkpoint that silently retains debt.
-    fn collect_block_garbage(&mut self, storage: &Storage) -> Result<(), SqlError> {
+    /// Returns true once the namespace is clean; false means another paced
+    /// deletion batch remains.
+    fn collect_block_garbage_batch(&mut self, storage: &Storage) -> Result<bool, SqlError> {
         self.roster_scratch.clear();
         self.sst_arena.reset();
         let scratch = self
@@ -10343,10 +10377,11 @@ impl Checkpointer {
         // yet; sweeping them would destroy the job's progress.
         if self.merge_job.is_some() {
             for id in self.merge_writer.roster_so_far() {
-                if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
+                if self.roster_scratch.len() == self.roster_scratch.capacity() {
                     return Err(sql_err!(
-                        SQLSTATE_IO,
-                        "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                        self.roster_scratch.capacity()
                     ));
                 }
                 self.roster_scratch.push(*id);
@@ -10354,10 +10389,11 @@ impl Checkpointer {
         }
         for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
             let h = prev.handle;
-            if self.roster_scratch.len() + 1 > MAX_KEEP_BLOCKS {
+            if self.roster_scratch.len() == self.roster_scratch.capacity() {
                 return Err(sql_err!(
-                    SQLSTATE_IO,
-                    "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                    self.roster_scratch.capacity()
                 ));
             }
             self.roster_scratch.push(h.roster);
@@ -10374,10 +10410,11 @@ impl Checkpointer {
                         "gc roster is not a multiple of 32 bytes"
                     ));
                 }
-                if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
+                if self.roster_scratch.len() == self.roster_scratch.capacity() {
                     return Err(sql_err!(
-                        SQLSTATE_IO,
-                        "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                        self.roster_scratch.capacity()
                     ));
                 }
                 let mut id = [0u8; 32];
@@ -10395,7 +10432,7 @@ impl Checkpointer {
                     handle.roster,
                     scratch,
                     |id| {
-                        if self.roster_scratch.len() == MAX_KEEP_BLOCKS {
+                        if self.roster_scratch.len() == self.roster_scratch.capacity() {
                             return false;
                         }
                         self.roster_scratch.push(id);
@@ -10411,12 +10448,18 @@ impl Checkpointer {
                 })?;
                 if !complete {
                     return Err(sql_err!(
-                        SQLSTATE_IO,
-                        "block GC keep-set exceeds fixed limit {MAX_KEEP_BLOCKS}"
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                        self.roster_scratch.capacity()
                     ));
                 }
             }
         }
+        // Listing may visit many obsolete objects. Sort the fixed keep-set
+        // once so each membership probe is logarithmic rather than scanning
+        // every live block for every listed key.
+        self.roster_scratch.sort_unstable();
+        self.roster_scratch.dedup();
         self.doomed_blocks.clear();
         let keep = &self.roster_scratch;
         let doomed = &mut self.doomed_blocks;
@@ -10425,10 +10468,10 @@ impl Checkpointer {
             .list("blocks/", |key| {
                 let hex = key.strip_prefix("blocks/").unwrap_or(key);
                 let known = parse_block_id(hex)
-                    .map(|id| keep.contains(&id))
+                    .map(|id| keep.binary_search(&id).is_ok())
                     .unwrap_or(false);
                 if !known {
-                    if doomed.len() < MAX_SWEEP_KEYS {
+                    if doomed.len() < doomed.capacity() {
                         doomed.push(crate::stack_format!(80, "{}", key));
                     } else {
                         overflow = true;
@@ -10442,45 +10485,35 @@ impl Checkpointer {
                 .delete(key.as_str())
                 .map_err(object_store_to_sql)?;
         }
-        if overflow {
-            return Err(sql_err!(
-                SQLSTATE_IO,
-                "block garbage sweep exceeds fixed limit {MAX_SWEEP_KEYS}"
-            ));
-        }
-        Ok(())
+        Ok(!overflow)
     }
 
     /// Removes objects from the obsolete pre-content-addressed SST namespace.
     /// Current manifests reference only content-addressed `blocks/` objects.
-    fn collect_garbage(&mut self) -> Result<(), SqlError> {
+    /// Returns true once the namespace is clean; false means another paced
+    /// deletion batch remains.
+    fn collect_garbage_batch(&mut self) -> Result<bool, SqlError> {
         // Two passes because list borrows the client: collect keys first
         // into pre-reserved scratch (no allocation post-freeze).
-        self.doomed_scratch.clear();
-        let doomed = &mut self.doomed_scratch;
+        self.garbage_scratch.clear();
+        let doomed = &mut self.garbage_scratch;
         let mut overflow = false;
         self.client
             .list("sst/", |key| {
-                if doomed.len() < MAX_SWEEP_KEYS {
+                if doomed.len() < doomed.capacity() {
                     doomed.push(crate::stack_format!(64, "{}", key));
                 } else {
                     overflow = true;
                 }
             })
             .map_err(object_store_to_sql)?;
-        for i in 0..self.doomed_scratch.len() {
-            let key = self.doomed_scratch[i];
+        for i in 0..self.garbage_scratch.len() {
+            let key = self.garbage_scratch[i];
             self.client
                 .delete(key.as_str())
                 .map_err(object_store_to_sql)?;
         }
-        if overflow {
-            return Err(sql_err!(
-                SQLSTATE_IO,
-                "SST garbage sweep exceeds fixed limit {MAX_SWEEP_KEYS}"
-            ));
-        }
-        Ok(())
+        Ok(!overflow)
     }
 }
 
@@ -12892,6 +12925,40 @@ mod stored_dependency_tests {
     use crate::mem::budget::Budget;
     use crate::mem::buffer::FixedBuf;
     use crate::storage::{DependencyClass, StoredDependencyIdentity, StoredQueryDependencies};
+
+    #[test]
+    fn checkpoint_maintenance_capacities_are_exactly_budgeted() {
+        let base = Config::default_dev();
+        let base_bytes = Checkpointer::budget_bytes(&base);
+
+        let mut commit = base.clone();
+        commit.checkpoint_commit_batches += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&commit) - base_bytes,
+            core::mem::size_of::<StackStr<64>>()
+        );
+
+        let mut live_blocks = base.clone();
+        live_blocks.checkpoint_live_blocks += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&live_blocks) - base_bytes,
+            core::mem::size_of::<BlockId>()
+        );
+
+        let mut garbage = base.clone();
+        garbage.checkpoint_garbage_batch_objects += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&garbage) - base_bytes,
+            core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>()
+        );
+
+        let mut merge = base;
+        merge.checkpoint_merge_entries += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&merge) - base_bytes,
+            core::mem::size_of::<(SstKey, u8)>()
+        );
+    }
 
     #[test]
     fn posting_sort_groups_duplicate_row_versions_after_their_token() {

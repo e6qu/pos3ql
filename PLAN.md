@@ -54,6 +54,18 @@ storage. RAM and local disk are bounded, disposable caches.
   publication, an ambiguous compare-and-swap response, and empty-cache recovery
   share one regression. The complete manifest has an explicit startup-reserved
   `checkpoint_manifest_bytes` bound and fails before publication when full.
+  Commit-chain replay, the live content-addressed block keep-set, SST-pair merge
+  scheduling, and garbage deletion batches have independent startup capacities.
+  Garbage beyond one batch is drained over paced beats instead of becoming a
+  scale error. Manifest publication is handed to local WAL, heap, and overlay
+  cleanup in the same beat before a newer statement can run; remote deletion
+  remains paced, while explicit checkpoints wait for it to complete.
+  Commit-batch pruning drains histories larger than one batch while retaining
+  the replay boundary. The sorted live-block set gives each listed-object
+  membership test logarithmic cost. Exact memory deltas, named exhaustion,
+  multi-batch cleanup, publication interleaving, multi-generation overlay
+  compaction, commit-chain cold recovery, and recovery after cleanup share
+  regressions.
   Startup-sized table, constraint/default/statistics, publication, replication,
   subscription, dependency, trigger, sequence, and information-schema catalogs
   construct rows from their transaction-visible cardinality instead of hidden
@@ -232,10 +244,10 @@ original and cold-recovery caches on scope exit, including assertion failures.
 Replace remaining compile-time per-object inline ceilings with startup-sized
 pools or bounded chunked structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
-catalog construction, compaction, and garbage collection. Exercise maximum-
-capacity inheritance, routine, trigger, policy, transaction, spill, compaction,
-garbage collection, checkpoint retry, and object-cold recovery while checking exact
-startup memory accounting and loud exhaustion.
+catalog construction, and execution scratch. Exercise maximum-capacity
+inheritance, routine, trigger, policy, transaction, spill, and remaining
+per-object structures through checkpoint retry and object-cold recovery while
+checking exact startup memory accounting and loud exhaustion.
 
 ### Multi-core execution
 

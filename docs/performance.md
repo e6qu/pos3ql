@@ -176,7 +176,11 @@ already share their documented SQL, WAL, checkpoint, and recovery bounds.
 Major SQL-object, metadata, database, and schema catalogs now have independent
 startup-sized pools; database connection and statistics registries, checkpoint
 row bookkeeping, and the named `checkpoint_manifest_bytes` reservation are
-charged at startup as well.
+charged at startup as well. Commit-chain replay, the live-block garbage keep-set,
+SST-pair merge scheduling, and garbage deletion batches are separately
+startup-sized. Deletion is paced across batches rather than capped at one batch,
+and live-block membership probes use a sorted fixed buffer instead of a linear
+scan per listed object.
 Multi-core execution must preserve fixed memory, MVCC, lock ordering, group
 publication order, and explicit backpressure. Writer fencing and promotion
 safety must exist before any failover benchmark or active-active claim is

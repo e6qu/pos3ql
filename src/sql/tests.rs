@@ -9745,6 +9745,266 @@ fn configured_transaction_capacity_covers_bulk_analyze_undo_and_exhaustion() {
 }
 
 #[test]
+fn configured_catalog_version_pools_cover_one_object_and_savepoint_reuse() {
+    let mut config = test_config("configured-catalog-version-pools");
+    config.max_tables = 4;
+    config.max_routines = 4;
+    config.max_ddl_per_transaction = 40;
+    config.max_catalog_versions_per_object = 40;
+    config.max_analyze_per_transaction = 40;
+    config.max_savepoints_per_transaction = 8;
+    config.table_rows = 16;
+    config.value_index_rows = 16;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("catalog-version-pools-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+
+    session.success(
+        &mut engine,
+        "CREATE TABLE version_pool(id integer, other_id integer); \
+         INSERT INTO version_pool VALUES (1, 2); \
+         CREATE STATISTICS version_pool_statistics (ndistinct) \
+             ON id, other_id FROM version_pool; \
+         CREATE FUNCTION version_pool_value() RETURNS integer LANGUAGE SQL \
+             BEGIN ATOMIC SELECT id FROM version_pool LIMIT 1; END; \
+         BEGIN",
+        false,
+    );
+
+    for target in 1..=10 {
+        session.success(
+            &mut engine,
+            &format!("ALTER TABLE version_pool ALTER COLUMN id SET STATISTICS {target}"),
+            false,
+        );
+    }
+    session.success(&mut engine, "SAVEPOINT before_more_definitions", false);
+    for target in 11..=14 {
+        session.success(
+            &mut engine,
+            &format!("ALTER TABLE version_pool ALTER COLUMN id SET STATISTICS {target}"),
+            false,
+        );
+    }
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_more_definitions",
+        false,
+    );
+
+    for _ in 0..10 {
+        session.success(&mut engine, "ANALYZE version_pool", false);
+    }
+    session.success(&mut engine, "SAVEPOINT before_more_analyze", false);
+    for _ in 0..4 {
+        session.success(&mut engine, "ANALYZE version_pool", false);
+    }
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_more_analyze",
+        false,
+    );
+
+    for value in 1..=10 {
+        session.success(
+            &mut engine,
+            &format!(
+                "CREATE OR REPLACE FUNCTION version_pool_value() RETURNS integer LANGUAGE SQL \
+                 BEGIN ATOMIC SELECT {value} FROM version_pool LIMIT 1; END"
+            ),
+            false,
+        );
+    }
+    session.success(&mut engine, "SAVEPOINT before_more_replacements", false);
+    for value in 11..=14 {
+        session.success(
+            &mut engine,
+            &format!(
+                "CREATE OR REPLACE FUNCTION version_pool_value() RETURNS integer LANGUAGE SQL \
+                 BEGIN ATOMIC SELECT {value} FROM version_pool LIMIT 1; END"
+            ),
+            false,
+        );
+    }
+    assert_eq!(
+        data_rows(&session.success(&mut engine, "SELECT version_pool_value()", false)),
+        ["14"]
+    );
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT before_more_replacements; COMMIT",
+        false,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT attstattarget FROM pg_attribute \
+             WHERE attrelid = 'version_pool'::regclass AND attname = 'id'; \
+             SELECT count(*) FROM pg_stats WHERE tablename = 'version_pool'; \
+             SELECT count(*) FROM pg_statistic_ext_data; \
+             SELECT version_pool_value()",
+            false,
+        )),
+        ["10", "2", "1", "10"]
+    );
+
+    drop(session);
+    engine.checkpoint().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT attstattarget FROM pg_attribute \
+             WHERE attrelid = 'version_pool'::regclass AND attname = 'id'; \
+             SELECT count(*) FROM pg_stats WHERE tablename = 'version_pool'; \
+             SELECT count(*) FROM pg_statistic_ext_data; \
+             SELECT version_pool_value()",
+        )),
+        ["10", "2", "1", "10"]
+    );
+    let dependency_error = run_with(&mut cold, &mut cold_budget, "DROP TABLE version_pool");
+    assert!(
+        String::from_utf8_lossy(&dependency_error).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&dependency_error)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn configured_catalog_version_pools_do_not_allocate_while_serving() {
+    let mut config = test_config("configured-catalog-version-pools-memory");
+    config.max_tables = 4;
+    config.max_routines = 4;
+    config.max_ddl_per_transaction = 40;
+    config.max_catalog_versions_per_object = 10;
+    config.max_analyze_per_transaction = 40;
+    config.max_savepoints_per_transaction = 8;
+    config.table_rows = 16;
+    config.value_index_rows = 16;
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE version_pool_memory(id integer, other_id integer); \
+         INSERT INTO version_pool_memory VALUES (1, 2); \
+         CREATE STATISTICS version_pool_memory_statistics (ndistinct) \
+             ON id, other_id FROM version_pool_memory; \
+         CREATE FUNCTION version_pool_memory_value() RETURNS integer LANGUAGE SQL \
+             BEGIN ATOMIC SELECT id FROM version_pool_memory LIMIT 1; END; \
+         BEGIN",
+        false,
+    );
+
+    for target in 1..=9 {
+        session.success(
+            &mut engine,
+            &format!("ALTER TABLE version_pool_memory ALTER COLUMN id SET STATISTICS {target}"),
+            true,
+        );
+    }
+    session.success(
+        &mut engine,
+        "SAVEPOINT definition_reuse; \
+         ALTER TABLE version_pool_memory ALTER COLUMN id SET STATISTICS 10",
+        true,
+    );
+    let definition_exhaustion = session.execute(
+        &mut engine,
+        "ALTER TABLE version_pool_memory ALTER COLUMN id SET STATISTICS 11",
+        true,
+    );
+    assert!(String::from_utf8_lossy(&definition_exhaustion).contains("54000"));
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT definition_reuse; \
+         ALTER TABLE version_pool_memory ALTER COLUMN id SET STATISTICS 10",
+        true,
+    );
+
+    for _ in 0..9 {
+        session.success(&mut engine, "ANALYZE version_pool_memory", true);
+    }
+    session.success(
+        &mut engine,
+        "SAVEPOINT analyze_reuse; ANALYZE version_pool_memory",
+        true,
+    );
+    let analyze_exhaustion = session.execute(&mut engine, "ANALYZE version_pool_memory", true);
+    assert!(String::from_utf8_lossy(&analyze_exhaustion).contains("54000"));
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT analyze_reuse; ANALYZE version_pool_memory",
+        true,
+    );
+
+    for value in 1..=9 {
+        session.success(
+            &mut engine,
+            &format!(
+                "CREATE OR REPLACE FUNCTION version_pool_memory_value() RETURNS integer \
+                 LANGUAGE SQL BEGIN ATOMIC \
+                 SELECT {value} FROM version_pool_memory LIMIT 1; END"
+            ),
+            true,
+        );
+    }
+    session.success(
+        &mut engine,
+        "SAVEPOINT routine_reuse; \
+         CREATE OR REPLACE FUNCTION version_pool_memory_value() RETURNS integer \
+             LANGUAGE SQL BEGIN ATOMIC \
+             SELECT 10 FROM version_pool_memory LIMIT 1; END",
+        true,
+    );
+    let routine_exhaustion = session.execute(
+        &mut engine,
+        "CREATE OR REPLACE FUNCTION version_pool_memory_value() RETURNS integer \
+         LANGUAGE SQL BEGIN ATOMIC \
+         SELECT 11 FROM version_pool_memory LIMIT 1; END",
+        true,
+    );
+    assert!(String::from_utf8_lossy(&routine_exhaustion).contains("54000"));
+    session.success(
+        &mut engine,
+        "ROLLBACK TO SAVEPOINT routine_reuse; \
+         CREATE OR REPLACE FUNCTION version_pool_memory_value() RETURNS integer \
+             LANGUAGE SQL BEGIN ATOMIC \
+             SELECT 10 FROM version_pool_memory LIMIT 1; END; \
+         COMMIT",
+        true,
+    );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT attstattarget FROM pg_attribute \
+             WHERE attrelid = 'version_pool_memory'::regclass AND attname = 'id'; \
+             SELECT count(*) FROM pg_stats WHERE tablename = 'version_pool_memory'; \
+             SELECT count(*) FROM pg_statistic_ext_data; \
+             SELECT version_pool_memory_value()",
+            true,
+        )),
+        ["10", "2", "1", "10"]
+    );
+}
+
+#[test]
 fn configured_transaction_capacity_covers_deferred_exhaustion_and_reuse() {
     for (label, metadata, row_bytes, failing_insert) in [
         (

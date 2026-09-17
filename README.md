@@ -143,7 +143,11 @@ cannot leave a partially published catalog object.
 `max_ddl_per_transaction` sizes catalog undo, commit, prepared-transaction,
 subscription-apply, and logical-decoding state together. It is reserved for
 every transaction slot at startup; exhaustion aborts the current statement or
-transaction instead of partially applying bulk DDL.
+transaction instead of partially applying bulk DDL. Pending table-definition
+and routine-dependency pools use that transaction bound together with
+`max_catalog_versions_per_object` (default 8). The latter is an explicit
+startup-memory choice rather than a compiled inline-array ceiling and may be
+raised when workloads repeatedly change one object in a transaction.
 
 Atomic transaction bookkeeping is independently startup-sized by
 `max_savepoints_per_transaction` (default 16),
@@ -153,7 +157,10 @@ extended statistics). These capacities cover connection, prepared-transaction,
 and subscription-apply slots. Savepoint configuration also reserves GUC,
 foreign-query, large-object descriptor depth, and per-relation nested statistics
 state; session reset reuses the original allocation. Statement arenas, row undo,
-and WAL staging remain separate named bounds.
+and WAL staging remain separate named bounds. Pending table and extended
+statistics pools combine `max_analyze_per_transaction` with
+`max_catalog_versions_per_object`, including repeated ANALYZE of one object and
+savepoint rollback.
 
 TRUNCATE fan-out uses the complete configured physical-table capacity, including
 inheritance and partition descendants and foreign-key cascades. Transaction and

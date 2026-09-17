@@ -55,6 +55,8 @@ pub struct Config {
     pub txn_rows: usize,
     /// Catalog mutations one transaction may stage for commit or rollback.
     pub max_ddl_per_transaction: usize,
+    /// Successive transaction-private images retained for one catalog object.
+    pub max_catalog_versions_per_object: usize,
     pub max_savepoints_per_transaction: usize,
     pub max_deferred_constraints_per_transaction: usize,
     pub deferred_trigger_bytes: usize,
@@ -325,6 +327,7 @@ impl Config {
             portal_result_bytes: 64 * KIB,
             txn_rows: 8192,
             max_ddl_per_transaction: 256,
+            max_catalog_versions_per_object: 8,
             max_savepoints_per_transaction: 16,
             max_deferred_constraints_per_transaction: 128,
             deferred_trigger_bytes: 256 * KIB,
@@ -580,6 +583,10 @@ impl Config {
                 }
                 "max_ddl_per_transaction" => {
                     config.max_ddl_per_transaction =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_catalog_versions_per_object" => {
+                    config.max_catalog_versions_per_object =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_savepoints_per_transaction" => {
@@ -1173,6 +1180,10 @@ impl Config {
                 config.max_savepoints_per_transaction,
             ),
             (
+                "max_catalog_versions_per_object",
+                config.max_catalog_versions_per_object,
+            ),
+            (
                 "max_deferred_constraints_per_transaction",
                 config.max_deferred_constraints_per_transaction,
             ),
@@ -1516,12 +1527,14 @@ mod tests {
     #[test]
     fn transaction_capacities_are_validated_and_exactly_budgeted() {
         let config = Config::parse(
-            "max_savepoints_per_transaction = 257\n\
+            "max_catalog_versions_per_object = 33\n\
+             max_savepoints_per_transaction = 257\n\
              max_deferred_constraints_per_transaction = 1024\n\
              deferred_trigger_bytes = 1MiB\n\
              max_analyze_per_transaction = 260\n",
         )
         .unwrap();
+        assert_eq!(config.max_catalog_versions_per_object, 33);
         assert_eq!(config.max_savepoints_per_transaction, 257);
         assert_eq!(config.max_deferred_constraints_per_transaction, 1024);
         assert_eq!(config.deferred_trigger_bytes, MIB);
@@ -1533,6 +1546,7 @@ mod tests {
         assert_eq!(transaction.constraint_capacity(), 1024);
         assert_eq!(transaction.truncate_table_capacity(), config.max_tables + 1);
         for key in [
+            "max_catalog_versions_per_object",
             "max_savepoints_per_transaction",
             "max_deferred_constraints_per_transaction",
             "deferred_trigger_bytes",
@@ -1585,6 +1599,7 @@ mod tests {
 listen_addr = 0.0.0.0:5432
 max_connections = 128
 max_ddl_per_transaction = 192
+max_catalog_versions_per_object = 24
 max_prepared_transactions = 11
 max_locks_per_transaction = 96
 max_replication_slots = 12
@@ -1616,6 +1631,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.listen_addr, "0.0.0.0:5432");
         assert_eq!(c.max_connections, 128);
         assert_eq!(c.max_ddl_per_transaction, 192);
+        assert_eq!(c.max_catalog_versions_per_object, 24);
         assert_eq!(c.max_prepared_transactions, 11);
         assert_eq!(c.max_locks_per_transaction, 96);
         assert_eq!(c.max_replication_slots, 12);

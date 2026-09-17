@@ -49421,6 +49421,190 @@ fn inverted_index_navigation_prunes_cold_objects_and_merges_mvcc_overlays() {
 }
 
 #[test]
+fn gin_postings_route_exact_tokens_and_conservatively_decline_unbounded_queries() {
+    let mut config = test_config("gin-posting-navigation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 2 << 20;
+    config.wal_bytes = 16 << 20;
+    config.memtable_bytes = 16 << 20;
+    config.table_rows = 1024;
+    config.txn_rows = 2048;
+    config.value_index_rows = 16384;
+    config.max_indexes = 8;
+    config.max_value_indexes = 8;
+    config.object_store_bucket = format!("gin-posting-navigation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE posting_rows (
+             id integer PRIMARY KEY,
+             tags integer[], document tsvector, json_ops jsonb, json_path jsonb
+         );
+         CREATE INDEX posting_tags ON posting_rows USING gin(tags);
+         CREATE INDEX posting_document ON posting_rows USING gin(document);
+         CREATE INDEX posting_json_ops ON posting_rows USING gin(json_ops);
+         CREATE INDEX posting_json_path ON posting_rows USING gin(json_path jsonb_path_ops);
+         INSERT INTO posting_rows
+           SELECT value,
+                  CASE WHEN value=77 THEN ARRAY[value,value] ELSE ARRAY[value,1000+value] END,
+                  to_tsvector('simple','token'||value::text||' group'||(value%8)::text),
+                  jsonb_build_object('key'||value::text,'value'||value::text),
+                  jsonb_build_object('token','value'||value::text)
+             FROM generate_series(1,128) AS source(value);
+         INSERT INTO posting_rows VALUES
+           (129,ARRAY[]::integer[],''::tsvector,'{}'::jsonb,'{}'::jsonb),
+           (130,NULL,NULL,NULL,NULL);
+         ANALYZE posting_rows",
+        false,
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    let table_slot = engine.storage.find_table("public", "posting_rows").unwrap();
+    let index_slot = engine
+        .storage
+        .index_slot("public", "posting_tags", 0)
+        .unwrap();
+    let binding = engine
+        .storage
+        .value_binding_for_index(
+            table_slot,
+            engine
+                .storage
+                .index_visible_to(index_slot, 0)
+                .unwrap()
+                .created_at,
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .storage
+            .value_binding_handle(table_slot, binding)
+            .unwrap()
+            .entries,
+        255,
+        "duplicate array elements must collapse to one durable posting"
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    let plans = data_rows(&cold_session.success(
+        &mut cold,
+        "EXPLAIN SELECT id FROM posting_rows WHERE tags @> ARRAY[77];
+         EXPLAIN SELECT id FROM posting_rows WHERE document @@ 'token77'::tsquery;
+         EXPLAIN SELECT id FROM posting_rows WHERE json_ops ? 'key77';
+         EXPLAIN SELECT id FROM posting_rows
+          WHERE json_path @> '{\"token\":\"value77\"}'::jsonb",
+        false,
+    ));
+    for index in [
+        "posting_tags",
+        "posting_document",
+        "posting_json_ops",
+        "posting_json_path",
+    ] {
+        assert!(
+            plans.iter().any(|row| row.contains(index)),
+            "{index}: {plans:?}"
+        );
+    }
+    let queries = [
+        "SELECT id FROM posting_rows WHERE tags @> ARRAY[77]",
+        "SELECT id FROM posting_rows WHERE tags && ARRAY[77,9999]",
+        "SELECT id FROM posting_rows WHERE document @@ 'token77 | absent'::tsquery",
+        "SELECT id FROM posting_rows WHERE document @@ 'token77 & !absent'::tsquery",
+        "SELECT id FROM posting_rows WHERE json_ops ? 'key77'",
+        "SELECT id FROM posting_rows WHERE json_ops ?| ARRAY['key77','absent']",
+        "SELECT id FROM posting_rows WHERE json_ops ?& ARRAY['key77']",
+        "SELECT id FROM posting_rows WHERE json_path @> '{\"token\":\"value77\"}'::jsonb",
+    ];
+    for query in queries {
+        let before = cold.storage.block_io_stats();
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, query, false)),
+            ["77"],
+            "{query}"
+        );
+        let traffic = cold.storage.block_io_stats().saturating_sub(before);
+        assert!(traffic.object_gets <= 8, "{query}: {traffic:?}");
+        assert!(traffic.object_read_bytes < 160_000, "{query}: {traffic:?}");
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, query, true)),
+            ["77"],
+            "{query}"
+        );
+    }
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "PREPARE posting_overlap(integer[]) AS
+               SELECT id FROM posting_rows WHERE tags && $1;
+             EXECUTE posting_overlap(ARRAY[77,9999]);
+             EXECUTE posting_overlap(ARRAY[]::integer[]);
+             DEALLOCATE posting_overlap",
+            false,
+        )),
+        ["77"]
+    );
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "SELECT id FROM posting_rows WHERE tags=ARRAY[]::integer[];
+             SELECT count(*) FROM posting_rows WHERE document @@ '!missing'::tsquery;
+             SELECT count(*) FROM posting_rows WHERE json_ops @> '{}'::jsonb;
+             SELECT count(*) FROM posting_rows WHERE json_path @> '2'::jsonb",
+            false,
+        )),
+        ["129", "129", "129", "0"]
+    );
+
+    let mutation = "UPDATE posting_rows
+                        SET tags=ARRAY[77], document='token77'::tsvector,
+                            json_ops='{\"key77\":\"value77\"}'::jsonb,
+                            json_path='{\"token\":\"value77\"}'::jsonb
+                      WHERE id=88";
+    cold_session.success(&mut cold, "BEGIN; SAVEPOINT changed", false);
+    cold_session.success(&mut cold, mutation, false);
+    for query in queries {
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, &format!("{query} ORDER BY id"), false)),
+            ["77", "88"],
+            "{query}"
+        );
+    }
+    cold_session.success(&mut cold, "ROLLBACK TO changed; COMMIT", false);
+    cold_session.success(&mut cold, mutation, false);
+    cold_session.success(&mut cold, "DELETE FROM posting_rows WHERE id=77", false);
+    cold.commit_wal().unwrap();
+    assert!(cold.checkpoint().unwrap());
+    drop(cold_session);
+    drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    for query in queries {
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovered_budget, query)),
+            ["88"],
+            "{query}"
+        );
+    }
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn network_and_range_navigation_prunes_every_builtin_interval_family() {
     let mut config = test_config("network-range-navigation");
     config.object_store_on = true;

@@ -72,7 +72,7 @@ mod value;
 
 pub(crate) use navigation::{
     INTERVAL_KEY_BYTES, IntervalSummary, NavigationKind, NavigationSpec, NavigationSummary,
-    SpatialBounds, TokenSignature,
+    POSTING_KEY_BYTES, SpatialBounds, TokenSignature,
 };
 
 pub(crate) mod lz4;
@@ -150,6 +150,8 @@ pub(crate) enum BlockType {
     SstDataPaxColumnV1 = 16,
     /// Bounding-box navigation nodes over immutable secondary-index data.
     ValueIndexNavigationV1 = 17,
+    /// Exact-token GIN posting navigation nodes.
+    ValueIndexPostingV1 = 18,
 }
 
 impl BlockType {
@@ -169,6 +171,7 @@ impl BlockType {
             15 => BlockType::SstDataPaxV2,
             16 => BlockType::SstDataPaxColumnV1,
             17 => BlockType::ValueIndexNavigationV1,
+            18 => BlockType::ValueIndexPostingV1,
             _ => return None,
         })
     }
@@ -572,6 +575,7 @@ mod tests {
             BlockType::ValueIndexData,
             BlockType::ValueIndexRoster,
             BlockType::ValueIndexNavigationV1,
+            BlockType::ValueIndexPostingV1,
         ]
         .into_iter()
         .enumerate()

@@ -11,7 +11,7 @@
 use super::navigation::SpatialBounds;
 use super::navigation::{
     INTERVAL_DATA_BYTES, NavigationCursor, NavigationKind, NavigationSummary, NavigationWriter,
-    SIGNATURE_DATA_BYTES, SPATIAL_DATA_BYTES,
+    POSTING_DATA_BYTES, SIGNATURE_DATA_BYTES, SPATIAL_DATA_BYTES,
 };
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
@@ -140,8 +140,10 @@ impl ValueIndexWriter {
             NavigationKind::Spatial => SPATIAL_DATA_BYTES,
             NavigationKind::Signature => SIGNATURE_DATA_BYTES,
             NavigationKind::Interval => INTERVAL_DATA_BYTES,
+            NavigationKind::Posting => POSTING_DATA_BYTES,
         };
-        self.navigation.reset(position, covering);
+        self.navigation
+            .reset(position, covering, kind == NavigationKind::Posting);
     }
 
     pub(crate) fn append_navigation(
@@ -470,7 +472,10 @@ pub(crate) fn walk_value_roster(
 ) -> Result<bool, ValueIndexError> {
     let first_roster = store.get(&root, scratch)?;
     let root_kind = first_roster.1;
-    if root_kind == BlockType::ValueIndexNavigationV1 {
+    if matches!(
+        root_kind,
+        BlockType::ValueIndexNavigationV1 | BlockType::ValueIndexPostingV1
+    ) {
         let mut cursor = NavigationCursor::for_gc(root);
         let mut stopped = false;
         loop {
@@ -614,7 +619,10 @@ impl<'a> ValueIndexReader<'a> {
     ) -> Result<(), ValueIndexError> {
         let first_roster = store.get(&handle.roster, self.roster)?;
         let root_kind = first_roster.1;
-        if root_kind == BlockType::ValueIndexNavigationV1 {
+        if matches!(
+            root_kind,
+            BlockType::ValueIndexNavigationV1 | BlockType::ValueIndexPostingV1
+        ) {
             return self.walk_navigation(
                 store,
                 handle,
@@ -683,7 +691,10 @@ impl<'a> ValueIndexReader<'a> {
     ) -> Result<(), ValueIndexError> {
         let first_roster = store.get(&handle.roster, self.roster)?;
         let root_kind = first_roster.1;
-        if root_kind == BlockType::ValueIndexNavigationV1 {
+        if matches!(
+            root_kind,
+            BlockType::ValueIndexNavigationV1 | BlockType::ValueIndexPostingV1
+        ) {
             return self.walk_navigation(
                 store,
                 handle,
@@ -944,6 +955,80 @@ mod tests {
                 panic!("empty reused generation")
             })
             .unwrap();
+    }
+
+    #[test]
+    fn posting_generations_have_a_distinct_root_and_route_exact_keys() {
+        let mut budget = Budget::new(16 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "posting values", 8 << 20, 2048).unwrap();
+        let mut writer = ValueIndexWriter::new();
+        writer.reset_navigation(0, NavigationKind::Posting, false);
+        for value in 0..8000u64 {
+            let mut key = [0u8; 9];
+            key[0] = 2;
+            key[1..].copy_from_slice(&value.to_be_bytes());
+            let mut interval = [0; crate::store::INTERVAL_KEY_BYTES];
+            interval[..key.len()].copy_from_slice(&key);
+            writer
+                .append_navigation(
+                    &mut store,
+                    (value, value + 10, 7),
+                    &key,
+                    None,
+                    NavigationSummary::Interval(crate::store::IntervalSummary::bounded(
+                        interval, interval,
+                    )),
+                    &mut |left, right| left.cmp(right),
+                )
+                .unwrap();
+        }
+        let handle = writer.finish(&mut store, 8).unwrap().unwrap();
+        let mut roster = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        assert_eq!(
+            store.get(&handle.roster, &mut roster).unwrap().1,
+            BlockType::ValueIndexPostingV1
+        );
+        let target = 6345u64;
+        let mut target_key = [0u8; 9];
+        target_key[0] = 2;
+        target_key[1..].copy_from_slice(&target.to_be_bytes());
+        let mut interval = [0; crate::store::INTERVAL_KEY_BYTES];
+        interval[..target_key.len()].copy_from_slice(&target_key);
+        let before = store.reads();
+        let mut found = None;
+        crate::mem::guard::forbid_alloc(|| {
+            ValueIndexReader::over(&mut roster, &mut data)
+                .range_covering_with_bounds(
+                    &mut store,
+                    &handle,
+                    |_, summary| match summary {
+                        NavigationSummary::Interval(summary) => {
+                            summary.intersects(interval, interval)
+                        }
+                        NavigationSummary::Empty => false,
+                        _ => true,
+                    },
+                    |key| match key.cmp(&target_key) {
+                        core::cmp::Ordering::Less => ValueIndexPosition::Before,
+                        core::cmp::Ordering::Equal => ValueIndexPosition::Match,
+                        core::cmp::Ordering::Greater => ValueIndexPosition::After,
+                    },
+                    |hash, rowid, lsn, key, payload| {
+                        found = Some((hash, rowid, lsn));
+                        assert_eq!(key, target_key);
+                        assert!(payload.is_empty());
+                    },
+                )
+                .unwrap();
+        });
+        assert_eq!(found, Some((target, target + 10, 7)));
+        assert!(
+            store.reads() - before <= 5,
+            "{} reads",
+            store.reads() - before
+        );
     }
 
     #[test]

@@ -248,6 +248,8 @@ bench_pos3ql warm-memory-gist-knn --workload gist-knn --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-gin-array --workload gin-array --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-gin-array-overlap --workload gin-array-overlap --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-gin-tsvector --workload gin-tsvector --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-gist-tsvector --workload gist-tsvector --clients "$CLIENTS" \
@@ -315,6 +317,8 @@ bench_pos3ql cold-object-gist-spatial --workload gist-spatial --clients 1 \
 bench_pos3ql cold-object-gist-knn --workload gist-knn --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-gin-array --workload gin-array --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-gin-array-overlap --workload gin-array-overlap --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql cold-object-gin-tsvector --workload gin-tsvector --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index

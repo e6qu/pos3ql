@@ -197,6 +197,15 @@ contained-by cases conservatively retain children. Empty-cache object-read
 budgets, transaction overlays, recovery, malformed summaries, PostgreSQL 18
 differential cases, and distinct warm/cold performance workloads qualify all
 five operator-class paths without runtime allocation.
+GiST range, multirange, and network generations and SP-GiST range and network
+generations use fixed-size ordered interval summaries in the same immutable
+tree. All six built-in range subtypes, empty and unbounded ranges, IPv4, and
+IPv6 prune disjoint cold objects while retaining exact SQL and MVCC rechecks.
+Unknown network and homogeneous range literals resolve from the indexed
+operand at the probe boundary. Three-level cold-read budgets, every physical
+operator-class path, transaction overlays, reindexing, checkpoint recovery,
+malformed summaries, PostgreSQL 18 differential cases, and distinct warm/cold
+performance workloads qualify the implementation without runtime allocation.
 External harnesses reserve loopback ports across build delays with atomic,
 owner-tracked claims shared by conformance and performance runs. Crashed owners
 are reclaimed under an OS lock; startup probes verify fixture process ownership.
@@ -225,14 +234,14 @@ worker limit under read-only, write-heavy, and mixed workloads.
 
 ### Navigable specialized indexes
 
-Geometric and signature navigation is implemented. Extend object-native
-navigation to network and range/multirange generations. Dedicated GIN posting
-structures can further reduce leaf rechecks and duplicate-value work beyond
-the implemented array, JSONB, and full-text signature pruning. Unfiltered nearest-neighbor limits still
-materialize compact keys and need ranked node traversal with MVCC-safe limit
-and residual-filter handling. Preserve exact rechecks, fixed memory, rollback,
-publication, garbage collection, and cold recovery without PostgreSQL page
-layouts or native operator-class callbacks.
+Geometric, signature, and interval navigation is implemented. Dedicated GIN
+posting structures can further reduce leaf rechecks and duplicate-value work
+beyond the implemented array, JSONB, and full-text signature pruning.
+Unfiltered nearest-neighbor limits still materialize compact keys and need
+ranked node traversal with MVCC-safe limit and residual-filter handling.
+Preserve exact rechecks, fixed memory, rollback, publication, garbage
+collection, and cold recovery without PostgreSQL page layouts or native
+operator-class callbacks.
 
 ### Availability and operations
 

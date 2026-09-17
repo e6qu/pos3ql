@@ -2340,9 +2340,9 @@ fn network_op<'a>(operator: BinaryOp, l: Datum<'a>, r: Datum<'a>) -> Result<Datu
 fn net_operand_error(operator: BinaryOp, l: &Datum, r: &Datum) -> SqlError {
     sql_err!(
         sqlstate::UNDEFINED_FUNCTION,
-        "operator does not exist: {} {:?} {}",
+        "operator does not exist: {} {} {}",
         type_name_of(l),
-        operator,
+        operator.operator_name().unwrap_or("?"),
         type_name_of(r)
     )
 }
@@ -2435,6 +2435,61 @@ pub(crate) fn binary<'a>(
             .and_then(|name| super::funcs::geometry::unknown_operand_kind(name, kind, false))
     {
         r = cast_to(r, ColType::Geometry(target), arena)?;
+    }
+    // Network relationship and bitwise operators have network arguments on
+    // both sides. Resolve an unknown string from the typed peer before
+    // overload dispatch, just as scalar comparison does. Arithmetic is
+    // intentionally excluded because `inet`/integer and `inet`/`inet`
+    // overloads do not have one homogeneous peer type.
+    if matches!(
+        operator,
+        Shl | Shr | NetContainedEq | NetContainsEq | Overlaps | BitAnd | BitOr
+    ) {
+        if l_unknown && is_network(&r) {
+            l = coerce_unknown(l, &r)?;
+        }
+        if r_unknown && is_network(&l) {
+            r = coerce_unknown(r, &l)?;
+        }
+    }
+    // Range comparison, set, overlap, and positional operators have the same
+    // range family on both sides. Their unknown literal therefore takes the
+    // peer's concrete range type before dispatch. Containment is asymmetric:
+    // only an unknown container is unambiguously a range, while an unknown
+    // contained value can instead be the range's scalar element.
+    let range_type = |datum: &Datum| match datum {
+        Datum::Range { kind, .. } => Some(ColType::Range(*kind)),
+        Datum::Multirange { kind, .. } => Some(ColType::Multirange(*kind)),
+        _ => None,
+    };
+    let homogeneous_range = matches!(
+        operator,
+        Eq | NotEq
+            | Lt
+            | LtEq
+            | Gt
+            | GtEq
+            | Add
+            | Sub
+            | Mul
+            | Overlaps
+            | Shl
+            | Shr
+            | NotRightOf
+            | NotLeftOf
+            | Adjacent
+    );
+    if l_unknown
+        && (homogeneous_range || operator == Contains)
+        && let Some(target) = range_type(&r)
+    {
+        l = cast_to(l, target, arena)?;
+    }
+    if r_unknown
+        && (homogeneous_range || operator == ContainedBy)
+        && let Some(target) = range_type(&l)
+    {
+        r = cast_to(r, target, arena)?;
     }
     if operator == BinaryOp::Pow {
         if l_unknown && matches!(l, Datum::Text(_)) {

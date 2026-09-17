@@ -49421,6 +49421,203 @@ fn inverted_index_navigation_prunes_cold_objects_and_merges_mvcc_overlays() {
 }
 
 #[test]
+fn network_and_range_navigation_prunes_every_builtin_interval_family() {
+    let mut config = test_config("network-range-navigation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_buffer_bytes = 4 << 20;
+    config.wal_bytes = 48 << 20;
+    config.memtable_bytes = 48 << 20;
+    config.table_rows = 4096;
+    config.txn_rows = 8192;
+    config.value_index_rows = 65536;
+    config.max_indexes = 16;
+    config.max_value_indexes = 16;
+    config.object_store_bucket = format!("network-range-navigation-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE interval_rows (
+             id integer PRIMARY KEY,
+             gist_address inet, spgist_address inet,
+             int_span int4range, big_span int8range, numeric_span numrange,
+             date_span daterange, timestamp_span tsrange,
+             timestamptz_span tstzrange, spgist_span int4range,
+             spans int4multirange
+         );
+         CREATE INDEX interval_gist_address ON interval_rows USING gist(gist_address inet_ops);
+         CREATE INDEX interval_spgist_address ON interval_rows USING spgist(spgist_address inet_ops);
+         CREATE INDEX interval_int_span ON interval_rows USING gist(int_span);
+         CREATE INDEX interval_big_span ON interval_rows USING gist(big_span);
+         CREATE INDEX interval_numeric_span ON interval_rows USING gist(numeric_span);
+         CREATE INDEX interval_date_span ON interval_rows USING gist(date_span);
+         CREATE INDEX interval_timestamp_span ON interval_rows USING gist(timestamp_span);
+         CREATE INDEX interval_timestamptz_span ON interval_rows USING gist(timestamptz_span);
+         CREATE INDEX interval_spgist_span ON interval_rows USING spgist(spgist_span);
+         CREATE INDEX interval_spans ON interval_rows USING gist(spans)",
+        false,
+    );
+    for first in (1..=2000).step_by(100) {
+        session.success(
+            &mut engine,
+            &format!(
+                "INSERT INTO interval_rows
+                   SELECT value,
+                          '10.0.0.0'::inet + value,
+                          '11.0.0.0'::inet + value,
+                          int4range(value*4,value*4+2),
+                          int8range(value::bigint*10000000000,value::bigint*10000000000+2),
+                          numrange(value::numeric/10,value::numeric/10+0.1),
+                          daterange(date '2020-01-01'+value,date '2020-01-01'+value+1),
+                          tsrange((date '2020-01-01'+value)::timestamp,
+                                  (date '2020-01-01'+value+1)::timestamp),
+                          tstzrange((date '2020-01-01'+value)::timestamptz,
+                                    (date '2020-01-01'+value+1)::timestamptz),
+                          int4range(value*5,value*5+2),
+                          int4multirange(int4range(value*7,value*7+2),
+                                         int4range(value*7+4,value*7+6))
+                     FROM generate_series({first},{}) AS source(value)",
+                first + 99
+            ),
+            false,
+        );
+    }
+    session.success(
+        &mut engine,
+        "INSERT INTO interval_rows VALUES
+           (2001,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+           (2002,'0.0.0.0/0','::/0','empty','empty','empty','empty','empty','empty','empty','{}'),
+           (2003,'2001:db8::1/64','2001:db8:1::1/64','[9000,9002)',
+             '[90000000000000,90000000000002)','[900,900.1)',
+             '[2030-01-01,2030-01-02)','[2030-01-01,2030-01-02)',
+             '[\"2030-01-01 00:00:00+00\",\"2030-01-02 00:00:00+00\")',
+             '[9000,9002)','{[9000,9002)}')",
+        false,
+    );
+    session.success(&mut engine, "ANALYZE interval_rows", false);
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    let plans = data_rows(&session.success(
+        &mut engine,
+        "EXPLAIN SELECT id FROM interval_rows WHERE gist_address <<= '10.0.4.176/32';
+         EXPLAIN SELECT id FROM interval_rows WHERE spgist_address <<= '11.0.4.176/32';
+         EXPLAIN SELECT id FROM interval_rows WHERE int_span && '[4800,4801)'::int4range;
+         EXPLAIN SELECT id FROM interval_rows WHERE big_span @> 12000000000001::bigint;
+         EXPLAIN SELECT id FROM interval_rows WHERE numeric_span @> 120.05::numeric;
+         EXPLAIN SELECT id FROM interval_rows
+          WHERE date_span @> date '2023-04-15';
+         EXPLAIN SELECT id FROM interval_rows
+          WHERE timestamp_span @> timestamp '2023-04-15 12:00:00';
+         EXPLAIN SELECT id FROM interval_rows
+          WHERE timestamptz_span @> timestamptz '2023-04-15 12:00:00+00';
+         EXPLAIN SELECT id FROM interval_rows WHERE spgist_span && '[6000,6001)'::int4range;
+         EXPLAIN SELECT id FROM interval_rows WHERE spans && '{[8400,8401)}'::int4multirange",
+        false,
+    ));
+    for index in [
+        "interval_gist_address",
+        "interval_spgist_address",
+        "interval_int_span",
+        "interval_big_span",
+        "interval_numeric_span",
+        "interval_date_span",
+        "interval_timestamp_span",
+        "interval_timestamptz_span",
+        "interval_spgist_span",
+        "interval_spans",
+    ] {
+        assert!(
+            plans.iter().any(|row| row.contains(index)),
+            "{index}: {plans:?}"
+        );
+    }
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    let queries = [
+        "SELECT id FROM interval_rows WHERE gist_address <<= '10.0.4.176/32'",
+        "SELECT id FROM interval_rows WHERE spgist_address <<= '11.0.4.176/32'",
+        "SELECT id FROM interval_rows WHERE int_span && '[4800,4801)'",
+        "SELECT id FROM interval_rows WHERE big_span @> 12000000000001::bigint",
+        "SELECT id FROM interval_rows WHERE numeric_span @> 120.05::numeric",
+        "SELECT id FROM interval_rows WHERE date_span @> date '2023-04-15'",
+        "SELECT id FROM interval_rows WHERE timestamp_span @> timestamp '2023-04-15 12:00:00'",
+        "SELECT id FROM interval_rows WHERE timestamptz_span @> timestamptz '2023-04-15 12:00:00+00'",
+        "SELECT id FROM interval_rows WHERE spgist_span && '[6000,6001)'::int4range",
+        "SELECT id FROM interval_rows WHERE spans && '{[8400,8401)}'",
+    ];
+    for query in queries {
+        let before = cold.storage.block_io_stats();
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, query, false)),
+            ["1200"]
+        );
+        let traffic = cold.storage.block_io_stats().saturating_sub(before);
+        assert!(traffic.object_gets <= 16, "{query}: {traffic:?}");
+        assert!(traffic.object_read_bytes < 400_000, "{query}: {traffic:?}");
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, query, true)),
+            ["1200"]
+        );
+    }
+    assert_eq!(
+        data_rows(&cold_session.success(
+            &mut cold,
+            "SELECT id FROM interval_rows WHERE int_span='empty'::int4range;
+             SELECT id FROM interval_rows WHERE spans <@ '{[1,2)}'::int4multirange",
+            false,
+        )),
+        ["2002", "2002"]
+    );
+
+    let mutation = "UPDATE interval_rows SET
+                        gist_address='10.0.4.176/32', spgist_address='11.0.4.176/32',
+                        int_span='[4800,4801)', big_span='[12000000000000,12000000000002)',
+                        numeric_span='[120,120.1)', date_span='[2023-04-15,2023-04-16)',
+                        timestamp_span='[2023-04-15,2023-04-16)',
+                        timestamptz_span='[\"2023-04-15 00:00:00+00\",\"2023-04-16 00:00:00+00\")',
+                        spgist_span='[6000,6001)', spans='{[8400,8401)}'
+                      WHERE id=1800";
+    cold_session.success(&mut cold, "BEGIN; SAVEPOINT changed", false);
+    cold_session.success(&mut cold, mutation, false);
+    for query in queries {
+        assert_eq!(
+            data_rows(&cold_session.success(&mut cold, &format!("{query} ORDER BY id"), false)),
+            ["1200", "1800"]
+        );
+    }
+    cold_session.success(&mut cold, "ROLLBACK TO changed; COMMIT", false);
+    cold_session.success(&mut cold, mutation, false);
+    cold_session.success(&mut cold, "DELETE FROM interval_rows WHERE id=1200", false);
+    cold.commit_wal().unwrap();
+    assert!(cold.checkpoint().unwrap());
+    drop(cold_session);
+    drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    for query in queries {
+        assert_eq!(
+            data_rows(&run_with(&mut recovered, &mut recovery_budget, query)),
+            ["1800"]
+        );
+    }
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
     let mut config = test_config("physical-gist-indexes");
     config.object_store_on = true;

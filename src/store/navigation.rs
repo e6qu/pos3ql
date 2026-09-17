@@ -10,6 +10,77 @@ const NODE_BYTES: usize = HEADER + FANOUT * REFERENCE;
 const PENDING: usize = 1 + (FANOUT - 1) * LEVELS;
 pub(crate) const SPATIAL_DATA_BYTES: usize = 16 * 1024;
 pub(crate) const SIGNATURE_DATA_BYTES: usize = 1024;
+pub(crate) const INTERVAL_DATA_BYTES: usize = 8 * 1024;
+
+pub(crate) const INTERVAL_KEY_BYTES: usize = 15;
+const INTERVAL_HAS_EMPTY: u8 = 1;
+
+/// A conservative one-dimensional envelope. Keys are order-preserving,
+/// possibly lossy prefixes of SQL values. Empty range values are tracked
+/// separately because they match containment and equality without occupying
+/// any point in the envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntervalSummary {
+    lower: [u8; INTERVAL_KEY_BYTES],
+    upper: [u8; INTERVAL_KEY_BYTES],
+    flags: u8,
+}
+
+impl IntervalSummary {
+    pub(crate) fn bounded(
+        lower: [u8; INTERVAL_KEY_BYTES],
+        upper: [u8; INTERVAL_KEY_BYTES],
+    ) -> Self {
+        debug_assert!(lower <= upper);
+        Self {
+            lower,
+            upper,
+            flags: 0,
+        }
+    }
+
+    pub(crate) fn empty_value() -> Self {
+        Self {
+            lower: [u8::MAX; INTERVAL_KEY_BYTES],
+            upper: [0; INTERVAL_KEY_BYTES],
+            flags: INTERVAL_HAS_EMPTY,
+        }
+    }
+
+    pub(crate) fn has_empty(self) -> bool {
+        self.flags & INTERVAL_HAS_EMPTY != 0
+    }
+
+    pub(crate) fn has_values(self) -> bool {
+        self.lower <= self.upper
+    }
+
+    pub(crate) fn bounds(self) -> ([u8; INTERVAL_KEY_BYTES], [u8; INTERVAL_KEY_BYTES]) {
+        (self.lower, self.upper)
+    }
+
+    pub(crate) fn intersects(
+        self,
+        lower: [u8; INTERVAL_KEY_BYTES],
+        upper: [u8; INTERVAL_KEY_BYTES],
+    ) -> bool {
+        self.has_values() && self.lower <= upper && self.upper >= lower
+    }
+
+    fn union(self, other: Self) -> Self {
+        let (lower, upper) = match (self.has_values(), other.has_values()) {
+            (true, true) => (self.lower.min(other.lower), self.upper.max(other.upper)),
+            (true, false) => (self.lower, self.upper),
+            (false, true) => (other.lower, other.upper),
+            (false, false) => ([u8::MAX; INTERVAL_KEY_BYTES], [0; INTERVAL_KEY_BYTES]),
+        };
+        Self {
+            lower,
+            upper,
+            flags: self.flags | other.flags,
+        }
+    }
+}
 
 /// A small, mergeable token signature. It is deliberately a one-sided filter:
 /// collisions may retain irrelevant children, but can never hide a match.
@@ -60,6 +131,7 @@ pub(crate) enum NavigationSummary {
     Unbounded,
     Finite(SpatialBox),
     Signature(TokenSignature),
+    Interval(IntervalSummary),
 }
 
 pub(crate) type SpatialBounds = NavigationSummary;
@@ -68,6 +140,7 @@ pub(crate) type SpatialBounds = NavigationSummary;
 pub(crate) enum NavigationKind {
     Spatial,
     Signature,
+    Interval,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +198,7 @@ impl NavigationSummary {
                 left.maximum_y.max(right.maximum_y),
             ),
             (Self::Signature(left), Self::Signature(right)) => Self::Signature(left.union(right)),
+            (Self::Interval(left), Self::Interval(right)) => Self::Interval(left.union(right)),
             _ => Self::Unbounded,
         }
     }
@@ -156,6 +230,12 @@ impl NavigationSummary {
                     bytes.copy_from_slice(&value.to_le_bytes());
                 }
             }
+            Self::Interval(interval) => {
+                output[0] = 4;
+                output[1] = interval.flags;
+                output[2..17].copy_from_slice(&interval.lower);
+                output[17..32].copy_from_slice(&interval.upper);
+            }
         }
     }
 
@@ -180,6 +260,18 @@ impl NavigationSummary {
             3 => Ok(Self::Signature(TokenSignature(core::array::from_fn(
                 |index| u64::from_le_bytes(input[1 + index * 8..9 + index * 8].try_into().unwrap()),
             )))),
+            4 if input[1] & !INTERVAL_HAS_EMPTY == 0 && input[32] == 0 => {
+                let interval = IntervalSummary {
+                    lower: input[2..17].try_into().unwrap(),
+                    upper: input[17..32].try_into().unwrap(),
+                    flags: input[1],
+                };
+                if interval.has_values() || interval.has_empty() {
+                    Ok(Self::Interval(interval))
+                } else {
+                    Err(ValueIndexError::Corrupt)
+                }
+            }
             _ => Err(ValueIndexError::Corrupt),
         }
     }
@@ -484,6 +576,31 @@ mod tests {
     use crate::store::MemoryBlockStore;
 
     #[test]
+    fn interval_summaries_preserve_empty_values_and_validate_encoding() {
+        let left = IntervalSummary::bounded([1; INTERVAL_KEY_BYTES], [3; INTERVAL_KEY_BYTES]);
+        let right = IntervalSummary::bounded([5; INTERVAL_KEY_BYTES], [9; INTERVAL_KEY_BYTES]);
+        let summary = NavigationSummary::Interval(left)
+            .union(NavigationSummary::Interval(IntervalSummary::empty_value()))
+            .union(NavigationSummary::Interval(right));
+        let NavigationSummary::Interval(interval) = summary else {
+            panic!("interval summary");
+        };
+        assert_eq!(
+            interval.bounds(),
+            ([1; INTERVAL_KEY_BYTES], [9; INTERVAL_KEY_BYTES])
+        );
+        assert!(interval.has_empty());
+        let mut encoded = [0; 33];
+        summary.encode(&mut encoded);
+        assert_eq!(NavigationSummary::decode(&encoded).unwrap(), summary);
+        encoded[32] = 1;
+        assert_eq!(
+            NavigationSummary::decode(&encoded),
+            Err(ValueIndexError::Corrupt)
+        );
+    }
+
+    #[test]
     fn streaming_tree_prunes_three_levels_without_runtime_allocation() {
         let mut budget = Budget::new(16 << 20);
         let mut store = MemoryBlockStore::new(&mut budget, "navigation", 8 << 20, 2048).unwrap();
@@ -515,6 +632,7 @@ mod tests {
                 SpatialBounds::Empty => false,
                 SpatialBounds::Unbounded => true,
                 SpatialBounds::Signature(_) => true,
+                SpatialBounds::Interval(_) => true,
             }
         };
         crate::mem::guard::forbid_alloc(|| {
@@ -665,7 +783,7 @@ mod tests {
             (4, 33),
             (6, 1),
             (HEADER + 32, 0),
-            (HEADER + 40, 4),
+            (HEADER + 40, 5),
         ] {
             let mut bytes = original;
             bytes[at] = value;

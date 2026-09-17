@@ -2838,7 +2838,21 @@ fn indexed_candidates_for_plan<'a>(
                 }));
             }
             if is_inclusion_operator(constraint.operator) {
-                values[bound][position] = raw;
+                // Inclusion operators are commonly heterogeneous (a range
+                // may contain a scalar), so they cannot generally cast the
+                // probe to the indexed type. Network relationships and range
+                // predicates other than scalar containment are homogeneous,
+                // however, so PostgreSQL resolves an unknown probe from the
+                // typed indexed operand.
+                let homogeneous = matches!(target_type, ColType::Inet | ColType::Cidr)
+                    || (matches!(target_type, ColType::Range(_) | ColType::Multirange(_))
+                        && constraint.operator != BinaryOp::Contains);
+                values[bound][position] =
+                    if homogeneous && matches!(constraint.operand, Expr::Str(_) | Expr::Param(_)) {
+                        cast_to(raw, target_type, arena)?
+                    } else {
+                        raw
+                    };
                 continue;
             }
             let raw_type = ColType::from_oid(raw.type_oid());
@@ -2870,6 +2884,8 @@ fn indexed_candidates_for_plan<'a>(
     let mut search_bounds = [[crate::store::SpatialBounds::Unbounded; MAX_INDEX_COLS]; 2];
     let mut signature_predicates =
         [[super::super::index_signature::SignaturePredicate::Always; MAX_INDEX_COLS]; 2];
+    let mut interval_predicates =
+        [[super::super::index_interval::IntervalPredicate::Always; MAX_INDEX_COLS]; 2];
     for position in 0..plan.n_columns {
         if matches!(types[position], ColType::Geometry(_)) {
             for bound in 0..2 {
@@ -2891,6 +2907,10 @@ fn indexed_candidates_for_plan<'a>(
                     values[bound][position],
                     constraint.operator,
                 );
+                interval_predicates[bound][position] = super::super::index_interval::predicate(
+                    values[bound][position],
+                    constraint.operator,
+                )?;
             }
         }
     }
@@ -2908,6 +2928,17 @@ fn indexed_candidates_for_plan<'a>(
             .enumerate()
             .all(|(bound, constraint)| {
                 constraint.is_none() || signature_predicates[bound][position].may_match(summary)
+            });
+        }
+        if matches!(summary, crate::store::NavigationSummary::Interval(_)) {
+            return [
+                plan.constraints[position],
+                plan.additional_constraints[position],
+            ]
+            .into_iter()
+            .enumerate()
+            .all(|(bound, constraint)| {
+                constraint.is_none() || interval_predicates[bound][position].may_match(summary)
             });
         }
         [

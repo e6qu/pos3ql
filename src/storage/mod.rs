@@ -26341,37 +26341,62 @@ impl Storage {
                 && index.database == self.tables[table_index].database
                 && index.ddl_state != CatalogDdlState::Absent
         })?;
-        index.resolved_operator_classes[..index.n_cols]
-            .iter()
-            .enumerate()
-            .find_map(|(position, class)| {
-                let kind = match class {
-                    Some(IndexOperatorClass::Gist(
-                        GistOperatorClass::Point
-                        | GistOperatorClass::Box
-                        | GistOperatorClass::Polygon
-                        | GistOperatorClass::Circle,
-                    ))
-                    | Some(IndexOperatorClass::SpGist(
-                        SpGistOperatorClass::QuadPoint
-                        | SpGistOperatorClass::KdPoint
-                        | SpGistOperatorClass::Box
-                        | SpGistOperatorClass::Polygon,
-                    )) => NavigationKind::Spatial,
-                    Some(IndexOperatorClass::Gist(GistOperatorClass::TsVector))
-                    | Some(IndexOperatorClass::Gin(
-                        GinOperatorClass::Array
-                        | GinOperatorClass::TsVector
-                        | GinOperatorClass::Jsonb
-                        | GinOperatorClass::JsonbPath,
-                    )) => NavigationKind::Signature,
-                    _ => return None,
-                };
-                Some(NavigationSpec {
-                    position: position as u8,
-                    kind,
-                })
+        let classify = |class: Option<IndexOperatorClass>| -> Option<NavigationKind> {
+            Some(match class {
+                Some(IndexOperatorClass::Gist(
+                    GistOperatorClass::Point
+                    | GistOperatorClass::Box
+                    | GistOperatorClass::Polygon
+                    | GistOperatorClass::Circle,
+                ))
+                | Some(IndexOperatorClass::SpGist(
+                    SpGistOperatorClass::QuadPoint
+                    | SpGistOperatorClass::KdPoint
+                    | SpGistOperatorClass::Box
+                    | SpGistOperatorClass::Polygon,
+                )) => NavigationKind::Spatial,
+                Some(IndexOperatorClass::Gist(
+                    GistOperatorClass::Inet
+                    | GistOperatorClass::Range
+                    | GistOperatorClass::Multirange,
+                ))
+                | Some(IndexOperatorClass::SpGist(
+                    SpGistOperatorClass::Inet | SpGistOperatorClass::Range,
+                )) => NavigationKind::Interval,
+                Some(IndexOperatorClass::Gist(GistOperatorClass::TsVector))
+                | Some(IndexOperatorClass::Gin(
+                    GinOperatorClass::Array
+                    | GinOperatorClass::TsVector
+                    | GinOperatorClass::Jsonb
+                    | GinOperatorClass::JsonbPath,
+                )) => NavigationKind::Signature,
+                _ => return None,
             })
+        };
+        // A generation has one summary position. Preserve whichever spatial
+        // or signature column the established position-order rule selected;
+        // otherwise adding an earlier interval silently de-optimizes it.
+        let classes = &index.resolved_operator_classes[..index.n_cols];
+        if let Some((position, kind)) = classes.iter().enumerate().find_map(|(position, class)| {
+            classify(*class)
+                .filter(|kind| *kind != NavigationKind::Interval)
+                .map(|kind| (position, kind))
+        }) {
+            return Some(NavigationSpec {
+                position: position as u8,
+                kind,
+            });
+        }
+        if let Some(position) = classes
+            .iter()
+            .position(|class| classify(*class) == Some(NavigationKind::Interval))
+        {
+            return Some(NavigationSpec {
+                position: position as u8,
+                kind: NavigationKind::Interval,
+            });
+        }
+        None
     }
 
     pub(crate) fn value_binding_navigation_summary(
@@ -26401,6 +26426,9 @@ impl Storage {
             crate::store::NavigationKind::Signature => Ok(crate::sql::index_signature::summary(
                 values[usize::from(navigation.position)],
             )),
+            crate::store::NavigationKind::Interval => {
+                crate::sql::index_interval::summary(values[usize::from(navigation.position)])
+            }
         }
     }
 
@@ -26823,6 +26851,7 @@ impl Storage {
                 }
                 SpatialBounds::Unbounded => (2, 0.0, 0.0),
                 SpatialBounds::Signature(_) => (2, 0.0, 0.0),
+                SpatialBounds::Interval(_) => (2, 0.0, 0.0),
             };
             let left_key = order_key(left_bounds);
             let right_key = order_key(right_bounds);
@@ -26831,6 +26860,29 @@ impl Storage {
                 .cmp(&right_key.0)
                 .then_with(|| left_key.1.total_cmp(&right_key.1))
                 .then_with(|| left_key.2.total_cmp(&right_key.2))
+                .then_with(|| left.cmp(right)));
+        }
+        if let Some(
+            navigation @ crate::store::NavigationSpec {
+                kind: crate::store::NavigationKind::Interval,
+                ..
+            },
+        ) = navigation
+        {
+            let left_summary =
+                self.value_binding_navigation_summary(table_index, binding, navigation, left)?;
+            let right_summary =
+                self.value_binding_navigation_summary(table_index, binding, navigation, right)?;
+            let order_key = |summary| match summary {
+                crate::store::NavigationSummary::Empty => (0, [0; 15], [0; 15], false),
+                crate::store::NavigationSummary::Interval(interval) => {
+                    let (lower, upper) = interval.bounds();
+                    (1, lower, upper, interval.has_empty())
+                }
+                _ => (2, [0; 15], [0; 15], false),
+            };
+            return Ok(order_key(left_summary)
+                .cmp(&order_key(right_summary))
                 .then_with(|| left.cmp(right)));
         }
         if !enforcer.ordered {

@@ -2695,7 +2695,6 @@ pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_COLUMNS + MAX_UNIQUES + MAX_EX
 /// Extended-statistics objects and their computed values are startup-bounded.
 /// PostgreSQL accepts more objects/keys/MCV entries; crossing one of these
 /// envelopes is an explicit capacity error rather than an incomplete object.
-pub(crate) const MAX_EXTENDED_STATISTICS_PER_TABLE: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
 pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = crate::sql::parser::MAX_LIST;
@@ -3661,8 +3660,7 @@ fn pending_table_statistics_capacity(config: &Config) -> usize {
 
 fn pending_extended_statistics_capacity(config: &Config) -> usize {
     config
-        .max_tables
-        .saturating_mul(MAX_EXTENDED_STATISTICS_PER_TABLE)
+        .extended_statistics_capacity()
         .saturating_mul(config.max_catalog_versions_per_object)
         .min(
             catalog_transaction_capacity(config).saturating_mul(config.max_analyze_per_transaction),
@@ -8777,7 +8775,9 @@ impl SequenceDef {
 /// INCLUDE columns. Source:
 /// https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/pg_config_manual.h
 pub(crate) const MAX_INDEX_COLS: usize = 32;
-pub(crate) const MAX_BRIN_UNSUMMARIZED_RANGES: usize = 64;
+/// Durable WAL count width for one BRIN maintenance image. Configuration can
+/// reserve any smaller per-index capacity at startup.
+pub(crate) const MAX_BRIN_UNSUMMARIZED_RANGES: usize = u8::MAX as usize;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BrinMaintenanceState {
@@ -8788,7 +8788,6 @@ pub(crate) struct BrinMaintenanceState {
     /// Exclusive logical page boundary covered when the index was built or
     /// new ranges were last discovered. It is rounded to pages_per_range.
     pub(crate) summarized_until_page: u64,
-    pub(crate) ranges: [u64; MAX_BRIN_UNSUMMARIZED_RANGES],
     pub(crate) count: u8,
     pub(crate) wal_dirty: bool,
 }
@@ -8798,7 +8797,6 @@ impl BrinMaintenanceState {
         index_created_at: 0,
         pages_per_range: 0,
         summarized_until_page: 0,
-        ranges: [0; MAX_BRIN_UNSUMMARIZED_RANGES],
         count: 0,
         wal_dirty: false,
     };
@@ -11281,6 +11279,8 @@ pub struct Storage {
     domain_graph_scratch: std::cell::RefCell<FixedVec<u8>>,
     indexes: FixedVec<IndexDef>,
     brin_maintenance: std::cell::RefCell<FixedVec<BrinMaintenanceState>>,
+    brin_unsummarized_ranges: std::cell::RefCell<FixedVec<u64>>,
+    brin_unsummarized_ranges_per_index: usize,
     databases: FixedVec<DatabaseDef>,
     current_database: DatabaseOid,
     current_connection_id: Cell<i32>,
@@ -14373,13 +14373,15 @@ impl Storage {
             + config.max_triggers
                 * (size_of::<TriggerDef>() + config.max_tables * size_of::<PartitionTriggerState>())
             + config.max_policies * size_of::<PolicyDef>()
-            + config.max_tables
-                * MAX_EXTENDED_STATISTICS_PER_TABLE
-                * size_of::<ExtendedStatisticsDef>()
+            + config.extended_statistics_capacity() * size_of::<ExtendedStatisticsDef>()
             + config.max_publications * size_of::<PublicationDef>()
             + config.max_materialized_views
                 * (size_of::<MatviewDef>() + size_of::<StoredQueryDependencies>())
             + config.max_indexes * (size_of::<IndexDef>() + size_of::<BrinMaintenanceState>())
+            + config
+                .max_indexes
+                .saturating_mul(config.max_brin_unsummarized_ranges_per_index)
+                .saturating_mul(size_of::<u64>())
             + FixedMap::<u64, RowState>::budget_bytes(config.large_object_pages)
                 .saturating_sub(FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + config.max_rules * size_of::<RuleDef>()
@@ -14793,7 +14795,7 @@ impl Storage {
                 .push(PolicyDef::EMPTY)
                 .expect("sized to policy capacity");
         }
-        let extended_statistics_capacity = config.max_tables * MAX_EXTENDED_STATISTICS_PER_TABLE;
+        let extended_statistics_capacity = config.extended_statistics_capacity();
         let mut extended_statistics =
             FixedVec::new(budget, "extended_statistics", extended_statistics_capacity)?;
         for _ in 0..extended_statistics_capacity {
@@ -15122,6 +15124,16 @@ impl Storage {
         )?;
         let mut indexes = FixedVec::new(budget, "indexes", config.max_indexes)?;
         let mut brin_maintenance = FixedVec::new(budget, "brin_maintenance", config.max_indexes)?;
+        let brin_range_capacity = config
+            .max_indexes
+            .saturating_mul(config.max_brin_unsummarized_ranges_per_index);
+        let mut brin_unsummarized_ranges =
+            FixedVec::new(budget, "brin_unsummarized_ranges", brin_range_capacity)?;
+        for _ in 0..brin_range_capacity {
+            brin_unsummarized_ranges
+                .push(0)
+                .expect("sized to every index's BRIN range capacity");
+        }
         for _ in 0..config.max_indexes {
             indexes
                 .push(IndexDef {
@@ -15373,6 +15385,8 @@ impl Storage {
             domain_graph_scratch: std::cell::RefCell::new(domain_graph_scratch),
             indexes,
             brin_maintenance: std::cell::RefCell::new(brin_maintenance),
+            brin_unsummarized_ranges: std::cell::RefCell::new(brin_unsummarized_ranges),
+            brin_unsummarized_ranges_per_index: config.max_brin_unsummarized_ranges_per_index,
             databases,
             current_database: DatabaseOid::POSTGRES,
             current_connection_id: Cell::new(0),
@@ -26508,6 +26522,10 @@ impl Storage {
             .options
             .pages_per_range
             .unwrap_or(128);
+        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
+        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
+        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
+        let ranges = &mut ranges[range_start..range_end];
         let mut states = self.brin_maintenance.borrow_mut();
         let state = &mut states[index_slot];
         if state.index_created_at != created_at {
@@ -26519,6 +26537,7 @@ impl Storage {
                 summarized_until_page: covered_end,
                 ..BrinMaintenanceState::EMPTY
             };
+            ranges.fill(0);
             return Ok(());
         }
         let pages_per_range = u64::from(state.pages_per_range);
@@ -26528,16 +26547,16 @@ impl Storage {
             return Ok(());
         }
         let additional = ((covered_end - state.summarized_until_page) / pages_per_range) as usize;
-        if usize::from(state.count) + additional > state.ranges.len() {
+        if usize::from(state.count) + additional > ranges.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "BRIN unsummarized ranges exceed the startup-bound limit ({})",
-                state.ranges.len()
+                ranges.len()
             ));
         }
         let mut range = state.summarized_until_page;
         while range < covered_end {
-            state.ranges[usize::from(state.count)] = range;
+            ranges[usize::from(state.count)] = range;
             state.count += 1;
             range += pages_per_range;
         }
@@ -26557,6 +26576,10 @@ impl Storage {
             return Ok(());
         };
         let created_at = self.indexes[index_slot].created_at;
+        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
+        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
+        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
+        let ranges = &mut ranges[range_start..range_end];
         let mut states = self.brin_maintenance.borrow_mut();
         let state = &mut states[index_slot];
         if state.index_created_at != created_at {
@@ -26564,18 +26587,19 @@ impl Storage {
                 index_created_at: created_at,
                 ..BrinMaintenanceState::EMPTY
             };
+            ranges.fill(0);
         }
-        if state.ranges[..usize::from(state.count)].contains(&range) {
+        if ranges[..usize::from(state.count)].contains(&range) {
             return Ok(());
         }
-        if usize::from(state.count) == state.ranges.len() {
+        if usize::from(state.count) == ranges.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "BRIN unsummarized ranges exceed the startup-bound limit ({})",
-                state.ranges.len()
+                ranges.len()
             ));
         }
-        state.ranges[usize::from(state.count)] = range;
+        ranges[usize::from(state.count)] = range;
         state.count += 1;
         state.wal_dirty = true;
         Ok(())
@@ -26591,17 +26615,21 @@ impl Storage {
         let Some(range) = self.brin_range_start(index_slot, block, txid)? else {
             return Ok(0);
         };
+        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
+        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
+        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
+        let ranges = &mut ranges[range_start..range_end];
         let mut states = self.brin_maintenance.borrow_mut();
         let state = &mut states[index_slot];
-        let Some(position) = state.ranges[..usize::from(state.count)]
+        let Some(position) = ranges[..usize::from(state.count)]
             .iter()
             .position(|candidate| *candidate == range)
         else {
             return Ok(0);
         };
         let last = usize::from(state.count) - 1;
-        state.ranges[position] = state.ranges[last];
-        state.ranges[last] = 0;
+        ranges[position] = ranges[last];
+        ranges[last] = 0;
         state.count -= 1;
         state.wal_dirty = true;
         Ok(1)
@@ -26613,11 +26641,14 @@ impl Storage {
         txid: u32,
     ) -> Result<i32, SqlError> {
         self.brin_discover_new_ranges(index_slot, txid)?;
+        let range_start = index_slot * self.brin_unsummarized_ranges_per_index;
+        let range_end = range_start + self.brin_unsummarized_ranges_per_index;
+        let mut ranges = self.brin_unsummarized_ranges.borrow_mut();
         let mut states = self.brin_maintenance.borrow_mut();
         let state = &mut states[index_slot];
         let count = i32::from(state.count);
         if count != 0 {
-            state.ranges.fill(0);
+            ranges[range_start..range_end].fill(0);
             state.count = 0;
             state.wal_dirty = true;
         }
@@ -26626,6 +26657,14 @@ impl Storage {
 
     pub(crate) fn brin_maintenance_state(&self, index_slot: usize) -> BrinMaintenanceState {
         self.brin_maintenance.borrow()[index_slot]
+    }
+
+    pub(crate) fn brin_unsummarized_ranges(&self, index_slot: usize) -> std::cell::Ref<'_, [u64]> {
+        let start = index_slot * self.brin_unsummarized_ranges_per_index;
+        let count = usize::from(self.brin_maintenance.borrow()[index_slot].count);
+        std::cell::Ref::map(self.brin_unsummarized_ranges.borrow(), |ranges| {
+            &ranges[start..start + count]
+        })
     }
 
     pub(crate) fn rebuild_brin_maintenance(
@@ -26650,6 +26689,10 @@ impl Storage {
             wal_dirty: true,
             ..BrinMaintenanceState::EMPTY
         };
+        let start = index_slot * self.brin_unsummarized_ranges_per_index;
+        self.brin_unsummarized_ranges.borrow_mut()
+            [start..start + self.brin_unsummarized_ranges_per_index]
+            .fill(0);
         Ok(())
     }
 
@@ -26668,7 +26711,7 @@ impl Storage {
             || !(1..=131_072).contains(&pages_per_range)
             || summarized_until_page == 0
             || !summarized_until_page.is_multiple_of(u64::from(pages_per_range))
-            || ranges.len() > MAX_BRIN_UNSUMMARIZED_RANGES
+            || ranges.len() > self.brin_unsummarized_ranges_per_index
             || ranges.iter().enumerate().any(|(position, range)| {
                 *range >= summarized_until_page
                     || !range.is_multiple_of(u64::from(pages_per_range))
@@ -26685,8 +26728,12 @@ impl Storage {
         state.index_created_at = self.indexes[index_slot].created_at;
         state.pages_per_range = pages_per_range;
         state.summarized_until_page = summarized_until_page;
-        state.ranges.fill(0);
-        state.ranges[..ranges.len()].copy_from_slice(ranges);
+        let start = index_slot * self.brin_unsummarized_ranges_per_index;
+        let mut stored_ranges = self.brin_unsummarized_ranges.borrow_mut();
+        let stored_ranges =
+            &mut stored_ranges[start..start + self.brin_unsummarized_ranges_per_index];
+        stored_ranges.fill(0);
+        stored_ranges[..ranges.len()].copy_from_slice(ranges);
         state.count = ranges.len() as u8;
         state.wal_dirty = false;
         Ok(())
@@ -37157,17 +37204,6 @@ impl Storage {
                 spec.name.as_str()
             ));
         }
-        if self
-            .extended_statistics_for_table(usize::from(spec.table), txid)
-            .count()
-            == MAX_EXTENDED_STATISTICS_PER_TABLE
-        {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "relation has too many statistics objects (limit {})",
-                MAX_EXTENDED_STATISTICS_PER_TABLE
-            ));
-        }
         let Some(slot) = self
             .extended_statistics
             .iter()
@@ -38011,6 +38047,10 @@ impl Storage {
             summarized_until_page: brin_summarized_until_page,
             ..BrinMaintenanceState::EMPTY
         };
+        let range_start = i * self.brin_unsummarized_ranges_per_index;
+        self.brin_unsummarized_ranges.borrow_mut()
+            [range_start..range_start + self.brin_unsummarized_ranges_per_index]
+            .fill(0);
         Ok(i)
     }
 
@@ -43723,6 +43763,9 @@ mod tests {
         config.max_column_acl_entries = 23;
         config.max_default_acl_entries = 24;
         config.max_parameter_acl_entries = 25;
+        config.max_indexes = 6;
+        config.set_extended_statistics_capacity(31);
+        config.max_brin_unsummarized_ranges_per_index = 70;
         config.max_views = 3;
         config.max_materialized_views = 4;
         config.max_routines = 5;
@@ -43785,6 +43828,10 @@ mod tests {
         assert_eq!(storage.column_acl_entries.capacity(), 23);
         assert_eq!(storage.default_acl_entries.capacity(), 24);
         assert_eq!(storage.parameter_acl_entries.capacity(), 25);
+        assert_eq!(storage.indexes.len(), 6);
+        assert_eq!(storage.extended_statistics.len(), 31);
+        assert_eq!(storage.brin_maintenance.borrow().len(), 6);
+        assert_eq!(storage.brin_unsummarized_ranges.borrow().len(), 6 * 70);
         assert_eq!(storage.views.len(), 3);
         assert_eq!(storage.matviews.len(), 4);
         assert_eq!(storage.matview_dependencies.len(), 4);

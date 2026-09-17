@@ -3729,19 +3729,16 @@ fn copy_like_statistics(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     use crate::sql::ast::{StatisticsExpression, StatisticsKey};
-    use crate::storage::{
-        ExtendedStatisticsSpec, MAX_EXTENDED_STATISTICS_KEYS, MAX_EXTENDED_STATISTICS_PER_TABLE,
-    };
+    use crate::storage::{ExtendedStatisticsSpec, MAX_EXTENDED_STATISTICS_KEYS};
 
     for like in statement.likes.iter().filter(|like| like.statistics) {
         let source_slot = resolve_dml_table(storage, &like.source, txn.txid)?;
-        let mut copied = [None; MAX_EXTENDED_STATISTICS_PER_TABLE];
-        let mut count = 0usize;
-        for (slot, definition) in storage.extended_statistics_for_table(source_slot, txn.txid) {
-            copied[count] = Some((slot, *definition));
-            count += 1;
-        }
-        for (source_statistics_slot, source) in copied[..count].iter().copied().flatten() {
+        let source_capacity = storage.extended_statistics_count();
+        for source_statistics_slot in 0..source_capacity {
+            let source = *storage.extended_statistics(source_statistics_slot);
+            if !source.visible_to(txn.txid) || usize::from(source.table) != source_slot {
+                continue;
+            }
             let definition = source.definition_for(txn.txid);
             let mut keys = [StatisticsKey::Column(""); MAX_EXTENDED_STATISTICS_KEYS];
             for (position, key) in source.keys_for(txn.txid).iter().enumerate() {
@@ -5356,14 +5353,16 @@ fn drop_table_kind(
                         Err(error) => return sql_fail(error),
                     }
                 }
-                let mut statistics_slots =
-                    [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
-                let mut statistics_count = 0usize;
-                for (slot, _) in storage.extended_statistics_for_table(index, txn.txid) {
-                    statistics_slots[statistics_count] = slot;
-                    statistics_count += 1;
-                }
-                for statistics_slot in statistics_slots[..statistics_count].iter().copied() {
+                loop {
+                    let statistics_slot = {
+                        storage
+                            .extended_statistics_for_table(index, txn.txid)
+                            .map(|(slot, _)| slot)
+                            .next()
+                    };
+                    let Some(statistics_slot) = statistics_slot else {
+                        break;
+                    };
                     let definition = storage
                         .extended_statistics(statistics_slot)
                         .definition_for(txn.txid);
@@ -8791,8 +8790,6 @@ pub fn drop_owned(
     if storage.table_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.view_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
-        || storage.extended_statistics_count()
-            > MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE
     {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -8834,8 +8831,10 @@ pub fn drop_owned(
             Ok(values) => values,
             Err(_) => return sql_fail(super::query::arena_full_pub()),
         };
-    let mut statistics =
-        [false; MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
+    let statistics = match arena.alloc_slice_with(storage.extended_statistics_count(), |_| false) {
+        Ok(values) => values,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let event_triggers = match arena.alloc_slice_with(storage.event_trigger_capacity(), |_| false) {
         Ok(values) => values,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -42747,32 +42746,31 @@ fn apply_column_drop_dependencies(
         stage_index_drop(storage, wal, txn, slot)?;
     }
 
-    let mut selected_statistics = [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
-    let mut selected_statistics_count = 0usize;
-    for (slot, statistics) in storage.extended_statistics_for_table(table, txn.txid) {
-        let mut depends = false;
-        for key in statistics.keys_for(txn.txid) {
-            match key {
-                crate::storage::ExtendedStatisticsKey::Column(name) => {
-                    depends |= *name == column_name;
-                }
-                crate::storage::ExtendedStatisticsKey::Expression(source) => {
-                    let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-                    depends |= check_referenced_columns(expression, &table_definition)?
-                        & (1u64 << column)
-                        != 0;
+    loop {
+        let mut selected_statistics = None;
+        for (slot, statistics) in storage.extended_statistics_for_table(table, txn.txid) {
+            let mut depends = false;
+            for key in statistics.keys_for(txn.txid) {
+                match key {
+                    crate::storage::ExtendedStatisticsKey::Column(name) => {
+                        depends |= *name == column_name;
+                    }
+                    crate::storage::ExtendedStatisticsKey::Expression(source) => {
+                        let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+                        depends |= check_referenced_columns(expression, &table_definition)?
+                            & (1u64 << column)
+                            != 0;
+                    }
                 }
             }
+            if depends {
+                selected_statistics = Some(slot);
+                break;
+            }
         }
-        if depends {
-            selected_statistics[selected_statistics_count] = slot;
-            selected_statistics_count += 1;
-        }
-    }
-    for slot in selected_statistics[..selected_statistics_count]
-        .iter()
-        .copied()
-    {
+        let Some(slot) = selected_statistics else {
+            break;
+        };
         let definition = storage.extended_statistics(slot).definition_for(txn.txid);
         let lsn = storage.bump_lsn();
         wal.stage(
@@ -44611,14 +44609,12 @@ fn rewrite_table_statistics_column_references(
     if renames.is_empty() {
         return Ok(());
     }
-    let mut slots = [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
-    let mut count = 0usize;
-    for (slot, _) in storage.extended_statistics_for_table(table, txn.txid) {
-        slots[count] = slot;
-        count += 1;
-    }
-    for slot in slots[..count].iter().copied() {
+    let statistics_capacity = storage.extended_statistics_count();
+    for slot in 0..statistics_capacity {
         let statistics = *storage.extended_statistics(slot);
+        if !statistics.visible_to(txn.txid) || usize::from(statistics.table) != table {
+            continue;
+        }
         let mut keys = [crate::storage::ExtendedStatisticsKey::Column(SqlName::EMPTY);
             crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
         keys[..statistics.keys_for(txn.txid).len()].copy_from_slice(statistics.keys_for(txn.txid));
@@ -46635,14 +46631,13 @@ pub(crate) fn analyze_extended_statistics(
         Ok(rendered)
     }
 
-    let mut definitions = [None; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
-    let mut definition_count = 0usize;
-    for (slot, definition) in storage.extended_statistics_for_table(table, txn.txid) {
-        definitions[definition_count] = Some((slot, *definition));
-        definition_count += 1;
-    }
     let table_definition = *storage.table_def(table, txn.txid);
-    for (slot, definition) in definitions[..definition_count].iter().copied().flatten() {
+    let statistics_capacity = storage.extended_statistics_count();
+    for slot in 0..statistics_capacity {
+        let definition = *storage.extended_statistics(slot);
+        if !definition.visible_to(txn.txid) || usize::from(definition.table) != table {
+            continue;
+        }
         if definition.definition_for(txn.txid).target == Some(0) {
             storage.write_extended_statistics_data(
                 slot,

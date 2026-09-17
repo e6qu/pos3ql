@@ -81,6 +81,18 @@ storage. RAM and local disk are bounded, disposable caches.
   snapshots, savepoint rollback and reuse, active repeatable-read snapshots,
   ten durable deltas, checkpoint publication, empty-cache recovery, and exact
   startup accounting.
+- Extended-statistics objects draw from the independent startup-sized
+  `max_extended_statistics` catalog rather than an eight-object-per-table
+  array. CREATE, LIKE INCLUDING STATISTICS, schema evolution, DROP cascades,
+  ownership graphs, ANALYZE, WAL, checkpoints, and catalogs traverse the full
+  configured pool without fixed scratch. BRIN unsummarized ranges live in one
+  startup-reserved pool governed by
+  `max_brin_unsummarized_ranges_per_index`; the durable one-byte count admits
+  up to 255 ranges and every WAL/checkpoint/rebuild path uses the configured
+  slice. One regression fills ten statistics slots and seventy trigger and
+  BRIN slots, verifies named exhaustion, loses an ambiguous checkpoint reply,
+  retries publication, removes local state, and exercises the recovered
+  catalogs, triggers, BRIN maintenance, and rows from object storage.
 - Database and schema catalogs are independently startup-sized through
   `max_databases` and `max_schemas`, with their complete memory cost charged
   before serving. Database connection counters, cumulative statistics,
@@ -278,10 +290,14 @@ original and cold-recovery caches on scope exit, including assertion failures.
 Replace remaining compile-time per-object inline ceilings with startup-sized
 pools or bounded chunked structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
-catalog construction, and execution scratch. Exercise maximum-capacity
-trigger and remaining per-object structures through checkpoint retry and
-object-cold recovery while checking exact startup memory accounting and loud
-exhaustion. Row-version chains and spill-generation rosters are complete and
+catalog construction, and execution scratch. Stored-query dependency sets are
+the next known arbitrary inline catalog ceiling; replace their 64-entry images
+across views, rules, policies, materialized views, routines, WAL, and
+checkpoints with startup-sized pooled storage. Exercise every remaining
+per-object structure through checkpoint retry and object-cold recovery while
+checking exact startup memory accounting and loud exhaustion. Row-version
+chains, spill-generation rosters, extended-statistics catalogs, BRIN range
+maintenance, and maximum-capacity trigger qualification are complete and
 belong to the implemented baseline above.
 
 ### Multi-core execution

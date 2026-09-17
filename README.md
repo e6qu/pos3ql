@@ -131,14 +131,23 @@ on-disk representation limit; object ACL capacity must reserve the three
 built-in public-schema grants.
 
 Legacy configurations that specify only `max_tables` keep the historical
-one-slot-per-table defaults for those catalog classes. Row-level security uses
-an independent `max_policies` pool (default 256), not eight slots per table;
-there is no second per-table policy limit. Policy plans draw from the statement
-arena. Routine parameters, output columns, configuration settings, policy role
-lists, and trigger arguments accept the parser's complete 64-item boundary.
+one-slot-per-table defaults for those catalog classes and eight extended-
+statistics slots per table. Explicit `max_extended_statistics` configuration
+uses one shared cluster catalog, with no second per-table limit. The development
+configuration reserves 256 slots.
+Row-level security likewise uses an independent `max_policies` pool (default
+256), not eight slots per table. Policy plans draw from the statement arena.
+Routine parameters, output columns, configuration settings, policy role lists,
+and trigger arguments accept the parser's complete 64-item boundary.
 Trigger arguments follow PostgreSQL's zero-based `TG_ARGV` and NULL-for-none
 semantics. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.
+
+BRIN maintenance retains unsummarized logical ranges in a contiguous startup-
+reserved pool sized by `max_indexes` and
+`max_brin_unsummarized_ranges_per_index` (default 64, durable-format maximum
+255). Exhaustion reports SQLSTATE `54000`; rebuilding, WAL replay, checkpoints,
+and cold recovery use the same configured bound.
 
 `max_ddl_per_transaction` sizes catalog undo, commit, prepared-transaction,
 subscription-apply, and logical-decoding state together. It is reserved for

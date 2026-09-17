@@ -9,8 +9,9 @@ There are currently no defects that meet this file's inclusion criteria.
 The geometric, ranked nearest-neighbor, inverted posting, signature, and
 interval index-navigation,
 checkpoint-maintenance capacity and publication handoff, concurrent-harness
-port, and integration-scratch audits have no external blocker; their fixes are
-qualified in the implementation and regression suites.
+port, integration-scratch, and accepted-definition list audits have no external
+blocker; their fixes are qualified in the implementation and regression
+suites.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

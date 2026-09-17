@@ -102,14 +102,19 @@ storage. RAM and local disk are bounded, disposable caches.
   table constraint kinds and domain checks use the parser's complete 64-item
   bounded list, named composites use the 64-column row boundary, partition
   keys and index tuples use PostgreSQL 18's exact 32-attribute limits, and
-  LIST bounds use the complete 64-value parser list. Constraint enforcement,
-  record shapes, PostgreSQL catalogs, WAL, checkpoint manifests, loud
-  over-boundary errors, and empty-cache object recovery share those limits.
+  LIST bounds use the complete 64-value parser list. Direct inheritance
+  parents, defaults across every view column, subscription publication names,
+  event-trigger tags, foreign OPTIONS clauses, and operator-family operators
+  and support functions also use the complete parser list. Constraint
+  enforcement, record shapes, PostgreSQL catalogs, WAL, checkpoint manifests,
+  loud over-boundary errors, and empty-cache object recovery share those
+  limits.
   New index WAL uses 32-bit masks while legacy 8-bit WAL remains readable;
   textual checkpoint masks remain backward-readable.
-  Wide table/domain WAL staging borrows definitions, decoder branches isolate
-  fixed scratch, and manifest replay transfers pending table ownership at one
-  choke point rather than reserving a copy in every branch. Schema-only catalog
+  Wide table/domain/operator-family/operator-class/foreign-table WAL staging
+  borrows definitions, decoder branches isolate fixed scratch, and manifest
+  replay transfers pending table ownership at one choke point rather than
+  reserving a copy in every branch. Schema-only catalog
   resolution reads one shared, storage-independent definition rather than
   constructing and discarding rows. Catalog-backed view descriptions cannot
   recursively materialize their own catalogs. Procedural count passes recycle
@@ -245,9 +250,9 @@ Replace remaining compile-time per-object inline ceilings with startup-sized
 pools or bounded chunked structures where they restrict advertised scale.
 Audit their slot widths, journal encodings, checkpoint and manifest structures,
 catalog construction, and execution scratch. Exercise maximum-capacity
-inheritance, routine, trigger, policy, transaction, spill, and remaining
-per-object structures through checkpoint retry and object-cold recovery while
-checking exact startup memory accounting and loud exhaustion.
+routine, trigger, policy, transaction, spill, and remaining per-object
+structures through checkpoint retry and object-cold recovery while checking
+exact startup memory accounting and loud exhaustion.
 
 ### Multi-core execution
 

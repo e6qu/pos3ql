@@ -544,8 +544,9 @@ pub(crate) enum WalOp<'a> {
     SetForeignTable {
         slot: u16,
         created_at: u64,
-        definition: Option<crate::storage::foreign::ForeignTableDefinition>,
+        definition: &'a Option<crate::storage::foreign::ForeignTableDefinition>,
     },
+    RestoreForeignTable(&'a [u8]),
     /// A table definition staged by the SQL executor. Borrowing keeps the WAL
     /// operation discriminant small even when configured inline schema bounds
     /// make `TableDef` large.
@@ -1150,16 +1151,18 @@ pub(crate) enum WalOp<'a> {
     },
     SetOperatorFamily {
         created_at: u64,
-        definition: crate::storage::OperatorFamilyDefinition,
+        definition: &'a crate::storage::OperatorFamilyDefinition,
     },
+    RestoreOperatorFamily(&'a [u8]),
     DropOperatorFamily {
         schema: &'a str,
         name: &'a str,
     },
     SetOperatorClass {
         created_at: u64,
-        definition: crate::storage::OperatorClassDefinition,
+        definition: &'a crate::storage::OperatorClassDefinition,
     },
+    RestoreOperatorClass(&'a [u8]),
     DropOperatorClass {
         schema: &'a str,
         name: &'a str,
@@ -2116,7 +2119,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetForeignDataWrapper { .. } => KIND_SET_FOREIGN_DATA_WRAPPER,
         WalOp::SetForeignServer { .. } => KIND_SET_FOREIGN_SERVER,
         WalOp::SetUserMapping { .. } => KIND_SET_USER_MAPPING,
-        WalOp::SetForeignTable { .. } => KIND_SET_FOREIGN_TABLE,
+        WalOp::SetForeignTable { .. } | WalOp::RestoreForeignTable(_) => KIND_SET_FOREIGN_TABLE,
         WalOp::CreateTable(_) | WalOp::RestoreTable(_) => KIND_CREATE,
         WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
@@ -2208,9 +2211,11 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropCast { .. } => KIND_DROP_CAST,
         WalOp::SetOperator { .. } => KIND_SET_OPERATOR,
         WalOp::DropOperator { .. } => KIND_DROP_OPERATOR,
-        WalOp::SetOperatorFamily { .. } => KIND_SET_OPERATOR_FAMILY,
+        WalOp::SetOperatorFamily { .. } | WalOp::RestoreOperatorFamily(_) => {
+            KIND_SET_OPERATOR_FAMILY
+        }
         WalOp::DropOperatorFamily { .. } => KIND_DROP_OPERATOR_FAMILY,
-        WalOp::SetOperatorClass { .. } => KIND_SET_OPERATOR_CLASS,
+        WalOp::SetOperatorClass { .. } | WalOp::RestoreOperatorClass(_) => KIND_SET_OPERATOR_CLASS,
         WalOp::DropOperatorClass { .. } => KIND_DROP_OPERATOR_CLASS,
         WalOp::SetCollation { .. } => KIND_SET_COLLATION,
         WalOp::DropCollation { .. } => KIND_DROP_COLLATION,
@@ -2308,7 +2313,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::SetForeignTable { definition, .. } => {
-            11 + definition.map_or(0, |definition| {
+            11 + definition.as_ref().map_or(0, |definition| {
                 4 + foreign_options_len(definition.options)
                     + 1
                     + definition.column_options.entries().len() * 3
@@ -2988,7 +2993,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             }
             n
         }
-        WalOp::RestoreDomain(payload) | WalOp::RestoreRoutine(payload) => payload.len(),
+        WalOp::RestoreDomain(payload)
+        | WalOp::RestoreRoutine(payload)
+        | WalOp::RestoreForeignTable(payload)
+        | WalOp::RestoreOperatorFamily(payload)
+        | WalOp::RestoreOperatorClass(payload) => payload.len(),
         WalOp::DropDomain { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateEnum(def) => {
             let mut n = 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
@@ -5048,7 +5057,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
-        WalOp::RestoreDomain(payload) | WalOp::RestoreRoutine(payload) => buffer.append(payload),
+        WalOp::RestoreDomain(payload)
+        | WalOp::RestoreRoutine(payload)
+        | WalOp::RestoreForeignTable(payload)
+        | WalOp::RestoreOperatorFamily(payload)
+        | WalOp::RestoreOperatorClass(payload) => buffer.append(payload),
         WalOp::DropDomain { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
@@ -6463,12 +6476,19 @@ fn stored_boolean(code: u8) -> Option<bool> {
 }
 
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
-    decode_op_inner(kind, payload, None, None, None)
+    decode_op_inner(kind, payload, WalDecodeOutput::NONE)
 }
 
 pub(crate) fn decode_table_payload(payload: &[u8]) -> Option<TableDef> {
     let mut definition = TableDef::empty();
-    decode_op_inner(KIND_CREATE, payload, Some(&mut definition), None, None)?;
+    decode_op_inner(
+        KIND_CREATE,
+        payload,
+        WalDecodeOutput {
+            table: Some(&mut definition),
+            ..WalDecodeOutput::NONE
+        },
+    )?;
     Some(definition)
 }
 
@@ -6477,9 +6497,10 @@ pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<crate::storage::Do
     decode_op_inner(
         KIND_CREATE_DOMAIN,
         payload,
-        None,
-        Some(&mut definition),
-        None,
+        WalDecodeOutput {
+            domain: Some(&mut definition),
+            ..WalDecodeOutput::NONE
+        },
     )?;
     Some(definition)
 }
@@ -6489,19 +6510,113 @@ pub(crate) fn decode_routine_payload(
     payload: &[u8],
 ) -> Option<(crate::storage::RoutineDef, WalStoredQueryDependencies<'_>)> {
     let mut decoded = None;
-    decode_op_inner(KIND_CREATE_ROUTINE, payload, None, None, Some(&mut decoded))?;
+    decode_op_inner(
+        KIND_CREATE_ROUTINE,
+        payload,
+        WalDecodeOutput {
+            routine: Some(&mut decoded),
+            ..WalDecodeOutput::NONE
+        },
+    )?;
     decoded
+}
+
+#[inline(never)]
+pub(crate) fn decode_foreign_table_payload(
+    payload: &[u8],
+) -> Option<(
+    u16,
+    u64,
+    Option<crate::storage::foreign::ForeignTableDefinition>,
+)> {
+    let mut decoded = None;
+    decode_op_inner(
+        KIND_SET_FOREIGN_TABLE,
+        payload,
+        WalDecodeOutput {
+            foreign_table: Some(&mut decoded),
+            ..WalDecodeOutput::NONE
+        },
+    )?;
+    decoded
+}
+
+#[inline(never)]
+pub(crate) fn decode_operator_family_payload(
+    payload: &[u8],
+) -> Option<(u64, crate::storage::OperatorFamilyDefinition)> {
+    let mut decoded = None;
+    decode_op_inner(
+        KIND_SET_OPERATOR_FAMILY,
+        payload,
+        WalDecodeOutput {
+            operator_family: Some(&mut decoded),
+            ..WalDecodeOutput::NONE
+        },
+    )?;
+    decoded
+}
+
+#[inline(never)]
+pub(crate) fn decode_operator_class_payload(
+    payload: &[u8],
+) -> Option<(u64, crate::storage::OperatorClassDefinition)> {
+    let mut decoded = None;
+    decode_op_inner(
+        KIND_SET_OPERATOR_CLASS,
+        payload,
+        WalDecodeOutput {
+            operator_class: Some(&mut decoded),
+            ..WalDecodeOutput::NONE
+        },
+    )?;
+    decoded
+}
+
+struct WalDecodeOutput<'output, 'payload> {
+    table: Option<&'output mut TableDef>,
+    domain: Option<&'output mut crate::storage::DomainDef>,
+    routine: Option<
+        &'output mut Option<(
+            crate::storage::RoutineDef,
+            WalStoredQueryDependencies<'payload>,
+        )>,
+    >,
+    foreign_table: Option<
+        &'output mut Option<(
+            u16,
+            u64,
+            Option<crate::storage::foreign::ForeignTableDefinition>,
+        )>,
+    >,
+    operator_family: Option<&'output mut Option<(u64, crate::storage::OperatorFamilyDefinition)>>,
+    operator_class: Option<&'output mut Option<(u64, crate::storage::OperatorClassDefinition)>>,
+}
+
+impl WalDecodeOutput<'_, '_> {
+    const NONE: Self = Self {
+        table: None,
+        domain: None,
+        routine: None,
+        foreign_table: None,
+        operator_family: None,
+        operator_class: None,
+    };
 }
 
 fn decode_op_inner<'a>(
     kind: u8,
     payload: &'a [u8],
-    decoded_table: Option<&mut TableDef>,
-    decoded_domain: Option<&mut crate::storage::DomainDef>,
-    decoded_routine: Option<
-        &mut Option<(crate::storage::RoutineDef, WalStoredQueryDependencies<'a>)>,
-    >,
+    output: WalDecodeOutput<'_, 'a>,
 ) -> Option<WalOp<'a>> {
+    let WalDecodeOutput {
+        table: decoded_table,
+        domain: decoded_domain,
+        routine: decoded_routine,
+        foreign_table: decoded_foreign_table,
+        operator_family: decoded_operator_family,
+        operator_class: decoded_operator_class,
+    } = output;
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Option<&str> {
         let len = *payload.get(*at)? as usize;
@@ -6692,11 +6807,13 @@ fn decode_op_inner<'a>(
                 }
                 _ => return None,
             };
-            (at == payload.len()).then_some(WalOp::SetForeignTable {
-                slot,
-                created_at,
-                definition,
-            })
+            if at != payload.len() {
+                return None;
+            }
+            if let Some(output) = decoded_foreign_table {
+                *output = Some((slot, created_at, definition));
+            }
+            Some(WalOp::RestoreForeignTable(payload))
         }),
         KIND_CREATE => decode_large_op(|| {
             let table_version = payload.get(at).copied()?;
@@ -9684,16 +9801,20 @@ fn decode_op_inner<'a>(
                     function,
                 };
             }
-            (at == payload.len()).then_some(WalOp::SetOperatorFamily {
-                created_at,
-                definition: crate::storage::OperatorFamilyDefinition {
-                    schema,
-                    name,
-                    owner,
-                    operators,
-                    functions,
-                },
-            })
+            if at != payload.len() {
+                return None;
+            }
+            let definition = crate::storage::OperatorFamilyDefinition {
+                schema,
+                name,
+                owner,
+                operators,
+                functions,
+            };
+            if let Some(output) = decoded_operator_family {
+                *output = Some((created_at, definition));
+            }
+            Some(WalOp::RestoreOperatorFamily(payload))
         }),
         KIND_DROP_OPERATOR_FAMILY | KIND_DROP_OPERATOR_CLASS => decode_large_op(|| {
             let schema = take_name(&mut at)?;
@@ -9778,20 +9899,24 @@ fn decode_op_inner<'a>(
                     function,
                 };
             }
-            (at == payload.len()).then_some(WalOp::SetOperatorClass {
-                created_at,
-                definition: crate::storage::OperatorClassDefinition {
-                    schema,
-                    name,
-                    owner,
-                    family,
-                    input,
-                    storage,
-                    default,
-                    operators,
-                    functions,
-                },
-            })
+            if at != payload.len() {
+                return None;
+            }
+            let definition = crate::storage::OperatorClassDefinition {
+                schema,
+                name,
+                owner,
+                family,
+                input,
+                storage,
+                default,
+                operators,
+                functions,
+            };
+            if let Some(output) = decoded_operator_class {
+                *output = Some((created_at, definition));
+            }
+            Some(WalOp::RestoreOperatorClass(payload))
         }),
         KIND_DROP_ROUTINE => decode_large_op(|| {
             let name = take_name(&mut at)?;
@@ -11551,7 +11676,7 @@ mod tests {
             },
             WalOp::SetOperatorFamily {
                 created_at: 12,
-                definition: family,
+                definition: &family,
             },
             WalOp::DropOperatorFamily {
                 schema: "public",
@@ -11559,7 +11684,7 @@ mod tests {
             },
             WalOp::SetOperatorClass {
                 created_at: 13,
-                definition: class,
+                definition: &class,
             },
             WalOp::DropOperatorClass {
                 schema: "public",
@@ -11828,6 +11953,18 @@ mod tests {
         assert!(
             core::mem::size_of::<WalOp<'static>>()
                 < core::mem::size_of::<crate::storage::DomainDef>()
+        );
+        assert!(
+            core::mem::size_of::<WalOp<'static>>()
+                < core::mem::size_of::<crate::storage::foreign::ForeignTableDefinition>()
+        );
+        assert!(
+            core::mem::size_of::<WalOp<'static>>()
+                < core::mem::size_of::<crate::storage::OperatorFamilyDefinition>()
+        );
+        assert!(
+            core::mem::size_of::<WalOp<'static>>()
+                < core::mem::size_of::<crate::storage::OperatorClassDefinition>()
         );
     }
 

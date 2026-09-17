@@ -193,9 +193,12 @@ Wide schema objects use one explicit boundary through DDL, enforcement,
 catalogs, WAL, checkpoints, and recovery. Index tuples and partition keys match
 PostgreSQL 18's 32-attribute limits; the bounded SQL parser admits 64 table
 constraints of each modeled kind, 64 domain checks, 64 composite fields, and
-64 LIST-bound values. Crossing a boundary returns a program-limit error before
-catalog mutation. Index key/include counts and `pg_partitioned_table` expose
-the same accepted shape after empty-cache recovery.
+64 LIST-bound values. Direct inheritance parents, defaults across every view
+column, subscription publication names, event-trigger tags, foreign OPTIONS
+clauses, and operator-family operator/support-function catalogs use that same
+64-item statement boundary. Crossing a boundary returns a program-limit error
+before catalog mutation. Index key/include counts and `pg_partitioned_table`
+expose the same accepted shape after empty-cache recovery.
 
 Implicit index OIDs reserve the complete enforcer stride. Constraint kinds use
 disjoint catalog-local OID bands for every accepted table slot and position.

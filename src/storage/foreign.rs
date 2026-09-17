@@ -10,8 +10,12 @@ use crate::util::StackStr;
 
 use super::{CatalogDdlState, DatabaseOid, Ownership, PendingOwnership, SqlName};
 
-pub(crate) const MAX_FOREIGN_OPTIONS: usize = 16;
-pub(crate) const MAX_FOREIGN_COLUMN_OPTIONS: usize = 32;
+/// One OPTIONS clause follows the parser's complete bounded list.
+pub(crate) const MAX_FOREIGN_OPTIONS: usize = crate::sql::parser::MAX_LIST;
+/// Column options share one sparse table-level catalog. Its bound admits one
+/// option for every accepted column or a complete OPTIONS clause on one
+/// column, without the former 32-entry storage-only ceiling.
+pub(crate) const MAX_FOREIGN_COLUMN_OPTIONS: usize = MAX_FOREIGN_OPTIONS;
 pub(crate) const FOREIGN_OPTION_VALUE_MAX: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

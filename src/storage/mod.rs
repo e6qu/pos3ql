@@ -97,7 +97,10 @@ impl PublicationFilters {
 
 /// A subscription's publication list is part of its startup-bounded durable
 /// state, rather than an unbounded connection-side string.
-pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = 16;
+/// A subscription's publication list follows the parser's complete bounded
+/// list. Storage, WAL, workers, and catalogs must not impose a narrower shape
+/// after the statement has parsed successfully.
+pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const SUBSCRIPTION_CONNINFO_BYTES: usize = 512;
 pub(crate) const MAX_TRIGGER_ARGUMENTS: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const TRIGGER_ARGUMENT_BYTES: usize = u8::MAX as usize;
@@ -1148,9 +1151,10 @@ impl DeclaredColumnType {
 /// `gen_random_uuid()`, …); a longer one is a loud error, never silent growth.
 /// This keeps each copied column definition within the recovery stack envelope.
 pub(crate) const DEFAULT_EXPR_MAX: usize = 120;
-/// Active view defaults stay sparse so catalog and WAL frames fit their
-/// startup-bounded execution envelopes.
-pub(crate) const MAX_VIEW_DEFAULTS: usize = 8;
+/// Every accepted view column may carry a default. Keeping the sparse entries
+/// at the view-column boundary prevents ALTER VIEW from introducing a narrower
+/// catalog-only limit.
+pub(crate) const MAX_VIEW_DEFAULTS: usize = MAX_COLUMNS;
 
 impl ColumnMeta {
     pub const EMPTY: Self = ColumnMeta {
@@ -1672,8 +1676,8 @@ pub struct DetachedPartitionBound {
     pub bound: PartitionBound,
 }
 
-/// Inline catalog capacity for direct ordinary-inheritance parents.
-pub(crate) const MAX_TABLE_INHERITANCE_PARENTS: usize = 8;
+/// Direct ordinary-inheritance parents follow the parser's bounded list.
+pub(crate) const MAX_TABLE_INHERITANCE_PARENTS: usize = crate::sql::parser::MAX_LIST;
 
 /// Direct table-inheritance edges.  This is deliberately separate from
 /// partition attachment: a partition owns routing and cannot also be treated
@@ -2598,7 +2602,7 @@ pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_COLUMNS + MAX_UNIQUES + MAX_EX
 pub(crate) const MAX_EXTENDED_STATISTICS_PER_TABLE: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
-pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = 32;
+pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const EVENT_TRIGGER_TAG_MAX: usize = 64;
 
 /// PostgreSQL's closed server-encoding identity. Construction is checked once
@@ -5846,7 +5850,8 @@ pub(crate) const OPERATOR_OID_BASE: i32 = 620_000;
 pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = 640_000;
 pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = 660_000;
 pub(crate) const ACCESS_METHOD_OID_BASE: i32 = 680_000;
-pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = 16;
+/// Operators and support functions each follow the parser's bounded DDL list.
+pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = crate::sql::parser::MAX_LIST;
 pub(crate) const MAX_ACCESS_METHODS: usize = 32;
 
 fn catalog_object_oid(base: i32, created_at: u64) -> i32 {
@@ -43156,8 +43161,44 @@ mod tests {
 
     #[test]
     fn stored_query_dependency_arrays_live_outside_catalog_definitions() {
-        assert!(size_of::<ViewDef>() < size_of::<StoredQueryDependencies>());
-        assert!(size_of::<MatviewDef>() < size_of::<StoredQueryDependencies>());
+        // Exhaustive destructuring is the compile-time guard. Catalog entries
+        // retain only the rule/backing-table indirection; the dependency array
+        // lives in that separately sized object rather than every entry.
+        let view_shape = |view: &ViewDef| {
+            let ViewDef {
+                database: _,
+                created_at: _,
+                schema: _,
+                name: _,
+                persistence: _,
+                return_rule: _,
+                options: _,
+                columns: _,
+                ownership: _,
+                pending_schema: _,
+                pending_name: _,
+                pending_options: _,
+                pending_columns: _,
+                ddl_state: _,
+            } = view;
+        };
+        let matview_shape = |view: &MatviewDef| {
+            let MatviewDef {
+                database: _,
+                created_at: _,
+                backing_table: _,
+                sql: _,
+                creation_path: _,
+                ownership: _,
+                populated: _,
+                ddl_state: _,
+            } = view;
+        };
+        let _ = (view_shape, matview_shape);
+        assert!(
+            size_of::<StoredQueryDependencies>()
+                >= MAX_STORED_QUERY_DEPENDENCIES * size_of::<StoredQueryDependency>()
+        );
     }
 
     #[test]

@@ -1222,98 +1222,100 @@ fn typmod_change_requires_rewrite(ctype: types::ColType, old: i32, new: i32) -> 
     }
 }
 
+pub(crate) const SUPPORTED_EVENT_TRIGGER_TAGS: &[&str] = &[
+    "ALTER AGGREGATE",
+    "ALTER COLLATION",
+    "ALTER CONVERSION",
+    "ALTER DEFAULT PRIVILEGES",
+    "ALTER DOMAIN",
+    "ALTER EXTENSION",
+    "ALTER FUNCTION",
+    "ALTER INDEX",
+    "ALTER LANGUAGE",
+    "ALTER OPERATOR",
+    "ALTER OPERATOR CLASS",
+    "ALTER OPERATOR FAMILY",
+    "ALTER MATERIALIZED VIEW",
+    "ALTER SCHEMA",
+    "ALTER VIEW",
+    "ALTER POLICY",
+    "ALTER PROCEDURE",
+    "ALTER PUBLICATION",
+    "ALTER RULE",
+    "ALTER ROUTINE",
+    "ALTER SEQUENCE",
+    "ALTER STATISTICS",
+    "ALTER SUBSCRIPTION",
+    "ALTER TABLE",
+    "ALTER TRIGGER",
+    "ALTER TYPE",
+    "COMMENT",
+    "CREATE AGGREGATE",
+    "CREATE ACCESS METHOD",
+    "CREATE CAST",
+    "CREATE COLLATION",
+    "CREATE CONVERSION",
+    "CREATE DOMAIN",
+    "CREATE EXTENSION",
+    "CREATE FUNCTION",
+    "CREATE INDEX",
+    "CREATE LANGUAGE",
+    "CREATE MATERIALIZED VIEW",
+    "CREATE OPERATOR",
+    "CREATE OPERATOR CLASS",
+    "CREATE OPERATOR FAMILY",
+    "CREATE POLICY",
+    "CREATE PROCEDURE",
+    "CREATE PUBLICATION",
+    "CREATE RULE",
+    "CREATE SCHEMA",
+    "CREATE SEQUENCE",
+    "CREATE STATISTICS",
+    "CREATE SUBSCRIPTION",
+    "CREATE TABLE",
+    "CREATE TABLE AS",
+    "CREATE TRIGGER",
+    "CREATE TYPE",
+    "CREATE VIEW",
+    "DROP AGGREGATE",
+    "DROP ACCESS METHOD",
+    "DROP CAST",
+    "DROP COLLATION",
+    "DROP CONVERSION",
+    "DROP DOMAIN",
+    "DROP EXTENSION",
+    "DROP FUNCTION",
+    "DROP INDEX",
+    "DROP LANGUAGE",
+    "DROP MATERIALIZED VIEW",
+    "DROP OWNED",
+    "DROP OPERATOR",
+    "DROP OPERATOR CLASS",
+    "DROP OPERATOR FAMILY",
+    "DROP POLICY",
+    "DROP PROCEDURE",
+    "DROP PUBLICATION",
+    "DROP RULE",
+    "DROP ROUTINE",
+    "DROP SCHEMA",
+    "DROP SEQUENCE",
+    "DROP STATISTICS",
+    "DROP SUBSCRIPTION",
+    "DROP TABLE",
+    "DROP TRIGGER",
+    "DROP TYPE",
+    "DROP VIEW",
+    "GRANT",
+    "REFRESH MATERIALIZED VIEW",
+    "REINDEX",
+    "REVOKE",
+    "SELECT INTO",
+];
+
 pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
-    [
-        "ALTER AGGREGATE",
-        "ALTER COLLATION",
-        "ALTER CONVERSION",
-        "ALTER DEFAULT PRIVILEGES",
-        "ALTER DOMAIN",
-        "ALTER EXTENSION",
-        "ALTER FUNCTION",
-        "ALTER INDEX",
-        "ALTER LANGUAGE",
-        "ALTER OPERATOR",
-        "ALTER OPERATOR CLASS",
-        "ALTER OPERATOR FAMILY",
-        "ALTER MATERIALIZED VIEW",
-        "ALTER SCHEMA",
-        "ALTER VIEW",
-        "ALTER POLICY",
-        "ALTER PROCEDURE",
-        "ALTER PUBLICATION",
-        "ALTER RULE",
-        "ALTER ROUTINE",
-        "ALTER SEQUENCE",
-        "ALTER STATISTICS",
-        "ALTER SUBSCRIPTION",
-        "ALTER TABLE",
-        "ALTER TRIGGER",
-        "ALTER TYPE",
-        "COMMENT",
-        "CREATE AGGREGATE",
-        "CREATE ACCESS METHOD",
-        "CREATE CAST",
-        "CREATE COLLATION",
-        "CREATE CONVERSION",
-        "CREATE DOMAIN",
-        "CREATE EXTENSION",
-        "CREATE FUNCTION",
-        "CREATE INDEX",
-        "CREATE LANGUAGE",
-        "CREATE MATERIALIZED VIEW",
-        "CREATE OPERATOR",
-        "CREATE OPERATOR CLASS",
-        "CREATE OPERATOR FAMILY",
-        "CREATE POLICY",
-        "CREATE PROCEDURE",
-        "CREATE PUBLICATION",
-        "CREATE RULE",
-        "CREATE SCHEMA",
-        "CREATE SEQUENCE",
-        "CREATE STATISTICS",
-        "CREATE SUBSCRIPTION",
-        "CREATE TABLE",
-        "CREATE TABLE AS",
-        "CREATE TRIGGER",
-        "CREATE TYPE",
-        "CREATE VIEW",
-        "DROP AGGREGATE",
-        "DROP ACCESS METHOD",
-        "DROP CAST",
-        "DROP COLLATION",
-        "DROP CONVERSION",
-        "DROP DOMAIN",
-        "DROP EXTENSION",
-        "DROP FUNCTION",
-        "DROP INDEX",
-        "DROP LANGUAGE",
-        "DROP MATERIALIZED VIEW",
-        "DROP OWNED",
-        "DROP OPERATOR",
-        "DROP OPERATOR CLASS",
-        "DROP OPERATOR FAMILY",
-        "DROP POLICY",
-        "DROP PROCEDURE",
-        "DROP PUBLICATION",
-        "DROP RULE",
-        "DROP ROUTINE",
-        "DROP SCHEMA",
-        "DROP SEQUENCE",
-        "DROP STATISTICS",
-        "DROP SUBSCRIPTION",
-        "DROP TABLE",
-        "DROP TRIGGER",
-        "DROP TYPE",
-        "DROP VIEW",
-        "GRANT",
-        "REFRESH MATERIALIZED VIEW",
-        "REINDEX",
-        "REVOKE",
-        "SELECT INTO",
-    ]
-    .iter()
-    .any(|known| known.eq_ignore_ascii_case(tag))
+    SUPPORTED_EVENT_TRIGGER_TAGS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(tag))
 }
 
 fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
@@ -6143,6 +6145,7 @@ impl Engine {
             {
                 continue;
             }
+            let foreign_table_definition;
             let operation = match class {
                 crate::storage::foreign::ForeignObjectClass::Wrapper => {
                     let entry = self.storage.foreign_wrapper_entry(slot as usize);
@@ -6178,12 +6181,13 @@ impl Engine {
                 }
                 crate::storage::foreign::ForeignObjectClass::Table => {
                     let entry = self.storage.foreign_table_entry(slot as usize);
+                    foreign_table_definition = entry
+                        .visible_to(txn.txid)
+                        .then(|| entry.definition_for(txn.txid));
                     WalOp::SetForeignTable {
                         slot: slot as u16,
                         created_at: entry.created_at,
-                        definition: entry
-                            .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
+                        definition: &foreign_table_definition,
                     }
                 }
             };
@@ -18829,7 +18833,17 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             slot,
             created_at,
             definition,
-        } => storage.replay_set_foreign_table(slot as usize, created_at, definition)?,
+        } => storage.replay_set_foreign_table(slot as usize, created_at, *definition)?,
+        WalOp::RestoreForeignTable(payload) => {
+            let (slot, created_at, definition) = crate::wal::decode_foreign_table_payload(payload)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal foreign-table definition is corrupt"
+                    )
+                })?;
+            storage.replay_set_foreign_table(slot as usize, created_at, definition)?;
+        }
         WalOp::Commit { .. }
         | WalOp::PrepareTransaction { .. }
         | WalOp::PreparedLocks { .. }
@@ -18912,6 +18926,16 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             created_at,
             definition,
         } => {
+            storage.replay_set_operator_family(created_at, *definition)?;
+        }
+        WalOp::RestoreOperatorFamily(payload) => {
+            let (created_at, definition) = crate::wal::decode_operator_family_payload(payload)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal operator-family definition is corrupt"
+                    )
+                })?;
             storage.replay_set_operator_family(created_at, definition)?;
         }
         WalOp::DropOperatorFamily { schema, name } => {
@@ -18930,6 +18954,16 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             created_at,
             definition,
         } => {
+            storage.replay_set_operator_class(created_at, *definition)?;
+        }
+        WalOp::RestoreOperatorClass(payload) => {
+            let (created_at, definition) = crate::wal::decode_operator_class_payload(payload)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "journal operator-class definition is corrupt"
+                    )
+                })?;
             storage.replay_set_operator_class(created_at, definition)?;
         }
         WalOp::DropOperatorClass { schema, name } => {

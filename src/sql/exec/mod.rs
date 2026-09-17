@@ -30667,7 +30667,7 @@ pub(crate) fn create_operator_family(
         lsn,
         &WalOp::SetOperatorFamily {
             created_at,
-            definition,
+            definition: &definition,
         },
     ) {
         storage.rollback_operator_family_create(slot);
@@ -30950,7 +30950,7 @@ fn stage_operator_family(
         lsn,
         &WalOp::SetOperatorFamily {
             created_at,
-            definition,
+            definition: &definition,
         },
     ) {
         storage.rollback_operator_family_alter(slot, prior);
@@ -31153,7 +31153,7 @@ fn stage_operator_class(
         lsn,
         &WalOp::SetOperatorClass {
             created_at,
-            definition,
+            definition: &definition,
         },
     ) {
         storage.rollback_operator_class_alter(slot, prior);
@@ -31303,7 +31303,7 @@ pub(crate) fn create_operator_class(
             lsn,
             &WalOp::SetOperatorFamily {
                 created_at,
-                definition,
+                definition: &definition,
             },
         ) {
             storage.rollback_operator_family_create(slot);
@@ -31457,7 +31457,7 @@ pub(crate) fn create_operator_class(
         lsn,
         &WalOp::SetOperatorClass {
             created_at,
-            definition,
+            definition: &definition,
         },
     ) {
         storage.rollback_operator_class_create(slot);

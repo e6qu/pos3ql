@@ -13196,6 +13196,237 @@ fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
 }
 
 #[test]
+fn maximum_definition_lists_survive_wal_checkpoint_and_cold_recovery() {
+    const WIDTH: usize = crate::sql::parser::MAX_LIST;
+    assert!(super::SUPPORTED_EVENT_TRIGGER_TAGS.len() >= WIDTH);
+
+    let mut config = test_config("maximum-definition-lists");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("maximum-definition-lists-{}", std::process::id());
+    config.max_tables = WIDTH + 8;
+    config.max_domains = WIDTH + 8;
+    config.max_routines = WIDTH * 2 + 8;
+    config.max_operators = WIDTH + 8;
+    config.max_subscriptions = 2;
+    config.max_event_triggers = 2;
+    config.table_rows = 128;
+    config.wal_bytes = 8 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    for index in 0..WIDTH {
+        let statement = format!("CREATE TABLE wide_parent_{index} (shared integer)");
+        let output = run_with(&mut engine, &mut budget, &statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let parents = (0..WIDTH)
+        .map(|index| format!("wide_parent_{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = format!(
+        "CREATE TABLE wide_inheritance_child () INHERITS ({parents}); \
+         INSERT INTO wide_inheritance_child VALUES (41)"
+    );
+    let output = run_with(&mut engine, &mut budget, &statement);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let source_columns = (0..WIDTH)
+        .map(|index| format!("column_{index} integer"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let selected_columns = (0..WIDTH)
+        .map(|index| format!("column_{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = format!(
+        "CREATE TABLE wide_view_source ({source_columns}); \
+         CREATE VIEW wide_default_view AS SELECT {selected_columns} FROM wide_view_source"
+    );
+    let output = run_with(&mut engine, &mut budget, &statement);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for index in 0..WIDTH {
+        let statement =
+            format!("ALTER VIEW wide_default_view ALTER COLUMN column_{index} SET DEFAULT {index}");
+        let output = run_with(&mut engine, &mut budget, &statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    let publications = (0..WIDTH)
+        .map(|index| format!("publication_{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = format!(
+        "CREATE SUBSCRIPTION wide_subscription CONNECTION 'host=publisher' \
+         PUBLICATION {publications} WITH (connect = false, slot_name = NONE)"
+    );
+    let output = run_with(&mut engine, &mut budget, &statement);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let event_tags = super::SUPPORTED_EVENT_TRIGGER_TAGS
+        .iter()
+        .take(WIDTH)
+        .map(|tag| format!("'{tag}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = format!(
+        "CREATE FUNCTION wide_event_function() RETURNS event_trigger LANGUAGE plpgsql \
+           AS 'BEGIN RETURN; END'; \
+         CREATE EVENT TRIGGER wide_event_trigger ON ddl_command_end \
+           WHEN TAG IN ({event_tags}) EXECUTE FUNCTION wide_event_function()"
+    );
+    let output = run_with(&mut engine, &mut budget, &statement);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let foreign_columns = (0..WIDTH)
+        .map(|index| format!("column_{index} integer OPTIONS (remote_{index} 'value')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let foreign_options = (0..WIDTH)
+        .map(|index| format!("option_{index} 'value'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let statement = format!(
+        "CREATE FOREIGN DATA WRAPPER wide_fdw NO HANDLER NO VALIDATOR; \
+         CREATE SERVER wide_server FOREIGN DATA WRAPPER wide_fdw; \
+         CREATE FOREIGN TABLE wide_foreign ({foreign_columns}) SERVER wide_server \
+           OPTIONS ({foreign_options})"
+    );
+    let output = run_with(&mut engine, &mut budget, &statement);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    for index in 0..WIDTH {
+        for statement in [
+            format!("CREATE DOMAIN wide_type_{index} AS integer"),
+            format!(
+                "CREATE FUNCTION wide_equal_{index}(wide_type_{index},wide_type_{index}) \
+                 RETURNS boolean LANGUAGE SQL RETURN true"
+            ),
+            format!(
+                "CREATE FUNCTION wide_compare_{index}(wide_type_{index},wide_type_{index}) \
+                 RETURNS integer LANGUAGE SQL RETURN 0"
+            ),
+            format!(
+                "CREATE OPERATOR public.=== (FUNCTION = wide_equal_{index}, \
+                 LEFTARG = wide_type_{index}, RIGHTARG = wide_type_{index})"
+            ),
+        ] {
+            let output = run_with(&mut engine, &mut budget, &statement);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{statement}: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OPERATOR FAMILY wide_family USING btree",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    for first in (0..WIDTH).step_by(16) {
+        let actions = (first..first + 16)
+            .flat_map(|index| {
+                [
+                    format!("OPERATOR 3 public.===(wide_type_{index},wide_type_{index})"),
+                    format!(
+                        "FUNCTION 1 (wide_type_{index},wide_type_{index}) \
+                         wide_compare_{index}(wide_type_{index},wide_type_{index})"
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let statement = format!("ALTER OPERATOR FAMILY wide_family USING btree ADD {actions}");
+        let output = run_with(&mut engine, &mut budget, &statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    let verify = "SELECT count(*) FROM pg_inherits \
+                    WHERE inhrelid = 'wide_inheritance_child'::regclass; \
+                  SELECT shared FROM ONLY wide_inheritance_child; \
+                  SELECT count(*) FROM pg_attrdef \
+                    WHERE adrelid = 'wide_default_view'::regclass; \
+                  SELECT cardinality(subpublications) FROM pg_subscription \
+                    WHERE subname = 'wide_subscription'; \
+                  SELECT cardinality(evttags) FROM pg_event_trigger \
+                    WHERE evtname = 'wide_event_trigger'; \
+                  SELECT cardinality(ftoptions) FROM pg_foreign_table \
+                    WHERE ftrelid = 'wide_foreign'::regclass; \
+                  SELECT count(*) FROM pg_attribute \
+                    WHERE attrelid = 'wide_foreign'::regclass AND cardinality(attfdwoptions) = 1; \
+                  SELECT count(*) FROM pg_amop \
+                    WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname = 'wide_family'); \
+                  SELECT count(*) FROM pg_amproc \
+                    WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname = 'wide_family')";
+    let expected = ["64", "41", "64", "64", "64", "64", "64", "64", "64"];
+    assert_eq!(
+        data_rows(&run_with(&mut engine, &mut budget, verify)),
+        expected
+    );
+
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut replayed, &mut replay_budget, verify)),
+        expected,
+        "maximum definitions must survive local WAL replay"
+    );
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut cold, &mut cold_budget, verify)),
+        expected,
+        "maximum definitions must survive object-store cold recovery"
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn alter_view_rename_preserves_oid_comments_and_recovery() {
     let config = test_config("alter-view-rename");
     let mut budget = Budget::new(1 << 29);

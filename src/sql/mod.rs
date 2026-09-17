@@ -8085,6 +8085,14 @@ impl Engine {
             Some(lsn) => {
                 self.begin_post_publish_cleanup(lsn);
                 self.finish_post_publish_cleanup()?;
+                let ckpt = self
+                    .ckpt
+                    .as_mut()
+                    .expect("checkpoint target remains attached");
+                ckpt.disable_async_block_reads();
+                let maintenance = ckpt.finish_maintenance(&self.storage);
+                ckpt.enable_async_block_reads();
+                maintenance?;
                 Ok(true)
             }
             None => Ok(false),

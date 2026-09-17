@@ -178,7 +178,13 @@ the internal large-object relation. Checkpoint publication, compare-and-swap
 retry, and empty-cache recovery therefore cover every configured physical table
 slot instead of silently stopping at 1,024. `checkpoint_manifest_bytes` reserves
 the complete serialized catalog image at startup and reports named exhaustion
-before publication. Table, constraint, default, statistics, publication,
+before publication. `checkpoint_commit_batches`, `checkpoint_live_blocks`, and
+`checkpoint_merge_entries` independently size cold-recovery ordering, the live
+block keep-set, and one SST-pair merge. `checkpoint_garbage_batch_objects`
+paces deletion without imposing a ceiling on accumulated obsolete objects;
+successful explicit checkpoints drain every batch. All four reservations are
+charged before serving, and configured exhaustion names the responsible bound.
+Table, constraint, default, statistics, publication,
 replication, subscription, dependency, trigger, sequence, and information-schema
 catalog builders use their transaction-visible cardinality rather than hidden
 256/512/1,024-row arrays.

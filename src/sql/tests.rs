@@ -62672,6 +62672,412 @@ fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
 }
 
 #[test]
+fn configured_commit_chain_capacity_controls_object_cold_recovery() {
+    let mut config = test_config("commit-chain-capacity");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-commit-chain-capacity-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.checkpoint_commit_batches = 5;
+    config.checkpoint_garbage_batch_objects = 1;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    stage_without_publication(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recovered_batches (id integer PRIMARY KEY)",
+    );
+    engine.commit_wal().unwrap();
+    for id in 1..=4 {
+        stage_without_publication(
+            &mut engine,
+            &mut budget,
+            &format!("INSERT INTO recovered_batches VALUES ({id})"),
+        );
+        engine.commit_wal().unwrap();
+    }
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut undersized = config.clone();
+    undersized.checkpoint_commit_batches = 4;
+    undersized.data_dir = format!("{}-undersized", config.data_dir);
+    let mut undersized_budget = Budget::new((1 << 29) + (96 << 20));
+    let error = match Engine::new(&undersized, &mut undersized_budget) {
+        Ok(_) => panic!("an undersized recovery chain must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("commit-head chain exceeds checkpoint_commit_batches (4)"),
+        "{error}"
+    );
+
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id FROM recovered_batches ORDER BY id"
+        )),
+        ["1", "2", "3", "4"]
+    );
+    assert!(recovered.checkpoint().unwrap());
+    let mut retained_batches = 0;
+    recovered
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("commits/", |key| {
+            retained_batches += usize::from(key.ends_with(".batch"));
+        })
+        .unwrap();
+    assert_eq!(
+        retained_batches, 1,
+        "batched pruning must retain only the replay-boundary batch"
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+    let _ = std::fs::remove_dir_all(&undersized.data_dir);
+}
+
+#[test]
+fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
+    let mut config = test_config("checkpoint-garbage-batches");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-checkpoint-garbage-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.checkpoint_garbage_batch_objects = 2;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE garbage_survivor (id integer PRIMARY KEY); \
+         INSERT INTO garbage_survivor VALUES (1)",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    for index in 0..5 {
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .client
+            .put(
+                &format!("sst/orphan-{index}"),
+                b"obsolete",
+                crate::object_store::Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .client
+            .put(
+                &format!("blocks/orphan-{index}"),
+                b"orphan",
+                crate::object_store::Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+    }
+    assert!(engine.checkpoint().unwrap());
+
+    let mut obsolete = 0;
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("sst/", |_| obsolete += 1)
+        .unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("blocks/orphan-", |_| obsolete += 1)
+        .unwrap();
+    assert_eq!(obsolete, 0, "successful checkpoint must drain every batch");
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id FROM garbage_survivor"
+        )),
+        ["1"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn checkpoint_compaction_retains_every_overlay_generation() {
+    let mut config = test_config("checkpoint-overlay-generations");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-overlay-generations-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.memtable_bytes = 512 << 10;
+    config.table_rows = 1024;
+    config.wal_buffer_bytes = 1 << 20;
+    config.work_arena_bytes = 96 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE overlay_generations (id integer PRIMARY KEY, value text)",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+
+    for batch in 0..10 {
+        let inserted = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO overlay_generations \
+                   SELECT {batch} * 500 + value, 'r' || ({batch} * 500 + value) \
+                     FROM generate_series(0, 499) value"
+            ),
+        );
+        assert!(
+            !message_types(&inserted).contains(&b'E'),
+            "batch {batch}: {}",
+            String::from_utf8_lossy(&inserted)
+        );
+        assert!(engine.checkpoint().unwrap(), "batch {batch} must publish");
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT count(*) FROM overlay_generations"
+            )),
+            [(batch + 1) * 500].map(|count| count.to_string()),
+            "batch {batch} disappeared at a checkpoint/merge boundary"
+        );
+    }
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*), min(value), max(value) FROM overlay_generations"
+        )),
+        ["5000|r0|r999"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn checkpoint_reports_publication_before_paced_maintenance() {
+    let mut config = test_config("checkpoint-publication-handoff");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-publication-handoff-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.memtable_bytes = 256 << 10;
+    config.table_rows = 512;
+    config.wal_buffer_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let first = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_handoff (id integer PRIMARY KEY, value text); \
+         INSERT INTO publication_handoff \
+           SELECT value, repeat('x', 128) FROM generate_series(1, 400) value",
+    );
+    assert!(!message_types(&first).contains(&b'E'));
+
+    let published_lsn = loop {
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        match step {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => assert!(
+                !engine.ckpt.as_ref().unwrap().maintenance_pending(),
+                "a durable manifest must be handed to local cleanup in the same beat"
+            ),
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty storage became idle before publication")
+            }
+        }
+    };
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+
+    let second = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO publication_handoff \
+           SELECT value, repeat('y', 128) FROM generate_series(401, 800) value",
+    );
+    assert!(!message_types(&second).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*), count(*) FILTER (WHERE value = repeat('y', 128)) \
+               FROM publication_handoff"
+        )),
+        ["800|400"]
+    );
+
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn checkpoint_live_block_capacity_exhausts_loudly() {
+    let mut config = test_config("checkpoint-live-block-capacity");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-checkpoint-live-blocks-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.checkpoint_live_blocks = 1;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE live_block_capacity (id integer PRIMARY KEY); \
+         INSERT INTO live_block_capacity VALUES (1)",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    let error = engine.checkpoint().unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    assert!(
+        error
+            .message
+            .as_str()
+            .contains("checkpoint_live_blocks (1)"),
+        "{error:?}"
+    );
+
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn checkpoint_merge_capacity_exhausts_loudly_for_a_pinned_full_list() {
+    let mut config = test_config("checkpoint-merge-capacity");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-checkpoint-merge-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.checkpoint_merge_entries = 1;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut writer = TxnState::new(&mut budget, 256).unwrap();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE TABLE merge_capacity (id integer PRIMARY KEY, value integer); \
+         INSERT INTO merge_capacity VALUES (1, 0)",
+    );
+    assert!(engine.checkpoint().unwrap());
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM merge_capacity"
+        )),
+        ["0"]
+    );
+
+    let mut exhaustion = None;
+    for version in 1..=10 {
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut writer,
+            &format!("UPDATE merge_capacity SET value = {version} WHERE id = 1"),
+        );
+        match engine.checkpoint() {
+            Ok(true) => {}
+            Ok(false) => panic!("dirty checkpoint unexpectedly did no work"),
+            Err(error) => {
+                exhaustion = Some(error);
+                break;
+            }
+        }
+    }
+    let error = exhaustion.expect("the full pinned list must reach its configured merge bound");
+    assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+    assert!(
+        error
+            .message
+            .as_str()
+            .contains("checkpoint_merge_entries (1)"),
+        "{error:?}"
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut reader,
+            "SELECT value FROM merge_capacity"
+        )),
+        ["0"],
+        "capacity failure must preserve the pinned snapshot"
+    );
+
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn ambiguous_commit_batch_put_is_idempotently_adopted() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

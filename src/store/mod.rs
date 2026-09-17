@@ -180,7 +180,7 @@ impl BlockType {
 /// A block's name: the SHA-256 of its payload. Two blocks with the same
 /// contents have the same identity by construction, which is what makes a write
 /// idempotent and a retry harmless.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) struct BlockId(pub(crate) [u8; 32]);
 
 impl BlockId {

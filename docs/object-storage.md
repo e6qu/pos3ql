@@ -78,6 +78,14 @@ decoding, and page buffers are fixed at startup. Retries are limited to typed
 retryable outcomes and preserve conditional-request identity; they are not a
 fallback to different semantics or another provider API.
 
+Checkpoint maintenance uses the same provider-neutral list and delete contract.
+Cold commit-chain replay, live-block retention, SST-pair merge scratch, and
+garbage deletion batches have independent startup capacities. A garbage batch
+is a pacing unit, not a namespace-size limit: automatic checkpoints continue it
+between statements, while an explicit checkpoint returns only after all listed
+obsolete objects are deleted. Live-set or recovery-chain exhaustion fails with
+the corresponding configuration name and never weakens retention.
+
 ## Qualification
 
 Required CI has three independent layers:

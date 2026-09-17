@@ -8,9 +8,9 @@ work and architecture limits belong in [PLAN.md](PLAN.md).
 There are currently no defects that meet this file's inclusion criteria.
 The geometric, ranked nearest-neighbor, inverted posting, signature, and
 interval index-navigation,
-concurrent-harness port, and integration-scratch audits have no external
-blocker; their fixes are qualified in the implementation and regression
-suites.
+checkpoint-maintenance capacity and publication handoff, concurrent-harness
+port, and integration-scratch audits have no external blocker; their fixes are
+qualified in the implementation and regression suites.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

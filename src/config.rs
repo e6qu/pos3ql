@@ -229,6 +229,16 @@ pub struct Config {
     /// Startup-fixed buffer for one complete checkpoint manifest. Catalog
     /// growth beyond it fails loudly before publication.
     pub checkpoint_manifest_bytes: usize,
+    /// Commit-batch identities retained while cold recovery walks the durable
+    /// head chain into ascending replay order.
+    pub checkpoint_commit_batches: usize,
+    /// Content-addressed block identities retained by one checkpoint garbage
+    /// collection keep-set.
+    pub checkpoint_live_blocks: usize,
+    /// Obsolete objects deleted by one paced garbage collection beat.
+    pub checkpoint_garbage_batch_objects: usize,
+    /// Physical row-version entries retained while one SST pair is merged.
+    pub checkpoint_merge_entries: usize,
     /// S3-compatible data-plane authority (`host:port`).
     pub object_store_endpoint: String,
     /// Bucket containing this database's durable objects.
@@ -389,6 +399,10 @@ impl Config {
             wal_upload_sync: false,
             wal_upload_buffer_bytes: 8 * MIB,
             checkpoint_manifest_bytes: 256 * KIB,
+            checkpoint_commit_batches: 4096,
+            checkpoint_live_blocks: 64 * 1024,
+            checkpoint_garbage_batch_objects: 4096,
+            checkpoint_merge_entries: 512 * 1024,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
             object_store_bucket: "pos3ql".to_string(),
             object_store_prefix: String::new(),
@@ -816,6 +830,22 @@ impl Config {
                     config.checkpoint_manifest_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
+                "checkpoint_commit_batches" => {
+                    config.checkpoint_commit_batches =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "checkpoint_live_blocks" => {
+                    config.checkpoint_live_blocks =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "checkpoint_garbage_batch_objects" => {
+                    config.checkpoint_garbage_batch_objects =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "checkpoint_merge_entries" => {
+                    config.checkpoint_merge_entries =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
                 "object_store" => match value {
                     "on" | "true" => config.object_store_on = true,
                     "off" | "false" => config.object_store_on = false,
@@ -1015,6 +1045,25 @@ impl Config {
                 0,
                 "checkpoint_manifest_bytes must be greater than zero".to_string(),
             ));
+        }
+        for (name, value) in [
+            (
+                "checkpoint_commit_batches",
+                config.checkpoint_commit_batches,
+            ),
+            ("checkpoint_live_blocks", config.checkpoint_live_blocks),
+            (
+                "checkpoint_garbage_batch_objects",
+                config.checkpoint_garbage_batch_objects,
+            ),
+            ("checkpoint_merge_entries", config.checkpoint_merge_entries),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::at(
+                    0,
+                    format!("{name} must be greater than zero"),
+                ));
+            }
         }
         if config.temporary_spill_bytes != 0
             && config.temporary_spill_bytes < crate::store::BLOCK_SIZE
@@ -1557,6 +1606,10 @@ max_parameter_acl_entries = 300
 memtable_bytes = 16MiB   # small for tests
 temporary_spill_bytes = 32MiB
 checkpoint_manifest_bytes = 2MiB
+checkpoint_commit_batches = 7000
+checkpoint_live_blocks = 8000
+checkpoint_garbage_batch_objects = 3
+checkpoint_merge_entries = 9000
 sql_arena_bytes = 4096
 ";
         let c = Config::parse(text).unwrap();
@@ -1584,6 +1637,10 @@ sql_arena_bytes = 4096
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.temporary_spill_bytes, 32 * MIB);
         assert_eq!(c.checkpoint_manifest_bytes, 2 * MIB);
+        assert_eq!(c.checkpoint_commit_batches, 7000);
+        assert_eq!(c.checkpoint_live_blocks, 8000);
+        assert_eq!(c.checkpoint_garbage_batch_objects, 3);
+        assert_eq!(c.checkpoint_merge_entries, 9000);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.
         assert_eq!(c.block_cache_bytes, Config::default_dev().block_cache_bytes);
@@ -1609,6 +1666,20 @@ sql_arena_bytes = 4096
             error.message,
             "checkpoint_manifest_bytes must be greater than zero"
         );
+    }
+
+    #[test]
+    fn checkpoint_maintenance_capacities_must_be_nonzero() {
+        for name in [
+            "checkpoint_commit_batches",
+            "checkpoint_live_blocks",
+            "checkpoint_garbage_batch_objects",
+            "checkpoint_merge_entries",
+        ] {
+            let error = Config::parse(&format!("{name} = 0\n")).unwrap_err();
+            assert_eq!(error.line, 0);
+            assert_eq!(error.message, format!("{name} must be greater than zero"));
+        }
     }
 
     #[test]

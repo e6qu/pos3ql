@@ -1493,12 +1493,10 @@ pub fn write_datum_json_styled(
         ),
         Datum::Array { element, raw } => {
             out.write_char('[')?;
-            let count = crate::sql::array::len(raw);
-            for i in 0..count {
+            for (i, elem) in crate::sql::array::elements(raw, *element).enumerate() {
                 if i > 0 {
                     out.write_str(comma)?;
                 }
-                let elem = crate::sql::array::get(raw, *element, i).unwrap_or(Datum::Null);
                 write_datum_json_styled(&elem, colon, comma, out)?;
             }
             out.write_char(']')

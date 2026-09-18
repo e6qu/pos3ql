@@ -374,9 +374,7 @@ pub struct Exploded {
 
 pub fn explode_count(raw: &[u8]) -> Result<usize, SqlError> {
     let mut count = 0usize;
-    for index in 0..crate::sql::array::len(raw) {
-        let value = crate::sql::array::get(raw, crate::sql::types::ArrElem::AclItem, index)
-            .unwrap_or(crate::sql::types::Datum::Null);
+    for value in crate::sql::array::elements(raw, crate::sql::types::ArrElem::AclItem) {
         let privileges = match value {
             crate::sql::types::Datum::Text(value) => parse(value)?.privilege_count(),
             crate::sql::types::Datum::AclItem(item) => item.privileges().count_ones() as usize,
@@ -404,9 +402,7 @@ pub fn explode_at(
     arena: &Arena,
 ) -> Result<Option<Exploded>, SqlError> {
     let mut current = 0usize;
-    for index in 0..crate::sql::array::len(raw) {
-        let value = crate::sql::array::get(raw, crate::sql::types::ArrElem::AclItem, index)
-            .unwrap_or(crate::sql::types::Datum::Null);
+    for value in crate::sql::array::elements(raw, crate::sql::types::ArrElem::AclItem) {
         let (grantor, grantee, privileges, grant_options) = match value {
             crate::sql::types::Datum::Text(value) => {
                 let parsed = parse(value)?;

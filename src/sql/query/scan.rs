@@ -351,9 +351,11 @@ fn refresh_catalog_object_names<'a>(
         {
             let shape = crate::sql::array::shape(raw).expect("stored array has a valid shape");
             let count = shape.element_count();
-            let mut refreshed = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
-            for (index, output) in refreshed.iter_mut().take(count).enumerate() {
-                let item = crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
+            let refreshed = crate::sql::array::alloc_items(arena, count)?;
+            for (output, item) in refreshed
+                .iter_mut()
+                .zip(crate::sql::array::elements(raw, element))
+            {
                 *output = match item {
                     Datum::Null => Datum::Null,
                     Datum::Regtype { referenced_oid, .. } => {
@@ -382,7 +384,7 @@ fn refresh_catalog_object_names<'a>(
             }
             *value = Datum::Array {
                 element,
-                raw: crate::sql::array::build_shaped(&refreshed[..count], shape, arena)?,
+                raw: crate::sql::array::build_shaped(refreshed, shape, arena)?,
             };
             continue;
         }

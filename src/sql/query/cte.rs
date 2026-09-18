@@ -2977,7 +2977,14 @@ fn recursive_path<'a>(
     key: Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let parent_count = match parent {
+        Some(Datum::Array {
+            element: ArrElem::Record,
+            raw,
+        }) => crate::sql::array::len(raw),
+        _ => 0,
+    };
+    let values = crate::sql::array::alloc_items(arena, parent_count + 1)?;
     let mut count = 0usize;
     if let Some(Datum::Array {
         element: ArrElem::Record,
@@ -2985,20 +2992,17 @@ fn recursive_path<'a>(
     }) = parent
     {
         count = crate::sql::array::len(raw);
-        if count >= values.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "recursive path exceeds the array limit"
-            ));
-        }
-        for (index, value) in values.iter_mut().enumerate().take(count) {
-            *value = crate::sql::array::get_record(raw, index, arena)?.unwrap_or(Datum::Null);
+        for (value, payload) in values
+            .iter_mut()
+            .zip(crate::sql::array::element_payloads(raw))
+        {
+            *value = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
         }
     }
     values[count] = key;
     Ok(Datum::Array {
         element: ArrElem::Record,
-        raw: crate::sql::array::build(&values[..=count], arena)?,
+        raw: crate::sql::array::build(values, arena)?,
     })
 }
 
@@ -3017,8 +3021,8 @@ fn recursive_path_contains<'a>(
             "invalid recursive path state"
         ));
     };
-    for index in 0..crate::sql::array::len(raw) {
-        let member = crate::sql::array::get_record(raw, index, arena)?.unwrap_or(Datum::Null);
+    for payload in crate::sql::array::element_payloads(raw) {
+        let member = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
         if crate::sql::eval::membership_eq(&member, key)? == Some(true) {
             return Ok(true);
         }

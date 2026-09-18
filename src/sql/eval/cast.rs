@@ -579,8 +579,8 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Array { element: e, .. } if e == element => v,
             // A different element type: re-encode each element cast to it.
             Datum::Array { element: e, raw } => {
-                let mut items = [Datum::Null; 1024];
-                let n = load_array(raw, e, element, &mut items, 0, arena)?;
+                let items = crate::sql::array::alloc_items(arena, crate::sql::array::len(raw))?;
+                let n = load_array(raw, e, element, &mut *items, 0, arena)?;
                 Datum::Array {
                     element,
                     raw: crate::sql::array::build(&items[..n], arena)?,
@@ -782,8 +782,13 @@ fn int2vector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<&'a [u8], S
     let out = arena
         .alloc_slice_with(count * 2, |_| 0u8)
         .map_err(|_| arena_full())?;
-    for (index, chunk) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        let Some(Datum::Int2(value)) = crate::sql::array::get(raw, ArrElem::Int2, index) else {
+    for (chunk, item) in out
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(crate::sql::array::elements(raw, ArrElem::Int2))
+    {
+        let Datum::Int2(value) = item else {
             return Err(invalid_vector("int2vector"));
         };
         chunk.copy_from_slice(&value.to_le_bytes());
@@ -796,8 +801,13 @@ fn oidvector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<&'a [u8], Sq
     let out = arena
         .alloc_slice_with(count * 4, |_| 0u8)
         .map_err(|_| arena_full())?;
-    for (index, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let Some(Datum::Oid(value)) = crate::sql::array::get(raw, ArrElem::Oid, index) else {
+    for (chunk, item) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(crate::sql::array::elements(raw, ArrElem::Oid))
+    {
+        let Datum::Oid(value) = item else {
             return Err(invalid_vector("oidvector"));
         };
         chunk.copy_from_slice(&value.to_le_bytes());
@@ -819,7 +829,7 @@ fn int2vector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, Sq
             "int2vector value too large"
         ));
     }
-    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let items = crate::sql::array::alloc_items(arena, values.len())?;
     for (item, value) in items.iter_mut().zip(values) {
         *item = Datum::Int2(i16::from_le_bytes(*value));
     }
@@ -843,7 +853,7 @@ fn oidvector_as_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<Datum<'a>, Sql
             "oidvector value too large"
         ));
     }
-    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let items = crate::sql::array::alloc_items(arena, values.len())?;
     for (item, value) in items.iter_mut().zip(values) {
         *item = Datum::Oid(u32::from_le_bytes(*value));
     }

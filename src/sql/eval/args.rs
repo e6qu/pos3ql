@@ -28,7 +28,7 @@ use super::{
 /// at the call boundary prevents individual built-ins from accidentally
 /// stringifying an array or accepting a scalar.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn variadic_tail<'a, 'out>(
+pub(crate) fn variadic_tail<'a>(
     name: &str,
     args: &[&Expr<'a>],
     fixed: usize,
@@ -37,23 +37,16 @@ pub(crate) fn variadic_tail<'a, 'out>(
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
-    out: &'out mut [Datum<'a>],
-) -> Result<Option<&'out [Datum<'a>]>, SqlError> {
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
     if !explicit {
         let tail = args
             .get(fixed..)
             .ok_or_else(|| arity_err(name, args.len()))?;
-        if tail.len() > out.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many arguments for {}()",
-                name
-            ));
-        }
+        let out = crate::sql::array::alloc_items(arena, tail.len())?;
         for (target, expression) in out.iter_mut().zip(tail) {
             *target = eval_full(expression, arena, params, row, hooks)?;
         }
-        return Ok(Some(&out[..tail.len()]));
+        return Ok(Some(out));
     }
     if args.len() != fixed + 1 {
         return Err(arity_err(name, args.len()));
@@ -62,18 +55,14 @@ pub(crate) fn variadic_tail<'a, 'out>(
         Datum::Null => Ok(None),
         Datum::Array { element, raw } => {
             let count = crate::sql::array::len(raw);
-            if count > out.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many arguments for {}()",
-                    name
-                ));
+            let out = crate::sql::array::alloc_items(arena, count)?;
+            for (target, value) in out
+                .iter_mut()
+                .zip(crate::sql::array::elements(raw, element))
+            {
+                *target = value;
             }
-            for (index, target) in out[..count].iter_mut().enumerate() {
-                *target = crate::sql::array::get(raw, element, index)
-                    .expect("validated array carries every member");
-            }
-            Ok(Some(&out[..count]))
+            Ok(Some(out))
         }
         _ => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -271,74 +260,6 @@ pub(crate) fn width_bucket_numeric(
     };
     let q = trunc_div(&mul(&num_a, &cnt, arena)?, &den, arena)?;
     Ok((q.to_i64()? + 1) as i32)
-}
-
-/// `format()` `%s`: the argument's text (NULL renders as empty).
-pub(crate) fn format_append_str<'a>(
-    out: &mut StackStr<4096>,
-    v: Datum<'a>,
-    arena: &'a Arena,
-) -> Result<(), SqlError> {
-    if !v.is_null() {
-        let _ = out.write_str(datum_to_text(v, arena)?);
-    }
-    Ok(())
-}
-
-/// `format()` `%I`: a SQL identifier, double-quoted only when it is not a bare
-/// lowercase identifier.
-pub(crate) fn format_append_ident<'a>(
-    out: &mut StackStr<4096>,
-    v: Datum<'a>,
-    arena: &'a Arena,
-) -> Result<(), SqlError> {
-    if v.is_null() {
-        return Err(sql_err!(
-            sqlstate::NULL_VALUE_NOT_ALLOWED,
-            "null value cannot be formatted as SQL identifier"
-        ));
-    }
-    let s = datum_to_text(v, arena)?;
-    let bare = !s.is_empty()
-        && s.bytes()
-            .enumerate()
-            .all(|(i, c)| c == b'_' || c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit()));
-    if bare {
-        let _ = out.write_str(s);
-    } else {
-        let _ = out.write_char('"');
-        for c in s.chars() {
-            if c == '"' {
-                let _ = out.write_char('"');
-            }
-            let _ = out.write_char(c);
-        }
-        let _ = out.write_char('"');
-    }
-    Ok(())
-}
-
-/// `format()` `%L`: a SQL literal — `NULL` for null, otherwise single-quoted
-/// with embedded quotes doubled.
-pub(crate) fn format_append_literal<'a>(
-    out: &mut StackStr<4096>,
-    v: Datum<'a>,
-    arena: &'a Arena,
-) -> Result<(), SqlError> {
-    if v.is_null() {
-        let _ = out.write_str("NULL");
-        return Ok(());
-    }
-    let s = datum_to_text(v, arena)?;
-    let _ = out.write_char('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            let _ = out.write_char('\'');
-        }
-        let _ = out.write_char(c);
-    }
-    let _ = out.write_char('\'');
-    Ok(())
 }
 
 /// 1-based character position of byte offset `b` in `s`.
@@ -693,32 +614,9 @@ pub(crate) fn alloc_text<'a>(
     Ok(Datum::Text(unsafe { core::str::from_utf8_unchecked(out) }))
 }
 
-/// The pieces `string_to_array` and `string_to_table` split a string into.
-/// PostgreSQL gives both the same rule, so it is written once: a NULL delimiter
-/// splits into individual characters, an empty delimiter does not split at all,
-/// an empty input yields nothing, and the caller decides separately what a
-/// piece equal to its `null_string` becomes. Returns how many pieces landed in
-/// `out`, which borrow from `s`.
-pub(crate) fn split_pieces<'a>(
-    s: &'a str,
-    delimiter: Option<&str>,
-    out: &mut [&'a str],
-) -> Result<usize, SqlError> {
-    for_each_split_piece(s, delimiter, |piece, index| {
-        let Some(slot) = out.get_mut(index) else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many pieces in a split string"
-            ));
-        };
-        *slot = piece;
-        Ok(())
-    })
-}
-
 /// Visits the complete split result without imposing a compiled row-count
 /// ceiling. Callers that materialize results reserve their exact arena slice
-/// after a count pass; array callers retain the array format's own bound.
+/// after a count pass; array callers retain only the durable format's bound.
 pub(crate) fn for_each_split_piece<'a>(
     s: &'a str,
     delimiter: Option<&str>,

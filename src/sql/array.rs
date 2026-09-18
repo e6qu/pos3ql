@@ -7,7 +7,10 @@ use crate::storage::rowenc;
 use super::eval::{SqlError, sqlstate};
 use super::types::{ArrElem, Datum};
 
-pub const MAX_ELEMENTS: usize = 1024;
+/// The durable array header stores its element count as an unsigned 16-bit
+/// value. Execution derives temporary slices from the actual count, so this
+/// representation boundary is the only element-count ceiling.
+pub const MAX_ELEMENTS: usize = u16::MAX as usize;
 pub const MAX_DIMENSIONS: usize = 6;
 
 const MAGIC: [u8; 4] = *b"AR01";
@@ -161,6 +164,21 @@ fn invalid_shape() -> SqlError {
     )
 }
 
+/// Reserves an exact temporary element slice from statement memory. Array
+/// producers use this choke point instead of embedding a narrower stack
+/// capacity than the durable format accepts.
+pub(crate) fn alloc_items<'a>(
+    arena: &'a Arena,
+    len: usize,
+) -> Result<&'a mut [Datum<'a>], SqlError> {
+    if len > MAX_ELEMENTS {
+        return Err(array_too_large());
+    }
+    arena
+        .alloc_slice_with(len, |_| Datum::Null)
+        .map_err(|_| arena_full())
+}
+
 /// Serializes a rank-one array with PostgreSQL's default lower bound.
 pub fn build<'a>(items: &[Datum], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
     build_shaped(items, Shape::one(items.len())?, arena)
@@ -260,8 +278,8 @@ pub fn stack<'a>(members: &[Datum<'a>], arena: &'a Arena) -> Result<Datum<'a>, S
                 "cannot accumulate arrays of different dimensionality"
             ));
         }
-        for index in 0..child.element_count() {
-            flattened[at] = get(member_raw, member_element, index).expect("array datum invariant");
+        for value in elements(member_raw, member_element) {
+            flattened[at] = value;
             at += 1;
         }
     }
@@ -344,43 +362,107 @@ pub fn get<'a>(raw: &'a [u8], element: ArrElem, index: usize) -> Option<Datum<'a
     None
 }
 
-pub(crate) fn get_record<'a>(
-    raw: &'a [u8],
-    index: usize,
-    arena: &'a Arena,
-) -> Result<Option<Datum<'a>>, SqlError> {
-    let shape = shape(raw).expect("array datum must carry a canonical valid shape");
-    if index >= shape.element_count() {
-        return Ok(None);
-    }
-    let mut at = payload_offset(shape);
-    for current in 0..shape.element_count() {
-        let length = u32::from_le_bytes(
-            raw.get(at..at + 4)
-                .ok_or_else(invalid_shape)?
-                .try_into()
-                .map_err(|_| invalid_shape())?,
-        ) as usize;
-        at += 4;
-        if current == index {
-            let payload = raw.get(at..at + length).ok_or_else(invalid_shape)?;
-            return crate::sql::exec::decode_projected_col_record(payload, 0, arena).map(Some);
-        }
-        at += length;
-    }
-    Ok(None)
+/// Walks a validated array's sequential payload once. Array values do not
+/// carry an offset table, so bulk operations must use this iterator rather
+/// than repeated indexed lookup, which would rescan the prefix for every
+/// element.
+pub struct Elements<'a> {
+    payloads: ElementPayloads<'a>,
+    element: ArrElem,
 }
+
+pub fn elements(raw: &[u8], element: ArrElem) -> Elements<'_> {
+    Elements {
+        payloads: element_payloads(raw),
+        element,
+    }
+}
+
+pub(crate) struct ElementPayloads<'a> {
+    raw: &'a [u8],
+    remaining: usize,
+    at: usize,
+}
+
+pub(crate) fn element_payloads(raw: &[u8]) -> ElementPayloads<'_> {
+    let shape = shape(raw).expect("array datum must carry a canonical valid shape");
+    ElementPayloads {
+        raw,
+        remaining: shape.element_count(),
+        at: payload_offset(shape),
+    }
+}
+
+impl<'a> Iterator for ElementPayloads<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let length =
+            u32::from_le_bytes(self.raw.get(self.at..self.at + 4)?.try_into().ok()?) as usize;
+        self.at += 4;
+        let payload = self.raw.get(self.at..self.at + length)?;
+        self.at += length;
+        self.remaining -= 1;
+        Some(payload)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for ElementPayloads<'_> {}
+
+impl<'a> Iterator for Elements<'a> {
+    type Item = Datum<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let payload = self.payloads.next()?;
+        if self.element == ArrElem::Record {
+            return Some(crate::sql::exec::decode_projected_pub(payload, 0));
+        }
+        let schema = [self.element.to_coltype()];
+        let mut out = [Datum::Null; 1];
+        rowenc::decode(payload, &schema, &mut out).ok()?;
+        Some(out[0])
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.payloads.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Elements<'_> {}
 
 pub fn parse_literal<'a>(
     text: &'a str,
     element: ArrElem,
     arena: &'a Arena,
 ) -> Result<&'a [u8], SqlError> {
-    let mut parser = LiteralParser::new(text.trim(), element, arena);
+    let text = text.trim();
+    // The syntax pass determines the exact datum slice before any values are
+    // converted. This keeps literal parsing within statement memory without a
+    // compiled temporary array or a worst-case reservation.
+    let mut counter = LiteralParser::new(text, element, arena, true);
+    let _ = counter.bounds()?;
+    let mut no_items = [];
+    let mut counted_dimensions = [0usize; MAX_DIMENSIONS];
+    counter.level(&mut no_items, &mut counted_dimensions, 0)?;
+    counter.space();
+    if counter.at != counter.text.len() {
+        return Err(counter.bad());
+    }
+    let items = arena
+        .alloc_slice_with(counter.count, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+
+    let mut parser = LiteralParser::new(text, element, arena, false);
     let (supplied_bounds, supplied_count) = parser.bounds()?;
-    let mut items = [Datum::Null; MAX_ELEMENTS];
     let mut dimensions = [0usize; MAX_DIMENSIONS];
-    let levels = parser.level(&mut items, &mut dimensions, 0)?;
+    let levels = parser.level(items, &mut dimensions, 0)?;
     parser.space();
     if parser.at != parser.text.len() {
         return Err(parser.bad());
@@ -407,7 +489,7 @@ pub fn parse_literal<'a>(
         lowers[index] = lower;
     }
     build_shaped(
-        &items[..parser.count],
+        items,
         Shape::new(&dimensions[..levels], &lowers[..levels])?,
         arena,
     )
@@ -419,16 +501,18 @@ struct LiteralParser<'a> {
     element: ArrElem,
     arena: &'a Arena,
     count: usize,
+    count_only: bool,
 }
 
 impl<'a> LiteralParser<'a> {
-    fn new(text: &'a str, element: ArrElem, arena: &'a Arena) -> Self {
+    fn new(text: &'a str, element: ArrElem, arena: &'a Arena, count_only: bool) -> Self {
         Self {
             text,
             at: 0,
             element,
             arena,
             count: 0,
+            count_only,
         }
     }
 
@@ -513,7 +597,7 @@ impl<'a> LiteralParser<'a> {
 
     fn level(
         &mut self,
-        items: &mut [Datum<'a>; MAX_ELEMENTS],
+        items: &mut [Datum<'a>],
         dimensions: &mut [usize; MAX_DIMENSIONS],
         depth: usize,
     ) -> Result<usize, SqlError> {
@@ -571,12 +655,46 @@ impl<'a> LiteralParser<'a> {
         Ok(levels)
     }
 
-    fn value(&mut self, items: &mut [Datum<'a>; MAX_ELEMENTS]) -> Result<(), SqlError> {
+    fn value(&mut self, items: &mut [Datum<'a>]) -> Result<(), SqlError> {
         if self.count == MAX_ELEMENTS {
             return Err(array_too_large());
         }
         self.space();
         let bytes = self.text.as_bytes();
+        if self.count_only {
+            if bytes.get(self.at) == Some(&b'\"') {
+                self.at += 1;
+                loop {
+                    let Some(&byte) = bytes.get(self.at) else {
+                        return Err(self.bad());
+                    };
+                    self.at += 1;
+                    match byte {
+                        b'\"' => break,
+                        b'\\' => {
+                            if bytes.get(self.at).is_none() {
+                                return Err(self.bad());
+                            }
+                            self.at += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                while let Some(&byte) = bytes.get(self.at) {
+                    if byte == self.element.delimiter() || byte == b'}' {
+                        break;
+                    }
+                    if byte == b'{' {
+                        return Err(self.bad());
+                    }
+                    self.at += 1;
+                }
+            }
+            self.count += 1;
+            return Ok(());
+        }
+        debug_assert!(self.count < items.len());
         let (value, quoted) = if bytes.get(self.at) == Some(&b'\"') {
             self.at += 1;
             // A quoted array member is UTF-8 with byte-level backslash
@@ -653,8 +771,8 @@ pub fn write(f: &mut core::fmt::Formatter<'_>, element: ArrElem, raw: &[u8]) -> 
         }
         f.write_str("=")?;
     }
-    let mut index = 0;
-    write_level(f, element, raw, shape, 0, &mut index)
+    let mut elements = elements(raw, element);
+    write_level(f, shape, 0, &mut elements)
 }
 
 /// Renders already-decoded elements under an existing shape. Catalog-aware
@@ -722,29 +840,24 @@ pub(crate) fn format_shaped<'a>(
 
 fn write_level(
     f: &mut core::fmt::Formatter<'_>,
-    element: ArrElem,
-    raw: &[u8],
     shape: Shape,
     depth: usize,
-    index: &mut usize,
+    elements: &mut Elements<'_>,
 ) -> core::fmt::Result {
     f.write_str("{")?;
     for member in 0..shape.dimension(depth).unwrap() {
         if member > 0 {
-            f.write_str(match element.delimiter() {
+            f.write_str(match elements.element.delimiter() {
                 b',' => ",",
                 b';' => ";",
                 _ => unreachable!("array delimiter is a closed ArrElem property"),
             })?;
         }
         if depth + 1 == shape.dimension_count() {
-            match get(raw, element, *index) {
-                Some(datum) => super::types::write_array_elem(f, &datum, element.delimiter())?,
-                None => f.write_str("NULL")?,
-            }
-            *index += 1;
+            let datum = elements.next().expect("array datum carries every member");
+            super::types::write_array_elem(f, &datum, elements.element.delimiter())?;
         } else {
-            write_level(f, element, raw, shape, depth + 1, index)?;
+            write_level(f, shape, depth + 1, elements)?;
         }
     }
     f.write_str("}")
@@ -762,5 +875,17 @@ mod tests {
         let raw = parse_literal("{\"bé\",\"\\\\x\"}", ArrElem::Text, &arena).unwrap();
         assert_eq!(get(raw, ArrElem::Text, 0), Some(Datum::Text("bé")));
         assert_eq!(get(raw, ArrElem::Text, 1), Some(Datum::Text("\\x")));
+    }
+
+    #[test]
+    fn element_limit_matches_the_durable_count_width() {
+        assert_eq!(
+            Shape::one(MAX_ELEMENTS).unwrap().element_count(),
+            u16::MAX as usize
+        );
+        assert_eq!(
+            Shape::one(MAX_ELEMENTS + 1).unwrap_err().sqlstate,
+            sqlstate::PROGRAM_LIMIT_EXCEEDED
+        );
     }
 }

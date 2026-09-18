@@ -175,6 +175,11 @@ Checkpoint deletion markers likewise use the existing startup-sized row
 overlay; crossing 1,024 deletes no longer forces a full-generation rewrite.
 Split table-function output and effective search paths have no narrower
 compiled row/entry count than their statement-memory and GUC byte boundaries.
+Array producers likewise reserve their actual shape in statement memory up to
+the durable 65,535-element boundary. Comparisons, searches, formatting,
+`unnest`, casts, JSON conversion, and index token extraction walk encoded
+array payloads sequentially, avoiding the quadratic prefix rescans that an
+indexed lookup would impose on wide variable-length arrays.
 Wide constraints, composites, partition definitions, and index tuples
 already share their documented SQL, WAL, checkpoint, and recovery bounds.
 Major SQL-object, metadata, database, and schema catalogs now have independent

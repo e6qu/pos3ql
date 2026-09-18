@@ -25036,25 +25036,23 @@ fn execute_trigger_block<'a>(
                                     Datum::Null
                                 })
                                 .map_err(|_| super::query::arena_full_pub())?;
-                            for (index, value) in values.iter_mut().enumerate() {
+                            let mut elements = crate::sql::array::elements(raw, element);
+                            for value in values.iter_mut() {
                                 if slice_rank == 0 {
                                     *value = detached_trigger_datum(
-                                        crate::sql::array::get(raw, element, index)
-                                            .expect("array datum invariant"),
+                                        elements.next().expect("array datum invariant"),
                                         context.arena,
                                     )?;
                                 } else {
                                     let items = context
                                         .arena
-                                        .alloc_slice_with(width, |offset| {
-                                            crate::sql::array::get(
-                                                raw,
-                                                element,
-                                                index * width + offset,
-                                            )
-                                            .expect("array datum invariant")
-                                        })
+                                        .alloc_slice_with(width, |_| Datum::Null)
                                         .map_err(|_| super::query::arena_full_pub())?;
+                                    for (item, source) in
+                                        items.iter_mut().zip(elements.by_ref().take(width))
+                                    {
+                                        *item = source;
+                                    }
                                     *value = Datum::Array {
                                         element,
                                         raw: crate::sql::array::build_shaped(
@@ -41149,19 +41147,14 @@ fn validate_stored_domain_value(
             )
         });
     };
-    let shape = crate::sql::array::shape(raw).ok_or_else(|| {
+    crate::sql::array::shape(raw).ok_or_else(|| {
         sql_err!(
             sqlstate::INTERNAL_ERROR,
             "stored domain array has invalid shape"
         )
     })?;
-    for index in 0..shape.element_count() {
-        validate(crate::sql::array::get(raw, element, index).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INTERNAL_ERROR,
-                "stored domain array has invalid element"
-            )
-        })?)?;
+    for value in crate::sql::array::elements(raw, element) {
+        validate(value)?;
     }
     Ok(())
 }
@@ -45862,11 +45855,13 @@ fn rewrite_enum_values(
                     Datum::Array { element, raw } => {
                         let shape = crate::sql::array::shape(raw).expect("array datum invariant");
                         let count = crate::sql::array::len(raw);
-                        let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+                        let items = crate::sql::array::alloc_items(arena, count)?;
                         let mut array_changed = false;
-                        for (index, item) in items.iter_mut().take(count).enumerate() {
-                            *item =
-                                crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
+                        for (item, value) in items
+                            .iter_mut()
+                            .zip(crate::sql::array::elements(raw, element))
+                        {
+                            *item = value;
                             if let Datum::Enum { slot, sort, label } = *item
                                 && slot == enum_slot
                             {
@@ -45895,11 +45890,7 @@ fn rewrite_enum_values(
                         if array_changed {
                             values[column_index] = Datum::Array {
                                 element,
-                                raw: crate::sql::array::build_shaped(
-                                    &items[..count],
-                                    shape,
-                                    arena,
-                                )?,
+                                raw: crate::sql::array::build_shaped(items, shape, arena)?,
                             };
                             changed = true;
                         }
@@ -53297,7 +53288,7 @@ fn decode_binary_array<'a>(
     )?;
     let count = shape.element_count();
     let element_type = element.to_coltype();
-    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let items = crate::sql::array::alloc_items(arena, count)?;
     let mut saw_null = false;
     for slot in items.iter_mut().take(count) {
         let len = reader.i32().map_err(|_| bad())?;
@@ -53372,7 +53363,7 @@ fn decode_binary_array<'a>(
     }
     Ok(Datum::Array {
         element,
-        raw: crate::sql::array::build_shaped(&items[..count], shape, arena)?,
+        raw: crate::sql::array::build_shaped(items, shape, arena)?,
     })
 }
 
@@ -54149,39 +54140,37 @@ pub(crate) fn binary_field_plan<'a>(
             ) =>
         {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-            let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
-            for (index, value) in values.iter_mut().take(shape.element_count()).enumerate() {
-                let decoded = if *element == crate::sql::types::ArrElem::Record {
-                    crate::sql::array::get_record(raw, index, arena)?
-                } else {
-                    crate::sql::array::get(raw, *element, index)
-                };
-                *value = match decoded {
-                    Some(Datum::CompositeText {
-                        slot,
-                        physical_fields,
-                        text,
-                    }) => decode_stored_composite_text(
-                        text,
-                        slot,
-                        physical_fields,
-                        storage,
-                        txid,
-                        arena,
-                    )?,
-                    Some(value) => value,
-                    None => Datum::Null,
-                };
+            let values = crate::sql::array::alloc_items(arena, shape.element_count())?;
+            if *element == crate::sql::types::ArrElem::Record {
+                for (value, payload) in values
+                    .iter_mut()
+                    .zip(crate::sql::array::element_payloads(raw))
+                {
+                    *value = crate::sql::exec::decode_projected_col_record(payload, 0, arena)?;
+                }
+            } else {
+                for (value, decoded) in values
+                    .iter_mut()
+                    .zip(crate::sql::array::elements(raw, *element))
+                {
+                    *value = match decoded {
+                        Datum::CompositeText {
+                            slot,
+                            physical_fields,
+                            text,
+                        } => decode_stored_composite_text(
+                            text,
+                            slot,
+                            physical_fields,
+                            storage,
+                            txid,
+                            arena,
+                        )?,
+                        value => value,
+                    };
+                }
             }
-            let stored = arena
-                .alloc_slice_copy(&values[..shape.element_count()])
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "COPY BINARY composite array exceeds the statement arena"
-                    )
-                })?;
-            Ok(BinaryFieldPlan::CompositeArray(*element, shape, stored))
+            Ok(BinaryFieldPlan::CompositeArray(*element, shape, values))
         }
         _ => Ok(BinaryFieldPlan::Direct),
     }
@@ -68116,14 +68105,16 @@ pub(crate) fn coerce_user_type_array<'a>(
     };
     let shape = crate::sql::array::shape(raw).expect("array datum carries a valid shape");
     let count = shape.element_count();
-    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
-    for (index, item) in items.iter_mut().take(count).enumerate() {
-        let value = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
+    let items = crate::sql::array::alloc_items(arena, count)?;
+    for (item, value) in items
+        .iter_mut()
+        .zip(crate::sql::array::elements(raw, source))
+    {
         *item = coerce_user_type_array_element(value, target, storage, txid, arena)?;
     }
     Ok(Datum::Array {
         element: target,
-        raw: crate::sql::array::build_shaped(&items[..count], shape, arena)?,
+        raw: crate::sql::array::build_shaped(items, shape, arena)?,
     })
 }
 
@@ -68465,9 +68456,11 @@ fn apply_array_element_typmod<'a>(
     }
     let shape = crate::sql::array::shape(raw).expect("array datum invariant");
     let count = shape.element_count();
-    let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
-    for (index, slot) in values.iter_mut().take(count).enumerate() {
-        let member = crate::sql::array::get(raw, element, index).expect("array datum invariant");
+    let values = crate::sql::array::alloc_items(arena, count)?;
+    for (slot, member) in values
+        .iter_mut()
+        .zip(crate::sql::array::elements(raw, element))
+    {
         *slot = if cast {
             apply_cast_typmod(member, element.to_coltype(), type_mod, arena)?
         } else {
@@ -68476,7 +68469,7 @@ fn apply_array_element_typmod<'a>(
     }
     Ok(Datum::Array {
         element,
-        raw: crate::sql::array::build_shaped(&values[..count], shape, arena)?,
+        raw: crate::sql::array::build_shaped(values, shape, arena)?,
     })
 }
 
@@ -69493,6 +69486,42 @@ mod tests {
             (Some(2), Some(5))
         );
         assert_eq!(datum.to_string(), "[2:3][4:5]={{1,2},{3,4}}");
+    }
+
+    #[test]
+    fn binary_array_crosses_the_former_inline_element_limit() {
+        const ELEMENTS: i32 = 1_100;
+        let mut bytes = Vec::with_capacity(20 + ELEMENTS as usize * 8);
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&23_u32.to_be_bytes());
+        bytes.extend_from_slice(&ELEMENTS.to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in 1..=ELEMENTS {
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "wide binary array", 1 << 19).unwrap();
+        let datum = decode_binary_field(
+            ColType::Array(crate::sql::types::ArrElem::Int4),
+            &bytes,
+            &arena,
+        )
+        .unwrap();
+        let Datum::Array { raw, element } = datum else {
+            panic!("array expected");
+        };
+        assert_eq!(crate::sql::array::len(raw), ELEMENTS as usize);
+        assert_eq!(
+            crate::sql::array::get(raw, element, 0),
+            Some(Datum::Int4(1))
+        );
+        assert_eq!(
+            crate::sql::array::get(raw, element, ELEMENTS as usize - 1),
+            Some(Datum::Int4(ELEMENTS))
+        );
     }
 
     #[test]

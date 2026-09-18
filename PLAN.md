@@ -208,6 +208,16 @@ storage. RAM and local disk are bounded, disposable caches.
   to a full rewrite at that width. Allocation-forbidden PostgreSQL 18 fixtures
   cross the path and set-result boundaries, while 1,100 deletions remain a
   delta and survive checkpoint publication and empty-cache object recovery.
+- SQL array values admit the durable format's complete 65,535-element count;
+  the former 1,024-element stack buffer is not a client-visible limit.
+  Literal and binary input, aggregates, concatenation and mutation, split
+  functions, variadic arguments, comparisons, `unnest`, JSON/text output,
+  casts, indexing, WAL, checkpoints, and object-cold recovery use exact
+  statement-arena slices. Sequential consumers decode the payload in one pass
+  rather than repeatedly scanning variable-width prefixes. Variadic
+  `format()` results grow in that arena rather than stopping at 4 KiB. PostgreSQL 18
+  differential and allocation-forbidden regressions cross the old boundary
+  and recover the stored values with empty local caches.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those
@@ -354,7 +364,8 @@ dependency images, row-version chains, spill-generation rosters,
 extended-statistics catalogs, BRIN range maintenance, maximum-capacity trigger
 qualification, effective search paths, split table-function results, and
 checkpoint deletion markers are complete and belong to the implemented
-baseline above.
+baseline above. SQL array value width and its execution scratch are also
+complete up to the durable 16-bit element-count boundary.
 
 ### Multi-core execution
 

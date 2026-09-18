@@ -171,6 +171,10 @@ retain complete exact ordering.
 The known structural limits remain global query serialization and the
 remaining per-object inline ceilings. Role, type, sequence, and ACL
 catalog pools are startup-sized within their documented identity widths.
+Checkpoint deletion markers likewise use the existing startup-sized row
+overlay; crossing 1,024 deletes no longer forces a full-generation rewrite.
+Split table-function output and effective search paths have no narrower
+compiled row/entry count than their statement-memory and GUC byte boundaries.
 Wide constraints, composites, partition definitions, and index tuples
 already share their documented SQL, WAL, checkpoint, and recovery bounds.
 Major SQL-object, metadata, database, and schema catalogs now have independent

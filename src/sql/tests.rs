@@ -70765,3 +70765,94 @@ fn cte_ctas_sequence_effects_survive_row_scratch_rewinds() {
     );
     assert_eq!(data_rows(&output), ["1|1", "2|2", "3|3"]);
 }
+
+#[test]
+fn remaining_inline_widths_are_allocation_free_and_survive_cold_recovery() {
+    let mut config = test_config("remaining-inline-widths");
+    config.max_schemas = 32;
+    config.table_rows = 2_048;
+    config.txn_rows = 2_048;
+    config.memtable_bytes = 16 << 20;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("remaining-inline-widths-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let (fixture, cleanup) =
+        include_str!("../../tests/external/differential/180_remaining_inline_widths.sql")
+            .split_once("-- cleanup")
+            .unwrap();
+    let (allocation_free, simulator_backed) = fixture
+        .split_once("-- simulator-backed external runs")
+        .unwrap();
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(&mut engine, allocation_free, true);
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1100|1|1",
+            "1100|1|1",
+            "19",
+            "a|{pg_catalog,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,public}"
+        ]
+    );
+    // Derived-table materialization writes an external run through the object
+    // simulator, whose fixture keys allocate. The engine path itself remains
+    // fixed-allocation and is covered above without derived-run I/O.
+    let output = session.success(&mut engine, simulator_backed, false);
+    assert_eq!(data_rows(&output), ["1100", "1100"]);
+
+    session.success(
+        &mut engine,
+        "CREATE TABLE checkpoint_delete_width(id integer PRIMARY KEY); \
+         INSERT INTO checkpoint_delete_width SELECT value FROM generate_series(1, 1200) AS value",
+        true,
+    );
+    assert!(engine.checkpoint().unwrap());
+    let slot = engine
+        .storage
+        .find_table("public", "checkpoint_delete_width")
+        .unwrap();
+    assert_eq!(engine.storage.table(slot).n_spill_ssts, 1);
+    // The simulator constructs heap-backed object keys on GET. Production
+    // clients use startup-reserved request buffers, so keep that fixture-only
+    // work outside the allocation guard while scanning the spilled rows.
+    session.success(
+        &mut engine,
+        "DELETE FROM checkpoint_delete_width WHERE id <= 1100",
+        false,
+    );
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        engine.storage.table(slot).n_spill_ssts,
+        2,
+        "more than 1,024 deletion markers must remain a delta checkpoint"
+    );
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT count(*), min(id), max(id) FROM checkpoint_delete_width; \
+         SELECT count(*), min(length(value)), max(length(value)) FROM inline_width_split",
+    );
+    assert_eq!(data_rows(&recovered), ["100|1101|1200", "1100|1|1"]);
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    cold_session.success(&mut cold, cleanup, false);
+    cold_session.success(&mut cold, "DROP TABLE checkpoint_delete_width", false);
+    drop(cold_session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

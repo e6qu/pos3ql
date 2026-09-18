@@ -198,6 +198,16 @@ storage. RAM and local disk are bounded, disposable caches.
   sequence and mutable-routine calls, 1,100 logical messages, and a 70,000-row
   cursor. Checkpoint and empty-cache object recovery preserve the durable
   effects; PostgreSQL 18 differential fixtures cover the former boundaries.
+- Effective search paths derive their entry capacity from the accepted GUC
+  byte boundary instead of silently stopping at sixteen schemas; resolution,
+  `current_schema`, and `current_schemas` share that capacity. Plain and
+  regular-expression split table functions count first and materialize their
+  exact result in statement memory rather than using a 1,024-row stack array.
+  Checkpoint deletions use the startup-sized row overlay as their sole pending
+  bound: tables no longer embed an unused 1,024-row tombstone roster or switch
+  to a full rewrite at that width. Allocation-forbidden PostgreSQL 18 fixtures
+  cross the path and set-result boundaries, while 1,100 deletions remain a
+  delta and survive checkpoint publication and empty-cache object recovery.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those
@@ -340,10 +350,11 @@ Audit their slot widths, journal encodings, checkpoint and manifest structures,
 catalog construction, and execution scratch. Exercise every remaining
 per-object structure through checkpoint retry and object-cold recovery while
 checking exact startup memory accounting and loud exhaustion. Stored-query
-dependency images, row-version
-chains, spill-generation rosters, extended-statistics catalogs, BRIN range
-maintenance, and maximum-capacity trigger qualification are complete and
-belong to the implemented baseline above.
+dependency images, row-version chains, spill-generation rosters,
+extended-statistics catalogs, BRIN range maintenance, maximum-capacity trigger
+qualification, effective search paths, split table-function results, and
+checkpoint deletion markers are complete and belong to the implemented
+baseline above.
 
 ### Multi-core execution
 

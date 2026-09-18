@@ -341,7 +341,7 @@ fn current_database_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlErr
 /// explicit `pg_catalog` sits among them.
 #[derive(Clone, Copy)]
 pub struct SessionSchemas {
-    pub names: [crate::util::StackStr<64>; 17],
+    pub names: [crate::util::StackStr<64>; crate::storage::MAX_PATH_ENTRIES],
     pub n: usize,
     pub catalog_pos: usize,
 }
@@ -350,7 +350,7 @@ std::thread_local! {
     static SESSION_SCHEMAS: core::cell::RefCell<SessionSchemas> =
         const {
             core::cell::RefCell::new(SessionSchemas {
-                names: [crate::util::StackStr::new(); 17],
+                names: [crate::util::StackStr::new(); crate::storage::MAX_PATH_ENTRIES],
                 n: 0,
                 catalog_pos: 0,
             })
@@ -1584,7 +1584,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Bool(true)
                 );
                 let schemas = session_schemas();
-                let mut elems = [Datum::Null; 18];
+                let mut elems = [Datum::Null; crate::storage::MAX_PATH_ENTRIES];
                 let mut n = 0;
                 for (i, name) in schemas.names[..schemas.n].iter().enumerate() {
                     if include_implicit && i == schemas.catalog_pos {

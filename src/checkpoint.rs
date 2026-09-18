@@ -320,8 +320,7 @@ impl TemporarySpiller {
         };
         let generation = storage.table(slot).generation;
         let delta = storage.table(slot).n_spill_ssts > 0
-            && storage.table(slot).n_spill_ssts < storage.table(slot).spill_ssts.len()
-            && !storage.table(slot).tombstones_overflow;
+            && storage.table(slot).n_spill_ssts < storage.table(slot).spill_ssts.len();
 
         sort_scratch.clear();
         storage.for_each_row_state(slot, &mut |rowid, state| {
@@ -9984,13 +9983,14 @@ impl Checkpointer {
         // A clean table carries its whole SST list forward untouched.
         let clean = !storage.table(slot).dirty && self.prev_scratch[slot].n > 0;
         // A dirty table with spilled SSTs and room flushes a *delta*:
-        // its heap-resident committed rows plus the tombstones recorded
-        // since the last checkpoint. Otherwise it rewrites fully.
+        // its heap-resident committed rows plus deletion markers retained in
+        // the row overlay since the last checkpoint. Otherwise it rewrites
+        // fully. The overlay is already startup-sized by `table_rows`, so
+        // there is no second compiled tombstone limit.
         let delta = !clean
             && storage.table(slot).dirty
             && self.prev_scratch[slot].n > 0
-            && self.prev_scratch[slot].n < self.prev_scratch[slot].capacity()
-            && !storage.table(slot).tombstones_overflow;
+            && self.prev_scratch[slot].n < self.prev_scratch[slot].capacity();
         if storage.has_active_snapshots()
             && !clean
             && storage.table(slot).n_spill_ssts > 0

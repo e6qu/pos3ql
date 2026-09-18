@@ -168,6 +168,12 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   constant, and pgoutput logical-message indexes use the fixed work arena.
   Differential and allocation-forbidden coverage crosses 1,024 calls and
   messages and 65,536 cursor rows.
+- Every accepted 128-byte `search_path` is represented completely through name
+  resolution and `current_schema`/`current_schemas`; there is no narrower
+  sixteen-entry resolver bound. `string_to_table` and
+  `regexp_split_to_table` results use exact statement-arena slices rather than
+  1,024-entry stack arrays. Checkpoint deletion markers use the startup-sized
+  row overlay, so deletion count does not select a hidden full-rewrite path.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

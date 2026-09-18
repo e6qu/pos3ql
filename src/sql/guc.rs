@@ -15,6 +15,11 @@ use super::ast::{TransactionCharacteristics, TransactionIsolation};
 use super::datetime::{DateFormat, DateStyle, FieldOrder, IntervalStyle};
 use super::eval::SqlError;
 
+/// Maximum canonical byte length of a session search path. The resolver's
+/// entry bound is derived from this value, so a byte-valid path cannot overrun
+/// a narrower effective-path array.
+pub const SEARCH_PATH_BYTES: usize = 128;
+
 #[derive(Clone, Copy)]
 struct PrngState {
     s0: u64,
@@ -644,7 +649,7 @@ struct GucValues {
 
     client_encoding: StackStr<32>,
     application_name: StackStr<64>,
-    search_path: StackStr<128>,
+    search_path: StackStr<SEARCH_PATH_BYTES>,
     default_tablespace: StackStr<64>,
     default_text_search_config: StackStr<128>,
     client_min_messages: MessageLevel,
@@ -1184,7 +1189,7 @@ impl GucState {
         g
     }
 
-    pub fn search_path(&self) -> StackStr<128> {
+    pub fn search_path(&self) -> StackStr<SEARCH_PATH_BYTES> {
         self.store.borrow().current.search_path
     }
 
@@ -2696,7 +2701,10 @@ fn is_utf8(v: &str) -> bool {
 /// an element quoted on output when it needs quoting (`"$user"`, mixed case,
 /// spaces). Elements split on commas *outside* quotes: a single-quoted
 /// string is one element however many commas it contains.
-fn canonicalize_search_path(v: &str, out: &mut StackStr<128>) -> Result<(), SqlError> {
+fn canonicalize_search_path(
+    v: &str,
+    out: &mut StackStr<SEARCH_PATH_BYTES>,
+) -> Result<(), SqlError> {
     use core::fmt::Write as _;
     let mut first = true;
     let mut rest = v.trim();
@@ -2774,7 +2782,8 @@ fn canonicalize_search_path(v: &str, out: &mut StackStr<128>) -> Result<(), SqlE
         if out.is_truncated() {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
-                "search_path is too long (limit 128 bytes)"
+                "search_path is too long (limit {} bytes)",
+                SEARCH_PATH_BYTES
             ));
         }
     }

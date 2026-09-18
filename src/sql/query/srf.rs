@@ -13,7 +13,6 @@ use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_
 use crate::sql::exec::MAX_PROJ;
 
 /// Pieces one `string_to_table` call may split into.
-const MAX_PIECES: usize = 1024;
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_COLUMNS, RoutineDef, SqlName, Storage, TableDef};
@@ -1683,7 +1682,7 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
                 "regexp_split_to_table() does not support the \"global\" option"
             ));
         }
-        Ok(crate::sql::eval::regex_split_pub_with_options(src, pat, parsed.options, arena)?.len())
+        crate::sql::eval::regex_split_count_pub(src, pat, parsed.options)
     } else if name.eq_ignore_ascii_case("string_to_table") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
@@ -1701,8 +1700,7 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             (Datum::Null, _) => return Ok(0),
             _ => return Err(srf_signature_error(name)),
         };
-        let mut pieces: [&str; MAX_PIECES] = [""; MAX_PIECES];
-        Ok(crate::sql::eval::split_pieces(src, delimiter, &mut pieces)?)
+        crate::sql::eval::count_split_pieces(src, delimiter)
     } else if name.eq_ignore_ascii_case("generate_subscripts") {
         if !(2..=3).contains(&args.len()) {
             return Err(sql_err!(
@@ -4267,20 +4265,20 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         } else {
             None
         };
-        let mut pieces: [&str; MAX_PIECES] = [""; MAX_PIECES];
-        let n = crate::sql::eval::split_pieces(source, delimiter, &mut pieces)?;
+        let n = crate::sql::eval::count_split_pieces(source, delimiter)?;
         const EMPTY: &[u8] = &[];
         let rows = arena
             .alloc_slice_with(n, |_| EMPTY)
             .map_err(|_| arena_full())?;
-        for (slot, piece) in rows.iter_mut().zip(pieces[..n].iter()) {
-            let value = if null_string == Some(*piece) {
+        crate::sql::eval::for_each_split_piece(source, delimiter, |piece, index| {
+            let value = if null_string == Some(piece) {
                 Datum::Null
             } else {
                 Datum::Text(piece)
             };
-            *slot = crate::sql::exec::encode_projected_pub(&[value], arena)?;
-        }
+            rows[index] = crate::sql::exec::encode_projected_pub(&[value], arena)?;
+            Ok(())
+        })?;
         return Ok(&*rows);
     }
     // regexp_split_to_table(string, pattern [, flags]): one text row per piece.
@@ -4314,15 +4312,15 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 "regexp_split_to_table() does not support the \"global\" option"
             ));
         }
-        let pieces =
-            crate::sql::eval::regex_split_pub_with_options(src, pat, parsed.options, arena)?;
+        let n = crate::sql::eval::regex_split_count_pub(src, pat, parsed.options)?;
         const EMPTY: &[u8] = &[];
         let rows = arena
-            .alloc_slice_with(pieces.len(), |_| EMPTY)
+            .alloc_slice_with(n, |_| EMPTY)
             .map_err(|_| arena_full())?;
-        for (slot, piece) in rows.iter_mut().zip(pieces.iter()) {
-            *slot = crate::sql::exec::encode_projected_pub(&[*piece], arena)?;
-        }
+        crate::sql::eval::for_each_regex_split(src, pat, parsed.options, |piece, index| {
+            rows[index] = crate::sql::exec::encode_projected_pub(&[Datum::Text(piece)], arena)?;
+            Ok(())
+        })?;
         return Ok(&*rows);
     }
     // generate_subscripts(array, dim [, reverse]): declared indices along one

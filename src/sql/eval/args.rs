@@ -704,15 +704,29 @@ pub(crate) fn split_pieces<'a>(
     delimiter: Option<&str>,
     out: &mut [&'a str],
 ) -> Result<usize, SqlError> {
-    let mut n = 0usize;
-    let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
-        if *n >= out.len() {
+    for_each_split_piece(s, delimiter, |piece, index| {
+        let Some(slot) = out.get_mut(index) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many pieces in a split string"
             ));
-        }
-        out[*n] = piece;
+        };
+        *slot = piece;
+        Ok(())
+    })
+}
+
+/// Visits the complete split result without imposing a compiled row-count
+/// ceiling. Callers that materialize results reserve their exact arena slice
+/// after a count pass; array callers retain the array format's own bound.
+pub(crate) fn for_each_split_piece<'a>(
+    s: &'a str,
+    delimiter: Option<&str>,
+    mut visit: impl FnMut(&'a str, usize) -> Result<(), SqlError>,
+) -> Result<usize, SqlError> {
+    let mut n = 0usize;
+    let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
+        visit(piece, *n)?;
         *n += 1;
         Ok(())
     };
@@ -731,4 +745,24 @@ pub(crate) fn split_pieces<'a>(
         }
     }
     Ok(n)
+}
+
+pub(crate) fn count_split_pieces(s: &str, delimiter: Option<&str>) -> Result<usize, SqlError> {
+    for_each_split_piece(s, delimiter, |_, _| Ok(()))
+}
+
+pub(crate) fn split_piece_at<'a>(
+    s: &'a str,
+    delimiter: Option<&str>,
+    wanted: usize,
+) -> Option<&'a str> {
+    match delimiter {
+        Some("") => (wanted == 0).then_some(s),
+        Some(delimiter) if !s.is_empty() => s.split(delimiter).nth(wanted),
+        Some(_) => None,
+        None => s
+            .char_indices()
+            .nth(wanted)
+            .map(|(index, character)| &s[index..index + character.len_utf8()]),
+    }
 }

@@ -2562,14 +2562,6 @@ pub struct Table {
     /// slot its bytes live in.
     pub(crate) spill_ssts: Box<[Option<crate::store::SstHandle>]>,
     pub(crate) n_spill_ssts: usize,
-    /// Rowids removed since the last checkpoint while this table had spilled
-    /// SSTs — each becomes a tombstone entry in the next delta, so a cold
-    /// start does not resurrect an older SST's version. Overflow forces the
-    /// next checkpoint to a full rewrite instead of a delta (never dropping a
-    /// tombstone).
-    pub(crate) tombstones: [u64; MAX_TOMBSTONES],
-    pub(crate) n_tombstones: usize,
-    pub(crate) tombstones_overflow: bool,
     /// Value caches accelerating this table's uniqueness and equality probes,
     /// one per distinct constrained or named-index tuple, rebuilt whenever the
     /// definition/index set changes and maintained per committed row otherwise.
@@ -2677,10 +2669,6 @@ impl TableStatistics {
         columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
     };
 }
-
-/// Deletes remembered between checkpoints; past this the next checkpoint
-/// rewrites the table fully rather than lose one.
-pub(crate) const MAX_TOMBSTONES: usize = 1024;
 
 /// The most value indexes one table can carry: one per distinct indexed
 /// column tuple, whether introduced by a constraint or a named index.
@@ -11021,8 +11009,10 @@ pub enum PathEntry {
     Catalog,
 }
 
-/// How many schemas a search_path may name.
-pub(crate) const MAX_PATH_ENTRIES: usize = 16;
+/// A canonical search path cannot contain more non-empty names than this:
+/// each name needs at least one byte and adjacent names need a separator. One
+/// additional entry admits the implicit `pg_catalog` prefix.
+pub(crate) const MAX_PATH_ENTRIES: usize = crate::sql::guc::SEARCH_PATH_BYTES.div_ceil(2) + 1;
 
 /// The effective search path of the running statement: the visible schemas
 /// the session's `search_path` names, in order, with `pg_catalog` interleaved
@@ -15042,9 +15032,6 @@ impl Storage {
                     spill_ssts: vec![None; config.max_spill_generations_per_table]
                         .into_boxed_slice(),
                     n_spill_ssts: 0,
-                    tombstones: [0; MAX_TOMBSTONES],
-                    n_tombstones: 0,
-                    tombstones_overflow: false,
                     enforcers: [None; MAX_VALUE_ENFORCERS],
                     n_enforcers: 0,
                 })
@@ -23578,6 +23565,10 @@ impl Storage {
     /// skipped (PostgreSQL validates lazily, not at SET), and `pg_catalog` is
     /// implicit first unless the path places it explicitly.
     pub fn compute_path(&self, raw: &str, user: &str, txid: u32) -> PathContext {
+        assert!(
+            raw.len() <= crate::sql::guc::SEARCH_PATH_BYTES,
+            "search path passed to resolution has already crossed its GUC boundary"
+        );
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
         let mut n = 0;
         let mut explicit_catalog = false;
@@ -23600,7 +23591,7 @@ impl Storage {
             }
             let element = rest[..split].trim();
             rest = rest.get(split + 1..).unwrap_or("").trim_start();
-            if element.is_empty() || n == MAX_PATH_ENTRIES {
+            if element.is_empty() {
                 continue;
             }
             // Unquote a `"quoted name"` element ("" is an embedded quote).
@@ -23626,6 +23617,7 @@ impl Storage {
             let name = if name == "$user" { user } else { name };
             if name == "pg_catalog" {
                 if !explicit_catalog {
+                    assert!(n < MAX_PATH_ENTRIES, "bounded search path fits resolver");
                     entries[n] = PathEntry::Catalog;
                     n += 1;
                     explicit_catalog = true;
@@ -23635,16 +23627,17 @@ impl Storage {
             if let Some(slot) = self.find_schema_visible(name, txid) {
                 let entry = PathEntry::Schema(slot as u16);
                 if !entries[..n].contains(&entry) {
+                    assert!(n < MAX_PATH_ENTRIES, "bounded search path fits resolver");
                     entries[n] = entry;
                     n += 1;
                 }
             }
         }
         if !explicit_catalog {
+            assert!(n < MAX_PATH_ENTRIES, "bounded search path fits resolver");
             // Implicit pg_catalog precedes everything, as PostgreSQL has it.
             let mut shifted = [PathEntry::Catalog; MAX_PATH_ENTRIES];
-            shifted[1..=n.min(MAX_PATH_ENTRIES - 1)]
-                .copy_from_slice(&entries[..n.min(MAX_PATH_ENTRIES - 1)]);
+            shifted[1..=n].copy_from_slice(&entries[..n]);
             return PathContext {
                 entries: shifted,
                 n: n + 1,
@@ -25665,21 +25658,15 @@ impl Storage {
             "spill iterator is shorter than declared length"
         );
         table.n_spill_ssts = len;
-        table.n_tombstones = 0;
-        table.tombstones_overflow = false;
     }
 
-    /// Clears a table's remembered tombstones — called only once the manifest
-    /// referencing the SST that carries them has *published*. A failed
-    /// publish keeps them, so the retry flushes them again rather than losing
-    /// a delete.
+    /// Clears a table's shadowing deletion markers only after the manifest
+    /// referencing their SST tombstones has published. A failed publication
+    /// keeps the markers, so its retry cannot lose a delete.
     pub(crate) fn clear_tombstones(&mut self, slot: usize) {
         let table = &mut self.tables[slot];
-        table.n_tombstones = 0;
-        table.tombstones_overflow = false;
-        // The install that cleared the buffer has made the SSTs themselves
-        // carry (or moot) every recorded deletion, so the shadowing markers
-        // are done shadowing.
+        // The installed SSTs now carry (or moot) every deletion, so the row
+        // overlay markers are done shadowing older generations.
         loop {
             let mut batch = [0u64; 512];
             let mut n = 0usize;
@@ -25700,26 +25687,6 @@ impl Storage {
                 table.rows.remove(&rowid);
             }
         }
-    }
-
-    /// What the next checkpoint should do for this table: a delta flush (the
-    /// spill list has room and every remembered tombstone fits), or a full
-    /// rewrite.
-    /// Records a committed-row removal for the next delta checkpoint, so a
-    /// cold start cannot resurrect an older SST's version of the row. Only
-    /// meaningful while the table has spilled SSTs.
-    fn record_tombstone(table: &mut Table, rowid: u64) {
-        if table.n_spill_ssts == 0 || table.tombstones_overflow {
-            return;
-        }
-        if table.n_tombstones == MAX_TOMBSTONES {
-            // Never drop one: the next checkpoint falls back to a full
-            // rewrite, which needs no tombstones at all.
-            table.tombstones_overflow = true;
-            return;
-        }
-        table.tombstones[table.n_tombstones] = rowid;
-        table.n_tombstones += 1;
     }
 
     pub fn table_count(&self) -> usize {
@@ -26540,8 +26507,8 @@ impl Storage {
 
     /// Promotes a row's pending change to committed. The WAL record must
     /// already be durable.
-    /// Removes a committed row outright (journal replay of a DELETE),
-    /// recording the tombstone a later delta checkpoint needs.
+    /// Removes a committed row outright (journal replay of a DELETE), retaining
+    /// the shadowing marker a later delta checkpoint emits as a tombstone.
     pub fn remove_committed(&mut self, table_index: usize, rowid: u64, commit_lsn: u64) {
         if self.tables[table_index].n_spill_ssts == 0 {
             if self.remove_row_state(table_index, rowid).is_some() {
@@ -26563,7 +26530,6 @@ impl Storage {
                 pending: PendingVersions::empty(),
             },
         );
-        Self::record_tombstone(table, rowid);
         table.mark_dirty();
     }
 
@@ -26638,7 +26604,6 @@ impl Storage {
             if table.n_spill_ssts == 0 && state.history.is_empty() {
                 table.rows.remove(&rowid);
             }
-            Self::record_tombstone(table, rowid);
         }
         table.mark_dirty();
     }
@@ -26688,11 +26653,8 @@ impl Storage {
             .get(&rowid)
             .copied()
             .expect("row present after rewrite");
-        if state.committed.is_none() {
-            if table.n_spill_ssts == 0 {
-                table.rows.remove(&rowid);
-            }
-            Self::record_tombstone(table, rowid);
+        if state.committed.is_none() && table.n_spill_ssts == 0 {
+            table.rows.remove(&rowid);
         }
         table.mark_dirty();
     }
@@ -28973,8 +28935,6 @@ impl Storage {
         table.serial_dirty = false;
         table.spill_ssts.fill(None);
         table.n_spill_ssts = 0;
-        table.n_tombstones = 0;
-        table.tombstones_overflow = false;
         let schema = table.def.schema;
         let name = table.def.name;
         self.rename_stored_query_dependency(DependencyClass::Table, slot, None, schema, name);

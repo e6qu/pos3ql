@@ -70165,3 +70165,327 @@ fn grouping_and_using_alias_semantics_survive_stored_queries_and_cold_recovery()
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn arena_sized_programs_execute_without_compiled_width_limits_and_survive_cold_recovery() {
+    use core::fmt::Write as _;
+
+    let (mut fixed_engine, fixed_budget) = test_engine();
+    let mut simple_batch = String::new();
+    for _ in 0..70 {
+        simple_batch.push_str("SELECT 1;");
+    }
+    let output = run_with_fixed_memory(&mut fixed_engine, &fixed_budget, &simple_batch, 8 << 20);
+    assert_eq!(
+        data_rows(&output).len(),
+        70,
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with_fixed_memory(
+        &mut fixed_engine,
+        &fixed_budget,
+        "CREATE TABLE arena_atomic(value integer)",
+        8 << 20,
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let mut atomic_batch = String::new();
+    for _ in 0..70 {
+        atomic_batch.push_str("INSERT INTO arena_atomic VALUES (1);");
+    }
+    let exhausted = run_with_fixed_memory(&mut fixed_engine, &fixed_budget, &atomic_batch, 1 << 12);
+    assert!(
+        String::from_utf8_lossy(&exhausted).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&exhausted)
+    );
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut fixed_engine,
+            &fixed_budget,
+            "SELECT count(*) FROM arena_atomic",
+            8 << 20,
+        )),
+        ["0"]
+    );
+    let mut deep_loop = String::from("DO $$BEGIN <<outer>> LOOP ");
+    for _ in 1..257 {
+        deep_loop.push_str("LOOP ");
+    }
+    deep_loop.push_str("EXIT outer;");
+    for _ in 0..257 {
+        deep_loop.push_str("END LOOP;");
+    }
+    deep_loop.push_str("END$$");
+    let output = run_with_fixed_memory(&mut fixed_engine, &fixed_budget, &deep_loop, 16 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(fixed_engine);
+
+    let mut config = test_config("arena-sized-programs-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.max_routines = 16;
+    config.object_store_bucket = format!("arena-programs-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    let mut sql_function =
+        String::from("CREATE FUNCTION wide_sql_program() RETURNS integer LANGUAGE SQL AS $$");
+    for _ in 0..70 {
+        sql_function.push_str("SELECT 1;");
+    }
+    sql_function.push_str("SELECT 42$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &sql_function, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut local_function = String::from(
+        "CREATE FUNCTION wide_local_program() RETURNS integer LANGUAGE plpgsql AS $$DECLARE ",
+    );
+    for index in 0..70 {
+        write!(local_function, "v{index} integer := {index};").unwrap();
+    }
+    local_function.push_str("BEGIN RETURN v69; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &local_function, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut step_function = String::from(
+        "CREATE FUNCTION wide_step_program() RETURNS integer LANGUAGE plpgsql AS $$DECLARE v integer := 0; BEGIN ",
+    );
+    for _ in 0..70 {
+        step_function.push_str("v := v + 1;");
+    }
+    step_function.push_str("RETURN v; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &step_function, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut branch_function = String::from(
+        "CREATE FUNCTION wide_branch_program(n integer) RETURNS integer LANGUAGE plpgsql AS $$BEGIN IF n = 0 THEN n := 100;",
+    );
+    for index in 1..70 {
+        write!(branch_function, "ELSIF n = {index} THEN n := 100;").unwrap();
+    }
+    branch_function.push_str("END IF; RETURN n; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &branch_function, 12 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut handler_function = String::from(
+        "CREATE FUNCTION wide_handler_program() RETURNS integer LANGUAGE plpgsql AS $$BEGIN BEGIN RAISE SQLSTATE 'P0002'; EXCEPTION ",
+    );
+    for _ in 0..65 {
+        handler_function.push_str("WHEN others THEN NULL;");
+    }
+    handler_function.push_str("END; RETURN 7; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &handler_function, 12 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE w(value integer); CREATE TABLE wide_trigger_rows(v integer)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut sql_procedure =
+        String::from("CREATE PROCEDURE wide_sql_procedure() LANGUAGE SQL AS $$");
+    for _ in 0..70 {
+        sql_procedure.push_str("INSERT INTO w VALUES (1);");
+    }
+    sql_procedure.push_str("$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &sql_procedure, 12 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut plpgsql_procedure =
+        String::from("CREATE PROCEDURE wide_local_procedure() LANGUAGE plpgsql AS $$DECLARE ");
+    for index in 0..70 {
+        write!(plpgsql_procedure, "v{index} integer := {index};").unwrap();
+    }
+    plpgsql_procedure.push_str("BEGIN INSERT INTO w VALUES (v69); END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &plpgsql_procedure, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut trigger_function = String::from(
+        "CREATE FUNCTION wide_trigger_program() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN ",
+    );
+    for _ in 0..70 {
+        trigger_function.push_str("NEW.v := NEW.v + 1;");
+    }
+    trigger_function.push_str("RETURN NEW; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &trigger_function, 12 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRIGGER wide_trigger BEFORE INSERT ON wide_trigger_rows FOR EACH ROW EXECUTE FUNCTION wide_trigger_program()",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut anonymous = String::from("DO $$BEGIN ");
+    for _ in 0..70 {
+        anonymous.push_str("NULL;");
+    }
+    anonymous.push_str("INSERT INTO w VALUES (2); END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &anonymous, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut output_function = String::from(
+        "CREATE FUNCTION wide_output_program(OUT result integer) LANGUAGE plpgsql AS $$DECLARE ",
+    );
+    for index in 0..70 {
+        write!(output_function, "v{index} integer := {index};").unwrap();
+    }
+    output_function.push_str("BEGIN result := 88; RETURN; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &output_function, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut set_function = String::from(
+        "CREATE FUNCTION wide_set_program() RETURNS SETOF integer LANGUAGE plpgsql AS $$BEGIN ",
+    );
+    for _ in 0..70 {
+        set_function.push_str("NULL;");
+    }
+    set_function.push_str("RETURN NEXT 9; RETURN; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &set_function, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE wide_event_log(value integer)",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let mut event_function = String::from(
+        "CREATE FUNCTION wide_event_program() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN ",
+    );
+    for _ in 0..70 {
+        event_function.push_str("NULL;");
+    }
+    event_function.push_str("INSERT INTO wide_event_log VALUES (1); RETURN; END$$");
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &event_function, 8 << 20);
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EVENT TRIGGER wide_event ON ddl_command_end EXECUTE FUNCTION wide_event_program(); CREATE TABLE wide_event_target(value integer)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "SELECT wide_sql_program(), wide_local_program(), wide_step_program(), wide_branch_program(69), wide_handler_program(), wide_output_program(); SELECT * FROM wide_set_program(); CALL wide_sql_procedure(); CALL wide_local_procedure(); INSERT INTO wide_trigger_rows VALUES (1); SELECT count(*), sum(value) FROM w; SELECT v FROM wide_trigger_rows; SELECT count(*) FROM wide_event_log",
+        12 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["42|69|70|100|7|88", "9", "72|141", "71", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let output = run_with_arena_bytes(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT wide_sql_program(), wide_local_program(), wide_step_program(), wide_branch_program(69), wide_handler_program(), wide_output_program(); SELECT * FROM wide_set_program(); CALL wide_sql_procedure(); CALL wide_local_procedure(); INSERT INTO wide_trigger_rows VALUES (2); CREATE TABLE wide_event_target_cold(value integer); SELECT count(*), sum(value) FROM w; SELECT v FROM wide_trigger_rows ORDER BY v; SELECT count(*) FROM wide_event_log",
+        12 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["42|69|70|100|7|88", "9", "143|280", "71", "72", "2"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn postgresql_program_width_fixture_is_one_complete_simple_query_batch() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        include_str!("../../tests/external/differential/177_program_width.sql"),
+        16 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["42|69|70|100", "72|141", "66"]);
+}

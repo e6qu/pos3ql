@@ -29,6 +29,10 @@ The extended-statistics and BRIN-maintenance capacity audit found no external
 blocker: the former table-derived ceiling and per-index inline array are
 replaced by configured startup pools and qualified with maximum trigger
 catalogs through checkpoint retry and object-cold recovery.
+The procedural program-width audit found no external blocker: simple-query and
+stored SQL programs, PL/pgSQL locals, branches, handlers, conditions, and loop
+control now use statement-arena storage, with differential and object-cold
+qualification beyond the former compiled limits.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

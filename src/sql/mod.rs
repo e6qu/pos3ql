@@ -8644,24 +8644,24 @@ impl Engine {
             datetime::transaction_micros(),
             backend_xid,
         );
-        let mut statements = [None; parser::MAX_LIST];
+        let statements = match arena.alloc_slice_with(parser::statement_capacity(text), |_| None) {
+            Ok(statements) => statements,
+            Err(_) => {
+                let error = query::arena_full_pub();
+                if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    self.rollback_txn(txn, guc);
+                }
+                responder.error(error.sqlstate, error.message.as_str())?;
+                return Ok(ExecutionStatus::Complete);
+            }
+        };
         let mut statement_count = 0usize;
         loop {
             match parser.next_stmt() {
                 Ok(Some(statement)) => {
-                    if statement_count == statements.len() {
-                        let error = sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "query string has too many statements"
-                        );
-                        if txn.is_explicit() {
-                            txn.failed = true;
-                        } else {
-                            self.rollback_txn(txn, guc);
-                        }
-                        responder.error(error.sqlstate, error.message.as_str())?;
-                        return Ok(ExecutionStatus::Complete);
-                    }
+                    debug_assert!(statement_count < statements.len());
                     statements[statement_count] = Some(statement);
                     statement_count += 1;
                 }
@@ -13020,7 +13020,11 @@ impl Engine {
             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
         };
         let output_mark = responder.buffer.mark();
-        let mut statements = [None; parser::MAX_LIST];
+        let statements =
+            match arena.alloc_slice_with(parser::statement_capacity(body.as_str()), |_| None) {
+                Ok(statements) => statements,
+                Err(_) => return Ok(Err(eval::arena_full())),
+            };
         let mut statement_count = 0usize;
         loop {
             let statement = match parser.next_stmt() {
@@ -13031,12 +13035,7 @@ impl Engine {
                     return Ok(Err(parse_error_to_sql(&error)));
                 }
             };
-            if statement_count == statements.len() {
-                return Ok(Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "procedure body has too many statements"
-                )));
-            }
+            debug_assert!(statement_count < statements.len());
             statements[statement_count] = Some(statement);
             statement_count += 1;
         }

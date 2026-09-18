@@ -245,6 +245,14 @@ input returns SQLSTATE `54000` without dropping parse warnings or partially
 executing the statement. The maximum accepted shapes are qualified before and
 after empty-cache object recovery.
 
+That 64-item limit governs the breadth of one SQL construct, not the number of
+statements in a program. Simple-query batches and SQL and PL/pgSQL routine
+bodies retain every statement that fits the fixed statement arena. PL/pgSQL
+locals, branches, exception handlers and conditions, and loop-control depth
+use the same arena-backed program representation. Exhaustion returns SQLSTATE
+`54000` before a simple-query batch executes; stored programs are qualified
+through every procedural host and empty-cache object recovery.
+
 Implicit index OIDs reserve the complete enforcer stride. Constraint kinds use
 disjoint catalog-local OID bands for every accepted table slot and position.
 Partition-trigger clone OIDs include the

@@ -146,6 +146,13 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   the same maximum shapes; the plan tree uses the fixed statement arena.
   Item 65 returns SQLSTATE `54000`, and maximum shapes are exercised before
   and after empty-cache object recovery.
+- Program length does not share that 64-item arity limit. Simple-protocol
+  batches, SQL-language bodies, and PL/pgSQL bodies are sized from their source
+  in the fixed statement arena. PL/pgSQL locals, branches, exception handlers
+  and conditions, and nested loop-control state are arena-backed. Arena
+  exhaustion is reported before a simple batch executes, while accepted stored
+  functions, procedures, triggers, event triggers, and anonymous blocks retain
+  their complete programs across WAL, checkpoints, and object-cold recovery.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

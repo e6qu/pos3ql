@@ -170,6 +170,15 @@ storage. RAM and local disk are bounded, disposable caches.
   same accepted joins and set trees from statement-arena storage rather than a
   narrower inline array. Exact-boundary execution and complete plans are
   qualified both live and after empty-cache object recovery.
+- Program length is independent of that statement-arity boundary. Simple-query
+  batches, SQL function and procedure bodies, and PL/pgSQL functions,
+  procedures, triggers, event triggers, and anonymous blocks retain every
+  statement that fits the fixed statement arena. PL/pgSQL local namespaces,
+  conditional branches, exception conditions and handlers, and loop-control
+  depth use arena-backed full-width representations rather than compiled 64-
+  or 255-entry arrays. Named arena exhaustion is atomic. PostgreSQL 18
+  differential coverage, allocation-forbidden batches, all procedural hosts,
+  and empty-cache recovery qualify programs beyond the former boundary.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those

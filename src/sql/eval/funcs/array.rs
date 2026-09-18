@@ -186,8 +186,7 @@ pub(crate) fn dispatch<'a>(
                 };
                 let first = usize::try_from(start.saturating_sub(i64::from(lower)).max(0))
                     .unwrap_or(usize::MAX);
-                for i in first..array::len(raw) {
-                    let el = array::get(raw, element, i).unwrap_or(Datum::Null);
+                for (offset, el) in array::elements(raw, element).skip(first).enumerate() {
                     let hit = if target.is_null() {
                         el.is_null()
                     } else if el.is_null() {
@@ -196,6 +195,7 @@ pub(crate) fn dispatch<'a>(
                         compare_datums(&el, &target)?.is_eq()
                     };
                     if hit {
+                        let i = first + offset;
                         let index = i32::try_from(i).map_err(|_| {
                             sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large")
                         })?;
@@ -237,10 +237,9 @@ pub(crate) fn dispatch<'a>(
                         compare_datums(el, &target)?.is_eq()
                     })
                 };
-                let len = array::len(raw);
                 let mut count = 0usize;
-                for i in 0..len {
-                    if matches(&array::get(raw, element, i).unwrap_or(Datum::Null))? {
+                for el in array::elements(raw, element) {
+                    if matches(&el)? {
                         count += 1;
                     }
                 }
@@ -248,8 +247,8 @@ pub(crate) fn dispatch<'a>(
                     .alloc_slice_with(count, |_| Datum::Null)
                     .map_err(|_| arena_full())?;
                 let mut at = 0usize;
-                for i in 0..len {
-                    if matches(&array::get(raw, element, i).unwrap_or(Datum::Null))? {
+                for (i, el) in array::elements(raw, element).enumerate() {
+                    if matches(&el)? {
                         let index = i32::try_from(i).map_err(|_| {
                             sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large")
                         })?;
@@ -294,7 +293,8 @@ pub(crate) fn dispatch<'a>(
                     Some(e) => unify_arr_elem(source, e),
                     None => source,
                 };
-                let mut items = [Datum::Null; 1024];
+                let source_count = raw.map_or(0, array::len);
+                let items = array::alloc_items(arena, source_count + 1)?;
                 let mut n = 0usize;
                 let source_shape = raw.map(|raw| array::shape(raw).expect("array datum invariant"));
                 if source_shape.is_some_and(|shape| shape.dimension_count() > 1) {
@@ -313,7 +313,7 @@ pub(crate) fn dispatch<'a>(
                     n += 1;
                 }
                 if let Some(raw) = raw {
-                    n = load_array(raw, source, element, &mut items, n, arena)?;
+                    n = load_array(raw, source, element, &mut *items, n, arena)?;
                 }
                 if name == "array_append" {
                     if n == items.len() {
@@ -394,10 +394,9 @@ pub(crate) fn dispatch<'a>(
                     (source, Datum::Null)
                 };
                 let to_coltype = element.to_coltype();
-                let mut items = [Datum::Null; 1024];
+                let items = array::alloc_items(arena, shape.element_count())?;
                 let mut n = 0usize;
-                for i in 0..array::len(raw) {
-                    let el = array::get(raw, source, i).unwrap_or(Datum::Null);
+                for el in array::elements(raw, source) {
                     let matches = if target.is_null() {
                         el.is_null()
                     } else if el.is_null() {
@@ -470,11 +469,13 @@ pub(crate) fn dispatch<'a>(
                     ));
                 }
                 let keep = total - trim as usize;
-                let mut items = [Datum::Null; 1024];
-                let n = load_array(raw, element, element, &mut items, 0, arena)?;
+                let items = array::alloc_items(arena, keep)?;
+                for (item, value) in items.iter_mut().zip(array::elements(raw, element)) {
+                    *item = value;
+                }
                 Ok(Datum::Array {
                     element,
-                    raw: array::build(&items[..keep.min(n)], arena)?,
+                    raw: array::build(items, arena)?,
                 })
             }
             "array_ndims" | "array_dims" => {
@@ -556,13 +557,12 @@ pub(crate) fn dispatch<'a>(
                     Datum::Text(s) => s,
                     other => return Err(type_mismatch("array_to_string delimiter", &other)),
                 };
-                let count = array::len(raw);
                 // Renders the i-th element as text, or `None` to omit it (a NULL
                 // element with no null-string replacement).
-                let elem_text = |i: usize| -> Result<Option<&'a str>, SqlError> {
-                    match array::get(raw, element, i) {
-                        Some(Datum::Null) | None => Ok(nullrep),
-                        Some(v) => match cast_to(v, ColType::Text, arena)? {
+                let elem_text = |value: Datum<'a>| -> Result<Option<&'a str>, SqlError> {
+                    match value {
+                        Datum::Null => Ok(nullrep),
+                        v => match cast_to(v, ColType::Text, arena)? {
                             Datum::Text(s) => Ok(Some(s)),
                             Datum::Null => Ok(nullrep),
                             other => Err(type_mismatch("array_to_string element", &other)),
@@ -572,8 +572,8 @@ pub(crate) fn dispatch<'a>(
                 // Pass 1: total byte length; pass 2: fill (elements re-rendered).
                 let mut total = 0usize;
                 let mut first = true;
-                for i in 0..count {
-                    if let Some(s) = elem_text(i)? {
+                for value in array::elements(raw, element) {
+                    if let Some(s) = elem_text(value)? {
                         if !first {
                             total += delim.len();
                         }
@@ -586,8 +586,8 @@ pub(crate) fn dispatch<'a>(
                     .map_err(|_| arena_full())?;
                 let mut at = 0;
                 let mut first = true;
-                for i in 0..count {
-                    if let Some(s) = elem_text(i)? {
+                for value in array::elements(raw, element) {
+                    if let Some(s) = elem_text(value)? {
                         if !first {
                             out[at..at + delim.len()].copy_from_slice(delim.as_bytes());
                             at += delim.len();
@@ -706,19 +706,19 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     None
                 };
-                let mut items: [Datum; 1024] = [Datum::Null; 1024];
-                let mut pieces: [&str; 1024] = [""; 1024];
-                let n = super::super::split_pieces(s, delim, &mut pieces)?;
-                for (k, &piece) in pieces[..n].iter().enumerate() {
-                    items[k] = if null_str == Some(piece) {
+                let count = super::super::count_split_pieces(s, delim)?;
+                let items = array::alloc_items(arena, count)?;
+                super::super::for_each_split_piece(s, delim, |piece, index| {
+                    items[index] = if null_str == Some(piece) {
                         Datum::Null
                     } else {
                         Datum::Text(piece)
                     };
-                }
+                    Ok(())
+                })?;
                 Ok(Datum::Array {
                     element: ArrElem::Text,
-                    raw: array::build(&items[..n], arena)?,
+                    raw: array::build(items, arena)?,
                 })
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),

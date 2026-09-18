@@ -268,6 +268,15 @@ are represented once, by the startup-sized row overlay whose shadow markers
 the delta writer already consumes; there is no per-table tombstone array or
 1,024-delete rewrite threshold.
 
+Array values use the durable format's complete 65,535-element count rather
+than a 1,024-element execution buffer. Literal and binary input, aggregation,
+concatenation and mutation, split functions, variadic calls, comparison,
+`unnest`, JSON/text output, WAL, checkpoints, and object-cold recovery share
+that boundary. Producers reserve exact slices in the fixed statement arena,
+and bulk readers walk the encoded payload once instead of rescanning each
+variable-width prefix. `format()` likewise builds its result in statement
+memory instead of imposing a separate 4 KiB buffer.
+
 Resumable mutable-routine calls also retain every replay result and pending
 argument that fits statement memory; the persistent arena tail keeps both
 valid across per-row retry rewinds. Cursor row indexes are derived from the

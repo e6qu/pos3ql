@@ -17,8 +17,7 @@ use crate::util::StackStr;
 
 use super::super::{
     ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, byte_to_char_1based, eval_full,
-    expand_replacement, int_arg, regex_split_with_options, regexp_options, similar_to_posix,
-    sqlstate, text_arg,
+    expand_replacement, int_arg, regexp_options, similar_to_posix, sqlstate, text_arg,
 };
 
 fn start_byte(source: &str, one_based: i64) -> Option<usize> {
@@ -583,11 +582,15 @@ pub(crate) fn dispatch<'a>(
                     regexp_options("")?
                 };
                 reject_global(name, parsed.global)?;
-                let mut pieces = [Datum::Null; 1024];
-                let n = regex_split_with_options(src, pat, parsed.options, &mut pieces)?;
+                let n = super::super::regex_split_count_pub(src, pat, parsed.options)?;
+                let pieces = array::alloc_items(arena, n)?;
+                super::super::for_each_regex_split(src, pat, parsed.options, |piece, index| {
+                    pieces[index] = Datum::Text(piece);
+                    Ok(())
+                })?;
                 Ok(Datum::Array {
                     element: ArrElem::Text,
-                    raw: array::build(&pieces[..n], arena)?,
+                    raw: array::build(pieces, arena)?,
                 })
             }
             crate::sql::parser::SIMILAR_TO => {

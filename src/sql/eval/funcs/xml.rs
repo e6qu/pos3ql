@@ -132,10 +132,13 @@ fn xpath_namespace_pairs<'a>(
         ));
     }
     let mut count = 0usize;
-    for row in 0..rows {
-        let prefix = crate::sql::array::get(raw, element, row * 2)
+    let mut elements = crate::sql::array::elements(raw, element);
+    for _ in 0..rows {
+        let prefix = elements
+            .next()
             .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "invalid XPath namespace mapping"))?;
-        let uri = crate::sql::array::get(raw, element, row * 2 + 1)
+        let uri = elements
+            .next()
             .ok_or_else(|| sql_err!(sqlstate::DATA_EXCEPTION, "invalid XPath namespace mapping"))?;
         let (Datum::Text(prefix), Datum::Text(uri)) = (prefix, uri) else {
             return Err(sql_err!(

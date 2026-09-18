@@ -153,21 +153,18 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     other => return Err(type_mismatch(name, &other)),
                 };
-                for index in 0..crate::sql::array::len(raw) {
-                    if !matches!(
-                        crate::sql::array::get(raw, element, index),
-                        Some(Datum::Text(_) | Datum::AclItem(_))
-                    ) {
+                for value in crate::sql::array::elements(raw, element) {
+                    if !matches!(value, Datum::Text(_) | Datum::AclItem(_)) {
                         return Err(sql_err!(
                             sqlstate::NULL_VALUE_NOT_ALLOWED,
                             "ACL arrays must not contain null values"
                         ));
                     }
                 }
-                for index in 0..crate::sql::array::len(raw) {
-                    let value = match crate::sql::array::get(raw, element, index) {
-                        Some(Datum::AclItem(item)) => item,
-                        Some(Datum::Text(value)) => {
+                for value in crate::sql::array::elements(raw, element) {
+                    let value = match value {
+                        Datum::AclItem(item) => item,
+                        Datum::Text(value) => {
                             let catalog = hooks.catalog.expect("ACL catalog was required above");
                             crate::sql::acl::from_text(value, catalog, arena)?
                         }

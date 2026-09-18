@@ -23,7 +23,7 @@ mod operators;
 pub(crate) use args::*;
 
 mod pattern;
-pub(crate) use pattern::{for_each_regex_split, regex_split_with_options};
+pub(crate) use pattern::for_each_regex_split;
 pub use pattern::{like_match, regex_split_count_pub, regex_split_piece_at_pub, regexp_options};
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
@@ -2052,15 +2052,18 @@ fn materialize_acl_value<'a>(
             let items = arena
                 .alloc_slice_with(count, |_| Datum::Null)
                 .map_err(|_| arena_full())?;
-            for (index, target) in items.iter_mut().enumerate() {
-                *target = match super::array::get(raw, ArrElem::AclItem, index) {
-                    Some(Datum::AclItem(item)) => {
+            for (target, value) in items
+                .iter_mut()
+                .zip(super::array::elements(raw, ArrElem::AclItem))
+            {
+                *target = match value {
+                    Datum::AclItem(item) => {
                         Datum::AclItem(crate::sql::acl::materialize(item, catalog, arena)?)
                     }
-                    Some(Datum::Text(text)) => {
+                    Datum::Text(text) => {
                         Datum::AclItem(crate::sql::acl::from_text(text, catalog, arena)?)
                     }
-                    Some(Datum::Null) => Datum::Null,
+                    Datum::Null => Datum::Null,
                     _ => unreachable!("aclitem array carries its declared element type"),
                 };
             }
@@ -2439,13 +2442,16 @@ fn eval_full_inner<'a>(
                         let items = arena
                             .alloc_slice_with(count, |_| Datum::Null)
                             .map_err(|_| arena_full())?;
-                        for (index, item) in items.iter_mut().enumerate() {
-                            *item = match super::array::get(raw, ArrElem::AclItem, index) {
-                                Some(Datum::Text(value)) => Datum::AclItem(
-                                    crate::sql::acl::from_text(value, catalog, arena)?,
-                                ),
-                                Some(item @ Datum::AclItem(_)) => item,
-                                Some(Datum::Null) => Datum::Null,
+                        for (item, value) in items
+                            .iter_mut()
+                            .zip(super::array::elements(raw, ArrElem::AclItem))
+                        {
+                            *item = match value {
+                                Datum::Text(value) => Datum::AclItem(crate::sql::acl::from_text(
+                                    value, catalog, arena,
+                                )?),
+                                item @ Datum::AclItem(_) => item,
+                                Datum::Null => Datum::Null,
                                 _ => {
                                     unreachable!("aclitem array decoder preserves its element type")
                                 }
@@ -3072,7 +3078,8 @@ fn eval_full_inner<'a>(
                         "array has too many dimensions"
                     ));
                 }
-                let mut flattened = [Datum::Null; super::array::MAX_ELEMENTS];
+                let result_shape = child.with_first(items.len(), 1)?;
+                let flattened = super::array::alloc_items(arena, result_shape.element_count())?;
                 let mut count = 0usize;
                 for value in vals.iter().take(items.len()) {
                     let Datum::Array {
@@ -3099,18 +3106,14 @@ fn eval_full_inner<'a>(
                         member_raw,
                         member_element,
                         element,
-                        &mut flattened,
+                        &mut *flattened,
                         count,
                         arena,
                     )?;
                 }
                 return Ok(Datum::Array {
                     element,
-                    raw: super::array::build_shaped(
-                        &flattened[..count],
-                        child.with_first(items.len(), 1)?,
-                        arena,
-                    )?,
+                    raw: super::array::build_shaped(&flattened[..count], result_shape, arena)?,
                 });
             }
             let element = element.unwrap_or_else(|| {
@@ -3572,10 +3575,8 @@ fn eval_full_inner<'a>(
                 }
                 _ => return Err(type_mismatch("ANY/ALL requires an array", &array)),
             };
-            let n = super::array::len(raw);
             let mut saw_null = false;
-            for i in 0..n {
-                let el = super::array::get(raw, element, i).unwrap_or(Datum::Null);
+            for el in super::array::elements(raw, element) {
                 let (left, right) =
                     coerce_enum_literal(lhs, el, is_unknown_literal(operand), false, hooks, arena)?;
                 match binary(operator, left, right, false, false, arena)? {
@@ -5676,14 +5677,13 @@ fn load_array<'a>(
 ) -> Result<usize, SqlError> {
     let mut n = start;
     let to_coltype = to.to_coltype();
-    for i in 0..super::array::len(raw) {
+    for el in super::array::elements(raw, from) {
         if n == items.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "array value too large"
             ));
         }
-        let el = super::array::get(raw, from, i).unwrap_or(Datum::Null);
         items[n] = if el.is_null() || from == to {
             el
         } else {
@@ -5832,9 +5832,9 @@ pub(crate) fn materialize_composite_text_output<'a>(
         } => catalog.materialize_composite(slot, physical_fields, text, arena),
         Datum::Array { element, raw } if matches!(element.to_coltype(), ColType::Composite(_)) => {
             let shape = super::array::shape(raw).expect("array datum invariant");
-            let mut items = [Datum::Null; super::array::MAX_ELEMENTS];
-            for (index, item) in items.iter_mut().take(shape.element_count()).enumerate() {
-                *item = match super::array::get(raw, element, index).unwrap_or(Datum::Null) {
+            let items = super::array::alloc_items(arena, shape.element_count())?;
+            for (item, value) in items.iter_mut().zip(super::array::elements(raw, element)) {
+                *item = match value {
                     Datum::CompositeText {
                         slot,
                         physical_fields,
@@ -5844,9 +5844,7 @@ pub(crate) fn materialize_composite_text_output<'a>(
                 };
             }
             Ok(Datum::Text(super::array::format_shaped(
-                &items[..shape.element_count()],
-                shape,
-                arena,
+                items, shape, arena,
             )?))
         }
         value => Ok(value),
@@ -6056,8 +6054,8 @@ fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
         Datum::Array { element, raw } => {
             // `jsonb - text[]`: delete each named key.
             let mut node = root;
-            for i in 0..super::array::len(raw) {
-                if let Some(Datum::Text(key)) = super::array::get(raw, element, i) {
+            for value in super::array::elements(raw, element) {
+                if let Datum::Text(key) = value {
                     node = super::json::delete_key(node, key, arena)?;
                 }
             }
@@ -6126,8 +6124,7 @@ fn json_path<'a>(
         other => return Err(type_mismatch("#> path must be a text array", &other)),
     };
     let mut node = super::json::parse(text, arena)?;
-    for i in 0..super::array::len(raw) {
-        let step = super::array::get(raw, element, i).unwrap_or(Datum::Null);
+    for step in super::array::elements(raw, element) {
         let Datum::Text(key) = step else {
             return Ok(Datum::Null);
         };
@@ -6201,11 +6198,9 @@ fn json_exists<'a>(
                 Datum::Null => return Ok(Datum::Null),
                 other => return Err(type_mismatch("?|/?& require a text array", &other)),
             };
-            let n = super::array::len(raw);
             let all = operator == JsonExistsAll;
             let mut result = all;
-            for i in 0..n {
-                let key = super::array::get(raw, element, i).unwrap_or(Datum::Null);
+            for key in super::array::elements(raw, element) {
                 let present = matches!(key, Datum::Text(k) if has(k));
                 if all {
                     result = result && present;
@@ -6456,21 +6451,12 @@ fn array_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datu
         }
         (None, None) => unreachable!("caller ensures an array operand"),
     };
-    let mut items = [Datum::Null; super::array::MAX_ELEMENTS];
+    let items = super::array::alloc_items(arena, result_shape.element_count())?;
     let mut n = 0usize;
     for side in [l, r] {
         match side {
             Datum::Array { raw, element: e } => {
-                for i in 0..super::array::len(raw) {
-                    if n >= items.len() {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "array size exceeds the maximum allowed"
-                        ));
-                    }
-                    let value = super::array::get(raw, e, i).ok_or_else(|| {
-                        sql_err!(sqlstate::INTERNAL_ERROR, "corrupt array element")
-                    })?;
+                for value in super::array::elements(raw, e) {
                     items[n] = if value.is_null() || e == element {
                         value
                     } else {
@@ -7160,10 +7146,12 @@ pub(crate) fn reg_array_cast<'a>(
     };
     let shape = crate::sql::array::shape(raw).expect("array datum carries a valid shape");
     let count = shape.element_count();
-    let mut items = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let items = crate::sql::array::alloc_items(arena, count)?;
     let element_type = target.to_coltype();
-    for (index, output) in items.iter_mut().take(count).enumerate() {
-        let input = crate::sql::array::get(raw, source, index).unwrap_or(Datum::Null);
+    for (output, input) in items
+        .iter_mut()
+        .zip(crate::sql::array::elements(raw, source))
+    {
         *output = if element_type == ColType::Regtype {
             regtype_cast(input, catalog, arena)?
         } else {
@@ -7172,7 +7160,7 @@ pub(crate) fn reg_array_cast<'a>(
     }
     Ok(Datum::Array {
         element: target,
-        raw: crate::sql::array::build_shaped(&items[..count], shape, arena)?,
+        raw: crate::sql::array::build_shaped(items, shape, arena)?,
     })
 }
 

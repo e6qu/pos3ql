@@ -4,17 +4,16 @@
 
 use core::fmt::Write;
 
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::Expr;
 use crate::sql::parser;
 use crate::sql::to_char;
 use crate::sql::types::{Datum, RecordField};
-use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
 use super::super::{
-    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, eval_full, expression_type_identity,
-    format_append_ident, format_append_literal, format_append_str, sqlstate, text_arg,
-    type_mismatch,
+    ColumnLookup, EvalHooks, SqlError, arena_full, arity_err, datum_to_text, eval_full,
+    expression_type_identity, sqlstate, text_arg, type_mismatch,
 };
 
 fn decimal(bytes: &[u8], at: &mut usize) -> Result<Option<usize>, SqlError> {
@@ -63,6 +62,123 @@ fn format_argument<'a>(
             "too few arguments for format()"
         )
     })
+}
+
+struct ArenaText<'a> {
+    bytes: ArenaList<'a, u8>,
+}
+
+impl<'a> ArenaText<'a> {
+    const fn new(arena: &'a Arena) -> Self {
+        Self {
+            bytes: ArenaList::new(arena),
+        }
+    }
+
+    fn finish(&self) -> &'a str {
+        // Every append originates in UTF-8 text or `char` encoding.
+        unsafe { core::str::from_utf8_unchecked(self.bytes.as_slice()) }
+    }
+}
+
+impl core::fmt::Write for ArenaText<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        for &byte in text.as_bytes() {
+            self.bytes.push(byte).map_err(|_| core::fmt::Error)?;
+        }
+        Ok(())
+    }
+}
+
+enum FormattedArgument<'a> {
+    String(Option<&'a str>),
+    Identifier { text: &'a str, bare: bool },
+    Literal(Option<&'a str>),
+}
+
+impl FormattedArgument<'_> {
+    fn characters(&self) -> usize {
+        match *self {
+            Self::String(Some(text)) => text.chars().count(),
+            Self::String(None) => 0,
+            Self::Identifier { text, bare: true } => text.chars().count(),
+            Self::Identifier { text, bare: false } => {
+                2 + text.chars().count() + text.chars().filter(|&c| c == '"').count()
+            }
+            Self::Literal(None) => 4,
+            Self::Literal(Some(text)) => {
+                2 + text.chars().count() + text.chars().filter(|&c| c == '\'').count()
+            }
+        }
+    }
+
+    fn write(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        match *self {
+            Self::String(text) => out.write_str(text.unwrap_or("")),
+            Self::Identifier { text, bare: true } => out.write_str(text),
+            Self::Identifier { text, bare: false } => {
+                out.write_char('"')?;
+                for character in text.chars() {
+                    if character == '"' {
+                        out.write_char('"')?;
+                    }
+                    out.write_char(character)?;
+                }
+                out.write_char('"')
+            }
+            Self::Literal(None) => out.write_str("NULL"),
+            Self::Literal(Some(text)) => {
+                out.write_char('\'')?;
+                for character in text.chars() {
+                    if character == '\'' {
+                        out.write_char('\'')?;
+                    }
+                    out.write_char(character)?;
+                }
+                out.write_char('\'')
+            }
+        }
+    }
+}
+
+fn formatted_argument<'a>(
+    specifier: u8,
+    value: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<FormattedArgument<'a>, SqlError> {
+    if specifier == b's' {
+        return Ok(FormattedArgument::String(
+            (!value.is_null())
+                .then(|| datum_to_text(value, arena))
+                .transpose()?,
+        ));
+    }
+    if specifier == b'I' {
+        if value.is_null() {
+            return Err(sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "null value cannot be formatted as SQL identifier"
+            ));
+        }
+        let text = datum_to_text(value, arena)?;
+        let bare = !text.is_empty()
+            && text.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_lowercase() || (index > 0 && byte.is_ascii_digit())
+            });
+        return Ok(FormattedArgument::Identifier { text, bare });
+    }
+    Ok(FormattedArgument::Literal(
+        (!value.is_null())
+            .then(|| datum_to_text(value, arena))
+            .transpose()?,
+    ))
+}
+
+fn write_spaces(out: &mut impl core::fmt::Write, count: usize) -> core::fmt::Result {
+    for _ in 0..count {
+        out.write_char(' ')?;
+    }
+    Ok(())
 }
 
 /// Handles the miscellaneous scalar family. Returns `None` if `name` is not one
@@ -195,33 +311,24 @@ pub(crate) fn dispatch<'a>(
                 let Some(fmt) = text_arg(name, args, 0, arena, params, row, hooks)? else {
                     return Ok(Datum::Null);
                 };
-                let mut evaluated = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
                 let values = super::super::args::variadic_tail(
-                    name,
-                    args,
-                    1,
-                    variadic,
-                    arena,
-                    params,
-                    row,
-                    hooks,
-                    &mut evaluated,
+                    name, args, 1, variadic, arena, params, row, hooks,
                 )?;
                 let values = values.unwrap_or(&[]);
-                let mut out = StackStr::<4096>::new();
+                let mut out = ArenaText::new(arena);
                 let mut next = 0usize;
                 let bytes = fmt.as_bytes();
                 let mut i = 0usize;
                 while i < bytes.len() {
                     if bytes[i] != b'%' {
                         let end = fmt[i..].find('%').map_or(bytes.len(), |offset| i + offset);
-                        let _ = out.write_str(&fmt[i..end]);
+                        out.write_str(&fmt[i..end]).map_err(|_| arena_full())?;
                         i = end;
                         continue;
                     }
                     i += 1;
                     if bytes.get(i) == Some(&b'%') {
-                        let _ = out.write_char('%');
+                        out.write_char('%').map_err(|_| arena_full())?;
                         i += 1;
                         continue;
                     }
@@ -296,41 +403,17 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                     let value = format_argument(values, position, &mut next)?;
-                    let mut rendered = StackStr::<4096>::new();
-                    match spec {
-                        b's' => format_append_str(&mut rendered, value, arena)?,
-                        b'I' => format_append_ident(&mut rendered, value, arena)?,
-                        b'L' => format_append_literal(&mut rendered, value, arena)?,
-                        _ => unreachable!("specifier validated above"),
-                    }
-                    if rendered.is_truncated() {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "formatted value exceeds the statement formatting buffer"
-                        ));
-                    }
-                    let padding = width.saturating_sub(rendered.as_str().chars().count());
+                    let rendered = formatted_argument(spec, value, arena)?;
+                    let padding = width.saturating_sub(rendered.characters());
                     if !left {
-                        for _ in 0..padding {
-                            let _ = out.write_char(' ');
-                        }
+                        write_spaces(&mut out, padding).map_err(|_| arena_full())?;
                     }
-                    let _ = out.write_str(rendered.as_str());
+                    rendered.write(&mut out).map_err(|_| arena_full())?;
                     if left {
-                        for _ in 0..padding {
-                            let _ = out.write_char(' ');
-                        }
+                        write_spaces(&mut out, padding).map_err(|_| arena_full())?;
                     }
                 }
-                if out.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "format() result exceeds the statement formatting buffer"
-                    ));
-                }
-                Ok(Datum::Text(
-                    arena.alloc_str(out.as_str()).map_err(|_| arena_full())?,
-                ))
+                Ok(Datum::Text(out.finish()))
             }
             "to_number" => {
                 arity(2)?;

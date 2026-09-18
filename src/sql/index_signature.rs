@@ -102,8 +102,7 @@ pub(crate) fn for_each_value_token(datum: Datum<'_>, mut emit: impl FnMut(Postin
     match datum {
         Datum::Null => {}
         Datum::Array { element, raw } => {
-            for index in 0..super::array::len(raw) {
-                let value = super::array::get(raw, element, index).unwrap_or(Datum::Null);
+            for value in super::array::elements(raw, element) {
                 if !value.is_null() {
                     emit(PostingToken::new(
                         ARRAY_ELEMENT,
@@ -156,10 +155,8 @@ pub(crate) fn predicate(search: Datum<'_>, operator: BinaryOp) -> SignaturePredi
         {
             let mut tokens = TokenSignature::default();
             let mut count = 0usize;
-            for index in 0..super::array::len(raw) {
-                if let Some(Datum::Text(text) | Datum::Bpchar(text)) =
-                    super::array::get(raw, element, index)
-                {
+            for value in super::array::elements(raw, element) {
+                if let Datum::Text(text) | Datum::Bpchar(text) = value {
                     tokens.insert(JSON_EXISTS, hash_bytes(text.as_bytes()));
                     count += 1;
                 }
@@ -179,8 +176,7 @@ pub(crate) fn predicate(search: Datum<'_>, operator: BinaryOp) -> SignaturePredi
             } else {
                 let mut tokens = TokenSignature::default();
                 let mut count = 0usize;
-                for index in 0..super::array::len(raw) {
-                    let value = super::array::get(raw, element, index).unwrap_or(Datum::Null);
+                for value in super::array::elements(raw, element) {
                     if !value.is_null() {
                         tokens.insert(ARRAY_ELEMENT, super::eval::hash_key(&[value], &[0]));
                         count += 1;
@@ -261,10 +257,8 @@ pub(crate) fn posting_probe(
         Datum::Array { element, raw }
             if matches!(operator, BinaryOp::JsonExistsAny | BinaryOp::JsonExistsAll) =>
         {
-            for index in 0..super::array::len(raw) {
-                let Some(Datum::Text(text) | Datum::Bpchar(text)) =
-                    super::array::get(raw, element, index)
-                else {
+            for value in super::array::elements(raw, element) {
+                let (Datum::Text(text) | Datum::Bpchar(text)) = value else {
                     continue;
                 };
                 let token = PostingToken::new(JSON_EXISTS, hash_bytes(text.as_bytes()));
@@ -283,8 +277,7 @@ pub(crate) fn posting_probe(
             if operator == BinaryOp::ContainedBy {
                 return PostingProbe::Unusable;
             }
-            for index in 0..super::array::len(raw) {
-                let value = super::array::get(raw, element, index).unwrap_or(Datum::Null);
+            for value in super::array::elements(raw, element) {
                 if value.is_null() {
                     continue;
                 }

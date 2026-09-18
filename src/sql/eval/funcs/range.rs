@@ -279,10 +279,8 @@ pub(crate) fn dispatch<'a>(
                         if element.to_coltype() != crate::sql::types::ColType::Range(kind) {
                             return Err(type_mismatch(name, &value));
                         }
-                        for index in 0..crate::sql::array::len(raw) {
-                            if add(
-                                crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null)
-                            )? {
+                        for value in crate::sql::array::elements(raw, element) {
+                            if add(value)? {
                                 return Ok(Datum::Null);
                             }
                         }

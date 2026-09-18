@@ -314,21 +314,19 @@ where
                 let values = arena
                     .alloc_slice_with(crate::sql::array::len(raw), |_| Datum::Null)
                     .map_err(|_| arena_full())?;
-                for (index, value) in values.iter_mut().enumerate() {
-                    *value = match crate::sql::array::get(
-                        raw,
-                        crate::sql::types::ArrElem::Text,
-                        index,
-                    ) {
-                        Some(Datum::Text(value)) => Datum::Text(value),
-                        Some(Datum::Null) => {
+                for (value, source) in values.iter_mut().zip(crate::sql::array::elements(
+                    raw,
+                    crate::sql::types::ArrElem::Text,
+                )) {
+                    *value = match source {
+                        Datum::Text(value) => Datum::Text(value),
+                        Datum::Null => {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,
                                 "null array element not allowed in this context"
                             ));
                         }
-                        Some(_) => unreachable!("text array has text elements"),
-                        None => unreachable!("array length fixes every publication index"),
+                        _ => unreachable!("text array has text elements"),
                     };
                 }
                 Ok(values)
@@ -4185,18 +4183,19 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let rows = arena
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
-        for (index, slot) in rows.iter_mut().enumerate() {
-            let option = match crate::sql::array::get(raw, crate::sql::types::ArrElem::Text, index)
-            {
-                Some(Datum::Text(option)) => option,
-                Some(Datum::Null) => {
+        for (slot, source) in rows.iter_mut().zip(crate::sql::array::elements(
+            raw,
+            crate::sql::types::ArrElem::Text,
+        )) {
+            let option = match source {
+                Datum::Text(option) => option,
+                Datum::Null => {
                     return Err(sql_err!(
                         sqlstate::NULL_VALUE_NOT_ALLOWED,
                         "null value not allowed"
                     ));
                 }
-                None => unreachable!("array length fixes every option index"),
-                Some(_) => return Err(srf_signature_error(tref.table)),
+                _ => return Err(srf_signature_error(tref.table)),
             };
             let (name, value) = match option.split_once('=') {
                 Some((name, value)) => (Datum::Text(name), Datum::Text(value)),
@@ -4692,13 +4691,21 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let rows = arena
             .alloc_slice_with(count, |_| EMPTY)
             .map_err(|_| arena_full())?;
+        let mut element_iters: [Option<crate::sql::array::Elements<'_>>; MAX_COLUMNS] =
+            std::array::from_fn(|_| None);
+        for (column, value) in arrays[..args.len()].iter().enumerate() {
+            if let Datum::Array { element, raw } = *value {
+                element_iters[column] = Some(crate::sql::array::elements(raw, element));
+            }
+        }
         for (row_index, row) in rows.iter_mut().enumerate() {
             let mut values = [Datum::Null; MAX_COLUMNS];
             for (column, array) in arrays[..args.len()].iter().enumerate() {
                 values[column] = match *array {
-                    Datum::Array { element, raw } => {
-                        crate::sql::array::get(raw, element, row_index).unwrap_or(Datum::Null)
-                    }
+                    Datum::Array { .. } => element_iters[column]
+                        .as_mut()
+                        .and_then(Iterator::next)
+                        .unwrap_or(Datum::Null),
                     Datum::Multirange { text, kind } => {
                         let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
                         let component_count =

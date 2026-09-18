@@ -312,10 +312,9 @@ fn write_wire_array(
     }
     fn level(
         element: crate::sql::types::ArrElem,
-        raw: &[u8],
         shape: crate::sql::array::Shape,
         depth: usize,
-        index: &mut usize,
+        elements: &mut crate::sql::array::Elements<'_>,
         render: crate::sql::guc::RenderContext,
         out: &mut dyn FnMut(&[u8]),
     ) {
@@ -326,20 +325,19 @@ fn write_wire_array(
             }
             if depth + 1 == shape.dimension_count() {
                 write_wire_array_element(
-                    crate::sql::array::get(raw, element, *index).unwrap_or(Datum::Null),
+                    elements.next().expect("array datum carries every member"),
                     element.delimiter(),
                     render,
                     out,
                 );
-                *index += 1;
             } else {
-                level(element, raw, shape, depth + 1, index, render, out);
+                level(element, shape, depth + 1, elements, render, out);
             }
         }
         out(b"}");
     }
-    let mut index = 0;
-    level(element, raw, shape, 0, &mut index, render, out);
+    let mut elements = crate::sql::array::elements(raw, element);
+    level(element, shape, 0, &mut elements, render, out);
 }
 
 fn wire_text_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usize {
@@ -467,10 +465,8 @@ fn binary_value_len(value: &Datum) -> usize {
         }
         Datum::Array { element, raw } => {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-            let count = shape.element_count();
             let mut bytes = 12usize.saturating_add(shape.dimension_count().saturating_mul(8));
-            for index in 0..count {
-                let item = crate::sql::array::get(raw, *element, index).unwrap_or(Datum::Null);
+            for item in crate::sql::array::elements(raw, *element) {
                 bytes = bytes
                     .saturating_add(4)
                     .saturating_add(binary_value_len(&item));
@@ -1634,21 +1630,17 @@ impl<'b> Responder<'b> {
                 Datum::Array { element, raw } => {
                     let elem_oid = element.element_oid();
                     let shape = crate::sql::array::shape(raw).expect("array datum invariant");
-                    let count = shape.element_count();
                     m.field(|m| {
                         m.i32(shape.dimension_count() as i32);
-                        let has_null = (0..count).any(|i| {
-                            crate::sql::array::get(raw, *element, i).is_none_or(|d| d.is_null())
-                        });
+                        let has_null =
+                            crate::sql::array::elements(raw, *element).any(|datum| datum.is_null());
                         m.i32(i32::from(has_null));
                         m.i32(elem_oid);
                         for index in 0..shape.dimension_count() {
                             m.i32(shape.dimension(index).unwrap() as i32);
                             m.i32(shape.lower_bound(index).unwrap());
                         }
-                        for i in 0..count {
-                            let elem =
-                                crate::sql::array::get(raw, *element, i).unwrap_or(Datum::Null);
+                        for elem in crate::sql::array::elements(raw, *element) {
                             Self::encode_value_binary(m, &elem);
                         }
                     });
@@ -2428,6 +2420,46 @@ mod tests {
                 0, 0, 0, 2, 0, 0, 0, 2, // first dimension
                 0, 0, 0, 2, 0, 0, 0, 4, // second dimension
             ]
+        );
+    }
+
+    #[test]
+    fn binary_array_output_crosses_the_former_inline_element_limit() {
+        const ELEMENTS: usize = 1_100;
+        let mut arena_budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut arena_budget, "wide binary array", 1 << 19).unwrap();
+        let values = crate::sql::array::alloc_items(&arena, ELEMENTS).unwrap();
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = Datum::Int4(index as i32 + 1);
+        }
+        let raw = crate::sql::array::build(values, &arena).unwrap();
+        let datum = Datum::Array {
+            element: crate::sql::types::ArrElem::Int4,
+            raw,
+        };
+
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "wide binary result", 16 << 10).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(&mut message, &datum);
+        message.finish().unwrap();
+        let encoded = buffer.readable();
+        assert_eq!(
+            i32::from_be_bytes(encoded[5..9].try_into().unwrap()),
+            (20 + ELEMENTS * 8) as i32
+        );
+        assert_eq!(
+            i32::from_be_bytes(encoded[21..25].try_into().unwrap()),
+            ELEMENTS as i32
+        );
+        let last = 29 + (ELEMENTS - 1) * 8;
+        assert_eq!(
+            i32::from_be_bytes(encoded[last..last + 4].try_into().unwrap()),
+            4
+        );
+        assert_eq!(
+            i32::from_be_bytes(encoded[last + 4..last + 8].try_into().unwrap()),
+            ELEMENTS as i32
         );
     }
 

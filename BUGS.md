@@ -53,6 +53,12 @@ checkpoint deletion markers use the already bounded row overlay instead of an
 unused per-table 1,024-entry roster. PostgreSQL 18 differential,
 allocation-forbidden execution, delta-generation inspection, checkpoint
 publication, and empty-cache recovery cover the former limits.
+The SQL array-width audit found no external blocker. Array values now use the
+durable 65,535-element boundary, exact statement-memory scratch, and
+single-pass payload traversal. Text and binary input, aggregation, mutation,
+variadic expansion, comparison, set expansion, output, checkpoint publication,
+and empty-cache recovery are qualified beyond the former 1,024-element limit.
+The same audit removed `format()`'s unrelated 4 KiB result ceiling.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

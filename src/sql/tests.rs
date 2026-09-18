@@ -70856,3 +70856,77 @@ fn remaining_inline_widths_are_allocation_free_and_survive_cold_recovery() {
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
+
+#[test]
+fn array_value_width_is_allocation_free_and_survives_cold_recovery() {
+    let mut config = test_config("array-value-width");
+    config.table_rows = 2_048;
+    config.txn_rows = 2_048;
+    config.memtable_bytes = 16 << 20;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("array-value-width-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let (fixture, cleanup) =
+        include_str!("../../tests/external/differential/181_array_value_width.sql")
+            .split_once("-- cleanup")
+            .unwrap();
+    let (allocation_free, simulator_backed) = fixture
+        .split_once("-- simulator-backed external run")
+        .unwrap();
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(&mut engine, allocation_free, true);
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1100|1|1100|1100|v1|v1100",
+            "1100",
+            "1100",
+            "1100",
+            "1101|1101|1101|0|2200|1099|-550|1000",
+            "1100|2199|1100",
+            "4400",
+            "t|t|t|t",
+            "2201|2201",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    // Lateral materialization writes an external run through the object
+    // simulator, whose fixture keys allocate. The production path uses the
+    // startup-reserved object request buffers.
+    let output = session.success(&mut engine, simulator_backed, false);
+    assert_eq!(data_rows(&output), ["1100|1|1100"]);
+
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with_arena_bytes(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT cardinality(integers), integers[1], integers[1100], \
+                cardinality(words), words[1], words[1100], \
+                array_position(integers, 1100) \
+           FROM array_value_width",
+        16 << 20,
+    );
+    assert_eq!(data_rows(&recovered), ["1100|1|1100|1100|v1|v1100|1100"]);
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    cold_session.success(&mut cold, cleanup, false);
+    drop(cold_session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}

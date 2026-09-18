@@ -395,26 +395,6 @@ pub fn regex_split_piece_at_pub<'a>(
     Ok((piece == wanted).then_some(&src[last..]))
 }
 
-/// Splits `src` on every match of `pattern`, writing the pieces into `out` and
-/// returning the count. An empty pattern splits into individual characters.
-pub(crate) fn regex_split_with_options<'a>(
-    src: &'a str,
-    pattern: &str,
-    options: crate::sql::regex::RegexOptions,
-    out: &mut [Datum<'a>],
-) -> Result<usize, SqlError> {
-    for_each_regex_split(src, pattern, options, |piece, index| {
-        let Some(slot) = out.get_mut(index) else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many split pieces"
-            ));
-        };
-        *slot = Datum::Text(piece);
-        Ok(())
-    })
-}
-
 pub(crate) fn for_each_regex_split<'a>(
     src: &'a str,
     pattern: &str,

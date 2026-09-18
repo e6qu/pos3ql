@@ -631,22 +631,15 @@ pub(crate) fn dispatch<'a>(
             "concat" => {
                 // Concatenates every argument's text form, skipping NULLs.
                 let mut total = 0usize;
-                let mut values = [Datum::Null; array::MAX_ELEMENTS];
                 let Some(values) = super::super::args::variadic_tail(
-                    name,
-                    args,
-                    0,
-                    variadic,
-                    arena,
-                    params,
-                    row,
-                    hooks,
-                    &mut values,
+                    name, args, 0, variadic, arena, params, row, hooks,
                 )?
                 else {
                     return Ok(Datum::Null);
                 };
-                let mut parts: [&str; array::MAX_ELEMENTS] = [""; array::MAX_ELEMENTS];
+                let parts = arena
+                    .alloc_slice_with(values.len(), |_| "")
+                    .map_err(|_| arena_full())?;
                 if star {
                     return Err(arity_err(name, args.len()));
                 }
@@ -670,22 +663,15 @@ pub(crate) fn dispatch<'a>(
                     Some(s) => s,
                     None => return Ok(Datum::Null),
                 };
-                let mut values = [Datum::Null; array::MAX_ELEMENTS];
                 let Some(values) = super::super::args::variadic_tail(
-                    name,
-                    args,
-                    1,
-                    variadic,
-                    arena,
-                    params,
-                    row,
-                    hooks,
-                    &mut values,
+                    name, args, 1, variadic, arena, params, row, hooks,
                 )?
                 else {
                     return Ok(Datum::Null);
                 };
-                let mut parts: [&str; array::MAX_ELEMENTS] = [""; array::MAX_ELEMENTS];
+                let parts = arena
+                    .alloc_slice_with(values.len(), |_| "")
+                    .map_err(|_| arena_full())?;
                 let mut np = 0;
                 let mut total = 0usize;
                 for &v in values {

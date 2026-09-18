@@ -111,33 +111,24 @@ fn acl_contains(left: Datum<'_>, right: Datum<'_>) -> Result<Datum<'static>, Sql
         Datum::Text(value) => Some(crate::sql::acl::parse(value)?),
         _ => None,
     };
-    for index in 0..array::len(raw) {
-        if !matches!(
-            array::get(raw, crate::sql::types::ArrElem::AclItem, index),
-            Some(Datum::Text(_) | Datum::AclItem(_))
-        ) {
+    for value in array::elements(raw, crate::sql::types::ArrElem::AclItem) {
+        if !matches!(value, Datum::Text(_) | Datum::AclItem(_)) {
             return Err(sql_err!(
                 sqlstate::NULL_VALUE_NOT_ALLOWED,
                 "ACL arrays must not contain null values"
             ));
         }
     }
-    for index in 0..array::len(raw) {
-        let contains = match (
-            array::get(raw, crate::sql::types::ArrElem::AclItem, index),
-            right_item,
-            right_text,
-        ) {
-            (Some(Datum::AclItem(value)), Some(right), _) => {
+    for value in array::elements(raw, crate::sql::types::ArrElem::AclItem) {
+        let contains = match (value, right_item, right_text) {
+            (Datum::AclItem(value), Some(right), _) => {
                 value.grantee() == right.grantee()
                     && value.grantor() == right.grantor()
                     && value.privileges() & right.privileges() == right.privileges()
                     && value.grant_options() & right.grant_options() == right.grant_options()
             }
-            (Some(Datum::Text(value)), _, Some(right)) => {
-                crate::sql::acl::parse(value)?.contains(right)
-            }
-            (Some(Datum::Text(_) | Datum::AclItem(_)), _, _) => false,
+            (Datum::Text(value), _, Some(right)) => crate::sql::acl::parse(value)?.contains(right),
+            (Datum::Text(_) | Datum::AclItem(_), _, _) => false,
             _ => unreachable!("ACL array was validated before containment"),
         };
         if contains {
@@ -176,8 +167,7 @@ pub(crate) fn array_set_op<'a>(
         if needle.is_null() {
             return Ok(false);
         }
-        for i in 0..array::len(raw) {
-            let v = array::get(raw, elem, i).unwrap_or(Datum::Null);
+        for v in array::elements(raw, elem) {
             if !v.is_null() && compare_datums(needle, &v)?.is_eq() {
                 return Ok(true);
             }
@@ -187,8 +177,7 @@ pub(crate) fn array_set_op<'a>(
     // Every element of `sub` is a member of `sup`.
     let subset =
         |sub_elem, sub_raw: &'a [u8], sup_elem, sup_raw: &'a [u8]| -> Result<bool, SqlError> {
-            for i in 0..array::len(sub_raw) {
-                let v = array::get(sub_raw, sub_elem, i).unwrap_or(Datum::Null);
+            for v in array::elements(sub_raw, sub_elem) {
                 // PostgreSQL's containment does not consider a NULL element
                 // equal to another NULL element.
                 if v.is_null() || !member(&v, sup_elem, sup_raw)? {
@@ -202,8 +191,7 @@ pub(crate) fn array_set_op<'a>(
         ContainedBy => subset(le, lr, re, rr)?,
         Overlaps => {
             let mut any = false;
-            for i in 0..array::len(lr) {
-                let v = array::get(lr, le, i).unwrap_or(Datum::Null);
+            for v in array::elements(lr, le) {
                 if member(&v, re, rr)? {
                     any = true;
                     break;
@@ -997,9 +985,7 @@ pub(crate) fn compare_datums_as(
         (Datum::Array { element, raw: ra }, Datum::Array { raw: rb, .. }) => {
             // PostgreSQL compares contents first, then dimensionality and bounds.
             let (length_a, length_b) = (array::len(ra), array::len(rb));
-            for i in 0..length_a.min(length_b) {
-                let x = array::get(ra, *element, i).unwrap_or(Datum::Null);
-                let y = array::get(rb, *element, i).unwrap_or(Datum::Null);
+            for (x, y) in array::elements(ra, *element).zip(array::elements(rb, *element)) {
                 let c = compare_datums(&x, &y)?;
                 if !c.is_eq() {
                     return Ok(c);

@@ -174,6 +174,13 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   `regexp_split_to_table` results use exact statement-arena slices rather than
   1,024-entry stack arrays. Checkpoint deletion markers use the startup-sized
   row overlay, so deletion count does not select a hidden full-rewrite path.
+- Array values accept up to 65,535 elements, the durable format's unsigned
+  16-bit count. Text and binary input, aggregates, mutation, variadic calls,
+  comparisons, `unnest`, output, WAL, checkpoints, and object-cold recovery
+  have no narrower 1,024-element scratch limit. Wider values fail explicitly
+  with SQLSTATE `54000`, as do accepted-width operations that exhaust the
+  fixed statement arena. `format()` output also uses statement memory rather
+  than a separate 4 KiB compiled buffer.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

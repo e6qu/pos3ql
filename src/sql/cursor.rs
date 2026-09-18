@@ -117,8 +117,14 @@ struct CursorSlot {
     position: i64,
 }
 
-/// How many rows one cursor may hold (the span index's capacity).
-const MAX_CURSOR_ROWS: usize = 65536;
+// A PostgreSQL DataRow has a type byte, four-byte message length, and two-byte
+// field count even when it has no columns. Deriving the index capacity from
+// the byte buffer keeps one startup budget as the only cursor-width limit.
+const MIN_DATA_ROW_BYTES: usize = 7;
+
+const fn cursor_row_capacity(config: &Config) -> usize {
+    config.cursor_bytes / MIN_DATA_ROW_BYTES
+}
 
 fn seal_capture(
     rows: &FixedBuf,
@@ -126,6 +132,7 @@ fn seal_capture(
     spans: &mut Vec<(u32, u32)>,
 ) -> Result<(), SqlError> {
     let bytes = rows.readable();
+    let row_capacity = rows.capacity() / MIN_DATA_ROW_BYTES;
     let mut cursor = 0usize;
     let mut captured_description: Option<(usize, usize)> = None;
     while cursor + 5 <= bytes.len() {
@@ -141,11 +148,11 @@ fn seal_capture(
         match kind {
             b'T' => captured_description = Some((cursor, total)),
             b'D' => {
-                if spans.len() == MAX_CURSOR_ROWS {
+                if spans.len() == row_capacity {
                     return Err(sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "cursor holds more than {} rows",
-                        MAX_CURSOR_ROWS
+                        "cursor row index exceeds cursor_bytes-derived capacity of {} rows",
+                        row_capacity
                     ));
                 }
                 spans.push((cursor as u32, total as u32));
@@ -334,14 +341,16 @@ pub(crate) fn binary_row_field_is_null(row: &[u8], target: usize) -> Result<bool
 
 impl CursorPool {
     pub fn budget_bytes(config: &Config) -> usize {
+        let row_capacity = cursor_row_capacity(config);
         config.max_cursors
             * (config.cursor_bytes * 2
                 + 2048
                 + CURSOR_STATEMENT_BYTES
-                + MAX_CURSOR_ROWS * 2 * core::mem::size_of::<(u32, u32)>())
+                + row_capacity * 2 * core::mem::size_of::<(u32, u32)>())
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        let row_capacity = cursor_row_capacity(config);
         let mut slots = Vec::with_capacity(config.max_cursors);
         for _ in 0..config.max_cursors {
             slots.push(CursorSlot {
@@ -357,14 +366,14 @@ impl CursorPool {
                 description_binary: FixedBuf::new(budget, "cursor_binary_description", 1024)?,
                 rows_text: FixedBuf::new(budget, "cursor_text_rows", config.cursor_bytes)?,
                 rows_binary: FixedBuf::new(budget, "cursor_binary_rows", config.cursor_bytes)?,
-                spans_text: Vec::with_capacity(MAX_CURSOR_ROWS),
-                spans_binary: Vec::with_capacity(MAX_CURSOR_ROWS),
+                spans_text: Vec::with_capacity(row_capacity),
+                spans_binary: Vec::with_capacity(row_capacity),
                 position: 0,
             });
         }
         Ok(Self {
             slots,
-            emit: Vec::with_capacity(MAX_CURSOR_ROWS),
+            emit: Vec::with_capacity(row_capacity),
             next_unnamed: 1,
         })
     }

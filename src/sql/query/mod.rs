@@ -10,7 +10,7 @@
 //! Subqueries are uncorrelated and pre-evaluated once per statement; their
 //! results are injected into evaluation by node identity (EvalHooks).
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::{Responder, ResultFmt};
 use crate::pg::wire::WireFull;
 use crate::sql_err;
@@ -411,9 +411,7 @@ use window::{
 /// second, smaller executor limit.
 pub const MAX_JOIN_TABLES: usize = 64;
 const MAX_AGGS: usize = super::parser::MAX_LIST;
-pub(crate) const MAX_ROUTINE_INVOCATIONS: usize = 1024;
-
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 std::thread_local! {
     /// Wall-clock deadline (micros since 2000-01-01) for the running statement;
     /// 0 means no `statement_timeout` is armed. Single-threaded per connection.
@@ -475,7 +473,7 @@ pub(crate) struct RoutineInvocationState<'a> {
     next: Cell<usize>,
     completed: Cell<usize>,
     pending: Cell<Option<PendingRoutineInvocation<'a>>>,
-    results: [Cell<RoutineInvocationResult<'a>>; MAX_ROUTINE_INVOCATIONS],
+    results: RefCell<ArenaList<'a, RoutineInvocationResult<'a>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -541,13 +539,12 @@ pub(crate) fn active_routine_invocations<'a>() -> Option<(&'a RoutineInvocationS
 }
 
 impl<'a> RoutineInvocationState<'a> {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(arena: &'a Arena) -> Self {
         Self {
             next: Cell::new(0),
             completed: Cell::new(0),
             pending: Cell::new(None),
-            results: [const { Cell::new(RoutineInvocationResult::Scalar(Datum::Null)) };
-                MAX_ROUTINE_INVOCATIONS],
+            results: RefCell::new(ArenaList::new_persistent(arena)),
         }
     }
 
@@ -572,16 +569,10 @@ impl<'a> RoutineInvocationState<'a> {
         query_arena: &'query Arena,
     ) -> Result<Option<Datum<'query>>, SqlError> {
         let ordinal = self.next.get();
-        if ordinal == MAX_ROUTINE_INVOCATIONS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL statement exceeds {} mutable routine invocations",
-                MAX_ROUTINE_INVOCATIONS
-            ));
-        }
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Scalar(value) = self.results[ordinal].get() else {
+            let RoutineInvocationResult::Scalar(value) = self.results.borrow().as_slice()[ordinal]
+            else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a table source to a scalar expression"
@@ -592,7 +583,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(Some(PendingRoutineInvocation {
             slot,
             intrinsic_oid: None,
-            arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
+            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -609,16 +600,10 @@ impl<'a> RoutineInvocationState<'a> {
         query_arena: &'query Arena,
     ) -> Result<Datum<'query>, SqlError> {
         let ordinal = self.next.get();
-        if ordinal == MAX_ROUTINE_INVOCATIONS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL statement exceeds {} mutable routine invocations",
-                MAX_ROUTINE_INVOCATIONS
-            ));
-        }
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Scalar(value) = self.results[ordinal].get() else {
+            let RoutineInvocationResult::Scalar(value) = self.results.borrow().as_slice()[ordinal]
+            else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "intrinsic invocation changed result shape"
@@ -629,7 +614,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(Some(PendingRoutineInvocation {
             slot: 0,
             intrinsic_oid: Some(oid),
-            arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
+            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -644,14 +629,15 @@ impl<'a> RoutineInvocationState<'a> {
 
     pub(crate) fn complete(&self, result: Datum<'a>) -> Result<(), SqlError> {
         let ordinal = self.completed.get();
-        if ordinal == MAX_ROUTINE_INVOCATIONS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL statement exceeds {} mutable routine invocations",
-                MAX_ROUTINE_INVOCATIONS
-            ));
-        }
-        self.results[ordinal].set(RoutineInvocationResult::Scalar(result));
+        self.results
+            .borrow_mut()
+            .push(RoutineInvocationResult::Scalar(result))
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "mutable routine replay exceeds statement memory"
+                )
+            })?;
         self.completed.set(ordinal + 1);
         Ok(())
     }
@@ -663,16 +649,10 @@ impl<'a> RoutineInvocationState<'a> {
         statement_arena: &'a Arena,
     ) -> Result<Option<&'a [&'a [u8]]>, SqlError> {
         let ordinal = self.next.get();
-        if ordinal == MAX_ROUTINE_INVOCATIONS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL statement exceeds {} mutable routine invocations",
-                MAX_ROUTINE_INVOCATIONS
-            ));
-        }
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            let RoutineInvocationResult::Rows(rows) = self.results[ordinal].get() else {
+            let RoutineInvocationResult::Rows(rows) = self.results.borrow().as_slice()[ordinal]
+            else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "SQL routine invocation changed from a scalar expression to a table source"
@@ -683,7 +663,7 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(Some(PendingRoutineInvocation {
             slot,
             intrinsic_oid: None,
-            arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
+            arguments: super::exec::encode_projected_persistent_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
@@ -694,14 +674,15 @@ impl<'a> RoutineInvocationState<'a> {
 
     pub(crate) fn complete_rows(&self, rows: &'a [&'a [u8]]) -> Result<(), SqlError> {
         let ordinal = self.completed.get();
-        if ordinal == MAX_ROUTINE_INVOCATIONS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL statement exceeds {} mutable routine invocations",
-                MAX_ROUTINE_INVOCATIONS
-            ));
-        }
-        self.results[ordinal].set(RoutineInvocationResult::Rows(rows));
+        self.results
+            .borrow_mut()
+            .push(RoutineInvocationResult::Rows(rows))
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "mutable routine replay exceeds statement memory"
+                )
+            })?;
         self.completed.set(ordinal + 1);
         Ok(())
     }

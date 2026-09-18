@@ -442,7 +442,7 @@ pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_t
 mod projected;
 pub(crate) use projected::{
     compare_projected_prefix, encode_projected_by_into, encode_projected_into,
-    projected_row_len_by, projected_row_width,
+    encode_projected_persistent_pub, projected_row_len_by, projected_row_width,
 };
 pub use projected::{
     decode_projected_col_record, decode_projected_pub, decode_projected_value,

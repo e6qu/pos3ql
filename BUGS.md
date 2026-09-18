@@ -40,6 +40,12 @@ and 1,100-call statements are qualified allocation-free, differentially, and
 after empty-cache object recovery. Retry-persistent effects use the statement
 arena tail so CTE, CTAS, and materialized-view row-scratch rewinds cannot
 invalidate recorded values.
+The remaining execution-width audit also found no external blocker. Mutable
+routine arguments and replay results now survive retries in statement memory,
+cursor indexes are sized from `cursor_bytes`, and logical-message decoding
+uses work memory. Regressions cross 1,024 calls and messages and 65,536 cursor
+rows under the allocation guard, PostgreSQL differential execution, and
+empty-cache recovery.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -1112,6 +1112,12 @@ impl Config {
                 "collation_scratch_bytes must be greater than zero".to_string(),
             ));
         }
+        if config.cursor_bytes > u32::MAX as usize {
+            return Err(ConfigError::at(
+                0,
+                "cursor_bytes must fit the cursor wire-offset representation".to_string(),
+            ));
+        }
         if config.checkpoint_manifest_bytes == 0 {
             return Err(ConfigError::at(
                 0,
@@ -2124,6 +2130,17 @@ sql_arena_bytes = 4096
                 .unwrap();
         assert_eq!(config.database_collation_locale, "C.UTF-8");
         assert_eq!(config.collation_scratch_bytes, 8 * KIB);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn cursor_bytes_fit_wire_offsets() {
+        let error = Config::parse("cursor_bytes = 4GiB\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cursor_bytes must fit the cursor wire-offset representation")
+        );
     }
 
     #[test]

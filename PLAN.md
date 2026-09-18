@@ -187,9 +187,17 @@ storage. RAM and local disk are bounded, disposable caches.
   Retry-safe volatile sequence evaluation records every call that fits that
   arena rather than stopping at 1,024. Its buffers grow from the statement
   arena tail and survive front-only per-row scratch rewinds.
+  Mutable-routine replay results and encoded pending arguments now follow the
+  same persistent-tail contract, removing the 1,024-call array and preventing
+  modification retries from reading front storage after rewind. Cursor row
+  indexes derive their startup capacity from `cursor_bytes`, so the byte
+  budget is the sole cursor-result bound rather than a separate 65,536-row
+  ceiling. Logical-replication message indexes grow in fixed work memory and
+  no longer inherit the routine-call limit.
   Allocation-forbidden regressions cover 260-table schema cascades and 1,100
-  calls before and after checkpoint and empty-cache object recovery; a
-  PostgreSQL 18 differential fixture covers both former boundaries.
+  sequence and mutable-routine calls, 1,100 logical messages, and a 70,000-row
+  cursor. Checkpoint and empty-cache object recovery preserve the durable
+  effects; PostgreSQL 18 differential fixtures cover the former boundaries.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those

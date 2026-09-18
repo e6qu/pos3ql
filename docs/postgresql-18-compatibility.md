@@ -162,6 +162,12 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   scratch rewinds. The accepted widths are exercised against PostgreSQL 18 and
   through empty-cache object recovery; statement-memory exhaustion remains
   SQLSTATE `54000`.
+- Mutable-routine replay has the same statement-memory contract, including
+  pending arguments retained across modification retries. Cursor materialized
+  row indexes are sized from `cursor_bytes` instead of a separate row-count
+  constant, and pgoutput logical-message indexes use the fixed work arena.
+  Differential and allocation-forbidden coverage crosses 1,024 calls and
+  messages and 65,536 cursor rows.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

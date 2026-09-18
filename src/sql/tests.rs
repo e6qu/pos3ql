@@ -18876,6 +18876,81 @@ fn logical_messages_are_transactional_binary_safe_and_command_ordered_body() {
 }
 
 #[test]
+fn logical_replication_message_index_scales_with_work_memory() {
+    let mut config = test_config("logical-message-work-memory");
+    config.wal_buffer_bytes = 1 << 20;
+    config.wal_bytes = 4 << 20;
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION wide_message_publication FOR ALL TABLES",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let floor = engine.storage.lsn();
+    let emitted = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT pg_logical_emit_message(true, 'wide', value::text) \
+           FROM generate_series(1, 1100) AS values(value); \
+         COMMIT",
+    );
+    assert!(
+        !String::from_utf8_lossy(&emitted).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&emitted)
+    );
+    assert_eq!(data_rows(&emitted).len(), 1_100);
+
+    let publication = crate::storage::SqlName::parse("wide_message_publication").unwrap();
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "wide message scratch", 1 << 20).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "wide message send", 1 << 20).unwrap();
+    let transaction = crate::mem::guard::forbid_alloc(|| {
+        engine.emit_replication_transaction_for_origin(
+            floor,
+            crate::sql::ReplicationEmission {
+                publications: &[publication],
+                binary: false,
+                messages: true,
+                origin: crate::storage::SubscriptionOrigin::Any,
+                protocol: crate::pg::pgoutput::ProtocolVersion::V4,
+            },
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+    })
+    .unwrap()
+    .expect("logical-message transaction exists");
+    assert!(transaction.1);
+
+    let mut messages = 0usize;
+    let mut begins = 0usize;
+    let mut commits = 0usize;
+    let mut at = 0usize;
+    while at < send.len() {
+        let bytes = send.readable();
+        let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+        let payload = &bytes[at + 5..at + 1 + length];
+        let crate::pg::pginput::CopyData::XLogData { message, .. } =
+            crate::pg::pginput::copy_data(payload).unwrap()
+        else {
+            panic!("unexpected keepalive")
+        };
+        match message {
+            crate::pg::pginput::Message::Begin { .. } => begins += 1,
+            crate::pg::pginput::Message::Commit { .. } => commits += 1,
+            crate::pg::pginput::Message::LogicalMessage { .. } => messages += 1,
+            other => panic!("unexpected pgoutput message: {other:?}"),
+        }
+        at += 1 + length;
+    }
+    assert_eq!((begins, messages, commits), (1, 1_100, 1));
+}
+
+#[test]
 fn logical_publication_of_partitioned_parent_emits_routed_leaf_changes() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -70614,6 +70689,59 @@ fn postgresql_execution_effect_width_fixture_is_one_complete_simple_query_batch(
         String::from_utf8_lossy(&output)
     );
     assert_eq!(data_rows(&output), ["1100|1|1100", "359|1"]);
+}
+
+#[test]
+fn remaining_execution_widths_are_allocation_free_and_survive_cold_recovery() {
+    let mut config = test_config("postgresql-remaining-execution-widths-fixture");
+    config.cursor_bytes = 4 << 20;
+    config.txn_rows = 4_096;
+    config.table_rows = 4_096;
+    config.memtable_bytes = 16 << 20;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("remaining-execution-widths-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let (exercise, cleanup) =
+        include_str!("../../tests/external/differential/179_remaining_execution_widths.sql")
+            .split_once("-- cleanup")
+            .unwrap();
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(&mut engine, exercise, true);
+    assert_eq!(
+        data_rows(&output),
+        ["1100|1|1100", "1100|1|1100", "65537", "70000"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    // The simulator builds heap-backed fixture keys on object GET. Production
+    // clients use startup-reserved request buffers; keep that fixture detail
+    // outside the allocation guard while still forcing empty-cache recovery.
+    let recovered = cold_session.success(
+        &mut cold,
+        "SELECT count(*), min(value), max(value) FROM execution_width_results; \
+         SELECT count(*), min(value), max(value) FROM execution_width_audit",
+        false,
+    );
+    assert_eq!(data_rows(&recovered), ["1100|1|1100", "1100|1|1100"]);
+    cold_session.success(&mut cold, cleanup, false);
+    drop(cold_session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

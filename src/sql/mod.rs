@@ -14061,7 +14061,7 @@ impl Engine {
                 exec::create_table(&mut self.storage, &mut self.wal, txn, c, arena, responder)
             }
             Stmt::DropTable(d) => {
-                exec::drop_table(&mut self.storage, &mut self.wal, txn, d, responder)
+                exec::drop_table(&mut self.storage, &mut self.wal, txn, d, arena, responder)
             }
             Stmt::CreateView {
                 name,
@@ -14204,6 +14204,7 @@ impl Engine {
                 identities,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateOperatorFamily { name, .. } => exec::create_operator_family(
@@ -14443,6 +14444,7 @@ impl Engine {
                     cascade: *cascade,
                     kind: crate::sql::ast::RoutineTargetKind::Function,
                 },
+                arena,
                 responder,
             ),
             Stmt::DropProcedure {
@@ -14459,6 +14461,7 @@ impl Engine {
                     cascade: *cascade,
                     kind: crate::sql::ast::RoutineTargetKind::Procedure,
                 },
+                arena,
                 responder,
             ),
             Stmt::DropRoutine {
@@ -14475,6 +14478,7 @@ impl Engine {
                     cascade: *cascade,
                     kind: crate::sql::ast::RoutineTargetKind::Either,
                 },
+                arena,
                 responder,
             ),
             Stmt::DropAggregate {
@@ -14488,6 +14492,7 @@ impl Engine {
                 aggregates,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::DropView {
@@ -14501,6 +14506,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateCollation(command) => {
@@ -14598,6 +14604,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::AlterForeignServer { name, action } => exec::alter_foreign_server(
@@ -14619,6 +14626,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::AlterUserMapping(command) => {
@@ -14627,9 +14635,14 @@ impl Engine {
             Stmt::DropUserMapping(command) => {
                 exec::drop_user_mapping(&mut self.storage, &mut self.wal, txn, command, responder)
             }
-            Stmt::DropForeignTable(command) => {
-                exec::drop_foreign_table(&mut self.storage, &mut self.wal, txn, command, responder)
-            }
+            Stmt::DropForeignTable(command) => exec::drop_foreign_table(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                arena,
+                responder,
+            ),
             Stmt::ImportForeignSchema(command) => exec::import_foreign_schema(
                 &mut self.storage,
                 &mut self.wal,
@@ -14700,6 +14713,7 @@ impl Engine {
                 name,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateEventTrigger(command) => exec::create_event_trigger(
@@ -14935,6 +14949,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateSequence {
@@ -14982,6 +14997,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateDomain(d) => {
@@ -15244,6 +15260,7 @@ impl Engine {
                 names,
                 *if_exists,
                 *cascade,
+                arena,
                 responder,
             ),
             Stmt::CreateDatabase { name, options } => {

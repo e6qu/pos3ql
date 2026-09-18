@@ -41236,6 +41236,10 @@ impl Storage {
             .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
     }
 
+    pub(crate) fn operator_count(&self) -> usize {
+        self.operators.len()
+    }
+
     pub(crate) fn collations_visible_to(
         &self,
         txid: u32,
@@ -42321,6 +42325,10 @@ impl Storage {
             .filter(move |(_, rule)| {
                 rule.database == self.current_database && rule.visible_to(txid)
             })
+    }
+
+    pub(crate) fn rule_count(&self) -> usize {
+        self.rules.len()
     }
 
     fn validate_rule_target(&self, target: RuleTarget, txid: u32) -> Result<(), SqlError> {

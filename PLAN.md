@@ -229,6 +229,17 @@ with runtime allocation forbidden. A separate regression crosses the former
 64-dependency ceiling, proves configured exhaustion is atomic, retries an
 ambiguous checkpoint publication, and executes the recovered definition from
 empty local caches.
+Stored-query dependency planning is likewise catalog-sized. Restrict/cascade
+closure, ordered diagnostics, type and column dependency cleanup, schema drops,
+and `DROP OWNED` allocate independent statement-arena selections from the
+configured table, view, materialized-view, routine, rewrite-rule, operator, and
+schema cardinalities instead of sharing a 128-slot array. Selection merges are
+bounded by their own catalogs, and dependency depth uses full-width indices.
+A regression places views, a SQL routine, and a rewrite rule beyond slot 127,
+checks allocation-forbidden cascade rollback and independently sized
+`DROP OWNED`, retries ambiguous checkpoint publication, removes both local
+cache tiers, and verifies the live graph and its eventual cascade from object
+storage across two cold starts.
 Deep savepoints preserve GUC, foreign-query, large-object, and cumulative
 statistics state without 8-bit nesting or truncated name lists. TRUNCATE closes
 inheritance, partition, and foreign-key fan-out over every configured table;

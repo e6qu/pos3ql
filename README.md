@@ -160,6 +160,11 @@ pending table definitions use the transaction bound together with
 `max_catalog_versions_per_object` (default 8). These are explicit startup-memory
 choices rather than compiled inline-array ceilings and may be raised for wider
 stored queries or workloads that repeatedly change one object in a transaction.
+Restrict/cascade diagnostics, schema and type cleanup, and `DROP OWNED` size
+their dependency selections independently from the configured table, view,
+materialized-view, routine, rewrite-rule, operator, and schema catalogs. There
+is no separate 128-object dependency-planning ceiling, and one catalog's
+capacity is never used to index another catalog's selection.
 
 Row MVCC history is independently sized by `max_row_versions_per_row`
 (default 8). Startup reserves global pending-command and committed-snapshot

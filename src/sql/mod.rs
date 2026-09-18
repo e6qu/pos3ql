@@ -60,7 +60,7 @@ pub mod xml;
 
 use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
 use crate::config::Config;
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
@@ -1390,12 +1390,6 @@ struct PendingLogicalMessage {
     command_id: u32,
     emitted: bool,
 }
-
-const EMPTY_PENDING_LOGICAL_MESSAGE: PendingLogicalMessage = PendingLogicalMessage {
-    record_offset: 0,
-    command_id: 0,
-    emitted: false,
-};
 
 #[derive(Clone, Copy)]
 struct ReplicationType {
@@ -3815,9 +3809,7 @@ impl Engine {
             let mut has_replication_origin = false;
             let mut subscription_origin = None;
             let mut truncate_count = 0usize;
-            let mut logical_messages =
-                [EMPTY_PENDING_LOGICAL_MESSAGE; crate::sql::query::MAX_ROUTINE_INVOCATIONS];
-            let mut logical_message_count = 0usize;
+            let mut logical_messages = ArenaList::new(filter_arena);
             let mut has_transactional_message = false;
             let mut has_nontransactional_message = false;
             let mut has_row_change = false;
@@ -3937,18 +3929,18 @@ impl Engine {
                     ..
                 }) = crate::wal::decode_record(&transaction[at + 16..at + total])
                 {
-                    if logical_message_count == logical_messages.len() {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "replication transaction contains too many logical messages"
-                        ));
-                    }
-                    logical_messages[logical_message_count] = PendingLogicalMessage {
-                        record_offset: at,
-                        command_id,
-                        emitted: false,
-                    };
-                    logical_message_count += 1;
+                    logical_messages
+                        .push(PendingLogicalMessage {
+                            record_offset: at,
+                            command_id,
+                            emitted: false,
+                        })
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "replication logical-message index exceeds work memory"
+                            )
+                        })?;
                     has_transactional_message |= transactional;
                     has_nontransactional_message |= !transactional;
                 }
@@ -3978,7 +3970,7 @@ impl Engine {
             // selected by the publication union survives statement-level
             // TRUNCATE suppression. Catalog and slot WAL stay durable but do
             // not manufacture an empty subscriber transaction.
-            let mut publication_change = messages && logical_message_count != 0;
+            let mut publication_change = messages && !logical_messages.is_empty();
             for truncate in &truncates[..truncate_count] {
                 for table_slot in &truncate_tables
                     [truncate.table_offset..truncate.table_offset + truncate.table_count]
@@ -4187,7 +4179,7 @@ impl Engine {
                             messages,
                             end_lsn,
                             command_id,
-                            &mut logical_messages[..logical_message_count],
+                            logical_messages.as_mut_slice(),
                             responder,
                         )?;
                         emit_pending_truncates(
@@ -4380,7 +4372,7 @@ impl Engine {
                             messages,
                             end_lsn,
                             command_id,
-                            &mut logical_messages[..logical_message_count],
+                            logical_messages.as_mut_slice(),
                             responder,
                         )?;
                         let Some(table_slot) = storage.find_table(schema, table) else {
@@ -4500,7 +4492,7 @@ impl Engine {
                 messages,
                 end_lsn,
                 u32::MAX,
-                &mut logical_messages[..logical_message_count],
+                logical_messages.as_mut_slice(),
                 responder,
             )?;
             if !has_nontransactional_message {
@@ -11442,7 +11434,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let invocations = query::RoutineInvocationState::new();
+        let invocations = query::RoutineInvocationState::new(arena);
         let sequence_state = sequence::SequenceReplayState::new(arena);
         let source_snapshot = txn.command_id().saturating_add(1);
         loop {
@@ -11501,7 +11493,7 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let invocations = query::RoutineInvocationState::new();
+        let invocations = query::RoutineInvocationState::new(arena);
         loop {
             self.work.reset();
             invocations.begin_attempt();
@@ -11790,7 +11782,7 @@ impl Engine {
             Err(error) => return Ok(Err(error)),
         };
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
-        let nested_invocations = query::RoutineInvocationState::new();
+        let nested_invocations = query::RoutineInvocationState::new(arena);
         nested_invocations.begin_attempt();
         let _routine_invocation_scope = query::enter_routine_invocation_scope(Some(
             query::RoutineInvocationContext::new(&nested_invocations, arena),
@@ -12238,7 +12230,7 @@ impl Engine {
             *argument = exec::decode_projected_pub(pending.arguments, index);
         }
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
-        let nested_invocations = query::RoutineInvocationState::new();
+        let nested_invocations = query::RoutineInvocationState::new(arena);
         nested_invocations.begin_attempt();
         let _routine_invocation_scope = query::enter_routine_invocation_scope(Some(
             query::RoutineInvocationContext::new(&nested_invocations, arena),

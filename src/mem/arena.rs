@@ -181,7 +181,7 @@ impl Arena {
         clippy::mut_from_ref,
         reason = "each call returns a disjoint tail region; reset() takes &mut self"
     )]
-    fn alloc_tail_slice_with<T: Copy>(
+    pub(crate) fn alloc_persistent_slice_with<T: Copy>(
         &self,
         len: usize,
         mut fill: impl FnMut(usize) -> T,
@@ -349,7 +349,8 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
         if self.len == self.capacity {
             let capacity = self.capacity.saturating_mul(2).max(4);
             let entries = if self.persistent {
-                self.arena.alloc_tail_slice_with(capacity, |_| value)?
+                self.arena
+                    .alloc_persistent_slice_with(capacity, |_| value)?
             } else {
                 self.arena.alloc_slice_with(capacity, |_| value)?
             };
@@ -381,6 +382,14 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
             &[]
         } else {
             unsafe { core::slice::from_raw_parts(self.entries, self.len) }
+        }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.is_empty() {
+            &mut []
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(self.entries, self.len) }
         }
     }
 }

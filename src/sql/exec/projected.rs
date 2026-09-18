@@ -25,6 +25,25 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
     Ok(&*out)
 }
 
+/// Encodes state that must survive front rewinds used to retry resumable
+/// execution. The statement reset still reclaims it as a unit.
+pub(crate) fn encode_projected_persistent_pub<'a>(
+    values: &[Datum],
+    arena: &'a Arena,
+) -> Result<&'a [u8], SqlError> {
+    let len = projected_row_len(values)?;
+    let out = arena
+        .alloc_persistent_slice_with(len, |_| 0u8)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "mutable routine arguments exceed statement memory"
+            )
+        })?;
+    encode_projected_into(values, out)?;
+    Ok(&*out)
+}
+
 /// Exact byte length of a projected row whose values are read by index.
 pub(crate) fn projected_row_len_by<'a>(
     count: usize,
@@ -1170,6 +1189,19 @@ mod tests {
         assert_eq!(projected_row_width(encoded), 2);
         assert_eq!(decode_projected_pub(encoded, 0), values[0]);
         assert_eq!(decode_projected_pub(encoded, 1), values[1]);
+    }
+
+    #[test]
+    fn persistent_projected_rows_survive_front_rewinds() {
+        let mut budget = Budget::new(4096);
+        let arena = Arena::new(&mut budget, "persistent projected row", 2048).unwrap();
+        let mark = arena.mark();
+        let encoded =
+            encode_projected_persistent_pub(&[Datum::Text("persistent")], &arena).unwrap();
+        let _scratch = arena.alloc_slice_with(512, |_| 0xa5u8).unwrap();
+        unsafe { arena.rewind_to(mark) };
+        let _overwrite = arena.alloc_slice_with(1024, |_| 0x5au8).unwrap();
+        assert_eq!(decode_projected_pub(encoded, 0), Datum::Text("persistent"));
     }
 
     #[test]

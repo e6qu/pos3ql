@@ -111,7 +111,7 @@ CREATE USER	complete	83_roles_acl.sql and 100_role_credentials.sql
 CREATE USER MAPPING	complete	tests/external/ci_diff.sh
 CREATE VIEW	complete	76_stored_dependencies.sql
 DEALLOCATE	complete	14_surface.sql
-DECLARE	complete	39_cursors.sql
+DECLARE	complete	39_cursors.sql and 179_remaining_execution_widths.sql (including cursor results above 65,536 rows within cursor_bytes)
 DELETE	complete	02_dml_returning.sql
 DISCARD	complete	118_database_configuration.sql
 DO	complete	100_plpgsql_procedures.sql, 112_routine_bodies_attributes_do.sql, 142_plpgsql_catalog_locals.sql, and 177_program_width.sql (arena-sized PL/pgSQL declarations and program length, catalog-typed locals, control flow, diagnostics, exceptions, queries, DML, and lone top-level transaction control)
@@ -161,10 +161,10 @@ DROP VIEW	complete	76_stored_dependencies.sql
 END	complete	05_transactions.sql
 EXECUTE	complete	14_surface.sql
 EXPLAIN	complete	48_vacuum_analyze.sql, 131_plpgsql_functions.sql, raw-wire portal, and driver structured-output coverage
-FETCH	complete	39_cursors.sql
+FETCH	complete	39_cursors.sql and 179_remaining_execution_widths.sql
 GRANT	complete	83_roles_acl.sql, 133_privilege_targets.sql, 140_catalog_schema_evolution.sql, and 141_routine_attribute_evolution.sql
 IMPORT FOREIGN SCHEMA	complete	tests/external/ci_diff.sh
-INSERT	complete	02_dml_returning.sql
+INSERT	complete	02_dml_returning.sql and 179_remaining_execution_widths.sql (including more than 1,024 side-effecting routine calls in one source)
 LISTEN	complete	14_surface.sql
 LOAD	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 LOCK	complete	67_for_update.sql

@@ -12,6 +12,10 @@ struct FunctionTimingFrame {
     child_micros: u64,
 }
 
+// This bounds only nested timing frames, not the number of routine calls in a
+// statement. Routine execution has its own statement-arena-backed replay log.
+const MAX_FUNCTION_TIMING_DEPTH: usize = 1024;
+
 impl FunctionTimingFrame {
     const EMPTY: Self = Self {
         started: 0,
@@ -20,14 +24,14 @@ impl FunctionTimingFrame {
 }
 
 struct FunctionTimingStack {
-    frames: [FunctionTimingFrame; crate::sql::query::MAX_ROUTINE_INVOCATIONS],
+    frames: [FunctionTimingFrame; MAX_FUNCTION_TIMING_DEPTH],
     depth: usize,
 }
 
 std::thread_local! {
     static FUNCTION_TIMING: std::cell::RefCell<FunctionTimingStack> = const {
         std::cell::RefCell::new(FunctionTimingStack {
-            frames: [FunctionTimingFrame::EMPTY; crate::sql::query::MAX_ROUTINE_INVOCATIONS],
+            frames: [FunctionTimingFrame::EMPTY; MAX_FUNCTION_TIMING_DEPTH],
             depth: 0,
         })
     };

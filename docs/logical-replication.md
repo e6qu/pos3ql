@@ -7,6 +7,7 @@ pos3ql implements PostgreSQL 18 logical replication where the protocol can be de
 - `IDENTIFY_SYSTEM`, logical slot creation, exported snapshots, `START_REPLICATION`, keepalives, and standby-status feedback use PostgreSQL replication-protocol framing.
 - pgoutput protocol versions 1–4 publish text or binary tuples, relation and type metadata, replica identities, inserts, updates, deletes, truncation, origins, publication projections and row filters, generated columns, and partition routing.
 - `messages = true` publishes pgoutput `M` frames. `pg_logical_emit_message` accepts text or binary content. Transactional messages retain SQL command order among row changes and disappear on rollback; nontransactional messages own an independently durable batch and survive an outer rollback.
+- Transactional message ordering uses the startup-sized work arena; there is no separate message-count ceiling. Work-memory exhaustion is a named error.
 - One complete emitted transaction must fit the startup-sized replication buffers. Exhaustion is a named error and cannot advance the slot.
 
 ## Subscriber

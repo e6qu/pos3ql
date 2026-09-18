@@ -259,6 +259,15 @@ use the same arena-backed program representation. Exhaustion returns SQLSTATE
 `54000` before a simple-query batch executes; stored programs are qualified
 through every procedural host and empty-cache object recovery.
 
+Resumable mutable-routine calls also retain every replay result and pending
+argument that fits statement memory; the persistent arena tail keeps both
+valid across per-row retry rewinds. Cursor row indexes are derived from the
+startup `cursor_bytes` buffer instead of imposing a second 65,536-row limit.
+Logical-decoding message indexes likewise consume the fixed work arena rather
+than sharing an unrelated routine-call ceiling. Allocation-forbidden and
+PostgreSQL 18 differential tests cross all three former boundaries, and the
+durable routine effects are verified after empty-cache object recovery.
+
 Implicit index OIDs reserve the complete enforcer stride. Constraint kinds use
 disjoint catalog-local OID bands for every accepted table slot and position.
 Partition-trigger clone OIDs include the

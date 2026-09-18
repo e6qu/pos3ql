@@ -2807,10 +2807,15 @@ impl Engine {
             + config.max_connections as usize * size_of::<(i32, u64)>()
             + config.max_roles * size_of::<u16>()
             + config.max_databases * size_of::<u16>()
-            + config.max_ddl_per_transaction
-                * (size_of::<(usize, bool)>() + size_of::<usize>() + size_of::<PendingTruncate>())
-            + (config.max_tables + 1)
-                * (config.max_ddl_per_transaction * size_of::<u16>() + size_of::<u32>())
+            + config.max_ddl_per_transaction.saturating_mul(
+                size_of::<(usize, bool)>() + size_of::<usize>() + size_of::<PendingTruncate>(),
+            )
+            + config.max_tables.saturating_add(1).saturating_mul(
+                config
+                    .max_ddl_per_transaction
+                    .saturating_mul(size_of::<u16>())
+                    .saturating_add(size_of::<u32>()),
+            )
             + two_phase::PreparedTransactions::budget_bytes(config)
             + crate::pg::replication_client::ReplicationClient::budget_bytes(
                 1,
@@ -3113,7 +3118,9 @@ impl Engine {
             logical_decoding_truncate_tables: FixedVec::new(
                 budget,
                 "logical_decoding_truncate_tables",
-                config.max_ddl_per_transaction * (config.max_tables + 1),
+                config
+                    .max_ddl_per_transaction
+                    .saturating_mul(config.max_tables.saturating_add(1)),
             )?,
             logical_decoding_truncate_relations: FixedVec::new(
                 budget,
@@ -11436,7 +11443,7 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let invocations = query::RoutineInvocationState::new();
-        let sequence_state = sequence::SequenceReplayState::new();
+        let sequence_state = sequence::SequenceReplayState::new(arena);
         let source_snapshot = txn.command_id().saturating_add(1);
         loop {
             self.work.reset();
@@ -16231,9 +16238,7 @@ impl Engine {
             arena,
             responder,
         } = execution;
-        let mut commands = [event_trigger::DdlCommand::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
-        let mut drops = [event_trigger::DroppedObject::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
-        let (command_count, drop_count) = event_trigger::collect(
+        let graphs = event_trigger::collect(
             &self.storage,
             txn.txid,
             statement,
@@ -16245,13 +16250,10 @@ impl Engine {
                 origin: event_ddl_origin,
                 in_extension: txn.in_extension_script(),
             },
-            event_trigger::EventGraphs {
-                commands: &mut commands,
-                drops: &mut drops,
-            },
+            arena,
         )?;
         if event_drop {
-            let _scope = event_trigger::enter_dropped_objects(&drops[..drop_count]);
+            let _scope = event_trigger::enter_dropped_objects(graphs.drops);
             self.fire_event_triggers(
                 EventTriggerInvocation::SqlDrop { tag },
                 EventTriggerExecution {
@@ -16265,7 +16267,7 @@ impl Engine {
             )?;
         }
         if event_end {
-            let _scope = event_trigger::enter_ddl_commands(&commands[..command_count]);
+            let _scope = event_trigger::enter_ddl_commands(graphs.commands);
             self.fire_event_triggers(
                 EventTriggerInvocation::DdlCommandEnd { tag },
                 EventTriggerExecution {
@@ -17624,7 +17626,7 @@ impl Engine {
             let (text, binary) = cursors.result_buffers(at);
             let mut capture = Responder::for_cursor(text, binary);
             capture.set_render(guc.render());
-            let sequence_state = sequence::SequenceReplayState::new();
+            let sequence_state = sequence::SequenceReplayState::new(arena);
             let sequence = sequence::ReplaySeqEval::new(
                 sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
                 &sequence_state,
@@ -17742,7 +17744,7 @@ impl Engine {
             capture
                 .row_description(&columns[..count])
                 .map_err(|_| cursor_result_too_large())?;
-            let sequence_state = sequence::SequenceReplayState::new();
+            let sequence_state = sequence::SequenceReplayState::new(arena);
             let sequence = sequence::ReplaySeqEval::new(
                 sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
                 &sequence_state,

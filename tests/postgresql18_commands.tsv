@@ -75,7 +75,7 @@ CREATE COLLATION	complete	120_collation_conversion.sql
 CREATE CONVERSION	complete	120_collation_conversion.sql
 CREATE DATABASE	complete	118_database_configuration.sql
 CREATE DOMAIN	complete	62_domains.sql
-CREATE EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
+CREATE EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql and 178_execution_effect_width.sql (lifecycle, filtering, and statement-arena-sized object graphs)
 CREATE EXTENSION	complete	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
 CREATE FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
 CREATE FOREIGN TABLE	complete	tests/external/ci_diff.sh
@@ -93,7 +93,7 @@ CREATE PUBLICATION	complete	84_publication.sql, typed descendant selection, priv
 CREATE ROLE	complete	83_roles_acl.sql, 100_role_credentials.sql, and 140_catalog_schema_evolution.sql cover attributes, SCRAM/MD5 credentials, aliases, initial memberships, and recovery
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	complete	37_schemas.sql and typed dynamic-utility checkpoint/cold-recovery coverage
-CREATE SEQUENCE	complete	54_sequence.sql and 145_relation_persistence.sql (permanent, temporary, and unlogged variants with typed catalog and recovery boundaries)
+CREATE SEQUENCE	complete	54_sequence.sql, 145_relation_persistence.sql, and 178_execution_effect_width.sql (permanent, temporary, and unlogged variants, typed catalog and recovery boundaries, and arena-sized retry effects)
 CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
@@ -122,7 +122,7 @@ DROP COLLATION	complete	120_collation_conversion.sql
 DROP CONVERSION	complete	120_collation_conversion.sql
 DROP DATABASE	complete	118_database_configuration.sql
 DROP DOMAIN	complete	62_domains.sql
-DROP EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
+DROP EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql and 178_execution_effect_width.sql
 DROP EXTENSION	complete	111_extension_lifecycle.sql covers SQL-package dependency classes; native packages are not loaded
 DROP FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh
 DROP FOREIGN TABLE	complete	tests/external/ci_diff.sh
@@ -141,7 +141,7 @@ DROP PUBLICATION	complete	84_publication.sql and publication lifecycle recovery 
 DROP ROLE	complete	83_roles_acl.sql and 100_role_credentials.sql cover dependencies, aliases, quoted special names, and recovery
 DROP ROUTINE	complete	90_routine_lifecycle.sql and 141_routine_attribute_evolution.sql
 DROP RULE	complete	tests/external/differential/122_rewrite_rules.sql
-DROP SCHEMA	complete	37_schemas.sql
+DROP SCHEMA	complete	37_schemas.sql and 178_execution_effect_width.sql (including event-trigger graphs beyond 256 objects)
 DROP SEQUENCE	complete	54_sequence.sql
 DROP SERVER	complete	tests/external/ci_diff.sh
 DROP STATISTICS	complete	109_extended_statistics.sql
@@ -184,7 +184,7 @@ ROLLBACK PREPARED	complete	120_two_phase_transactions.sql
 ROLLBACK TO SAVEPOINT	complete	05_transactions.sql
 SAVEPOINT	complete	05_transactions.sql
 SECURITY LABEL	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
-SELECT	complete	14_surface.sql
+SELECT	complete	14_surface.sql and 178_execution_effect_width.sql (including more than 1,024 retry-safe volatile sequence calls)
 SELECT INTO	complete	69_select_into.sql and 145_relation_persistence.sql cover permanent and temporary persistence
 SET	complete	75_guc_mutation.sql and 119_transaction_configuration.sql
 SET CONSTRAINTS	complete	101_trigger_timing.sql

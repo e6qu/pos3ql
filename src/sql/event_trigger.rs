@@ -3,7 +3,7 @@
 use core::cell::Cell;
 use core::fmt::Write as _;
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{DropTable, Stmt};
 use crate::sql::catalog;
 use crate::sql::eval::{SqlError, sqlstate};
@@ -12,7 +12,6 @@ use crate::sql_err;
 use crate::storage::{RoutineKind, Storage};
 use crate::util::StackStr;
 
-pub(crate) const MAX_EVENT_OBJECTS: usize = 256;
 pub(crate) const MAX_ADDRESS_PARTS: usize = crate::storage::MAX_ROUTINE_ARGUMENTS;
 type EventIdentity = StackStr<8192>;
 type EventAddressPart = StackStr<512>;
@@ -20,15 +19,13 @@ type EventAddressPart = StackStr<512>;
 #[derive(Clone, Copy)]
 pub(crate) struct BeforeDdl<'a> {
     altered_table: Option<(usize, &'a crate::storage::TableDef)>,
-    dependent_drops: [Option<(EventObjectRef, bool)>; MAX_EVENT_OBJECTS],
-    dependent_drop_count: usize,
+    dependent_drops: &'a [(EventObjectRef, bool)],
 }
 
 impl BeforeDdl<'_> {
     pub(crate) const EMPTY: Self = Self {
         altered_table: None,
-        dependent_drops: [None; MAX_EVENT_OBJECTS],
-        dependent_drop_count: 0,
+        dependent_drops: &[],
     };
 }
 
@@ -39,6 +36,7 @@ pub(crate) fn capture_before<'a>(
     arena: &'a Arena,
 ) -> Result<BeforeDdl<'a>, SqlError> {
     let mut before = BeforeDdl::EMPTY;
+    let mut dependent_drops = ArenaList::new(arena);
     let alter_root = match statement {
         Stmt::AlterTable(alter)
             if alter.actions.iter().any(|action| {
@@ -123,19 +121,16 @@ pub(crate) fn capture_before<'a>(
                 catalog::FIRST_FK_OID + child_slot as i32 * 64 + foreign_key_index as i32,
                 foreign_key.name.as_str(),
             );
-            if before.dependent_drops[..before.dependent_drop_count]
+            if dependent_drops
+                .as_slice()
                 .iter()
-                .flatten()
                 .any(|(existing, _)| *existing == reference)
             {
                 continue;
             }
-            let target = before
-                .dependent_drops
-                .get_mut(before.dependent_drop_count)
-                .ok_or_else(graph_full)?;
-            *target = Some((reference, true));
-            before.dependent_drop_count += 1;
+            dependent_drops
+                .push((reference, true))
+                .map_err(|_| graph_full())?;
             for ordinal in 0..4 {
                 let reference = foreign_key_trigger_reference(
                     child,
@@ -144,15 +139,13 @@ pub(crate) fn capture_before<'a>(
                     foreign_key,
                     ordinal,
                 );
-                let target = before
-                    .dependent_drops
-                    .get_mut(before.dependent_drop_count)
-                    .ok_or_else(graph_full)?;
-                *target = Some((reference, false));
-                before.dependent_drop_count += 1;
+                dependent_drops
+                    .push((reference, false))
+                    .map_err(|_| graph_full())?;
             }
         }
     }
+    before.dependent_drops = dependent_drops.as_slice();
     Ok(before)
 }
 
@@ -195,12 +188,6 @@ pub(crate) struct DdlCommand {
 }
 
 impl DdlCommand {
-    pub(crate) const EMPTY: Self = Self {
-        reference: EventObjectRef::Empty,
-        command_tag: StackStr::new(),
-        in_extension: false,
-    };
-
     pub(crate) fn object(self, storage: &Storage, txid: u32) -> Result<EventObject, SqlError> {
         self.reference.materialize(storage, txid)
     }
@@ -219,13 +206,6 @@ pub(crate) struct DroppedObject {
 }
 
 impl DroppedObject {
-    pub(crate) const EMPTY: Self = Self {
-        reference: EventObjectRef::Empty,
-        original: false,
-        normal: false,
-        temporary: false,
-    };
-
     pub(crate) fn object(self, storage: &Storage, txid: u32) -> Result<EventObject, SqlError> {
         self.reference.materialize(storage, txid)
     }
@@ -343,7 +323,6 @@ enum ObjectRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventObjectRef {
-    Empty,
     Utility(StackStr<32>),
     Primary(ObjectRef),
     TableIndex {
@@ -410,7 +389,6 @@ enum EventObjectRef {
 impl EventObjectRef {
     fn materialize(self, storage: &Storage, txid: u32) -> Result<EventObject, SqlError> {
         Ok(match self {
-            Self::Empty => return Err(graph_full()),
             Self::Utility(object_type) => EventObject {
                 object_type,
                 ..EventObject::EMPTY
@@ -863,7 +841,7 @@ fn qualified(schema: &str, name: &str) -> Result<EventIdentity, SqlError> {
 fn graph_full() -> SqlError {
     sql_err!(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-        "event-trigger object graph exceeds its startup-sized capacity"
+        "event-trigger object graph exceeds statement memory"
     )
 }
 
@@ -3057,48 +3035,51 @@ fn is_original(
 }
 
 fn push_command(
-    output: &mut [DdlCommand; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DdlCommand>,
     count: &mut usize,
     reference: EventObjectRef,
     tag: &str,
     in_extension: bool,
 ) -> Result<(), SqlError> {
-    let slot = output.get_mut(*count).ok_or_else(graph_full)?;
-    *slot = DdlCommand {
-        reference,
-        command_tag: StackStr::from_str(tag),
-        in_extension,
-    };
+    output
+        .push(DdlCommand {
+            reference,
+            command_tag: StackStr::from_str(tag),
+            in_extension,
+        })
+        .map_err(|_| graph_full())?;
     *count += 1;
     Ok(())
 }
 
 fn push_drop(
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
     reference: EventObjectRef,
     original: bool,
     normal: bool,
 ) -> Result<(), SqlError> {
-    let slot = output.get_mut(*count).ok_or_else(graph_full)?;
-    *slot = DroppedObject {
-        reference,
-        original,
-        normal,
-        temporary: false,
-    };
+    output
+        .push(DroppedObject {
+            reference,
+            original,
+            normal,
+            temporary: false,
+        })
+        .map_err(|_| graph_full())?;
     *count += 1;
     Ok(())
 }
 
 fn push_drop_once(
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
     reference: EventObjectRef,
     original: bool,
     normal: bool,
 ) -> Result<(), SqlError> {
-    if output[..*count]
+    if output
+        .as_slice()
         .iter()
         .any(|dropped| dropped.reference == reference)
     {
@@ -3162,7 +3143,7 @@ fn push_foreign_key_trigger_drops(
     child_slot: usize,
     foreign_key_index: usize,
     foreign_key: &crate::storage::ForeignKey,
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     for ordinal in 0..4 {
@@ -3202,7 +3183,7 @@ fn push_alter_table_drops(
     before: BeforeDdl<'_>,
     storage: &Storage,
     txid: u32,
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     let (slot, old) = match before.altered_table {
@@ -3550,7 +3531,7 @@ fn push_table_indexes(
     storage: &Storage,
     txid: u32,
     slot: usize,
-    output: &mut [DdlCommand; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DdlCommand>,
     count: &mut usize,
     in_extension: bool,
 ) -> Result<(), SqlError> {
@@ -3614,7 +3595,7 @@ fn push_table_drop_dependents(
     storage: &Storage,
     txid: u32,
     slot: usize,
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     let table = storage.table_def(slot, txid);
@@ -3793,7 +3774,7 @@ fn push_view_drop_dependents(
     _storage: &Storage,
     slot: usize,
     parent_is_normal: bool,
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     let view_ref = u16::try_from(slot).map_err(|_| graph_full())?;
@@ -3824,7 +3805,7 @@ fn push_type_drop_dependents(
     storage: &Storage,
     txid: u32,
     reference: ObjectRef,
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     match reference {
@@ -3887,7 +3868,7 @@ fn push_drop_dependents(
     txid: u32,
     reference: ObjectRef,
     parent_is_normal: bool,
-    output: &mut [DroppedObject; MAX_EVENT_OBJECTS],
+    output: &mut ArenaList<'_, DroppedObject>,
     count: &mut usize,
 ) -> Result<(), SqlError> {
     match reference {
@@ -3914,18 +3895,18 @@ pub(crate) struct CollectChanges<'a, 'b> {
 }
 
 pub(crate) struct EventGraphs<'a> {
-    pub commands: &'a mut [DdlCommand; MAX_EVENT_OBJECTS],
-    pub drops: &'a mut [DroppedObject; MAX_EVENT_OBJECTS],
+    pub commands: &'a [DdlCommand],
+    pub drops: &'a [DroppedObject],
 }
 
-pub(crate) fn collect(
+pub(crate) fn collect<'a>(
     storage: &Storage,
     txid: u32,
     statement: &Stmt<'_>,
     tag: &str,
     changes: CollectChanges<'_, '_>,
-    graphs: EventGraphs<'_>,
-) -> Result<(usize, usize), SqlError> {
+    arena: &'a Arena,
+) -> Result<EventGraphs<'a>, SqlError> {
     let CollectChanges {
         before,
         undo,
@@ -3933,12 +3914,13 @@ pub(crate) fn collect(
         origin,
         in_extension,
     } = changes;
-    let EventGraphs { commands, drops } = graphs;
+    let mut commands = ArenaList::new(arena);
+    let mut drops = ArenaList::new(arena);
     let mut command_count = 0;
     let mut drop_count = 0;
     if let Some(object_type) = utility_command_object_type(statement) {
         push_command(
-            commands,
+            &mut commands,
             &mut command_count,
             EventObjectRef::Utility(StackStr::from_str(object_type)),
             tag,
@@ -3959,37 +3941,51 @@ pub(crate) fn collect(
                 continue;
             }
             push_drop(
-                drops,
+                &mut drops,
                 &mut drop_count,
                 EventObjectRef::Primary(reference),
                 original,
                 !original,
             )?;
-            push_drop_dependents(storage, txid, reference, !original, drops, &mut drop_count)?;
+            push_drop_dependents(
+                storage,
+                txid,
+                reference,
+                !original,
+                &mut drops,
+                &mut drop_count,
+            )?;
         }
     }
-    push_alter_table_drops(statement, before, storage, txid, drops, &mut drop_count)?;
-    for (reference, normal) in before.dependent_drops[..before.dependent_drop_count]
-        .iter()
-        .flatten()
-        .copied()
-    {
-        push_drop_once(drops, &mut drop_count, reference, false, normal)?;
+    push_alter_table_drops(
+        statement,
+        before,
+        storage,
+        txid,
+        &mut drops,
+        &mut drop_count,
+    )?;
+    for (reference, normal) in before.dependent_drops.iter().copied() {
+        push_drop_once(&mut drops, &mut drop_count, reference, false, normal)?;
     }
-    let mut seen_commands: [Option<EventObjectRef>; MAX_EVENT_OBJECTS] = [None; MAX_EVENT_OBJECTS];
-    let mut seen_command_count = 0usize;
+    let mut seen_commands = ArenaList::new(arena);
     for (&entry, &entry_origin) in undo.iter().zip(undo_origins) {
         if entry_origin != origin {
             continue;
         }
         if let DdlUndo::CommentSet { slot, .. } = entry {
             let reference = comment_reference(storage, txid, slot as usize, statement)?;
-            if seen_commands[..seen_command_count].contains(&Some(reference)) {
+            if seen_commands.as_slice().contains(&reference) {
                 continue;
             }
-            seen_commands[seen_command_count] = Some(reference);
-            seen_command_count += 1;
-            push_command(commands, &mut command_count, reference, tag, in_extension)?;
+            seen_commands.push(reference).map_err(|_| graph_full())?;
+            push_command(
+                &mut commands,
+                &mut command_count,
+                reference,
+                tag,
+                in_extension,
+            )?;
             continue;
         }
         let Some((reference, mutation)) = mutation(storage, entry) else {
@@ -4003,13 +3999,14 @@ pub(crate) fn collect(
                 continue;
             }
             let command_reference = EventObjectRef::Primary(reference);
-            if seen_commands[..seen_command_count].contains(&Some(command_reference)) {
+            if seen_commands.as_slice().contains(&command_reference) {
                 continue;
             }
-            seen_commands[seen_command_count] = Some(command_reference);
-            seen_command_count += 1;
+            seen_commands
+                .push(command_reference)
+                .map_err(|_| graph_full())?;
             push_command(
-                commands,
+                &mut commands,
                 &mut command_count,
                 command_reference,
                 tag,
@@ -4022,12 +4019,17 @@ pub(crate) fn collect(
                     storage,
                     txid,
                     slot,
-                    commands,
+                    &mut commands,
                     &mut command_count,
                     in_extension,
                 )?;
             }
         }
     }
-    Ok((command_count, drop_count))
+    debug_assert_eq!(command_count, commands.len());
+    debug_assert_eq!(drop_count, drops.len());
+    Ok(EventGraphs {
+        commands: commands.as_slice(),
+        drops: drops.as_slice(),
+    })
 }

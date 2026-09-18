@@ -5,7 +5,7 @@
 //! arena size, loudly). No allocation anywhere.
 
 use super::txn::{TxnMode, TxnState};
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::mem::fixed_vec::FixedVec;
 use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
@@ -15338,50 +15338,24 @@ struct TriggerBlock<'a> {
 /// prefix behind in the bump arena, so capacity doubles geometrically and the
 /// total abandoned scratch remains bounded by the final slice size.
 struct ProgramList<'a, T: Copy> {
-    arena: &'a Arena,
-    entries: *mut T,
-    len: usize,
-    capacity: usize,
+    entries: ArenaList<'a, T>,
 }
 
 impl<'a, T: Copy + 'a> ProgramList<'a, T> {
     const fn new(arena: &'a Arena) -> Self {
         Self {
-            arena,
-            entries: core::ptr::null_mut(),
-            len: 0,
-            capacity: 0,
+            entries: ArenaList::new(arena),
         }
     }
 
     fn push(&mut self, value: T) -> Result<(), SqlError> {
-        if self.len == self.capacity {
-            let capacity = self.capacity.saturating_mul(2).max(4);
-            let entries = self
-                .arena
-                .alloc_slice_with(capacity, |_| value)
-                .map_err(|_| super::query::arena_full_pub())?;
-            if self.len != 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(self.entries, entries.as_mut_ptr(), self.len);
-                }
-            }
-            self.entries = entries.as_mut_ptr();
-            self.capacity = capacity;
-        }
-        unsafe {
-            self.entries.add(self.len).write(value);
-        }
-        self.len += 1;
-        Ok(())
+        self.entries
+            .push(value)
+            .map_err(|_| super::query::arena_full_pub())
     }
 
     fn as_slice(&self) -> &'a [T] {
-        if self.len == 0 {
-            &[]
-        } else {
-            unsafe { core::slice::from_raw_parts(self.entries, self.len) }
-        }
+        self.entries.as_slice()
     }
 }
 
@@ -38218,7 +38192,7 @@ pub fn create_table_as(
             Ok(s) => s,
             Err(e) => return sql_fail(e),
         };
-        let replay_state = crate::sql::sequence::SequenceReplayState::new();
+        let replay_state = crate::sql::sequence::SequenceReplayState::new(arena);
         let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
             crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
             &replay_state,
@@ -38490,7 +38464,7 @@ pub fn refresh_materialized_view(
         Ok(select) => select,
         Err(error) => return sql_fail(error),
     };
-    let replay_state = crate::sql::sequence::SequenceReplayState::new();
+    let replay_state = crate::sql::sequence::SequenceReplayState::new(arena);
     let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
         crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
         &replay_state,

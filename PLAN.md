@@ -179,6 +179,17 @@ storage. RAM and local disk are bounded, disposable caches.
   or 255-entry arrays. Named arena exhaustion is atomic. PostgreSQL 18
   differential coverage, allocation-forbidden batches, all procedural hosts,
   and empty-cache recovery qualify programs beyond the former boundary.
+- Transaction and statement effect logs do not impose secondary compiled
+  widths. `max_ddl_per_transaction` may exceed 256 and continues to size every
+  startup-reserved transaction, commit, prepared, apply, and logical-decoding
+  structure. Event-trigger command, dropped-object, dependent-drop, and
+  deduplication graphs grow geometrically in the fixed statement arena.
+  Retry-safe volatile sequence evaluation records every call that fits that
+  arena rather than stopping at 1,024. Its buffers grow from the statement
+  arena tail and survive front-only per-row scratch rewinds.
+  Allocation-forbidden regressions cover 260-table schema cascades and 1,100
+  calls before and after checkpoint and empty-cache object recovery; a
+  PostgreSQL 18 differential fixture covers both former boundaries.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those

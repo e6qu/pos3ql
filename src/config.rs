@@ -1229,15 +1229,10 @@ impl Config {
                 "max_locks_per_transaction must be greater than zero".to_string(),
             ));
         }
-        if config.max_ddl_per_transaction == 0
-            || config.max_ddl_per_transaction > crate::sql::event_trigger::MAX_EVENT_OBJECTS
-        {
+        if config.max_ddl_per_transaction == 0 {
             return Err(ConfigError::at(
                 0,
-                format!(
-                    "max_ddl_per_transaction must be between 1 and {}",
-                    crate::sql::event_trigger::MAX_EVENT_OBJECTS
-                ),
+                "max_ddl_per_transaction must be greater than zero".to_string(),
             ));
         }
         for (name, capacity) in [
@@ -1919,7 +1914,12 @@ sql_arena_bytes = 4096
         assert!(Config::parse("memtable_bytes = lots\n").is_err());
         assert!(Config::parse("max_connections = -1\n").is_err());
         assert!(Config::parse("max_ddl_per_transaction = 0\n").is_err());
-        assert!(Config::parse("max_ddl_per_transaction = 257\n").is_err());
+        assert_eq!(
+            Config::parse("max_ddl_per_transaction = 257\n")
+                .unwrap()
+                .max_ddl_per_transaction,
+            257
+        );
         assert!(Config::parse("max_rules = 0\n").is_err());
         assert!(Config::parse("max_stored_query_dependencies_per_object = 0\n").is_err());
         assert!(Config::parse("max_stored_query_dependencies_per_object = 256\n").is_err());

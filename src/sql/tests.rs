@@ -9666,6 +9666,109 @@ impl ConfiguredTransactionSession {
 }
 
 #[test]
+fn statement_arena_scales_event_graphs_ddl_and_sequence_effects_through_cold_recovery() {
+    use core::fmt::Write;
+
+    const TABLES_PER_SCHEMA: usize = 260;
+    const DROPPED_OBJECTS: usize = 1 + TABLES_PER_SCHEMA * 3;
+
+    let mut config = test_config("arena-backed-execution-effects");
+    config.max_tables = TABLES_PER_SCHEMA * 2 + 1;
+    config.max_ddl_per_transaction = 1_024;
+    config.txn_rows = 2_048;
+    config.table_rows = 8;
+    config.memtable_bytes = 8 << 20;
+    config.wal_bytes = 32 << 20;
+    config.wal_buffer_bytes = 8 << 20;
+    config.checkpoint_manifest_bytes = 8 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    // The simulator owns heap-backed fixture state. Keep commit-batch upload
+    // out of allocation-forbidden statements; the explicit checkpoint still
+    // proves empty-cache object recovery.
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("arena-effects-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(3usize << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    session.success(
+        &mut engine,
+        "CREATE TABLE wide_drop_audit(tag text, objects bigint, originals bigint); \
+         CREATE FUNCTION record_wide_drop() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+           BEGIN \
+             INSERT INTO wide_drop_audit \
+               SELECT 'DROP SCHEMA', count(*), \
+                      sum(CASE WHEN original THEN 1 ELSE 0 END) \
+                 FROM pg_event_trigger_dropped_objects(); \
+             RETURN; \
+           END \
+         $$; \
+         CREATE EVENT TRIGGER record_wide_drop_end ON sql_drop \
+           EXECUTE FUNCTION record_wide_drop(); \
+         CREATE SEQUENCE wide_effect_sequence",
+        false,
+    );
+
+    for schema in ["wide_drop_live", "wide_drop_cold"] {
+        session.success(&mut engine, &format!("CREATE SCHEMA {schema}"), false);
+        let mut batch = String::new();
+        for table in 0..TABLES_PER_SCHEMA {
+            writeln!(batch, "CREATE TABLE {schema}.t_{table:03}(value integer);").unwrap();
+            if (table + 1) % 16 == 0 || table + 1 == TABLES_PER_SCHEMA {
+                session.success(&mut engine, &batch, false);
+                batch.clear();
+            }
+        }
+    }
+
+    let live_drop = session.success(&mut engine, "DROP SCHEMA wide_drop_live CASCADE", true);
+    assert!(!message_types(&live_drop).contains(&b'E'));
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT tag, objects, originals FROM wide_drop_audit",
+            true,
+        )),
+        [format!("DROP SCHEMA|{DROPPED_OBJECTS}|1")]
+    );
+    let sequence_rows = data_rows(&session.success(
+        &mut engine,
+        "SELECT nextval('wide_effect_sequence') FROM generate_series(1, 1100)",
+        true,
+    ));
+    assert_eq!(sequence_rows.len(), 1_100);
+    assert_eq!(sequence_rows.first().unwrap(), "1");
+    assert_eq!(sequence_rows.last().unwrap(), "1100");
+    session.success(&mut engine, "TRUNCATE wide_drop_audit", true);
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(3usize << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    cold_session.success(&mut cold, "DROP SCHEMA wide_drop_cold CASCADE", true);
+    let cold_rows = data_rows(&cold_session.success(
+        &mut cold,
+        "SELECT tag, objects, originals FROM wide_drop_audit; \
+         SELECT nextval('wide_effect_sequence') FROM generate_series(1, 1100)",
+        true,
+    ));
+    assert_eq!(cold_rows.len(), 1_101);
+    assert_eq!(cold_rows[0], format!("DROP SCHEMA|{DROPPED_OBJECTS}|1"));
+    assert_eq!(cold_rows[1], "1101");
+    assert_eq!(cold_rows.last().unwrap(), "2200");
+    drop(cold_session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn configured_transaction_capacity_covers_deep_savepoints_and_deferred_checking() {
     let mut config = test_config("deep-savepoints-deferred-checking");
     config.max_savepoints_per_transaction = 257;
@@ -70488,4 +70591,49 @@ fn postgresql_program_width_fixture_is_one_complete_simple_query_batch() {
         String::from_utf8_lossy(&output)
     );
     assert_eq!(data_rows(&output), ["42|69|70|100", "72|141", "66"]);
+}
+
+#[test]
+fn postgresql_execution_effect_width_fixture_is_one_complete_simple_query_batch() {
+    let mut config = test_config("postgresql-execution-effect-width-fixture");
+    config.max_tables = 96;
+    config.max_value_indexes = 64;
+    config.max_ddl_per_transaction = 512;
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with_ddl_capacity(
+        &mut engine,
+        &mut budget,
+        include_str!("../../tests/external/differential/178_execution_effect_width.sql"),
+        config.max_ddl_per_transaction,
+        16 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(data_rows(&output), ["1100|1|1100", "359|1"]);
+}
+
+#[test]
+fn cte_ctas_sequence_effects_survive_row_scratch_rewinds() {
+    let config = test_config("cte-ctas-persistent-sequence-effects");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE effect_rewind_sequence;
+         CREATE TABLE effect_rewind_source(id integer);
+         INSERT INTO effect_rewind_source VALUES (1), (2), (3);
+         CREATE TABLE effect_rewind_copy AS
+           WITH value AS MATERIALIZED (
+             SELECT nextval('effect_rewind_sequence') AS sequence_value, id
+             FROM effect_rewind_source ORDER BY id
+           )
+           SELECT sequence_value, id FROM value;
+         SELECT sequence_value, id FROM effect_rewind_copy ORDER BY id;",
+    );
+    assert_eq!(data_rows(&output), ["1|1", "2|2", "3|3"]);
 }

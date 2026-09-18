@@ -33,6 +33,13 @@ The procedural program-width audit found no external blocker: simple-query and
 stored SQL programs, PL/pgSQL locals, branches, handlers, conditions, and loop
 control now use statement-arena storage, with differential and object-cold
 qualification beyond the former compiled limits.
+The execution-effect audit found no external blocker: event-trigger object
+graphs and volatile sequence replay now grow within statement memory, and
+configured transaction DDL capacity is no longer capped at 256. Wide cascades
+and 1,100-call statements are qualified allocation-free, differentially, and
+after empty-cache object recovery. Retry-persistent effects use the statement
+arena tail so CTE, CTAS, and materialized-view row-scratch rewinds cannot
+invalidate recorded values.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -152,7 +152,13 @@ and cold recovery use the same configured bound.
 `max_ddl_per_transaction` sizes catalog undo, commit, prepared-transaction,
 subscription-apply, and logical-decoding state together. It is reserved for
 every transaction slot at startup; exhaustion aborts the current statement or
-transaction instead of partially applying bulk DDL. Stored-query dependencies
+transaction instead of partially applying bulk DDL. It has no separate
+compiled 256-change ceiling. Event-trigger command and dropped-object graphs
+grow within the fixed statement arena, so dependent-object reporting does not
+impose a narrower catalog limit. Retry-safe volatile sequence results use that
+same arena contract instead of a 1,024-call array. Persistent effects grow from
+the arena tail, separately from front-grown row scratch, so executor rewinds
+cannot invalidate retry state. Stored-query dependencies
 for views, materialized views, rules, policies, and routines use one contiguous
 startup pool, with `max_stored_query_dependencies_per_object` (default 64,
 durable maximum 255) as the sole per-object bound. Their pending versions and

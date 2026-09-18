@@ -153,6 +153,15 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   exhaustion is reported before a simple batch executes, while accepted stored
   functions, procedures, triggers, event triggers, and anonymous blocks retain
   their complete programs across WAL, checkpoints, and object-cold recovery.
+- Event-trigger command and dropped-object graphs are statement-arena bounded,
+  including dependent objects and duplicate suppression; they have no separate
+  256-object limit. `max_ddl_per_transaction` is independently startup-sized
+  and may exceed 256. Retry-safe `nextval`, `currval`, `lastval`, and `setval`
+  effects likewise use statement memory rather than a 1,024-call array. The
+  persistent log grows from the arena tail and survives front-only executor
+  scratch rewinds. The accepted widths are exercised against PostgreSQL 18 and
+  through empty-cache object recovery; statement-memory exhaustion remains
+  SQLSTATE `54000`.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

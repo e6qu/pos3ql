@@ -16,6 +16,7 @@ pub struct Arena {
     base: *mut u8,
     capacity: usize,
     offset: Cell<usize>,
+    tail_offset: Cell<usize>,
     high_water: Cell<usize>,
 }
 
@@ -71,6 +72,7 @@ impl Arena {
             base,
             capacity,
             offset: Cell::new(0),
+            tail_offset: Cell::new(capacity),
             high_water: Cell::new(0),
         })
     }
@@ -173,10 +175,32 @@ impl Arena {
         }
     }
 
+    /// Allocates persistent statement state from the opposite end of the
+    /// arena. Front rewinds used for per-row scratch cannot reclaim it.
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "each call returns a disjoint tail region; reset() takes &mut self"
+    )]
+    fn alloc_tail_slice_with<T: Copy>(
+        &self,
+        len: usize,
+        mut fill: impl FnMut(usize) -> T,
+    ) -> Result<&mut [T], ArenaFull> {
+        let layout = Layout::array::<T>(len).map_err(|_| self.full(usize::MAX))?;
+        let ptr = self.alloc_raw_tail(layout)?.cast::<T>();
+        unsafe {
+            for i in 0..len {
+                ptr.add(i).write(fill(i));
+            }
+            Ok(core::slice::from_raw_parts_mut(ptr, len))
+        }
+    }
+
     /// Rewinds the arena. Requires `&mut self`, so the borrow checker
     /// guarantees no allocation handed out earlier is still alive.
     pub fn reset(&mut self) {
         self.offset.set(0);
+        self.tail_offset.set(self.capacity);
     }
 
     /// Marks the current frontier for allocation-free per-row scratch reuse.
@@ -187,7 +211,8 @@ impl Arena {
         }
     }
 
-    /// Recycles every allocation made after `mark`.
+    /// Recycles every front allocation made after `mark`. Persistent tail
+    /// allocations remain live until the whole arena is reset.
     ///
     /// # Safety
     ///
@@ -208,7 +233,7 @@ impl Arena {
     }
 
     pub fn used(&self) -> usize {
-        self.offset.get()
+        self.offset.get() + self.capacity - self.tail_offset.get()
     }
 
     /// Highest fill ever reached — observability for sizing the arena.
@@ -232,12 +257,38 @@ impl Arena {
         let end = start
             .checked_add(layout.size())
             .ok_or_else(|| self.full(layout.size()))?;
-        if end > self.capacity {
+        if end > self.tail_offset.get() {
             return Err(self.full(layout.size()));
         }
         self.offset.set(end);
-        if end > self.high_water.get() {
-            self.high_water.set(end);
+        let used = end + self.capacity - self.tail_offset.get();
+        if used > self.high_water.get() {
+            self.high_water.set(used);
+        }
+        Ok(unsafe { self.base.add(start) })
+    }
+
+    fn alloc_raw_tail(&self, layout: Layout) -> Result<*mut u8, ArenaFull> {
+        assert!(
+            layout.align() <= ARENA_ALIGN,
+            "arena '{}': alignment {} exceeds arena alignment {}",
+            self.what,
+            layout.align(),
+            ARENA_ALIGN
+        );
+        let unaligned = self
+            .tail_offset
+            .get()
+            .checked_sub(layout.size())
+            .ok_or_else(|| self.full(layout.size()))?;
+        let start = unaligned & !(layout.align() - 1);
+        if start < self.offset.get() {
+            return Err(self.full(layout.size()));
+        }
+        self.tail_offset.set(start);
+        let used = self.offset.get() + self.capacity - start;
+        if used > self.high_water.get() {
+            self.high_water.set(used);
         }
         Ok(unsafe { self.base.add(start) })
     }
@@ -246,7 +297,7 @@ impl Arena {
         ArenaFull {
             what: self.what,
             requested,
-            remaining: self.capacity - self.offset.get(),
+            remaining: self.tail_offset.get() - self.offset.get(),
             capacity: self.capacity,
         }
     }
@@ -257,6 +308,80 @@ impl Drop for Arena {
         let layout =
             Layout::from_size_align(self.capacity, ARENA_ALIGN).expect("validated at construction");
         unsafe { std::alloc::dealloc(self.base, layout) };
+    }
+}
+
+/// A geometrically growing list whose backing storage comes from one arena.
+/// Growth leaves the old prefix in the bump arena, so all abandoned storage
+/// is bounded by the final capacity and reclaimed with the arena.
+pub(crate) struct ArenaList<'a, T: Copy> {
+    arena: &'a Arena,
+    entries: *mut T,
+    len: usize,
+    capacity: usize,
+    persistent: bool,
+}
+
+impl<'a, T: Copy + 'a> ArenaList<'a, T> {
+    pub(crate) const fn new(arena: &'a Arena) -> Self {
+        Self {
+            arena,
+            entries: core::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+            persistent: false,
+        }
+    }
+
+    /// Creates a list whose backing buffers survive front rewinds. Use this
+    /// for state retained across executor attempts or per-row scratch scopes.
+    pub(crate) const fn new_persistent(arena: &'a Arena) -> Self {
+        Self {
+            arena,
+            entries: core::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+            persistent: true,
+        }
+    }
+
+    pub(crate) fn push(&mut self, value: T) -> Result<(), ArenaFull> {
+        if self.len == self.capacity {
+            let capacity = self.capacity.saturating_mul(2).max(4);
+            let entries = if self.persistent {
+                self.arena.alloc_tail_slice_with(capacity, |_| value)?
+            } else {
+                self.arena.alloc_slice_with(capacity, |_| value)?
+            };
+            if self.len != 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(self.entries, entries.as_mut_ptr(), self.len);
+                }
+            }
+            self.entries = entries.as_mut_ptr();
+            self.capacity = capacity;
+        }
+        unsafe {
+            self.entries.add(self.len).write(value);
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn as_slice(&self) -> &'a [T] {
+        if self.is_empty() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.entries, self.len) }
+        }
     }
 }
 
@@ -383,5 +508,48 @@ mod tests {
                 arena.alloc(i).unwrap();
             }
         });
+    }
+
+    #[test]
+    fn arena_list_grows_geometrically_without_heap_allocation() {
+        let mut budget = Budget::new(8192);
+        let arena = Arena::new(&mut budget, "list", 4096).unwrap();
+        let mut list = ArenaList::new(&arena);
+        crate::mem::guard::forbid_alloc(|| {
+            for value in 0..70u32 {
+                list.push(value).unwrap();
+            }
+        });
+        assert_eq!(list.len(), 70);
+        assert_eq!(list.as_slice(), (0..70u32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn arena_list_reports_arena_exhaustion() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "small_list", 64).unwrap();
+        let mut list = ArenaList::new(&arena);
+        let error = loop {
+            if let Err(error) = list.push(1u64) {
+                break error;
+            }
+        };
+        assert_eq!(error.what, "small_list");
+        assert_eq!(list.as_slice(), &[1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn persistent_arena_list_survives_front_rewinds() {
+        let mut budget = Budget::new(4096);
+        let arena = Arena::new(&mut budget, "two ended", 2048).unwrap();
+        let mark = arena.mark();
+        let mut list = ArenaList::new_persistent(&arena);
+        for value in 0..70u32 {
+            let _scratch = arena.alloc_slice_with(16, |_| 0xa5u8).unwrap();
+            list.push(value).unwrap();
+            unsafe { arena.rewind_to(mark) };
+        }
+        let _overwrite = arena.alloc_slice_with(512, |_| 0x5au8).unwrap();
+        assert_eq!(list.as_slice(), (0..70u32).collect::<Vec<_>>());
     }
 }

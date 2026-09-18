@@ -9,29 +9,28 @@
 //!
 //! [`EvalHooks`]: crate::sql::eval::EvalHooks
 
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::guc::SeqSession;
 use crate::sql_err;
 use crate::storage::{AccessClass, AccessObject, PrivilegeSet, Storage};
-use core::cell::Cell;
-
-pub const MAX_REPLAYED_SEQUENCE_CALLS: usize = 1024;
+use core::cell::{Cell, RefCell};
 
 /// Bounded effect log for an expression stream that may be physically retried
 /// while waiting for a mutable SQL routine. Sequence calls are replayed in
 /// logical call order, never advanced again by a retry.
-pub struct SequenceReplayState {
+pub struct SequenceReplayState<'a> {
     next: Cell<usize>,
     completed: Cell<usize>,
-    values: [Cell<i64>; MAX_REPLAYED_SEQUENCE_CALLS],
+    values: RefCell<ArenaList<'a, i64>>,
 }
 
-impl SequenceReplayState {
-    pub fn new() -> Self {
+impl<'a> SequenceReplayState<'a> {
+    pub fn new(arena: &'a Arena) -> Self {
         Self {
             next: Cell::new(0),
             completed: Cell::new(0),
-            values: [const { Cell::new(0) }; MAX_REPLAYED_SEQUENCE_CALLS],
+            values: RefCell::new(ArenaList::new_persistent(arena)),
         }
     }
 
@@ -49,27 +48,20 @@ impl SequenceReplayState {
 
     fn invoke(&self, action: impl FnOnce() -> Result<i64, SqlError>) -> Result<i64, SqlError> {
         let ordinal = self.next.get();
-        if ordinal == MAX_REPLAYED_SEQUENCE_CALLS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL statement exceeds {} volatile sequence calls",
-                MAX_REPLAYED_SEQUENCE_CALLS
-            ));
-        }
         self.next.set(ordinal + 1);
         if ordinal < self.completed.get() {
-            return Ok(self.values[ordinal].get());
+            return Ok(self.values.borrow().as_slice()[ordinal]);
         }
+        debug_assert_eq!(ordinal, self.completed.get());
         let value = action()?;
-        self.values[ordinal].set(value);
+        self.values.borrow_mut().push(value).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "volatile sequence replay exceeds statement memory"
+            )
+        })?;
         self.completed.set(ordinal + 1);
         Ok(value)
-    }
-}
-
-impl Default for SequenceReplayState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -85,13 +77,13 @@ pub struct SeqEval<'a> {
     dry: bool,
 }
 
-pub struct ReplaySeqEval<'base, 'state> {
+pub struct ReplaySeqEval<'base, 'state, 'arena> {
     base: SeqEval<'base>,
-    state: &'state SequenceReplayState,
+    state: &'state SequenceReplayState<'arena>,
 }
 
-impl<'base, 'state> ReplaySeqEval<'base, 'state> {
-    pub fn new(base: SeqEval<'base>, state: &'state SequenceReplayState) -> Self {
+impl<'base, 'state, 'arena> ReplaySeqEval<'base, 'state, 'arena> {
+    pub fn new(base: SeqEval<'base>, state: &'state SequenceReplayState<'arena>) -> Self {
         Self { base, state }
     }
 }
@@ -276,7 +268,7 @@ impl SequenceAccess for SeqEval<'_> {
     }
 }
 
-impl SequenceAccess for ReplaySeqEval<'_, '_> {
+impl SequenceAccess for ReplaySeqEval<'_, '_, '_> {
     fn nextval(&self, name: &str) -> Result<i64, SqlError> {
         self.state.invoke(|| self.base.nextval(name))
     }
@@ -307,5 +299,60 @@ impl SequenceAccess for ReplaySeqEval<'_, '_> {
     }
     fn restore_statement_cursor(&self, cursor: usize) {
         self.state.restore_cursor(cursor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::budget::Budget;
+
+    #[test]
+    fn replay_state_scales_with_the_statement_arena_and_replays_exactly() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "sequence replay", 1 << 16).unwrap();
+        let replay = SequenceReplayState::new(&arena);
+        let row_mark = arena.mark();
+        let calls = Cell::new(0i64);
+        crate::mem::guard::forbid_alloc(|| {
+            for expected in 1..=1_100i64 {
+                let _row_scratch = arena.alloc_slice_with(16, |_| 0xa5u8).unwrap();
+                assert_eq!(
+                    replay
+                        .invoke(|| {
+                            calls.set(calls.get() + 1);
+                            Ok(calls.get())
+                        })
+                        .unwrap(),
+                    expected
+                );
+                unsafe { arena.rewind_to(row_mark) };
+            }
+            replay.begin_attempt();
+            for expected in 1..=1_100i64 {
+                let _row_scratch = arena.alloc_slice_with(16, |_| 0x5au8).unwrap();
+                assert_eq!(
+                    replay
+                        .invoke(|| panic!("a replayed call must not run again"))
+                        .unwrap(),
+                    expected
+                );
+                unsafe { arena.rewind_to(row_mark) };
+            }
+        });
+        assert_eq!(calls.get(), 1_100);
+    }
+
+    #[test]
+    fn replay_state_reports_statement_memory_exhaustion() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "small sequence replay", 64).unwrap();
+        let replay = SequenceReplayState::new(&arena);
+        for value in 0..4 {
+            assert_eq!(replay.invoke(|| Ok(value)).unwrap(), value);
+        }
+        let error = replay.invoke(|| Ok(4)).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
+        assert!(error.message.as_str().contains("statement memory"));
     }
 }

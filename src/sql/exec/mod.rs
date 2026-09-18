@@ -3113,7 +3113,7 @@ fn execute_row_trigger_body<'a>(
     )?;
     let transition_relations =
         trigger_transition_relations(trigger, definition, transition_rows, context.arena)?;
-    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
         context,
@@ -3125,7 +3125,7 @@ fn execute_row_trigger_body<'a>(
         },
         program.locals,
         &[],
-        &mut local_values,
+        local_values,
     )?;
     match execute_trigger_block(
         context,
@@ -3136,7 +3136,7 @@ fn execute_row_trigger_body<'a>(
         before,
         transition_relations,
         program.locals,
-        &mut local_values,
+        local_values,
         program.body,
         &mut status,
         None,
@@ -14561,7 +14561,7 @@ fn plpgsql_output_value<'a>(
     engine: &super::Engine,
     routine: &crate::storage::RoutineDef,
     locals: &[TriggerLocalDecl<'a>],
-    values: &[Datum<'a>; MAX_COLUMNS],
+    values: &[Datum<'a>],
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
@@ -15321,17 +15321,68 @@ struct TriggerWhile<'a> {
 enum TriggerLoopControl<'a> {
     Exit {
         condition: Option<&'a Expr<'a>>,
-        unwind: u8,
+        unwind: usize,
     },
     Continue {
         condition: Option<&'a Expr<'a>>,
-        unwind: u8,
+        unwind: usize,
     },
 }
 
 #[derive(Clone, Copy)]
 struct TriggerBlock<'a> {
     statements: &'a [TriggerStatement<'a>],
+}
+
+/// A growable list backed only by the statement arena. Growth leaves the old
+/// prefix behind in the bump arena, so capacity doubles geometrically and the
+/// total abandoned scratch remains bounded by the final slice size.
+struct ProgramList<'a, T: Copy> {
+    arena: &'a Arena,
+    entries: *mut T,
+    len: usize,
+    capacity: usize,
+}
+
+impl<'a, T: Copy + 'a> ProgramList<'a, T> {
+    const fn new(arena: &'a Arena) -> Self {
+        Self {
+            arena,
+            entries: core::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    fn push(&mut self, value: T) -> Result<(), SqlError> {
+        if self.len == self.capacity {
+            let capacity = self.capacity.saturating_mul(2).max(4);
+            let entries = self
+                .arena
+                .alloc_slice_with(capacity, |_| value)
+                .map_err(|_| super::query::arena_full_pub())?;
+            if self.len != 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(self.entries, entries.as_mut_ptr(), self.len);
+                }
+            }
+            self.entries = entries.as_mut_ptr();
+            self.capacity = capacity;
+        }
+        unsafe {
+            self.entries.add(self.len).write(value);
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    fn as_slice(&self) -> &'a [T] {
+        if self.len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.entries, self.len) }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -15349,8 +15400,8 @@ struct ParsedTriggerProgram<'a> {
 #[derive(Clone, Copy)]
 enum TriggerFlow<'a> {
     Return(TriggerReturnValue<'a>),
-    Exit(u8),
-    Continue(u8),
+    Exit(usize),
+    Continue(usize),
 }
 
 /// The caught error is an explicitly scoped execution value. Lexically nested
@@ -16078,27 +16129,23 @@ fn trigger_control_header(statement: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn split_trigger_control(statement: &str) -> ([Option<&str>; MAX_COLUMNS], usize) {
-    let mut parts = [None; MAX_COLUMNS];
-    parts[0] = Some(statement);
-    let mut count = 1;
-    while count < parts.len() {
-        let Some(previous) = parts[count - 1] else {
-            break;
-        };
-        let Some((header, rest)) = trigger_control_header(previous) else {
-            break;
-        };
-        parts[count - 1] = Some(header);
-        parts[count] = Some(rest);
-        count += 1;
+fn append_trigger_control<'a>(
+    statement: &'a str,
+    statements: &mut ProgramList<'a, &'a str>,
+) -> Result<(), SqlError> {
+    let mut remaining = statement;
+    while let Some((header, rest)) = trigger_control_header(remaining) {
+        statements.push(header)?;
+        remaining = rest;
     }
-    (parts, count)
+    statements.push(remaining)
 }
 
-fn split_trigger_statements(body: &str) -> Result<([Option<&str>; MAX_COLUMNS], usize), SqlError> {
-    let mut statements = [None; MAX_COLUMNS];
-    let mut count = 0;
+fn split_trigger_statements<'a>(
+    body: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a [&'a str], SqlError> {
+    let mut statements = ProgramList::new(arena);
     let mut start = 0;
     let mut quote = None;
     let mut depth = 0usize;
@@ -16116,17 +16163,7 @@ fn split_trigger_statements(body: &str) -> Result<([Option<&str>; MAX_COLUMNS], 
             ';' if depth == 0 => {
                 let statement = body[start..offset].trim();
                 if !statement.is_empty() {
-                    let (parts, part_count) = split_trigger_control(statement);
-                    if count + part_count > MAX_COLUMNS {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "trigger body has too many statements"
-                        ));
-                    }
-                    for part in parts[..part_count].iter().filter_map(|part| *part) {
-                        statements[count] = Some(part);
-                        count += 1;
-                    }
+                    append_trigger_control(statement, &mut statements)?;
                 }
                 start = offset + 1;
             }
@@ -16138,19 +16175,9 @@ fn split_trigger_statements(body: &str) -> Result<([Option<&str>; MAX_COLUMNS], 
     }
     let statement = body[start..].trim();
     if !statement.is_empty() {
-        let (parts, part_count) = split_trigger_control(statement);
-        if count + part_count > MAX_COLUMNS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "trigger body has too many statements"
-            ));
-        }
-        for part in parts[..part_count].iter().filter_map(|part| *part) {
-            statements[count] = Some(part);
-            count += 1;
-        }
+        append_trigger_control(statement, &mut statements)?;
     }
-    Ok((statements, count))
+    Ok(statements.as_slice())
 }
 
 fn parse_trigger_assignment<'a>(
@@ -17333,7 +17360,7 @@ fn parse_trigger_loop_control<'a>(
                     "there is no label \"{}\" attached to any enclosing loop",
                     label.as_str()
                 )
-            })? as u8,
+            })?,
         None => 0,
     };
     Ok(Some(if is_exit {
@@ -17360,7 +17387,7 @@ fn loop_control_for_label<'a>(
                 "there is no label \"{}\" attached to any enclosing loop",
                 label.as_str()
             )
-        })? as u8;
+        })?;
     Ok(if is_exit {
         TriggerLoopControl::Exit { condition, unwind }
     } else {
@@ -17607,8 +17634,7 @@ fn parse_trigger_exception_conditions<'a>(
     text: &'a str,
     arena: &'a Arena,
 ) -> Result<&'a [TriggerExceptionCondition], SqlError> {
-    let mut conditions = [None; MAX_COLUMNS];
-    let mut count = 0;
+    let mut conditions = ProgramList::new(arena);
     let mut remaining = text.trim();
     // `OR` is a keyword, not a substring: split only on whitespace-delimited
     // occurrences so a future condition name cannot be split accidentally.
@@ -17618,19 +17644,13 @@ fn parse_trigger_exception_conditions<'a>(
         } else {
             (remaining, "")
         };
-        if count == conditions.len() || condition.trim().is_empty() {
+        if condition.trim().is_empty() {
             return Err(unsupported_trigger_body());
         }
-        conditions[count] = Some(parse_trigger_exception_condition(condition)?);
-        count += 1;
+        conditions.push(parse_trigger_exception_condition(condition)?)?;
         remaining = rest;
     }
-    arena
-        .alloc_slice_with(count, |index| {
-            conditions[index].expect("exception condition initialized")
-        })
-        .map(|conditions| &*conditions)
-        .map_err(|_| super::query::arena_full_pub())
+    Ok(conditions.as_slice())
 }
 
 fn parse_trigger_statement<'a>(
@@ -17737,114 +17757,80 @@ fn parse_trigger_statement<'a>(
 }
 
 fn parse_trigger_block<'a>(
-    segments: &[Option<&'a str>],
+    segments: &[&'a str],
     at: &mut usize,
     arena: &'a Arena,
-    loop_labels: &mut [Option<SqlName>; MAX_COLUMNS],
+    loop_labels: &mut [Option<SqlName>],
     loop_depth: usize,
     handler_active: bool,
     program_kind: PlpgsqlProgramKind,
 ) -> Result<(TriggerBlock<'a>, TriggerBlockEnd<'a>), SqlError> {
-    let mut statements = [None; MAX_COLUMNS];
-    let mut statement_count = 0;
+    let mut statements = ProgramList::new(arena);
     let mut saw_return = false;
-    while let Some(segment) = segments.get(*at).and_then(|segment| *segment) {
+    while let Some(&segment) = segments.get(*at) {
         if segment.eq_ignore_ascii_case("exception") {
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| super::query::arena_full_pub())?;
-            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::Exception));
+            return Ok((
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
+                TriggerBlockEnd::Exception,
+            ));
         }
         if segment.eq_ignore_ascii_case("end") {
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL program exceeds the statement arena"
-                    )
-                })?;
-            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::End));
+            return Ok((
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
+                TriggerBlockEnd::End,
+            ));
         }
         if segment.eq_ignore_ascii_case("end if") {
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL program exceeds the statement arena"
-                    )
-                })?;
-            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndIf));
+            return Ok((
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
+                TriggerBlockEnd::EndIf,
+            ));
         }
         if segment.eq_ignore_ascii_case("end case") {
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL program exceeds the statement arena"
-                    )
-                })?;
-            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndCase));
+            return Ok((
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
+                TriggerBlockEnd::EndCase,
+            ));
         }
         if segment.eq_ignore_ascii_case("end loop") {
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL program exceeds the statement arena"
-                    )
-                })?;
-            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndLoop));
+            return Ok((
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
+                TriggerBlockEnd::EndLoop,
+            ));
         }
         if segment.eq_ignore_ascii_case("else") {
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL program exceeds the statement arena"
-                    )
-                })?;
-            return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::Else));
+            return Ok((
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
+                TriggerBlockEnd::Else,
+            ));
         }
         if let Some(condition) = strip_trigger_keyword(segment, "elsif") {
             let Some(condition) = trigger_tail(condition, "then") else {
                 return Err(unsupported_trigger_body());
             };
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL program exceeds the statement arena"
-                    )
-                })?;
             return Ok((
-                TriggerBlock { statements: out },
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
                 TriggerBlockEnd::Elsif(condition),
             ));
         }
@@ -17853,22 +17839,14 @@ fn parse_trigger_block<'a>(
                 return Err(unsupported_trigger_body());
             };
             *at += 1;
-            let out = arena
-                .alloc_slice_with(statement_count, |index| {
-                    statements[index].expect("trigger statement initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
-                    )
-                })?;
             return Ok((
-                TriggerBlock { statements: out },
+                TriggerBlock {
+                    statements: statements.as_slice(),
+                },
                 TriggerBlockEnd::When(condition),
             ));
         }
-        if saw_return || statement_count == MAX_COLUMNS {
+        if saw_return {
             return Err(unsupported_trigger_body());
         }
         *at += 1;
@@ -17888,8 +17866,7 @@ fn parse_trigger_block<'a>(
             let Some(condition) = trigger_tail(condition, "then") else {
                 return Err(unsupported_trigger_body());
             };
-            let mut branches = [None; MAX_COLUMNS];
-            let mut branch_count = 0;
+            let mut branches = ProgramList::new(arena);
             let mut condition = Some(super::parser::parse_expr(condition, arena)?);
             loop {
                 let (block, ending) = parse_trigger_block(
@@ -17901,13 +17878,12 @@ fn parse_trigger_block<'a>(
                     handler_active,
                     program_kind,
                 )?;
-                branches[branch_count] = Some(TriggerBranch { condition, block });
-                branch_count += 1;
+                branches.push(TriggerBranch { condition, block })?;
                 match ending {
-                    TriggerBlockEnd::Elsif(next) if branch_count < MAX_COLUMNS => {
+                    TriggerBlockEnd::Elsif(next) => {
                         condition = Some(super::parser::parse_expr(next, arena)?);
                     }
-                    TriggerBlockEnd::Else if branch_count < MAX_COLUMNS => {
+                    TriggerBlockEnd::Else => {
                         let (block, ending) = parse_trigger_block(
                             segments,
                             at,
@@ -17920,35 +17896,25 @@ fn parse_trigger_block<'a>(
                         if !matches!(ending, TriggerBlockEnd::EndIf) {
                             return Err(unsupported_trigger_body());
                         }
-                        branches[branch_count] = Some(TriggerBranch {
+                        branches.push(TriggerBranch {
                             condition: None,
                             block,
-                        });
-                        branch_count += 1;
+                        })?;
                         break;
                     }
                     TriggerBlockEnd::EndIf => break,
                     _ => return Err(unsupported_trigger_body()),
                 }
             }
-            let branches = arena
-                .alloc_slice_with(branch_count, |index| {
-                    branches[index].expect("trigger branch initialized")
-                })
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "PL/pgSQL program exceeds the statement arena"
-                    )
-                })?;
-            TriggerStatement::If(TriggerIf { branches })
+            TriggerStatement::If(TriggerIf {
+                branches: branches.as_slice(),
+            })
         } else if let Some(header) = strip_trigger_keyword(segment, "case") {
             let operand = (!header.trim().is_empty())
                 .then(|| super::parser::parse_expr(header.trim(), arena))
                 .transpose()?;
-            let mut branches = [None; MAX_COLUMNS];
-            let mut branch_count = 0;
-            let Some(first) = segments.get(*at).and_then(|segment| *segment) else {
+            let mut branches = ProgramList::new(arena);
+            let Some(&first) = segments.get(*at) else {
                 return Err(unsupported_trigger_body());
             };
             let Some(first) = strip_trigger_keyword(first, "when") else {
@@ -17969,13 +17935,9 @@ fn parse_trigger_block<'a>(
                     handler_active,
                     program_kind,
                 )?;
-                if branch_count == branches.len() {
-                    return Err(unsupported_trigger_body());
-                }
-                branches[branch_count] = Some(TriggerCaseBranch { when, block });
-                branch_count += 1;
+                branches.push(TriggerCaseBranch { when, block })?;
                 match ending {
-                    TriggerBlockEnd::When(next) if branch_count < branches.len() => {
+                    TriggerBlockEnd::When(next) => {
                         when = super::parser::parse_expr(next, arena)?;
                     }
                     TriggerBlockEnd::Else => {
@@ -17991,26 +17953,16 @@ fn parse_trigger_block<'a>(
                         if !matches!(ending, TriggerBlockEnd::EndCase) {
                             return Err(unsupported_trigger_body());
                         }
-                        let branches = arena
-                            .alloc_slice_with(branch_count, |index| {
-                                branches[index].expect("case branch initialized")
-                            })
-                            .map_err(|_| super::query::arena_full_pub())?;
                         break TriggerStatement::Case(TriggerCase {
                             operand,
-                            branches,
+                            branches: branches.as_slice(),
                             otherwise: Some(otherwise),
                         });
                     }
                     TriggerBlockEnd::EndCase => {
-                        let branches = arena
-                            .alloc_slice_with(branch_count, |index| {
-                                branches[index].expect("case branch initialized")
-                            })
-                            .map_err(|_| super::query::arena_full_pub())?;
                         break TriggerStatement::Case(TriggerCase {
                             operand,
-                            branches,
+                            branches: branches.as_slice(),
                             otherwise: None,
                         });
                     }
@@ -18028,9 +17980,8 @@ fn parse_trigger_block<'a>(
                 program_kind,
             )?;
             if matches!(ending, TriggerBlockEnd::Exception) {
-                let mut handlers = [None; MAX_COLUMNS];
-                let mut handler_count = 0;
-                let Some(header) = segments.get(*at).and_then(|segment| *segment) else {
+                let mut handlers = ProgramList::new(arena);
+                let Some(&header) = segments.get(*at) else {
                     return Err(unsupported_trigger_body());
                 };
                 let Some(conditions) = strip_trigger_keyword(header, "when") else {
@@ -18050,14 +18001,10 @@ fn parse_trigger_block<'a>(
                         true,
                         program_kind,
                     )?;
-                    if handler_count == handlers.len() {
-                        return Err(unsupported_trigger_body());
-                    }
-                    handlers[handler_count] = Some(TriggerExceptionHandler {
+                    handlers.push(TriggerExceptionHandler {
                         conditions: parse_trigger_exception_conditions(conditions, arena)?,
                         block,
-                    });
-                    handler_count += 1;
+                    })?;
                     match ending {
                         TriggerBlockEnd::End => break,
                         TriggerBlockEnd::When(next) => {
@@ -18066,14 +18013,9 @@ fn parse_trigger_block<'a>(
                         _ => return Err(unsupported_trigger_body()),
                     }
                 }
-                let handlers = arena
-                    .alloc_slice_with(handler_count, |index| {
-                        handlers[index].expect("exception handler initialized")
-                    })
-                    .map_err(|_| super::query::arena_full_pub())?;
                 TriggerStatement::Exception(TriggerException {
                     protected,
-                    handlers,
+                    handlers: handlers.as_slice(),
                 })
             } else {
                 if !matches!(ending, TriggerBlockEnd::End) {
@@ -18171,8 +18113,7 @@ fn parse_trigger_block<'a>(
             )?
         };
         saw_return = matches!(statement, TriggerStatement::Return(_));
-        statements[statement_count] = Some(statement);
-        statement_count += 1;
+        statements.push(statement)?;
     }
     Err(unsupported_trigger_body())
 }
@@ -18188,14 +18129,13 @@ fn parse_plpgsql_program<'a>(
             return Err(unsupported_trigger_body());
         };
         let declaration_source = declarations[..begin_at].trim();
-        let (segments, count) = split_trigger_statements(declaration_source)?;
-        let mut locals = [None; MAX_COLUMNS];
-        let mut local_count = 0usize;
-        for declaration in segments[..count].iter().filter_map(|segment| *segment) {
+        let segments = split_trigger_statements(declaration_source, arena)?;
+        let mut locals = ProgramList::new(arena);
+        for declaration in segments.iter().copied() {
             let local = parse_trigger_local(declaration, arena, program_kind)?;
-            if locals[..local_count]
+            if locals
+                .as_slice()
                 .iter()
-                .flatten()
                 .any(|prior: &ParsedTriggerLocalDecl<'_>| prior.name == local.name)
             {
                 return Err(sql_err!(
@@ -18204,45 +18144,30 @@ fn parse_plpgsql_program<'a>(
                     local.name.as_str()
                 ));
             }
-            if local_count == locals.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "PL/pgSQL program has too many local variables"
-                ));
-            }
-            locals[local_count] = Some(local);
-            local_count += 1;
+            locals.push(local)?;
         }
-        let locals = arena
-            .alloc_slice_with(local_count, |index| {
-                locals[index].expect("local initialized")
-            })
-            .map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "PL/pgSQL locals exceed the statement arena"
-                )
-            })?;
-        (&*locals, declarations[begin_at + 5..].trim())
+        (locals.as_slice(), declarations[begin_at + 5..].trim())
     } else {
         (
             &[][..],
             strip_trigger_keyword(body, "begin").ok_or_else(unsupported_trigger_body)?,
         )
     };
-    let (segments, count) = split_trigger_statements(body)?;
+    let segments = split_trigger_statements(body, arena)?;
     let mut at = 0;
-    let mut loop_labels = [None; MAX_COLUMNS];
+    let loop_labels = arena
+        .alloc_slice_with(segments.len().max(1), |_| None)
+        .map_err(|_| super::query::arena_full_pub())?;
     let (body, ending) = parse_trigger_block(
-        &segments[..count],
+        segments,
         &mut at,
         arena,
-        &mut loop_labels,
+        loop_labels,
         0,
         false,
         program_kind,
     )?;
-    if !matches!(ending, TriggerBlockEnd::End) || at != count {
+    if !matches!(ending, TriggerBlockEnd::End) || at != segments.len() {
         return Err(unsupported_trigger_body());
     }
     let has_return = body
@@ -18265,16 +18190,18 @@ fn resolve_plpgsql_program_locals<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<TriggerProgram<'a>, SqlError> {
-    let mut resolved = [TriggerLocalDecl {
-        name: SqlName::EMPTY,
-        ctype: ColType::Bool,
-        user_type: None,
-        type_mod: -1,
-        initial: None,
-        record_shape: None,
-        constant: false,
-        not_null: false,
-    }; MAX_COLUMNS];
+    let resolved = arena
+        .alloc_slice_with(program.locals.len(), |_| TriggerLocalDecl {
+            name: SqlName::EMPTY,
+            ctype: ColType::Bool,
+            user_type: None,
+            type_mod: -1,
+            initial: None,
+            record_shape: None,
+            constant: false,
+            not_null: false,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
     for (index, local) in program.locals.iter().copied().enumerate() {
         let (ctype, user_type, type_mod, record_shape) = match local.ty {
             ParsedPlpgsqlLocalType::Named { name, type_mod } => {
@@ -18310,11 +18237,8 @@ fn resolve_plpgsql_program_locals<'a>(
             not_null: local.not_null,
         };
     }
-    let locals = arena
-        .alloc_slice_copy(&resolved[..program.locals.len()])
-        .map_err(|_| super::query::arena_full_pub())?;
     let program = TriggerProgram {
-        locals: &*locals,
+        locals: resolved,
         body: program.body,
     };
     validate_plpgsql_constant_assignments(&program)?;
@@ -18601,7 +18525,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         params: crate::sql::eval::NO_PARAMS,
         responder,
     };
-    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
         &context,
@@ -18613,7 +18537,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         },
         program.locals,
         &[],
-        &mut local_values,
+        local_values,
     )?;
     let mut no_new = None;
     match execute_trigger_block(
@@ -18625,7 +18549,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         false,
         None,
         program.locals,
-        &mut local_values,
+        local_values,
         program.body,
         &mut status,
         None,
@@ -18677,7 +18601,7 @@ pub(crate) fn execute_event_trigger<'a>(
         params: crate::sql::eval::NO_PARAMS,
         responder,
     };
-    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let local_values = allocate_plpgsql_local_values(arena, program.locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
         &context,
@@ -18689,7 +18613,7 @@ pub(crate) fn execute_event_trigger<'a>(
         },
         program.locals,
         &[],
-        &mut local_values,
+        local_values,
     )?;
     let mut no_new = None;
     match execute_trigger_block(
@@ -18701,7 +18625,7 @@ pub(crate) fn execute_event_trigger<'a>(
         false,
         None,
         program.locals,
-        &mut local_values,
+        local_values,
         program.body,
         &mut status,
         None,
@@ -18742,8 +18666,16 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         txn.txid,
         arena,
     )?;
-    let mut declarations = [None; MAX_COLUMNS];
-    let mut seeded = [Datum::Null; MAX_COLUMNS];
+    let declaration_capacity = routine
+        .parameters()
+        .iter()
+        .filter(|parameter| !parameter.name.as_str().is_empty())
+        .count()
+        .saturating_add(program.locals.len());
+    let declarations = arena
+        .alloc_slice_with(declaration_capacity, |_| empty_plpgsql_local())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let seeded = allocate_plpgsql_local_values(arena, declaration_capacity)?;
     let mut declaration_count = 0usize;
     let mut input_index = 0usize;
     for parameter in routine.parameters() {
@@ -18757,16 +18689,9 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         if parameter.name.as_str().is_empty() {
             continue;
         }
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL procedure has too many variables"
-            ));
-        }
         if TriggerExceptionVariable::parse(parameter.name.as_str()).is_some()
             || declarations[..declaration_count]
                 .iter()
-                .flatten()
                 .any(|prior: &TriggerLocalDecl<'_>| prior.name == parameter.name)
         {
             return Err(sql_err!(
@@ -18775,7 +18700,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
                 parameter.name.as_str()
             ));
         }
-        declarations[declaration_count] = Some(TriggerLocalDecl {
+        declarations[declaration_count] = TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -18784,21 +18709,14 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             record_shape: None,
             constant: false,
             not_null: false,
-        });
+        };
         seeded[declaration_count] = input.unwrap_or(Datum::Null);
         declaration_count += 1;
     }
     let seeded_count = declaration_count;
     for local in program.locals {
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL procedure has too many variables"
-            ));
-        }
         if declarations[..declaration_count]
             .iter()
-            .flatten()
             .any(|prior| prior.name == local.name)
         {
             return Err(sql_err!(
@@ -18807,14 +18725,10 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
                 local.name.as_str()
             ));
         }
-        declarations[declaration_count] = Some(*local);
+        declarations[declaration_count] = *local;
         declaration_count += 1;
     }
-    let locals = arena
-        .alloc_slice_with(declaration_count, |index| {
-            declarations[index].expect("procedure local initialized")
-        })
-        .map_err(|_| super::query::arena_full_pub())?;
+    let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::procedure(routine, arena)?;
     let mut context = TriggerExecContext {
@@ -18830,7 +18744,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         params: inputs,
         responder,
     };
-    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
         &context,
@@ -18842,7 +18756,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         },
         locals,
         &seeded[..seeded_count],
-        &mut local_values,
+        local_values,
     )?;
     let mut no_new = None;
     match execute_trigger_block(
@@ -18854,7 +18768,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         false,
         None,
         locals,
-        &mut local_values,
+        local_values,
         program.body,
         &mut status,
         None,
@@ -18907,20 +18821,31 @@ pub(crate) fn execute_plpgsql_function<'a>(
         txn.txid,
         arena,
     )?;
-    let mut declarations = [None; MAX_COLUMNS];
-    let mut seeded = [Datum::Null; MAX_COLUMNS];
+    let declaration_capacity = routine
+        .arguments()
+        .iter()
+        .filter(|parameter| !parameter.name.as_str().is_empty())
+        .count()
+        .saturating_add(
+            routine
+                .parameters()
+                .iter()
+                .filter(|parameter| {
+                    parameter.mode.is_output() && !parameter.name.as_str().is_empty()
+                })
+                .count(),
+        )
+        .saturating_add(program.locals.len());
+    let declarations = arena
+        .alloc_slice_with(declaration_capacity, |_| empty_plpgsql_local())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let seeded = allocate_plpgsql_local_values(arena, declaration_capacity)?;
     let mut declaration_count = 0usize;
     for (input_index, parameter) in routine.arguments().iter().copied().enumerate() {
         if parameter.name.as_str().is_empty() {
             continue;
         }
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL function has too many variables"
-            ));
-        }
-        declarations[declaration_count] = Some(TriggerLocalDecl {
+        declarations[declaration_count] = TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -18929,7 +18854,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
             record_shape: None,
             constant: false,
             not_null: false,
-        });
+        };
         seeded[declaration_count] = inputs[input_index];
         declaration_count += 1;
     }
@@ -18942,18 +18867,11 @@ pub(crate) fn execute_plpgsql_function<'a>(
     {
         if declarations[..declaration_count]
             .iter()
-            .flatten()
             .any(|prior| prior.name == parameter.name)
         {
             continue;
         }
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL function has too many variables"
-            ));
-        }
-        declarations[declaration_count] = Some(TriggerLocalDecl {
+        declarations[declaration_count] = TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -18962,19 +18880,12 @@ pub(crate) fn execute_plpgsql_function<'a>(
             record_shape: None,
             constant: false,
             not_null: false,
-        });
+        };
         declaration_count += 1;
     }
     for local in program.locals {
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL function has too many variables"
-            ));
-        }
         if declarations[..declaration_count]
             .iter()
-            .flatten()
             .any(|prior| prior.name == local.name)
         {
             return Err(sql_err!(
@@ -18983,14 +18894,10 @@ pub(crate) fn execute_plpgsql_function<'a>(
                 local.name.as_str()
             ));
         }
-        declarations[declaration_count] = Some(*local);
+        declarations[declaration_count] = *local;
         declaration_count += 1;
     }
-    let locals = arena
-        .alloc_slice_with(declaration_count, |index| {
-            declarations[index].expect("function local initialized")
-        })
-        .map_err(|_| super::query::arena_full_pub())?;
+    let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::function(routine, program_kind, arena)?;
     let mut context = TriggerExecContext {
@@ -19006,7 +18913,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         params: inputs,
         responder,
     };
-    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
         &context,
@@ -19018,7 +18925,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         },
         locals,
         &seeded[..seeded_count],
-        &mut local_values,
+        local_values,
     )?;
     let mut no_new = None;
     match execute_trigger_block(
@@ -19030,7 +18937,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         false,
         None,
         locals,
-        &mut local_values,
+        local_values,
         program.body,
         &mut status,
         None,
@@ -19045,7 +18952,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         None | Some(TriggerFlow::Return(TriggerReturnValue::Void))
             if program_kind == PlpgsqlProgramKind::OutputFunction =>
         {
-            plpgsql_output_value(engine, routine, locals, &local_values, txn.txid, arena)
+            plpgsql_output_value(engine, routine, locals, local_values, txn.txid, arena)
         }
         None => Err(sql_err!(
             sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
@@ -19084,20 +18991,23 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         txn.txid,
         arena,
     )?;
-    let mut declarations = [None; MAX_COLUMNS];
-    let mut seeded = [Datum::Null; MAX_COLUMNS];
+    let declaration_capacity = routine
+        .arguments()
+        .iter()
+        .filter(|parameter| !parameter.name.as_str().is_empty())
+        .count()
+        .saturating_add(routine.result_column_count)
+        .saturating_add(program.locals.len());
+    let declarations = arena
+        .alloc_slice_with(declaration_capacity, |_| empty_plpgsql_local())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let seeded = allocate_plpgsql_local_values(arena, declaration_capacity)?;
     let mut declaration_count = 0usize;
     for (input_index, parameter) in routine.arguments().iter().copied().enumerate() {
         if parameter.name.as_str().is_empty() {
             continue;
         }
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL function has too many variables"
-            ));
-        }
-        declarations[declaration_count] = Some(TriggerLocalDecl {
+        declarations[declaration_count] = TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
             user_type: parameter.user_type,
@@ -19106,7 +19016,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             record_shape: None,
             constant: false,
             not_null: false,
-        });
+        };
         seeded[declaration_count] = inputs[input_index];
         declaration_count += 1;
     }
@@ -19121,18 +19031,11 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         if output.name.as_str().is_empty()
             || declarations[..declaration_count]
                 .iter()
-                .flatten()
                 .any(|prior| prior.name == output.name)
         {
             continue;
         }
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL function has too many variables"
-            ));
-        }
-        declarations[declaration_count] = Some(TriggerLocalDecl {
+        declarations[declaration_count] = TriggerLocalDecl {
             name: output.name,
             ctype: output.ctype,
             user_type: output.user_type,
@@ -19141,19 +19044,12 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             record_shape: None,
             constant: false,
             not_null: false,
-        });
+        };
         declaration_count += 1;
     }
     for local in program.locals {
-        if declaration_count == declarations.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL function has too many variables"
-            ));
-        }
         if declarations[..declaration_count]
             .iter()
-            .flatten()
             .any(|prior| prior.name == local.name)
         {
             return Err(sql_err!(
@@ -19162,14 +19058,10 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
                 local.name.as_str()
             ));
         }
-        declarations[declaration_count] = Some(*local);
+        declarations[declaration_count] = *local;
         declaration_count += 1;
     }
-    let locals = arena
-        .alloc_slice_with(declaration_count, |index| {
-            declarations[index].expect("function local initialized")
-        })
-        .map_err(|_| super::query::arena_full_pub())?;
+    let locals = &declarations[..declaration_count];
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::function(routine, PlpgsqlProgramKind::SetFunction, arena)?;
     let mut context = TriggerExecContext {
@@ -19185,7 +19077,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         params: inputs,
         responder,
     };
-    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let local_values = allocate_plpgsql_local_values(arena, locals.len())?;
     initialize_trigger_locals(
         &context,
         invocation,
@@ -19196,7 +19088,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         },
         locals,
         &seeded[..seeded_count],
-        &mut local_values,
+        local_values,
     )?;
     let mut result = PlpgsqlSetResult::for_routine(routine);
     let mut status = TriggerExecutionStatus::default();
@@ -19215,10 +19107,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
                 )
             })?;
     }
-    status.set_output_locals(
-        &output_local_indices[..output_columns.len()],
-        &local_values[..locals.len()],
-    );
+    status.set_output_locals(&output_local_indices[..output_columns.len()], local_values);
     let mut no_new = None;
     match execute_trigger_block(
         &mut context,
@@ -19229,7 +19118,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         false,
         None,
         locals,
-        &mut local_values,
+        local_values,
         program.body,
         &mut status,
         None,
@@ -19286,102 +19175,117 @@ mod trigger_program_tests {
 
     #[test]
     fn control_headers_split_before_their_first_action() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "trigger statement splitter", 1 << 12).unwrap();
         let body = "IF NEW.value > 5 THEN INSERT INTO audit VALUES (1);\n\
                     ELSIF NEW.value = 5 THEN INSERT INTO audit VALUES (2);\n\
                     ELSE INSERT INTO audit VALUES (3);\n\
                     END IF; RETURN NEW; END";
-        let (segments, count) = split_trigger_statements(body).unwrap();
+        let segments = split_trigger_statements(body, &arena).unwrap();
         assert_eq!(
-            segments[..count],
+            segments,
             [
-                Some("IF NEW.value > 5 THEN"),
-                Some("INSERT INTO audit VALUES (1)"),
-                Some("ELSIF NEW.value = 5 THEN"),
-                Some("INSERT INTO audit VALUES (2)"),
-                Some("ELSE"),
-                Some("INSERT INTO audit VALUES (3)"),
-                Some("END IF"),
-                Some("RETURN NEW"),
-                Some("END"),
+                "IF NEW.value > 5 THEN",
+                "INSERT INTO audit VALUES (1)",
+                "ELSIF NEW.value = 5 THEN",
+                "INSERT INTO audit VALUES (2)",
+                "ELSE",
+                "INSERT INTO audit VALUES (3)",
+                "END IF",
+                "RETURN NEW",
+                "END",
             ]
         );
     }
 
     #[test]
     fn for_header_splits_before_its_first_action() {
-        let (segments, count) = split_trigger_statements(
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "trigger statement splitter", 1 << 12).unwrap();
+        let segments = split_trigger_statements(
             "FOR item IN REVERSE 1..5 BY 2 LOOP INSERT INTO audit VALUES (item); END LOOP; RETURN NEW; END",
+            &arena,
         )
         .unwrap();
         assert_eq!(
-            segments[..count],
+            segments,
             [
-                Some("FOR item IN REVERSE 1..5 BY 2 LOOP"),
-                Some("INSERT INTO audit VALUES (item)"),
-                Some("END LOOP"),
-                Some("RETURN NEW"),
-                Some("END"),
+                "FOR item IN REVERSE 1..5 BY 2 LOOP",
+                "INSERT INTO audit VALUES (item)",
+                "END LOOP",
+                "RETURN NEW",
+                "END",
             ]
         );
     }
 
     #[test]
     fn labelled_loop_header_splits_before_its_first_action() {
-        let (segments, count) = split_trigger_statements(
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "trigger statement splitter", 1 << 12).unwrap();
+        let segments = split_trigger_statements(
             "<<outer>> LOOP INSERT INTO audit VALUES (1); END LOOP; RETURN NEW; END",
+            &arena,
         )
         .unwrap();
         assert_eq!(
-            segments[..count],
+            segments,
             [
-                Some("<<outer>> LOOP"),
-                Some("INSERT INTO audit VALUES (1)"),
-                Some("END LOOP"),
-                Some("RETURN NEW"),
-                Some("END"),
+                "<<outer>> LOOP",
+                "INSERT INTO audit VALUES (1)",
+                "END LOOP",
+                "RETURN NEW",
+                "END",
             ]
         );
     }
 
     #[test]
     fn nested_begin_splits_before_its_first_action() {
-        let (segments, count) =
-            split_trigger_statements("BEGIN INSERT INTO audit VALUES (3); END; RETURN NEW; END")
-                .unwrap();
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "trigger statement splitter", 1 << 12).unwrap();
+        let segments = split_trigger_statements(
+            "BEGIN INSERT INTO audit VALUES (3); END; RETURN NEW; END",
+            &arena,
+        )
+        .unwrap();
         assert_eq!(
-            segments[..count],
+            segments,
             [
-                Some("BEGIN"),
-                Some("INSERT INTO audit VALUES (3)"),
-                Some("END"),
-                Some("RETURN NEW"),
-                Some("END"),
+                "BEGIN",
+                "INSERT INTO audit VALUES (3)",
+                "END",
+                "RETURN NEW",
+                "END",
             ]
         );
     }
 
     #[test]
     fn exception_handlers_split_before_each_handler_action() {
-        let (segments, count) = split_trigger_statements(
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "trigger statement splitter", 1 << 12).unwrap();
+        let segments = split_trigger_statements(
             "BEGIN RAISE EXCEPTION 'fail'; EXCEPTION \
              WHEN unique_violation THEN RAISE EXCEPTION 'first'; \
              WHEN raise_exception THEN INSERT INTO audit VALUES (1); \
              END; RETURN NEW; END",
+            &arena,
         )
         .unwrap();
         assert_eq!(
-            segments[..count],
+            segments,
             [
-                Some("BEGIN"),
-                Some("RAISE EXCEPTION 'fail'"),
-                Some("EXCEPTION"),
-                Some("WHEN unique_violation THEN"),
-                Some("RAISE EXCEPTION 'first'"),
-                Some("WHEN raise_exception THEN"),
-                Some("INSERT INTO audit VALUES (1)"),
-                Some("END"),
-                Some("RETURN NEW"),
-                Some("END"),
+                "BEGIN",
+                "RAISE EXCEPTION 'fail'",
+                "EXCEPTION",
+                "WHEN unique_violation THEN",
+                "RAISE EXCEPTION 'first'",
+                "WHEN raise_exception THEN",
+                "INSERT INTO audit VALUES (1)",
+                "END",
+                "RETURN NEW",
+                "END",
             ]
         );
     }
@@ -19389,7 +19293,7 @@ mod trigger_program_tests {
     #[test]
     fn exception_program_retains_each_ordered_handler() {
         let mut budget = Budget::new(1 << 16);
-        let arena = Arena::new(&mut budget, "trigger exception parser", 1 << 12).unwrap();
+        let arena = Arena::new(&mut budget, "trigger exception parser", 1 << 15).unwrap();
         let program = parse_trigger_program(
             "BEGIN BEGIN RAISE EXCEPTION 'fail'; EXCEPTION \
              WHEN unique_violation THEN RAISE EXCEPTION 'first'; \
@@ -19410,6 +19314,75 @@ mod trigger_program_tests {
             panic!("second handler must retain its typed condition");
         };
         assert_eq!(*second, sqlstate::RAISE_EXCEPTION);
+    }
+
+    #[test]
+    fn procedural_program_width_is_arena_bounded() {
+        use core::fmt::Write as _;
+
+        let mut budget = Budget::new(16 << 20);
+        let arena = Arena::new(&mut budget, "wide PL/pgSQL parser", 12 << 20).unwrap();
+
+        let mut sequential = String::from("DECLARE ");
+        for index in 0..80 {
+            write!(sequential, "v{index} integer;").unwrap();
+        }
+        sequential.push_str(" BEGIN ");
+        for _ in 0..80 {
+            sequential.push_str("NULL;");
+        }
+        sequential.push_str("RETURN 1; END");
+        let program =
+            parse_plpgsql_program(&sequential, &arena, PlpgsqlProgramKind::Function).unwrap();
+        assert_eq!(program.locals.len(), 80);
+        assert_eq!(program.body.statements.len(), 81);
+
+        let mut branches = String::from("BEGIN IF false THEN NULL;");
+        for _ in 0..80 {
+            branches.push_str("ELSIF false THEN NULL;");
+        }
+        branches.push_str("ELSE NULL; END IF; RETURN 1; END");
+        let program =
+            parse_plpgsql_program(&branches, &arena, PlpgsqlProgramKind::Function).unwrap();
+        let TriggerStatement::If(branches) = program.body.statements[0] else {
+            panic!("wide conditional must remain one IF statement");
+        };
+        assert_eq!(branches.branches.len(), 82);
+
+        let mut conditions = String::from("BEGIN BEGIN NULL; EXCEPTION WHEN division_by_zero");
+        for _ in 1..80 {
+            conditions.push_str(" OR division_by_zero");
+        }
+        conditions.push_str(" THEN NULL; END; RETURN 1; END");
+        let program =
+            parse_plpgsql_program(&conditions, &arena, PlpgsqlProgramKind::Function).unwrap();
+        let TriggerStatement::Exception(exception) = program.body.statements[0] else {
+            panic!("wide condition list must remain one exception block");
+        };
+        assert_eq!(exception.handlers[0].conditions.len(), 80);
+
+        let mut handlers = String::from("BEGIN BEGIN NULL; EXCEPTION ");
+        for _ in 0..80 {
+            handlers.push_str("WHEN division_by_zero THEN NULL;");
+        }
+        handlers.push_str("END; RETURN 1; END");
+        let program =
+            parse_plpgsql_program(&handlers, &arena, PlpgsqlProgramKind::Function).unwrap();
+        let TriggerStatement::Exception(exception) = program.body.statements[0] else {
+            panic!("wide handler list must remain one exception block");
+        };
+        assert_eq!(exception.handlers.len(), 80);
+
+        let mut nested = String::from("BEGIN <<outer>> LOOP ");
+        for _ in 1..257 {
+            nested.push_str("LOOP ");
+        }
+        nested.push_str("EXIT outer;");
+        for _ in 0..257 {
+            nested.push_str("END LOOP;");
+        }
+        nested.push_str("RETURN 1; END");
+        parse_plpgsql_program(&nested, &arena, PlpgsqlProgramKind::Function).unwrap();
     }
 }
 
@@ -22435,13 +22408,35 @@ fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlEr
     }
 }
 
+fn allocate_plpgsql_local_values<'a>(
+    arena: &'a Arena,
+    count: usize,
+) -> Result<&'a mut [Datum<'a>], SqlError> {
+    arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| super::query::arena_full_pub())
+}
+
+fn empty_plpgsql_local<'a>() -> TriggerLocalDecl<'a> {
+    TriggerLocalDecl {
+        name: SqlName::EMPTY,
+        ctype: ColType::Bool,
+        user_type: None,
+        type_mod: -1,
+        initial: None,
+        record_shape: None,
+        constant: false,
+        not_null: false,
+    }
+}
+
 fn initialize_trigger_locals<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     invocation: TriggerInvocation<'a>,
     transition: TriggerTransition<'_, '_, 'a>,
     locals: &[TriggerLocalDecl<'a>],
     seeded: &[Datum<'a>],
-    values: &mut [Datum<'a>; MAX_COLUMNS],
+    values: &mut [Datum<'a>],
 ) -> Result<(), SqlError> {
     for (index, local) in locals.iter().enumerate() {
         if let Some(value) = seeded.get(index).copied() {
@@ -22576,7 +22571,7 @@ fn coerce_plpgsql_table_rowtype<'a>(
 fn assign_trigger_local<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl<'a>],
-    values: &mut [Datum<'a>; MAX_COLUMNS],
+    values: &mut [Datum<'a>],
     target: SqlName,
     value: Datum<'a>,
 ) -> Result<(), SqlError> {
@@ -22972,7 +22967,7 @@ fn execute_trigger_block<'a>(
     before: bool,
     transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
     locals: &[TriggerLocalDecl<'a>],
-    local_values: &mut [Datum<'a>; MAX_COLUMNS],
+    local_values: &mut [Datum<'a>],
     block: TriggerBlock<'a>,
     status: &mut TriggerExecutionStatus<'a>,
     exception: Option<&TriggerExceptionDiagnostic<'_>>,
@@ -26156,7 +26151,7 @@ fn fire_statement_triggers_with_rows<'a>(
         let transition_relations =
             trigger_transition_relations(&trigger, definition, rows, context.arena)?;
         let mut no_new = None;
-        let mut local_values = [Datum::Null; MAX_COLUMNS];
+        let local_values = allocate_plpgsql_local_values(context.arena, program.locals.len())?;
         let mut status = TriggerExecutionStatus::default();
         initialize_trigger_locals(
             &context,
@@ -26168,7 +26163,7 @@ fn fire_statement_triggers_with_rows<'a>(
             },
             program.locals,
             &[],
-            &mut local_values,
+            local_values,
         )?;
         match execute_trigger_block(
             &mut context,
@@ -26179,7 +26174,7 @@ fn fire_statement_triggers_with_rows<'a>(
             before,
             transition_relations,
             program.locals,
-            &mut local_values,
+            local_values,
             program.body,
             &mut status,
             None,
@@ -32176,17 +32171,21 @@ pub fn create_routine(
                         Ok(program) => program,
                         Err(error) => return sql_fail(error),
                     };
-                let mut namespace = [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+                let namespace_capacity = routine.arguments.len().saturating_add(
+                    matches!(kind, crate::storage::RoutineKind::TableFunction)
+                        .then_some(result_column_count)
+                        .unwrap_or(0),
+                );
+                let namespace = match arena
+                    .alloc_slice_with(namespace_capacity, |_| RoutineParameterDef::EMPTY)
+                {
+                    Ok(namespace) => namespace,
+                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                };
                 let mut namespace_count = routine.arguments.len();
                 namespace[..namespace_count].copy_from_slice(&parameters[..namespace_count]);
                 if matches!(kind, crate::storage::RoutineKind::TableFunction) {
                     for output in &result_columns[..result_column_count] {
-                        if namespace_count == namespace.len() {
-                            return sql_fail(sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "PL/pgSQL function has too many variables"
-                            ));
-                        }
                         namespace[namespace_count] = RoutineParameterDef {
                             name: output.name,
                             ctype: output.ctype,

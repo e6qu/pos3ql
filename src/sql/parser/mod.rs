@@ -122,6 +122,19 @@ fn alter_pass(action: &AlterAction) -> u8 {
 
 pub const MAX_ROWS: usize = 256;
 
+/// An allocation upper bound for the statements in one SQL source string.
+/// Semicolons inside literals and comments deliberately over-count: reserving
+/// a few empty arena slots is cheaper and safer than maintaining a second SQL
+/// lexer solely to size parser output.
+pub(crate) fn statement_capacity(source: &str) -> usize {
+    source
+        .as_bytes()
+        .iter()
+        .filter(|&&byte| byte == b';')
+        .count()
+        .saturating_add(1)
+}
+
 /// Words that cannot appear as a bare column reference; mirrors the
 /// reserved entries of PostgreSQL's keyword table that this grammar uses.
 /// Whether a numeric token carries a `0x`/`0o`/`0b` base prefix.

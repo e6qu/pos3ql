@@ -755,11 +755,12 @@ pub(crate) fn parse_routine_function_program<'a>(
     routine_name: &'a str,
     parameters: &[crate::storage::RoutineArgumentDef],
 ) -> Result<RoutineFunctionProgram<'a>, SqlError> {
-    const MAX_ROUTINE_STATEMENTS: usize = 64;
     let mut parser = super::parser::Parser::new(body, arena)
         .and_then(|parser| parser.with_routine_parameters(routine_name, parameters))
         .map_err(|error| super::parse_error_to_sql(&error))?;
-    let mut parsed = [None; MAX_ROUTINE_STATEMENTS];
+    let parsed = arena
+        .alloc_slice_with(super::parser::statement_capacity(body), |_| None)
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     loop {
         let statement = parser
@@ -771,13 +772,7 @@ pub(crate) fn parse_routine_function_program<'a>(
         } else {
             RoutinePrelude::Statement(arena.alloc(statement).map_err(|_| arena_full())?)
         };
-        if count == parsed.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "SQL function body exceeds {} statements",
-                parsed.len()
-            ));
-        }
+        debug_assert!(count < parsed.len());
         parsed[count] = Some(step);
         count += 1;
     }

@@ -23,8 +23,8 @@ mod operators;
 pub(crate) use args::*;
 
 mod pattern;
-pub(crate) use pattern::regex_split_with_options;
-pub use pattern::{like_match, regex_split_pub_with_options, regexp_options};
+pub(crate) use pattern::{for_each_regex_split, regex_split_with_options};
+pub use pattern::{like_match, regex_split_count_pub, regex_split_piece_at_pub, regexp_options};
 pub(crate) use pattern::{regex_substring, similar_to_posix, sql_regex_substring};
 
 pub(crate) use operators::arithmetic;
@@ -4712,14 +4712,15 @@ fn call<'a>(
                     "regexp_split_to_table() does not support the \"global\" option"
                 ));
             }
-            let pieces = regex_split_pub_with_options(src, pat, parsed.options, arena)?;
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "set-returning function called where not allowed"
                 )
             })?;
-            Ok(pieces.get(k - 1).copied().unwrap_or(Datum::Null))
+            Ok(regex_split_piece_at_pub(src, pat, parsed.options, k - 1)?
+                .map(Datum::Text)
+                .unwrap_or(Datum::Null))
         }
         // Set-returning `string_to_table(string, delimiter [, null_string])`:
         // the k-th piece for the current expansion index. The split rule is
@@ -4738,16 +4739,14 @@ fn call<'a>(
             } else {
                 None
             };
-            let mut pieces = [""; crate::sql::parser::MAX_LIST * 16];
-            let n = split_pieces(source, delimiter, &mut pieces)?;
             let k = hooks.srf_index.ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "set-returning function called where not allowed"
                 )
             })?;
-            Ok(match pieces[..n].get(k - 1) {
-                Some(piece) if null_string == Some(*piece) => Datum::Null,
+            Ok(match split_piece_at(source, delimiter, k - 1) {
+                Some(piece) if null_string == Some(piece) => Datum::Null,
                 Some(piece) => Datum::Text(arena.alloc_str(piece).map_err(|_| arena_full())?),
                 None => Datum::Null,
             })

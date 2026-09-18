@@ -13726,7 +13726,7 @@ impl Engine {
         {
             use core::fmt::Write as _;
             let mut published = eval::funcs::system::SessionSchemas {
-                names: [crate::util::StackStr::new(); 17],
+                names: [crate::util::StackStr::new(); crate::storage::MAX_PATH_ENTRIES],
                 n: 0,
                 catalog_pos: usize::MAX,
             };

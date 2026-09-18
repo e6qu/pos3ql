@@ -259,6 +259,15 @@ use the same arena-backed program representation. Exhaustion returns SQLSTATE
 `54000` before a simple-query batch executes; stored programs are qualified
 through every procedural host and empty-cache object recovery.
 
+The effective `search_path` entry array is derived from the accepted 128-byte
+GUC representation, so every accepted path is resolved and exposed through
+`current_schema`/`current_schemas` without a separate sixteen-schema cutoff.
+`string_to_table` and `regexp_split_to_table` materialize as many rows as fit
+statement memory rather than stopping at 1,024. Pending checkpoint deletions
+are represented once, by the startup-sized row overlay whose shadow markers
+the delta writer already consumes; there is no per-table tombstone array or
+1,024-delete rewrite threshold.
+
 Resumable mutable-routine calls also retain every replay result and pending
 argument that fits statement memory; the persistent arena tail keeps both
 valid across per-row retry rewinds. Cursor row indexes are derived from the

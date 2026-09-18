@@ -46,6 +46,13 @@ cursor indexes are sized from `cursor_bytes`, and logical-message decoding
 uses work memory. Regressions cross 1,024 calls and messages and 65,536 cursor
 rows under the allocation guard, PostgreSQL differential execution, and
 empty-cache recovery.
+The residual inline-width audit found no external blocker. Effective search
+paths are sized from their accepted byte boundary instead of a sixteen-entry
+array, split table functions use exact statement-arena result slices, and
+checkpoint deletion markers use the already bounded row overlay instead of an
+unused per-table 1,024-entry roster. PostgreSQL 18 differential,
+allocation-forbidden execution, delta-generation inspection, checkpoint
+publication, and empty-cache recovery cover the former limits.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

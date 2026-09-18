@@ -340,17 +340,59 @@ pub(crate) fn sql_regex_substring<'a>(
     }
 }
 
-pub fn regex_split_pub_with_options<'a>(
+pub fn regex_split_count_pub(
+    src: &str,
+    pattern: &str,
+    options: crate::sql::regex::RegexOptions,
+) -> Result<usize, SqlError> {
+    for_each_regex_split(src, pattern, options, |_, _| Ok(()))
+}
+
+pub fn regex_split_piece_at_pub<'a>(
     src: &'a str,
     pattern: &str,
     options: crate::sql::regex::RegexOptions,
-    arena: &'a Arena,
-) -> Result<&'a [Datum<'a>], SqlError> {
-    let mut pieces = [Datum::Null; 1024];
-    let n = regex_split_with_options(src, pattern, options, &mut pieces)?;
-    Ok(&*arena
-        .alloc_slice_copy(&pieces[..n])
-        .map_err(|_| arena_full())?)
+    wanted: usize,
+) -> Result<Option<&'a str>, SqlError> {
+    if pattern.is_empty() {
+        return Ok(src
+            .char_indices()
+            .nth(wanted)
+            .map(|(index, character)| &src[index..index + character.len_utf8()]));
+    }
+    let mut piece = 0usize;
+    let mut last = 0usize;
+    let mut pos = 0usize;
+    let mut previous_match_end = None;
+    while pos <= src.len() {
+        let Some((start, end)) = crate::sql::regex::find_with_options(pattern, src, pos, options)?
+        else {
+            break;
+        };
+        if end == start {
+            if start != 0 && start != src.len() && previous_match_end != Some(start) {
+                if piece == wanted {
+                    return Ok(Some(&src[last..start]));
+                }
+                piece += 1;
+                last = start;
+            }
+            previous_match_end = Some(end);
+            let Some(next) = crate::sql::regex::next_match_from(src, start, end) else {
+                break;
+            };
+            pos = next;
+            continue;
+        }
+        if piece == wanted {
+            return Ok(Some(&src[last..start]));
+        }
+        piece += 1;
+        last = end;
+        previous_match_end = Some(end);
+        pos = end;
+    }
+    Ok((piece == wanted).then_some(&src[last..]))
 }
 
 /// Splits `src` on every match of `pattern`, writing the pieces into `out` and
@@ -361,15 +403,27 @@ pub(crate) fn regex_split_with_options<'a>(
     options: crate::sql::regex::RegexOptions,
     out: &mut [Datum<'a>],
 ) -> Result<usize, SqlError> {
-    let mut n = 0usize;
-    let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
-        if *n == out.len() {
+    for_each_regex_split(src, pattern, options, |piece, index| {
+        let Some(slot) = out.get_mut(index) else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "too many split pieces"
             ));
-        }
-        out[*n] = Datum::Text(piece);
+        };
+        *slot = Datum::Text(piece);
+        Ok(())
+    })
+}
+
+pub(crate) fn for_each_regex_split<'a>(
+    src: &'a str,
+    pattern: &str,
+    options: crate::sql::regex::RegexOptions,
+    mut visit: impl FnMut(&'a str, usize) -> Result<(), SqlError>,
+) -> Result<usize, SqlError> {
+    let mut n = 0usize;
+    let mut push = |piece: &'a str, n: &mut usize| -> Result<(), SqlError> {
+        visit(piece, *n)?;
         *n += 1;
         Ok(())
     };

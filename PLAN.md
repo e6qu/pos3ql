@@ -215,9 +215,22 @@ storage. RAM and local disk are bounded, disposable caches.
   casts, indexing, WAL, checkpoints, and object-cold recovery use exact
   statement-arena slices. Sequential consumers decode the payload in one pass
   rather than repeatedly scanning variable-width prefixes. Variadic
-  `format()` results grow in that arena rather than stopping at 4 KiB. PostgreSQL 18
-  differential and allocation-forbidden regressions cross the old boundary
-  and recover the stored values with empty local caches.
+   `format()` results grow in that arena rather than stopping at 4 KiB. PostgreSQL 18
+   differential and allocation-forbidden regressions cross the old boundary
+   and recover the stored values with empty local caches.
+- Statement lists are bounded by the statement arena, not the parser's former
+  64-item staging arrays or the 256-row VALUES staging: select lists, `IN`
+  lists, `ARRAY` constructors, `CASE` arms, function arguments up to
+  PostgreSQL's own 100, `DISTINCT ON` / `ORDER BY` / window partition and
+  ordering keys, CTEs, set-operation branches, row-locking clauses, `ALTER
+  TABLE` actions, `RETURNING` lists, GRANT/REVOKE role lists, VALUES rows, and
+  the aggregate, subquery, and correlated-merge execution scratch they feed
+  all use geometric arena lists or exact arena slices. Per-row
+  correlated-subquery merge scratch is allocated once per statement pass from
+  the true node counts, so scans never grow the arena per row. Arena
+  exhaustion during parse is SQLSTATE `54000`, not a syntax error. PostgreSQL
+  18 differential and allocation-forbidden regressions cross the former
+  boundaries and recover stored results with empty local caches.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those
@@ -365,7 +378,14 @@ extended-statistics catalogs, BRIN range maintenance, maximum-capacity trigger
 qualification, effective search paths, split table-function results, and
 checkpoint deletion markers are complete and belong to the implemented
 baseline above. SQL array value width and its execution scratch are also
-complete up to the durable 16-bit element-count boundary.
+complete up to the durable 16-bit element-count boundary. Statement list
+width is complete up to statement memory, with named exceptions that remain
+bounded: 64 Bind/SQL-`PREPARE` parameters (PostgreSQL's wire boundary is
+65,535), 64 `GROUP BY` terms and 256 grouping sets (bitmask-keyed), 128-column
+results, 256 rows per XMLTABLE/JSON_TABLE call, 64 join relations and `USING`
+columns, the durable 64-item per-definition shapes (constraints, routine
+arguments, enum labels, policy roles, and their kin), and per-value
+`tsvector`/`tsquery`, JSON container, multirange, and geometry widths.
 
 ### Multi-core execution
 

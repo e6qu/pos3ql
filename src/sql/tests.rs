@@ -13699,7 +13699,7 @@ fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
 
 #[test]
 fn maximum_definition_lists_survive_wal_checkpoint_and_cold_recovery() {
-    const WIDTH: usize = crate::sql::parser::MAX_LIST;
+    const WIDTH: usize = crate::storage::MAX_DEFINITION_ITEMS;
     assert!(super::SUPPORTED_EVENT_TRIGGER_TAGS.len() >= WIDTH);
 
     let mut config = test_config("maximum-definition-lists");
@@ -13930,7 +13930,7 @@ fn maximum_definition_lists_survive_wal_checkpoint_and_cold_recovery() {
 
 #[test]
 fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
-    const WIDTH: usize = crate::sql::parser::MAX_LIST;
+    const WIDTH: usize = crate::storage::MAX_DEFINITION_ITEMS;
 
     let mut config = test_config("maximum-statement-width");
     config.object_store_on = true;
@@ -14141,6 +14141,7 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
         String::from_utf8_lossy(&setup_output)
     );
     verify(&mut engine, &mut budget, "live");
+    // Past the former fixed set-operation boundary, the statement now runs.
     let oversized_set = (0..=WIDTH)
         .map(|index| {
             if index == 0 {
@@ -14153,9 +14154,13 @@ fn maximum_statement_width_executes_before_and_after_object_cold_recovery() {
         .join(" ");
     let oversized_output = run_with(&mut engine, &mut budget, &oversized_set);
     let oversized_text = String::from_utf8_lossy(&oversized_output);
-    assert!(oversized_text.contains("54000"), "{oversized_text}");
     assert!(
-        oversized_text.contains("too many set-operation branches"),
+        !oversized_text.contains("ERROR"),
+        "{oversized_set}: {oversized_text}"
+    );
+    assert_eq!(
+        data_rows(&oversized_output).len(),
+        WIDTH + 1,
         "{oversized_text}"
     );
     assert!(engine.checkpoint().unwrap());
@@ -52814,7 +52819,7 @@ fn routine_setting_values_and_reset_values_share_one_bounded_definition() {
 fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     use core::fmt::Write as _;
 
-    const WIDTH: usize = crate::sql::parser::MAX_LIST;
+    const WIDTH: usize = crate::storage::MAX_DEFINITION_ITEMS;
     const POLICIES: usize = 40;
     let mut config = test_config("wide-callable-policy");
     config.max_tables = 2;
@@ -52936,9 +52941,14 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
             "CREATE TRIGGER wide_trigger_overflow BEFORE INSERT ON wide_policy_target FOR EACH ROW EXECUTE FUNCTION wide_trigger_function({})",
             vec!["'argument'"; WIDTH + 1].join(",")
         ),
+        // PostgreSQL deduplicates a policy's role list; exceeding the catalog
+        // boundary takes WIDTH + 1 DISTINCT roles.
         format!(
-            "ALTER POLICY wide_allow ON wide_policy_target TO {}",
-            vec!["wide_policy_role_0"; WIDTH + 1].join(",")
+            "ALTER POLICY wide_allow ON wide_policy_target TO postgres,{}",
+            (0..WIDTH)
+                .map(|index| format!("wide_policy_role_{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
         ),
     ] {
         let observed = run_with_arena_bytes(&mut engine, &mut budget, &overflow, 8 << 20);
@@ -70923,6 +70933,74 @@ fn array_value_width_is_allocation_free_and_survives_cold_recovery() {
         16 << 20,
     );
     assert_eq!(data_rows(&recovered), ["1100|1|1100|1100|v1|v1100|1100"]);
+    let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
+    cold_session.success(&mut cold, cleanup, false);
+    drop(cold_session);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn statement_list_width_is_allocation_free_and_survives_cold_recovery() {
+    let mut config = test_config("statement-list-width");
+    config.max_roles = 128;
+    config.table_rows = 2_048;
+    config.txn_rows = 2_048;
+    config.memtable_bytes = 16 << 20;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    config.checkpoint_manifest_bytes = 4 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("statement-list-width-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let (fixture, cleanup) =
+        include_str!("../../tests/external/differential/182_statement_list_width.sql")
+            .split_once("-- cleanup")
+            .unwrap();
+    let (allocation_free, simulator_backed) = fixture
+        .split_once("-- simulator-backed external run")
+        .unwrap();
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(&mut engine, allocation_free, true);
+    assert_eq!(
+        data_rows(&output),
+        ["t", "100|100", "-7", "7", "1000|2|2000|1001000", "0", "70",],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    // CTE and derived-table materialization, windowed source materialization,
+    // and sorted runs write external runs through the object simulator, whose
+    // fixture keys allocate. The production path uses the startup-reserved
+    // object request buffers.
+    let output = session.success(&mut engine, simulator_backed, false);
+    assert_eq!(
+        data_rows(&output),
+        ["65", "8", "1", "1", "2", "2", "4", "6", "100|5050", "1000"]
+    );
+
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with_arena_bytes(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT count(*), min(v), max(v), sum(v) FROM list_width; \
+         SELECT count(*) FROM pg_auth_members WHERE member = \
+                (SELECT oid FROM pg_roles WHERE rolname = 'list_summit');",
+        16 << 20,
+    );
+    assert_eq!(data_rows(&recovered), ["1000|2|2000|1001000", "70"]);
     let mut cold_session = ConfiguredTransactionSession::new(&config, &mut cold_budget);
     cold_session.success(&mut cold, cleanup, false);
     drop(cold_session);

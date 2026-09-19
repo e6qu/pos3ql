@@ -6,7 +6,7 @@
 //! its result substituted as a constant. A correlated one is re-evaluated per
 //! outer row, with the outer row's columns chained onto the inner scope.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{BinaryOp, Collation, Expr, Select, SelectItem, SetTree};
 use crate::sql::eval::{
     ColumnLookup, EvalHooks, SqlError, SubqueryList, SubqueryListProbe, SubqueryValues, eval_full,
@@ -19,11 +19,10 @@ use crate::storage::Storage;
 
 use super::setops::materialize_set_body;
 use super::{
-    Chained, MAX_AGGS, MAX_JOIN_TABLES, MAX_SUBQUERIES, MAX_WINDOWS, QueryScope, SUBQUERY_DEPTH,
-    ScopeCols, ScopeSchema, arena_full, cmp_key_rows, collect_aggs,
-    collect_table_sample_expressions, collect_windows, fold_aggregates, fromless_aggregate_hooks,
-    pax_column_demand, scan_source_with_pax_columns, select_into_rows, select_into_rows_recycling,
-    where_passes,
+    Chained, MAX_JOIN_TABLES, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema, arena_full,
+    cmp_key_rows, collect_aggs, collect_table_sample_expressions, collect_windows, fold_aggregates,
+    fromless_aggregate_hooks, pax_column_demand, scan_source_with_pax_columns, select_into_rows,
+    select_into_rows_recycling, where_passes,
 };
 use crate::sql::exec::MAX_PROJ;
 
@@ -662,11 +661,11 @@ fn streaming_array_subquery<'a>(
     Ok((v, v))
 }
 
-/// Walks an expression tree collecting subquery nodes.
+/// Walks an expression tree collecting subquery nodes, in discovery order and
+/// deduplicated by node identity so each subquery keeps one stable position.
 fn collect_subqueries<'a>(
     expression: &'a Expr<'a>,
-    out: &mut [Option<&'a Expr<'a>>; MAX_SUBQUERIES],
-    n: &mut usize,
+    out: &mut ArenaList<'a, &'a Expr<'a>>,
 ) -> Result<(), SqlError> {
     if matches!(
         expression,
@@ -677,29 +676,19 @@ fn collect_subqueries<'a>(
             | Expr::Exists(_)
             | Expr::ArraySubquery(_)
     ) {
-        if out[..*n]
-            .iter()
-            .any(|e| core::ptr::eq(e.expect("set"), expression))
-        {
+        if out.as_slice().iter().any(|&e| core::ptr::eq(e, expression)) {
             return Ok(());
         }
-        if *n == MAX_SUBQUERIES {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many subqueries in one query"
-            ));
-        }
-        out[*n] = Some(expression);
-        *n += 1;
+        out.push(expression).map_err(|_| arena_full())?;
         // The operand of IN (SELECT ..) may itself contain subqueries.
         if let Expr::InSubquery { operand, .. } | Expr::QuantifiedSubquery { operand, .. } =
             expression
         {
-            collect_subqueries(operand, out, n)?;
+            collect_subqueries(operand, out)?;
         }
         return Ok(());
     }
-    walk_children(expression, &mut |child| collect_subqueries(child, out, n))
+    walk_children(expression, &mut |child| collect_subqueries(child, out))
 }
 
 /// Selects the already-classified correlated nodes that occur inside one
@@ -709,25 +698,23 @@ fn collect_subqueries<'a>(
 pub(super) fn correlated_in_expression<'a>(
     expression: Option<&'a Expr<'a>>,
     correlated: &[&'a Expr<'a>],
-    out: &mut [&'a Expr<'a>; MAX_SUBQUERIES],
-) -> Result<usize, SqlError> {
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
     let Some(expression) = expression else {
-        return Ok(0);
+        return Ok(&[]);
     };
-    let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
-    let mut count = 0;
-    collect_subqueries(expression, &mut nodes, &mut count)?;
-    let mut selected = 0;
-    for node in nodes[..count].iter().flatten() {
+    let mut nodes = ArenaList::new(arena);
+    collect_subqueries(expression, &mut nodes)?;
+    let mut selected = ArenaList::new(arena);
+    for &node in nodes.as_slice() {
         if correlated
             .iter()
-            .any(|candidate| core::ptr::eq(*candidate, *node))
+            .any(|candidate| core::ptr::eq(*candidate, node))
         {
-            out[selected] = node;
-            selected += 1;
+            selected.push(node).map_err(|_| arena_full())?;
         }
     }
-    Ok(selected)
+    Ok(selected.as_slice())
 }
 
 /// The error-safe top-level WHERE conjuncts that do not depend on a correlated
@@ -1210,12 +1197,11 @@ pub fn prepare_subqueries<'a>(
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
-    let mut n = 0;
+    let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
-        collect_subqueries(expression, &mut nodes, &mut n)?;
+        collect_subqueries(expression, &mut nodes)?;
     }
-    eval_subquery_nodes(&nodes[..n], storage, txid, arena, params, depth, outer)
+    eval_subquery_nodes(nodes.as_slice(), storage, txid, arena, params, depth, outer)
 }
 
 /// Evaluates a set of already-collected subquery nodes (scalar, IN, or
@@ -1223,7 +1209,7 @@ pub fn prepare_subqueries<'a>(
 /// EXISTS results are stored as boolean scalars.
 #[allow(clippy::too_many_arguments)]
 fn eval_subquery_nodes<'a>(
-    nodes: &[Option<&'a Expr<'a>>],
+    nodes: &[&'a Expr<'a>],
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1231,11 +1217,25 @@ fn eval_subquery_nodes<'a>(
     depth: u32,
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<SubqueryValues<'a, 'a>, SqlError> {
-    let mut scalars_tmp: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-    let mut lists_tmp: [SubqueryList<'_>; MAX_SUBQUERIES] = [empty_subquery_list(); MAX_SUBQUERIES];
+    let n_list_nodes = nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node,
+                Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. }
+            )
+        })
+        .count();
+    let scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)] = arena
+        .alloc_slice_with(nodes.len() - n_list_nodes, |_| {
+            (core::ptr::null(), Datum::Null, Datum::Null)
+        })
+        .map_err(|_| arena_full())?;
+    let lists: &mut [SubqueryList<'a>] = arena
+        .alloc_slice_with(n_list_nodes, |_| empty_subquery_list())
+        .map_err(|_| arena_full())?;
     let (mut n_scalars, mut n_lists) = (0, 0);
-    for node in nodes.iter().flatten() {
+    for node in nodes {
         match node {
             Expr::RowSubquery { select, arity } => {
                 let (values, _, witness) = run_row_subquery(
@@ -1254,7 +1254,7 @@ fn eval_subquery_nodes<'a>(
                         "more than one row returned by a subquery used as an expression"
                     ));
                 }
-                scalars_tmp[n_scalars] = (
+                scalars[n_scalars] = (
                     *node as *const _,
                     values.first().copied().unwrap_or(Datum::Null),
                     witness,
@@ -1266,7 +1266,7 @@ fn eval_subquery_nodes<'a>(
                     let (value, witness) = streaming_scalar_subquery(
                         select, storage, txid, arena, params, depth, outer,
                     )?;
-                    scalars_tmp[n_scalars] = (*node as *const _, value, witness);
+                    scalars[n_scalars] = (*node as *const _, value, witness);
                     n_scalars += 1;
                     continue;
                 }
@@ -1279,13 +1279,12 @@ fn eval_subquery_nodes<'a>(
                     ));
                 }
                 let v = values.first().copied().unwrap_or(Datum::Null);
-                scalars_tmp[n_scalars] = (*node as *const _, v, witness);
+                scalars[n_scalars] = (*node as *const _, v, witness);
                 n_scalars += 1;
             }
             Expr::Exists(select) => {
                 let found = subquery_exists(select, storage, txid, arena, params, depth, outer)?;
-                scalars_tmp[n_scalars] =
-                    (*node as *const _, Datum::Bool(found), Datum::Bool(false));
+                scalars[n_scalars] = (*node as *const _, Datum::Bool(found), Datum::Bool(false));
                 n_scalars += 1;
             }
             Expr::ArraySubquery(select) => {
@@ -1293,14 +1292,14 @@ fn eval_subquery_nodes<'a>(
                     let (v, witness) = streaming_array_subquery(
                         select, storage, txid, arena, params, depth, outer,
                     )?;
-                    scalars_tmp[n_scalars] = (*node as *const _, v, witness);
+                    scalars[n_scalars] = (*node as *const _, v, witness);
                     n_scalars += 1;
                     continue;
                 }
                 let (values, _, witness) =
                     run_subquery(select, storage, txid, arena, params, depth, outer, 1)?;
                 let v = build_array_scalar(values, &witness, storage, txid, arena)?;
-                scalars_tmp[n_scalars] = (*node as *const _, v, v);
+                scalars[n_scalars] = (*node as *const _, v, v);
                 n_scalars += 1;
             }
             Expr::InSubquery {
@@ -1316,7 +1315,7 @@ fn eval_subquery_nodes<'a>(
                     .then(|| row_subquery_witness(original_select, storage, txid, arena, outer))
                     .transpose()?;
                 if storage.spill_attached() {
-                    lists_tmp[n_lists] = external_list_subquery(
+                    lists[n_lists] = external_list_subquery(
                         node,
                         select,
                         storage,
@@ -1334,7 +1333,7 @@ fn eval_subquery_nodes<'a>(
                 }
                 let (values, saw_null, witness) =
                     run_subquery(select, storage, txid, arena, params, depth, outer, arity)?;
-                lists_tmp[n_lists] = SubqueryList {
+                lists[n_lists] = SubqueryList {
                     node: (*node as *const Expr).cast(),
                     values,
                     probe: None,
@@ -1347,12 +1346,8 @@ fn eval_subquery_nodes<'a>(
             _ => unreachable!("collector only stores subquery nodes"),
         }
     }
-    let scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)] = arena
-        .alloc_slice_copy(&scalars_tmp[..n_scalars])
-        .map_err(|_| arena_full())?;
-    let lists = arena
-        .alloc_slice_copy(&lists_tmp[..n_lists])
-        .map_err(|_| arena_full())?;
+    debug_assert_eq!(n_scalars, scalars.len());
+    debug_assert_eq!(n_lists, lists.len());
     Ok(SubqueryValues { scalars, lists })
 }
 
@@ -1431,25 +1426,23 @@ fn subquery_exists<'a>(
         // FROM-less: an aggregate query yields its one output row even over
         // zero input rows (WHERE false), so EXISTS is true unless HAVING
         // filters it. A plain query yields one row when WHERE holds.
-        let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
-            [(core::ptr::null(), &Expr::Null); MAX_AGGS];
-        let mut n_aggs = 0;
+        let mut agg_nodes = ArenaList::new(arena);
         for item in select.items {
             if let SelectItem::Expr { expression, .. } = item {
-                collect_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
+                collect_aggs(expression, &mut agg_nodes, storage, txid)?;
             }
         }
         if let Some(h) = select.having {
-            collect_aggs(h, &mut agg_nodes, &mut n_aggs, storage, txid)?;
+            collect_aggs(h, &mut agg_nodes, storage, txid)?;
         }
-        if n_aggs > 0 || select.having.is_some() {
+        if !agg_nodes.is_empty() || select.having.is_some() {
             let base = Chained {
                 inner: &crate::sql::eval::NoColumns,
                 outer,
             };
             let hook_data = fromless_aggregate_hooks(
                 select,
-                &agg_nodes[..n_aggs],
+                agg_nodes.as_slice(),
                 storage,
                 txid,
                 arena,
@@ -1554,10 +1547,9 @@ pub(crate) fn expression_has_correlated_subquery<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
-    let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
-    let mut count = 0usize;
-    collect_subqueries(expression, &mut nodes, &mut count)?;
-    for node in nodes[..count].iter().flatten() {
+    let mut nodes = ArenaList::new(arena);
+    collect_subqueries(expression, &mut nodes)?;
+    for &node in nodes.as_slice() {
         if subquery_node_correlated(node, storage, txid, arena)? {
             return Ok(true);
         }
@@ -1764,26 +1756,21 @@ pub(super) fn prepare_outer_subqueries<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
 ) -> Result<OuterSubs<'a>, SqlError> {
-    let mut nodes: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
-    let mut n = 0;
+    let mut nodes = ArenaList::new(arena);
     for expression in exprs.iter().flatten() {
-        collect_subqueries(expression, &mut nodes, &mut n)?;
+        collect_subqueries(expression, &mut nodes)?;
     }
-    let mut uncorr: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
-    let mut n_un = 0;
-    let mut corr: [Option<&Expr>; MAX_SUBQUERIES] = [None; MAX_SUBQUERIES];
-    let mut n_corr = 0;
-    for node in nodes[..n].iter().flatten() {
+    let mut uncorr = ArenaList::new(arena);
+    let mut corr = ArenaList::new(arena);
+    for &node in nodes.as_slice() {
         if subquery_node_correlated(node, storage, txid, arena)? {
-            corr[n_corr] = Some(*node);
-            n_corr += 1;
+            corr.push(node).map_err(|_| arena_full())?;
         } else {
-            uncorr[n_un] = Some(*node);
-            n_un += 1;
+            uncorr.push(node).map_err(|_| arena_full())?;
         }
     }
     let base = eval_subquery_nodes(
-        &uncorr[..n_un],
+        uncorr.as_slice(),
         storage,
         txid,
         arena,
@@ -1791,32 +1778,87 @@ pub(super) fn prepare_outer_subqueries<'a>(
         SUBQUERY_DEPTH,
         None,
     )?;
-    let correlated = arena
-        .alloc_slice_with(n_corr, |i| corr[i].expect("set"))
+    Ok(OuterSubs {
+        base,
+        correlated: corr.as_slice(),
+    })
+}
+
+/// The exact scratch sizes `merge_correlated` fills for `base` + `correlated`
+/// (scalar slots, list slots). Callers allocate once per statement execution
+/// and reuse the slices across rows, so per-row merges never grow the arena.
+pub(super) fn merge_scratch_lens(
+    base: Option<&SubqueryValues<'_, '_>>,
+    correlated: &[&Expr<'_>],
+) -> (usize, usize) {
+    let Some(base) = base else {
+        return (0, 0);
+    };
+    let list_nodes = correlated
+        .iter()
+        .filter(|node| {
+            matches!(
+                node,
+                Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. }
+            )
+        })
+        .count();
+    (
+        base.scalars.len() + correlated.len() - list_nodes,
+        base.lists.len() + list_nodes,
+    )
+}
+
+/// Per-row merge scratch [`merge_correlated`] fills: scalar and list slots
+/// keyed by subquery node address.
+pub(super) type ScalarSlots<'a> = [(*const Expr<'a>, Datum<'a>, Datum<'a>)];
+pub(super) type ListSlots<'a> = [SubqueryList<'a>];
+
+/// Allocates the reusable merge scratch [`merge_correlated`] fills, sized
+/// exactly by [`merge_scratch_lens`]. Callers allocate once per statement (or
+/// per grouping pass) and reuse the slices across rows, so per-row merges
+/// never grow the arena.
+pub(super) fn alloc_merge_scratch<'a>(
+    base: Option<&SubqueryValues<'_, '_>>,
+    correlated: &[&Expr<'_>],
+    arena: &'a Arena,
+) -> Result<(&'a mut ScalarSlots<'a>, &'a mut ListSlots<'a>), SqlError> {
+    let (n_scalars, n_lists) = merge_scratch_lens(base, correlated);
+    let scalars = arena
+        .alloc_slice_with(n_scalars, |_| (core::ptr::null(), Datum::Null, Datum::Null))
         .map_err(|_| arena_full())?;
-    Ok(OuterSubs { base, correlated })
+    let lists = arena
+        .alloc_slice_with(n_lists, |_| empty_subquery_list())
+        .map_err(|_| arena_full())?;
+    Ok((scalars, lists))
 }
 
 /// Builds per-outer-row [`SubqueryValues`] by merging the pre-evaluated
 /// uncorrelated results with correlated subqueries evaluated against `outer`.
-/// The merged arrays live in caller-provided stack scratch (no arena growth
-/// for the bookkeeping; only the subquery result values themselves use the
-/// arena).
+/// The merged arrays live in caller-provided scratch sized by
+/// [`merge_scratch_lens`] (no arena growth for the bookkeeping; only the
+/// subquery result values themselves use the arena).
 #[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::unnecessary_cast,
+    reason = "the base values' node addresses were narrowed by covariance; the cast restores the statement-arena lifetime rustc requires"
+)]
 pub(super) fn merge_correlated<'a, 'b>(
     correlated: &[&'a Expr<'a>],
-    base: &SubqueryValues<'a, 'a>,
+    base: &SubqueryValues<'_, 'a>,
     outer: &dyn ColumnLookup<'a>,
     storage: &'a Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
-    scalars: &'b mut [(*const Expr<'a>, Datum<'a>, Datum<'a>); MAX_SUBQUERIES],
-    lists: &'b mut [SubqueryList<'a>; MAX_SUBQUERIES],
+    scalars: &'b mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
+    lists: &'b mut [SubqueryList<'a>],
 ) -> Result<SubqueryValues<'b, 'a>, SqlError> {
     let mut ns = 0;
     for (p, v, w) in base.scalars {
-        scalars[ns] = (*p, *v, *w);
+        // Node addresses are identity keys; every base value was built from
+        // this statement's arena, so the widened pointer is the same address.
+        scalars[ns] = (*p as *const Expr<'a>, *v, *w);
         ns += 1;
     }
     let mut nl = 0;
@@ -2005,23 +2047,14 @@ pub(super) fn correlated_where_passes<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
+    scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
+    lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
     let Some(predicate) = predicate else {
         return Ok(true);
     };
-    let mut scalars: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-    let mut lists: [SubqueryList<'_>; MAX_SUBQUERIES] = [empty_subquery_list(); MAX_SUBQUERIES];
     let values = merge_correlated(
-        correlated,
-        base,
-        row,
-        storage,
-        txid,
-        arena,
-        params,
-        &mut scalars,
-        &mut lists,
+        correlated, base, row, storage, txid, arena, params, scalars, lists,
     )?;
     let where_hooks = EvalHooks {
         subs: Some(&values),
@@ -2519,17 +2552,10 @@ fn run_subquery<'a>(
     };
     // A window function needs rows materialized before it can be computed, so
     // its body belongs to the row-source executor just as a grouped one does.
-    let mut win_probe: [&Expr; MAX_WINDOWS] = [&Expr::Null; MAX_WINDOWS];
-    let mut n_win_probe = 0;
-    collect_windows(item, &mut win_probe, &mut n_win_probe, storage, txid)?;
+    let mut win_probe = ArenaList::new(arena);
+    collect_windows(item, &mut win_probe, storage, txid)?;
     for ob in select.order_by {
-        collect_windows(
-            ob.expression,
-            &mut win_probe,
-            &mut n_win_probe,
-            storage,
-            txid,
-        )?;
+        collect_windows(ob.expression, &mut win_probe, storage, txid)?;
     }
     // A set-returning function in the subquery's select list expands to many
     // rows, so its body belongs to the row-source executor too (which handles
@@ -2538,7 +2564,7 @@ fn run_subquery<'a>(
     if !select.group_by.is_empty()
         || select.having.is_some()
         || select.distinct
-        || n_win_probe > 0
+        || !win_probe.is_empty()
         || has_srf
     {
         // Grouped/DISTINCT/windowed/SRF subquery: the row-source executor
@@ -2650,14 +2676,12 @@ fn run_subquery<'a>(
         // FROM-less: one row (outer columns still visible if correlated).
         // Aggregates fold over that single virtual row (zero when WHERE is
         // false) and still yield their one output row.
-        let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
-            [(core::ptr::null(), &Expr::Null); MAX_AGGS];
-        let mut n_aggs = 0;
-        collect_aggs(item, &mut agg_nodes, &mut n_aggs, storage, txid)?;
-        if n_aggs > 0 {
+        let mut agg_nodes = ArenaList::new(arena);
+        collect_aggs(item, &mut agg_nodes, storage, txid)?;
+        if !agg_nodes.is_empty() {
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 select,
-                &agg_nodes[..n_aggs],
+                agg_nodes.as_slice(),
                 storage,
                 txid,
                 arena,
@@ -2749,25 +2773,24 @@ fn run_subquery<'a>(
     };
 
     // Aggregate subquery: one row.
-    let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
-        [(core::ptr::null(), &Expr::Null); MAX_AGGS];
-    let mut n_aggs = 0;
-    collect_aggs(item, &mut agg_nodes, &mut n_aggs, storage, txid)?;
-    if n_aggs > 0 {
+    let mut agg_nodes = ArenaList::new(arena);
+    collect_aggs(item, &mut agg_nodes, storage, txid)?;
+    if !agg_nodes.is_empty() {
         let agg_values = fold_aggregates(
             storage,
             &scope,
             from,
             txid,
             select.where_clause,
-            &agg_nodes[..n_aggs],
+            agg_nodes.as_slice(),
             arena,
             params,
             &hooks,
             outer,
         )?;
+        let agg_nodes = agg_nodes.as_slice();
         let ptrs = arena
-            .alloc_slice_with(n_aggs, |i| agg_nodes[i].0)
+            .alloc_slice_with(agg_nodes.len(), |i| agg_nodes[i].0)
             .map_err(|_| arena_full())?;
         let agg_hooks = EvalHooks {
             group: None,

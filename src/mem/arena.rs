@@ -373,6 +373,14 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
         self.len
     }
 
+    /// Drops entries past `len` without reclaiming their arena storage (the
+    /// bump arena reclaims everything at reset). `len` must not exceed the
+    /// current length.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len);
+        self.len = len;
+    }
+
     pub(crate) const fn is_empty(&self) -> bool {
         self.len == 0
     }

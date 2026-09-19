@@ -2491,10 +2491,10 @@ pub(crate) fn dispatch<'a>(
                     ..
                 } = args[0]
                     && let Some(cat) = hooks.catalog
-                    && args.len() <= crate::sql::parser::MAX_LIST
                 {
-                    let mut argument_oids =
-                        [crate::sql::types::oid::UNKNOWN; crate::sql::parser::MAX_LIST];
+                    let argument_oids = arena
+                        .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
+                        .map_err(|_| arena_full())?;
                     for (index, argument) in args.iter().enumerate() {
                         argument_oids[index] = match argument {
                             crate::sql::ast::Expr::Cast { type_name, .. } => cat
@@ -2508,12 +2508,9 @@ pub(crate) fn dispatch<'a>(
                             .unwrap_or(crate::sql::types::oid::UNKNOWN),
                         };
                     }
-                    if let Some(referenced_oid) = cat.routine_result_oid(
-                        name,
-                        argument_names,
-                        false,
-                        &argument_oids[..args.len()],
-                    ) && let Some(type_name) = cat.type_name(referenced_oid, arena)?
+                    if let Some(referenced_oid) =
+                        cat.routine_result_oid(name, argument_names, false, argument_oids)
+                        && let Some(type_name) = cat.type_name(referenced_oid, arena)?
                     {
                         return Ok(regtype(referenced_oid, type_name));
                     }

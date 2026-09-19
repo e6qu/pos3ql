@@ -11,7 +11,7 @@ use crate::util::StackStr;
 use super::{CatalogDdlState, DatabaseOid, Ownership, PendingOwnership, SqlName};
 
 /// One OPTIONS clause follows the parser's complete bounded list.
-pub(crate) const MAX_FOREIGN_OPTIONS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_FOREIGN_OPTIONS: usize = super::MAX_DEFINITION_ITEMS;
 /// Column options share one sparse table-level catalog. Its bound admits one
 /// option for every accepted column or a complete OPTIONS clause on one
 /// column, without the former 32-entry storage-only ceiling.

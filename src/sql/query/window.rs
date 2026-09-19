@@ -6,7 +6,7 @@
 //! points `rewrite_grouped_windows`, `project_window_rows`, `window_select`,
 //! `dedup_window_rows`, and `cmp_key_rows` are called from the query pipeline.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{
     BinaryOp, Collation, Expr, FrameBound, FrameUnits, FromClause, OrderBy, Select, SelectItem,
@@ -24,11 +24,10 @@ use crate::{sql_err, stack_format};
 use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
-    AggState, GroupedRewrite, MAX_AGGS, MAX_JOIN_TABLES, MAX_SUBQUERIES, MAX_WIN_KEYS, MAX_WINDOWS,
-    Outcome, QueryScope, arena_full, collect_grouped_aggs, merge_correlated, pax_column_demand,
-    project_row, record_star_width, resolve_order_target, rewrite_grouped_expr,
-    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
-    window_row,
+    AggState, GroupedRewrite, MAX_JOIN_TABLES, Outcome, QueryScope, arena_full,
+    collect_grouped_aggs, merge_correlated, pax_column_demand, project_row, record_star_width,
+    resolve_order_target, rewrite_grouped_expr, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns, sql_fail, sql_ok, window_row,
 };
 
 fn window_scan_where<'a>(
@@ -36,10 +35,8 @@ fn window_scan_where<'a>(
     correlated: &[&'a Expr<'a>],
     arena: &'a Arena,
 ) -> Result<Option<&'a Expr<'a>>, SqlError> {
-    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
-    let count =
-        correlated_in_expression(statement.where_clause, correlated, &mut where_correlated)?;
-    correlated_scan_conjuncts(statement.where_clause, &where_correlated[..count], arena)
+    let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
+    correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)
 }
 
 fn window_pax_columns<'a>(
@@ -47,21 +44,32 @@ fn window_pax_columns<'a>(
     scope: &QueryScope<'a>,
     from: &'a FromClause<'a>,
     win_nodes: &[&'a Expr<'a>],
-) -> super::PaxReadDemand {
-    let mut expressions = [&Expr::Null; MAX_PROJ * 3 + MAX_WINDOWS + 3];
+    arena: &'a Arena,
+) -> Result<super::PaxReadDemand, SqlError> {
+    if statement
+        .items
+        .iter()
+        .any(|item| !matches!(item, SelectItem::Expr { .. }))
+    {
+        return Ok(super::PaxReadDemand::full_row(
+            super::scan::PaxFullRowReason::WildcardProjection,
+        ));
+    }
+    let n_expressions = statement.items.len()
+        + win_nodes.len()
+        + statement.order_by.len()
+        + statement.distinct_on.len()
+        + 4;
+    let expressions: &mut [&Expr] = arena
+        .alloc_slice_with(n_expressions, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for item in statement.items {
-        match item {
-            SelectItem::Expr { expression, .. } => {
-                expressions[count] = expression;
-                count += 1;
-            }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) | SelectItem::RecordStar(_) => {
-                return super::PaxReadDemand::full_row(
-                    super::scan::PaxFullRowReason::WildcardProjection,
-                );
-            }
-        }
+        let SelectItem::Expr { expression, .. } = item else {
+            unreachable!("wildcards returned above");
+        };
+        expressions[count] = expression;
+        count += 1;
     }
     for expression in win_nodes {
         expressions[count] = expression;
@@ -87,7 +95,7 @@ fn window_pax_columns<'a>(
         expressions[count] = expression;
         count += 1;
     }
-    pax_column_demand(scope, from, &expressions[..count])
+    Ok(pax_column_demand(scope, from, &expressions[..count]))
 }
 
 /// Windows over a grouped query: PostgreSQL evaluates window functions after
@@ -102,23 +110,28 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    let mut agg_nodes: [(*const Expr, &Expr); MAX_AGGS] =
-        [(core::ptr::null(), &Expr::Null); MAX_AGGS];
-    let mut n_aggs = 0;
+    let mut agg_nodes = ArenaList::new(arena);
     for item in statement.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
-            collect_grouped_aggs(expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
+            collect_grouped_aggs(expression, &mut agg_nodes, storage, txid)?;
         }
     }
     for ob in statement.order_by {
-        collect_grouped_aggs(ob.expression, &mut agg_nodes, &mut n_aggs, storage, txid)?;
+        collect_grouped_aggs(ob.expression, &mut agg_nodes, storage, txid)?;
     }
+    let agg_nodes = agg_nodes.as_slice();
+    let n_aggs = agg_nodes.len();
 
     // The inner select: one named column per grouping key and per aggregate.
     let n_keys = statement.group_by.len();
+    if n_keys + n_aggs > MAX_PROJ {
+        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
+    }
     let mut inner_items = [SelectItem::Wildcard; MAX_PROJ];
     let mut group_names: [&str; MAX_PROJ] = [""; MAX_PROJ];
-    let mut agg_names: [&str; MAX_AGGS] = [""; MAX_AGGS];
+    let agg_names = arena
+        .alloc_slice_with(n_aggs, |_| "")
+        .map_err(|_| arena_full())?;
     for (i, g) in statement.group_by.iter().enumerate() {
         let name = arena
             .alloc_str(stack_format!(16, "?g{}", i).as_str())
@@ -164,12 +177,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
     let group_names: &[&str] = arena
         .alloc_slice_copy(&group_names[..n_keys])
         .map_err(|_| arena_full())?;
-    let agg_names: &[&str] = arena
-        .alloc_slice_copy(&agg_names[..n_aggs])
-        .map_err(|_| arena_full())?;
-    let agg_nodes: &[(*const Expr, &Expr)] = arena
-        .alloc_slice_copy(&agg_nodes[..n_aggs])
-        .map_err(|_| arena_full())?;
+    let agg_names: &[&str] = agg_names;
     let scope = statement
         .from
         .as_ref()
@@ -1429,7 +1437,12 @@ pub(crate) fn project_window_rows<'a>(
     outer: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<(&'a [&'a [Datum<'a>]], &'a [&'a [Datum<'a>]]), SqlError> {
     let scan_where = window_scan_where(statement, correlated, arena)?;
-    let pax_columns = window_pax_columns(statement, scope, from, win_nodes);
+    let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
+    // Per-row correlated-subquery scratch, allocated once and reused across
+    // both passes and the per-output-row merge below: per-row merges must not
+    // grow the statement arena.
+    let (where_scalars, where_lists) =
+        super::subquery::alloc_merge_scratch(Some(base), correlated, arena)?;
     // Flat-row column offsets per table.
     let mut offs = [0usize; MAX_JOIN_TABLES];
     let mut total = 0usize;
@@ -1461,6 +1474,8 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 hooks,
                 row,
+                &mut *where_scalars,
+                &mut *where_lists,
             )? {
                 return Ok(true);
             }
@@ -1495,6 +1510,8 @@ pub(crate) fn project_window_rows<'a>(
                 params,
                 hooks,
                 row,
+                &mut *where_scalars,
+                &mut *where_lists,
             )? {
                 return Ok(true);
             }
@@ -1520,7 +1537,9 @@ pub(crate) fn project_window_rows<'a>(
     let rows: &[&[Datum]] = &rows[..count];
 
     // Compute each window function's per-row values.
-    let mut win_vals: [&[Datum]; MAX_WINDOWS] = [empty; MAX_WINDOWS];
+    let win_vals: &mut [&[Datum]] = arena
+        .alloc_slice_with(win_nodes.len(), |_| empty)
+        .map_err(|_| arena_full())?;
     for (wi, &node) in win_nodes.iter().enumerate() {
         win_vals[wi] = compute_window(
             storage, txid, node, rows, scope, &offs, arena, params, hooks,
@@ -1532,13 +1551,9 @@ pub(crate) fn project_window_rows<'a>(
 
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
-    let mut order_exprs: [Option<&Expr>; MAX_WIN_KEYS] = [None; MAX_WIN_KEYS];
-    if n_order > MAX_WIN_KEYS {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "ORDER BY list too long"
-        ));
-    }
+    let order_exprs: &mut [Option<&Expr>] = arena
+        .alloc_slice_with(n_order, |_| None)
+        .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
         order_exprs[k] = Some(resolve_order_target(
             ob.expression,
@@ -1555,23 +1570,30 @@ pub(crate) fn project_window_rows<'a>(
     let sort_keys: &mut [&[Datum]] = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
+    let wv: &mut [Datum] = arena
+        .alloc_slice_with(win_nodes.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     for i in 0..count {
-        let mut wv = [Datum::Null; MAX_WINDOWS];
         for (w, wval) in win_vals.iter().enumerate().take(win_nodes.len()) {
             wv[w] = wval[i];
         }
         let jr = window_row(scope, rows[i], &offs);
         // Correlated subqueries in the select list / ORDER BY re-evaluate per
         // output row (their outer references resolve to this window row).
-        let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-            [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-        let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
         let row_subs;
         let subs = if correlated.is_empty() {
             hooks.subs
         } else {
             row_subs = merge_correlated(
-                correlated, base, &jr, storage, txid, arena, params, &mut sc, &mut ls,
+                correlated,
+                base,
+                &jr,
+                storage,
+                txid,
+                arena,
+                params,
+                &mut *where_scalars,
+                &mut *where_lists,
             )?;
             Some(&row_subs)
         };
@@ -1600,7 +1622,9 @@ pub(crate) fn project_window_rows<'a>(
         proj_rows[i] = &*arena
             .alloc_slice_copy(&projected[..np])
             .map_err(|_| arena_full())?;
-        let mut keys = [Datum::Null; MAX_WIN_KEYS];
+        let keys: &mut [Datum] = arena
+            .alloc_slice_with(n_order, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
             keys[k] = eval_full(
                 oe.expect("set"),
@@ -1724,7 +1748,11 @@ pub(crate) fn external_window_into<'a>(
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<bool, SqlError>,
 ) -> Result<u64, SqlError> {
     let scan_where = window_scan_where(statement, correlated, arena)?;
-    let pax_columns = window_pax_columns(statement, scope, from, win_nodes);
+    let pax_columns = window_pax_columns(statement, scope, from, win_nodes, arena)?;
+    // Per-row correlated-subquery scratch, allocated once and reused across
+    // every scan pass below: per-row merges must not grow the statement arena.
+    let (where_scalars, where_lists) =
+        super::subquery::alloc_merge_scratch(Some(base), correlated, arena)?;
     // Flat-row column offsets per table.
     let mut offs = [0usize; MAX_JOIN_TABLES];
     let mut total = 0usize;
@@ -1734,13 +1762,9 @@ pub(crate) fn external_window_into<'a>(
     }
     // Resolve ORDER BY (ordinals → select items).
     let n_order = statement.order_by.len();
-    if n_order > MAX_WIN_KEYS {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "ORDER BY list too long"
-        ));
-    }
-    let mut order_exprs: [Option<&Expr>; MAX_WIN_KEYS] = [None; MAX_WIN_KEYS];
+    let order_exprs: &mut [Option<&Expr>] = arena
+        .alloc_slice_with(n_order, |_| None)
+        .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
         order_exprs[k] = Some(resolve_order_target(
             ob.expression,
@@ -1775,8 +1799,12 @@ pub(crate) fn external_window_into<'a>(
         };
         let n_partition = spec.partition_by.len();
         let n_keys = n_partition + spec.order_by.len();
-        let mut partition_collations = [Collation::None; MAX_WIN_KEYS];
-        let mut order_collations = [Collation::None; MAX_WIN_KEYS];
+        let partition_collations: &mut [Collation] = arena
+            .alloc_slice_with(n_partition, |_| Collation::None)
+            .map_err(|_| arena_full())?;
+        let order_collations: &mut [Collation] = arena
+            .alloc_slice_with(spec.order_by.len(), |_| Collation::None)
+            .map_err(|_| arena_full())?;
         for (index, expression) in spec.partition_by.iter().enumerate() {
             partition_collations[index] = scope.expression_collation(expression)?;
         }
@@ -1831,6 +1859,8 @@ pub(crate) fn external_window_into<'a>(
                     params,
                     hooks,
                     row,
+                    &mut *where_scalars,
+                    &mut *where_lists,
                 )? {
                     return Ok(true);
                 }
@@ -2016,7 +2046,9 @@ pub(crate) fn external_window_into<'a>(
     // Re-scan the source, projecting each row with its window values read
     // back from the completed run, and sort the projected rows by ORDER BY.
     let width = projected_width(statement.items, scope)?;
-    let mut statement_order_collations = [Collation::None; MAX_WIN_KEYS];
+    let statement_order_collations: &mut [Collation] = arena
+        .alloc_slice_with(statement.order_by.len(), |_| Collation::None)
+        .map_err(|_| arena_full())?;
     for (index, order) in statement.order_by.iter().enumerate() {
         let expression = resolve_order_target(order.expression, statement.items, scope, arena)?;
         statement_order_collations[index] = scope.expression_collation(expression)?;
@@ -2051,6 +2083,12 @@ pub(crate) fn external_window_into<'a>(
         None => None,
     };
     let win_count = win_nodes.len();
+    let wv: &mut [Datum] = arena
+        .alloc_slice_with(win_count, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let keys: &mut [Datum] = arena
+        .alloc_slice_with(n_order, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
     let mut position = 0i64;
     scan_source_recycling_with_pax_columns(
         storage,
@@ -2073,12 +2111,13 @@ pub(crate) fn external_window_into<'a>(
                 params,
                 hooks,
                 row,
+                &mut *where_scalars,
+                &mut *where_lists,
             )? {
                 return Ok(true);
             }
             // Each window value is detached into the arena so the reader can
             // advance past it before the row is projected.
-            let mut wv = [Datum::Null; MAX_WINDOWS];
             for w in 0..win_count {
                 let reader = win_reader.as_mut().ok_or_else(|| {
                     sql_err!(sqlstate::INTERNAL_ERROR, "window run is missing rows")
@@ -2107,15 +2146,20 @@ pub(crate) fn external_window_into<'a>(
                     .with_block_store(|blocks| reader.advance(blocks))
                     .expect("spill-attached block store")?;
             }
-            let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-                [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-            let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
             let row_subs;
             let subs = if correlated.is_empty() {
                 hooks.subs
             } else {
                 row_subs = merge_correlated(
-                    correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
+                    correlated,
+                    base,
+                    row,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    &mut *where_scalars,
+                    &mut *where_lists,
                 )?;
                 Some(&row_subs)
             };
@@ -2142,7 +2186,6 @@ pub(crate) fn external_window_into<'a>(
                 outer,
             )?;
             debug_assert_eq!(np, width);
-            let mut keys = [Datum::Null; MAX_WIN_KEYS];
             for (k, oe) in order_exprs.iter().enumerate().take(n_order) {
                 keys[k] = eval_full(
                     oe.expect("set"),

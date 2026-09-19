@@ -138,7 +138,7 @@ configuration reserves 256 slots.
 Row-level security likewise uses an independent `max_policies` pool (default
 256), not eight slots per table. Policy plans draw from the statement arena.
 Routine parameters, output columns, configuration settings, policy role lists,
-and trigger arguments accept the parser's complete 64-item boundary.
+and trigger arguments accept the durable 64-item per-definition boundary.
 Trigger arguments follow PostgreSQL's zero-based `TG_ARGV` and NULL-for-none
 semantics. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.
@@ -240,16 +240,19 @@ clauses, and operator-family operator/support-function catalogs use that same
 before catalog mutation. Index key/include counts and `pg_partitioned_table`
 expose the same accepted shape after empty-cache recovery.
 
-Wide statements likewise use the parser's complete 64-item list boundary for
-simple and extended execution: Bind parameters, CTEs, row-locking clauses,
-window definitions, `ALTER TABLE` actions, `JOIN ... USING` columns, aggregate
-and scalar-subquery scratch, set-operation leaves, and anonymous record shapes
-are described, planned, executed, and explained at that width. A window may
-compose 64 partition keys with 64 ordering keys. `EXPLAIN` plan nodes live in
-the fixed statement arena rather than the worker stack, and over-boundary
-input returns SQLSTATE `54000` without dropping parse warnings or partially
-executing the statement. The maximum accepted shapes are qualified before and
-after empty-cache object recovery.
+Wide statements are bounded by the fixed statement arena rather than compiled
+staging arrays: select lists, `IN` lists, `VALUES` rows, CTEs, row-locking
+clauses, window definitions and their partition/ordering keys, `ALTER TABLE`
+actions, aggregates, scalar subqueries, set-operation branches, GRANT role
+lists, and multi-hundred-item expression lists are described, planned,
+executed, and explained at their written width. Remaining fixed statement
+boundaries are 64 Bind/SQL-`PREPARE` parameters, 64 `GROUP BY` terms with 256
+grouping sets, 128-column results, 256 rows per XMLTABLE/JSON_TABLE call, and
+64 join relations and `USING` columns. `EXPLAIN` plan nodes live in the fixed
+statement arena rather than the worker stack, and arena exhaustion returns
+SQLSTATE `54000` without dropping parse warnings or partially executing the
+statement. The former boundaries are qualified before and after empty-cache
+object recovery.
 
 That 64-item limit governs the breadth of one SQL construct, not the number of
 statements in a program. Simple-query batches and SQL and PL/pgSQL routine

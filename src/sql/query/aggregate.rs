@@ -18,8 +18,8 @@ use crate::sql_err;
 use crate::storage::Storage;
 
 use super::{
-    Chained, MAX_AGGS, QueryScope, arena_full, pax_column_demand,
-    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
+    Chained, QueryScope, arena_full, pax_column_demand, scan_source_recycling_with_pax_columns,
+    scan_source_with_pax_columns,
 };
 
 struct JsonAggregateDisplay<'a> {
@@ -81,14 +81,18 @@ pub(crate) fn fold_aggregates<'a>(
     hooks: &EvalHooks<'_, 'a>,
     outer_arg: Option<&dyn ColumnLookup<'a>>,
 ) -> Result<&'a mut [Datum<'a>], SqlError> {
-    let mut states = [AggState::default(); MAX_AGGS];
+    let states: &mut [AggState] = arena
+        .alloc_slice_with(agg_nodes.len(), |_| AggState::default())
+        .map_err(|_| arena_full())?;
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
         states[i].init(node, storage, txid, &super::ScopeCols(scope), arena)?;
     }
     let recycling_safe = states[..agg_nodes.len()]
         .iter()
         .all(AggState::recycling_safe);
-    let mut expressions = [&Expr::Null; MAX_AGGS + 1];
+    let expressions: &mut [&Expr] = arena
+        .alloc_slice_with(agg_nodes.len() + 1, |_| &Expr::Null)
+        .map_err(|_| arena_full())?;
     for (index, (_, expression)) in agg_nodes.iter().enumerate() {
         expressions[index] = expression;
     }

@@ -13,9 +13,10 @@ use super::eval::SqlError;
 use super::types::ColType;
 use core::cell::Cell;
 
-/// Upper bound on declared PREPARE parameter types (matches the parser's
-/// per-list limit).
-pub const MAX_PREP_PARAMS: usize = super::parser::MAX_LIST;
+/// Upper bound on declared PREPARE parameter types; the slot stores them
+/// inline, so the SQL-level pool has its own boundary (PostgreSQL's protocol
+/// boundary is 65,535).
+pub const MAX_PREP_PARAMS: usize = 64;
 const MAX_PREP_RESULTS: usize = super::exec::MAX_PROJ;
 
 pub struct SqlPreparedPool {

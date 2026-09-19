@@ -1,9 +1,10 @@
 //! Recursive-descent parser (Pratt for expressions) into the arena AST.
 //!
-//! Fixed limits, checked loudly: at most [`MAX_LIST`] items per select
-//! list / column list / VALUES row, and [`MAX_ROWS`] rows per INSERT.
+//! Statement lists (select items, column lists, VALUES rows, …) are bounded
+//! only by the statement arena; grouping-set masks and `LOCK TABLE` name lists
+//! keep their own fixed limits.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
 use crate::util::StackStr;
@@ -20,19 +21,15 @@ use super::types::{IntervalField, IntervalRange, TypeMod};
 pub(crate) const SIMILAR_TO: &str = "similar to";
 pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
 
-pub const MAX_LIST: usize = 64;
+/// GROUP BY terms in one query (and the width of one ROLLUP/CUBE clause):
+/// the grouping-set machinery keys each set on a 64-bit mask over the flat
+/// term list. Every other statement list is bounded only by the statement
+/// arena.
+pub const MAX_GROUP_TERMS: usize = 64;
 /// A single `LOCK TABLE` may name every relation in the largest bounded
 /// catalog operation. This is separate from ordinary SQL lists because
 /// pg_dump locks its complete table set in one statement.
 pub const MAX_LOCK_TABLES: usize = crate::storage::MAX_PUBLICATION_TABLES;
-
-pub const MAX_CTES: usize = MAX_LIST;
-/// Maximum number of `FOR UPDATE`/`FOR SHARE`/… clauses on one query.
-pub const MAX_LOCK_CLAUSES: usize = MAX_LIST;
-/// Upper bound on `WINDOW name AS (...)` definitions in one SELECT.
-pub const MAX_WINDOW_DEFS: usize = MAX_LIST;
-/// Upper bound on warnings one statement's parse may raise.
-pub const MAX_PARSE_WARNINGS: usize = MAX_LIST * 2;
 type OrderLimit<'a> = (
     &'a [OrderBy<'a>],
     Option<&'a Expr<'a>>,
@@ -58,9 +55,6 @@ fn push_mask(
     *n += 1;
     Ok(())
 }
-/// Upper bound on subcommands in one comma-separated ALTER TABLE.
-pub const MAX_ALTER_ACTIONS: usize = MAX_LIST;
-
 /// PostgreSQL executes ALTER TABLE subcommands in a fixed pass order rather
 /// than the written order: drops first, then column-type changes, then column
 /// adds, then constraint adds, then column-attribute changes. This returns the
@@ -278,15 +272,14 @@ pub struct Parser<'a> {
     /// Highest `$n` seen — the statement's parameter count.
     max_param: u32,
     /// The `WINDOW name AS (...)` definitions of the SELECT being parsed, which
-    /// `OVER name` resolves against. Scoped to that SELECT: saved and cleared
-    /// around a nested one, since a subquery neither sees nor exports them.
-    windows: [Option<(&'a str, &'a WindowSpec<'a>)>; MAX_WINDOW_DEFS],
-    n_windows: usize,
+    /// `OVER name` resolves against. Scoped to that SELECT: the length is saved
+    /// and truncated back around a nested one, since a subquery neither sees
+    /// nor exports them.
+    windows: ArenaList<'a, Option<(&'a str, &'a WindowSpec<'a>)>>,
     /// Warnings raised while parsing. PostgreSQL reports these before the
     /// statement's own output, so the engine drains them after each
     /// `next_stmt` and emits them ahead of executing it.
-    warnings: [StackStr<96>; MAX_PARSE_WARNINGS],
-    n_warnings: usize,
+    warnings: ArenaList<'a, StackStr<96>>,
     /// True while parsing a position where `SELECT ... INTO table` is legal (a
     /// top-level query). A subquery / CTE / set-op branch clears it, so an
     /// `INTO` there is rejected as PostgreSQL rejects it.
@@ -453,10 +446,8 @@ impl<'a> Parser<'a> {
             peek_at,
             arena,
             max_param: 0,
-            windows: [None; MAX_WINDOW_DEFS],
-            n_windows: 0,
-            warnings: [StackStr::new(); MAX_PARSE_WARNINGS],
-            n_warnings: 0,
+            windows: ArenaList::new(arena),
+            warnings: ArenaList::new(arena),
             allow_into: false,
             into_clause: None,
             stop_default_at_not_null: false,
@@ -473,9 +464,10 @@ impl<'a> Parser<'a> {
         self.routine_name = Some(routine_name);
         for (index, parameter) in parameters.iter().enumerate() {
             if !parameter.name.as_str().is_empty() {
-                let allocated = self.arena.alloc_str(parameter.name.as_str()).map_err(|_| {
-                    ParseError::new(self.peek_at, "statement too large for SQL arena")
-                })?;
+                let allocated = self
+                    .arena
+                    .alloc_str(parameter.name.as_str())
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                 self.routine_parameters[index] = Some(allocated);
             }
         }
@@ -1051,19 +1043,15 @@ impl<'a> Parser<'a> {
                     let targets = if self.eat_ident("all")? {
                         ConstraintTargets::All
                     } else {
-                        let mut names = [QualName::bare(""); MAX_LIST];
-                        let mut count = 0;
+                        let mut names = ArenaList::new(self.arena);
                         loop {
-                            if count == names.len() {
-                                return Err(self.limit("constraint names", names.len()));
-                            }
-                            names[count] = self.qual_name("constraint name")?;
-                            count += 1;
+                            let name = self.qual_name("constraint name")?;
+                            self.push(&mut names, name)?;
                             if !self.eat_op(",")? {
                                 break;
                             }
                         }
-                        ConstraintTargets::Named(self.arena_slice(&names[..count])?)
+                        ConstraintTargets::Named(names.as_slice())
                     };
                     let mode = if self.eat_ident("deferred")? {
                         ConstraintMode::Deferred
@@ -1406,23 +1394,19 @@ impl<'a> Parser<'a> {
         self.advance()?;
         let name = self.qual_name("procedure name")?;
         self.expect_op("(")?;
-        let mut arguments = [&Expr::Null; MAX_LIST];
-        let mut argument_names = [None; MAX_LIST];
-        let mut count = 0;
+        let mut arguments = ArenaList::new(self.arena);
+        let mut argument_names = ArenaList::new(self.arena);
         let mut saw_named = false;
         let mut variadic = false;
         if !self.eat_op(")")? {
             loop {
-                if count == arguments.len() {
-                    return Err(self.limit("procedure arguments", arguments.len()));
-                }
                 let this_variadic = self.eat_ident("variadic")?;
                 if this_variadic && saw_named {
                     return Err(self.err_here("VARIADIC argument cannot use named notation"));
                 }
                 let first = self.expression(0)?;
-                if self.eat_op("=>")? {
-                    argument_names[count] = Some(match first {
+                let (argument, argument_name) = if self.eat_op("=>")? {
+                    let argument_name = match first {
                         Expr::Column {
                             qualifier: None,
                             name,
@@ -1432,27 +1416,28 @@ impl<'a> Parser<'a> {
                                 self.err_here("procedure argument name must be an identifier")
                             );
                         }
-                    });
-                    arguments[count] = self.expression(0)?;
+                    };
+                    let argument = self.expression(0)?;
                     saw_named = true;
+                    (argument, Some(argument_name))
                 } else {
                     if saw_named {
                         return Err(
                             self.err_here("positional argument cannot follow named argument")
                         );
                     }
-                    arguments[count] = first;
-                }
+                    (first, None)
+                };
+                self.push(&mut arguments, argument)?;
+                self.push(&mut argument_names, argument_name)?;
                 if this_variadic {
                     variadic = true;
-                    count += 1;
                     if self.peeked != Tok::Op(")") {
                         return Err(self.err_here("VARIADIC argument must be last"));
                     }
                     self.advance()?;
                     break;
                 }
-                count += 1;
                 if self.eat_op(")")? {
                     break;
                 }
@@ -1461,9 +1446,9 @@ impl<'a> Parser<'a> {
         }
         Ok(Stmt::Call {
             name,
-            arguments: self.arena_slice(&arguments[..count])?,
+            arguments: arguments.as_slice(),
             argument_names: if saw_named {
-                self.arena_slice(&argument_names[..count])?
+                argument_names.as_slice()
             } else {
                 &[]
             },
@@ -1473,13 +1458,9 @@ impl<'a> Parser<'a> {
 
     /// A comma-separated projection list (used by SELECT and RETURNING).
     fn select_items(&mut self) -> Result<&'a [SelectItem<'a>], ParseError> {
-        let mut items = [SelectItem::Wildcard; MAX_LIST];
-        let mut n = 0;
+        let mut items = ArenaList::new(self.arena);
         loop {
-            if n == MAX_LIST {
-                return Err(self.limit("select list", MAX_LIST));
-            }
-            items[n] = if self.peeked == Tok::Op("*") {
+            let item = if self.peeked == Tok::Op("*") {
                 self.advance()?;
                 SelectItem::Wildcard
             } else if let Some(table) = self.table_wildcard()? {
@@ -1500,12 +1481,12 @@ impl<'a> Parser<'a> {
                     _ => SelectItem::Expr { expression, alias },
                 }
             };
-            n += 1;
+            self.push(&mut items, item)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.arena_slice(&items[..n])
+        Ok(items.as_slice())
     }
 
     /// `t.*` (two tokens of lookahead: restores the parser when the item
@@ -1585,27 +1566,23 @@ impl<'a> Parser<'a> {
         // list. The scope stays live past this function because the trailing
         // ORDER BY — parsed by our caller — may also use those names; the
         // caller restores the enclosing query's windows once it is done.
-        self.n_windows = 0;
+        self.windows.truncate(0);
         self.prescan_windows()?;
         let mut distinct_on: &'a [&'a Expr<'a>] = &[];
         let distinct = if self.eat_ident("distinct")? {
             // `DISTINCT ON (expr, ...)`: keep the first row per distinct key.
             if self.eat_ident("on")? {
                 self.expect_op("(")?;
-                let mut exprs = [self.arena_expr(Expr::Null)?; MAX_LIST];
-                let mut n = 0;
+                let mut exprs = ArenaList::new(self.arena);
                 loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("DISTINCT ON list", MAX_LIST));
-                    }
-                    exprs[n] = self.expression(0)?;
-                    n += 1;
+                    let expression = self.expression(0)?;
+                    self.push(&mut exprs, expression)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
-                distinct_on = self.arena_slice(&exprs[..n])?;
+                distinct_on = exprs.as_slice();
             }
             true
         } else {
@@ -1736,18 +1713,10 @@ impl<'a> Parser<'a> {
 
     /// Trailing ORDER BY / LIMIT / OFFSET (any may be absent).
     fn order_limit(&mut self) -> Result<OrderLimit<'a>, ParseError> {
-        let mut order = [OrderBy {
-            expression: &Expr::Null,
-            descending: false,
-            nulls_first: false,
-        }; MAX_LIST];
-        let mut n_order = 0;
+        let mut order = ArenaList::new(self.arena);
         if self.eat_ident("order")? {
             self.expect_ident("by")?;
             loop {
-                if n_order == MAX_LIST {
-                    return Err(self.limit("order by list", MAX_LIST));
-                }
                 let expression = self.expression(0)?;
                 let descending = self.order_direction()?;
                 // Optional NULLS FIRST/LAST; PostgreSQL defaults NULLS LAST
@@ -1762,18 +1731,20 @@ impl<'a> Parser<'a> {
                 } else {
                     descending
                 };
-                order[n_order] = OrderBy {
-                    expression,
-                    descending,
-                    nulls_first,
-                };
-                n_order += 1;
+                self.push(
+                    &mut order,
+                    OrderBy {
+                        expression,
+                        descending,
+                        nulls_first,
+                    },
+                )?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
         }
-        let order_by = self.arena_slice(&order[..n_order])?;
+        let order_by = order.as_slice();
         // LIMIT and OFFSET accept either order, as in PostgreSQL.
         let mut limit = None;
         let mut offset = None;
@@ -1874,8 +1845,10 @@ impl<'a> Parser<'a> {
     /// set-operation is carried in `set_body`.
     fn select(&mut self) -> Result<Select<'a>, ParseError> {
         // This is the nesting boundary for every subquery, so it is where a
-        // nested SELECT's named windows stop being visible.
-        let enclosing_windows = (self.windows, self.n_windows);
+        // nested SELECT's named windows stop being visible. Swapping in a
+        // fresh list (rather than truncating) keeps the enclosing definitions
+        // intact: a nested list's growth would overwrite truncated entries.
+        let enclosing_windows = core::mem::replace(&mut self.windows, ArenaList::new(self.arena));
         // A subquery / CTE / set-op branch is not a place `SELECT ... INTO` may
         // appear; forbid it here (select_core checks the flag).
         let saved_allow = self.allow_into;
@@ -1885,7 +1858,7 @@ impl<'a> Parser<'a> {
         // Row-locking clauses come last, after ORDER BY / LIMIT / OFFSET.
         let locking = self.locking_clauses()?;
         self.allow_into = saved_allow;
-        (self.windows, self.n_windows) = enclosing_windows;
+        self.windows = enclosing_windows;
         if let SetTree::Select(s) = body {
             let mut sel = **s;
             sel.order_by = order_by;
@@ -1949,16 +1922,8 @@ impl<'a> Parser<'a> {
     /// Parses the trailing `FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
     /// [OF t, …] [NOWAIT | SKIP LOCKED]` row-locking clauses (zero or more).
     fn locking_clauses(&mut self) -> Result<&'a [LockClause<'a>], ParseError> {
-        let mut clauses = [LockClause {
-            strength: LockStrength::Update,
-            of: &[],
-            wait: LockWait::Wait,
-        }; MAX_LOCK_CLAUSES];
-        let mut n = 0;
+        let mut clauses = ArenaList::new(self.arena);
         while self.eat_ident("for")? {
-            if n == MAX_LOCK_CLAUSES {
-                return Err(self.limit("locking clauses", MAX_LOCK_CLAUSES));
-            }
             let strength = if self.eat_ident("update")? {
                 LockStrength::Update
             } else if self.eat_ident("no")? {
@@ -1975,15 +1940,11 @@ impl<'a> Parser<'a> {
                     self.err_here("expected UPDATE, NO KEY UPDATE, SHARE, or KEY SHARE after FOR")
                 );
             };
-            let mut of = [""; MAX_LIST];
-            let mut nof = 0;
+            let mut of = ArenaList::new(self.arena);
             if self.eat_ident("of")? {
                 loop {
-                    if nof == MAX_LIST {
-                        return Err(self.limit("FOR ... OF list", MAX_LIST));
-                    }
-                    of[nof] = self.col_ident("table name")?;
-                    nof += 1;
+                    let table = self.col_ident("table name")?;
+                    self.push(&mut of, table)?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -1997,14 +1958,16 @@ impl<'a> Parser<'a> {
             } else {
                 LockWait::Wait
             };
-            clauses[n] = LockClause {
-                strength,
-                of: self.arena_slice(&of[..nof])?,
-                wait,
-            };
-            n += 1;
+            self.push(
+                &mut clauses,
+                LockClause {
+                    strength,
+                    of: of.as_slice(),
+                    wait,
+                },
+            )?;
         }
-        self.arena_slice(&clauses[..n])
+        Ok(clauses.as_slice())
     }
 
     /// A top-level query: a set-operation tree of SELECTs, then the trailing
@@ -2034,22 +1997,9 @@ impl<'a> Parser<'a> {
                 set_body: None,
                 locking: &[],
             })
-            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
-        let mut ctes = [Cte {
-            name: "",
-            columns: &[],
-            recursive: false,
-            materialization: crate::sql::ast::CteMaterialization::Default,
-            search: None,
-            cycle: None,
-            query: placeholder,
-            dml: None,
-        }; MAX_CTES];
-        let mut n = 0;
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
+        let mut ctes = ArenaList::new(self.arena);
         loop {
-            if n == MAX_CTES {
-                return Err(self.limit("WITH list", MAX_CTES));
-            }
             let name = self.col_ident("CTE name")?;
             // Optional output-column rename list `name(c1, c2, ...)`.
             let columns = self.column_alias_list()?.unwrap_or(&[]);
@@ -2076,14 +2026,14 @@ impl<'a> Parser<'a> {
                 let boxed_stmt = self
                     .arena
                     .alloc(stmt)
-                    .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                 (placeholder, Some(&*boxed_stmt))
             } else {
                 let q = self.query_select()?;
                 let boxed = self
                     .arena
                     .alloc(q)
-                    .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                 (&*boxed, None)
             };
             self.expect_op(")")?;
@@ -2135,22 +2085,24 @@ impl<'a> Parser<'a> {
                     "SEARCH and CYCLE clauses require a recursive SELECT common table expression",
                 ));
             }
-            ctes[n] = Cte {
-                name,
-                columns,
-                recursive,
-                materialization,
-                search,
-                cycle,
-                query: boxed,
-                dml,
-            };
-            n += 1;
+            self.push(
+                &mut ctes,
+                Cte {
+                    name,
+                    columns,
+                    recursive,
+                    materialization,
+                    search,
+                    cycle,
+                    query: boxed,
+                    dml,
+                },
+            )?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        let ctes = self.arena_slice(&ctes[..n])?;
+        let ctes = ctes.as_slice();
         match self.statement()? {
             Stmt::Select(mut sel) => {
                 sel.with = ctes;
@@ -2164,7 +2116,7 @@ impl<'a> Parser<'a> {
                 let statement = self
                     .arena
                     .alloc(statement)
-                    .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                 Ok(Stmt::With {
                     ctes,
                     statement: &*statement,
@@ -2178,23 +2130,19 @@ impl<'a> Parser<'a> {
     }
 
     fn cte_clause_columns(&mut self, what: &'static str) -> Result<&'a [&'a str], ParseError> {
-        let mut columns: [&'a str; MAX_LIST] = [""; MAX_LIST];
-        let mut count = 0;
+        let mut columns = ArenaList::new(self.arena);
         loop {
-            if count == MAX_LIST {
-                return Err(self.limit(what, MAX_LIST));
-            }
-            columns[count] = self.col_ident(what)?;
-            count += 1;
+            let column = self.col_ident(what)?;
+            self.push(&mut columns, column)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.arena_slice(&columns[..count])
+        Ok(columns.as_slice())
     }
 
     fn query(&mut self) -> Result<Stmt<'a>, ParseError> {
-        let enclosing_windows = (self.windows, self.n_windows);
+        let enclosing_windows = core::mem::replace(&mut self.windows, ArenaList::new(self.arena));
         // A top-level query may carry `SELECT ... INTO table`; capture the whole
         // statement's byte span so it can be rewritten to CREATE TABLE AS.
         let stmt_start = self.peek_at;
@@ -2208,7 +2156,7 @@ impl<'a> Parser<'a> {
         self.allow_into = saved_allow;
         let into = self.into_clause.take();
         self.into_clause = saved_into;
-        (self.windows, self.n_windows) = enclosing_windows;
+        self.windows = enclosing_windows;
         if let Some((name, persistence, into_start, into_end)) = into {
             // Reconstruct the query without its INTO clause and hand it to the
             // CREATE TABLE AS machinery.
@@ -2219,7 +2167,7 @@ impl<'a> Parser<'a> {
                     self.text[stmt_start..into_start].trim_end(),
                     self.text[into_end..stmt_end].trim_start()
                 ))
-                .map_err(|_| self.err_here("SELECT INTO query too large for the SQL arena"))?;
+                .map_err(|_| self.arena_full("SELECT INTO query too large for the SQL arena"))?;
             return Ok(Stmt::CreateTableAs {
                 name,
                 columns: &[],
@@ -2296,10 +2244,11 @@ impl<'a> Parser<'a> {
         // branch before the outer set operator combines it).
         if self.peeked == Tok::Op("(") {
             self.advance()?;
-            let enclosing_windows = (self.windows, self.n_windows);
+            let enclosing_windows =
+                core::mem::replace(&mut self.windows, ArenaList::new(self.arena));
             let inner = self.set_union()?;
             let (order_by, limit, offset, with_ties) = self.order_limit()?;
-            (self.windows, self.n_windows) = enclosing_windows;
+            self.windows = enclosing_windows;
             self.expect_op(")")?;
             if order_by.is_empty() && limit.is_none() && offset.is_none() {
                 return Ok(inner);
@@ -2335,7 +2284,7 @@ impl<'a> Parser<'a> {
             let boxed = self
                 .arena
                 .alloc(sel)
-                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
             return self.alloc_set(SetTree::Select(boxed));
         }
         // `VALUES (row), (row), ...` is a set-operator branch: desugar to
@@ -2345,32 +2294,30 @@ impl<'a> Parser<'a> {
             let mut tree: Option<&'a SetTree<'a>> = None;
             loop {
                 self.expect_op("(")?;
-                let mut items: [SelectItem<'a>; MAX_LIST] = [SelectItem::Wildcard; MAX_LIST];
-                let mut n = 0;
+                let mut items = ArenaList::new(self.arena);
                 loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("VALUES columns", MAX_LIST));
-                    }
                     // A VALUES column with no outer alias is named `columnN`,
                     // as PostgreSQL names it (a UNION-ALL takes its output names
                     // from the first branch, so naming every row is harmless).
                     let expression = self.expression(0)?;
                     let alias = self
                         .arena
-                        .alloc_str_display(format_args!("column{}", n + 1))
+                        .alloc_str_display(format_args!("column{}", items.len() + 1))
                         .map_err(|_| self.err_here("VALUES too large"))?;
-                    items[n] = SelectItem::Expr {
-                        expression,
-                        alias: Some(alias),
-                    };
-                    n += 1;
+                    self.push(
+                        &mut items,
+                        SelectItem::Expr {
+                            expression,
+                            alias: Some(alias),
+                        },
+                    )?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
                 let sel = Select {
-                    items: self.arena_slice(&items[..n])?,
+                    items: items.as_slice(),
                     distinct: false,
                     distinct_on: &[],
                     from: None,
@@ -2472,14 +2419,14 @@ impl<'a> Parser<'a> {
             return self.alloc_set(SetTree::Select(
                 self.arena
                     .alloc(select)
-                    .map_err(|_| self.err_here("statement too large for SQL arena"))?,
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?,
             ));
         }
         let core = self.select_core()?;
         let core = self
             .arena
             .alloc(core)
-            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         self.alloc_set(SetTree::Select(core))
     }
 
@@ -2496,7 +2443,7 @@ impl<'a> Parser<'a> {
     fn alloc_set(&mut self, tree: SetTree<'a>) -> Result<&'a SetTree<'a>, ParseError> {
         self.arena
             .alloc(tree)
-            .map_err(|_| self.err_here("statement too large for SQL arena"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))
             .map(|t| t as &_)
     }
 
@@ -2519,30 +2466,8 @@ impl<'a> Parser<'a> {
             self.advance()?;
             if self.eat_ident("from")? {
                 self.expect_op("(")?;
-                let mut functions = [TableRef {
-                    schema: None,
-                    table: "",
-                    alias: None,
-                    subquery: None,
-                    func_args: None,
-                    func_argument_names: &[],
-                    func_variadic: false,
-                    rows_from: None,
-                    col_alias: None,
-                    inheritance: RelationInheritance::Descendants,
-                    sample: None,
-                    cte: None,
-                    with_ordinality: false,
-                    lateral: false,
-                    authorization_role: None,
-                    bound_table: None,
-                    view_access: None,
-                }; MAX_LIST];
-                let mut count = 0usize;
+                let mut functions = ArenaList::new(self.arena);
                 loop {
-                    if count == functions.len() {
-                        return Err(self.limit("ROWS FROM functions", functions.len()));
-                    }
                     let function = self.table_ref()?;
                     if function.func_args.is_none()
                         || function.rows_from.is_some()
@@ -2553,8 +2478,7 @@ impl<'a> Parser<'a> {
                     {
                         return Err(self.err_here("ROWS FROM requires function calls"));
                     }
-                    functions[count] = function;
-                    count += 1;
+                    self.push(&mut functions, function)?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -2587,7 +2511,7 @@ impl<'a> Parser<'a> {
                     func_args: None,
                     func_argument_names: &[],
                     func_variadic: false,
-                    rows_from: Some(self.arena_slice(&functions[..count])?),
+                    rows_from: Some(functions.as_slice()),
                     col_alias,
                     inheritance: RelationInheritance::Descendants,
                     sample: None,
@@ -2613,7 +2537,7 @@ impl<'a> Parser<'a> {
             let boxed = self
                 .arena
                 .alloc(select)
-                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
             let explicit_as = self.eat_ident("as")?;
             let alias = if let Tok::Ident(word) = self.peeked {
                 if is_column_name_keyword(word) {
@@ -2670,31 +2594,27 @@ impl<'a> Parser<'a> {
         // immediately after the (possibly schema-qualified) name.
         let mut func_argument_names: &'a [Option<&'a str>] = &[];
         let mut func_variadic = false;
-        let mut func_args =
-            if table.eq_ignore_ascii_case("json_table") && self.peeked == Tok::Op("(") {
-                Some(self.json_table_arguments()?)
-            } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
-                Some(self.xml_table_arguments()?)
-            } else if self.peeked == Tok::Op("(") {
-                self.advance()?;
-                let mut args: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
-                let mut names = [None; MAX_LIST];
-                let mut n = 0;
-                let mut saw_named = false;
-                if self.peeked != Tok::Op(")") {
-                    loop {
-                        if n == MAX_LIST {
-                            return Err(self.limit("function arguments", MAX_LIST));
-                        }
-                        let this_variadic = self.eat_ident("variadic")?;
-                        if this_variadic && saw_named {
-                            return Err(
-                                self.err_here("VARIADIC argument cannot use named notation")
-                            );
-                        }
-                        let first = self.expression(0)?;
+        let mut func_args = if table.eq_ignore_ascii_case("json_table")
+            && self.peeked == Tok::Op("(")
+        {
+            Some(self.json_table_arguments()?)
+        } else if table.eq_ignore_ascii_case("xmltable") && self.peeked == Tok::Op("(") {
+            Some(self.xml_table_arguments()?)
+        } else if self.peeked == Tok::Op("(") {
+            self.advance()?;
+            let mut args = ArenaList::new(self.arena);
+            let mut names = ArenaList::new(self.arena);
+            let mut saw_named = false;
+            if self.peeked != Tok::Op(")") {
+                loop {
+                    let this_variadic = self.eat_ident("variadic")?;
+                    if this_variadic && saw_named {
+                        return Err(self.err_here("VARIADIC argument cannot use named notation"));
+                    }
+                    let first = self.expression(0)?;
+                    let (argument, argument_name) =
                         if self.eat_op("=>")? {
-                            names[n] = Some(match first {
+                            let argument_name = match first {
                                 Expr::Column {
                                     qualifier: None,
                                     name,
@@ -2703,38 +2623,39 @@ impl<'a> Parser<'a> {
                                     return Err(self
                                         .err_here("routine argument name must be an identifier"));
                                 }
-                            });
-                            args[n] = self.expression(0)?;
+                            };
+                            let argument = self.expression(0)?;
                             saw_named = true;
+                            (argument, Some(argument_name))
                         } else {
                             if saw_named {
                                 return Err(self
                                     .err_here("positional argument cannot follow named argument"));
                             }
-                            args[n] = first;
+                            (first, None)
+                        };
+                    self.push(&mut args, argument)?;
+                    self.push(&mut names, argument_name)?;
+                    if this_variadic {
+                        func_variadic = true;
+                        if self.peeked != Tok::Op(")") {
+                            return Err(self.err_here("VARIADIC argument must be last"));
                         }
-                        if this_variadic {
-                            func_variadic = true;
-                            n += 1;
-                            if self.peeked != Tok::Op(")") {
-                                return Err(self.err_here("VARIADIC argument must be last"));
-                            }
-                            break;
-                        }
-                        n += 1;
-                        if !self.eat_op(",")? {
-                            break;
-                        }
+                        break;
+                    }
+                    if !self.eat_op(",")? {
+                        break;
                     }
                 }
-                self.expect_op(")")?;
-                if saw_named {
-                    func_argument_names = self.arena_slice(&names[..n])?;
-                }
-                Some(self.arena_slice(&args[..n])?)
-            } else {
-                None
-            };
+            }
+            self.expect_op(")")?;
+            if saw_named {
+                func_argument_names = names.as_slice();
+            }
+            Some(args.as_slice())
+        } else {
+            None
+        };
         if func_args.is_some() && inheritance == RelationInheritance::Only {
             return Err(self.err_here("ONLY requires a relation, not a function call"));
         }
@@ -2817,23 +2738,19 @@ impl<'a> Parser<'a> {
             self.arena_expr(Expr::Null)?
         };
         let passing = if self.eat_ident("passing")? {
-            let null = self.arena_expr(Expr::Null)?;
-            let mut pairs = [null; MAX_LIST];
-            let mut count = 0usize;
+            let mut pairs = ArenaList::new(self.arena);
             loop {
-                if count + 2 > pairs.len() {
-                    return Err(self.limit("JSON_TABLE passing arguments", pairs.len() / 2));
-                }
-                pairs[count] = self.expression(0)?;
+                let value = self.expression(0)?;
+                self.push(&mut pairs, value)?;
                 self.expect_ident("as")?;
                 let name = self.any_ident("JSON path variable name")?;
-                pairs[count + 1] = self.arena_expr(Expr::Str(name))?;
-                count += 2;
+                let name = self.arena_expr(Expr::Str(name))?;
+                self.push(&mut pairs, name)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
-            self.plain_call("__json_table_passing", &pairs[..count])?
+            self.plain_call("__json_table_passing", pairs.as_slice())?
         } else {
             self.plain_call("__json_table_passing", &[])?
         };
@@ -2862,13 +2779,8 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let namespaces = if self.eat_ident("xmlnamespaces")? {
             self.expect_op("(")?;
-            let null = self.arena_expr(Expr::Null)?;
-            let mut pairs = [null; MAX_LIST];
-            let mut count = 0usize;
+            let mut pairs = ArenaList::new(self.arena);
             loop {
-                if count + 2 > pairs.len() {
-                    return Err(self.limit("XML namespace declarations", pairs.len() / 2));
-                }
                 let default = self.eat_ident("default")?;
                 if default {
                     return Err(ParseError {
@@ -2877,18 +2789,19 @@ impl<'a> Parser<'a> {
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                     });
                 }
-                pairs[count] = self.expression(0)?;
+                let uri = self.expression(0)?;
+                self.push(&mut pairs, uri)?;
                 self.expect_ident("as")?;
                 let prefix = self.any_ident("XML namespace prefix")?;
-                pairs[count + 1] = self.arena_expr(Expr::Str(prefix))?;
-                count += 2;
+                let prefix = self.arena_expr(Expr::Str(prefix))?;
+                self.push(&mut pairs, prefix)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
             self.expect_op(")")?;
             self.expect_op(",")?;
-            self.plain_call("__xml_namespaces", &pairs[..count])?
+            self.plain_call("__xml_namespaces", pairs.as_slice())?
         } else {
             self.plain_call("__xml_namespaces", &[])?
         };
@@ -2909,17 +2822,14 @@ impl<'a> Parser<'a> {
 
     fn xml_table_columns(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         let null = self.arena_expr(Expr::Null)?;
-        let mut columns = [null; MAX_LIST];
-        let mut count = 0usize;
+        let mut columns = ArenaList::new(self.arena);
         loop {
-            if count == columns.len() {
-                return Err(self.limit("XMLTABLE columns", columns.len()));
-            }
             let name = self.col_ident("XMLTABLE column name")?;
             let name = self.arena_expr(Expr::Str(name))?;
             if self.eat_ident("for")? {
                 self.expect_ident("ordinality")?;
-                columns[count] = self.plain_call("__xml_table_ordinality", &[name])?;
+                let column = self.plain_call("__xml_table_ordinality", &[name])?;
+                self.push(&mut columns, column)?;
             } else {
                 let (type_name, type_mod) = self.type_name_mod()?;
                 let type_name = self.arena_expr(Expr::Str(type_name))?;
@@ -2942,17 +2852,17 @@ impl<'a> Parser<'a> {
                     false
                 };
                 let not_null = self.arena_expr(Expr::Bool(not_null))?;
-                columns[count] = self.plain_call(
+                let column = self.plain_call(
                     "__xml_table_column",
                     &[name, type_name, type_mod, path, default, not_null],
                 )?;
+                self.push(&mut columns, column)?;
             }
-            count += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.plain_call("__xml_table_columns", &columns[..count])
+        self.plain_call("__xml_table_columns", columns.as_slice())
     }
 
     fn json_record_column_definitions(
@@ -2963,27 +2873,22 @@ impl<'a> Parser<'a> {
             return Err(self.err_here("JSON record conversion takes one JSON argument"));
         }
         self.expect_op("(")?;
-        let null = self.arena_expr(Expr::Null)?;
-        let mut definitions = [null; MAX_LIST];
-        let mut count = 0usize;
+        let mut definitions = ArenaList::new(self.arena);
         loop {
-            if count == definitions.len() {
-                return Err(self.limit("record column definitions", definitions.len()));
-            }
             let name = self.col_ident("record column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
             let name = self.arena_expr(Expr::Str(name))?;
             let type_name = self.arena_expr(Expr::Str(type_name))?;
             let type_mod = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
-            definitions[count] =
+            let definition =
                 self.plain_call("__json_record_column", &[name, type_name, type_mod])?;
-            count += 1;
+            self.push(&mut definitions, definition)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        let definitions = self.plain_call("__json_record_columns", &definitions[..count])?;
+        let definitions = self.plain_call("__json_record_columns", definitions.as_slice())?;
         self.arena_slice(&[function_args[0], definitions])
     }
 
@@ -2992,21 +2897,16 @@ impl<'a> Parser<'a> {
             return Err(self.err_here("JSON_TABLE columns are nested too deeply"));
         }
         self.expect_op("(")?;
-        let null = self.arena_expr(Expr::Null)?;
-        let mut columns = [null; MAX_LIST];
-        let mut count = 0usize;
+        let mut columns = ArenaList::new(self.arena);
         loop {
-            if count == columns.len() {
-                return Err(self.limit("JSON_TABLE columns", columns.len()));
-            }
-            columns[count] = self.json_table_column(depth)?;
-            count += 1;
+            let column = self.json_table_column(depth)?;
+            self.push(&mut columns, column)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        self.plain_call("__json_table_columns", &columns[..count])
+        self.plain_call("__json_table_columns", columns.as_slice())
     }
 
     fn json_table_column(&mut self, depth: u16) -> Result<&'a Expr<'a>, ParseError> {
@@ -3247,20 +3147,16 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.advance()?;
-        let mut columns: [&'a str; MAX_LIST] = [""; MAX_LIST];
-        let mut n = 0;
+        let mut columns = ArenaList::new(self.arena);
         loop {
-            if n == MAX_LIST {
-                return Err(self.limit("column aliases", MAX_LIST));
-            }
-            columns[n] = self.col_ident("column alias")?;
-            n += 1;
+            let column = self.col_ident("column alias")?;
+            self.push(&mut columns, column)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        Ok(Some(self.arena_slice(&columns[..n])?))
+        Ok(Some(columns.as_slice()))
     }
 
     #[expect(
@@ -4006,19 +3902,15 @@ impl<'a> Parser<'a> {
     }
 
     fn role_name_list(&mut self, what: &str) -> Result<&'a [&'a str], ParseError> {
-        let mut names = [""; MAX_LIST];
-        let mut count = 0usize;
+        let mut names = ArenaList::new(self.arena);
         loop {
-            if count == names.len() {
-                return Err(self.limit("roles", names.len()));
-            }
-            names[count] = self.any_ident(what)?;
-            count += 1;
+            let name = self.any_ident(what)?;
+            self.push(&mut names, name)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.arena_slice(&names[..count])
+        Ok(names.as_slice())
     }
 
     fn privilege_start(&self) -> bool {
@@ -4195,20 +4087,16 @@ impl<'a> Parser<'a> {
                 ) {
                     return Err(self.err_here("privilege does not support a column list"));
                 }
-                let mut columns = [""; MAX_LIST];
-                let mut column_count = 0usize;
+                let mut columns = ArenaList::new(self.arena);
                 loop {
-                    if column_count == columns.len() {
-                        return Err(self.limit("privilege columns", columns.len()));
-                    }
-                    columns[column_count] = self.col_ident("column name")?;
-                    column_count += 1;
+                    let column = self.col_ident("column name")?;
+                    self.push(&mut columns, column)?;
                     if self.eat_op(")")? {
                         break;
                     }
                     self.expect_op(",")?;
                 }
-                self.arena_slice(&columns[..column_count])?
+                columns.as_slice()
             } else {
                 &[]
             };
@@ -4258,41 +4146,29 @@ impl<'a> Parser<'a> {
             ParameterName, PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind,
         };
         if self.eat_ident("parameter")? {
-            let mut names = [ParameterName::EMPTY; MAX_LIST];
-            let mut count = 0usize;
+            let mut names = ArenaList::new(self.arena);
             loop {
-                if count == names.len() {
-                    return Err(self.limit("parameter privilege targets", names.len()));
-                }
                 let name = self.configuration_parameter_name()?;
-                names[count] = ParameterName::parse(name)
+                let name = ParameterName::parse(name)
                     .ok_or_else(|| self.err_here("invalid configuration parameter name"))?;
-                count += 1;
+                self.push(&mut names, name)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
-            return Ok(PrivilegeTarget::Parameters(
-                self.arena_slice(&names[..count])?,
-            ));
+            return Ok(PrivilegeTarget::Parameters(names.as_slice()));
         }
         if self.eat_ident("large")? {
             self.expect_ident("object")?;
-            let mut objects = [crate::sql::ast::LargeObjectId::parse(1).unwrap(); MAX_LIST];
-            let mut count = 0usize;
+            let mut objects = ArenaList::new(self.arena);
             loop {
-                if count == objects.len() {
-                    return Err(self.limit("large-object privilege targets", objects.len()));
-                }
-                objects[count] = self.large_object_id()?;
-                count += 1;
+                let object = self.large_object_id()?;
+                self.push(&mut objects, object)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
-            return Ok(PrivilegeTarget::LargeObjects(
-                self.arena_slice(&objects[..count])?,
-            ));
+            return Ok(PrivilegeTarget::LargeObjects(objects.as_slice()));
         }
         let kind = if self.eat_ident("all")? {
             if self.eat_ident("tables")? {
@@ -4352,13 +4228,9 @@ impl<'a> Parser<'a> {
             // TABLE is PostgreSQL's default object kind.
             PrivilegeObjectKind::Table
         };
-        let mut names = [QualName::bare(""); MAX_LIST];
-        let mut count = 0usize;
+        let mut names = ArenaList::new(self.arena);
         loop {
-            if count == names.len() {
-                return Err(self.limit("privilege targets", names.len()));
-            }
-            names[count] = if matches!(
+            let name = if matches!(
                 kind,
                 PrivilegeObjectKind::Schema
                     | PrivilegeObjectKind::Tablespace
@@ -4376,14 +4248,14 @@ impl<'a> Parser<'a> {
             } else {
                 self.qual_name("object name")?
             };
-            count += 1;
+            self.push(&mut names, name)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         Ok(PrivilegeTarget::Objects {
             kind,
-            names: self.arena_slice(&names[..count])?,
+            names: names.as_slice(),
         })
     }
 
@@ -4401,16 +4273,8 @@ impl<'a> Parser<'a> {
         kind: crate::sql::ast::RoutineTargetKind,
     ) -> Result<crate::sql::ast::PrivilegeTarget<'a>, ParseError> {
         use crate::sql::ast::{PrivilegeTarget, RoutineIdentity};
-        let mut identities = [RoutineIdentity {
-            name: QualName::bare(""),
-            argument_types: &[],
-            signature_is_explicit: true,
-        }; MAX_LIST];
-        let mut count = 0usize;
+        let mut identities = ArenaList::new(self.arena);
         loop {
-            if count == identities.len() {
-                return Err(self.limit("routine privilege targets", identities.len()));
-            }
             let name = self.qual_name("routine name")?;
             self.expect_op("(")?;
             let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -4431,19 +4295,22 @@ impl<'a> Parser<'a> {
                     self.expect_op(",")?;
                 }
             }
-            identities[count] = RoutineIdentity {
-                name,
-                argument_types: self.arena_slice(&argument_types[..argument_count])?,
-                signature_is_explicit: true,
-            };
-            count += 1;
+            let argument_types = self.arena_slice(&argument_types[..argument_count])?;
+            self.push(
+                &mut identities,
+                RoutineIdentity {
+                    name,
+                    argument_types,
+                    signature_is_explicit: true,
+                },
+            )?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         Ok(PrivilegeTarget::Routines {
             kind,
-            identities: self.arena_slice(&identities[..count])?,
+            identities: identities.as_slice(),
         })
     }
 
@@ -4668,14 +4535,10 @@ impl<'a> Parser<'a> {
     fn subscription_publication_change(
         &mut self,
     ) -> Result<(&'a [&'a str], SubscriptionPublicationRefresh), ParseError> {
-        let mut publications = [""; MAX_LIST];
-        let mut count = 0;
+        let mut publications = ArenaList::new(self.arena);
         loop {
-            if count == publications.len() {
-                return Err(self.limit("subscription publications", publications.len()));
-            }
-            publications[count] = self.any_ident("publication name")?;
-            count += 1;
+            let publication = self.any_ident("publication name")?;
+            self.push(&mut publications, publication)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -4713,7 +4576,7 @@ impl<'a> Parser<'a> {
             return Err(self.err_here("copy_data requires refresh = true"));
         }
         Ok((
-            self.arena_slice(&publications[..count])?,
+            publications.as_slice(),
             if refresh {
                 SubscriptionPublicationRefresh::Refresh { copy_data }
             } else {
@@ -5247,19 +5110,13 @@ impl<'a> Parser<'a> {
             } else {
                 self.materialized_view_table_action()?
             };
-            let mut actions = [crate::sql::ast::AlterAction::SetTablespace(""); MAX_LIST];
-            actions[0] = first;
-            let mut count = 1usize;
+            let mut actions = ArenaList::new(self.arena);
+            self.push(&mut actions, first)?;
             while self.eat_op(",")? {
-                if count == actions.len() {
-                    return Err(self.limit("ALTER MATERIALIZED VIEW actions", actions.len()));
-                }
-                actions[count] = self.materialized_view_table_action()?;
-                count += 1;
+                let action = self.materialized_view_table_action()?;
+                self.push(&mut actions, action)?;
             }
-            crate::sql::ast::AlterMaterializedViewAction::TableActions(
-                self.arena_slice(&actions[..count])?,
-            )
+            crate::sql::ast::AlterMaterializedViewAction::TableActions(actions.as_slice())
         };
         Ok(Stmt::AlterMaterializedView {
             name,
@@ -5661,14 +5518,10 @@ impl<'a> Parser<'a> {
             ));
         }
         // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
-        let mut buffer = [AlterAction::DropDefault { column: "" }; MAX_ALTER_ACTIONS];
-        let mut count = 0usize;
+        let mut buffer = ArenaList::new(self.arena);
         loop {
-            if count == MAX_ALTER_ACTIONS {
-                return Err(self.limit("ALTER TABLE actions", MAX_ALTER_ACTIONS));
-            }
-            buffer[count] = self.alter_table_cmd(foreign)?;
-            count += 1;
+            let action = self.alter_table_cmd(foreign)?;
+            self.push(&mut buffer, action)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -5677,10 +5530,11 @@ impl<'a> Parser<'a> {
         // written order, so a constraint can reference a column added later in
         // the same statement. A stable insertion sort by pass keeps the written
         // order within a pass and allocates nothing.
-        for i in 1..count {
+        let actions = buffer.as_mut_slice();
+        for i in 1..actions.len() {
             let mut j = i;
-            while j > 0 && alter_pass(&buffer[j - 1]) > alter_pass(&buffer[j]) {
-                buffer.swap(j - 1, j);
+            while j > 0 && alter_pass(&actions[j - 1]) > alter_pass(&actions[j]) {
+                actions.swap(j - 1, j);
                 j -= 1;
             }
         }
@@ -5690,7 +5544,7 @@ impl<'a> Parser<'a> {
                 table,
                 if_exists,
                 only,
-                actions: self.arena_slice(&buffer[..count])?,
+                actions: buffer.as_slice(),
             },
         ))
     }
@@ -6552,16 +6406,12 @@ impl<'a> Parser<'a> {
         }
         let name = self.any_ident("prepared statement name")?;
         // Declared parameter types, if any; they constrain EXECUTE arguments.
-        let mut ptypes: [&'a str; MAX_LIST] = [""; MAX_LIST];
-        let mut np = 0;
+        let mut ptypes = ArenaList::new(self.arena);
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             loop {
-                if np == MAX_LIST {
-                    return Err(self.limit("PREPARE parameter types", MAX_LIST));
-                }
-                ptypes[np] = self.type_name()?;
-                np += 1;
+                let ptype = self.type_name()?;
+                self.push(&mut ptypes, ptype)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -6577,7 +6427,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Prepare {
             name,
             sql,
-            param_types: self.arena_slice(&ptypes[..np])?,
+            param_types: ptypes.as_slice(),
         })
     }
 
@@ -6593,18 +6443,13 @@ impl<'a> Parser<'a> {
     fn execute_prepared(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("execute")?;
         let name = self.any_ident("prepared statement name")?;
-        let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-        let mut args: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
-        let mut n = 0;
+        let mut args = ArenaList::new(self.arena);
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             if self.peeked != Tok::Op(")") {
                 loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("EXECUTE arguments", MAX_LIST));
-                    }
-                    args[n] = self.expression(0)?;
-                    n += 1;
+                    let arg = self.expression(0)?;
+                    self.push(&mut args, arg)?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -6614,7 +6459,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Stmt::ExecutePrepared {
             name,
-            args: self.arena_slice(&args[..n])?,
+            args: args.as_slice(),
         })
     }
 
@@ -6622,16 +6467,12 @@ impl<'a> Parser<'a> {
         self.expect_ident("insert")?;
         self.expect_ident("into")?;
         let table = self.qual_name("table name")?;
-        let mut column_names: [&'a str; MAX_LIST] = [""; MAX_LIST];
-        let mut n_cols = 0;
+        let mut column_names = ArenaList::new(self.arena);
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             loop {
-                if n_cols == MAX_LIST {
-                    return Err(self.limit("column list", MAX_LIST));
-                }
-                column_names[n_cols] = self.col_ident("column name")?;
-                n_cols += 1;
+                let column = self.col_ident("column name")?;
+                self.push(&mut column_names, column)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -6652,8 +6493,7 @@ impl<'a> Parser<'a> {
             crate::sql::ast::Overriding::None
         };
         // Source is either VALUES (...), ... or any PostgreSQL query body.
-        let mut rows: [&'a [&'a Expr<'a>]; MAX_ROWS] = [&[]; MAX_ROWS];
-        let mut n_rows = 0;
+        let mut rows: ArenaList<'a, &'a [&'a Expr<'a>]> = ArenaList::new(self.arena);
         let mut select = None;
         if matches!(
             self.peeked,
@@ -6663,38 +6503,29 @@ impl<'a> Parser<'a> {
             select = Some(
                 self.arena
                     .alloc(sel)
-                    .map_err(|_| self.err_here("statement too large for SQL arena"))?
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?
                     as &_,
             );
         } else if self.eat_ident("default")? {
             // `DEFAULT VALUES` inserts one row of nothing but defaults, which
             // is exactly a row of `DEFAULT` markers over no named columns.
             self.expect_ident("values")?;
-            rows[0] = &[];
-            n_rows = 1;
+            self.push(&mut rows, &[])?;
         } else {
             self.expect_ident("values")?;
             loop {
-                if n_rows == MAX_ROWS {
-                    return Err(self.limit("VALUES rows", MAX_ROWS));
-                }
                 self.expect_op("(")?;
-                let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-                let mut row: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
-                let mut n = 0;
+                let mut row = ArenaList::new(self.arena);
                 loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("VALUES row", MAX_LIST));
-                    }
-                    row[n] = self.expression(0)?;
-                    n += 1;
+                    let value = self.expression(0)?;
+                    self.push(&mut row, value)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
-                rows[n_rows] = self.arena_slice(&row[..n])?;
-                n_rows += 1;
+                let row = row.as_slice();
+                self.push(&mut rows, row)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -6704,8 +6535,8 @@ impl<'a> Parser<'a> {
         let returning = self.returning()?;
         Ok(Stmt::Insert(Insert {
             table,
-            columns: self.arena_slice(&column_names[..n_cols])?,
-            rows: self.arena_slice(&rows[..n_rows])?,
+            columns: column_names.as_slice(),
+            rows: rows.as_slice(),
             select,
             on_conflict,
             returning,
@@ -6716,78 +6547,72 @@ impl<'a> Parser<'a> {
     /// Parses a DML `SET` list into its scalar execution form. A row target is
     /// expanded here so every executor shares the same assignment semantics.
     fn assignment_list(&mut self) -> Result<&'a [(&'a str, &'a Expr<'a>)], ParseError> {
-        let null = self.arena_expr(Expr::Null)?;
-        let mut assignments = [("", null); MAX_LIST];
-        let mut assigned = 0usize;
+        let mut assignments: ArenaList<'a, (&'a str, &'a Expr<'a>)> = ArenaList::new(self.arena);
         loop {
-            let mut names = [""; MAX_LIST];
-            let mut name_count = 0usize;
-            let mut subscript_count = 0usize;
-            let mut subscripts = [null; MAX_LIST];
+            let mut names = ArenaList::new(self.arena);
+            let mut subscripts = ArenaList::new(self.arena);
             if self.eat_op("(")? {
                 loop {
-                    if name_count == MAX_LIST {
-                        return Err(self.limit("assignment target", MAX_LIST));
-                    }
-                    names[name_count] = self.col_ident("column name")?;
-                    name_count += 1;
+                    let name = self.col_ident("column name")?;
+                    self.push(&mut names, name)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
             } else {
-                names[0] = self.col_ident("column name")?;
-                name_count = 1;
+                let name = self.col_ident("column name")?;
+                self.push(&mut names, name)?;
                 while self.eat_op("[")? {
-                    if subscript_count == MAX_LIST - 2 {
-                        return Err(self.limit("jsonb assignment subscripts", MAX_LIST - 2));
-                    }
-                    subscripts[subscript_count] = self.expression(0)?;
-                    subscript_count += 1;
+                    let subscript = self.expression(0)?;
+                    self.push(&mut subscripts, subscript)?;
                     self.expect_op("]")?;
                 }
             }
             self.expect_op("=")?;
 
-            let mut values = [null; MAX_LIST];
+            let name_count = names.len();
+            let mut values = ArenaList::new(self.arena);
             let value_count = if name_count == 1 {
-                values[0] = self.expression(0)?;
-                if subscript_count != 0 {
-                    let base = assignments[..assigned]
+                let mut value = self.expression(0)?;
+                if !subscripts.is_empty() {
+                    let base = assignments
+                        .as_slice()
                         .iter()
-                        .find_map(|(previous, value)| {
-                            (*previous == names[0]
+                        .find_map(|(previous, assigned)| {
+                            (*previous == names.as_slice()[0]
                                 && matches!(
-                                    **value,
+                                    **assigned,
                                     Expr::Call {
                                         name: "__jsonb_subscript_set",
                                         ..
                                     }
                                 ))
-                            .then_some(*value)
+                            .then_some(*assigned)
                         })
                         .map_or_else(
                             || {
                                 self.arena_expr(Expr::Column {
                                     qualifier: None,
-                                    name: names[0],
+                                    name: names.as_slice()[0],
                                 })
                             },
                             Ok,
                         )?;
-                    let mut call_args = [null; MAX_LIST];
-                    call_args[0] = base;
-                    call_args[1] = values[0];
-                    call_args[2..2 + subscript_count]
-                        .copy_from_slice(&subscripts[..subscript_count]);
-                    values[0] = self
-                        .plain_call("__jsonb_subscript_set", &call_args[..2 + subscript_count])?;
+                    let mut call_args = ArenaList::new(self.arena);
+                    self.push(&mut call_args, base)?;
+                    self.push(&mut call_args, value)?;
+                    for subscript in subscripts.as_slice() {
+                        self.push(&mut call_args, *subscript)?;
+                    }
+                    value = self.plain_call("__jsonb_subscript_set", call_args.as_slice())?;
                 }
+                self.push(&mut values, value)?;
                 1
             } else if self.eat_ident("row")? {
                 self.expect_op("(")?;
-                self.assignment_row_values(&mut values)?
+                self.assignment_row_values(&mut values)?;
+                values.len()
             } else if self.eat_op("(")? {
                 if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
                     let select = self.query_select()?;
@@ -6795,19 +6620,21 @@ impl<'a> Parser<'a> {
                     let select = self
                         .arena
                         .alloc(select)
-                        .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     let arity = u8::try_from(name_count)
                         .map_err(|_| self.err_here("assignment target is too wide"))?;
                     let record = self.arena_expr(Expr::RowSubquery { select, arity })?;
-                    for (index, value) in values.iter_mut().enumerate().take(name_count) {
-                        *value = self.arena_expr(Expr::RecordFieldIndex {
+                    for index in 0..name_count {
+                        let field = self.arena_expr(Expr::RecordFieldIndex {
                             base: record,
                             index: index as u8,
                         })?;
+                        self.push(&mut values, field)?;
                     }
                     name_count
                 } else {
-                    self.assignment_row_values(&mut values)?
+                    self.assignment_row_values(&mut values)?;
+                    values.len()
                 }
             } else {
                 return Err(self.err_here(
@@ -6824,57 +6651,50 @@ impl<'a> Parser<'a> {
                     sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
                 });
             }
-            for (name, value) in names[..name_count].iter().zip(&values[..value_count]) {
-                if let Some(previous) = assignments[..assigned]
+            for (name, value) in names.as_slice().iter().zip(values.as_slice()) {
+                if let Some(previous) = assignments
+                    .as_slice()
                     .iter()
-                    .position(|(previous, _)| *previous == *name)
+                    .position(|(previous, _)| previous == name)
                 {
-                    if subscript_count != 0
+                    if !subscripts.is_empty()
                         && matches!(
-                            *assignments[previous].1,
+                            *assignments.as_slice()[previous].1,
                             Expr::Call {
                                 name: "__jsonb_subscript_set",
                                 ..
                             }
                         )
                     {
-                        assignments[previous].1 = value;
+                        assignments.as_mut_slice()[previous].1 = *value;
                         continue;
                     }
                     return Err(self.err_here("multiple assignments to the same column"));
                 }
-                if assigned == MAX_LIST {
-                    return Err(self.limit("SET list", MAX_LIST));
-                }
-                assignments[assigned] = (*name, *value);
-                assigned += 1;
+                self.push(&mut assignments, (*name, *value))?;
             }
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.arena_slice(&assignments[..assigned])
+        Ok(assignments.as_slice())
     }
 
     /// Parses the comma-separated body after a multi-column assignment's
     /// opening parenthesis and consumes its closing parenthesis.
     fn assignment_row_values(
         &mut self,
-        values: &mut [&'a Expr<'a>; MAX_LIST],
-    ) -> Result<usize, ParseError> {
-        let mut count = 0usize;
+        values: &mut ArenaList<'a, &'a Expr<'a>>,
+    ) -> Result<(), ParseError> {
         loop {
-            if count == MAX_LIST {
-                return Err(self.limit("assignment source", MAX_LIST));
-            }
-            values[count] = self.expression(0)?;
-            count += 1;
+            let value = self.expression(0)?;
+            self.push(values, value)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        Ok(count)
+        Ok(())
     }
 
     /// `ON CONFLICT [(columns) | ON CONSTRAINT name] DO {NOTHING | UPDATE SET a
@@ -6884,35 +6704,27 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.expect_ident("conflict")?;
-        let null_expression = self.arena_expr(Expr::Null)?;
-        let mut target: [crate::sql::ast::OnConflictTarget<'a>; MAX_LIST] =
-            [crate::sql::ast::OnConflictTarget {
-                column: None,
-                expression: null_expression,
-                expression_text: "",
-            }; MAX_LIST];
-        let mut nt = 0;
+        let mut target = ArenaList::new(self.arena);
         let mut constraint = None;
         if self.eat_op("(")? {
             loop {
-                if nt == MAX_LIST {
-                    return Err(self.limit("conflict target", MAX_LIST));
-                }
                 let start = self.peek_at;
                 let expression = self.expression(0)?;
                 let expression_text = self.text[start..self.peek_at].trim_end();
-                target[nt] = crate::sql::ast::OnConflictTarget {
-                    column: match expression {
-                        Expr::Column {
-                            qualifier: None,
-                            name,
-                        } => Some(*name),
-                        _ => None,
+                self.push(
+                    &mut target,
+                    crate::sql::ast::OnConflictTarget {
+                        column: match expression {
+                            Expr::Column {
+                                qualifier: None,
+                                name,
+                            } => Some(*name),
+                            _ => None,
+                        },
+                        expression,
+                        expression_text,
                     },
-                    expression,
-                    expression_text,
-                };
-                nt += 1;
+                )?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -6938,7 +6750,7 @@ impl<'a> Parser<'a> {
             (Some(assigns), where_clause)
         };
         Ok(Some(OnConflict {
-            target: self.arena_slice(&target[..nt])?,
+            target: target.as_slice(),
             constraint,
             update,
             update_where,
@@ -6962,7 +6774,7 @@ impl<'a> Parser<'a> {
                 &*self
                     .arena
                     .alloc(fc)
-                    .map_err(|_| self.err_here("FROM too large for SQL arena"))?,
+                    .map_err(|_| self.arena_full("FROM too large for SQL arena"))?,
             )
         } else {
             None
@@ -6982,7 +6794,7 @@ impl<'a> Parser<'a> {
     /// `MERGE INTO [ONLY] target [*] [AS alias] USING source [AS alias] ON cond
     /// { WHEN MATCHED | WHEN NOT MATCHED [BY SOURCE | BY TARGET] ... }...`.
     fn merge(&mut self) -> Result<Stmt<'a>, ParseError> {
-        use crate::sql::ast::{Merge, MergeMatchKind, MergeTargetAction, MergeWhen};
+        use crate::sql::ast::{Merge, MergeMatchKind, MergeWhen};
         self.expect_ident("merge")?;
         self.expect_ident("into")?;
         let target_inheritance = if self.eat_ident("only")? {
@@ -7008,17 +6820,9 @@ impl<'a> Parser<'a> {
         let source = self.table_ref()?;
         self.expect_ident("on")?;
         let on = self.expression(0)?;
-        let dummy = MergeWhen::Matched {
-            cond: None,
-            action: MergeTargetAction::Delete,
-        };
-        let mut whens = [dummy; MAX_LIST];
+        let mut whens = ArenaList::new(self.arena);
         let mut unconditional = [false; 3];
-        let mut n = 0;
         while self.eat_ident("when")? {
-            if n == MAX_LIST {
-                return Err(self.limit("WHEN clauses", MAX_LIST));
-            }
             let kind = if self.eat_ident("not")? {
                 self.expect_ident("matched")?;
                 if self.eat_ident("by")? {
@@ -7063,10 +6867,9 @@ impl<'a> Parser<'a> {
             if when.condition().is_none() {
                 unconditional[kind.index()] = true;
             }
-            whens[n] = when;
-            n += 1;
+            self.push(&mut whens, when)?;
         }
-        if n == 0 {
+        if whens.is_empty() {
             return Err(self.err_here("MERGE requires at least one WHEN clause"));
         }
         let returning = self.returning()?;
@@ -7076,7 +6879,7 @@ impl<'a> Parser<'a> {
             target_alias,
             source,
             on,
-            whens: self.arena_slice(&whens[..n])?,
+            whens: whens.as_slice(),
             returning,
         }))
     }
@@ -7112,20 +6915,16 @@ impl<'a> Parser<'a> {
         let mut columns: &'a [&'a str] = &[];
         if self.peeked == Tok::Op("(") {
             self.advance()?;
-            let mut names = [""; MAX_LIST];
-            let mut c = 0;
+            let mut names = ArenaList::new(self.arena);
             loop {
-                if c == MAX_LIST {
-                    return Err(self.limit("column list", MAX_LIST));
-                }
-                names[c] = self.col_ident("column name")?;
-                c += 1;
+                let name = self.col_ident("column name")?;
+                self.push(&mut names, name)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
             self.expect_op(")")?;
-            columns = self.arena_slice(&names[..c])?;
+            columns = names.as_slice();
         }
         let overriding = if self.eat_ident("overriding")? {
             let mode = if self.eat_ident("system")? {
@@ -7153,15 +6952,10 @@ impl<'a> Parser<'a> {
         }
         self.expect_ident("values")?;
         self.expect_op("(")?;
-        let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-        let mut vals = [null_expr; MAX_LIST];
-        let mut v = 0;
+        let mut vals = ArenaList::new(self.arena);
         loop {
-            if v == MAX_LIST {
-                return Err(self.limit("VALUES list", MAX_LIST));
-            }
-            vals[v] = self.expression(0)?;
-            v += 1;
+            let value = self.expression(0)?;
+            self.push(&mut vals, value)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -7169,7 +6963,7 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         Ok(MergeSourceAction::Insert {
             columns,
-            values: self.arena_slice(&vals[..v])?,
+            values: vals.as_slice(),
             default_values: false,
             overriding,
         })
@@ -7588,7 +7382,7 @@ impl<'a> Parser<'a> {
                 &*self
                     .arena
                     .alloc(fc)
-                    .map_err(|_| self.err_here("USING too large for SQL arena"))?,
+                    .map_err(|_| self.arena_full("USING too large for SQL arena"))?,
             )
         } else {
             None
@@ -8132,19 +7926,17 @@ impl<'a> Parser<'a> {
 
     /// Records a warning for the engine to emit before this statement runs.
     fn warn(&mut self, message: StackStr<96>) -> Result<(), ParseError> {
-        if self.n_warnings == MAX_PARSE_WARNINGS {
-            return Err(self.limit("parse warnings", MAX_PARSE_WARNINGS));
-        }
-        self.warnings[self.n_warnings] = message;
-        self.n_warnings += 1;
-        Ok(())
+        self.warnings
+            .push(message)
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))
     }
 
     /// Takes the warnings raised since the last call, in the order parsed.
-    pub fn take_warnings(&mut self) -> ([StackStr<96>; MAX_PARSE_WARNINGS], usize) {
-        let taken = self.n_warnings;
-        self.n_warnings = 0;
-        (self.warnings, taken)
+    /// The returned slice stays valid: the replacement list starts empty, so
+    /// later warnings allocate fresh arena storage.
+    pub fn take_warnings(&mut self) -> &'a [StackStr<96>] {
+        let taken = core::mem::replace(&mut self.warnings, ArenaList::new(self.arena));
+        taken.as_slice()
     }
 
     /// Unquoted or quoted identifier.
@@ -8181,7 +7973,7 @@ impl<'a> Parser<'a> {
         self.arena
             .alloc(e)
             .map(|m| &*m)
-            .map_err(|_| self.err_here("statement too large for SQL arena"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))
     }
 
     /// Parses the body of a `GROUP BY` clause (the keywords already consumed)
@@ -8192,7 +7984,7 @@ impl<'a> Parser<'a> {
     /// across comma-separated top-level elements exactly as PostgreSQL does.
     fn group_by_clause(&mut self) -> Result<(&'a [&'a Expr<'a>], &'a [u64]), ParseError> {
         let null_expr = self.arena_expr(Expr::Null)?;
-        let mut flat: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
+        let mut flat: [&'a Expr<'a>; MAX_GROUP_TERMS] = [null_expr; MAX_GROUP_TERMS];
         let mut n_flat = 0usize;
         // Running cross-product of grouping-set masks; starts as one empty set.
         let mut acc = [0u64; MAX_GROUPING_SETS];
@@ -8206,7 +7998,7 @@ impl<'a> Parser<'a> {
                 let is_cube = self.peeked == Tok::Ident("cube");
                 self.advance()?;
                 self.expect_op("(")?;
-                let mut terms = [0u64; MAX_LIST];
+                let mut terms = [0u64; MAX_GROUP_TERMS];
                 let n_terms = self.grouping_term_list(&mut flat, &mut n_flat, &mut terms)?;
                 self.expect_op(")")?;
                 if is_cube {
@@ -8282,7 +8074,7 @@ impl<'a> Parser<'a> {
     /// equality) and returns its single-bit mask.
     fn intern_group(
         &mut self,
-        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        flat: &mut [&'a Expr<'a>; MAX_GROUP_TERMS],
         n_flat: &mut usize,
         e: &'a Expr<'a>,
     ) -> Result<u64, ParseError> {
@@ -8291,8 +8083,8 @@ impl<'a> Parser<'a> {
                 return Ok(1u64 << i);
             }
         }
-        if *n_flat == MAX_LIST {
-            return Err(self.limit("GROUP BY list", MAX_LIST));
+        if *n_flat == MAX_GROUP_TERMS {
+            return Err(self.limit("GROUP BY list", MAX_GROUP_TERMS));
         }
         let bit = 1u64 << *n_flat;
         flat[*n_flat] = e;
@@ -8305,7 +8097,7 @@ impl<'a> Parser<'a> {
     /// several columns) — and returns the OR of its column bits.
     fn grouping_term(
         &mut self,
-        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        flat: &mut [&'a Expr<'a>; MAX_GROUP_TERMS],
         n_flat: &mut usize,
     ) -> Result<u64, ParseError> {
         // A parenthesized list groups several columns into one level. A bare
@@ -8334,14 +8126,14 @@ impl<'a> Parser<'a> {
     /// `CUBE(...)`), storing one mask per term. Returns the term count.
     fn grouping_term_list(
         &mut self,
-        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        flat: &mut [&'a Expr<'a>; MAX_GROUP_TERMS],
         n_flat: &mut usize,
-        terms: &mut [u64; MAX_LIST],
+        terms: &mut [u64; MAX_GROUP_TERMS],
     ) -> Result<usize, ParseError> {
         let mut n = 0usize;
         loop {
-            if n == MAX_LIST {
-                return Err(self.limit("GROUP BY list", MAX_LIST));
+            if n == MAX_GROUP_TERMS {
+                return Err(self.limit("GROUP BY list", MAX_GROUP_TERMS));
             }
             terms[n] = self.grouping_term(flat, n_flat)?;
             n += 1;
@@ -8357,7 +8149,7 @@ impl<'a> Parser<'a> {
     /// expands to several sets.
     fn grouping_set_member(
         &mut self,
-        flat: &mut [&'a Expr<'a>; MAX_LIST],
+        flat: &mut [&'a Expr<'a>; MAX_GROUP_TERMS],
         n_flat: &mut usize,
         elem: &mut [u64; MAX_GROUPING_SETS],
         n_elem: &mut usize,
@@ -8366,7 +8158,7 @@ impl<'a> Parser<'a> {
             let is_cube = self.peeked == Tok::Ident("cube");
             self.advance()?;
             self.expect_op("(")?;
-            let mut terms = [0u64; MAX_LIST];
+            let mut terms = [0u64; MAX_GROUP_TERMS];
             let n_terms = self.grouping_term_list(flat, n_flat, &mut terms)?;
             self.expect_op(")")?;
             if is_cube {
@@ -8441,13 +8233,21 @@ impl<'a> Parser<'a> {
         self.arena
             .alloc_slice_copy(items)
             .map(|m| &*m)
-            .map_err(|_| self.err_here("statement too large for SQL arena"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))
+    }
+
+    /// Grows an arena-backed list, mapping arena exhaustion to a loud parse
+    /// error. Statement lists use this rather than fixed stack staging, so
+    /// only the statement's own arena bounds their width.
+    fn push<T: Copy + 'a>(&self, list: &mut ArenaList<'a, T>, value: T) -> Result<(), ParseError> {
+        list.push(value)
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))
     }
 
     fn arena_str(&self, s: &str) -> Result<&'a str, ParseError> {
         self.arena
             .alloc_str(s)
-            .map_err(|_| self.err_here("statement too large for SQL arena"))
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))
     }
 
     fn unexpected(&self, expected: &str) -> ParseError {
@@ -8460,6 +8260,15 @@ impl<'a> Parser<'a> {
 
     fn err_here(&self, message: &'static str) -> ParseError {
         ParseError::new(self.peek_at, message)
+    }
+
+    /// Statement-arena exhaustion is a resource limit, not a syntax error.
+    fn arena_full(&self, message: &'static str) -> ParseError {
+        ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "{}", message),
+            sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        }
     }
 
     fn limit(&self, what: &'static str, max: usize) -> ParseError {
@@ -8475,6 +8284,10 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
     use crate::mem::Budget;
+
+    /// The pre-arena parser's fixed list boundary; tests cross it to prove
+    /// the boundary is gone.
+    const FORMER_LIST_LIMIT: usize = 64;
 
     fn with_parser<R>(text: &str, f: impl FnOnce(&mut Parser) -> R) -> R {
         let mut budget = Budget::new(1 << 20);
@@ -8765,7 +8578,7 @@ mod tests {
     #[test]
     fn pg_dump_can_lock_a_complete_bounded_catalog() {
         let mut sql = String::from("LOCK TABLE ");
-        for index in 0..MAX_LIST {
+        for index in 0..FORMER_LIST_LIMIT {
             if index != 0 {
                 sql.push_str(", ");
             }
@@ -8776,7 +8589,7 @@ mod tests {
             let Stmt::LockTable { tables, mode, .. } = parser.next_stmt().unwrap().unwrap() else {
                 panic!("expected LOCK TABLE")
             };
-            assert_eq!(tables.len(), MAX_LIST);
+            assert_eq!(tables.len(), FORMER_LIST_LIMIT);
             assert_eq!(mode, TableLockMode::AccessShare);
         });
     }
@@ -10848,30 +10661,35 @@ mod tests {
     }
 
     #[test]
-    fn fixed_parse_capacity_is_a_program_limit_not_a_syntax_error() {
-        let mut sql = String::from("SELECT 1 IN (");
-        for value in 0..=MAX_LIST {
-            if value != 0 {
-                sql.push(',');
-            }
-            sql.push_str(&value.to_string());
-        }
-        sql.push(')');
-        with_parser(&sql, |parser| {
+    fn statement_lists_cross_the_former_fixed_width_and_exhaustion_is_a_program_limit() {
+        // Well past the former 64-item boundary: only the statement arena
+        // bounds list width now.
+        let wide = (0..=4 * FORMER_LIST_LIMIT)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        with_parser(&format!("SELECT 1 IN ({wide})"), |parser| {
+            assert!(matches!(parser.next_stmt().unwrap(), Some(Stmt::Select(_))));
+        });
+        with_parser(&format!("SELECT {wide}"), |parser| {
+            assert!(matches!(parser.next_stmt().unwrap(), Some(Stmt::Select(_))));
+        });
+        // Exhausting the statement arena is a resource limit, not a syntax
+        // error.
+        let huge = (0..100_000)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        with_parser(&format!("SELECT 1 IN ({huge})"), |parser| {
             let error = parser.next_stmt().unwrap_err();
             assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
-            assert!(
-                error
-                    .message
-                    .as_str()
-                    .contains("IN list exceeds fixed limit")
-            );
+            assert!(error.message.as_str().contains("SQL arena"));
         });
     }
 
     #[test]
-    fn statement_width_has_one_exact_boundary_and_never_drops_warnings() {
-        let warned_columns = (0..MAX_LIST)
+    fn statement_widths_cross_the_former_fixed_boundaries_and_never_drop_warnings() {
+        let warned_columns = (0..FORMER_LIST_LIMIT)
             .map(|index| format!("column_{index} timestamp(7)"))
             .collect::<Vec<_>>()
             .join(",");
@@ -10882,33 +10700,31 @@ mod tests {
                     parser.next_stmt().unwrap(),
                     Some(Stmt::CreateTable(_))
                 ));
-                let (warnings, count) = parser.take_warnings();
-                assert_eq!(count, MAX_PARSE_WARNINGS);
+                let warnings = parser.take_warnings();
+                assert_eq!(warnings.len(), 2 * FORMER_LIST_LIMIT);
                 assert!(
-                    warnings[..count]
+                    warnings
                         .iter()
                         .all(|warning| warning.as_str().contains("precision reduced"))
                 );
             },
         );
 
-        let ctes = (0..=MAX_LIST)
+        // Every one of these lists crossed its former 64-item boundary.
+        let width = FORMER_LIST_LIMIT + 1;
+        let ctes = (0..width)
             .map(|index| format!("cte_{index} AS (SELECT {index})"))
             .collect::<Vec<_>>()
             .join(",");
-        let lock_clauses = std::iter::repeat_n("FOR SHARE", MAX_LIST + 1)
+        let lock_clauses = std::iter::repeat_n("FOR SHARE", width)
             .collect::<Vec<_>>()
             .join(" ");
-        let windows = (0..=MAX_LIST)
+        let windows = (0..width)
             .map(|index| format!("window_{index} AS ()"))
             .collect::<Vec<_>>()
             .join(",");
-        let actions = (0..=MAX_LIST)
+        let actions = (0..width)
             .map(|index| format!("ADD COLUMN column_{index} integer"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let using_columns = (0..=MAX_LIST)
-            .map(|index| format!("column_{index}"))
             .collect::<Vec<_>>()
             .join(",");
         for (label, sql) in [
@@ -10922,17 +10738,11 @@ mod tests {
                 "ALTER TABLE actions",
                 format!("ALTER TABLE target {actions}"),
             ),
-            (
-                "USING columns",
-                format!("SELECT * FROM left_side JOIN right_side USING ({using_columns})"),
-            ),
         ] {
             with_parser(&sql, |parser| {
-                let error = parser.next_stmt().unwrap_err();
-                assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED, "{label}");
                 assert!(
-                    error.message.as_str().contains("fixed limit"),
-                    "{label}: {error:?}"
+                    parser.next_stmt().unwrap().is_some(),
+                    "{label} must parse past the former fixed boundary"
                 );
             });
         }

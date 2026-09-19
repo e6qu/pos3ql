@@ -6,11 +6,11 @@
 //! `GROUPING SETS` (and the `ROLLUP` / `CUBE` spellings) run this per set, with
 //! the columns a set collapses reading NULL.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
 use crate::sql::eval::{
-    ColumnLookup, EvalHooks, SqlError, compare_datums_collated, eval_full, sqlstate,
+    ColumnLookup, EvalHooks, SqlError, SubqueryList, compare_datums_collated, eval_full, sqlstate,
 };
 use crate::sql::types::Datum;
 use crate::sql_err;
@@ -22,9 +22,9 @@ use super::aggregate::AggState;
 use super::plan::where_passes;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts, merge_correlated};
 use super::{
-    JoinRow, MAX_AGGS, MAX_SUBQUERIES, Outcome, QueryScope, ScopeSchema, arena_full,
-    expr_contains_node, pax_column_demand, resolve_order_target,
-    scan_source_recycling_with_pax_columns, scan_source_with_pax_columns, sql_fail, sql_ok,
+    JoinRow, Outcome, QueryScope, ScopeSchema, arena_full, expr_contains_node, pax_column_demand,
+    resolve_order_target, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
+    sql_fail, sql_ok,
 };
 use crate::storage::Storage;
 
@@ -64,6 +64,8 @@ pub(super) fn row_passes_correlated_where<'a>(
     params: &[Datum<'a>],
     hooks: &EvalHooks<'_, 'a>,
     row: &JoinRow<'_, 'a, '_>,
+    scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
+    lists: &mut [SubqueryList<'a>],
 ) -> Result<bool, SqlError> {
     if correlated.is_empty() {
         return Ok(true);
@@ -71,12 +73,9 @@ pub(super) fn row_passes_correlated_where<'a>(
     let Some(w) = where_clause else {
         return Ok(true);
     };
-    let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-    let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
     let base = hooks.subs.expect("outer subqueries prepared");
     let row_subs = merge_correlated(
-        correlated, base, row, storage, txid, arena, params, &mut sc, &mut ls,
+        correlated, base, row, storage, txid, arena, params, scalars, lists,
     )?;
     let h = EvalHooks {
         subs: Some(&row_subs),
@@ -159,6 +158,10 @@ pub(super) fn groups_for_mask<'a>(
     let group_of: &mut [u32] = arena
         .alloc_slice_with(row_count, |_| 0u32)
         .map_err(|_| arena_full())?;
+    // Per-row correlated-subquery scratch, allocated once and reused: per-row
+    // merges must not grow the statement arena.
+    let (where_scalars, where_lists) =
+        super::subquery::alloc_merge_scratch(hooks.subs, correlated, arena)?;
     let (n_groups, rep_keys): (usize, &[&[u8]]) = if storage.spill_attached() && n_keys > 0 {
         let mut sorter = storage.external_sorter()?;
         sorter.reset();
@@ -185,12 +188,11 @@ pub(super) fn groups_for_mask<'a>(
                     params,
                     hooks,
                     row,
+                    &mut *where_scalars,
+                    &mut *where_lists,
                 )? {
                     return Ok(true);
                 }
-                let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-                    [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-                let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
                 let row_subs;
                 let row_hooks_store;
                 let row_hooks: &EvalHooks = if correlated.is_empty() {
@@ -204,8 +206,8 @@ pub(super) fn groups_for_mask<'a>(
                         txid,
                         arena,
                         params,
-                        &mut sc,
-                        &mut ls,
+                        &mut *where_scalars,
+                        &mut *where_lists,
                     )?;
                     row_hooks_store = EvalHooks {
                         subs: Some(&row_subs),
@@ -312,12 +314,11 @@ pub(super) fn groups_for_mask<'a>(
                         params,
                         hooks,
                         row,
+                        &mut *where_scalars,
+                        &mut *where_lists,
                     )? {
                         return Ok(true);
                     }
-                    let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-                        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-                    let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
                     let row_subs;
                     let row_hooks_store;
                     let row_hooks: &EvalHooks = if correlated.is_empty() {
@@ -331,8 +332,8 @@ pub(super) fn groups_for_mask<'a>(
                             txid,
                             arena,
                             params,
-                            &mut sc,
-                            &mut ls,
+                            &mut *where_scalars,
+                            &mut *where_lists,
                         )?;
                         row_hooks_store = EvalHooks {
                             subs: Some(&row_subs),
@@ -398,8 +399,7 @@ pub(super) fn groups_for_mask<'a>(
     // Correlated subquery nodes appearing in the select list, HAVING, or the
     // ORDER BY keys re-evaluate per group (their outer references resolve to
     // the group's keys); the rest were WHERE-level and already applied.
-    let mut group_correlated_buffer: [&Expr; MAX_SUBQUERIES] = [&Expr::Null; MAX_SUBQUERIES];
-    let mut n_group_correlated = 0usize;
+    let mut group_correlated_list = ArenaList::new(arena);
     for &node in correlated {
         let in_group_clauses = statement.items.iter().any(|item| {
             matches!(item, SelectItem::Expr { expression, .. }
@@ -411,12 +411,11 @@ pub(super) fn groups_for_mask<'a>(
                 .iter()
                 .take(n_order)
                 .any(|oe| oe.is_some_and(|o| expr_contains_node(o, node as *const Expr)));
-        if in_group_clauses && n_group_correlated < MAX_SUBQUERIES {
-            group_correlated_buffer[n_group_correlated] = node;
-            n_group_correlated += 1;
+        if in_group_clauses {
+            group_correlated_list.push(node).map_err(|_| arena_full())?;
         }
     }
-    let group_correlated = &group_correlated_buffer[..n_group_correlated];
+    let group_correlated = group_correlated_list.as_slice();
 
     let n_aggs = agg_nodes.len();
     let states: &mut [AggState] = arena
@@ -476,14 +475,13 @@ pub(super) fn groups_for_mask<'a>(
                 params,
                 hooks,
                 row,
+                &mut *where_scalars,
+                &mut *where_lists,
             )? {
                 return Ok(true);
             }
             // Correlated subqueries inside aggregate arguments re-evaluate
             // against each input row.
-            let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-                [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-            let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
             let row_subs;
             let row_hooks_store;
             let row_hooks: &EvalHooks = if correlated.is_empty() {
@@ -497,8 +495,8 @@ pub(super) fn groups_for_mask<'a>(
                     txid,
                     arena,
                     params,
-                    &mut sc,
-                    &mut ls,
+                    &mut *where_scalars,
+                    &mut *where_lists,
                 )?;
                 row_hooks_store = EvalHooks {
                     subs: Some(&row_subs),
@@ -574,21 +572,22 @@ pub(super) fn groups_for_mask<'a>(
     let per_group: &mut [&[&[u8]]] = arena
         .alloc_slice_with(n_groups, |_| empty_group)
         .map_err(|_| arena_full())?;
+    let (group_scalars, group_lists) =
+        super::subquery::alloc_merge_scratch(hooks.subs, group_correlated, arena)?;
     let mut output_count = 0usize;
     for g in 0..n_groups {
         let mut key_vals = [Datum::Null; MAX_PROJ];
         for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
             *slot = crate::sql::exec::decode_projected_pub(rep_keys[g], k);
         }
-        let mut agg_vals = [Datum::Null; MAX_AGGS];
+        let agg_vals: &mut [Datum] = arena
+            .alloc_slice_with(n_aggs, |_| Datum::Null)
+            .map_err(|_| arena_full())?;
         for (i, (_, node)) in agg_nodes.iter().enumerate() {
             let state = &mut states[g * n_aggs.max(1) + i];
             state.initialize_custom_direct(node, arena, params, &ScopeSchema(scope), hooks)?;
             agg_vals[i] = state.finish(arena, hooks.catalog)?;
         }
-        let mut sc: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-            [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-        let mut ls = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
         let merged_subs;
         let group_subs = if group_correlated.is_empty() {
             hooks.subs
@@ -605,8 +604,8 @@ pub(super) fn groups_for_mask<'a>(
                 txid,
                 arena,
                 params,
-                &mut sc,
-                &mut ls,
+                &mut *group_scalars,
+                &mut *group_lists,
             )?;
             Some(&merged_subs)
         };
@@ -736,7 +735,16 @@ pub(super) fn grouped_rows<'a>(
         return Err(ungrouped_error(column, scope));
     }
 
-    let mut expressions = [&Expr::Null; MAX_PROJ * 3 + MAX_AGGS + 2];
+    let expressions: &mut [&Expr] = arena
+        .alloc_slice_with(
+            statement.items.len()
+                + statement.group_by.len()
+                + agg_nodes.len()
+                + 2
+                + statement.order_by.len(),
+            |_| &Expr::Null,
+        )
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for item in statement.items {
         let SelectItem::Expr { expression, .. } = item else {
@@ -770,14 +778,12 @@ pub(super) fn grouped_rows<'a>(
     // Pass 1: count rows, so group storage can be arena-allocated. WHERE
     // with correlated subqueries is applied per row here too, so every pass
     // sees the same filtered sequence.
-    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
-    let where_correlated_count =
-        correlated_in_expression(statement.where_clause, correlated, &mut where_correlated)?;
-    let scan_where = correlated_scan_conjuncts(
-        statement.where_clause,
-        &where_correlated[..where_correlated_count],
-        arena,
-    )?;
+    let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
+    let scan_where = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
+    // Per-row correlated-subquery scratch, allocated once and reused: per-row
+    // merges must not grow the statement arena.
+    let (where_scalars, where_lists) =
+        super::subquery::alloc_merge_scratch(hooks.subs, correlated, arena)?;
     let mut row_count = 0usize;
     scan_source_recycling_with_pax_columns(
         storage,
@@ -800,6 +806,8 @@ pub(super) fn grouped_rows<'a>(
                 params,
                 hooks,
                 row,
+                &mut *where_scalars,
+                &mut *where_lists,
             )? {
                 return Ok(true);
             }
@@ -818,7 +826,9 @@ pub(super) fn grouped_rows<'a>(
         .map_err(|_| arena_full())?;
     // ORDER BY over groups: ordinals resolve to select items; keys evaluate
     // under the group hooks (so aggregates work). Resolved once.
-    let mut order_arr: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    let order_arr: &mut [Option<&Expr>] = arena
+        .alloc_slice_with(statement.order_by.len(), |_| None)
+        .map_err(|_| arena_full())?;
     for (k, ob) in statement.order_by.iter().enumerate() {
         let target = resolve_order_target(ob.expression, statement.items, scope, arena)?;
         // The sort key evaluates against the group, so it faces the same

@@ -59,6 +59,15 @@ single-pass payload traversal. Text and binary input, aggregation, mutation,
 variadic expansion, comparison, set expansion, output, checkpoint publication,
 and empty-cache recovery are qualified beyond the former 1,024-element limit.
 The same audit removed `format()`'s unrelated 4 KiB result ceiling.
+The statement-list-width audit found no external blocker. Parser staging,
+query rewrites, and execution scratch for statement lists use the statement
+arena; per-row correlated-subquery merge scratch is pre-sized from true node
+counts. The audit fixed a window-scope restore that truncation alone could not
+preserve, made statement-arena exhaustion during parse a program-limit error
+rather than a syntax error, and removed a silent cap that dropped correlated
+subqueries in grouped output beyond 64. PostgreSQL 18 differential,
+allocation-forbidden, and empty-cache recovery regressions cross the former
+64-item and 256-row boundaries.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

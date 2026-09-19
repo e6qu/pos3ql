@@ -18,10 +18,10 @@ use crate::storage::Storage;
 use crate::{sql_err, stack_format};
 
 use super::{
-    Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
-    correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, has_project_set,
-    merge_correlated, pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping,
-    record_star_width, resolve_order_target, scan_source_recycling_with_indexed_candidates,
+    Chained, JoinRow, Outcome, QueryScope, ResolvedColumn, arena_full, correlated_in_expression,
+    correlated_scan_conjuncts, correlated_where_passes, has_project_set, merge_correlated,
+    pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping, record_star_width,
+    resolve_order_target, scan_source_recycling_with_indexed_candidates,
     scan_source_recycling_with_pax_columns, sql_fail, sql_ok,
 };
 
@@ -131,6 +131,8 @@ fn for_each_materialized_projection<'a>(
     postponed: Option<&[bool; MAX_PROJ]>,
     has_srf: bool,
     outer: Option<&dyn ColumnLookup<'a>>,
+    scalars: &mut [(*const Expr<'a>, Datum<'a>, Datum<'a>)],
+    lists: &mut [crate::sql::eval::SubqueryList<'a>],
     consume: &mut impl FnMut(&JoinRow<'_, 'a, '_>, &[Datum<'a>], &[Datum<'a>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if !where_correlated.is_empty()
@@ -144,13 +146,12 @@ fn for_each_materialized_projection<'a>(
             arena,
             params,
             hooks,
+            &mut *scalars,
+            &mut *lists,
         )?
     {
         return Ok(());
     }
-    let mut scalars: [(*const Expr, Datum, Datum); MAX_SUBQUERIES] =
-        [(core::ptr::null(), Datum::Null, Datum::Null); MAX_SUBQUERIES];
-    let mut lists = [super::subquery::empty_subquery_list(); MAX_SUBQUERIES];
     let row_subqueries;
     let owned_hooks;
     let row_hooks: &EvalHooks = if correlated.is_empty() {
@@ -164,8 +165,8 @@ fn for_each_materialized_projection<'a>(
             txid,
             arena,
             params,
-            &mut scalars,
-            &mut lists,
+            &mut *scalars,
+            &mut *lists,
         )?;
         owned_hooks = EvalHooks {
             group: None,
@@ -397,8 +398,7 @@ struct MaterializationPlan<'a> {
     n_raw: usize,
     identities_at: usize,
     n_identities: usize,
-    where_correlated: [&'a Expr<'a>; MAX_SUBQUERIES],
-    n_where_correlated: usize,
+    where_correlated: &'a [&'a Expr<'a>],
     where_in_scan: Option<&'a Expr<'a>>,
     order_exprs: [Option<&'a Expr<'a>>; MAX_PROJ],
     key_collations: [Collation; MAX_PROJ],
@@ -414,6 +414,19 @@ fn projected_collations<'a>(
     let mut collations = [Collation::None; MAX_PROJ];
     let mut width = 0;
     for item in statement.items {
+        let remaining = match item {
+            SelectItem::Expr { .. } => 1,
+            SelectItem::Wildcard => scope.star_columns(),
+            SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
+            SelectItem::RecordStar(_) => 0,
+        };
+        if width + remaining > MAX_PROJ {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "select list expands past {} columns",
+                MAX_PROJ
+            ));
+        }
         match item {
             SelectItem::Expr { expression, .. } => {
                 collations[width] = scope.expression_collation(expression)?;
@@ -498,15 +511,12 @@ fn prepare_materialization<'a>(
 ) -> Result<MaterializationPlan<'a>, SqlError> {
     let n_order = statement.order_by.len();
     let n_on = statement.distinct_on.len();
-    let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
-    let n_where_correlated =
-        correlated_in_expression(statement.where_clause, correlated, &mut where_correlated)?;
-    let where_in_scan = correlated_scan_conjuncts(
-        statement.where_clause,
-        &where_correlated[..n_where_correlated],
-        arena,
-    )?;
+    let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
+    let where_in_scan = correlated_scan_conjuncts(statement.where_clause, where_correlated, arena)?;
 
+    if n_order + n_on > MAX_PROJ {
+        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
+    }
     let mut order_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut key_collations = [Collation::None; MAX_PROJ];
     for (key, order) in statement.order_by.iter().enumerate() {
@@ -595,7 +605,6 @@ fn prepare_materialization<'a>(
         identities_at,
         n_identities,
         where_correlated,
-        n_where_correlated,
         where_in_scan,
         order_exprs,
         key_collations,
@@ -616,7 +625,21 @@ fn materialization_pax_columns<'a>(
     from: &'a FromClause<'a>,
     plan: &MaterializationPlan<'a>,
 ) -> super::scan::PaxReadDemand {
+    if statement
+        .items
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard | SelectItem::TableWildcard(_)))
+    {
+        return super::scan::PaxReadDemand::full_row(
+            super::scan::PaxFullRowReason::WildcardProjection,
+        );
+    }
     let mut expressions = [&Expr::Null; MAX_PROJ * 2 + 1];
+    if statement.items.len() + 1 + plan.n_keys > expressions.len() {
+        return super::scan::PaxReadDemand::full_row(
+            super::scan::PaxFullRowReason::WildcardProjection,
+        );
+    }
     let mut count = 0usize;
     for item in statement.items {
         match item {
@@ -624,11 +647,7 @@ fn materialization_pax_columns<'a>(
                 expressions[count] = expression;
                 count += 1;
             }
-            SelectItem::Wildcard | SelectItem::TableWildcard(_) => {
-                return super::scan::PaxReadDemand::full_row(
-                    super::scan::PaxFullRowReason::WildcardProjection,
-                );
-            }
+            SelectItem::Wildcard | SelectItem::TableWildcard(_) => unreachable!("returned above"),
         }
     }
     if let Some(predicate) = statement.where_clause {
@@ -674,7 +693,6 @@ pub(crate) fn materialized_rows<'a>(
         identities_at,
         n_identities,
         where_correlated,
-        n_where_correlated,
         where_in_scan,
         order_exprs,
         key_collations,
@@ -682,6 +700,23 @@ pub(crate) fn materialized_rows<'a>(
         any_postponed,
         has_srf,
     } = plan;
+    // Per-row correlated-subquery scratch, allocated once and reused across
+    // both passes: per-row merges must not grow the statement arena. The
+    // WHERE gate and the row merge share the pair, so it is sized for the
+    // wider of the two.
+    let (n_where_scalars, n_where_lists) =
+        super::subquery::merge_scratch_lens(Some(base), where_correlated);
+    let (n_row_scalars, n_row_lists) = super::subquery::merge_scratch_lens(Some(base), correlated);
+    let merge_scalars = arena
+        .alloc_slice_with(n_where_scalars.max(n_row_scalars), |_| {
+            (core::ptr::null(), Datum::Null, Datum::Null)
+        })
+        .map_err(|_| arena_full())?;
+    let merge_lists = arena
+        .alloc_slice_with(n_where_lists.max(n_row_lists), |_| {
+            super::subquery::empty_subquery_list()
+        })
+        .map_err(|_| arena_full())?;
     let ordered_candidates = if !statement.distinct
         && statement.distinct_on.is_empty()
         && n_order > 0
@@ -748,7 +783,7 @@ pub(crate) fn materialized_rows<'a>(
             hooks,
             correlated,
             base,
-            &where_correlated[..n_where_correlated],
+            where_correlated,
             &order_exprs,
             n_keys,
             if any_postponed {
@@ -758,6 +793,8 @@ pub(crate) fn materialized_rows<'a>(
             },
             has_srf,
             outer,
+            &mut *merge_scalars,
+            &mut *merge_lists,
             &mut |row, projected, keys| {
                 let row_bytes = crate::sql::exec::projected_row_len_by(stored_width, |index| {
                     materialized_value_at(
@@ -842,7 +879,7 @@ pub(crate) fn materialized_rows<'a>(
                 hooks,
                 correlated,
                 base,
-                &where_correlated[..n_where_correlated],
+                where_correlated,
                 &order_exprs,
                 n_keys,
                 if any_postponed {
@@ -852,6 +889,8 @@ pub(crate) fn materialized_rows<'a>(
                 },
                 has_srf,
                 outer,
+                &mut *merge_scalars,
+                &mut *merge_lists,
                 &mut |row, projected, keys| {
                     debug_assert_eq!(projected.len(), width);
                     let remaining = encoded_bytes
@@ -1322,6 +1361,22 @@ pub(crate) fn external_materialized_into<'a>(
 ) -> Result<u64, SqlError> {
     let plan = prepare_materialization(storage, txid, statement, scope, correlated, arena)?;
     let pax_columns = materialization_pax_columns(statement, scope, from, &plan);
+    // Per-row correlated-subquery scratch, allocated once and reused: per-row
+    // merges must not grow the statement arena. Sized for the wider of the
+    // WHERE gate and the row merge, which share the pair.
+    let (n_where_scalars, n_where_lists) =
+        super::subquery::merge_scratch_lens(Some(base), plan.where_correlated);
+    let (n_row_scalars, n_row_lists) = super::subquery::merge_scratch_lens(Some(base), correlated);
+    let merge_scalars = arena
+        .alloc_slice_with(n_where_scalars.max(n_row_scalars), |_| {
+            (core::ptr::null(), Datum::Null, Datum::Null)
+        })
+        .map_err(|_| arena_full())?;
+    let merge_lists = arena
+        .alloc_slice_with(n_where_lists.max(n_row_lists), |_| {
+            super::subquery::empty_subquery_list()
+        })
+        .map_err(|_| arena_full())?;
     let ordered_candidates = if !statement.distinct
         && statement.distinct_on.is_empty()
         && plan.n_order > 0
@@ -1401,12 +1456,14 @@ pub(crate) fn external_materialized_into<'a>(
                     hooks,
                     correlated,
                     base,
-                    &plan.where_correlated[..plan.n_where_correlated],
+                    plan.where_correlated,
                     &plan.order_exprs,
                     plan.n_keys,
                     None,
                     false,
                     outer,
+                    &mut *merge_scalars,
+                    &mut *merge_lists,
                     &mut |_row, projected, _keys| {
                         if logical_index >= offset {
                             keep_emitting = emit(projected, &source_rowids)?;
@@ -1448,7 +1505,7 @@ pub(crate) fn external_materialized_into<'a>(
             hooks,
             correlated,
             base,
-            &plan.where_correlated[..plan.n_where_correlated],
+            plan.where_correlated,
             &plan.order_exprs,
             plan.n_keys,
             if plan.any_postponed {
@@ -1458,6 +1515,8 @@ pub(crate) fn external_materialized_into<'a>(
             },
             plan.has_srf,
             outer,
+            &mut *merge_scalars,
+            &mut *merge_lists,
             &mut |row, projected, keys| {
                 storage
                     .with_block_store(|blocks| {

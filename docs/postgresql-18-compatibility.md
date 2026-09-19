@@ -121,7 +121,7 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   Policies use `max_policies` (default 256) without a second per-table ceiling;
   their predicates are statement-arena bounded. Routine parameters, output
   columns, configuration settings, trigger arguments, and policy roles accept
-  the complete 64-item parser boundary. This remains below PostgreSQL's
+  the complete 64-item per-definition boundary. This remains below PostgreSQL's
   100-input-argument routine limit. `RETURNS TABLE` catalog argument metadata
   includes the independently bounded input and output shapes. Trigger arguments
   are zero-based and NULL when absent, matching PostgreSQL.
@@ -138,14 +138,19 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   preserved through record typing, catalogs, WAL, checkpoints, and object-cold
   recovery; wider PostgreSQL tables, composites, constraint collections, and
   LIST bounds remain loud program-limit errors rather than partial objects.
-- The bounded statement boundary is 64 Bind parameters, CTEs, row-locking
-  clauses, named windows, `ALTER TABLE` actions, `JOIN ... USING` columns,
-  aggregate calls, scalar subqueries, set-operation leaves, and independent
-  anonymous record shapes. Partition and ordering lists in one window may each
-  contain 64 expressions. Static description, execution, and `EXPLAIN` accept
-  the same maximum shapes; the plan tree uses the fixed statement arena.
-  Item 65 returns SQLSTATE `54000`, and maximum shapes are exercised before
-  and after empty-cache object recovery.
+- Statement lists are bounded by the fixed statement arena, not by compiled
+  staging arrays: select lists, `IN` lists, `ARRAY` constructors, `CASE` arms,
+  function arguments up to PostgreSQL's own 100, `VALUES` rows, CTEs,
+  row-locking clauses, named windows, `ALTER TABLE` actions, aggregates,
+  scalar subqueries, set-operation branches, `DISTINCT ON` / `ORDER BY` /
+  window partition and ordering keys, GRANT role lists, and `RETURNING` lists
+  all cross the former 64-item (and 256-row) boundaries. Arena exhaustion is
+  SQLSTATE `54000`. Remaining fixed boundaries: 64 Bind and SQL `PREPARE`
+  parameters (PostgreSQL's protocol boundary is 65,535), 64 `GROUP BY` terms
+  and 256 grouping sets (bitmask-keyed expansion), 128-column results, 256
+  rows per XMLTABLE/JSON_TABLE call, and 64 `JOIN ... USING` columns and join
+  relations. Differential and allocation-forbidden coverage crosses the former
+  boundaries and recovers the stored results with empty local caches.
 - Program length does not share that 64-item arity limit. Simple-protocol
   batches, SQL-language bodies, and PL/pgSQL bodies are sized from their source
   in the fixed statement arena. PL/pgSQL locals, branches, exception handlers

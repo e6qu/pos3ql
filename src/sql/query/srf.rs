@@ -7,7 +7,7 @@
 //! table, and needs a definition — column names and types — that the ordinary
 //! scan machinery can resolve against, which is what is synthesized here.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
@@ -17,6 +17,11 @@ use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_COLUMNS, RoutineDef, SqlName, Storage, TableDef};
 use crate::util::StackStr;
+
+/// Rows one XMLTABLE / JSON_TABLE / publication-table function call emits.
+/// Scaling this per-call value bound to the statement arena is tracked
+/// separately in PLAN.md.
+const MAX_SRF_CALL_ROWS: usize = 256;
 
 use super::setops::describe_set_body;
 use super::subquery::subquery_witness;
@@ -485,7 +490,7 @@ fn publication_table_rows<'a>(
     arena: &'a Arena,
     arguments: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    const MAX_RESULTS: usize = crate::sql::parser::MAX_ROWS;
+    const MAX_RESULTS: usize = MAX_SRF_CALL_ROWS;
     let mut names = [""; MAX_RESULTS];
     let mut name_count = 0usize;
     for argument in arguments {
@@ -4400,9 +4405,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         };
         let parsed = crate::sql::eval::regexp_options(flags)?;
         // Collect each match's encoded text[] row.
-        const EMPTY: &[u8] = &[];
-        let mut rows = [EMPTY; crate::sql::parser::MAX_LIST];
-        let mut n = 0usize;
+        let mut rows: ArenaList<'a, &'a [u8]> = ArenaList::new(arena);
         let mut spans = [(-1i64, -1i64); crate::sql::regex::MAX_GROUPS];
         let mut from = 0usize;
         while let Some(((mstart, mend), ng)) = crate::sql::regex::find_captures_with_options(
@@ -4430,14 +4433,8 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 element: crate::sql::types::ArrElem::Text,
                 raw: crate::sql::array::build(&elems[..count], arena)?,
             };
-            if n == crate::sql::parser::MAX_LIST {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many regexp_matches rows"
-                ));
-            }
-            rows[n] = crate::sql::exec::encode_projected_pub(&[arr], arena)?;
-            n += 1;
+            rows.push(crate::sql::exec::encode_projected_pub(&[arr], arena)?)
+                .map_err(|_| arena_full())?;
             if !parsed.global {
                 break;
             }
@@ -4446,10 +4443,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             };
             from = next;
         }
-        let out = arena
-            .alloc_slice_with(n, |i| rows[i])
-            .map_err(|_| arena_full())?;
-        return Ok(&*out);
+        return Ok(rows.as_slice());
     }
     // jsonb_object_keys(obj) / json_object_keys(obj): one text row per key.
     if tref.table.eq_ignore_ascii_case("jsonb_object_keys")
@@ -5393,8 +5387,7 @@ fn xml_table_rows<'a, C: ColumnLookup<'a>>(
     if !namespace_specs.len().is_multiple_of(2) {
         return Err(srf_signature_error("xmltable"));
     }
-    let mut namespaces = [("", ""); crate::sql::parser::MAX_LIST / 2];
-    let mut namespace_count = 0usize;
+    let mut namespaces: ArenaList<'a, (&'a str, &'a str)> = ArenaList::new(arena);
     for pair in namespace_specs.as_chunks::<2>().0 {
         let uri = eval_full(pair[0], arena, params, columns, hooks)?;
         if uri.is_null() {
@@ -5407,7 +5400,8 @@ fn xml_table_rows<'a, C: ColumnLookup<'a>>(
         let Expr::Str(prefix) = pair[1] else {
             return Err(srf_signature_error("xmltable"));
         };
-        if namespaces[..namespace_count]
+        if namespaces
+            .as_slice()
             .iter()
             .any(|(existing, _)| existing == prefix)
         {
@@ -5417,15 +5411,10 @@ fn xml_table_rows<'a, C: ColumnLookup<'a>>(
                 prefix
             ));
         }
-        namespaces[namespace_count] = (prefix, uri);
-        namespace_count += 1;
+        namespaces.push((prefix, uri)).map_err(|_| arena_full())?;
     }
-    let row_path = crate::sql::xml::rewrite_namespaces(
-        row_path,
-        document,
-        &namespaces[..namespace_count],
-        arena,
-    )?;
+    let row_path =
+        crate::sql::xml::rewrite_namespaces(row_path, document, namespaces.as_slice(), arena)?;
     let roots = crate::sql::xml::xpath(row_path, document, arena)?;
     let Expr::Call {
         name: "__xml_table_columns",
@@ -5436,7 +5425,7 @@ fn xml_table_rows<'a, C: ColumnLookup<'a>>(
         return Err(srf_signature_error("xmltable"));
     };
     const EMPTY: &[u8] = &[];
-    let mut encoded = [EMPTY; crate::sql::parser::MAX_ROWS];
+    let mut encoded = [EMPTY; MAX_SRF_CALL_ROWS];
     let mut count = 0usize;
     for (ordinal, root) in roots.iter().enumerate() {
         let Datum::Xml(context) = root else {
@@ -5475,12 +5464,8 @@ fn xml_table_rows<'a, C: ColumnLookup<'a>>(
             } else {
                 crate::sql::eval::cast_to_text(path, arena)?
             };
-            let path = crate::sql::xml::rewrite_namespaces(
-                path,
-                document,
-                &namespaces[..namespace_count],
-                arena,
-            )?;
+            let path =
+                crate::sql::xml::rewrite_namespaces(path, document, namespaces.as_slice(), arena)?;
             let selected = crate::sql::xml::xpath_relative(path, context, arena)?;
             let target_is_xml = ColType::from_sql_name(type_name) == Some(ColType::Xml);
             let mut value = if selected.is_empty() {
@@ -5616,7 +5601,7 @@ fn json_table_rows<'a, C: ColumnLookup<'a>>(
         ));
     };
     const EMPTY: &[u8] = &[];
-    let mut encoded = [EMPTY; crate::sql::parser::MAX_ROWS];
+    let mut encoded = [EMPTY; MAX_SRF_CALL_ROWS];
     let mut encoded_count = 0usize;
     let output_columns = json_table_specifications_width(specifications)?;
     for (index, root) in roots.iter().enumerate() {
@@ -5656,12 +5641,11 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     hooks: &EvalHooks<'_, 'a>,
-    encoded: &mut [&'a [u8]; crate::sql::parser::MAX_ROWS],
+    encoded: &mut [&'a [u8]; MAX_SRF_CALL_ROWS],
     encoded_count: &mut usize,
 ) -> Result<usize, SqlError> {
     let mut column = start_column;
-    let mut nested = [None; crate::sql::parser::MAX_LIST];
-    let mut nested_count = 0usize;
+    let mut nested: ArenaList<'a, (&'a Expr<'a>, usize)> = ArenaList::new(arena);
     for specification in specifications {
         let Expr::Call { name, args, .. } = specification else {
             return Err(sql_err!(
@@ -5684,8 +5668,9 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
             }
             "__json_table_nested" => {
                 let width = json_table_spec_width(specification)?;
-                nested[nested_count] = Some((*specification, column));
-                nested_count += 1;
+                nested
+                    .push((*specification, column))
+                    .map_err(|_| arena_full())?;
                 column += width;
             }
             _ => {
@@ -5696,7 +5681,7 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
             }
         }
     }
-    if nested_count == 0 {
+    if nested.is_empty() {
         if *encoded_count == encoded.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5710,7 +5695,7 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
         return Ok(column - start_column);
     }
 
-    for (nested_specification, nested_start) in nested[..nested_count].iter().flatten() {
+    for (nested_specification, nested_start) in nested.as_slice() {
         let Expr::Call { args, .. } = nested_specification else {
             unreachable!("nested specification is a call")
         };
@@ -6062,9 +6047,12 @@ fn rows_from_base_rows_outer<'a, C: ColumnLookup<'a>>(
     statement_arena: Option<&'a Arena>,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     const EMPTY_ROWS: &[&[u8]] = &[];
-    let mut rows_by_function: [&[&[u8]]; crate::sql::parser::MAX_LIST] =
-        [EMPTY_ROWS; crate::sql::parser::MAX_LIST];
-    let mut widths = [0usize; crate::sql::parser::MAX_LIST];
+    let rows_by_function = arena
+        .alloc_slice_with(functions.len(), |_| EMPTY_ROWS)
+        .map_err(|_| arena_full())?;
+    let widths = arena
+        .alloc_slice_with(functions.len(), |_| 0usize)
+        .map_err(|_| arena_full())?;
     let mut row_count = 0usize;
     let mut total_width = 0usize;
     for (index, function) in functions.iter().enumerate() {

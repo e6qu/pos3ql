@@ -6,7 +6,7 @@
 //! substituting walk that rebuilds a statement's expressions and FROM items in
 //! the arena with each reference replaced, which is the rest of this module.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{
     Collation, Cte, CteCycleMark, CteMaterialization, CteSearchOrder, Delete, Expr, FromClause,
     GroupingSetQuantifier, Insert, Join, JoinKind, MaterializedCte, Merge, MergeSourceAction,
@@ -83,7 +83,6 @@ pub(crate) fn expand_stored_query_exec<'a>(
 ) -> Result<&'a Select<'a>, SqlError> {
     with_exec_context(
         select.with,
-        select,
         storage,
         txid,
         arena,
@@ -144,18 +143,9 @@ fn expand_ctes_with_path<'a>(
     if sel.with.is_empty() && dependencies.is_none() && !storage.has_any_view() {
         return Ok(sel);
     }
-    if sel.with.len() > crate::sql::parser::MAX_CTES {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "too many WITH entries"
-        ));
-    }
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
-    let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
-        [("", sel, &[]); crate::sql::parser::MAX_CTES];
-    let mut materialized = [("", &EMPTY_CTE); crate::sql::parser::MAX_CTES];
-    let mut resolved_count = 0;
-    let mut materialized_count = 0;
+    let mut resolved = ArenaList::new(arena);
+    let mut materialized = ArenaList::new(arena);
     for (index, cte) in sel.with.iter().enumerate() {
         if sel.with[..index].iter().any(|prior| prior.name == cte.name) {
             return Err(sql_err!(
@@ -165,8 +155,8 @@ fn expand_ctes_with_path<'a>(
             ));
         }
         let context = Subst {
-            ctes: &resolved[..resolved_count],
-            materialized: &materialized[..materialized_count],
+            ctes: resolved.as_slice(),
+            materialized: materialized.as_slice(),
             storage,
             txid,
             depth,
@@ -188,22 +178,22 @@ fn expand_ctes_with_path<'a>(
             ));
         }
         if cte.recursive && self_references > 0 {
-            materialized[materialized_count] = (
-                cte.name,
-                describe_recursive_materialized(cte, context, storage, txid, arena)?,
-            );
-            materialized_count += 1;
+            let entry = describe_recursive_materialized(cte, context, storage, txid, arena)?;
+            materialized
+                .push((cte.name, entry))
+                .map_err(|_| arena_full())?;
         } else {
             let query = subst_select(cte.query, context, arena)?;
-            resolved[resolved_count] = (cte.name, query, cte.columns);
-            resolved_count += 1;
+            resolved
+                .push((cte.name, query, cte.columns))
+                .map_err(|_| arena_full())?;
         }
     }
     // Substitute the body against all CTEs (the WITH list is dropped by
     // subst_select, which never copies it) and expand any view references.
     let context = Subst {
-        ctes: &resolved[..resolved_count],
-        materialized: &materialized[..materialized_count],
+        ctes: resolved.as_slice(),
+        materialized: materialized.as_slice(),
         storage,
         txid,
         depth,
@@ -236,7 +226,6 @@ pub fn expand_ctes_exec<'a>(
     }
     with_exec_context(
         sel.with,
-        sel,
         storage,
         txid,
         arena,
@@ -403,7 +392,6 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
 ) -> Result<&'a Expr<'a>, SqlError> {
     with_exec_context(
         &[],
-        &EMPTY_SELECT,
         storage,
         txid,
         arena,
@@ -1033,9 +1021,8 @@ pub(crate) fn attach_rule_source<'a>(
                     ..*select
                 }
             } else {
-                let mut leaves: [Option<&SetTree<'a>>; crate::sql::parser::MAX_LIST] =
-                    [None; crate::sql::parser::MAX_LIST];
-                for (index, row) in insert.rows.iter().enumerate() {
+                let mut leaves: ArenaList<'a, &'a SetTree<'a>> = ArenaList::new(arena);
+                for row in insert.rows {
                     let items = arena
                         .alloc_slice_with(row.len(), |column| SelectItem::Expr {
                             expression: row[column],
@@ -1052,23 +1039,25 @@ pub(crate) fn attach_rule_source<'a>(
                             condition,
                         ))
                         .map_err(|_| arena_full())?;
-                    leaves[index] = Some(
-                        arena
-                            .alloc(SetTree::Select(&*select))
-                            .map(|tree| &*tree)
-                            .map_err(|_| arena_full())?,
-                    );
+                    leaves
+                        .push(
+                            arena
+                                .alloc(SetTree::Select(&*select))
+                                .map(|tree| &*tree)
+                                .map_err(|_| arena_full())?,
+                        )
+                        .map_err(|_| arena_full())?;
                 }
-                let mut tree = leaves[0].ok_or_else(|| {
+                let mut tree = *leaves.as_slice().first().ok_or_else(|| {
                     sql_err!(sqlstate::SYNTAX_ERROR, "rewrite INSERT action has no row")
                 })?;
-                for leaf in &leaves[1..insert.rows.len()] {
+                for leaf in &leaves.as_slice()[1..] {
                     tree = arena
                         .alloc(SetTree::Op {
                             operator: SetOp::Union,
                             all: true,
                             left: tree,
-                            right: leaf.expect("populated rewrite action row"),
+                            right: leaf,
                         })
                         .map(|tree| &*tree)
                         .map_err(|_| arena_full())?;
@@ -1158,14 +1147,8 @@ fn expand_stored_statement_with_transition<'a>(
         Stmt::SetQuery(query) if outer_with.is_empty() => query.with,
         _ => outer_with,
     };
-    let placeholder = match body {
-        Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
-        Stmt::Select(select) => select,
-        _ => &EMPTY_SELECT,
-    };
     with_exec_context(
         with,
-        placeholder,
         storage,
         txid,
         arena,
@@ -1265,13 +1248,8 @@ fn expand_dml_ctes_with_relations<'a>(
     relations: &[(&'a str, &'a MaterializedCte<'a>)],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
-    let placeholder = match statement {
-        Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
-        _ => &EMPTY_SELECT,
-    };
     with_exec_context(
         with,
-        placeholder,
         storage,
         txid,
         arena,
@@ -1531,7 +1509,6 @@ fn expand_view_returning<'a>(
 #[allow(clippy::too_many_arguments)]
 fn with_exec_context<'a, 's, 'e, R>(
     with: &'a [Cte<'a>],
-    placeholder: &'a Select<'a>,
     storage: &'s Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1548,23 +1525,13 @@ fn with_exec_context<'a, 's, 'e, R>(
     root_references: impl Fn(&str) -> usize,
     build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'e>) -> Result<R, SqlError>,
 ) -> Result<R, SqlError> {
-    if with.len() > crate::sql::parser::MAX_CTES {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "too many WITH entries"
-        ));
-    }
-    let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
-        [("", placeholder, &[]); crate::sql::parser::MAX_CTES];
-    let mut n = 0;
-    let mut materialized: [(&'a str, &'a MaterializedCte<'a>); crate::sql::parser::MAX_CTES] =
-        [("", &EMPTY_CTE); crate::sql::parser::MAX_CTES];
-    let mut nm = 0;
+    let mut resolved = ArenaList::new(arena);
+    let mut materialized = ArenaList::new(arena);
     for &(name, relation) in relations {
-        if nm == materialized.len()
-            || materialized[..nm]
-                .iter()
-                .any(|(existing, _)| *existing == name)
+        if materialized
+            .as_slice()
+            .iter()
+            .any(|(existing, _)| *existing == name)
         {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
@@ -1572,8 +1539,9 @@ fn with_exec_context<'a, 's, 'e, R>(
                 name
             ));
         }
-        materialized[nm] = (name, relation);
-        nm += 1;
+        materialized
+            .push((name, relation))
+            .map_err(|_| arena_full())?;
     }
     for (cte_index, cte) in with.iter().enumerate() {
         if with[..cte_index].iter().any(|prior| prior.name == cte.name) {
@@ -1583,20 +1551,20 @@ fn with_exec_context<'a, 's, 'e, R>(
                 cte.name
             ));
         }
-        let mut scoped_ctes = [("", placeholder, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
-        let mut scoped_materialized = [("", &EMPTY_CTE); MAX_VISIBLE_CTES];
-        let (scoped_n, scoped_nm) = fill_scoped_bindings(
+        let mut scoped_ctes = ArenaList::new(arena);
+        let mut scoped_materialized = ArenaList::new(arena);
+        fill_scoped_bindings(
             with,
-            &resolved[..n],
+            resolved.as_slice(),
             inherited_ctes,
-            &materialized[..nm],
+            materialized.as_slice(),
             inherited_materialized,
             &mut scoped_ctes,
             &mut scoped_materialized,
         )?;
         let context = Subst {
-            ctes: &scoped_ctes[..scoped_n],
-            materialized: &scoped_materialized[..scoped_nm],
+            ctes: scoped_ctes.as_slice(),
+            materialized: scoped_materialized.as_slice(),
             storage,
             txid,
             depth,
@@ -1630,13 +1598,15 @@ fn with_exec_context<'a, 's, 'e, R>(
                         cte.name
                     )
                 })?;
-            materialized[nm] = (cte.name, materialized_cte);
-            nm += 1;
+            materialized
+                .push((cte.name, materialized_cte))
+                .map_err(|_| arena_full())?;
         } else if cte.recursive && self_references > 0 {
             let recursive =
                 materialize_recursive(cte, context, storage, txid, arena, params, sequences)?;
-            materialized[nm] = (cte.name, recursive);
-            nm += 1;
+            materialized
+                .push((cte.name, recursive))
+                .map_err(|_| arena_full())?;
         } else {
             let query = subst_select(cte.query, context, arena)?;
             let references = root_references(cte.name)
@@ -1661,28 +1631,30 @@ fn with_exec_context<'a, 's, 'e, R>(
                     params,
                     sequences,
                 )?;
-                materialized[nm] = (cte.name, relation);
-                nm += 1;
+                materialized
+                    .push((cte.name, relation))
+                    .map_err(|_| arena_full())?;
             } else {
-                resolved[n] = (cte.name, query, cte.columns);
-                n += 1;
+                resolved
+                    .push((cte.name, query, cte.columns))
+                    .map_err(|_| arena_full())?;
             }
         }
     }
-    let mut scoped_ctes = [("", placeholder, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
-    let mut scoped_materialized = [("", &EMPTY_CTE); MAX_VISIBLE_CTES];
-    let (scoped_n, scoped_nm) = fill_scoped_bindings(
+    let mut scoped_ctes = ArenaList::new(arena);
+    let mut scoped_materialized = ArenaList::new(arena);
+    fill_scoped_bindings(
         with,
-        &resolved[..n],
+        resolved.as_slice(),
         inherited_ctes,
-        &materialized[..nm],
+        materialized.as_slice(),
         inherited_materialized,
         &mut scoped_ctes,
         &mut scoped_materialized,
     )?;
     let context = Subst {
-        ctes: &scoped_ctes[..scoped_n],
-        materialized: &scoped_materialized[..scoped_nm],
+        ctes: scoped_ctes.as_slice(),
+        materialized: scoped_materialized.as_slice(),
         storage,
         txid,
         depth,
@@ -1704,35 +1676,27 @@ fn fill_scoped_bindings<'a>(
     inherited_ctes: &CteBindings<'a>,
     materialized: &[(&'a str, &'a MaterializedCte<'a>)],
     inherited_materialized: &[(&'a str, &'a MaterializedCte<'a>)],
-    scoped_ctes: &mut [(&'a str, &'a Select<'a>, &'a [&'a str]); MAX_VISIBLE_CTES],
-    scoped_materialized: &mut [(&'a str, &'a MaterializedCte<'a>); MAX_VISIBLE_CTES],
-) -> Result<(usize, usize), SqlError> {
-    let mut scoped_n = 0;
+    scoped_ctes: &mut ArenaList<'a, (&'a str, &'a Select<'a>, &'a [&'a str])>,
+    scoped_materialized: &mut ArenaList<'a, (&'a str, &'a MaterializedCte<'a>)>,
+) -> Result<(), SqlError> {
     for binding in resolved.iter().chain(
         inherited_ctes
             .iter()
             .filter(|binding| !with.iter().any(|local| local.name == binding.0)),
     ) {
-        if scoped_n == scoped_ctes.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped_ctes[scoped_n] = *binding;
-        scoped_n += 1;
+        scoped_ctes.push(*binding).map_err(|_| arena_full())?;
     }
 
-    let mut scoped_nm = 0;
     for binding in materialized.iter().chain(
         inherited_materialized
             .iter()
             .filter(|binding| !with.iter().any(|local| local.name == binding.0)),
     ) {
-        if scoped_nm == scoped_materialized.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped_materialized[scoped_nm] = *binding;
-        scoped_nm += 1;
+        scoped_materialized
+            .push(*binding)
+            .map_err(|_| arena_full())?;
     }
-    Ok((scoped_n, scoped_nm))
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1921,43 +1885,7 @@ fn wrap_set_tree_with<'a>(
     Ok(&*arena.alloc(sel).map_err(|_| arena_full())?)
 }
 
-static EMPTY_CTE: MaterializedCte<'static> = MaterializedCte {
-    column_names: &[],
-    column_types: &[],
-    column_collations: &[],
-    source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
-};
-
-static EMPTY_SELECT: Select<'static> = Select {
-    items: &[],
-    distinct: false,
-    distinct_on: &[],
-    from: None,
-    where_clause: None,
-    group_by: &[],
-    grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
-    grouping_sets: &[],
-    having: None,
-    order_by: &[],
-    limit: None,
-    offset: None,
-    with_ties: false,
-    with: &[],
-    set_body: None,
-    locking: &[],
-};
-
 type CteBindings<'a> = [(&'a str, &'a Select<'a>, &'a [&'a str])];
-
-const MAX_VISIBLE_CTES: usize = crate::sql::parser::MAX_CTES * (MAX_VIEW_DEPTH as usize + 1);
-
-fn too_many_visible_ctes() -> SqlError {
-    sql_err!(
-        sqlstate::TOO_MANY_ARGUMENTS,
-        "nested WITH scopes expose more than {} common table expressions",
-        MAX_VISIBLE_CTES
-    )
-}
 
 /// Threaded through the FROM-reference rewrite: CTE bindings in scope (query
 /// plus optional column-rename list), materialized recursive CTEs, storage (to
@@ -3950,7 +3878,6 @@ fn subst_select<'a>(
     if let Some(execution) = context.execution {
         return with_exec_context(
             select.with,
-            select,
             context.storage,
             context.txid,
             arena,
@@ -3969,8 +3896,7 @@ fn subst_select<'a>(
         );
     }
 
-    let mut resolved = [("", select, &[] as &'a [&'a str]); crate::sql::parser::MAX_CTES];
-    let mut resolved_count = 0usize;
+    let mut resolved = ArenaList::new(arena);
     for (index, cte) in select.with.iter().enumerate() {
         if select.with[..index]
             .iter()
@@ -3988,27 +3914,18 @@ fn subst_select<'a>(
                 "WITH clause containing a data-modifying statement must be at the top level"
             ));
         }
-        let mut scoped = [("", select, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
-        let mut scoped_count = 0usize;
-        for binding in &resolved[..resolved_count] {
-            if scoped_count == scoped.len() {
-                return Err(too_many_visible_ctes());
-            }
-            scoped[scoped_count] = *binding;
-            scoped_count += 1;
+        let mut scoped = ArenaList::new(arena);
+        for binding in resolved.as_slice() {
+            scoped.push(*binding).map_err(|_| arena_full())?;
         }
         for binding in context.ctes {
             if select.with.iter().any(|local| local.name == binding.0) {
                 continue;
             }
-            if scoped_count == scoped.len() {
-                return Err(too_many_visible_ctes());
-            }
-            scoped[scoped_count] = *binding;
-            scoped_count += 1;
+            scoped.push(*binding).map_err(|_| arena_full())?;
         }
         let child = Subst {
-            ctes: &scoped[..scoped_count],
+            ctes: scoped.as_slice(),
             ..context
         };
         let query = if cte.recursive && select_references(cte.query, cte.name) > 0 {
@@ -4017,32 +3934,24 @@ fn subst_select<'a>(
         } else {
             subst_select(cte.query, child, arena)?
         };
-        resolved[resolved_count] = (cte.name, query, cte.columns);
-        resolved_count += 1;
+        resolved
+            .push((cte.name, query, cte.columns))
+            .map_err(|_| arena_full())?;
     }
-    let mut scoped = [("", select, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
-    let mut scoped_count = 0usize;
-    for binding in &resolved[..resolved_count] {
-        if scoped_count == scoped.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped[scoped_count] = *binding;
-        scoped_count += 1;
+    let mut scoped = ArenaList::new(arena);
+    for binding in resolved.as_slice() {
+        scoped.push(*binding).map_err(|_| arena_full())?;
     }
     for binding in context.ctes {
         if select.with.iter().any(|local| local.name == binding.0) {
             continue;
         }
-        if scoped_count == scoped.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped[scoped_count] = *binding;
-        scoped_count += 1;
+        scoped.push(*binding).map_err(|_| arena_full())?;
     }
     subst_select_body(
         select,
         Subst {
-            ctes: &scoped[..scoped_count],
+            ctes: scoped.as_slice(),
             ..context
         },
         arena,
@@ -4102,27 +4011,16 @@ fn subst_order_by<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [OrderBy<'a>], SqlError> {
-    let mut order = [OrderBy {
-        expression: &Expr::Null,
-        descending: false,
-        nulls_first: false,
-    }; crate::sql::parser::MAX_LIST];
-    if source.len() > order.len() {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "ORDER BY list too long"
-        ));
+    let mut order: ArenaList<'a, OrderBy<'a>> = ArenaList::new(arena);
+    for item in source {
+        order
+            .push(OrderBy {
+                expression: subst_expr(item.expression, context, arena)?,
+                ..*item
+            })
+            .map_err(|_| arena_full())?;
     }
-    for (index, item) in source.iter().enumerate() {
-        order[index] = OrderBy {
-            expression: subst_expr(item.expression, context, arena)?,
-            ..*item
-        };
-    }
-    arena
-        .alloc_slice_copy(&order[..source.len()])
-        .map(|order| &*order)
-        .map_err(|_| arena_full())
+    Ok(order.as_slice())
 }
 
 fn from_shadows_qualifier(from: &FromClause<'_>, qualifier: &str) -> bool {
@@ -4200,20 +4098,13 @@ fn subst_assignments<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
-    if source.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "assignment list too long"
-        ));
+    let mut assignments: ArenaList<'a, (&'a str, &'a Expr<'a>)> = ArenaList::new(arena);
+    for (column, expression) in source.iter().copied() {
+        assignments
+            .push((column, subst_expr(expression, context, arena)?))
+            .map_err(|_| arena_full())?;
     }
-    let mut assignments = [("", &Expr::Null); crate::sql::parser::MAX_LIST];
-    for (index, (column, expression)) in source.iter().enumerate() {
-        assignments[index] = (column, subst_expr(expression, context, arena)?);
-    }
-    arena
-        .alloc_slice_copy(&assignments[..source.len()])
-        .map(|assignments| &*assignments)
-        .map_err(|_| arena_full())
+    Ok(assignments.as_slice())
 }
 
 fn subst_on_conflict_targets<'a>(
@@ -4221,22 +4112,17 @@ fn subst_on_conflict_targets<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [OnConflictTarget<'a>], SqlError> {
-    let mut targets = [OnConflictTarget {
-        column: None,
-        expression: &Expr::Null,
-        expression_text: "",
-    }; crate::sql::parser::MAX_LIST];
-    for (index, target) in source.iter().enumerate() {
-        targets[index] = OnConflictTarget {
-            column: target.column,
-            expression: subst_expr(target.expression, context, arena)?,
-            expression_text: target.expression_text,
-        };
+    let mut targets: ArenaList<'a, OnConflictTarget<'a>> = ArenaList::new(arena);
+    for target in source {
+        targets
+            .push(OnConflictTarget {
+                column: target.column,
+                expression: subst_expr(target.expression, context, arena)?,
+                expression_text: target.expression_text,
+            })
+            .map_err(|_| arena_full())?;
     }
-    arena
-        .alloc_slice_copy(&targets[..source.len()])
-        .map(|targets| &*targets)
-        .map_err(|_| arena_full())
+    Ok(targets.as_slice())
 }
 
 fn subst_insert<'a>(
@@ -4244,19 +4130,12 @@ fn subst_insert<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<Insert<'a>, SqlError> {
-    if statement.rows.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "VALUES list too long"
-        ));
+    let mut rows: ArenaList<'a, &'a [&'a Expr<'a>]> = ArenaList::new(arena);
+    for row in statement.rows {
+        rows.push(subst_expr_slice(row, context, arena)?)
+            .map_err(|_| arena_full())?;
     }
-    let mut rows: [&[&Expr]; crate::sql::parser::MAX_LIST] = [&[]; crate::sql::parser::MAX_LIST];
-    for (index, row) in statement.rows.iter().enumerate() {
-        rows[index] = subst_expr_slice(row, context, arena)?;
-    }
-    let rows = arena
-        .alloc_slice_copy(&rows[..statement.rows.len()])
-        .map_err(|_| arena_full())?;
+    let rows = rows.as_slice();
     let select = match statement.select {
         Some(select) => Some(subst_select(select, context, arena)?),
         None => None,
@@ -4341,57 +4220,50 @@ fn subst_merge<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<Merge<'a>, SqlError> {
-    if statement.whens.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "MERGE action list too long"
-        ));
-    }
-    let mut whens = [MergeWhen::NotMatchedByTarget {
-        cond: None,
-        action: MergeSourceAction::DoNothing,
-    }; crate::sql::parser::MAX_LIST];
-    for (index, when) in statement.whens.iter().enumerate() {
+    let mut whens: ArenaList<'a, MergeWhen<'a>> = ArenaList::new(arena);
+    for when in statement.whens {
         let cond = opt_subst(when.condition(), context, arena)?;
-        whens[index] = match *when {
-            MergeWhen::Matched { action, .. } => MergeWhen::Matched {
-                cond,
-                action: match action {
-                    MergeTargetAction::Update(assignments) => {
-                        MergeTargetAction::Update(subst_assignments(assignments, context, arena)?)
-                    }
-                    MergeTargetAction::Delete => MergeTargetAction::Delete,
-                    MergeTargetAction::DoNothing => MergeTargetAction::DoNothing,
-                },
-            },
-            MergeWhen::NotMatchedBySource { action, .. } => MergeWhen::NotMatchedBySource {
-                cond,
-                action: match action {
-                    MergeTargetAction::Update(assignments) => {
-                        MergeTargetAction::Update(subst_assignments(assignments, context, arena)?)
-                    }
-                    MergeTargetAction::Delete => MergeTargetAction::Delete,
-                    MergeTargetAction::DoNothing => MergeTargetAction::DoNothing,
-                },
-            },
-            MergeWhen::NotMatchedByTarget { action, .. } => MergeWhen::NotMatchedByTarget {
-                cond,
-                action: match action {
-                    MergeSourceAction::Insert {
-                        columns,
-                        values,
-                        default_values,
-                        overriding,
-                    } => MergeSourceAction::Insert {
-                        columns,
-                        values: subst_expr_slice(values, context, arena)?,
-                        default_values,
-                        overriding,
+        whens
+            .push(match *when {
+                MergeWhen::Matched { action, .. } => MergeWhen::Matched {
+                    cond,
+                    action: match action {
+                        MergeTargetAction::Update(assignments) => MergeTargetAction::Update(
+                            subst_assignments(assignments, context, arena)?,
+                        ),
+                        MergeTargetAction::Delete => MergeTargetAction::Delete,
+                        MergeTargetAction::DoNothing => MergeTargetAction::DoNothing,
                     },
-                    MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
                 },
-            },
-        };
+                MergeWhen::NotMatchedBySource { action, .. } => MergeWhen::NotMatchedBySource {
+                    cond,
+                    action: match action {
+                        MergeTargetAction::Update(assignments) => MergeTargetAction::Update(
+                            subst_assignments(assignments, context, arena)?,
+                        ),
+                        MergeTargetAction::Delete => MergeTargetAction::Delete,
+                        MergeTargetAction::DoNothing => MergeTargetAction::DoNothing,
+                    },
+                },
+                MergeWhen::NotMatchedByTarget { action, .. } => MergeWhen::NotMatchedByTarget {
+                    cond,
+                    action: match action {
+                        MergeSourceAction::Insert {
+                            columns,
+                            values,
+                            default_values,
+                            overriding,
+                        } => MergeSourceAction::Insert {
+                            columns,
+                            values: subst_expr_slice(values, context, arena)?,
+                            default_values,
+                            overriding,
+                        },
+                        MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
+                    },
+                },
+            })
+            .map_err(|_| arena_full())?;
     }
     Ok(Merge {
         target: rewrite_stored_relation_name(statement.target, context, arena)?,
@@ -4399,9 +4271,7 @@ fn subst_merge<'a>(
         target_alias: statement.target_alias,
         source: subst_tableref(&statement.source, context, arena)?,
         on: subst_expr(statement.on, context, arena)?,
-        whens: arena
-            .alloc_slice_copy(&whens[..statement.whens.len()])
-            .map_err(|_| arena_full())?,
+        whens: whens.as_slice(),
         returning: Returning {
             items: subst_select_items(statement.returning.items, context, arena)?,
             ..statement.returning
@@ -4519,16 +4389,14 @@ fn subst_tableref<'a>(
     };
     let t = &rewritten;
     if let Some(functions) = t.rows_from {
-        let mut rewritten = [*t; crate::sql::parser::MAX_LIST];
-        for (slot, function) in rewritten.iter_mut().zip(functions) {
-            *slot = subst_tableref(function, context, arena)?;
+        let mut rewritten: ArenaList<'a, TableRef<'a>> = ArenaList::new(arena);
+        for function in functions {
+            rewritten
+                .push(subst_tableref(function, context, arena)?)
+                .map_err(|_| arena_full())?;
         }
         return Ok(TableRef {
-            rows_from: Some(
-                arena
-                    .alloc_slice_copy(&rewritten[..functions.len()])
-                    .map_err(|_| arena_full())?,
-            ),
+            rows_from: Some(rewritten.as_slice()),
             ..*t
         });
     }
@@ -4748,7 +4616,6 @@ fn subst_tableref<'a>(
         let expanded = if let Some(execution) = context.execution {
             with_exec_context(
                 vsel.with,
-                vsel,
                 context.storage,
                 context.txid,
                 arena,
@@ -4883,19 +4750,12 @@ fn subst_expr_slice<'a>(
     {
         return Ok(xs);
     }
-    let mut tmp = [&Expr::Null; crate::sql::parser::MAX_LIST];
-    if xs.len() > tmp.len() {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "expression list too long"
-        ));
+    let mut tmp: ArenaList<'a, &'a Expr<'a>> = ArenaList::new(arena);
+    for x in xs {
+        tmp.push(subst_expr(x, context, arena)?)
+            .map_err(|_| arena_full())?;
     }
-    for (i, x) in xs.iter().enumerate() {
-        tmp[i] = subst_expr(x, context, arena)?;
-    }
-    Ok(&*arena
-        .alloc_slice_copy(&tmp[..xs.len()])
-        .map_err(|_| arena_full())?)
+    Ok(tmp.as_slice())
 }
 
 /// True if `e` contains a subquery anywhere (so it needs rebuilding when CTEs
@@ -5445,45 +5305,25 @@ fn subst_expr<'a>(
             let name = rewrite_stored_operator_name(name, args, context, arena)?;
             let name =
                 rewrite_stored_routine_name(name, args, argument_names, *variadic, context, arena)?;
-            let mut ob = [OrderBy {
-                expression: &Expr::Null,
-                descending: false,
-                nulls_first: false,
-            }; crate::sql::parser::MAX_LIST];
-            if order_by.len() > ob.len() {
-                return Err(sql_err!(
-                    sqlstate::TOO_MANY_ARGUMENTS,
-                    "aggregate ORDER BY list too long"
-                ));
-            }
-            for (i, o) in order_by.iter().enumerate() {
-                ob[i] = OrderBy {
+            let mut ob: ArenaList<'a, OrderBy<'a>> = ArenaList::new(arena);
+            for o in order_by.iter() {
+                ob.push(OrderBy {
                     expression: subst_expr(o.expression, context, arena)?,
                     ..*o
-                };
-            }
-            let order_by = arena
-                .alloc_slice_copy(&ob[..order_by.len()])
+                })
                 .map_err(|_| arena_full())?;
+            }
+            let order_by = ob.as_slice();
             let over = match over {
                 None => None,
                 Some(w) => {
-                    let mut ob2 = [OrderBy {
-                        expression: &Expr::Null,
-                        descending: false,
-                        nulls_first: false,
-                    }; crate::sql::parser::MAX_LIST];
-                    if w.order_by.len() > ob2.len() {
-                        return Err(sql_err!(
-                            sqlstate::TOO_MANY_ARGUMENTS,
-                            "window ORDER BY list too long"
-                        ));
-                    }
-                    for (i, o) in w.order_by.iter().enumerate() {
-                        ob2[i] = OrderBy {
+                    let mut ob2: ArenaList<'a, OrderBy<'a>> = ArenaList::new(arena);
+                    for o in w.order_by {
+                        ob2.push(OrderBy {
                             expression: subst_expr(o.expression, context, arena)?,
                             ..*o
-                        };
+                        })
+                        .map_err(|_| arena_full())?;
                     }
                     let frame = match w.frame {
                         Some(frame) => Some(crate::sql::ast::WindowFrame {
@@ -5495,9 +5335,7 @@ fn subst_expr<'a>(
                     };
                     let spec = crate::sql::ast::WindowSpec {
                         partition_by: subst_expr_slice(w.partition_by, context, arena)?,
-                        order_by: arena
-                            .alloc_slice_copy(&ob2[..w.order_by.len()])
-                            .map_err(|_| arena_full())?,
+                        order_by: ob2.as_slice(),
                         frame,
                     };
                     Some(&*arena.alloc(spec).map_err(|_| arena_full())?)
@@ -5573,22 +5411,15 @@ fn subst_expr<'a>(
             synthetic,
         } => {
             let operand = opt_subst(*operand, context, arena)?;
-            let mut ws = [(&Expr::Null, &Expr::Null); crate::sql::parser::MAX_LIST];
-            if whens.len() > ws.len() {
-                return Err(sql_err!(
-                    sqlstate::TOO_MANY_ARGUMENTS,
-                    "CASE has too many WHEN branches"
-                ));
-            }
-            for (i, (c, r)) in whens.iter().enumerate() {
-                ws[i] = (
+            let mut ws: ArenaList<'a, (&'a Expr<'a>, &'a Expr<'a>)> = ArenaList::new(arena);
+            for (c, r) in whens.iter().copied() {
+                ws.push((
                     subst_expr(c, context, arena)?,
                     subst_expr(r, context, arena)?,
-                );
-            }
-            let whens = arena
-                .alloc_slice_copy(&ws[..whens.len()])
+                ))
                 .map_err(|_| arena_full())?;
+            }
+            let whens = ws.as_slice();
             Expr::Case {
                 operand,
                 whens,

@@ -30,9 +30,11 @@ use super::REPORTED_SERVER_VERSION;
 use super::respond::{MAX_RESULT_COLS, Responder, ResultFmt};
 use super::wire::{self, MsgIn, WireFull};
 
-/// Most parameters one Parse/Bind may carry. SQL PREPARE and the bounded
-/// parser use the same width, so the wire protocol cannot be a narrower gate.
-pub const MAX_BIND_PARAMS: usize = crate::sql::parser::MAX_LIST;
+/// Most parameters one Parse/Bind may carry; parameter state is stored inline
+/// per connection slot (PostgreSQL's protocol boundary is 65,535). Kept in
+/// step with SQL PREPARE so neither protocol is a narrower gate than the
+/// other.
+pub const MAX_BIND_PARAMS: usize = crate::sql::prep::MAX_PREP_PARAMS;
 
 /// Idle logical streams still need protocol traffic so a downstream can tell a
 /// quiet publisher from a dead connection. PostgreSQL's `k` frame carries that

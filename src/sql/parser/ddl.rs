@@ -6,9 +6,10 @@
 //! token helpers with every other statement, but nothing else refers to them.
 
 use super::{
-    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, MAX_LIST, ParseError, Parser,
-    QualName, Stmt, TableConstraint, Tok,
+    ColumnDef, CreateTable, DropTable, FkAction, LikeClause, ParseError, Parser, QualName, Stmt,
+    TableConstraint, Tok,
 };
+use crate::mem::arena::ArenaList;
 use crate::sql::ast::{
     AggregateArgument, AggregateArguments, AggregateDefinition, AggregateFinal,
     AggregateFinalModify, AggregateIdentity, AggregateMoving, AggregatePartial, AlterDomainAction,
@@ -161,14 +162,10 @@ impl<'a> Parser<'a> {
             self.expect_ident("tag")?;
             self.expect_ident("in")?;
             self.expect_op("(")?;
-            let mut tags = [""; MAX_LIST];
-            let mut count = 0usize;
+            let mut tags = ArenaList::new(self.arena);
             loop {
-                if count == tags.len() {
-                    return Err(self.limit("event trigger tags", tags.len()));
-                }
-                tags[count] = self.str_literal("command tag")?;
-                count += 1;
+                let tag = self.str_literal("command tag")?;
+                self.push(&mut tags, tag)?;
                 if self.eat_op(")")? {
                     break;
                 }
@@ -177,7 +174,7 @@ impl<'a> Parser<'a> {
             if self.eat_ident("and")? {
                 return Err(self.err_here("filter variable TAG specified more than once"));
             }
-            self.arena_slice(&tags[..count])?
+            tags.as_slice()
         } else {
             &[]
         };
@@ -1044,49 +1041,35 @@ impl<'a> Parser<'a> {
 
     pub(super) fn foreign_options(&mut self) -> Result<&'a [ForeignOption<'a>], ParseError> {
         self.expect_op("(")?;
-        let mut options = [ForeignOption {
-            name: "",
-            value: "",
-        }; MAX_LIST];
-        let mut count = 0usize;
+        let mut options: ArenaList<'a, ForeignOption<'a>> = ArenaList::new(self.arena);
         if self.eat_op(")")? {
             return Ok(&[]);
         }
         loop {
-            if count == options.len() {
-                return Err(self.limit("foreign options", options.len()));
-            }
             let name = self.any_ident("foreign option name")?;
-            if options[..count].iter().any(|option| option.name == name) {
+            if options.as_slice().iter().any(|option| option.name == name) {
                 return Err(self.err_here("foreign option specified more than once"));
             }
-            options[count] = ForeignOption {
-                name,
-                value: self.str_literal("foreign option value")?,
-            };
-            count += 1;
+            let value = self.str_literal("foreign option value")?;
+            self.push(&mut options, ForeignOption { name, value })?;
             if self.eat_op(")")? {
                 break;
             }
             self.expect_op(",")?;
         }
-        self.arena_slice(&options[..count])
+        Ok(options.as_slice())
     }
 
     pub(super) fn alter_foreign_options(
         &mut self,
     ) -> Result<&'a [ForeignOptionAction<'a>], ParseError> {
         self.expect_op("(")?;
-        let mut options = [ForeignOptionAction::Drop(""); MAX_LIST];
-        let mut names = [""; MAX_LIST];
-        let mut count = 0usize;
+        let mut options = ArenaList::new(self.arena);
+        let mut names = ArenaList::new(self.arena);
         if self.eat_op(")")? {
             return Ok(&[]);
         }
         loop {
-            if count == options.len() {
-                return Err(self.limit("foreign option alterations", options.len()));
-            }
             let operation = if self.eat_ident("set")? {
                 1u8
             } else if self.eat_ident("drop")? {
@@ -1096,11 +1079,11 @@ impl<'a> Parser<'a> {
                 0u8
             };
             let name = self.any_ident("foreign option name")?;
-            if names[..count].contains(&name) {
+            if names.as_slice().contains(&name) {
                 return Err(self.err_here("foreign option specified more than once"));
             }
-            names[count] = name;
-            options[count] = if operation == 2 {
+            self.push(&mut names, name)?;
+            let action = if operation == 2 {
                 ForeignOptionAction::Drop(name)
             } else {
                 let option = ForeignOption {
@@ -1113,13 +1096,13 @@ impl<'a> Parser<'a> {
                     ForeignOptionAction::Add(option)
                 }
             };
-            count += 1;
+            self.push(&mut options, action)?;
             if self.eat_op(")")? {
                 break;
             }
             self.expect_op(",")?;
         }
-        self.arena_slice(&options[..count])
+        Ok(options.as_slice())
     }
 
     fn foreign_user(&mut self) -> Result<ForeignUser<'a>, ParseError> {
@@ -1610,22 +1593,18 @@ impl<'a> Parser<'a> {
         if !self.eat_op("(")? {
             return Ok(&[]);
         }
-        let mut types = [""; MAX_LIST];
-        let mut count = 0usize;
+        let mut types = ArenaList::new(self.arena);
         if !self.eat_op(")")? {
             loop {
-                if count == types.len() {
-                    return Err(self.limit("type signature", types.len()));
-                }
-                types[count] = self.unmodified_type_name()?;
-                count += 1;
+                let signature_type = self.unmodified_type_name()?;
+                self.push(&mut types, signature_type)?;
                 if self.eat_op(")")? {
                     break;
                 }
                 self.expect_op(",")?;
             }
         }
-        self.arena_slice(&types[..count])
+        Ok(types.as_slice())
     }
 
     fn operator_qual_name(&mut self, what: &'static str) -> Result<QualName<'a>, ParseError> {
@@ -1895,13 +1874,9 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_ident("as")?;
-        let mut members = [OperatorClassMember::Storage("bool"); MAX_LIST];
-        let mut count = 0usize;
+        let mut members = ArenaList::new(self.arena);
         loop {
-            if count == members.len() {
-                return Err(self.limit("operator class members", members.len()));
-            }
-            members[count] = if self.eat_ident("operator")? {
+            let member = if self.eat_ident("operator")? {
                 let strategy = self.btree_strategy()?;
                 let operator = self.operator_qual_name("operator class operator is invalid")?;
                 let operand_types = if self.eat_op("(")? {
@@ -1964,7 +1939,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("storage")?;
                 OperatorClassMember::Storage(self.unmodified_type_name()?)
             };
-            count += 1;
+            self.push(&mut members, member)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -1975,7 +1950,7 @@ impl<'a> Parser<'a> {
             input_type,
             method,
             family,
-            members: self.arena_slice(&members[..count])?,
+            members: members.as_slice(),
         }))
     }
 
@@ -2172,41 +2147,25 @@ impl<'a> Parser<'a> {
         self.expect_ident("using")?;
         let method = self.access_method()?;
         let action = if self.eat_ident("add")? {
-            let mut members = [OperatorFamilyMember::CompareFunction {
-                left_type: "bool",
-                right_type: "bool",
-                function: QualName::bare("boolcmp"),
-                argument_types: &[],
-            }; MAX_LIST];
-            let mut count = 0usize;
+            let mut members = ArenaList::new(self.arena);
             loop {
-                if count == members.len() {
-                    return Err(self.limit("operator family members", members.len()));
-                }
-                members[count] = self.operator_family_add_member()?;
-                count += 1;
+                let member = self.operator_family_add_member()?;
+                self.push(&mut members, member)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
-            AlterOperatorFamilyAction::Add(self.arena_slice(&members[..count])?)
+            AlterOperatorFamilyAction::Add(members.as_slice())
         } else if self.eat_ident("drop")? {
-            let mut members = [OperatorFamilyMemberIdentity::CompareFunction {
-                left_type: "bool",
-                right_type: "bool",
-            }; MAX_LIST];
-            let mut count = 0usize;
+            let mut members = ArenaList::new(self.arena);
             loop {
-                if count == members.len() {
-                    return Err(self.limit("operator family members", members.len()));
-                }
-                members[count] = self.operator_family_drop_member()?;
-                count += 1;
+                let member = self.operator_family_drop_member()?;
+                self.push(&mut members, member)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
-            AlterOperatorFamilyAction::Drop(self.arena_slice(&members[..count])?)
+            AlterOperatorFamilyAction::Drop(members.as_slice())
         } else if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             AlterOperatorFamilyAction::Rename(self.col_ident("new operator family name")?)
@@ -3054,13 +3013,9 @@ impl<'a> Parser<'a> {
     }
 
     fn policy_roles(&mut self) -> Result<&'a [PolicyRole<'a>], ParseError> {
-        let mut roles = [PolicyRole::Public; MAX_LIST];
-        let mut count = 0usize;
+        let mut roles = ArenaList::new(self.arena);
         loop {
-            if count == roles.len() {
-                return Err(self.limit("policy roles", roles.len()));
-            }
-            roles[count] = if self.eat_ident("public")? {
+            let role = if self.eat_ident("public")? {
                 PolicyRole::Public
             } else if self.eat_ident("current_role")? {
                 PolicyRole::CurrentRole
@@ -3071,12 +3026,12 @@ impl<'a> Parser<'a> {
             } else {
                 PolicyRole::Named(self.any_ident("policy role")?)
             };
-            count += 1;
+            self.push(&mut roles, role)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.arena_slice(&roles[..count])
+        Ok(roles.as_slice())
     }
 
     /// CREATE POLICY's command kind decides which expression clauses can
@@ -3217,19 +3172,15 @@ impl<'a> Parser<'a> {
         };
         let mut events = [TriggerEvent::Insert; 4];
         let mut event_count = 0usize;
-        let mut update_columns = [""; MAX_LIST];
-        let mut update_column_count = 0usize;
+        let mut update_columns = ArenaList::new(self.arena);
         loop {
             let event = if self.eat_ident("insert")? {
                 TriggerEvent::Insert
             } else if self.eat_ident("update")? {
                 if self.eat_ident("of")? {
                     loop {
-                        if update_column_count == update_columns.len() {
-                            return Err(self.limit("UPDATE OF columns", update_columns.len()));
-                        }
                         let column = self.col_ident("UPDATE OF column")?;
-                        if update_columns[..update_column_count].contains(&column) {
+                        if update_columns.as_slice().contains(&column) {
                             return Err(ParseError {
                                 at: self.peek_at,
                                 message: stack_format!(
@@ -3240,8 +3191,7 @@ impl<'a> Parser<'a> {
                                 sqlstate: sqlstate::DUPLICATE_COLUMN,
                             });
                         }
-                        update_columns[update_column_count] = column;
-                        update_column_count += 1;
+                        self.push(&mut update_columns, column)?;
                         if !self.eat_op(",")? {
                             break;
                         }
@@ -3359,7 +3309,7 @@ impl<'a> Parser<'a> {
             if events[..event_count].contains(&TriggerEvent::Truncate) {
                 return Err(self.err_here("INSTEAD OF triggers cannot have TRUNCATE events"));
             }
-            if update_column_count != 0 {
+            if !update_columns.is_empty() {
                 return Err(self.err_here("INSTEAD OF triggers cannot have column lists"));
             }
         }
@@ -3389,7 +3339,7 @@ impl<'a> Parser<'a> {
             {
                 return Err(self.err_here("NEW TABLE requires INSERT or UPDATE"));
             }
-            if update_column_count != 0 {
+            if !update_columns.is_empty() {
                 return Err(
                     self.err_here("UPDATE OF column lists cannot be used with transition tables")
                 );
@@ -3408,14 +3358,10 @@ impl<'a> Parser<'a> {
         }
         let function = self.qual_name("trigger function")?;
         self.expect_op("(")?;
-        let mut arguments = [""; MAX_LIST];
-        let mut argument_count = 0usize;
+        let mut arguments = ArenaList::new(self.arena);
         if !self.eat_op(")")? {
             loop {
-                if argument_count == arguments.len() {
-                    return Err(self.limit("trigger arguments", arguments.len()));
-                }
-                arguments[argument_count] = match self.peeked {
+                let argument = match self.peeked {
                     crate::sql::lexer::Tok::Str(value)
                     | crate::sql::lexer::Tok::Num(value)
                     | crate::sql::lexer::Tok::Ident(value)
@@ -3425,7 +3371,7 @@ impl<'a> Parser<'a> {
                     }
                     _ => return Err(self.unexpected("expected trigger argument")),
                 };
-                argument_count += 1;
+                self.push(&mut arguments, argument)?;
                 if self.eat_op(")")? {
                     break;
                 }
@@ -3456,12 +3402,12 @@ impl<'a> Parser<'a> {
             timing,
             level,
             events: self.arena_slice(&events[..event_count])?,
-            update_columns: self.arena_slice(&update_columns[..update_column_count])?,
+            update_columns: update_columns.as_slice(),
             table,
             transition_tables,
             when,
             function,
-            arguments: self.arena_slice(&arguments[..argument_count])?,
+            arguments: arguments.as_slice(),
         }))
     }
 
@@ -4448,12 +4394,7 @@ impl<'a> Parser<'a> {
         let (base_type, base_type_mod) = self.type_name_mod()?;
         let mut not_null = false;
         let mut default_text = None;
-        let mut checks = [DomainCheck {
-            name: None,
-            expression: "",
-            validation: ConstraintValidation::EnforcedValidated,
-        }; MAX_LIST];
-        let mut n_checks = 0;
+        let mut checks = ArenaList::new(self.arena);
         loop {
             let cname = if self.eat_ident("constraint")? {
                 Some(self.col_ident("constraint name")?)
@@ -4466,15 +4407,12 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("null")? {
                 not_null = false;
             } else if self.eat_ident("check")? {
-                if n_checks == MAX_LIST {
-                    return Err(self.limit("domain CHECK constraints", MAX_LIST));
-                }
-                checks[n_checks] = DomainCheck {
+                let check = DomainCheck {
                     name: cname,
                     expression: self.check_text()?,
                     validation: ConstraintValidation::EnforcedValidated,
                 };
-                n_checks += 1;
+                self.push(&mut checks, check)?;
             } else if cname.is_none() && self.eat_ident("default")? {
                 let start = self.peek_at;
                 let _ = self.column_default_expression()?;
@@ -4485,7 +4423,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let checks = self.arena_slice(&checks[..n_checks])?;
+        let checks = checks.as_slice();
         Ok(Stmt::CreateDomain(CreateDomain {
             name,
             base_type,
@@ -4619,15 +4557,11 @@ impl<'a> Parser<'a> {
         self.expect_ident("as")?;
         if self.eat_ident("enum")? {
             self.expect_op("(")?;
-            let mut labels = [""; MAX_LIST];
-            let mut n = 0;
+            let mut labels = ArenaList::new(self.arena);
             if self.peeked != Tok::Op(")") {
                 loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("enum labels", MAX_LIST));
-                    }
-                    labels[n] = self.str_literal("enum label")?;
-                    n += 1;
+                    let label = self.str_literal("enum label")?;
+                    self.push(&mut labels, label)?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -4636,22 +4570,13 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             return Ok(Stmt::CreateEnum {
                 name,
-                labels: self.arena_slice(&labels[..n])?,
+                labels: labels.as_slice(),
             });
         }
         self.expect_op("(")?;
-        let mut fields = [crate::sql::ast::CompositeField {
-            name: "",
-            type_name: "",
-            type_mod: -1,
-            collation: crate::sql::ast::ParsedCollation::DEFAULT,
-        }; MAX_LIST];
-        let mut n = 0;
+        let mut fields = ArenaList::new(self.arena);
         if self.peeked != Tok::Op(")") {
             loop {
-                if n == MAX_LIST {
-                    return Err(self.limit("composite fields", MAX_LIST));
-                }
                 let field_name = self.any_ident("composite field name")?;
                 let (type_name, type_mod) = self.type_name_mod()?;
                 let collation = if self.eat_ident("collate")? {
@@ -4659,13 +4584,15 @@ impl<'a> Parser<'a> {
                 } else {
                     crate::sql::ast::ParsedCollation::DEFAULT
                 };
-                fields[n] = crate::sql::ast::CompositeField {
-                    name: field_name,
-                    type_name,
-                    type_mod,
-                    collation,
-                };
-                n += 1;
+                self.push(
+                    &mut fields,
+                    crate::sql::ast::CompositeField {
+                        name: field_name,
+                        type_name,
+                        type_mod,
+                        collation,
+                    },
+                )?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -4674,7 +4601,7 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         Ok(Stmt::CreateComposite {
             name,
-            fields: self.arena_slice(&fields[..n])?,
+            fields: fields.as_slice(),
         })
     }
 
@@ -5069,20 +4996,16 @@ impl<'a> Parser<'a> {
         let mut columns: &'a [&'a str] = &[];
         if self.peeked == Tok::Op("(") {
             self.expect_op("(")?;
-            let mut list = [""; MAX_LIST];
-            let mut m = 0;
+            let mut list = ArenaList::new(self.arena);
             loop {
-                if m == MAX_LIST {
-                    return Err(self.limit("column list", MAX_LIST));
-                }
-                list[m] = self.col_ident("column name")?;
-                m += 1;
+                let column = self.col_ident("column name")?;
+                self.push(&mut list, column)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
             self.expect_op(")")?;
-            columns = self.arena_slice(&list[..m])?;
+            columns = list.as_slice();
         }
         let options = self.table_as_options()?;
         self.expect_ident("as")?;
@@ -5247,7 +5170,7 @@ impl<'a> Parser<'a> {
             elements[n] = self
                 .arena
                 .alloc(element)
-                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
             n += 1;
         }
         if if_not_exists && n != 0 {
@@ -5339,24 +5262,8 @@ impl<'a> Parser<'a> {
             IndexAccessMethod::Btree
         };
         self.expect_op("(")?;
-        let null_expression = self.arena_expr(Expr::Null)?;
-        let mut columns = [crate::sql::ast::IndexColumn {
-            column: None,
-            expression: null_expression,
-            expression_text: "",
-            collation: None,
-            operator_class: None,
-            operator_class_options: crate::sql::ast::IndexOperatorClassOptions::DEFAULT,
-            descending: false,
-            ordering_specified: false,
-            nulls_first: false,
-            nulls_order_specified: false,
-        }; MAX_LIST];
-        let mut n = 0;
+        let mut columns = ArenaList::new(self.arena);
         loop {
-            if n == MAX_LIST {
-                return Err(self.limit("index columns", MAX_LIST));
-            }
             let start = self.peek_at;
             let expression = self.expression(0)?;
             let expression_text =
@@ -5408,41 +5315,39 @@ impl<'a> Parser<'a> {
             } else {
                 descending
             };
-            columns[n] = crate::sql::ast::IndexColumn {
-                column,
-                expression,
-                expression_text,
-                collation,
-                operator_class,
-                operator_class_options,
-                descending,
-                ordering_specified,
-                nulls_first,
-                nulls_order_specified,
-            };
-            n += 1;
+            self.push(
+                &mut columns,
+                crate::sql::ast::IndexColumn {
+                    column,
+                    expression,
+                    expression_text,
+                    collation,
+                    operator_class,
+                    operator_class_options,
+                    descending,
+                    ordering_specified,
+                    nulls_first,
+                    nulls_order_specified,
+                },
+            )?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        let columns = self.arena_slice(&columns[..n])?;
+        let columns = columns.as_slice();
         let include_columns = if self.eat_ident("include")? {
             self.expect_op("(")?;
-            let mut names = [""; MAX_LIST];
-            let mut count = 0;
+            let mut names = ArenaList::new(self.arena);
             loop {
-                if count == names.len() {
-                    return Err(self.limit("index included columns", names.len()));
-                }
-                names[count] = self.col_ident("included column name")?;
-                count += 1;
+                let name = self.col_ident("included column name")?;
+                self.push(&mut names, name)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
             self.expect_op(")")?;
-            self.arena_slice(&names[..count])?
+            names.as_slice()
         } else {
             &[]
         };
@@ -5999,17 +5904,10 @@ impl<'a> Parser<'a> {
         } else {
             RuleMode::Also
         };
-        let mut actions = [RuleAction {
-            statement: &Stmt::Commit,
-            sql: "",
-        }; MAX_LIST];
-        let mut count = 0usize;
+        let mut actions = ArenaList::new(self.arena);
         if !self.eat_ident("nothing")? {
             let parenthesized = self.eat_op("(")?;
             loop {
-                if count == actions.len() {
-                    return Err(self.limit("rule actions", actions.len()));
-                }
                 let start = self.peek_at;
                 let statement = self.statement()?;
                 if !rule_action_statement(&statement) {
@@ -6029,11 +5927,13 @@ impl<'a> Parser<'a> {
                     .alloc(statement)
                     .map(|statement| &*statement)
                     .map_err(|_| self.err_here("rule action is too large"))?;
-                actions[count] = RuleAction {
-                    statement,
-                    sql: source,
-                };
-                count += 1;
+                self.push(
+                    &mut actions,
+                    RuleAction {
+                        statement,
+                        sql: source,
+                    },
+                )?;
                 if !parenthesized {
                     break;
                 }
@@ -6054,7 +5954,7 @@ impl<'a> Parser<'a> {
             condition,
             condition_sql,
             mode,
-            actions: self.arena_slice(&actions[..count])?,
+            actions: actions.as_slice(),
         }))
     }
 
@@ -6143,14 +6043,10 @@ impl<'a> Parser<'a> {
         self.expect_ident("connection")?;
         let connection = self.str_literal("subscription connection string")?;
         self.expect_ident("publication")?;
-        let mut names = [""; MAX_LIST];
-        let mut count = 0usize;
+        let mut names = ArenaList::new(self.arena);
         loop {
-            if count == names.len() {
-                return Err(self.limit("subscription publications", names.len()));
-            }
-            names[count] = self.any_ident("publication name")?;
-            count += 1;
+            let publication = self.any_ident("publication name")?;
+            self.push(&mut names, publication)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -6314,7 +6210,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::CreateSubscription {
             name,
             connection,
-            publications: self.arena_slice(&names[..count])?,
+            publications: names.as_slice(),
             options,
         })
     }
@@ -6475,25 +6371,11 @@ impl<'a> Parser<'a> {
         &mut self,
         allow_details: bool,
     ) -> Result<(&'a [PublicationTarget<'a>], &'a [&'a str]), ParseError> {
-        let mut tables = [PublicationTarget {
-            relation: QualName {
-                schema: None,
-                name: "",
-            },
-            descendants: PublicationDescendants::Include,
-            columns: &[],
-            filter: None,
-            filter_text: None,
-        }; MAX_LIST];
-        let mut schemas = [""; MAX_LIST];
-        let mut table_count = 0;
-        let mut schema_count = 0;
+        let mut tables = ArenaList::new(self.arena);
+        let mut schemas = ArenaList::new(self.arena);
         loop {
             if self.eat_ident("table")? {
                 loop {
-                    if table_count == MAX_LIST {
-                        return Err(self.limit("publication tables", MAX_LIST));
-                    }
                     let descendants = if self.eat_ident("only")? {
                         PublicationDescendants::Only
                     } else {
@@ -6503,15 +6385,11 @@ impl<'a> Parser<'a> {
                     if self.eat_op("*")? && descendants == PublicationDescendants::Only {
                         return Err(self.err_here("ONLY and * cannot be specified together"));
                     }
-                    let mut columns = [""; MAX_LIST];
-                    let mut column_count = 0usize;
+                    let mut columns = ArenaList::new(self.arena);
                     if allow_details && self.eat_op("(")? {
                         loop {
-                            if column_count == columns.len() {
-                                return Err(self.limit("publication columns", columns.len()));
-                            }
-                            columns[column_count] = self.any_ident("column name")?;
-                            column_count += 1;
+                            let column = self.any_ident("column name")?;
+                            self.push(&mut columns, column)?;
                             if !self.eat_op(",")? {
                                 break;
                             }
@@ -6528,14 +6406,16 @@ impl<'a> Parser<'a> {
                     } else {
                         (None, None)
                     };
-                    tables[table_count] = PublicationTarget {
-                        relation,
-                        descendants,
-                        columns: self.arena_slice(&columns[..column_count])?,
-                        filter,
-                        filter_text,
-                    };
-                    table_count += 1;
+                    self.push(
+                        &mut tables,
+                        PublicationTarget {
+                            relation,
+                            descendants,
+                            columns: columns.as_slice(),
+                            filter,
+                            filter_text,
+                        },
+                    )?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -6547,17 +6427,14 @@ impl<'a> Parser<'a> {
                 self.expect_ident("in")?;
                 self.expect_ident("schema")?;
                 loop {
-                    if schema_count == MAX_LIST {
-                        return Err(self.limit("publication schemas", MAX_LIST));
-                    }
-                    schemas[schema_count] = if self.eat_ident("current_schema")? {
+                    let schema = if self.eat_ident("current_schema")? {
                         self.expect_op("(")?;
                         self.expect_op(")")?;
                         "public"
                     } else {
                         self.any_ident("schema name")?
                     };
-                    schema_count += 1;
+                    self.push(&mut schemas, schema)?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -6575,10 +6452,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok((
-            self.arena_slice(&tables[..table_count])?,
-            self.arena_slice(&schemas[..schema_count])?,
-        ))
+        Ok((tables.as_slice(), schemas.as_slice()))
     }
 
     fn publication_operations(&self, value: &'a str) -> Result<PublicationOperations, ParseError> {
@@ -6615,14 +6489,10 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let mut names = [""; MAX_LIST];
-            let mut count = 0usize;
+            let mut names = ArenaList::new(self.arena);
             loop {
-                if count == names.len() {
-                    return Err(self.limit("access methods", names.len()));
-                }
-                names[count] = self.col_ident("access method name")?;
-                count += 1;
+                let name = self.col_ident("access method name")?;
+                self.push(&mut names, name)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -6634,7 +6504,7 @@ impl<'a> Parser<'a> {
                 false
             };
             return Ok(Stmt::DropAccessMethod {
-                names: self.arena_slice(&names[..count])?,
+                names: names.as_slice(),
                 if_exists,
                 cascade,
             });
@@ -6934,17 +6804,10 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let mut identities = [OperatorIdentity {
-                name: QualName::bare("="),
-                operands: OperatorOperands::Prefix("bool"),
-            }; MAX_LIST];
-            let mut count = 0usize;
+            let mut identities = ArenaList::new(self.arena);
             loop {
-                if count == identities.len() {
-                    return Err(self.limit("operators", identities.len()));
-                }
-                identities[count] = self.operator_identity()?;
-                count += 1;
+                let identity = self.operator_identity()?;
+                self.push(&mut identities, identity)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -6956,7 +6819,7 @@ impl<'a> Parser<'a> {
                 false
             };
             return Ok(Stmt::DropOperator {
-                identities: self.arena_slice(&identities[..count])?,
+                identities: identities.as_slice(),
                 if_exists,
                 cascade,
             });
@@ -6968,14 +6831,10 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let mut names = [""; MAX_LIST];
-            let mut count = 0usize;
+            let mut names = ArenaList::new(self.arena);
             loop {
-                if count == names.len() {
-                    return Err(self.limit("languages", names.len()));
-                }
-                names[count] = self.col_ident("language name")?;
-                count += 1;
+                let name = self.col_ident("language name")?;
+                self.push(&mut names, name)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -6987,7 +6846,7 @@ impl<'a> Parser<'a> {
                 false
             };
             return Ok(Stmt::DropLanguage {
-                names: self.arena_slice(&names[..count])?,
+                names: names.as_slice(),
                 if_exists,
                 cascade,
             });
@@ -7031,14 +6890,10 @@ impl<'a> Parser<'a> {
             } else {
                 false
             };
-            let mut names = [""; MAX_LIST];
-            let mut count = 0usize;
+            let mut names = ArenaList::new(self.arena);
             loop {
-                if count == names.len() {
-                    return Err(self.limit("extensions", names.len()));
-                }
-                names[count] = self.col_ident("extension name")?;
-                count += 1;
+                let name = self.col_ident("extension name")?;
+                self.push(&mut names, name)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -7050,7 +6905,7 @@ impl<'a> Parser<'a> {
                 false
             };
             return Ok(Stmt::DropExtension {
-                names: self.arena_slice(&names[..count])?,
+                names: names.as_slice(),
                 if_exists,
                 cascade,
             });
@@ -7071,26 +6926,26 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("publication")? {
             let (names, if_exists) = self.drop_targets("publication name")?;
-            let mut publication_names: [&str; MAX_LIST] = [""; MAX_LIST];
-            for (index, name) in names.iter().enumerate() {
+            let mut publication_names = ArenaList::new(self.arena);
+            for name in names {
                 if name.schema.is_some() {
                     return Err(self.err_here("publication names cannot be schema-qualified"));
                 }
-                publication_names[index] = name.name;
+                self.push(&mut publication_names, name.name)?;
             }
             return Ok(Stmt::DropPublication {
-                names: self.arena_slice(&publication_names[..names.len()])?,
+                names: publication_names.as_slice(),
                 if_exists,
             });
         }
         if self.eat_ident("subscription")? {
             let (names, if_exists) = self.drop_targets("subscription name")?;
-            let mut subscription_names: [&str; MAX_LIST] = [""; MAX_LIST];
-            for (index, name) in names.iter().enumerate() {
-                subscription_names[index] = name.name;
+            let mut subscription_names = ArenaList::new(self.arena);
+            for name in names {
+                self.push(&mut subscription_names, name.name)?;
             }
             return Ok(Stmt::DropSubscription {
-                names: self.arena_slice(&subscription_names[..names.len()])?,
+                names: subscription_names.as_slice(),
                 if_exists,
             });
         }
@@ -7224,14 +7079,10 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let mut names: [&'a str; super::MAX_LIST] = [""; super::MAX_LIST];
-        let mut n = 0usize;
+        let mut names = ArenaList::new(self.arena);
         loop {
-            if n == names.len() {
-                return Err(self.limit("schemas", names.len()));
-            }
-            names[n] = self.col_ident("schema name")?;
-            n += 1;
+            let name = self.col_ident("schema name")?;
+            self.push(&mut names, name)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -7243,7 +7094,7 @@ impl<'a> Parser<'a> {
             false
         };
         Ok(Stmt::DropSchema {
-            names: self.arena_slice(&names[..n])?,
+            names: names.as_slice(),
             if_exists,
             cascade,
         })
@@ -7256,16 +7107,8 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let mut routines = [RoutineIdentity {
-            name: QualName::bare(""),
-            argument_types: &[],
-            signature_is_explicit: false,
-        }; MAX_LIST];
-        let mut count = 0;
+        let mut routines = ArenaList::new(self.arena);
         loop {
-            if count == routines.len() {
-                return Err(self.limit("routines", routines.len()));
-            }
             let name = self.qual_name("function name")?;
             let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut argument_count = 0;
@@ -7286,12 +7129,14 @@ impl<'a> Parser<'a> {
                     self.expect_op(",")?;
                 }
             }
-            routines[count] = RoutineIdentity {
-                name,
-                argument_types: self.arena_slice(&argument_types[..argument_count])?,
-                signature_is_explicit,
-            };
-            count += 1;
+            self.push(
+                &mut routines,
+                RoutineIdentity {
+                    name,
+                    argument_types: self.arena_slice(&argument_types[..argument_count])?,
+                    signature_is_explicit,
+                },
+            )?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -7302,7 +7147,7 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
-        let routines = self.arena_slice(&routines[..count])?;
+        let routines = routines.as_slice();
         match kind {
             RoutineTargetKind::Function => Ok(Stmt::DropFunction {
                 functions: routines,
@@ -7401,19 +7246,10 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let mut aggregates = [AggregateIdentity {
-            name: QualName::bare(""),
-            direct_argument_types: &[],
-            aggregated_argument_types: &[],
-            ordered_set: false,
-        }; MAX_LIST];
-        let mut count = 0usize;
+        let mut aggregates = ArenaList::new(self.arena);
         loop {
-            if count == aggregates.len() {
-                return Err(self.limit("aggregates", aggregates.len()));
-            }
-            aggregates[count] = self.aggregate_identity()?;
-            count += 1;
+            let aggregate = self.aggregate_identity()?;
+            self.push(&mut aggregates, aggregate)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -7425,7 +7261,7 @@ impl<'a> Parser<'a> {
             false
         };
         Ok(Stmt::DropAggregate {
-            aggregates: self.arena_slice(&aggregates[..count])?,
+            aggregates: aggregates.as_slice(),
             if_exists,
             cascade,
         })
@@ -7729,19 +7565,15 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let mut names = [""; MAX_LIST];
-        let mut count = 0usize;
+        let mut names = ArenaList::new(self.arena);
         loop {
-            if count == names.len() {
-                return Err(self.limit(what, names.len()));
-            }
-            names[count] = self.col_ident(what)?;
-            count += 1;
+            let name = self.col_ident(what)?;
+            self.push(&mut names, name)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        Ok((self.arena_slice(&names[..count])?, if_exists))
+        Ok((names.as_slice(), if_exists))
     }
 
     fn create_table(
@@ -7907,15 +7739,11 @@ impl<'a> Parser<'a> {
         {
             let first_ident = self.col_ident("column name")?;
             if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
-                let mut list = [""; MAX_LIST];
-                list[0] = first_ident;
-                let mut m = 1;
+                let mut list = ArenaList::new(self.arena);
+                self.push(&mut list, first_ident)?;
                 while self.eat_op(",")? {
-                    if m == MAX_LIST {
-                        return Err(self.limit("column list", MAX_LIST));
-                    }
-                    list[m] = self.col_ident("column name")?;
-                    m += 1;
+                    let column = self.col_ident("column name")?;
+                    self.push(&mut list, column)?;
                 }
                 self.expect_op(")")?;
                 let options = self.table_as_options()?;
@@ -7925,7 +7753,7 @@ impl<'a> Parser<'a> {
                         self.err_here("CREATE FOREIGN TABLE AS is not supported by PostgreSQL")
                     );
                 }
-                let cols = self.arena_slice(&list[..m])?;
+                let cols = list.as_slice();
                 return self.create_table_as(
                     name,
                     cols,
@@ -7938,65 +7766,28 @@ impl<'a> Parser<'a> {
             // Otherwise it is a column definition whose name we already read.
             pending_first_col = Some(first_ident);
         }
-        let mut columns = [ColumnDef {
-            name: "",
-            type_name: "",
-            type_mod: -1,
-            collation: crate::sql::ast::ParsedCollation::DEFAULT,
-            foreign_options: &[],
-            storage: None,
-            compression: crate::sql::ast::ColumnCompression::Default,
-            not_null: false,
-            not_null_inheritable: true,
-            unique: false,
-            primary: false,
-            default: None,
-            default_text: None,
-            generated_text: None,
-            identity: None,
-        }; MAX_LIST];
-        let mut n = 0;
-        let mut cons = [TableConstraint::Unique {
-            name: None,
-            columns: &[],
-            timing: ConstraintTiming::NotDeferrable,
-        }; MAX_LIST];
-        let mut n_cons = 0;
-        let mut likes = [LikeClause {
-            at: 0,
-            source: QualName::bare(""),
-            defaults: false,
-            constraints: false,
-            indexes: false,
-            identity: false,
-            generated: false,
-            storage: false,
-            compression: false,
-            comments: false,
-            statistics: false,
-        }; MAX_LIST];
-        let mut n_likes = 0;
+        let mut columns = ArenaList::new(self.arena);
+        let mut cons = ArenaList::new(self.arena);
+        let mut likes = ArenaList::new(self.arena);
         loop {
-            if n == 0 && n_cons == 0 && n_likes == 0 && self.peeked == Tok::Op(")") {
+            if columns.is_empty()
+                && cons.is_empty()
+                && likes.is_empty()
+                && self.peeked == Tok::Op(")")
+            {
                 break;
             }
             // The first column's name was pre-read to tell a definition list
             // from a `CREATE TABLE ... AS` column-name list; use it, skipping the
             // LIKE / constraint forms it cannot be.
             let col_name = if let Some(pre_read) = pending_first_col.take() {
-                if n == MAX_LIST {
-                    return Err(self.limit("column list", MAX_LIST));
-                }
                 pre_read
             } else {
                 // `LIKE source [INCLUDING ...]` copies another table's columns in
                 // at this position; the catalog is only consulted when it runs.
                 if self.eat_ident("like")? {
-                    if n_likes == MAX_LIST {
-                        return Err(self.limit("LIKE clauses", MAX_LIST));
-                    }
-                    likes[n_likes] = self.like_clause(n)?;
-                    n_likes += 1;
+                    let like = self.like_clause(columns.len())?;
+                    self.push(&mut likes, like)?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -8018,12 +7809,8 @@ impl<'a> Parser<'a> {
                         | Tok::Ident("foreign")
                         | Tok::Ident("exclude")
                 ) {
-                    let c = self.table_constraint(cons_name, false)?;
-                    if n_cons == MAX_LIST {
-                        return Err(self.limit("constraint list", MAX_LIST));
-                    }
-                    cons[n_cons] = c;
-                    n_cons += 1;
+                    let constraint = self.table_constraint(cons_name, false)?;
+                    self.push(&mut cons, constraint)?;
                     if !self.eat_op(",")? {
                         break;
                     }
@@ -8032,12 +7819,9 @@ impl<'a> Parser<'a> {
                 if cons_name.is_some() {
                     return Err(self.err_here("expected a table constraint after CONSTRAINT name"));
                 }
-                if n == MAX_LIST {
-                    return Err(self.limit("column list", MAX_LIST));
-                }
                 self.col_ident("column name")?
             };
-            let warnings_before = self.n_warnings;
+            let warnings_before = self.warnings.len();
             let (type_name, type_mod) = self.type_name_mod()?;
             let foreign_options = if foreign && self.eat_ident("options")? {
                 self.foreign_options()?
@@ -8068,8 +7852,8 @@ impl<'a> Parser<'a> {
             // PostgreSQL resolves a column definition's type twice, so a
             // precision-clamp warning is reported twice per column here where
             // a cast reports it once. Faithfully duplicated.
-            for w in warnings_before..self.n_warnings.min(super::MAX_PARSE_WARNINGS) {
-                let again = self.warnings[w];
+            for w in warnings_before..self.warnings.len() {
+                let again = self.warnings.as_slice()[w];
                 self.warn(again)?;
             }
             let mut not_null = false;
@@ -8106,15 +7890,15 @@ impl<'a> Parser<'a> {
                     // durable key object; only the default unnamed form can use
                     // the compact column flag.
                     if col_cons_name.is_some() || timing.is_deferrable() {
-                        if n_cons == MAX_LIST {
-                            return Err(self.limit("constraint list", MAX_LIST));
-                        }
-                        cons[n_cons] = TableConstraint::Unique {
-                            name: col_cons_name,
-                            columns: self.arena_slice(&[col_name])?,
-                            timing,
-                        };
-                        n_cons += 1;
+                        let key_columns = self.arena_slice(&[col_name])?;
+                        self.push(
+                            &mut cons,
+                            TableConstraint::Unique {
+                                name: col_cons_name,
+                                columns: key_columns,
+                                timing,
+                            },
+                        )?;
                         continue;
                     }
                     unique = true;
@@ -8122,15 +7906,15 @@ impl<'a> Parser<'a> {
                     self.expect_ident("key")?;
                     let timing = self.constraint_timing(false)?;
                     if col_cons_name.is_some() || timing.is_deferrable() {
-                        if n_cons == MAX_LIST {
-                            return Err(self.limit("constraint list", MAX_LIST));
-                        }
-                        cons[n_cons] = TableConstraint::PrimaryKey {
-                            name: col_cons_name,
-                            columns: self.arena_slice(&[col_name])?,
-                            timing,
-                        };
-                        n_cons += 1;
+                        let key_columns = self.arena_slice(&[col_name])?;
+                        self.push(
+                            &mut cons,
+                            TableConstraint::PrimaryKey {
+                                name: col_cons_name,
+                                columns: key_columns,
+                                timing,
+                            },
+                        )?;
                         // PRIMARY KEY implies NOT NULL; attach_constraints sets
                         // it, but a `LIKE` copy reads the flag, so set it here.
                         not_null = true;
@@ -8141,22 +7925,14 @@ impl<'a> Parser<'a> {
                     not_null = true;
                 } else if self.eat_ident("check")? {
                     // Desugar a column CHECK to a table-level CHECK.
-                    let c = self.check_constraint(col_cons_name, false)?;
-                    if n_cons == MAX_LIST {
-                        return Err(self.limit("constraint list", MAX_LIST));
-                    }
-                    cons[n_cons] = c;
-                    n_cons += 1;
+                    let constraint = self.check_constraint(col_cons_name, false)?;
+                    self.push(&mut cons, constraint)?;
                     continue;
                 } else if self.eat_ident("references")? {
                     // Desugar a column REFERENCES to a single-column FK.
                     let child = self.arena_slice(&[col_name])?;
-                    let c = self.references_tail(col_cons_name, child, false)?;
-                    if n_cons == MAX_LIST {
-                        return Err(self.limit("constraint list", MAX_LIST));
-                    }
-                    cons[n_cons] = c;
-                    n_cons += 1;
+                    let constraint = self.references_tail(col_cons_name, child, false)?;
+                    self.push(&mut cons, constraint)?;
                     continue;
                 } else if self.eat_ident("generated")? {
                     match self.generated_clause()? {
@@ -8169,24 +7945,26 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            columns[n] = ColumnDef {
-                name: col_name,
-                type_name,
-                type_mod,
-                collation,
-                foreign_options,
-                storage,
-                compression,
-                not_null,
-                not_null_inheritable,
-                unique,
-                primary,
-                default,
-                default_text,
-                generated_text,
-                identity,
-            };
-            n += 1;
+            self.push(
+                &mut columns,
+                ColumnDef {
+                    name: col_name,
+                    type_name,
+                    type_mod,
+                    collation,
+                    foreign_options,
+                    storage,
+                    compression,
+                    not_null,
+                    not_null_inheritable,
+                    unique,
+                    primary,
+                    default,
+                    default_text,
+                    generated_text,
+                    identity,
+                },
+            )?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -8230,20 +8008,16 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("a typed table cannot also specify INHERITS"));
                 }
                 self.expect_op("(")?;
-                let mut parents = [QualName::bare(""); MAX_LIST];
-                let mut n_parents = 0usize;
+                let mut parents = ArenaList::new(self.arena);
                 loop {
-                    if n_parents == parents.len() {
-                        return Err(self.limit("inheritance parent", parents.len()));
-                    }
-                    parents[n_parents] = self.qual_name("parent relation name")?;
-                    n_parents += 1;
+                    let parent = self.qual_name("parent relation name")?;
+                    self.push(&mut parents, parent)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
-                membership = TableMembership::Inherits(self.arena_slice(&parents[..n_parents])?);
+                membership = TableMembership::Inherits(parents.as_slice());
             } else if self.eat_ident("on")? {
                 if has_on_commit {
                     return Err(self.err_here("ON COMMIT specified more than once"));
@@ -8265,9 +8039,9 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let columns = self.arena_slice(&columns[..n])?;
-        let constraints = self.arena_slice(&cons[..n_cons])?;
-        let likes = self.arena_slice(&likes[..n_likes])?;
+        let columns = columns.as_slice();
+        let constraints = cons.as_slice();
+        let likes = likes.as_slice();
         let relation = CreateTable {
             name,
             columns,
@@ -8340,14 +8114,10 @@ impl<'a> Parser<'a> {
             return Err(self.err_here("expected RANGE, LIST, or HASH after PARTITION BY"));
         };
         self.expect_op("(")?;
-        let mut columns = [""; MAX_LIST];
-        let mut n_columns = 0;
+        let mut columns = ArenaList::new(self.arena);
         loop {
-            if n_columns == MAX_LIST {
-                return Err(self.limit("partition key", MAX_LIST));
-            }
-            columns[n_columns] = self.col_ident("partition key column")?;
-            n_columns += 1;
+            let column = self.col_ident("partition key column")?;
+            self.push(&mut columns, column)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -8355,26 +8125,22 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         Ok(crate::sql::ast::PartitionBy {
             strategy,
-            columns: self.arena_slice(&columns[..n_columns])?,
+            columns: columns.as_slice(),
         })
     }
 
     fn partition_bound_values(&mut self) -> Result<&'a [&'a Expr<'a>], ParseError> {
         self.expect_op("(")?;
-        let mut values: [&'a Expr<'a>; MAX_LIST] = [&Expr::Null; MAX_LIST];
-        let mut n = 0;
+        let mut values = ArenaList::new(self.arena);
         loop {
-            if n == MAX_LIST {
-                return Err(self.limit("partition bound", MAX_LIST));
-            }
-            values[n] = self.expression(0)?;
-            n += 1;
+            let value = self.expression(0)?;
+            self.push(&mut values, value)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        self.arena_slice(&values[..n])
+        Ok(values.as_slice())
     }
 
     /// The rest of a `LIKE source [ { INCLUDING | EXCLUDING } option ]...`
@@ -8495,22 +8261,19 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op("(")?;
-        let mut columns = [""; MAX_LIST];
-        let mut operators = [ExclusionOperator::Equal; MAX_LIST];
-        let mut count = 0;
+        let mut columns = ArenaList::new(self.arena);
+        let mut operators = ArenaList::new(self.arena);
         loop {
-            if count == columns.len() {
-                return Err(self.limit("exclusion elements", columns.len()));
-            }
-            columns[count] = self.col_ident("exclusion column")?;
+            let column = self.col_ident("exclusion column")?;
+            self.push(&mut columns, column)?;
             self.expect_ident("with")?;
-            operators[count] = match self.any_op_token()? {
+            let operator = match self.any_op_token()? {
                 "=" => ExclusionOperator::Equal,
                 "&&" => ExclusionOperator::Overlaps,
                 "-|-" => ExclusionOperator::Adjacent,
                 _ => return Err(self.err_here("unsupported exclusion operator")),
             };
-            count += 1;
+            self.push(&mut operators, operator)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -8529,8 +8292,8 @@ impl<'a> Parser<'a> {
         let timing = self.constraint_timing(false)?;
         Ok(TableConstraint::Exclusion {
             name,
-            columns: self.arena_slice(&columns[..count])?,
-            operators: self.arena_slice(&operators[..count])?,
+            columns: columns.as_slice(),
+            operators: operators.as_slice(),
             predicate,
             predicate_text,
             timing,

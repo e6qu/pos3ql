@@ -6,7 +6,7 @@
 //! `describe_set_body` and `materialize_set_body` are the shared entry points
 //! the derived-table, subquery, and INSERT-source paths reuse.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
 use crate::sql::ast::{Collation, Expr, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree};
 use crate::sql::eval::{SequenceAccess, SqlError, compare_datums_collated, sqlstate};
@@ -20,9 +20,6 @@ use super::{
     Outcome, QueryScope, arena_full, describe_scope_items, expand_set_tree_exec, infer_scope_type,
     select_into_rows, select_into_rows_recycling, sql_fail, sql_ok,
 };
-
-const MAX_SET_LEAVES: usize = crate::sql::parser::MAX_LIST;
-const MAX_SET_NODES: usize = MAX_SET_LEAVES * 2 - 1;
 
 struct DrySequence<'a>(&'a dyn SequenceAccess);
 
@@ -933,24 +930,13 @@ fn external_set_query<'a>(
 /// Walks a set tree collecting its SELECT leaves left-to-right.
 fn collect_set_leaves<'a>(
     tree: &'a SetTree<'a>,
-    out: &mut [Option<&'a Select<'a>>; MAX_SET_LEAVES],
-    n: &mut usize,
+    out: &mut ArenaList<'a, &'a Select<'a>>,
 ) -> Result<(), SqlError> {
     match tree {
-        SetTree::Select(s) => {
-            if *n == MAX_SET_LEAVES {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "too many set-operation branches"
-                ));
-            }
-            out[*n] = Some(s);
-            *n += 1;
-            Ok(())
-        }
+        SetTree::Select(s) => out.push(s).map_err(|_| arena_full()),
         SetTree::Op { left, right, .. } => {
-            collect_set_leaves(left, out, n)?;
-            collect_set_leaves(right, out, n)
+            collect_set_leaves(left, out)?;
+            collect_set_leaves(right, out)
         }
     }
 }
@@ -1115,19 +1101,13 @@ fn merge_set_collations(
 fn describe_set_collations(
     tree: &SetTree<'_>,
     column_count: usize,
-    leaves: &[[SetColumnCollation; MAX_PROJ]; MAX_SET_LEAVES],
+    leaves: &[[SetColumnCollation; MAX_PROJ]],
     next_leaf: &mut usize,
-    workspace: &mut [[SetColumnCollation; MAX_PROJ]; MAX_SET_NODES],
+    workspace: &mut [[SetColumnCollation; MAX_PROJ]],
     next_node: &mut usize,
 ) -> Result<usize, SqlError> {
     let output = *next_node;
     *next_node += 1;
-    if output == workspace.len() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "too many set-operation branches"
-        ));
-    }
     match tree {
         SetTree::Select(_) => {
             workspace[output][..column_count].copy_from_slice(&leaves[*next_leaf][..column_count]);
@@ -1357,13 +1337,15 @@ pub(crate) fn describe_set_body<'a>(
     columns: &mut [ColDesc<'a>],
     arena: &'a Arena,
 ) -> Result<usize, SqlError> {
-    let mut leaves: [Option<&Select>; MAX_SET_LEAVES] = [None; MAX_SET_LEAVES];
-    let mut n_leaves = 0;
-    collect_set_leaves(tree, &mut leaves, &mut n_leaves)?;
-    let leaf0 = leaves[0].expect(">=1 leaf");
+    let mut leaves = ArenaList::new(arena);
+    collect_set_leaves(tree, &mut leaves)?;
+    let leaves = leaves.as_slice();
+    let leaf0 = leaves.first().copied().expect(">=1 leaf");
     let n_cols = describe_leaf(storage, leaf0, txid, columns, arena)?;
     register_first_leaf_record_shapes(storage, leaf0, txid, arena, columns, n_cols)?;
-    let mut leaf_collations = [[SetColumnCollation::NONE; MAX_PROJ]; MAX_SET_LEAVES];
+    let leaf_collations = arena
+        .alloc_slice_with(leaves.len(), |_| [SetColumnCollation::NONE; MAX_PROJ])
+        .map_err(|_| arena_full())?;
     // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
     // type of the other branches, as PostgreSQL resolves an unknown literal).
     let mut target: [Option<ColType>; MAX_PROJ] = [None; MAX_PROJ];
@@ -1392,16 +1374,16 @@ pub(crate) fn describe_set_body<'a>(
             )
         };
     }
-    for (leaf_index, leaf) in leaves[1..n_leaves].iter().enumerate() {
+    for (leaf_index, leaf) in leaves[1..].iter().enumerate() {
         let mut lc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let ln = describe_leaf(storage, leaf.expect("leaf"), txid, &mut lc, arena)?;
+        let ln = describe_leaf(storage, leaf, txid, &mut lc, arena)?;
         if ln != n_cols {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "each UNION query must have the same number of columns"
             ));
         }
-        let leaf_ref = leaf.expect("leaf");
+        let leaf_ref = *leaf;
         for c in 0..n_cols {
             if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
                 continue; // an untyped NULL column adopts the running type
@@ -1453,15 +1435,19 @@ pub(crate) fn describe_set_body<'a>(
         col.type_oid = target[c].oid();
         col.typlen = target[c].typlen();
     }
-    let mut collation_workspace = [[SetColumnCollation::NONE; MAX_PROJ]; MAX_SET_NODES];
+    let collation_workspace = arena
+        .alloc_slice_with(2 * leaves.len() - 1, |_| {
+            [SetColumnCollation::NONE; MAX_PROJ]
+        })
+        .map_err(|_| arena_full())?;
     let mut next_collation_leaf = 0;
     let mut next_collation_node = 0;
     let collation_root = describe_set_collations(
         tree,
         n_cols,
-        &leaf_collations,
+        leaf_collations,
         &mut next_collation_leaf,
-        &mut collation_workspace,
+        collation_workspace,
         &mut next_collation_node,
     )?;
     for (index, (column, collation)) in columns[..n_cols]

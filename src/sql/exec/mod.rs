@@ -7453,6 +7453,7 @@ pub fn grant_role(
     wal: &mut Wal,
     txn: &mut TxnState,
     request: GrantRoleRequest<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let GrantRoleRequest {
@@ -7498,8 +7499,14 @@ pub fn grant_role(
         current_slot
     };
     let grantor_superuser = storage.role(grantor).attributes_to(txn.txid).superuser;
-    let mut role_slots = [0usize; crate::sql::parser::MAX_LIST];
-    let mut member_slots = [0usize; crate::sql::parser::MAX_LIST];
+    let role_slots = match arena.alloc_slice_with(roles.len(), |_| 0usize) {
+        Ok(slots) => slots,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let member_slots = match arena.alloc_slice_with(members.len(), |_| 0usize) {
+        Ok(slots) => slots,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     for (index, written) in roles.iter().enumerate() {
         let resolved = resolve_role_name(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
@@ -7529,8 +7536,8 @@ pub fn grant_role(
         };
         member_slots[index] = slot;
     }
-    for &role in &role_slots[..roles.len()] {
-        for &member in &member_slots[..members.len()] {
+    for &role in &*role_slots {
+        for &member in &*member_slots {
             if role == member || storage.role_is_member_of(role, member, txn.txid) {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_GRANT_OPERATION,
@@ -8017,6 +8024,7 @@ pub fn alter_default_privileges(
     roles: &[&str],
     schemas: &[&str],
     action: crate::sql::ast::DefaultPrivilegeAction<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::{DefaultPrivilegeAction, DefaultPrivilegeObjectKind};
@@ -8059,7 +8067,10 @@ pub fn alter_default_privileges(
     };
     let current_superuser = storage.role(current).attributes_to(txn.txid).superuser;
 
-    let mut owner_slots = [0u16; crate::sql::parser::MAX_LIST];
+    let owner_slots = match arena.alloc_slice_with(roles.len().max(1), |_| 0u16) {
+        Ok(slots) => slots,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
     let owner_count = if roles.is_empty() {
         owner_slots[0] = current as u16;
         1
@@ -8329,11 +8340,15 @@ pub fn reassign_owned(
     txn: &mut TxnState,
     roles: &[&str],
     new_owner: &str,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{AccessClass, AccessObject};
-    let mut source_roles = [0u16; crate::sql::parser::MAX_LIST];
-    let source_count = match resolve_owned_roles(storage, txn.txid, roles, &mut source_roles) {
+    let source_roles = match arena.alloc_slice_with(roles.len(), |_| 0u16) {
+        Ok(slots) => slots,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let source_count = match resolve_owned_roles(storage, txn.txid, roles, source_roles) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
@@ -8795,8 +8810,11 @@ pub fn drop_owned(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{AccessClass, AccessObject, DependencyClass};
-    let mut owned_roles = [0u16; crate::sql::parser::MAX_LIST];
-    let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, &mut owned_roles) {
+    let owned_roles = match arena.alloc_slice_with(roles.len(), |_| 0u16) {
+        Ok(slots) => slots,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    let owned_role_count = match resolve_owned_roles(storage, txn.txid, roles, owned_roles) {
         Ok(count) => count,
         Err(error) => return sql_fail(error),
     };
@@ -16208,38 +16226,33 @@ fn parse_plpgsql_assignment_target<'a>(
 ) -> Result<(Option<&'a str>, SqlName, &'a Expr<'a>), SqlError> {
     let target = super::parser::parse_expr(target, arena)?;
     let mut current = target;
-    let mut subscripts = [value; super::parser::MAX_LIST];
-    let mut count = 0usize;
+    let mut subscripts = ArenaList::new(arena);
     while let Expr::Subscript { base, index } = current {
-        if count == subscripts.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "PL/pgSQL assignment has too many subscripts"
-            ));
-        }
-        subscripts[count] = index;
-        count += 1;
+        subscripts
+            .push(index)
+            .map_err(|_| super::query::arena_full_pub())?;
         current = base;
     }
     let Expr::Column { qualifier, name } = current else {
         return Err(unsupported_trigger_body());
     };
     let column = SqlName::parse(name)?;
-    if count == 0 {
+    if subscripts.is_empty() {
         return Ok((*qualifier, column, value));
     }
-    let mut args = [value; super::parser::MAX_LIST];
-    args[0] = current;
-    args[1] = value;
-    for (output, subscript) in args[2..2 + count]
-        .iter_mut()
-        .zip(subscripts[..count].iter().rev())
-    {
-        *output = *subscript;
-    }
-    let args = arena
-        .alloc_slice_copy(&args[..2 + count])
+    let mut arg_list = ArenaList::new(arena);
+    arg_list
+        .push(current)
         .map_err(|_| super::query::arena_full_pub())?;
+    arg_list
+        .push(value)
+        .map_err(|_| super::query::arena_full_pub())?;
+    for subscript in subscripts.as_slice().iter().rev() {
+        arg_list
+            .push(*subscript)
+            .map_err(|_| super::query::arena_full_pub())?;
+    }
+    let args = arg_list.as_slice();
     let expression = arena
         .alloc(Expr::Call {
             name: "__jsonb_subscript_set",
@@ -20121,11 +20134,8 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
             name
         )
     })?;
-    let mut declared = [ColType::Bool; super::parser::MAX_LIST];
-    let declared_count = sqlprep.get_types(name).map_or(0, |types| {
-        declared[..types.len()].copy_from_slice(types);
-        types.len()
-    });
+    let declared = sqlprep.get_types(name).unwrap_or(&[]);
+    let declared_count = declared.len();
     if declared_count != 0 && values.len() != declared_count {
         return Err(sql_err!(
             sqlstate::PROTOCOL_VIOLATION,
@@ -21137,6 +21147,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         options: *options,
                         grantor: *grantor,
                     },
+                    context.arena,
                     responder,
                 ),
                 Stmt::RevokeRole {
@@ -21248,6 +21259,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     roles,
                     schemas,
                     *action,
+                    context.arena,
                     responder,
                 ),
                 Stmt::ReassignOwned { roles, new_owner } => super::exec::reassign_owned(
@@ -21256,6 +21268,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     roles,
                     new_owner,
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropOwned { roles, cascade } => super::exec::drop_owned(
@@ -63448,14 +63461,12 @@ fn alter_table_inner(
         Ok(definition) => &*definition,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    let mut inherited_actions =
-        [AlterAction::DropDefault { column: "" }; crate::sql::parser::MAX_ALTER_ACTIONS];
-    let mut inherited_action_count = 0;
+    let mut inherited_actions = ArenaList::new(arena);
     for action in statement.actions {
         if !ordinary_inheritance_propagates_action(definition, action) {
             continue;
         }
-        inherited_actions[inherited_action_count] = match action {
+        let inherited_action = match action {
             AlterAction::AlterConstraint {
                 name,
                 alteration: crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit },
@@ -63485,7 +63496,9 @@ fn alter_table_inner(
             }
             _ => *action,
         };
-        inherited_action_count += 1;
+        if inherited_actions.push(inherited_action).is_err() {
+            return sql_fail(super::query::arena_full_pub());
+        }
     }
     for (position, &table) in order.iter().enumerate() {
         let (schema, name) = {
@@ -63499,7 +63512,7 @@ fn alter_table_inner(
             },
             if_exists: false,
             only: false,
-            actions: &inherited_actions[..inherited_action_count],
+            actions: inherited_actions.as_slice(),
         };
         let mark = arena.mark();
         let outcome = alter_table_relation(

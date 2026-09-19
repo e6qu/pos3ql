@@ -192,14 +192,6 @@ impl From<WalSetupError> for EngineSetupError {
     }
 }
 
-/// Placeholder for the fixed-size array of data-modifying-CTE materializations.
-static EMPTY_DML_CTE: ast::MaterializedCte<'static> = ast::MaterializedCte {
-    column_names: &[],
-    column_types: &[],
-    column_collations: &[],
-    source: ast::MaterializedCteSource::Inline(&[]),
-};
-
 #[derive(Clone, Copy)]
 pub(crate) struct ReplicationEmission<'a> {
     pub publications: &'a [SqlName],
@@ -7919,7 +7911,17 @@ impl Engine {
         txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let mut types = [ColType::Bool; parser::MAX_LIST];
+        if param_types.len() > prep::MAX_PREP_PARAMS {
+            return Ok(Err(SqlError {
+                sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+                message: stack_format!(
+                    192,
+                    "PREPARE parameter types exceed the prepared-statement boundary of {}",
+                    prep::MAX_PREP_PARAMS
+                ),
+            }));
+        }
+        let mut types = [ColType::Bool; prep::MAX_PREP_PARAMS];
         for (index, type_name) in param_types.iter().enumerate() {
             let Some(ctype) = ColType::from_sql_name(type_name) else {
                 return Ok(Err(SqlError {
@@ -10003,9 +10005,7 @@ impl Engine {
         }
         // All of this statement's sub-parts share one command snapshot.
         self.storage.set_read_snapshot(txn.command_id());
-        let mut mats: [(&'a str, &'a ast::MaterializedCte<'a>); parser::MAX_CTES] =
-            [("", &EMPTY_DML_CTE); parser::MAX_CTES];
-        let mut n = 0;
+        let mut mats = ArenaList::new(arena);
         for (cte_index, cte) in with.iter().enumerate() {
             let Some(dml) = cte.dml else { continue };
             // Earlier ordinary, recursive, and data-modifying CTEs are in
@@ -10018,7 +10018,7 @@ impl Engine {
                 txn.txid,
                 arena,
                 params,
-                &mats[..n],
+                mats.as_slice(),
                 Some(&sequence::SeqEval::new(
                     &self.storage,
                     guc.seq_session(),
@@ -10181,18 +10181,12 @@ impl Engine {
                     source: ast::MaterializedCteSource::Inline(rows),
                 })
                 .map_err(|_| query::arena_full_pub())?;
-            if n == parser::MAX_CTES {
-                return Err(sql_err!(
-                    sqlstate::TOO_MANY_ARGUMENTS,
-                    "too many WITH entries"
-                ));
-            }
-            mats[n] = (cte.name, &*mcte);
-            n += 1;
+            mats.push((cte.name, &*mcte))
+                .map_err(|_| query::arena_full_pub())?;
         }
         Ok(Some(
             arena
-                .alloc_slice_copy(&mats[..n])
+                .alloc_slice_copy(mats.as_slice())
                 .map_err(|_| query::arena_full_pub())?,
         ))
     }
@@ -11586,8 +11580,11 @@ impl Engine {
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         if let Some(oid) = pending.intrinsic_oid {
-            let mut arguments = [Datum::Null; crate::sql::parser::MAX_LIST];
-            for (index, argument) in arguments[..pending.argument_count].iter_mut().enumerate() {
+            let arguments = match arena.alloc_slice_with(pending.argument_count, |_| Datum::Null) {
+                Ok(arguments) => arguments,
+                Err(_) => return Ok(Err(eval::arena_full())),
+            };
+            for (index, argument) in arguments.iter_mut().enumerate() {
                 *argument = match exec::decode_projected_col_record(pending.arguments, index, arena)
                 {
                     Ok(value) => value,
@@ -13400,7 +13397,7 @@ impl Engine {
         outer_params: &[Datum<'a>],
         sqlprep: &SqlPreparedPool,
         arena: &'a Arena,
-    ) -> Result<([Datum<'a>; parser::MAX_LIST], usize), SqlError> {
+    ) -> Result<&'a [Datum<'a>], SqlError> {
         let declared = sqlprep.get_types(name).ok_or_else(|| SqlError {
             sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
             message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
@@ -13417,7 +13414,9 @@ impl Engine {
                 ),
             });
         }
-        let mut values = [Datum::Null; parser::MAX_LIST];
+        let values = arena
+            .alloc_slice_with(arguments.len(), |_| Datum::Null)
+            .map_err(|_| eval::arena_full())?;
         for (index, argument) in arguments.iter().enumerate() {
             let value = eval(argument, arena, outer_params, &NoColumns)?;
             values[index] = if index < declared.len() {
@@ -13426,7 +13425,7 @@ impl Engine {
                 value
             };
         }
-        Ok((values, arguments.len()))
+        Ok(values)
     }
 
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
@@ -13965,24 +13964,19 @@ impl Engine {
                     Ok(plan) => plan,
                     Err(error) => return Ok(Err(error)),
                 };
-                let mut prepared_params = [Datum::Null; parser::MAX_LIST];
-                let prepared_count = if options.analyze {
-                    match statement {
-                        Stmt::ExecutePrepared { name, args } => {
-                            let (values, count) = match self
-                                .prepared_explain_arguments(name, args, params, sqlprep, arena)
-                            {
-                                Ok(values) => values,
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            prepared_params = values;
-                            count
-                        }
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
+                // SQL EXECUTE arguments are bounded by the pool's declared
+                // parameter count (prep::MAX_PREP_PARAMS) whenever types were
+                // declared; an arena slice carries the undeclared case too.
+                let mut prepared_params: &[Datum] = &[];
+                if options.analyze
+                    && let Stmt::ExecutePrepared { name, args } = statement
+                {
+                    prepared_params =
+                        match self.prepared_explain_arguments(name, args, params, sqlprep, arena) {
+                            Ok(values) => values,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                }
                 let actual = if options.analyze {
                     let before = self.storage.block_io_stats();
                     let (before_wal_records, before_wal_bytes) = self.wal.stage_stats(txn.txid);
@@ -13990,7 +13984,7 @@ impl Engine {
                     let started = std::time::Instant::now();
                     responder.begin_discard_query_output(options.serialize);
                     let execution_params = if matches!(statement, Stmt::ExecutePrepared { .. }) {
-                        &prepared_params[..prepared_count]
+                        prepared_params
                     } else {
                         params
                     };
@@ -15606,6 +15600,7 @@ impl Engine {
                     options: *options,
                     grantor: *grantor,
                 },
+                arena,
                 responder,
             ),
             Stmt::RevokeRole {
@@ -15717,6 +15712,7 @@ impl Engine {
                 roles,
                 schemas,
                 *action,
+                arena,
                 responder,
             ),
             Stmt::ReassignOwned { roles, new_owner } => exec::reassign_owned(
@@ -15725,6 +15721,7 @@ impl Engine {
                 txn,
                 roles,
                 new_owner,
+                arena,
                 responder,
             ),
             Stmt::DropOwned { roles, cascade } => exec::drop_owned(
@@ -16093,16 +16090,16 @@ impl Engine {
                         ),
                     }));
                 };
-                // Snapshot the declared parameter types before releasing the
-                // pool borrow.
-                let mut decl = [ColType::Bool; parser::MAX_LIST];
-                let n_decl = sqlprep
-                    .get_types(name)
-                    .map(|ts| {
-                        decl[..ts.len()].copy_from_slice(ts);
-                        ts.len()
-                    })
-                    .unwrap_or(0);
+                // Snapshot the declared parameter types into the arena before
+                // releasing the pool borrow.
+                let decl: &[ColType] = match sqlprep.get_types(name) {
+                    Some(ts) => match arena.alloc_slice_copy(ts) {
+                        Ok(copy) => copy,
+                        Err(_) => return Ok(Err(eval::arena_full())),
+                    },
+                    None => &[],
+                };
+                let n_decl = decl.len();
                 // Copy to the arena so the pool borrow ends before the
                 // recursive dispatch below.
                 let text = match arena.alloc_str(text) {
@@ -16130,7 +16127,10 @@ impl Engine {
                 }
                 // Argument expressions become the inner statement's $n
                 // parameters, coerced to the declared types when present.
-                let mut inner_params = [Datum::Null; parser::MAX_LIST];
+                let inner_params = match arena.alloc_slice_with(args.len(), |_| Datum::Null) {
+                    Ok(values) => values,
+                    Err(_) => return Ok(Err(eval::arena_full())),
+                };
                 for (i, a) in args.iter().enumerate() {
                     let v = match eval(a, arena, params, &NoColumns) {
                         Ok(v) => v,
@@ -18097,8 +18097,8 @@ fn emit_parse_warnings(
     parser: &mut parser::Parser,
     responder: &mut Responder,
 ) -> Result<(), WireFull> {
-    let (messages, n) = parser.take_warnings();
-    for message in &messages[..n] {
+    let messages = parser.take_warnings();
+    for message in messages {
         responder.warning(eval::sqlstate::INVALID_PARAMETER_VALUE, message.as_str())?;
     }
     Ok(())

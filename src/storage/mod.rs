@@ -95,14 +95,20 @@ impl PublicationFilters {
     }
 }
 
+/// Durable per-object definition lists (constraints, routine arguments, enum
+/// labels, partition bounds, and their kin) carry at most this many inline
+/// items. Wider DDL parses successfully and is then rejected loudly at
+/// definition time; scaling these per-object durable shapes is separate work.
+pub(crate) const MAX_DEFINITION_ITEMS: usize = 64;
+/// Nested row-state walk cursors (spill-merge recursion during DML) lease
+/// from this startup-sized pool.
+pub(crate) const MAX_ROW_WALK_NESTING: usize = 64;
+
 /// A subscription's publication list is part of its startup-bounded durable
 /// state, rather than an unbounded connection-side string.
-/// A subscription's publication list follows the parser's complete bounded
-/// list. Storage, WAL, workers, and catalogs must not impose a narrower shape
-/// after the statement has parsed successfully.
-pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const SUBSCRIPTION_CONNINFO_BYTES: usize = 512;
-pub(crate) const MAX_TRIGGER_ARGUMENTS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_TRIGGER_ARGUMENTS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const TRIGGER_ARGUMENT_BYTES: usize = u8::MAX as usize;
 pub(crate) const LARGE_OBJECT_BLOCK_SIZE: usize = 2_048;
 pub(crate) const INTERNAL_LARGE_OBJECT_SCHEMA: &str = "pos3ql_internal";
@@ -1182,7 +1188,7 @@ impl ColumnMeta {
 /// Per-kind table-constraint capacity. This follows the SQL parser's complete
 /// bounded list instead of imposing a smaller storage-only ceiling after DDL
 /// has already been accepted.
-pub(crate) const MAX_TABLE_CONSTRAINTS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_TABLE_CONSTRAINTS: usize = MAX_DEFINITION_ITEMS;
 /// Maximum number of named or multi-column UNIQUE/PRIMARY KEY constraints per
 /// table. Inline single-column keys use column flags until they need an
 /// independent catalog name.
@@ -1677,7 +1683,7 @@ pub struct DetachedPartitionBound {
 }
 
 /// Direct ordinary-inheritance parents follow the parser's bounded list.
-pub(crate) const MAX_TABLE_INHERITANCE_PARENTS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_TABLE_INHERITANCE_PARENTS: usize = MAX_DEFINITION_ITEMS;
 
 /// Direct table-inheritance edges.  This is deliberately separate from
 /// partition attachment: a partition owns routing and cannot also be treated
@@ -1858,7 +1864,7 @@ impl PartitionDef {
 pub(crate) const MAX_PARTITION_KEYS: usize = 32;
 /// LIST bounds follow the parser's complete bounded value list instead of
 /// imposing a narrower storage-only limit.
-pub(crate) const MAX_PARTITION_LIST_VALUES: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_PARTITION_LIST_VALUES: usize = MAX_DEFINITION_ITEMS;
 
 impl TableDef {
     /// A table with a name and no columns or constraints, for spread-init of
@@ -2685,7 +2691,7 @@ pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_COLUMNS + MAX_UNIQUES + MAX_EX
 /// envelopes is an explicit capacity error rather than an incomplete object.
 pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
-pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const EVENT_TRIGGER_TAG_MAX: usize = 64;
 
 /// PostgreSQL's closed server-encoding identity. Construction is checked once
@@ -3748,7 +3754,7 @@ impl Table {
 /// Maximum length of a stored view definition (the SELECT text).
 pub(crate) const VIEW_SQL_MAX: usize = 2048;
 pub(crate) const RULE_SQL_MAX: usize = VIEW_SQL_MAX;
-pub(crate) const MAX_RULE_ACTIONS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_RULE_ACTIONS: usize = MAX_DEFINITION_ITEMS;
 
 /// Durable stored-query dependency counts use one byte. Runtime configuration
 /// may reserve any smaller per-image capacity.
@@ -5772,7 +5778,7 @@ fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<
 /// Stored SQL routines share the table-sized catalog budget.  They are not
 /// executable closures: every durable definition is a bounded, replayable SQL
 /// identity and body.
-pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
 pub(crate) const ROUTINE_DEFAULT_MAX: usize = DEFAULT_EXPR_MAX;
 pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
@@ -5783,7 +5789,7 @@ pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 /// runtime allocation: its target and function are stable catalog slots.
 pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
 pub(crate) const POLICY_OID_BASE: i32 = 180_000;
-pub(crate) const MAX_POLICY_ROLES: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_POLICY_ROLES: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 
 pub(crate) fn trigger_oid(trigger: &TriggerDef) -> i32 {
@@ -6176,7 +6182,7 @@ pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = 640_000;
 pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = 660_000;
 pub(crate) const ACCESS_METHOD_OID_BASE: i32 = 680_000;
 /// Operators and support functions each follow the parser's bounded DDL list.
-pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const MAX_ACCESS_METHODS: usize = 32;
 
 fn catalog_object_oid(base: i32, created_at: u64) -> i32 {
@@ -6707,7 +6713,7 @@ impl RoutineLanguage {
     }
 }
 
-pub(crate) const MAX_ROUTINE_CONFIGS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_ROUTINE_CONFIGS: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const ROUTINE_CONFIG_VALUE_MAX: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8236,7 +8242,7 @@ pub(crate) struct PendingRoutineIdentity {
 }
 /// Domain constraint lists use the same complete bounded list accepted by the
 /// parser; recovery never observes a definition wider than this boundary.
-pub(crate) const MAX_DOMAIN_CHECKS: usize = crate::sql::parser::MAX_LIST;
+pub(crate) const MAX_DOMAIN_CHECKS: usize = MAX_DEFINITION_ITEMS;
 
 /// A `CREATE DOMAIN` type: a base type (with its typmod) plus optional
 /// `NOT NULL`, `DEFAULT` and `CHECK (VALUE ...)` constraints, enforced when a
@@ -11906,12 +11912,12 @@ impl SpillReader {
             "row-state walk contexts",
         )?;
         budget.draw_array(
-            crate::sql::parser::MAX_LIST.saturating_mul(max_spill_generations),
+            MAX_ROW_WALK_NESTING.saturating_mul(max_spill_generations),
             core::mem::size_of::<MemberCursor>(),
             "row-state walk cursors",
         )?;
         budget.draw_array(
-            crate::sql::parser::MAX_LIST,
+            MAX_ROW_WALK_NESTING,
             core::mem::size_of::<std::cell::RefCell<Box<[MemberCursor]>>>(),
             "row-state walk cursor slots",
         )?;
@@ -11985,7 +11991,7 @@ impl SpillReader {
         for _ in 0..SCAN_CONTEXTS {
             scan_contexts.push(context());
         }
-        let cursor_contexts = (0..crate::sql::parser::MAX_LIST)
+        let cursor_contexts = (0..MAX_ROW_WALK_NESTING)
             .map(|_| {
                 std::cell::RefCell::new(
                     vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
@@ -12016,7 +12022,7 @@ impl SpillReader {
                 * ((2 * max_spill_generations + 4) * crate::store::MAX_PAYLOAD
                     + 2 * max_spill_generations * core::mem::size_of::<Box<[u8]>>()
                     + core::mem::size_of::<std::cell::RefCell<ScanContext>>())
-            + crate::sql::parser::MAX_LIST
+            + MAX_ROW_WALK_NESTING
                 * (max_spill_generations * core::mem::size_of::<MemberCursor>()
                     + core::mem::size_of::<std::cell::RefCell<Box<[MemberCursor]>>>());
         if durable {

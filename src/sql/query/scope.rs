@@ -8,7 +8,7 @@
 //! reference resolves to). It is built twice over: a schema-only form for
 //! describe, and an executing form that also materializes derived tables.
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::ast::{BinaryOp, Expr, FromClause, MAX_USING_COLUMNS, MaterializedCte, TableRef};
 use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
@@ -17,19 +17,20 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, UserTy
 use crate::util::StackStr;
 
 use super::{
-    Chained, MAX_AGGS, MAX_JOIN_TABLES, MAX_WINDOWS, arena_full, collect_aggs, collect_windows,
-    common_using_type, select_into_rows, synth_derived_def, synth_derived_def_outer,
-    table_func_def, table_func_def_outer, table_func_rows_outer,
+    Chained, MAX_JOIN_TABLES, arena_full, collect_aggs, collect_windows, common_using_type,
+    select_into_rows, synth_derived_def, synth_derived_def_outer, table_func_def,
+    table_func_def_outer, table_func_rows_outer,
 };
 
 /// Upper bound on distinct USING/NATURAL-merged columns across a join tree
 /// (chained merges of the same name allocate a fresh entry per join).
 pub const MAX_MERGED_COLUMNS: usize = crate::storage::MAX_COLUMNS;
 
-fn validate_table_sample(
+fn validate_table_sample<'a>(
     storage: &Storage,
-    table: &TableRef<'_>,
+    table: &TableRef<'a>,
     txid: u32,
+    arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let Some(sample) = table.sample else {
         return Ok(());
@@ -62,25 +63,17 @@ fn validate_table_sample(
                 )
             });
         }
-        let mut aggregates = [(core::ptr::null(), &Expr::Null); MAX_AGGS];
-        let mut aggregate_count = 0;
-        collect_aggs(
-            expression,
-            &mut aggregates,
-            &mut aggregate_count,
-            storage,
-            txid,
-        )?;
-        if aggregate_count != 0 {
+        let mut aggregates = ArenaList::new(arena);
+        collect_aggs(expression, &mut aggregates, storage, txid)?;
+        if !aggregates.is_empty() {
             return Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
                 "aggregate functions are not allowed in functions in FROM"
             ));
         }
-        let mut windows = [&Expr::Null; MAX_WINDOWS];
-        let mut window_count = 0;
-        collect_windows(expression, &mut windows, &mut window_count, storage, txid)?;
-        if window_count != 0 {
+        let mut windows = ArenaList::new(arena);
+        collect_windows(expression, &mut windows, storage, txid)?;
+        if !windows.is_empty() {
             return Err(sql_err!(
                 sqlstate::WINDOWING_ERROR,
                 "window functions are not allowed in functions in FROM"
@@ -457,7 +450,7 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
-        validate_table_sample(storage, tref, txid)?;
+        validate_table_sample(storage, tref, txid, arena)?;
         if tref.sample.is_some()
             && (tref.cte.is_some()
                 || tref.is_function_source()
@@ -654,7 +647,7 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
-        validate_table_sample(storage, tref, txid)?;
+        validate_table_sample(storage, tref, txid, arena)?;
         if tref.sample.is_some()
             && (tref.cte.is_some()
                 || tref.is_function_source()

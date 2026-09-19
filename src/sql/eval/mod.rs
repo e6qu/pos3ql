@@ -3603,13 +3603,9 @@ fn effective_quantified_collations<'a>(
     catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
 ) -> Result<&'a [Collation], SqlError> {
-    let mut output = [Collation::None; super::parser::MAX_LIST];
-    if right.len() > output.len() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "too many fields in row comparison"
-        ));
-    }
+    let output = arena
+        .alloc_slice_with(right.len(), |_| Collation::None)
+        .map_err(|_| arena_full())?;
     let row_args = match operand {
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => Some(*args),
         _ => None,
@@ -3644,10 +3640,7 @@ fn effective_quantified_collations<'a>(
         });
         output[index] = required_comparison_collation(merge_derived_collations(left, right)?)?;
     }
-    arena
-        .alloc_slice_copy(&output[..right.len()])
-        .map(|slice| &*slice)
-        .map_err(|_| arena_full())
+    Ok(output)
 }
 
 fn typed_field_value<'a>(field: &super::types::RecordField<'a>) -> Datum<'a> {
@@ -4365,40 +4358,39 @@ fn call<'a>(
         });
     }
     if !star && let Some(catalog) = hooks.catalog {
-        let mut arguments = [Datum::Null; crate::sql::parser::MAX_LIST];
-        let mut argument_type_oids =
-            [crate::sql::types::oid::UNKNOWN; crate::sql::parser::MAX_LIST];
-        if args.len() <= arguments.len() {
-            for (slot, argument) in args.iter().enumerate() {
-                arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
-                argument_type_oids[slot] = expression_type_identity(argument, row, hooks)?
-                    .routine_argument_oid(&arguments[slot]);
-            }
-            if args.len() == 1
-                && let Some((schema, "!!")) = crate::sql::ast::catalog_operator_call(name)
-                && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-                && argument_type_oids[0] == crate::sql::types::oid::TSQUERY
-            {
-                return match arguments[0] {
-                    Datum::Null => Ok(Datum::Null),
-                    Datum::TsQuery(query) => {
-                        crate::sql::full_text::not_query(query.as_str(), arena)
-                            .map(crate::sql::full_text::restore_query)
-                            .map(Datum::TsQuery)
-                    }
-                    _ => unreachable!("tsquery operator argument identity"),
-                };
-            }
-            if let Some(result) = catalog.call_routine(
-                name,
-                &arguments[..args.len()],
-                argument_names,
-                variadic,
-                &argument_type_oids[..args.len()],
-                arena,
-            )? {
-                return Ok(result);
-            }
+        let arguments = arena
+            .alloc_slice_with(args.len(), |_| Datum::Null)
+            .map_err(|_| arena_full())?;
+        let argument_type_oids = arena
+            .alloc_slice_with(args.len(), |_| crate::sql::types::oid::UNKNOWN)
+            .map_err(|_| arena_full())?;
+        for (slot, argument) in args.iter().enumerate() {
+            arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
+            argument_type_oids[slot] = expression_type_identity(argument, row, hooks)?
+                .routine_argument_oid(&arguments[slot]);
+        }
+        if args.len() == 1
+            && let Some((schema, "!!")) = crate::sql::ast::catalog_operator_call(name)
+            && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            && argument_type_oids[0] == crate::sql::types::oid::TSQUERY
+        {
+            return match arguments[0] {
+                Datum::Null => Ok(Datum::Null),
+                Datum::TsQuery(query) => crate::sql::full_text::not_query(query.as_str(), arena)
+                    .map(crate::sql::full_text::restore_query)
+                    .map(Datum::TsQuery),
+                _ => unreachable!("tsquery operator argument identity"),
+            };
+        }
+        if let Some(result) = catalog.call_routine(
+            name,
+            arguments,
+            argument_names,
+            variadic,
+            argument_type_oids,
+            arena,
+        )? {
+            return Ok(result);
         }
     }
     match name {

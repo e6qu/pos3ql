@@ -7,10 +7,11 @@
 //! column, a parenthesized expression or row, a CASE, a subquery, an array —
 //! and the postfix forms (subscripts, field access, casts) that bind to it.
 
+use crate::mem::arena::ArenaList;
 use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 
-use super::{MAX_LIST, ParseError, Parser, is_base_prefixed, is_reserved_keyword};
+use super::{ParseError, Parser, is_base_prefixed, is_reserved_keyword};
 use crate::sql::ast::{BinaryOp, Expr, UnaryOp};
 use crate::sql::types::ColType;
 
@@ -286,7 +287,7 @@ impl<'a> Parser<'a> {
                         let boxed = self
                             .arena
                             .alloc(select)
-                            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                         left = self.arena_expr(Expr::InSubquery {
                             operand: left,
                             select: boxed,
@@ -294,15 +295,10 @@ impl<'a> Parser<'a> {
                         })?;
                         continue;
                     }
-                    let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-                    let mut list: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
-                    let mut n = 0;
+                    let mut list = ArenaList::new(self.arena);
                     loop {
-                        if n == MAX_LIST {
-                            return Err(self.limit("IN list", MAX_LIST));
-                        }
-                        list[n] = self.expression(0)?;
-                        n += 1;
+                        let value = self.expression(0)?;
+                        self.push(&mut list, value)?;
                         if !self.eat_op(",")? {
                             break;
                         }
@@ -310,7 +306,7 @@ impl<'a> Parser<'a> {
                     self.expect_op(")")?;
                     left = self.arena_expr(Expr::InList {
                         operand: left,
-                        list: self.arena_slice(&list[..n])?,
+                        list: list.as_slice(),
                         negated,
                     })?;
                     continue;
@@ -478,7 +474,7 @@ impl<'a> Parser<'a> {
                     let boxed = self
                         .arena
                         .alloc(select)
-                        .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     // `= ANY (sub)` is IN, `<> ALL (sub)` is NOT IN; the rest
                     // quantify over the subquery's collected result column
                     // (same truth table as the array forms, per PostgreSQL).
@@ -550,7 +546,7 @@ impl<'a> Parser<'a> {
                 .arena
                 .alloc(QualName { schema, name })
                 .map(|name| &*name)
-                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
             Ok(ParsedCollation::Named(name))
         }
     }
@@ -592,7 +588,7 @@ impl<'a> Parser<'a> {
                     let boxed = self
                         .arena
                         .alloc(select)
-                        .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     return self.arena_expr(Expr::Subquery(boxed));
                 }
                 let inner = self.expression(0)?;
@@ -602,19 +598,16 @@ impl<'a> Parser<'a> {
                 // an implicit row constructor equivalent to `ROW(...)`.
                 let mut base = inner;
                 if self.peeked == Tok::Op(",") {
-                    let mut items = [inner; MAX_LIST];
-                    let mut n = 1usize;
+                    let mut items = ArenaList::new(self.arena);
+                    self.push(&mut items, inner)?;
                     while self.peeked == Tok::Op(",") {
                         self.advance()?;
-                        if n == MAX_LIST {
-                            return Err(self.limit("row constructor", MAX_LIST));
-                        }
-                        items[n] = self.expression(0)?;
-                        n += 1;
+                        let item = self.expression(0)?;
+                        self.push(&mut items, item)?;
                     }
                     self.expect_op(")")?;
                     if self.peeked == Tok::Ident("overlaps") {
-                        if n != 2 {
+                        if items.len() != 2 {
                             return Err(self.err_here("OVERLAPS requires a (start, end) pair"));
                         }
                         self.advance()?;
@@ -625,10 +618,15 @@ impl<'a> Parser<'a> {
                         self.expect_op(")")?;
                         return self.plain_call(
                             crate::sql::parser::OVERLAPS_PERIODS,
-                            &[items[0], items[1], other_start, other_end],
+                            &[
+                                items.as_slice()[0],
+                                items.as_slice()[1],
+                                other_start,
+                                other_end,
+                            ],
                         );
                     }
-                    base = self.plain_call("row", &items[..n])?;
+                    base = self.plain_call("row", items.as_slice())?;
                     // A bare row constructor is not a field-access target:
                     // PostgreSQL's grammar reaches `.field` through a
                     // parenthesized expression, so `(1,2).f1` is a syntax error
@@ -766,7 +764,7 @@ impl<'a> Parser<'a> {
                 let boxed = self
                     .arena
                     .alloc(select)
-                    .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                    .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                 self.arena_expr(Expr::Exists(boxed))
             }
             Tok::Ident("default") => {
@@ -780,21 +778,14 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(self.expression(0)?)
                 };
-                let dummy: (&'a Expr<'a>, &'a Expr<'a>) =
-                    (self.arena_expr(Expr::Null)?, self.arena_expr(Expr::Null)?);
-                let mut whens: [(&'a Expr<'a>, &'a Expr<'a>); MAX_LIST] = [dummy; MAX_LIST];
-                let mut n = 0;
+                let mut whens = ArenaList::new(self.arena);
                 while self.eat_ident("when")? {
-                    if n == MAX_LIST {
-                        return Err(self.limit("CASE branches", MAX_LIST));
-                    }
                     let cond = self.expression(0)?;
                     self.expect_ident("then")?;
                     let result = self.expression(0)?;
-                    whens[n] = (cond, result);
-                    n += 1;
+                    self.push(&mut whens, (cond, result))?;
                 }
-                if n == 0 {
+                if whens.is_empty() {
                     return Err(self.unexpected("CASE requires at least one WHEN"));
                 }
                 let otherwise = if self.eat_ident("else")? {
@@ -805,7 +796,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("end")?;
                 self.arena_expr(Expr::Case {
                     operand,
-                    whens: self.arena_slice(&whens[..n])?,
+                    whens: whens.as_slice(),
                     otherwise,
                     synthetic: false,
                 })
@@ -863,24 +854,18 @@ impl<'a> Parser<'a> {
                 // `ARRAY[...]` array constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("[") {
                     self.advance()?;
-                    let mut items: [&'a Expr<'a>; MAX_LIST] =
-                        [self.arena_expr(Expr::Null)?; MAX_LIST];
-                    let mut n = 0;
+                    let mut items = ArenaList::new(self.arena);
                     if self.peeked != Tok::Op("]") {
                         loop {
-                            if n == MAX_LIST {
-                                return Err(self.limit("array elements", MAX_LIST));
-                            }
-                            items[n] = self.expression(0)?;
-                            n += 1;
+                            let item = self.expression(0)?;
+                            self.push(&mut items, item)?;
                             if !self.eat_op(",")? {
                                 break;
                             }
                         }
                     }
                     self.expect_op("]")?;
-                    let items = self.arena_slice(&items[..n])?;
-                    return self.arena_expr(Expr::Array(items));
+                    return self.arena_expr(Expr::Array(items.as_slice()));
                 }
                 // `ARRAY(SELECT ...)` array-from-subquery constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("(") {
@@ -890,7 +875,7 @@ impl<'a> Parser<'a> {
                     let boxed = self
                         .arena
                         .alloc(select)
-                        .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+                        .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
                     return self.arena_expr(Expr::ArraySubquery(boxed));
                 }
                 if name.eq_ignore_ascii_case("json") && self.peeked == Tok::Op("(") {
@@ -1252,18 +1237,18 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         self.expect_ident("name")?;
         let element_name = self.any_ident("XML element name")?;
-        let mut args = [self.arena_expr(Expr::Null)?; MAX_LIST];
-        args[0] = self.arena_expr(Expr::Str(element_name))?;
-        args[1] = self.arena_expr(Expr::Int(0))?;
-        let mut n = 2;
+        let mut args = ArenaList::new(self.arena);
+        let name_expr = self.arena_expr(Expr::Str(element_name))?;
+        self.push(&mut args, name_expr)?;
+        // Placeholder for the attribute count, patched in once the
+        // XMLATTRIBUTES clause is parsed.
+        let placeholder = self.arena_expr(Expr::Int(0))?;
+        self.push(&mut args, placeholder)?;
         let mut attributes = 0usize;
         if self.eat_op(",")? && self.peeked == Tok::Ident("xmlattributes") {
             self.advance()?;
             self.expect_op("(")?;
             loop {
-                if n + 2 > MAX_LIST {
-                    return Err(self.limit("XML element arguments", MAX_LIST));
-                }
                 let value = self.expression(0)?;
                 let alias = if self.eat_ident("as")? {
                     self.any_ident("XML attribute name")?
@@ -1272,9 +1257,9 @@ impl<'a> Parser<'a> {
                 } else {
                     return Err(self.err_here("XML attribute value must have an alias"));
                 };
-                args[n] = self.arena_expr(Expr::Str(alias))?;
-                args[n + 1] = value;
-                n += 2;
+                let alias_expr = self.arena_expr(Expr::Str(alias))?;
+                self.push(&mut args, alias_expr)?;
+                self.push(&mut args, value)?;
                 attributes += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -1283,41 +1268,32 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             if self.eat_op(",")? {
                 loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("XML element arguments", MAX_LIST));
-                    }
-                    args[n] = self.expression(0)?;
-                    n += 1;
+                    let value = self.expression(0)?;
+                    self.push(&mut args, value)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
             }
-        } else if n == 2 && self.peeked != Tok::Op(")") {
+        } else if args.len() == 2 && self.peeked != Tok::Op(")") {
             loop {
-                if n == MAX_LIST {
-                    return Err(self.limit("XML element arguments", MAX_LIST));
-                }
-                args[n] = self.expression(0)?;
-                n += 1;
+                let value = self.expression(0)?;
+                self.push(&mut args, value)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
         }
-        args[1] = self.arena_expr(Expr::Int(attributes as i64))?;
+        let count_expr = self.arena_expr(Expr::Int(attributes as i64))?;
+        args.as_mut_slice()[1] = count_expr;
         self.expect_op(")")?;
-        self.xml_call("__xmlelement", &args[..n])
+        self.xml_call("__xmlelement", args.as_slice())
     }
 
     fn sql_xml_forest(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
-        let mut args = [self.arena_expr(Expr::Null)?; MAX_LIST];
-        let mut n = 0;
+        let mut args = ArenaList::new(self.arena);
         loop {
-            if n + 2 > MAX_LIST {
-                return Err(self.limit("XML forest arguments", MAX_LIST));
-            }
             let value = self.expression(0)?;
             let alias = if self.eat_ident("as")? {
                 self.any_ident("XML element name")?
@@ -1326,15 +1302,15 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.err_here("XML forest value must have an alias"));
             };
-            args[n] = self.arena_expr(Expr::Str(alias))?;
-            args[n + 1] = value;
-            n += 2;
+            let alias_expr = self.arena_expr(Expr::Str(alias))?;
+            self.push(&mut args, alias_expr)?;
+            self.push(&mut args, value)?;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.expect_op(")")?;
-        self.xml_call("__xmlforest", &args[..n])
+        self.xml_call("__xmlforest", args.as_slice())
     }
 
     fn sql_xml_pi(&mut self) -> Result<&'a Expr<'a>, ParseError> {
@@ -1510,19 +1486,14 @@ impl<'a> Parser<'a> {
 
     fn sql_json_array_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
-        let null = self.arena_expr(Expr::Null)?;
-        let mut values = [null; MAX_LIST];
-        let mut count = 0;
+        let mut values = ArenaList::new(self.arena);
         while self.peeked != Tok::Op(")")
             && self.peeked != Tok::Ident("absent")
             && self.peeked != Tok::Ident("returning")
         {
-            if count == MAX_LIST {
-                return Err(self.limit("JSON array elements", MAX_LIST));
-            }
             let value = self.expression(0)?;
-            values[count] = self.sql_json_format_argument(value)?;
-            count += 1;
+            let value = self.sql_json_format_argument(value)?;
+            self.push(&mut values, value)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -1545,33 +1516,28 @@ impl<'a> Parser<'a> {
             absent,
             result,
             type_name,
-            &values[..count],
+            values.as_slice(),
             type_mod,
         )
     }
 
     fn sql_json_object_constructor(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
-        let null = self.arena_expr(Expr::Null)?;
-        let mut values = [null; MAX_LIST];
-        let mut count = 0;
+        let mut values = ArenaList::new(self.arena);
         while self.peeked != Tok::Op(")")
             && self.peeked != Tok::Ident("absent")
             && self.peeked != Tok::Ident("returning")
             && self.peeked != Tok::Ident("with")
             && self.peeked != Tok::Ident("without")
         {
-            if count + 2 > MAX_LIST {
-                return Err(self.limit("JSON object members", MAX_LIST / 2));
-            }
-            values[count] = self.expression(0)?;
-            count += 1;
+            let key = self.expression(0)?;
+            self.push(&mut values, key)?;
             if !self.eat_ident("value")? && !self.eat_op(":")? {
                 return Err(self.unexpected("expected VALUE or ':' in JSON_OBJECT"));
             }
             let value = self.expression(0)?;
-            values[count] = self.sql_json_format_argument(value)?;
-            count += 1;
+            let value = self.sql_json_format_argument(value)?;
+            self.push(&mut values, value)?;
             if !self.eat_op(",")? {
                 break;
             }
@@ -1602,14 +1568,14 @@ impl<'a> Parser<'a> {
         self.expect_op(")")?;
         // The object evaluator reads the final marker as ABSENT ON NULL while
         // the call-name option remains the uniqueness requirement.
-        values[count] = self.arena_expr(Expr::Bool(absent))?;
-        count += 1;
+        let absent_marker = self.arena_expr(Expr::Bool(absent))?;
+        self.push(&mut values, absent_marker)?;
         self.sql_json_result_call(
             "object",
             unique,
             result,
             type_name,
-            &values[..count],
+            values.as_slice(),
             type_mod,
         )
     }
@@ -1652,22 +1618,20 @@ impl<'a> Parser<'a> {
 
     fn sql_json_exists(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
-        let null = self.arena_expr(Expr::Null)?;
-        let mut args = [null; MAX_LIST];
-        args[0] = self.expression(0)?;
+        let mut args = ArenaList::new(self.arena);
+        let context = self.expression(0)?;
+        self.push(&mut args, context)?;
         self.expect_op(",")?;
-        args[1] = self.expression(0)?;
-        let mut count = 2;
+        let path = self.expression(0)?;
+        self.push(&mut args, path)?;
         if self.eat_ident("passing")? {
             loop {
-                if count + 2 > MAX_LIST {
-                    return Err(self.limit("JSON passing arguments", (MAX_LIST - 2) / 2));
-                }
-                args[count] = self.expression(0)?;
+                let value = self.expression(0)?;
+                self.push(&mut args, value)?;
                 self.expect_ident("as")?;
                 let name = self.any_ident("JSON path variable name")?;
-                args[count + 1] = self.arena_expr(Expr::Str(name))?;
-                count += 2;
+                let name_expr = self.arena_expr(Expr::Str(name))?;
+                self.push(&mut args, name_expr)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -1696,28 +1660,27 @@ impl<'a> Parser<'a> {
                 "error" => "__json_exists_error",
                 _ => "__json_exists_false",
             },
-            &args[..count],
+            args.as_slice(),
         )
     }
 
     fn sql_json_value(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
         let null = self.arena_expr(Expr::Null)?;
-        let mut args = [null; MAX_LIST];
-        args[0] = self.expression(0)?;
+        let mut args = ArenaList::new(self.arena);
+        let context = self.expression(0)?;
+        self.push(&mut args, context)?;
         self.expect_op(",")?;
-        args[1] = self.expression(0)?;
-        let mut count = 2;
+        let path = self.expression(0)?;
+        self.push(&mut args, path)?;
         if self.eat_ident("passing")? {
             loop {
-                if count + 2 + 6 > MAX_LIST {
-                    return Err(self.limit("JSON passing arguments", (MAX_LIST - 8) / 2));
-                }
-                args[count] = self.expression(0)?;
+                let value = self.expression(0)?;
+                self.push(&mut args, value)?;
                 self.expect_ident("as")?;
                 let name = self.any_ident("JSON path variable name")?;
-                args[count + 1] = self.arena_expr(Expr::Str(name))?;
-                count += 2;
+                let name_expr = self.arena_expr(Expr::Str(name))?;
+                self.push(&mut args, name_expr)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -1753,13 +1716,17 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        args[count] = empty_default;
-        args[count + 1] = error_default;
-        args[count + 2] = self.arena_expr(Expr::Str(empty_code))?;
-        args[count + 3] = self.arena_expr(Expr::Str(error_code))?;
-        args[count + 4] = self.arena_expr(Expr::Str(type_name))?;
-        args[count + 5] = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
-        let call = self.plain_call("__json_value", &args[..count + 6])?;
+        self.push(&mut args, empty_default)?;
+        self.push(&mut args, error_default)?;
+        let empty_code_expr = self.arena_expr(Expr::Str(empty_code))?;
+        self.push(&mut args, empty_code_expr)?;
+        let error_code_expr = self.arena_expr(Expr::Str(error_code))?;
+        self.push(&mut args, error_code_expr)?;
+        let type_name_expr = self.arena_expr(Expr::Str(type_name))?;
+        self.push(&mut args, type_name_expr)?;
+        let type_mod_expr = self.arena_expr(Expr::Int(i64::from(type_mod)))?;
+        self.push(&mut args, type_mod_expr)?;
+        let call = self.plain_call("__json_value", args.as_slice())?;
         self.arena_expr(Expr::Cast {
             operand: call,
             type_name,
@@ -1770,21 +1737,20 @@ impl<'a> Parser<'a> {
     fn sql_json_query(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
         let null = self.arena_expr(Expr::Null)?;
-        let mut args = [null; MAX_LIST];
-        args[0] = self.expression(0)?;
+        let mut args = ArenaList::new(self.arena);
+        let context = self.expression(0)?;
+        self.push(&mut args, context)?;
         self.expect_op(",")?;
-        args[1] = self.expression(0)?;
-        let mut count = 2;
+        let path = self.expression(0)?;
+        self.push(&mut args, path)?;
         if self.eat_ident("passing")? {
             loop {
-                if count + 2 + 6 > MAX_LIST {
-                    return Err(self.limit("JSON passing arguments", (MAX_LIST - 8) / 2));
-                }
-                args[count] = self.expression(0)?;
+                let value = self.expression(0)?;
+                self.push(&mut args, value)?;
                 self.expect_ident("as")?;
                 let name = self.any_ident("JSON path variable name")?;
-                args[count + 1] = self.arena_expr(Expr::Str(name))?;
-                count += 2;
+                let name_expr = self.arena_expr(Expr::Str(name))?;
+                self.push(&mut args, name_expr)?;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -1861,12 +1827,16 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_op(")")?;
-        args[count] = empty_default;
-        args[count + 1] = error_default;
-        args[count + 2] = self.arena_expr(Expr::Str(empty_code))?;
-        args[count + 3] = self.arena_expr(Expr::Str(error_code))?;
-        args[count + 4] = self.arena_expr(Expr::Str(wrapper))?;
-        args[count + 5] = self.arena_expr(Expr::Str(quotes))?;
+        self.push(&mut args, empty_default)?;
+        self.push(&mut args, error_default)?;
+        let empty_code_expr = self.arena_expr(Expr::Str(empty_code))?;
+        self.push(&mut args, empty_code_expr)?;
+        let error_code_expr = self.arena_expr(Expr::Str(error_code))?;
+        self.push(&mut args, error_code_expr)?;
+        let wrapper_expr = self.arena_expr(Expr::Str(wrapper))?;
+        self.push(&mut args, wrapper_expr)?;
+        let quotes_expr = self.arena_expr(Expr::Str(quotes))?;
+        self.push(&mut args, quotes_expr)?;
         let call = self.plain_call(
             match result {
                 "json" => "__json_query_json",
@@ -1875,7 +1845,7 @@ impl<'a> Parser<'a> {
                 "bytea" => "__json_query_bytea",
                 _ => unreachable!(),
             },
-            &args[..count + 6],
+            args.as_slice(),
         )?;
         if result == "text" && (!type_name.eq_ignore_ascii_case("text") || type_mod >= 0) {
             return self.arena_expr(Expr::Cast {
@@ -2118,19 +2088,14 @@ impl<'a> Parser<'a> {
                 filter,
             });
         }
-        let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-        let mut args: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
-        let mut argument_names = [None; MAX_LIST];
-        let mut n = 0;
+        let mut args = ArenaList::new(self.arena);
+        let mut argument_names = ArenaList::new(self.arena);
         let mut saw_named = false;
         let mut variadic = false;
         if self.peeked != Tok::Op(")") {
             loop {
-                if n == MAX_LIST {
-                    return Err(self.limit("function arguments", MAX_LIST));
-                }
                 let this_variadic = self.eat_ident("variadic")?;
-                if this_variadic && (n != 0 && saw_named) {
+                if this_variadic && (!args.is_empty() && saw_named) {
                     return Err(self.err_here("VARIADIC argument cannot use named notation"));
                 }
                 let first = self.expression(0)?;
@@ -2146,8 +2111,9 @@ impl<'a> Parser<'a> {
                             );
                         }
                     };
-                    argument_names[n] = Some(argument_name);
-                    args[n] = self.expression(0)?;
+                    self.push(&mut argument_names, Some(argument_name))?;
+                    let value = self.expression(0)?;
+                    self.push(&mut args, value)?;
                     saw_named = true;
                 } else {
                     if saw_named {
@@ -2155,17 +2121,16 @@ impl<'a> Parser<'a> {
                             self.err_here("positional argument cannot follow named argument")
                         );
                     }
-                    args[n] = first;
+                    self.push(&mut argument_names, None)?;
+                    self.push(&mut args, first)?;
                 }
                 if this_variadic {
                     variadic = true;
-                    n += 1;
                     if self.peeked != Tok::Op(")") {
                         return Err(self.err_here("VARIADIC argument must be last"));
                     }
                     break;
                 }
-                n += 1;
                 if !self.eat_op(",")? {
                     break;
                 }
@@ -2197,9 +2162,9 @@ impl<'a> Parser<'a> {
         };
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
-        let args = self.arena_slice(&args[..n])?;
+        let args = args.as_slice();
         let argument_names = if saw_named {
-            self.arena_slice(&argument_names[..n])?
+            argument_names.as_slice()
         } else {
             &[]
         };
@@ -2417,7 +2382,7 @@ impl<'a> Parser<'a> {
         let name = self
             .arena
             .alloc_str(encoded.as_str())
-            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         let args = self.arena_slice(&[left, right])?;
         self.arena_expr(Expr::Call {
             name,
@@ -2451,7 +2416,7 @@ impl<'a> Parser<'a> {
         let name = self
             .arena
             .alloc_str(encoded.as_str())
-            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+            .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
         self.arena_expr(Expr::Call {
             name,
             args: self.arena_slice(&[operand])?,
@@ -2557,7 +2522,7 @@ impl<'a> Parser<'a> {
             let combined = crate::stack_format!(64, "{} {}", value, word);
             self.arena
                 .alloc_str(combined.as_str())
-                .map_err(|_| self.err_here("interval literal too large for SQL arena"))?
+                .map_err(|_| self.arena_full("interval literal too large for SQL arena"))?
         } else {
             lit
         };
@@ -2720,7 +2685,7 @@ impl<'a> Parser<'a> {
         };
         self.arena
             .alloc_str(combined.as_str())
-            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+            .map_err(|_| self.arena_full("interval literal too large for SQL arena"))
     }
 
     /// A clock `TO`-range qualifier — `INTERVAL '1 2:03:04' DAY TO SECOND` and
@@ -2845,7 +2810,7 @@ impl<'a> Parser<'a> {
         );
         self.arena
             .alloc_str(combined.as_str())
-            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+            .map_err(|_| self.arena_full("interval literal too large for SQL arena"))
     }
 
     /// A bare number interpreted in a single field for a range qualifier — the
@@ -2881,7 +2846,7 @@ impl<'a> Parser<'a> {
         let combined = crate::stack_format!(64, "{} {}", magnitude, word);
         self.arena
             .alloc_str(combined.as_str())
-            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+            .map_err(|_| self.arena_full("interval literal too large for SQL arena"))
     }
 
     /// The interval field keyword under the cursor, as `(unit word, keeps a

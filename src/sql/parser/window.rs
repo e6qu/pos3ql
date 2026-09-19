@@ -8,7 +8,8 @@ use crate::sql::eval::sqlstate;
 use crate::sql::lexer::Tok;
 use crate::stack_format;
 
-use super::{MAX_LIST, MAX_WINDOW_DEFS, ParseError, Parser};
+use super::{ParseError, Parser};
+use crate::mem::arena::ArenaList;
 use crate::sql::ast::{
     Expr, FrameBound, FrameExclusion, FrameUnits, OrderBy, WindowFrame, WindowSpec,
 };
@@ -30,17 +31,8 @@ impl<'a> Parser<'a> {
     /// Parses a comma-separated ORDER BY item list (the `ORDER BY` keyword
     /// already consumed).
     pub(super) fn order_by_items(&mut self) -> Result<&'a [OrderBy<'a>], ParseError> {
-        let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-        let mut ord = [OrderBy {
-            expression: null_expr,
-            descending: false,
-            nulls_first: false,
-        }; MAX_LIST];
-        let mut m = 0;
+        let mut ord = ArenaList::new(self.arena);
         loop {
-            if m == MAX_LIST {
-                return Err(self.limit("ORDER BY", MAX_LIST));
-            }
             let expression = self.expression(0)?;
             let descending = self.order_direction()?;
             let nulls_first = if self.eat_ident("nulls")? {
@@ -53,17 +45,19 @@ impl<'a> Parser<'a> {
             } else {
                 descending
             };
-            ord[m] = OrderBy {
-                expression,
-                descending,
-                nulls_first,
-            };
-            m += 1;
+            self.push(
+                &mut ord,
+                OrderBy {
+                    expression,
+                    descending,
+                    nulls_first,
+                },
+            )?;
             if !self.eat_op(",")? {
                 break;
             }
         }
-        self.arena_slice(&ord[..m])
+        Ok(ord.as_slice())
     }
 
     /// One frame bound: UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, or
@@ -107,7 +101,7 @@ impl<'a> Parser<'a> {
 
     /// Resolves a name against the query's `WINDOW` definitions.
     pub(super) fn named_window(&mut self, name: &str) -> Result<&'a WindowSpec<'a>, ParseError> {
-        for entry in &self.windows[..self.n_windows] {
+        for entry in self.windows.as_slice() {
             match entry {
                 Some((defined, spec)) if *defined == name => return Ok(spec),
                 _ => {}
@@ -127,7 +121,7 @@ impl<'a> Parser<'a> {
         let spec = self
             .arena
             .alloc(spec)
-            .map_err(|_| self.err_here("window spec too large for arena"))?;
+            .map_err(|_| self.arena_full("window spec too large for arena"))?;
         Ok(&*spec)
     }
 
@@ -136,7 +130,7 @@ impl<'a> Parser<'a> {
     /// clause, and re-parsing it in its written position must not see itself
     /// as a redefinition).
     pub(super) fn window_definitions(&mut self) -> Result<(), ParseError> {
-        self.n_windows = 0;
+        self.windows.truncate(0);
         loop {
             let name = self.any_ident("window name")?;
             if self.named_window(name).is_ok() {
@@ -146,14 +140,13 @@ impl<'a> Parser<'a> {
                     sqlstate: sqlstate::WINDOWING_ERROR,
                 });
             }
-            if self.n_windows == MAX_WINDOW_DEFS {
-                return Err(self.limit("WINDOW definitions", MAX_WINDOW_DEFS));
-            }
             self.expect_ident("as")?;
             self.expect_op("(")?;
             let spec = self.window_spec_body()?;
-            self.windows[self.n_windows] = Some((name, self.arena_window(spec)?));
-            self.n_windows += 1;
+            let entry = Some((name, self.arena_window(spec)?));
+            self.windows
+                .push(entry)
+                .map_err(|_| self.arena_full("statement too large for SQL arena"))?;
             if !self.eat_op(",")? {
                 return Ok(());
             }
@@ -185,19 +178,15 @@ impl<'a> Parser<'a> {
         };
         let partition_by = if self.eat_ident("partition")? {
             self.expect_ident("by")?;
-            let mut parts: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
-            let mut n = 0;
+            let mut parts = ArenaList::new(self.arena);
             loop {
-                if n == MAX_LIST {
-                    return Err(self.limit("PARTITION BY", MAX_LIST));
-                }
-                parts[n] = self.expression(0)?;
-                n += 1;
+                let expression = self.expression(0)?;
+                self.push(&mut parts, expression)?;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
-            self.arena_slice(&parts[..n])?
+            parts.as_slice()
         } else {
             &[]
         };

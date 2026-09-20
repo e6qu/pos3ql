@@ -50,6 +50,17 @@ The full suite additionally needs Docker unless
 tools/run-performance.sh full ./performance-results/local
 ```
 
+To repeat only setup and mixed checkpoint pressure without starting PostgreSQL
+or replicas, use `checkpoint` mode. It retains the same raw workload schema and
+requires `POS3QL_BENCH_REPLICAS=0`:
+
+```sh
+POS3QL_BENCH_ROWS=1000 POS3QL_BENCH_TABLE_CAPACITY=2048 \
+POS3QL_BENCH_OPERATIONS=50 POS3QL_BENCH_CLIENTS=4 \
+POS3QL_BENCH_DISK_CACHE_MIB=1024 POS3QL_BENCH_TIMEOUT_SECONDS=120 \
+tools/run-performance.sh checkpoint ./performance-results/checkpoint
+```
+
 For an existing PostgreSQL instance, set
 `POS3QL_BENCH_POSTGRES_STORAGE` to describe its storage medium. The full run
 requires PostgreSQL 18 with `fsync`, `full_page_writes`, and
@@ -102,6 +113,21 @@ spilled rows alongside resident changes. The same-process point workload still
 records object reads and does not qualify as fully resident RAM. Explicit
 checkpoint pressure remains costly: the larger mixed run's p99 rose from 39.50
 ms to 4,355.29 ms with three checkpoints.
+The focused [checkpoint run](../benchmarks/baselines/2026-09-20-checkpoint-value-index-1000/README.md)
+preserves raw results from the cursor change on a clean commit. Its different
+suite order prevents a controlled timing comparison with that full baseline.
+Profiling traced most checkpoint samples to value-index rebuilds reopening
+spilled rows by point lookup. Checkpoint now derives each index entry from the
+merged sequential spill cursor, including covering payloads and posting
+tokens. Running the same zero-cache, 128-wide-row regression on merged main
+`c7246853` and this branch counted 837 and 84 object GETs, respectively,
+during its second checkpoint; both returned the same indexed rows after
+empty-cache recovery. The regression source is
+`checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery` in
+`src/sql/tests.rs`.
+That fixture isolates repeated reads. It does not establish a representative
+end-to-end speedup; publication and garbage collection remain in the measured
+checkpoint path.
 
 ## Measured scenarios
 

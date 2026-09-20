@@ -64476,6 +64476,82 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
 }
 
 #[test]
+fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
+    let mut config = test_config("checkpoint-value-stream");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-value-stream-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_bytes = 4 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE value_stream (id integer PRIMARY KEY, code text, tags integer[], payload text, padding text); \
+         INSERT INTO value_stream SELECT i, 'k-' || i::text, ARRAY[i], 'before', repeat('x', 2048) \
+           FROM generate_series(1, 128) AS g(i); \
+         CREATE INDEX value_stream_cover ON value_stream (code) INCLUDE (payload); \
+         CREATE INDEX value_stream_tags ON value_stream USING gin (tags)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let slot = engine.storage.find_table("public", "value_stream").unwrap();
+    engine.storage.evict_committed_table(slot);
+    engine.storage.evict_redundant_entries(slot);
+    assert!(engine.storage.spill_rows_are_unshadowed(slot));
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE value_stream SET payload = 'after' WHERE id = 17; \
+         UPDATE value_stream SET code = 'moved' WHERE id = 55; \
+         DELETE FROM value_stream WHERE id = 43; \
+         INSERT INTO value_stream VALUES (129, 'new', ARRAY[129], 'inserted', repeat('y', 2048))",
+    );
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    let before = engine.storage.block_io_stats();
+    assert!(engine.checkpoint().unwrap());
+    let reads = engine.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        (1..=160).contains(&reads.object_gets),
+        "spilled index rebuild repeated point reads: {reads:?}"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, payload FROM value_stream WHERE code IN ('k-17', 'moved', 'new') ORDER BY id; \
+             SELECT count(*) FROM value_stream WHERE tags @> ARRAY[43]; \
+             SELECT count(*) FROM value_stream",
+        )),
+        ["17|after", "55|before", "129|inserted", "0", "128"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

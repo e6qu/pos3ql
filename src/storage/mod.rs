@@ -275,11 +275,20 @@ pub(crate) struct SpilledRow<'a> {
 
 /// The physical representation a merged spill cursor hands to the executor.
 /// Canonical entries retain the historical path; PAX entries arrive as
-/// statement-owned decoded values after the resident block has been released.
+/// arena-owned decoded values after the resident block has been released.
 #[derive(Clone, Copy)]
 pub(crate) enum SpilledRowRepresentation<'a> {
     Encoded(&'a [u8]),
     Values(&'a [Datum<'a>]),
+}
+
+/// Key and payload borrow one caller-owned scratch row for the callback only.
+pub(crate) struct CheckpointValueEntry<'a> {
+    pub(crate) rowid: u64,
+    pub(crate) commit_lsn: u64,
+    pub(crate) hash: u64,
+    pub(crate) key: &'a [u8],
+    pub(crate) payload: &'a [u8],
 }
 
 /// A scan batch is deliberately small enough to leave statement-arena space
@@ -24238,6 +24247,7 @@ impl Storage {
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         emit: &mut dyn FnMut(
             u64,
+            u64,
             SpilledRowRepresentation<'a>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
     ) -> Result<(), SqlError> {
@@ -24500,7 +24510,7 @@ impl Storage {
                         "merged spill cursor payload does not match its selected version"
                     ));
                 }
-                Some(representation)
+                Some((commit_lsn, representation))
             } else {
                 None
             };
@@ -24510,8 +24520,8 @@ impl Storage {
                 }
             }
             drop(context);
-            let emitted = if let Some(representation) = representation {
-                emit(rowid, representation)
+            let emitted = if let Some((commit_lsn, representation)) = representation {
+                emit(rowid, commit_lsn, representation)
             } else {
                 Ok(core::ops::ControlFlow::Continue(()))
             };
@@ -24559,7 +24569,7 @@ impl Storage {
             arena,
             false,
             decoded_columns.as_ref(),
-            &mut |rowid, representation| {
+            &mut |rowid, _commit_lsn, representation| {
                 rows[len] = SpilledRow {
                     rowid,
                     representation,
@@ -24927,6 +24937,74 @@ impl Storage {
             }
         }
         Ok(core::ops::ControlFlow::Continue(()))
+    }
+
+    /// Supplies checkpoint index entries from the same merged payload cursor
+    /// used by scans, so spilled rows do not need a second point lookup.
+    pub(crate) fn for_each_value_binding_entry(
+        &self,
+        table_slot: usize,
+        binding: usize,
+        arena: &crate::mem::arena::Arena,
+        output: &mut [u8],
+        each: &mut dyn for<'entry> FnMut(
+            CheckpointValueEntry<'entry>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<(), SqlError> {
+        if self
+            .for_each_scan_overlay_row_state(table_slot, &mut |rowid, state| {
+                let Some(home) = state.committed else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                };
+                let Some((key_len, payload_len, hash)) =
+                    self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
+                else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                };
+                let (key, payload) = output[..key_len + payload_len].split_at(key_len);
+                each(CheckpointValueEntry {
+                    rowid,
+                    commit_lsn: state.committed_lsn,
+                    hash,
+                    key,
+                    payload,
+                })
+            })?
+            .is_break()
+        {
+            return Ok(());
+        }
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = self.tables[table_slot].def.schema(&mut schema);
+        self.spill_merged_walk_bytes(
+            table_slot,
+            arena,
+            true,
+            None,
+            &mut |rowid, commit_lsn, representation| {
+                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                let values = match representation {
+                    SpilledRowRepresentation::Encoded(bytes) => {
+                        rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+                        &decoded[..n_columns]
+                    }
+                    SpilledRowRepresentation::Values(values) => values,
+                };
+                let Some((key_len, payload_len, hash)) =
+                    self.encode_value_binding_values(table_slot, binding, values, output)?
+                else {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                };
+                let (key, payload) = output[..key_len + payload_len].split_at(key_len);
+                each(CheckpointValueEntry {
+                    rowid,
+                    commit_lsn,
+                    hash,
+                    key,
+                    payload,
+                })
+            },
+        )
     }
 
     fn redundant_spilled_row_state(state: &RowState) -> bool {
@@ -26748,76 +26826,82 @@ impl Storage {
         visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
     ) -> Result<R, SqlError> {
         let table = &self.tables[table_index];
-        let enforcer = table.enforcers[binding].expect("binding");
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = table.def.schema(&mut schema);
         let mark = self.index_arena.mark();
         let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-            let mut key = [Datum::Null; MAX_INDEX_COLS];
-            if let Some(created_at) = enforcer.index_created_at {
-                let index = self
-                    .indexes
-                    .iter()
-                    .find(|index| {
-                        index.ddl_state != CatalogDdlState::Absent
-                            && index.created_at == created_at
-                            && index.database == table.database
-                    })
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "physical index binding has no catalog definition"
-                        )
-                    })?;
-                if let Some(source) = index.predicate {
-                    let predicate =
-                        crate::sql::parser::parse_expr(source.as_str(), &self.index_arena)?;
-                    if !crate::sql::exec::constraints::index_predicate_matches(
-                        self,
-                        enforcer.evaluation_txid,
-                        &table.def,
-                        &values[..n_columns],
-                        predicate,
-                        &self.index_arena,
-                    )? {
-                        return visit(None, &values[..n_columns], &enforcer);
-                    }
-                }
-                let mut expressions = [None; MAX_INDEX_COLS];
-                for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
-                    if let Some(source) = source {
-                        expressions[position] = Some(crate::sql::parser::parse_expr(
-                            source.as_str(),
-                            &self.index_arena,
-                        )?);
-                    }
-                }
-                key = crate::sql::exec::constraints::index_key_values(
-                    self,
-                    enforcer.evaluation_txid,
-                    &table.def,
-                    &values[..n_columns],
-                    &index.columns[..index.n_cols],
-                    &expressions[..index.n_cols],
-                    &self.index_arena,
-                )?;
-            } else {
-                for (position, column) in enforcer.columns().iter().enumerate() {
-                    key[position] = values[*column as usize];
-                }
-            }
-            visit(
-                Some(&key[..enforcer.n_cols]),
-                &values[..n_columns],
-                &enforcer,
-            )
+            self.with_value_binding_values(table_index, binding, &values[..n_columns], visit)
         });
         // SAFETY: `visit` cannot return a borrowed key, and all expression
         // values have been encoded or hashed before this row-local rewind.
         unsafe { self.index_arena.rewind_to(mark) };
         result
+    }
+
+    fn with_value_binding_values<R>(
+        &self,
+        table_index: usize,
+        binding: usize,
+        values: &[Datum],
+        visit: impl FnOnce(Option<&[Datum]>, &[Datum], &Enforcer) -> Result<R, SqlError>,
+    ) -> Result<R, SqlError> {
+        let table = &self.tables[table_index];
+        let enforcer = table.enforcers[binding].expect("binding");
+        let mut key = [Datum::Null; MAX_INDEX_COLS];
+        if let Some(created_at) = enforcer.index_created_at {
+            let index = self
+                .indexes
+                .iter()
+                .find(|index| {
+                    index.ddl_state != CatalogDdlState::Absent
+                        && index.created_at == created_at
+                        && index.database == table.database
+                })
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "physical index binding has no catalog definition"
+                    )
+                })?;
+            if let Some(source) = index.predicate {
+                let predicate = crate::sql::parser::parse_expr(source.as_str(), &self.index_arena)?;
+                if !crate::sql::exec::constraints::index_predicate_matches(
+                    self,
+                    enforcer.evaluation_txid,
+                    &table.def,
+                    values,
+                    predicate,
+                    &self.index_arena,
+                )? {
+                    return visit(None, values, &enforcer);
+                }
+            }
+            let mut expressions = [None; MAX_INDEX_COLS];
+            for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
+                if let Some(source) = source {
+                    expressions[position] = Some(crate::sql::parser::parse_expr(
+                        source.as_str(),
+                        &self.index_arena,
+                    )?);
+                }
+            }
+            key = crate::sql::exec::constraints::index_key_values(
+                self,
+                enforcer.evaluation_txid,
+                &table.def,
+                values,
+                &index.columns[..index.n_cols],
+                &expressions[..index.n_cols],
+                &self.index_arena,
+            )?;
+        } else {
+            for (position, column) in enforcer.columns().iter().enumerate() {
+                key[position] = values[*column as usize];
+            }
+        }
+        visit(Some(&key[..enforcer.n_cols]), values, &enforcer)
     }
 
     /// The value-index maintenance for one committed row transition: remove the
@@ -28141,52 +28225,77 @@ impl Storage {
             binding,
             rowid,
             home,
-            |key, values, enforcer| {
-                let Some(key) = key else { return Ok(None) };
-                let key_len = rowenc::encoded_len(key);
-                let mut payload = [Datum::Null; MAX_COLUMNS];
-                let mut n_payload = 0usize;
-                for (column, value) in values.iter().enumerate() {
-                    if enforcer.include_mask & (1u64 << column) != 0 {
-                        payload[n_payload] = *value;
-                        n_payload += 1;
-                    }
-                }
-                let payload_len = if n_payload == 0 {
-                    0
-                } else {
-                    rowenc::encoded_len(&payload[..n_payload])
-                };
-                if key_len > crate::store::VALUE_INDEX_KEY_MAX
-                    || (n_payload != 0
-                        && key_len.saturating_add(payload_len)
-                            > crate::store::VALUE_INDEX_TUPLE_MAX)
-                    || key_len.saturating_add(payload_len) > output.len()
-                {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "index tuple exceeds the persistent block limit"
-                    ));
-                }
-                rowenc::encode(key, &mut output[..key_len]);
-                if n_payload != 0 {
-                    rowenc::encode(
-                        &payload[..n_payload],
-                        &mut output[key_len..key_len + payload_len],
-                    );
-                }
-                let compact = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
-                Ok(Some((
-                    key_len,
-                    payload_len,
-                    hash_key_collated(
-                        key,
-                        &compact[..enforcer.n_cols],
-                        &enforcer.collations[..enforcer.n_cols],
-                    ),
-                )))
-            },
+            |key, values, enforcer| Self::encode_value_binding_parts(key, values, enforcer, output),
         )
+    }
+
+    fn encode_value_binding_values(
+        &self,
+        table_index: usize,
+        binding: usize,
+        values: &[Datum],
+        output: &mut [u8],
+    ) -> Result<Option<(usize, usize, u64)>, SqlError> {
+        let mark = self.index_arena.mark();
+        let result = self.with_value_binding_values(
+            table_index,
+            binding,
+            values,
+            |key, values, enforcer| Self::encode_value_binding_parts(key, values, enforcer, output),
+        );
+        // SAFETY: the encoded key and payload own their bytes in `output`.
+        unsafe { self.index_arena.rewind_to(mark) };
+        result
+    }
+
+    fn encode_value_binding_parts(
+        key: Option<&[Datum]>,
+        values: &[Datum],
+        enforcer: &Enforcer,
+        output: &mut [u8],
+    ) -> Result<Option<(usize, usize, u64)>, SqlError> {
+        let Some(key) = key else { return Ok(None) };
+        let key_len = rowenc::encoded_len(key);
+        let mut payload = [Datum::Null; MAX_COLUMNS];
+        let mut n_payload = 0usize;
+        for (column, value) in values.iter().enumerate() {
+            if enforcer.include_mask & (1u64 << column) != 0 {
+                payload[n_payload] = *value;
+                n_payload += 1;
+            }
+        }
+        let payload_len = if n_payload == 0 {
+            0
+        } else {
+            rowenc::encoded_len(&payload[..n_payload])
+        };
+        if key_len > crate::store::VALUE_INDEX_KEY_MAX
+            || (n_payload != 0
+                && key_len.saturating_add(payload_len) > crate::store::VALUE_INDEX_TUPLE_MAX)
+            || key_len.saturating_add(payload_len) > output.len()
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "index tuple exceeds the persistent block limit"
+            ));
+        }
+        rowenc::encode(key, &mut output[..key_len]);
+        if n_payload != 0 {
+            rowenc::encode(
+                &payload[..n_payload],
+                &mut output[key_len..key_len + payload_len],
+            );
+        }
+        let compact = core::array::from_fn::<u16, MAX_INDEX_COLS, _>(|index| index as u16);
+        Ok(Some((
+            key_len,
+            payload_len,
+            hash_key_collated(
+                key,
+                &compact[..enforcer.n_cols],
+                &enforcer.collations[..enforcer.n_cols],
+            ),
+        )))
     }
 
     /// Compares two encoded keys with the indexed columns' PostgreSQL types

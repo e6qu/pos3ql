@@ -96,6 +96,12 @@ GET in flight; scans stream redundant spilled rows through the merged cursor.
 The harness records cache size and query timeout, and all 59 workloads now
 complete against actual PostgreSQL 18. The remaining checkpoint cost is
 performance qualification work in PLAN.md.
+The value-index checkpoint audit found no externally blocked defect. Its
+rebuild now encodes keys and covering payloads from the merged spill cursor
+instead of reopening each spilled row. A zero-cache regression qualifies
+primary, covering, and posting indexes across updates, deletes, insertion,
+and object-cold recovery. Remaining checkpoint interference is performance
+qualification work in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

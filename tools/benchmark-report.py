@@ -36,9 +36,11 @@ def main():
     print("# pos3ql performance report\n")
     print("Raw JSON files are the evidence; this report derives comparisons without hiding errors.\n")
     environment_path = args.directory / "environment.json"
+    suite_mode = None
     if environment_path.exists():
         environment = json.loads(environment_path.read_text(encoding="utf-8"))
         suite = environment["suite"]
+        suite_mode = suite.get("mode")
         cache = (
             f"{suite['disk_cache_mib']} MiB fixed disk cache, "
             if "disk_cache_mib" in suite else ""
@@ -178,6 +180,8 @@ def main():
     if comparisons:
         for label, value in comparisons:
             print(f"- {label}: {number(value)}x")
+    elif suite_mode == "checkpoint":
+        print("- This focused run measures checkpoint overlap; compare its raw workload with a matching run.")
     else:
         print("- The smoke suite does not run long-form comparison scenarios.")
 

@@ -24344,7 +24344,10 @@ impl Storage {
                 member,
                 commit_lsn,
             }) = verdict
-                && self.tables[slot].rows.get(&rowid).is_none()
+                && self.tables[slot]
+                    .rows
+                    .get(&rowid)
+                    .is_none_or(Self::redundant_spilled_row_state)
             {
                 let cursor = &cursors[member as usize];
                 let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
@@ -24523,11 +24526,9 @@ impl Storage {
         }
     }
 
-    /// Streams every spill-only row in bounded batches with bytes already
-    /// carried by the merged data-block cursor. Overlay rows are intentionally
-    /// excluded: they remain in the row-state seam, where transaction
-    /// visibility is resolved. The outer physical scan combines these rows
-    /// with that seam in its established physical order.
+    /// Streams spill rows in bounded batches with bytes carried by the merged
+    /// cursor. Mutable overlay rows stay in the row-state seam; redundant
+    /// committed spill metadata does not force a second object read.
     pub(crate) fn for_each_spilled_row_batch<'a, 'callback>(
         &self,
         table_slot: usize,
@@ -24872,10 +24873,11 @@ impl Storage {
     ) -> Result<(), SqlError> {
         // The overlay first: pending changes and hot rows, whose entries
         // shadow anything the spill list holds for the same rowid.
-        for (&rowid, state) in self.tables[table_slot].rows.iter() {
-            if each(rowid, *state)?.is_break() {
-                return Ok(());
-            }
+        if self
+            .for_each_resident_row_state(table_slot, each)?
+            .is_break()
+        {
+            return Ok(());
         }
         if self.tables[table_slot].n_spill_ssts == 0 {
             return Ok(());
@@ -24896,6 +24898,41 @@ impl Storage {
                 },
             )
         })
+    }
+
+    pub(crate) fn for_each_resident_row_state(
+        &self,
+        table_slot: usize,
+        each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<core::ops::ControlFlow<()>, SqlError> {
+        for (&rowid, state) in self.tables[table_slot].rows.iter() {
+            if each(rowid, *state)?.is_break() {
+                return Ok(core::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    }
+
+    pub(crate) fn for_each_scan_overlay_row_state(
+        &self,
+        table_slot: usize,
+        each: &mut dyn FnMut(u64, RowState) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<core::ops::ControlFlow<()>, SqlError> {
+        for (&rowid, state) in self.tables[table_slot].rows.iter() {
+            if Self::redundant_spilled_row_state(state) {
+                continue;
+            }
+            if each(rowid, *state)?.is_break() {
+                return Ok(core::ops::ControlFlow::Break(()));
+            }
+        }
+        Ok(core::ops::ControlFlow::Continue(()))
+    }
+
+    fn redundant_spilled_row_state(state: &RowState) -> bool {
+        matches!(state.committed, Some(RowHome::Spilled { .. }))
+            && state.history.is_empty()
+            && state.pending.is_none()
     }
 
     /// One row's state by id, through the same seam as the enumeration.
@@ -26382,10 +26419,7 @@ impl Storage {
             let mut batch = [0u64; 512];
             let mut n = 0usize;
             for (&rowid, state) in table.rows.iter() {
-                if matches!(state.committed, Some(RowHome::Spilled { .. }))
-                    && state.history.is_empty()
-                    && state.pending.is_none()
-                {
+                if Self::redundant_spilled_row_state(state) {
                     batch[n] = rowid;
                     n += 1;
                     if n == batch.len() {

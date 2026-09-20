@@ -154,6 +154,18 @@ change. The shared-host latency pair remains exploratory. Attribute the
 remaining SST publication and garbage-deletion costs, then qualify foreground
 interference at larger scale before changing checkpoint pacing.
 
+The focused harness now runs matching mixed workloads with and without three
+explicit checkpoints against actual PostgreSQL 18 as well as pos3ql. It
+rejects missing checkpoint operations and records PostgreSQL's durability and
+local storage settings. The [paired 1,000-row run](benchmarks/baselines/2026-09-21-postgresql18-checkpoint-1000/README.md)
+completed without errors: pos3ql p99 was 72.39 ms without explicit
+checkpoints and 1,447.94 ms with them; PostgreSQL p99 was 2.76 and 1.51 ms
+in its much shorter samples. These shared-host timings are exploratory, and
+PostgreSQL's local persistence has no equivalent object-request metric.
+Next, attribute pos3ql's remaining SST publication and deletion time using
+phase-specific measurements, then repeat checkpoint interference on larger
+datasets and representative hardware.
+
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local
 storage medium and durability settings and pos3ql's object store, network,

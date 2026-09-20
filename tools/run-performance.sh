@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=tests/external/liveness.sh
 . "$ROOT/tests/external/liveness.sh"
 TEST_PORT_HELPER="$ROOT/tests/external/test_ports.py"
 

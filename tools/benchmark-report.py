@@ -138,22 +138,6 @@ def main():
         ))
     pg_baseline = results.get("postgresql18-mixed-baseline")
     pg_interference = results.get("postgresql18-mixed-checkpoint-interference")
-    if pg_baseline and pg_interference:
-        comparisons.append((
-            "PostgreSQL 18 checkpoint-overlap / baseline p99",
-            ratio(
-                pg_interference["results"]["latency_ms"]["p99"],
-                pg_baseline["results"]["latency_ms"]["p99"],
-            ),
-        ))
-    if interference and pg_interference:
-        comparisons.append((
-            "pos3ql / PostgreSQL 18 checkpoint-overlap p99",
-            ratio(
-                interference["results"]["latency_ms"]["p99"],
-                pg_interference["results"]["latency_ms"]["p99"],
-            ),
-        ))
     postgres = results.get("postgresql18-point")
     if postgres and warm:
         comparisons.append((
@@ -202,6 +186,14 @@ def main():
         print("- This focused run measures checkpoint overlap; compare its raw workload with a matching run.")
     else:
         print("- The smoke suite does not run long-form comparison scenarios.")
+    if pg_baseline and pg_interference and interference:
+        print(
+            "- Matched checkpoint commands completed: "
+            f"pos3ql {interference['results']['maintenance_operations']}, "
+            f"PostgreSQL 18 {pg_interference['results']['maintenance_operations']}. "
+            "This short shared-host run compares SQL workloads on distinct persistence tiers; "
+            "the p99 samples above do not establish production ratios."
+        )
 
     scaling = sorted(
         (

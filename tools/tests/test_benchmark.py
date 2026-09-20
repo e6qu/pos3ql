@@ -341,6 +341,7 @@ class BenchmarkTest(unittest.TestCase):
             require_index=False,
             workload="update",
             maintenance_interval=0.0,
+            maintenance_limit=0,
             object_metrics=None,
             pid=None,
             fixed_memory_bytes=None,

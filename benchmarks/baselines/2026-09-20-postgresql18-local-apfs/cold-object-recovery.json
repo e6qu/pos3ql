@@ -1,0 +1,19 @@
+{
+  "artifact_type": "recovery",
+  "elapsed_seconds": 0.029348333,
+  "label": "cold-object-recovery",
+  "object_store": {
+    "errors": 0,
+    "request_body_bytes": 0,
+    "requests": {
+      "delete": 0,
+      "get": 5,
+      "list": 0,
+      "put": 0,
+      "range_get": 21
+    },
+    "response_body_bytes": 154336,
+    "schema_version": 1
+  },
+  "schema_version": 1
+}

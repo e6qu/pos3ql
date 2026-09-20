@@ -106,20 +106,26 @@ without post-startup allocation or weaker durability.
 
 ### Performance qualification
 
-Run an early exploratory baseline against unmodified PostgreSQL 18 using
-its normal local-storage durability path. Drive both systems with the same SQL,
-client load, row counts, and durability expectations; pos3ql uses its object
-store for durable state. Record PostgreSQL's storage medium and settings and
-pos3ql's independently operated compatible object store, network, and cache
-conditions. Compare end-to-end latency and throughput while reporting each
-system's distinct persistence costs separately. Do not model PostgreSQL as an
-object-storage database or treat its cache and object-request metrics as
-equivalent to pos3ql's.
+The [first exploratory baseline](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
+is complete against unmodified PostgreSQL 18 on its normal local-storage
+durability path. Matched comparison workloads used the same SQL and load.
+pos3ql published to an instrumented object-store fixture backed by local
+temporary storage. The 256-row, four-client run has complete raw artifacts,
+but its same-process point workload still made object requests. Its short
+duration cannot establish production ratios. The partial 1,000-row attempt
+timed out in SP-GiST text-prefix probing before reaching PostgreSQL.
+Diagnose that scaling boundary, settle the cache state explicitly, and
+extend the comparison to larger datasets and logical replicas before using it
+to rank concurrency
+or storage changes.
 
-Use the early comparison to identify the largest costs before changing
-concurrency or storage paths. Repeat long-running measurements after those
-changes on pinned representative hardware with an independently operated
-compatible object store. Publish schema-versioned raw
+Repeat long-running measurements on pinned representative hardware with an
+independently operated compatible object store. Record PostgreSQL's local
+storage medium and durability settings and pos3ql's object store, network,
+and cache conditions. Compare end-to-end latency and throughput for the stated
+setups while reporting each system's distinct persistence costs separately.
+Do not model PostgreSQL as an object-storage database or treat its cache and
+object-request metrics as equivalent to pos3ql's. Publish schema-versioned raw
 artifacts and a reproducible report with throughput, latency percentiles, CPU,
 fixed-memory occupancy, object requests and bytes, recovery time, checkpoint
 interference, replica freshness, and physical access-path counters.

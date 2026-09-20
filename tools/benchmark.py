@@ -330,6 +330,8 @@ def identify(connection):
 
 
 def setup_database(connection, rows):
+    # Setup is untimed and may build many indexes over a large fixture.
+    connection.socket.settimeout(300)
     connection.query("DROP TABLE IF EXISTS benchmark_kv")
     # A realistic row body makes even the small CI dataset span immutable
     # table blocks, so a selective cold index probe competes against an actual
@@ -347,6 +349,25 @@ def setup_database(connection, rows):
         "payload bigint NOT NULL, "
         "padding text NOT NULL DEFAULT repeat('x', 8192))"
     )
+    # Keep setup valid for startup-sized transaction pools smaller than the
+    # dataset; each chunk is its own implicit transaction on both engines.
+    for first in range(1, rows + 1, 100):
+        last = min(rows, first + 99)
+        connection.query(
+            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_spans, gist_address, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_span, spgist_address, spgist_location, payload) "
+            "SELECT value, value, value, int4range(value * 2, value * 2 + 2), "
+            "int4range(value * 3, value * 3 + 3), "
+            "int4multirange(int4range(value * 7, value * 7 + 2), int4range(value * 7 + 4, value * 7 + 6)), "
+            "'10.0.0.0'::inet + value, point(value, value), ARRAY[value], "
+            "to_tsvector('simple','token' || value::text), "
+            "to_tsvector('simple','gisttoken' || value::text), "
+            "jsonb_build_object('key' || value::text,'value' || value::text), "
+            "jsonb_build_object('token','value' || value::text), "
+            "'key-' || value::text, int4range(value * 5, value * 5 + 2), "
+            "'11.0.0.0'::inet + value, point(value, -value), 0 "
+            f"FROM generate_series({first}, {last}) AS value"
+        )
+    # Build secondary indexes after the bulk load; measured writes still maintain them.
     connection.query(
         "CREATE INDEX benchmark_hash_lookup ON benchmark_kv USING hash (hash_key)"
     )
@@ -401,26 +422,9 @@ def setup_database(connection, rows):
         "CREATE INDEX benchmark_covering "
         "ON benchmark_kv (id DESC) INCLUDE (payload)"
     )
-    # Keep setup valid for startup-sized transaction pools smaller than the
-    # dataset; each chunk is its own implicit transaction on both engines.
-    for first in range(1, rows + 1, 100):
-        last = min(rows, first + 99)
-        connection.query(
-            "INSERT INTO benchmark_kv(id, hash_key, brin_key, brin_span, gist_span, gist_spans, gist_address, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_span, spgist_address, spgist_location, payload) "
-            "SELECT value, value, value, int4range(value * 2, value * 2 + 2), "
-            "int4range(value * 3, value * 3 + 3), "
-            "int4multirange(int4range(value * 7, value * 7 + 2), int4range(value * 7 + 4, value * 7 + 6)), "
-            "'10.0.0.0'::inet + value, point(value, value), ARRAY[value], "
-            "to_tsvector('simple','token' || value::text), "
-            "to_tsvector('simple','gisttoken' || value::text), "
-            "jsonb_build_object('key' || value::text,'value' || value::text), "
-            "jsonb_build_object('token','value' || value::text), "
-            "'key-' || value::text, int4range(value * 5, value * 5 + 2), "
-            "'11.0.0.0'::inet + value, point(value, -value), 0 "
-            f"FROM generate_series({first}, {last}) AS value"
-        )
     connection.query("ANALYZE benchmark_kv")
     connection.query("CHECKPOINT")
+    connection.socket.settimeout(30)
 
 
 def read_access_path(connection):
@@ -506,6 +510,8 @@ def run(args):
             while not stop_maintenance.wait(args.maintenance_interval):
                 connection.query("CHECKPOINT")
                 maintenance_count[0] += 1
+                if args.maintenance_limit and maintenance_count[0] >= args.maintenance_limit:
+                    break
         except Exception as error:
             with result_lock:
                 errors.append(f"maintenance: {error}")
@@ -539,14 +545,19 @@ def run(args):
     if args.object_metrics:
         time.sleep(0.1)
     after_metrics = read_metrics(args.object_metrics)
+    for connection in connections:
+        connection.close()
     after_access_path = None
     if len(targets) == 1:
         try:
-            after_access_path = read_access_path(connections[0])
+            # PostgreSQL flushes backend statistics when the workers exit.
+            statistics_connection = PgConnection(*targets[0], args.user, args.database)
+            try:
+                after_access_path = read_access_path(statistics_connection)
+            finally:
+                statistics_connection.close()
         except Exception as error:
             errors.append(f"access-path result: {error}")
-    for connection in connections:
-        connection.close()
 
     ordered = sorted(latencies)
     completed = len(ordered)
@@ -567,6 +578,7 @@ def run(args):
             "synchronized": args.synchronized,
             "require_index": args.require_index,
             "maintenance_interval_seconds": args.maintenance_interval,
+            "maintenance_limit": args.maintenance_limit,
             "target_count": len(targets),
         },
         "results": {
@@ -709,6 +721,7 @@ def parse_args():
         help="fail validation unless every operation uses an index and none uses a sequential scan",
     )
     parser.add_argument("--maintenance-interval", type=float, default=0.0)
+    parser.add_argument("--maintenance-limit", type=int, default=0)
     parser.add_argument("--object-metrics")
     parser.add_argument("--pid", type=int)
     parser.add_argument("--fixed-memory-bytes", type=int)
@@ -728,6 +741,8 @@ def parse_args():
         parser.error("clients, operations, and rows must be positive")
     if args.maintenance_interval < 0:
         parser.error("maintenance interval cannot be negative")
+    if args.maintenance_limit < 0 or (args.maintenance_limit and not args.maintenance_interval):
+        parser.error("maintenance limit requires a positive interval")
     if args.require_index and (
         args.workload
         not in (

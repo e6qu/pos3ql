@@ -64598,8 +64598,8 @@ fn checkpoint_reuses_published_index_blocks_after_small_update() {
     assert!(engine.checkpoint().unwrap());
     let writes = engine.storage.block_io_stats().saturating_sub(before);
     assert!(
-        writes.object_puts <= 22,
-        "checkpoint uploaded unchanged published index blocks: {writes:?}"
+        writes.object_puts <= 12,
+        "checkpoint published unnecessary sort runs or unchanged index blocks: {writes:?}"
     );
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

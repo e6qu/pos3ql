@@ -333,6 +333,7 @@ class BenchmarkTest(unittest.TestCase):
             port=5432,
             user="postgres",
             database="postgres",
+            timeout_seconds=30,
             setup=False,
             rows=8,
             clients=4,

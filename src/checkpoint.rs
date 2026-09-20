@@ -10210,68 +10210,70 @@ impl Checkpointer {
             } else {
                 self.value_writer.reset();
             }
-            storage.for_each_row_state(slot, &mut |rowid, state| {
-                use core::ops::ControlFlow;
-                let Some(home) = state.committed else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                let Some((key_len, payload_len, hash)) =
-                    storage.encode_value_binding_entry(slot, binding, rowid, home, key)?
-                else {
-                    return Ok(ControlFlow::Continue(()));
-                };
-                if navigation.is_some_and(|navigation| {
-                    navigation.kind == crate::store::NavigationKind::Posting
-                }) {
-                    let mut token_error = None;
-                    storage.for_each_value_binding_posting_token(
-                        slot,
-                        binding,
-                        &key[..key_len],
-                        |token| {
-                            if token_error.is_some() {
-                                return;
-                            }
-                            let posting_key = token.encode();
-                            let entry_len = VALUE_SORT_ENTRY_HEADER + posting_key.len();
-                            sorted_entry[..8].copy_from_slice(&token.hash().to_le_bytes());
-                            sorted_entry[8..16].copy_from_slice(&rowid.to_le_bytes());
-                            sorted_entry[16..24]
-                                .copy_from_slice(&state.committed_lsn.to_le_bytes());
-                            sorted_entry[24..28]
-                                .copy_from_slice(&(posting_key.len() as u32).to_le_bytes());
-                            sorted_entry[28..32].fill(0);
-                            sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
-                                .copy_from_slice(&posting_key);
-                            if let Err(error) = value_sorter.push_encoded(
-                                &mut *self.blocks.borrow_mut(),
-                                &sorted_entry[..entry_len],
-                                &mut compare,
-                            ) {
-                                token_error = Some(error);
-                            }
-                        },
-                    )?;
-                    if let Some(error) = token_error {
-                        return Err(error);
+            storage.for_each_value_binding_entry(
+                slot,
+                binding,
+                &self.sst_arena,
+                key,
+                &mut |entry| {
+                    use core::ops::ControlFlow;
+                    let key_len = entry.key.len();
+                    if navigation.is_some_and(|navigation| {
+                        navigation.kind == crate::store::NavigationKind::Posting
+                    }) {
+                        let mut token_error = None;
+                        storage.for_each_value_binding_posting_token(
+                            slot,
+                            binding,
+                            entry.key,
+                            |token| {
+                                if token_error.is_some() {
+                                    return;
+                                }
+                                let posting_key = token.encode();
+                                let entry_len = VALUE_SORT_ENTRY_HEADER + posting_key.len();
+                                sorted_entry[..8].copy_from_slice(&token.hash().to_le_bytes());
+                                sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
+                                sorted_entry[16..24]
+                                    .copy_from_slice(&entry.commit_lsn.to_le_bytes());
+                                sorted_entry[24..28]
+                                    .copy_from_slice(&(posting_key.len() as u32).to_le_bytes());
+                                sorted_entry[28..32].fill(0);
+                                sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
+                                    .copy_from_slice(&posting_key);
+                                if let Err(error) = value_sorter.push_encoded(
+                                    &mut *self.blocks.borrow_mut(),
+                                    &sorted_entry[..entry_len],
+                                    &mut compare,
+                                ) {
+                                    token_error = Some(error);
+                                }
+                            },
+                        )?;
+                        if let Some(error) = token_error {
+                            return Err(error);
+                        }
+                        return Ok(ControlFlow::Continue(()));
                     }
-                    return Ok(ControlFlow::Continue(()));
-                }
-                let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + payload_len;
-                sorted_entry[..8].copy_from_slice(&hash.to_le_bytes());
-                sorted_entry[8..16].copy_from_slice(&rowid.to_le_bytes());
-                sorted_entry[16..24].copy_from_slice(&state.committed_lsn.to_le_bytes());
-                sorted_entry[24..28].copy_from_slice(&(key_len as u32).to_le_bytes());
-                sorted_entry[28..32].copy_from_slice(&(payload_len as u32).to_le_bytes());
-                sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
-                    .copy_from_slice(&key[..key_len + payload_len]);
-                value_sorter.push_encoded(
-                    &mut *self.blocks.borrow_mut(),
-                    &sorted_entry[..entry_len],
-                    &mut compare,
-                )?;
-                Ok(ControlFlow::Continue(()))
-            })?;
+                    let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + entry.payload.len();
+                    sorted_entry[..8].copy_from_slice(&entry.hash.to_le_bytes());
+                    sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
+                    sorted_entry[16..24].copy_from_slice(&entry.commit_lsn.to_le_bytes());
+                    sorted_entry[24..28].copy_from_slice(&(key_len as u32).to_le_bytes());
+                    sorted_entry[28..32]
+                        .copy_from_slice(&(entry.payload.len() as u32).to_le_bytes());
+                    sorted_entry[VALUE_SORT_ENTRY_HEADER..VALUE_SORT_ENTRY_HEADER + key_len]
+                        .copy_from_slice(entry.key);
+                    sorted_entry[VALUE_SORT_ENTRY_HEADER + key_len..entry_len]
+                        .copy_from_slice(entry.payload);
+                    value_sorter.push_encoded(
+                        &mut *self.blocks.borrow_mut(),
+                        &sorted_entry[..entry_len],
+                        &mut compare,
+                    )?;
+                    Ok(ControlFlow::Continue(()))
+                },
+            )?;
             let run = value_sorter.finish(&mut *self.blocks.borrow_mut(), &mut compare)?;
             if let Some(run) = run {
                 value_sort_reader.start(&mut *self.blocks.borrow_mut(), run)?;

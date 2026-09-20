@@ -123,10 +123,16 @@ warm-disk, and empty-cache states, then extend to larger datasets and logical
 replicas before using the comparison to rank concurrency or storage changes.
 
 Profile explicit checkpoint work by value-index rebuild, SST publication,
-and garbage deletion. The 1,000-row maintenance case completed, but its
-5,902 object requests and 4.36-second p99 query latency make checkpoint
-interference the next measured performance boundary. Preserve durability and
-fixed-memory behavior while reducing repeated reads and publication churn.
+and garbage deletion. The 1,000-row maintenance case completed with 5,902
+object requests and 4.36-second p99 query latency. Value-index rebuild now
+uses the merged spill cursor instead of point-reading each spilled row; a
+zero-cache regression reduced second-checkpoint object GETs from 837 to 84
+while preserving indexed results after object-cold recovery. Measure the
+remaining publication, garbage-deletion, and foreground interference costs
+before ranking further changes. A focused
+[1,000-row run](benchmarks/baselines/2026-09-20-checkpoint-value-index-1000/README.md)
+records the revised path but is not a controlled timing comparison with the
+earlier full suite. Preserve durability and fixed-memory behavior.
 
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local

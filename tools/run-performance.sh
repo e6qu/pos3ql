@@ -8,8 +8,8 @@ TEST_PORT_HELPER="$ROOT/tests/external/test_ports.py"
 
 MODE=${1:-full}
 case "$MODE" in
-  smoke|full) ;;
-  *) echo "usage: $0 [smoke|full] [output-directory]" >&2; exit 2 ;;
+  smoke|full|checkpoint) ;;
+  *) echo "usage: $0 [smoke|full|checkpoint] [output-directory]" >&2; exit 2 ;;
 esac
 OUTPUT=${2:-"$ROOT/performance-results/$(date -u +%Y%m%dT%H%M%SZ)"}
 mkdir -p "$OUTPUT"
@@ -222,11 +222,18 @@ else
   CLIENTS=${POS3QL_BENCH_CLIENTS:-8}
   REPLICA_SETTING=${POS3QL_BENCH_REPLICAS:-2}
 fi
+if [ "$MODE" = checkpoint ]; then
+  REPLICA_SETTING=${POS3QL_BENCH_REPLICAS:-0}
+  if [ "$REPLICA_SETTING" != 0 ]; then
+    echo "checkpoint mode requires POS3QL_BENCH_REPLICAS=0" >&2
+    exit 2
+  fi
+fi
 if ! [[ "$REPLICA_SETTING" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "POS3QL_BENCH_REPLICAS must be a nonnegative decimal count" >&2
   exit 2
 fi
-if [ "$MODE" = full ] && [ "$TABLE_CAPACITY" -lt $((ROWS + CLIENTS * OPERATIONS)) ]; then
+if [ "$MODE" != smoke ] && [ "$TABLE_CAPACITY" -lt $((ROWS + CLIENTS * OPERATIONS)) ]; then
   echo "POS3QL_BENCH_TABLE_CAPACITY must cover setup and inserted rows" >&2
   exit 2
 fi
@@ -242,6 +249,16 @@ DATA_WARM="$WORK/data-warm"
 start_pos3ql "$DATA_WARM" primary initial-start
 bench_pos3ql point-concurrency-1 --workload point-read --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --setup --require-index
+if [ "$MODE" = checkpoint ]; then
+  bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" \
+    --maintenance-interval 0.05 --maintenance-limit 3
+  stop_pos3ql
+  cp "$WORK/pos3ql-primary.log" "$OUTPUT/pos3ql-startup.log"
+  python3 "$ROOT/tools/benchmark-report.py" "$OUTPUT" >"$OUTPUT/report.md"
+  echo "performance results: $OUTPUT"
+  exit 0
+fi
 bench_pos3ql warm-memory-point --workload point-read --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-brin-point --workload brin-point --clients "$CLIENTS" \

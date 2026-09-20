@@ -384,8 +384,8 @@ pub(crate) trait BlockStore {
         0
     }
 
-    /// Whether any asynchronous slot still belongs to a caller, including a
-    /// completed body or terminal error awaiting that caller's retry.
+    /// Whether a GET socket is still in flight. Completed immutable responses
+    /// can be consumed or retried after synchronous checkpoint work.
     fn async_reads_busy(&self) -> bool {
         false
     }

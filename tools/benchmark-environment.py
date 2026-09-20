@@ -37,6 +37,8 @@ def main():
     parser.add_argument("--clients", type=int, required=True)
     parser.add_argument("--replicas", type=int, required=True)
     parser.add_argument("--object-latency-ms", type=float, required=True)
+    parser.add_argument("--disk-cache-mib", type=int, required=True)
+    parser.add_argument("--timeout-seconds", type=float, required=True)
     args = parser.parse_args()
     binary_bytes = args.binary.read_bytes()
     status = command("git", "status", "--porcelain")
@@ -63,6 +65,8 @@ def main():
             "clients": args.clients,
             "logical_replicas": args.replicas,
             "object_latency_ms": args.object_latency_ms,
+            "disk_cache_mib": args.disk_cache_mib,
+            "timeout_seconds": args.timeout_seconds,
         },
         "pos3ql_object_store": {
             "implementation": "tests/external/s3_test_server.py",

@@ -12,6 +12,13 @@ cd "$(dirname "$0")/../.." || exit
 ROOT=$(pwd)
 EXT=tests/external
 KEEP=${1:-}
+VENV=${POS3QL_VENV:-$ROOT/target/external-venv}
+
+ensure_psycopg_venv() {
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    python3 -m venv "$VENV" && "$VENV/bin/pip" install --quiet 'psycopg[binary]'
+  fi
+}
 
 PSQL=${POS3QL_PSQL:-/opt/homebrew/opt/libpq/bin/psql}
 
@@ -283,10 +290,7 @@ fi
 
 step "driver test (psycopg 3, extended protocol with binary parameters)"
 restart_main_server psycopg
-VENV=${POS3QL_VENV:-$ROOT/target/external-venv}
-if [[ ! -x "$VENV/bin/python" ]]; then
-  python3 -m venv "$VENV" && "$VENV/bin/pip" install --quiet 'psycopg[binary]'
-fi
+ensure_psycopg_venv || exit 1
 if POS3QL_PORT=$PG_PORT "$VENV/bin/python" - <<EOF > "$WORK/driver.out" 2>&1
 import os, runpy, sys
 sys.argv = ["driver_test.py"]
@@ -602,6 +606,15 @@ out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
   -c "SELECT (SELECT count(*) FROM big), (SELECT v FROM big WHERE id = 4321), (SELECT count(*) FROM big WHERE id % 100 = 7), (SELECT v FROM big WHERE id = 2500)" 2>&1)
 [[ "$out" == "4950|updated|0|r2500" ]] && ok "5000 rows through a 1024-entry map" \
   || bad "overlay row count: '$out'"
+out=$("$PSQL" -h 127.0.0.1 -p $((PG_PORT + 3)) -U postgres -X -t -A -F'|' \
+  -c "BEGIN" \
+  -c "INSERT INTO big VALUES (5001, 'resident')" \
+  -c "UPDATE big SET v = 'resident-update' WHERE id = 4321" \
+  -c "SELECT count(*), min(v) FILTER (WHERE id = 4321), min(v) FILTER (WHERE id = 5001) FROM big" \
+  -c "ROLLBACK" 2>&1)
+[[ "$out" == *"4951|resident-update|resident"* ]] \
+  && ok "aggregate scan merges resident changes with spilled rows" \
+  || bad "mixed resident and spilled scan: '$out'"
 
 # Uniqueness must hold across the spill boundary: a duplicate of a key long
 # evicted from the overlay must still be caught against its spilled row, not
@@ -1366,6 +1379,7 @@ fi # diff
 if want spilldiff; then
 
 step "forced-spill differential: the whole suite with a 256KiB memtable over the bucket"
+ensure_psycopg_venv || exit 1
 # Every corpus and sqllogictest block runs against a pos3ql whose memtable is
 # three orders of magnitude under the dataset churn, so ordinary queries
 # continuously spill, checkpoint (paced merges included), and read rows back

@@ -1,0 +1,32 @@
+{
+  "artifact_type": "environment",
+  "docker_version": "6.0.2",
+  "generated_utc": "2026-09-20T15:33:33.063568+00:00",
+  "git_commit": "d1aba82ea63a83ff9eed8febd9ca247691ca666f",
+  "git_dirty": false,
+  "logical_cpu_count": 12,
+  "machine": "arm64",
+  "physical_memory_bytes": 25769803776,
+  "platform": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+  "pos3ql_binary_sha256": "90b21cb47c5759845d1cc8e668084521df4f7e313c24e1ce30deba4e84a957ae",
+  "pos3ql_object_store": {
+    "backing": "temporary local filesystem",
+    "implementation": "tests/external/s3_test_server.py",
+    "independently_operated": false
+  },
+  "processor": "arm",
+  "python_version": "3.14.6 (main, Jun 10 2026, 10:03:53) [Clang 17.0.0 (clang-1700.6.4.2)]",
+  "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "schema_version": 1,
+  "suite": {
+    "clients": 4,
+    "disk_cache_mib": 1024,
+    "logical_replicas": 0,
+    "mode": "full",
+    "object_latency_ms": 2.0,
+    "operations_per_client": 50,
+    "rows": 1000,
+    "table_capacity": 2048,
+    "timeout_seconds": 120.0
+  }
+}

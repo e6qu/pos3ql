@@ -1,0 +1,48 @@
+{
+  "database_identity": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit",
+  "label": "postgresql18-ordered-limit",
+  "results": {
+    "access_path": {
+      "index_scans": 200,
+      "index_tuples_fetched": 6400,
+      "sequential_scans": 0,
+      "sequential_tuples_read": 0
+    },
+    "attempted_operations": 200,
+    "completed_operations": 200,
+    "elapsed_seconds": 0.087347166,
+    "errors": [],
+    "fixed_memory_occupancy": null,
+    "fixed_memory_plan_bytes": null,
+    "latency_ms": {
+      "maximum": 2.8155,
+      "mean": 1.733241665,
+      "minimum": 0.226375,
+      "p50": 1.717,
+      "p95": 2.39275,
+      "p99": 2.678916
+    },
+    "maintenance_operations": 0,
+    "maximum_rss_bytes": null,
+    "object_requests_per_operation": null,
+    "object_store": null,
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 2289.713669702804
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit"
+  ],
+  "workload": {
+    "clients": 4,
+    "maintenance_interval_seconds": 0.0,
+    "maintenance_limit": 0,
+    "name": "ordered-limit",
+    "operations_per_client": 50,
+    "require_index": false,
+    "rows": 1000,
+    "synchronized": false,
+    "target_count": 1,
+    "timeout_seconds": 120.0
+  }
+}

@@ -59,8 +59,12 @@ treating a mutable image tag as provenance. Its defaults
 can be overridden with `POS3QL_BENCH_ROWS`,
 `POS3QL_BENCH_TABLE_CAPACITY`, `POS3QL_BENCH_OPERATIONS`,
 `POS3QL_BENCH_CLIENTS`, `POS3QL_BENCH_REPLICAS`, and
-`POS3QL_BENCH_OBJECT_LATENCY_MS`. The capacity must cover both the setup rows
-and all rows inserted by the configured clients and operations.
+`POS3QL_BENCH_OBJECT_LATENCY_MS`. `POS3QL_BENCH_DISK_CACHE_MIB` sizes the
+fixed local disk block cache (default 128 MiB), and
+`POS3QL_BENCH_TIMEOUT_SECONDS` sets the per-query socket timeout (default 30
+seconds). Both settings are recorded in the environment manifest; the timeout
+also appears in each workload file. The capacity must cover both the setup
+rows and all rows inserted by the configured clients and operations.
 CPU and resident-memory sampling uses `/proc` on Linux; peak RSS remains
 available through `ps` on other supported systems.
 
@@ -86,13 +90,18 @@ temporary storage. Its PostgreSQL comparison is an exploratory baseline; the
 representative qualification in [PLAN.md](../PLAN.md) also requires pinned
 hardware and an independently operated compatible object store.
 
-The first complete [measured baseline](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
-uses actual PostgreSQL 18.6 on local APFS with durability enabled, 256 rows,
-four clients, and no replicas. The raw JSON, PostgreSQL settings, startup logs,
-and derived report are preserved with the run. The same-process point workload
-recorded object reads and therefore does not qualify as a fully resident RAM
-measurement. A partial 1,000-row attempt timed out in SP-GiST text-prefix
-probing; its failure artifact is preserved alongside the completed baseline.
+The complete [256-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
+and [1,000-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs-1000/README.md)
+exploratory baselines use actual PostgreSQL 18.6 on local APFS with durability
+enabled, four clients, and no replicas. Raw JSON, PostgreSQL settings, startup
+logs, and derived reports are preserved. The larger run uses a 1 GiB disk
+cache and a 120-second query timeout; its 59 workloads all completed. A prior
+1,000-row attempt timed out in SP-GiST text-prefix probing. Completed object
+reads now release fixed-slot pressure, and sequential scans stream immutable
+spilled rows alongside resident changes. The same-process point workload still
+records object reads and does not qualify as fully resident RAM. Explicit
+checkpoint pressure remains costly: the larger mixed run's p99 rose from 39.50
+ms to 4,355.29 ms with three checkpoints.
 
 ## Measured scenarios
 

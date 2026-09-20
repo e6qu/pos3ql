@@ -6182,29 +6182,29 @@ fn scan_source_mode<'a>(
                 storage.record_relation_scan(txid, $slot, None, 0)?;
                 let mut index = 0usize;
                 let mut aborted = false;
-                if storage.spill_rows_are_unshadowed($slot) {
-                    visit_spilled_rows!($slot, index, aborted);
-                } else {
-                    storage.for_each_row_state($slot, &mut |rowid, state| {
-                        use core::ops::ControlFlow;
-                        check_timeout()?;
-                        let Some(home) = storage.visible_row_home($slot, rowid, state, txid)?
-                        else {
-                            return Ok(ControlFlow::Continue(()));
-                        };
-                        storage.record_relation_tuple_read(txid, $slot, None)?;
-                        let this = index;
-                        index += 1;
-                        let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
-                            let bytes = storage.row_bytes($slot, rowid, home, arena)?;
-                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
-                        })?;
-                        if !keep_scanning {
-                            aborted = true;
-                            return Ok(ControlFlow::Break(()));
-                        }
-                        Ok(ControlFlow::Continue(()))
+                let _ = storage.for_each_scan_overlay_row_state($slot, &mut |rowid, state| {
+                    use core::ops::ControlFlow;
+                    check_timeout()?;
+                    let Some(home) = storage.visible_row_home($slot, rowid, state, txid)? else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    storage.record_relation_tuple_read(txid, $slot, None)?;
+                    let this = index;
+                    index += 1;
+                    let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
+                        let bytes = storage.row_bytes($slot, rowid, home, arena)?;
+                        visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
                     })?;
+                    if !keep_scanning {
+                        aborted = true;
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    Ok(ControlFlow::Continue(()))
+                })?;
+                if !aborted {
+                    // Spill entries shadowed by the overlay are omitted by
+                    // the merged cursor; their resident versions ran first.
+                    visit_spilled_rows!($slot, index, aborted);
                 }
                 if aborted {
                     return Ok(false);
@@ -6380,13 +6380,11 @@ fn scan_source_mode<'a>(
             || (scope.derived[order[depth]].is_none()
                 && storage.relation_has_descendants(scope.slots[order[depth]], txid))
         {
-            // Outermost scan: iterate in heap-offset (insertion) order so a
-            // per-row error surfaces on the same row as PostgreSQL, whose heap
-            // scan is physical (insertion) order for a freshly-loaded table.
-            // The rows live in a hash map (slot order), so snapshot the visible
-            // locations into the per-statement arena and sort by offset. Only
-            // the outermost scan is ordered — it drives output/error order, and
-            // ordering an inner join scan would re-snapshot per outer row.
+            // A heap-only outer scan uses heap-offset order, so row errors on
+            // freshly loaded tables follow PostgreSQL's physical insertion
+            // order. Spilled rows stream in SST order to avoid point-reading
+            // every immutable row; SQL without ORDER BY has no row-order
+            // contract. Inner scans avoid re-sorting for each outer row.
             let slot = scope.slots[order[depth]];
             if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
                 && storage.relation_has_descendants(slot, txid)
@@ -6459,6 +6457,10 @@ fn scan_source_mode<'a>(
             }
             let access = indexed.filter(|access| access.table == order[depth]);
             let candidates = access.map(|access| access.rowids);
+            if candidates.is_none() && storage.spill_generation_count(slot) != 0 {
+                visit_sequential_physical_rows!(slot);
+                return Ok(true);
+            }
             if access.is_none_or(|access| access.scan_executed) {
                 storage.record_relation_scan(
                     txid,
@@ -6466,20 +6468,6 @@ fn scan_source_mode<'a>(
                     access.map(|access| access.index_oid),
                     access.map_or(0, |access| access.index_entries),
                 )?;
-            }
-            // A cold, overlay-free table is already being merged in SST data
-            // blocks. Carry the selected entry bytes out of that cursor rather
-            // than point-reading every row a second time. Any resident overlay
-            // stays on the general row-state path below, which owns its MVCC
-            // shadowing and mixed heap/SST physical order.
-            if candidates.is_none() && storage.spill_rows_are_unshadowed(slot) {
-                let mut index = 0usize;
-                let mut aborted = false;
-                visit_spilled_rows!(slot, index, aborted);
-                if aborted {
-                    return Ok(false);
-                }
-                return Ok(true);
             }
             // A key-carrying ordered candidate set can satisfy the scan
             // without fetching the base tuple when the physical demand proof
@@ -6577,9 +6565,10 @@ fn scan_source_mode<'a>(
                 }
                 return Ok(true);
             }
-            let count = candidates
-                .map(<[u64]>::len)
-                .unwrap_or(storage.visible_row_count(slot, txid)?);
+            let count = match candidates {
+                Some(rowids) => rowids.len(),
+                None => storage.visible_row_count(slot, txid)?,
+            };
             let ordered = arena
                 .alloc_slice_with(count, |_| {
                     (

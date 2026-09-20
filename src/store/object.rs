@@ -143,6 +143,7 @@ struct ObjectReadSlot {
     pending_id: Option<BlockId>,
     ready_id: Option<BlockId>,
     error_id: Option<BlockId>,
+    speculative: bool,
     packed: bool,
     pending_error: Option<StoreError>,
     started_at: Option<Instant>,
@@ -174,6 +175,7 @@ impl OwnedObjectStore {
                     pending_id: None,
                     ready_id: None,
                     error_id: None,
+                    speculative: false,
                     packed: false,
                     pending_error: None,
                     started_at: None,
@@ -211,6 +213,16 @@ impl OwnedObjectStore {
 
     fn disable_async_gets(&mut self) {
         for slot in self.slots.as_mut_slice() {
+            if slot.speculative {
+                // A speculative response has no demand owner. A later reader
+                // can issue its own GET if its lookahead was discarded.
+                slot.ready_id = None;
+                slot.error_id = None;
+                slot.pending_error = None;
+                slot.started_at = None;
+                slot.hedge_issued = false;
+                slot.speculative = false;
+            }
             slot.client.disable_async_gets();
         }
         self.async_gets_enabled = false;
@@ -268,6 +280,26 @@ impl OwnedObjectStore {
             && slot.pending_error.is_none()
     }
 
+    fn demand_slot(&mut self) -> Option<&mut ObjectReadSlot> {
+        let index = self.slots.iter().position(Self::slot_is_free).or_else(|| {
+            self.slots.iter().position(|slot| {
+                slot.pending_id.is_none() && (slot.ready_id.is_some() || slot.error_id.is_some())
+            })
+        });
+        let index = index?;
+        let slot = &mut self.slots[index];
+        // Immutable completed responses can be retried if their caller still
+        // needs them. Reclaim one when all fixed slots are occupied.
+        slot.ready_id = None;
+        slot.error_id = None;
+        slot.pending_error = None;
+        slot.started_at = None;
+        slot.hedge_issued = false;
+        slot.speculative = false;
+        slot.packed = false;
+        Some(slot)
+    }
+
     fn release_siblings(&mut self, id: BlockId, winner: usize) {
         for (index, slot) in self.slots.as_mut_slice().iter_mut().enumerate() {
             if index == winner
@@ -286,6 +318,7 @@ impl OwnedObjectStore {
             slot.pending_error = None;
             slot.started_at = None;
             slot.hedge_issued = false;
+            slot.speculative = false;
             slot.packed = false;
         }
     }
@@ -390,14 +423,16 @@ impl BlockStore for OwnedObjectStore {
             let slot = &mut self.slots[winner];
             slot.ready_id = None;
             slot.hedge_issued = false;
+            slot.speculative = false;
             slot.packed = false;
             return decode_block_body(slot.client.body_bytes(), id, into);
         }
-        if self
+        if let Some(slot) = self
             .slots
-            .iter()
-            .any(|slot| slot.pending_id == Some(*id) && !slot.packed)
+            .iter_mut()
+            .find(|slot| slot.pending_id == Some(*id) && !slot.packed)
         {
+            slot.speculative = false;
             return Err(StoreError::NotReady);
         }
         if let Some(winner) = self
@@ -409,15 +444,17 @@ impl BlockStore for OwnedObjectStore {
             let slot = &mut self.slots[winner];
             slot.error_id = None;
             slot.hedge_issued = false;
+            slot.speculative = false;
             slot.packed = false;
             return Err(slot.pending_error.take().expect("checked above"));
         }
         let started = Instant::now();
+        let prefix = self.prefix;
         let result = {
-            let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
+            let Some(slot) = self.demand_slot() else {
                 return Err(StoreError::NotReady);
             };
-            let result = get_block(&mut slot.client, self.prefix, id, into);
+            let result = get_block(&mut slot.client, prefix, id, into);
             if matches!(result, Err(StoreError::NotReady)) {
                 slot.pending_id = Some(*id);
                 slot.started_at = Some(started);
@@ -449,6 +486,7 @@ impl BlockStore for OwnedObjectStore {
             let slot = &mut self.slots[winner];
             slot.ready_id = None;
             slot.hedge_issued = false;
+            slot.speculative = false;
             slot.packed = false;
             if slot.client.body_bytes().len() != length {
                 return Err(StoreError::Corrupt(super::BlockError::Truncated));
@@ -470,16 +508,18 @@ impl BlockStore for OwnedObjectStore {
             let slot = &mut self.slots[winner];
             slot.error_id = None;
             slot.hedge_issued = false;
+            slot.speculative = false;
             slot.packed = false;
             return Err(slot.pending_error.take().expect("checked above"));
         }
         let started = Instant::now();
-        let Some(slot) = self.slots.iter_mut().find(|slot| Self::slot_is_free(slot)) else {
+        let prefix = self.prefix;
+        let Some(slot) = self.demand_slot() else {
             return Err(StoreError::NotReady);
         };
         let result = get_packed_block(
             &mut slot.client,
-            self.prefix,
+            prefix,
             container,
             offset,
             length,
@@ -521,11 +561,13 @@ impl BlockStore for OwnedObjectStore {
             match slot.client.get(key, None) {
                 Ok(result) => {
                     slot.ready_id = Some(*id);
+                    slot.speculative = true;
                     Some(result.len)
                 }
                 Err(ObjectError::WouldBlock) => {
                     slot.pending_id = Some(*id);
                     slot.started_at = Some(started);
+                    slot.speculative = true;
                     slot.packed = false;
                     None
                 }
@@ -555,6 +597,7 @@ impl BlockStore for OwnedObjectStore {
             let slot = &mut self.slots[winner];
             slot.ready_id = None;
             slot.hedge_issued = false;
+            slot.speculative = false;
             slot.packed = false;
             return decode_block_body(slot.client.body_bytes(), id, into).map(Some);
         }
@@ -574,10 +617,15 @@ impl BlockStore for OwnedObjectStore {
             let slot = &mut self.slots[winner];
             slot.error_id = None;
             slot.hedge_issued = false;
+            slot.speculative = false;
             slot.packed = false;
             return Err(slot.pending_error.take().expect("checked above"));
         }
-        Ok(None)
+        match self.get(id, into) {
+            Ok(result) => Ok(Some(result)),
+            Err(StoreError::NotReady) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn io_stats(&self) -> BlockIoStats {
@@ -601,9 +649,7 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn async_reads_busy(&self) -> bool {
-        self.slots.iter().any(|slot| {
-            slot.pending_id.is_some() || slot.ready_id.is_some() || slot.error_id.is_some()
-        })
+        self.slots.iter().any(|slot| slot.pending_id.is_some())
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
@@ -770,6 +816,55 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_prefetch_does_not_starve_demand_or_checkpoint() {
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.object_store_get_slots = 1;
+        config.object_store_bucket = format!("abandoned-prefetch-{}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+        let mut budget = Budget::new(16 << 20);
+        let mut store = OwnedObjectStore::new(&config, &mut budget, "blocks/").unwrap();
+        let first = store.put(b"first", BlockType::SstData, 0).unwrap();
+        let second = store.put(b"second", BlockType::SstData, 0).unwrap();
+        store.enable_async_gets();
+
+        assert_eq!(store.prefetch(&first).unwrap(), PrefetchState::Scheduled);
+        assert!(!store.async_reads_busy());
+        let mut output = [0; 32];
+        assert_eq!(
+            store.get(&second, &mut output).unwrap(),
+            (6, BlockType::SstData)
+        );
+        assert_eq!(&output[..6], b"second");
+        assert_eq!(
+            store.take_prefetch(&first, &mut output).unwrap(),
+            Some((5, BlockType::SstData))
+        );
+        assert_eq!(&output[..5], b"first");
+
+        assert_eq!(store.prefetch(&second).unwrap(), PrefetchState::Scheduled);
+        store.slots[0].speculative = false;
+        assert_eq!(
+            store.get(&first, &mut output).unwrap(),
+            (5, BlockType::SstData)
+        );
+        assert_eq!(&output[..5], b"first");
+        assert_eq!(
+            store.take_prefetch(&second, &mut output).unwrap(),
+            Some((6, BlockType::SstData))
+        );
+        assert_eq!(&output[..6], b"second");
+
+        assert_eq!(store.prefetch(&second).unwrap(), PrefetchState::Scheduled);
+        assert!(!store.async_reads_busy());
+        store.disable_async_gets();
+        assert!(store.slots[0].ready_id.is_none());
+        drop(store);
+        crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    }
+
+    #[test]
     fn packed_read_remains_reactor_owned_until_its_extent_is_consumed() {
         let payload = b"packed range body";
         let mut framed = [0u8; super::super::BLOCK_SIZE];
@@ -822,7 +917,8 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(complete, "mock packed response did not complete");
-        assert!(store.async_reads_busy());
+        assert!(!store.async_reads_busy());
+        store.disable_async_gets();
         assert_eq!(
             store
                 .get_packed(&container, 0, framed_len, &expected, &mut output, &mut [])

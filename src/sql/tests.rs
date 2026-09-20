@@ -36791,7 +36791,7 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
              RESET ROLE;
              CALL checkpoint_log(9);
              SELECT has_function_privilege('checkpoint_reader', 'checkpoint_overload(integer)', 'EXECUTE');
-             SELECT value FROM checkpoint_procedure_log;
+             SELECT value FROM checkpoint_procedure_log ORDER BY value;
              SELECT position, value FROM checkpoint_pairs() ORDER BY position;
              SELECT pg_get_functiondef(oid) FROM pg_proc WHERE proname = 'checkpoint_pairs';",
         )),

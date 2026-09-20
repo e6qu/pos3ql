@@ -90,8 +90,12 @@ The measured PostgreSQL baseline audit found no externally blocked defect.
 The harness now completes against a local PostgreSQL 18 server on macOS,
 flushes worker statistics before reading access-path deltas, builds secondary
 indexes after loading the fixture, and bounds explicit checkpoint pressure.
-The larger text-prefix performance boundary is tracked as qualification work
-in PLAN.md.
+The 1,000-row scaling audit found no externally blocked defect. Completed
+object reads now release fixed-slot pressure and no longer park writes with no
+GET in flight; scans stream redundant spilled rows through the merged cursor.
+The harness records cache size and query timeout, and all 59 workloads now
+complete against actual PostgreSQL 18. The remaining checkpoint cost is
+performance qualification work in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

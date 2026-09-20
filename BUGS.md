@@ -78,6 +78,13 @@ The PostgreSQL comparison provenance audit found no externally blocked defect.
 The harness now records the reference server's durability settings and storage
 setup, and labels local object-store fixture timings as exploratory. A zero
 replica count no longer enters the scale loop and launches unintended replicas.
+The table-function row-width audit found no externally blocked defect.
+XMLTABLE, JSON_TABLE, and publication-introspection rows now use statement
+memory beyond 256 rows. The audit also fixed publication enumeration of the
+internal large-object relation and XML `PASSING` syntax that accepted a cast
+where PostgreSQL requires a primary expression. PostgreSQL 18 differential,
+allocation-forbidden, and empty-cache recovery regressions cover the former
+limit.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

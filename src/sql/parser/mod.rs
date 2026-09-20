@@ -2805,12 +2805,12 @@ impl<'a> Parser<'a> {
         } else {
             self.plain_call("__xml_namespaces", &[])?
         };
-        let row_path = self.expression(0)?;
+        let row_path = self.prefix()?;
         self.expect_ident("passing")?;
         if self.eat_ident("by")? && !self.eat_ident("ref")? {
             self.expect_ident("value")?;
         }
-        let document = self.expression(0)?;
+        let document = self.prefix()?;
         if self.eat_ident("by")? {
             self.expect_ident("ref")?;
         }

@@ -1189,6 +1189,79 @@ fn xmltable_and_xmlagg_cover_relational_execution() {
 }
 
 #[test]
+fn table_function_rows_cross_256_and_survive_object_cold_recovery() {
+    let mut config = test_config("table-function-row-width");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_bytes = 4 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.object_store_bucket = format!("table-function-row-width-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE table_function_documents(document jsonb, xml_document xml); \
+         INSERT INTO table_function_documents VALUES (
+           ('[' || repeat('1,', 299) || '1]')::jsonb,
+           ('<rows>' || repeat('<row/>', 300) || '</rows>')::xml); \
+         CREATE TABLE table_function_json_rows AS
+           SELECT item.ordinality
+             FROM table_function_documents AS source,
+                  LATERAL JSON_TABLE(source.document, '$[*]'
+                    COLUMNS (ordinality FOR ORDINALITY)) AS item; \
+         CREATE TABLE table_function_xml_rows AS
+           SELECT item.ordinality
+             FROM table_function_documents AS source,
+                  LATERAL XMLTABLE('/rows/row' PASSING source.xml_document
+                    COLUMNS ordinality FOR ORDINALITY) AS item; \
+         CHECKPOINT",
+        4 << 20,
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let wide = "SELECT count(*), max(ordinality) FROM table_function_json_rows; \
+                SELECT count(*), max(ordinality) FROM table_function_xml_rows; \
+                SELECT count(*), max(item.ordinality)
+                  FROM table_function_documents AS source,
+                       LATERAL JSON_TABLE(source.document, '$'
+                         COLUMNS (NESTED PATH '$[*]'
+                           COLUMNS (ordinality FOR ORDINALITY))) AS item; \
+                SELECT count(*), max(item.ordinality)
+                  FROM table_function_documents AS source,
+                       LATERAL XMLTABLE('/rows/row' PASSING source.xml_document
+                         COLUMNS ordinality FOR ORDINALITY) AS item";
+    let output = run_with_fixed_memory(&mut engine, &budget, wide, 4 << 20);
+    assert_eq!(
+        data_rows(&output),
+        ["300|300", "300|300", "300|300", "300|300"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with_arena_bytes(&mut cold, &mut cold_budget, wide, 4 << 20);
+    assert_eq!(
+        data_rows(&recovered),
+        ["300|300", "300|300", "300|300", "300|300"],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn sql_xml_namespaces_and_xpath_scalar_results_match_postgresql() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -10332,6 +10405,15 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
         "CREATE PUBLICATION truncate_fanout_publication FOR ALL TABLES",
         false,
     );
+    assert_eq!(
+        data_rows(&session.success(
+            &mut engine,
+            "SELECT count(*) FROM pg_get_publication_tables('truncate_fanout_publication'); \
+             SELECT count(*) FROM pg_publication_tables WHERE pubname = 'truncate_fanout_publication'",
+            true,
+        )),
+        ["300", "300"]
+    );
     let floor = engine.storage.lsn();
     assert_eq!(data_rows(&session.success(&mut engine, "BEGIN; SAVEPOINT before_truncate; TRUNCATE truncate_fanout_0 CASCADE; ROLLBACK TO SAVEPOINT before_truncate; SELECT count(*) FROM truncate_fanout_0; SELECT count(*) FROM truncate_fanout_299; TRUNCATE truncate_fanout_0 CASCADE; COMMIT", false)), ["1", "1"]);
     let mut scratch =
@@ -10483,6 +10565,15 @@ fn configured_transaction_capacity_covers_truncate_fanout_and_prepared_cold_reco
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     let mut recovered_session = ConfiguredTransactionSession::new(&config, &mut recovered_budget);
     assert_eq!(data_rows(&recovered_session.success(&mut recovered, "SELECT count(*) FROM truncate_fanout_0; SELECT count(*) FROM truncate_fanout_299; SELECT count(*) FROM pg_prepared_xacts", false)), ["0", "0", "0"]);
+    assert_eq!(
+        data_rows(&recovered_session.success(
+            &mut recovered,
+            "SELECT count(*) FROM pg_get_publication_tables('truncate_fanout_publication'); \
+             SELECT count(*) FROM pg_publication_tables WHERE pubname = 'truncate_fanout_publication'",
+            true,
+        )),
+        ["300", "300"]
+    );
     drop(recovered_session);
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

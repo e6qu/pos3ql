@@ -12,16 +12,10 @@ use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 
-/// Pieces one `string_to_table` call may split into.
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_COLUMNS, RoutineDef, SqlName, Storage, TableDef};
 use crate::util::StackStr;
-
-/// Rows one XMLTABLE / JSON_TABLE / publication-table function call emits.
-/// Scaling this per-call value bound to the statement arena is tracked
-/// separately in PLAN.md.
-const MAX_SRF_CALL_ROWS: usize = 256;
 
 use super::setops::describe_set_body;
 use super::subquery::subquery_witness;
@@ -490,33 +484,19 @@ fn publication_table_rows<'a>(
     arena: &'a Arena,
     arguments: &[Datum<'a>],
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    const MAX_RESULTS: usize = MAX_SRF_CALL_ROWS;
-    let mut names = [""; MAX_RESULTS];
-    let mut name_count = 0usize;
+    let mut names = ArenaList::new(arena);
     for argument in arguments {
         match argument {
             Datum::Text(name) | Datum::Bpchar(name) => {
-                if name_count == names.len() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "pg_get_publication_tables has too many publication names"
-                    ));
-                }
-                names[name_count] = name;
-                name_count += 1;
+                names.push(*name).map_err(|_| arena_full())?;
             }
             _ => return Err(srf_signature_error("pg_get_publication_tables")),
         }
     }
 
-    let empty = PublishedRelation {
-        publication_slot: usize::MAX,
-        relation_slot: usize::MAX,
-    };
-    let mut published = [empty; MAX_RESULTS];
-    let mut published_count = 0usize;
+    let mut published: ArenaList<'a, PublishedRelation> = ArenaList::new(arena);
     let mut any_via_root = false;
-    for name in &names[..name_count] {
+    for name in names.as_slice() {
         let (publication_slot, publication) = storage
             .publications_with_slots_visible_to(txid)
             .find(|(_, publication)| publication.name_for(txid).as_str() == *name)
@@ -529,7 +509,7 @@ fn publication_table_rows<'a>(
             })?;
         let definition = publication.definition_for(txid);
         any_via_root |= definition.publish_via_partition_root;
-        let publication_start = published_count;
+        let publication_start = published.len();
         for (table_slot, table) in storage.live_tables() {
             if !table.visible_to(txid) {
                 continue;
@@ -549,33 +529,28 @@ fn publication_table_rows<'a>(
             }
             let relation_slot =
                 publication_output_relation_for(storage, txid, definition, table_slot, explicit);
-            if published[publication_start..published_count]
+            if published.as_slice()[publication_start..]
                 .iter()
                 .any(|entry| entry.relation_slot == relation_slot)
             {
                 continue;
             }
-            if published_count == published.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "pg_get_publication_tables exceeds {} rows",
-                    published.len()
-                ));
-            }
-            published[published_count] = PublishedRelation {
-                publication_slot,
-                relation_slot,
-            };
-            published_count += 1;
+            published
+                .push(PublishedRelation {
+                    publication_slot,
+                    relation_slot,
+                })
+                .map_err(|_| arena_full())?;
         }
     }
 
+    let published = published.as_slice();
     const EMPTY_ROW: &[u8] = &[];
     let rows = arena
-        .alloc_slice_with(published_count, |_| EMPTY_ROW)
+        .alloc_slice_with(published.len(), |_| EMPTY_ROW)
         .map_err(|_| arena_full())?;
     let mut row_count = 0usize;
-    for info in &published[..published_count] {
+    for info in published {
         if any_via_root {
             let mut ancestor = storage
                 .table_def(info.relation_slot, txid)
@@ -584,10 +559,7 @@ fn publication_table_rows<'a>(
             let mut shadowed = false;
             while let Some(attachment) = ancestor {
                 let parent = usize::from(attachment.parent);
-                if published[..published_count]
-                    .iter()
-                    .any(|other| other.relation_slot == parent)
-                {
+                if published.iter().any(|other| other.relation_slot == parent) {
                     shadowed = true;
                     break;
                 }
@@ -5506,19 +5478,11 @@ fn xml_table_rows<'a, C: ColumnLookup<'a>>(
     else {
         return Err(srf_signature_error("xmltable"));
     };
-    const EMPTY: &[u8] = &[];
-    let mut encoded = [EMPTY; MAX_SRF_CALL_ROWS];
-    let mut count = 0usize;
+    let mut encoded = ArenaList::new(arena);
     for (ordinal, root) in roots.iter().enumerate() {
         let Datum::Xml(context) = root else {
             continue;
         };
-        if count == encoded.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "XMLTABLE produced too many rows"
-            ));
-        }
         let mut values = [Datum::Null; MAX_COLUMNS];
         for (column, specification) in specifications.iter().enumerate() {
             let Expr::Call { name, args, .. } = specification else {
@@ -5591,14 +5555,14 @@ fn xml_table_rows<'a, C: ColumnLookup<'a>>(
             }
             values[column] = value;
         }
-        encoded[count] =
-            crate::sql::exec::encode_projected_pub(&values[..specifications.len()], arena)?;
-        count += 1;
+        encoded
+            .push(crate::sql::exec::encode_projected_pub(
+                &values[..specifications.len()],
+                arena,
+            )?)
+            .map_err(|_| arena_full())?;
     }
-    arena
-        .alloc_slice_copy(&encoded[..count])
-        .map(|rows| &*rows)
-        .map_err(|_| arena_full())
+    Ok(encoded.as_slice())
 }
 
 struct XmlTableConcat<'a>(&'a [Datum<'a>]);
@@ -5682,9 +5646,7 @@ fn json_table_rows<'a, C: ColumnLookup<'a>>(
             "invalid JSON_TABLE column specification"
         ));
     };
-    const EMPTY: &[u8] = &[];
-    let mut encoded = [EMPTY; MAX_SRF_CALL_ROWS];
-    let mut encoded_count = 0usize;
+    let mut encoded = ArenaList::new(arena);
     let output_columns = json_table_specifications_width(specifications)?;
     for (index, root) in roots.iter().enumerate() {
         let values = [Datum::Null; MAX_COLUMNS];
@@ -5701,13 +5663,9 @@ fn json_table_rows<'a, C: ColumnLookup<'a>>(
             columns,
             hooks,
             &mut encoded,
-            &mut encoded_count,
         )?;
     }
-    arena
-        .alloc_slice_copy(&encoded[..encoded_count])
-        .map(|rows| &*rows)
-        .map_err(|_| arena_full())
+    Ok(encoded.as_slice())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5723,8 +5681,7 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     columns: &C,
     hooks: &EvalHooks<'_, 'a>,
-    encoded: &mut [&'a [u8]; MAX_SRF_CALL_ROWS],
-    encoded_count: &mut usize,
+    encoded: &mut ArenaList<'a, &'a [u8]>,
 ) -> Result<usize, SqlError> {
     let mut column = start_column;
     let mut nested: ArenaList<'a, (&'a Expr<'a>, usize)> = ArenaList::new(arena);
@@ -5764,16 +5721,12 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
         }
     }
     if nested.is_empty() {
-        if *encoded_count == encoded.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "JSON_TABLE produces more than {} rows",
-                encoded.len()
-            ));
-        }
-        encoded[*encoded_count] =
-            crate::sql::exec::encode_projected_pub(&values[..output_columns], arena)?;
-        *encoded_count += 1;
+        encoded
+            .push(crate::sql::exec::encode_projected_pub(
+                &values[..output_columns],
+                arena,
+            )?)
+            .map_err(|_| arena_full())?;
         return Ok(column - start_column);
     }
 
@@ -5807,16 +5760,12 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
             ));
         };
         if children.is_empty() {
-            if *encoded_count == encoded.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "JSON_TABLE produces more than {} rows",
-                    encoded.len()
-                ));
-            }
-            encoded[*encoded_count] =
-                crate::sql::exec::encode_projected_pub(&values[..output_columns], arena)?;
-            *encoded_count += 1;
+            encoded
+                .push(crate::sql::exec::encode_projected_pub(
+                    &values[..output_columns],
+                    arena,
+                )?)
+                .map_err(|_| arena_full())?;
         } else {
             for (child_index, child) in children.iter().enumerate() {
                 json_table_emit_level(
@@ -5832,7 +5781,6 @@ fn json_table_emit_level<'a, C: ColumnLookup<'a>>(
                     columns,
                     hooks,
                     encoded,
-                    encoded_count,
                 )?;
             }
         }

@@ -64,16 +64,16 @@ The known narrower limits to resolve or justify are:
 
 - 64 Bind and SQL `PREPARE` parameters against the PostgreSQL wire count of
   65,535; 64 `GROUP BY` terms and 256 grouping sets;
-- 128 result columns; 256 rows per XMLTABLE or JSON_TABLE call; 64 joined
-  relations and 64 `USING` columns;
+- 128 result columns; 64 joined relations and 64 `USING` columns;
 - durable 64-item definition shapes, including constraints, routine arguments,
   enum labels, and policy roles; and
 - per-value `tsvector`/`tsquery`, multirange, and geometry widths.
 
-JSON container, path, result, and rendered-text widths are complete up to
-statement memory. SQL array value width is complete up to its durable 16-bit
-element count. Statement lists other than the exceptions above are bounded by
-statement memory.
+JSON container, path, result, rendered-text, and JSON_TABLE row widths are
+complete up to statement memory. XMLTABLE row width also follows statement
+memory within the separately bounded XPath index. SQL array value width is
+complete up to its durable 16-bit element count. Statement lists other than
+the exceptions above are bounded by statement memory.
 
 For each changed capacity, qualify the full accepted width through parse or
 wire input, execution, catalog output where applicable, journal encoding,

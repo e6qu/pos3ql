@@ -48,9 +48,10 @@ def error_fields(payload):
 
 
 class PgConnection:
-    def __init__(self, host, port, user, database):
-        self.socket = socket.create_connection((host, port), timeout=30)
-        self.socket.settimeout(30)
+    def __init__(self, host, port, user, database, timeout_seconds=30):
+        self.timeout_seconds = timeout_seconds
+        self.socket = socket.create_connection((host, port), timeout=timeout_seconds)
+        self.socket.settimeout(timeout_seconds)
         parameters = (
             b"user\0" + user.encode() + b"\0"
             + b"database\0" + database.encode() + b"\0"
@@ -331,7 +332,7 @@ def identify(connection):
 
 def setup_database(connection, rows):
     # Setup is untimed and may build many indexes over a large fixture.
-    connection.socket.settimeout(300)
+    connection.socket.settimeout(max(300, connection.timeout_seconds))
     connection.query("DROP TABLE IF EXISTS benchmark_kv")
     # A realistic row body makes even the small CI dataset span immutable
     # table blocks, so a selective cold index probe competes against an actual
@@ -424,7 +425,7 @@ def setup_database(connection, rows):
     )
     connection.query("ANALYZE benchmark_kv")
     connection.query("CHECKPOINT")
-    connection.socket.settimeout(30)
+    connection.socket.settimeout(connection.timeout_seconds)
 
 
 def read_access_path(connection):
@@ -450,7 +451,7 @@ def subtract_access_path(after, before):
 
 def run(args):
     targets = args.targets or [(args.host, args.port)]
-    control = PgConnection(*targets[0], args.user, args.database)
+    control = PgConnection(*targets[0], args.user, args.database, args.timeout_seconds)
     try:
         identity = identify(control)
         if args.setup:
@@ -460,12 +461,13 @@ def run(args):
 
     target_identities = []
     for host, port in targets:
-        connection = PgConnection(host, port, args.user, args.database)
+        connection = PgConnection(host, port, args.user, args.database, args.timeout_seconds)
         try:
             target_identities.append(identify(connection))
         finally:
             connection.close()
-    connections = [PgConnection(*targets[index % len(targets)], args.user, args.database)
+    connections = [PgConnection(*targets[index % len(targets)], args.user, args.database,
+                                args.timeout_seconds)
                    for index in range(args.clients)]
     latencies = []
     errors = []
@@ -505,7 +507,7 @@ def run(args):
                 latencies.extend(local)
 
     def maintain():
-        connection = PgConnection(*targets[0], args.user, args.database)
+        connection = PgConnection(*targets[0], args.user, args.database, args.timeout_seconds)
         try:
             while not stop_maintenance.wait(args.maintenance_interval):
                 connection.query("CHECKPOINT")
@@ -551,7 +553,8 @@ def run(args):
     if len(targets) == 1:
         try:
             # PostgreSQL flushes backend statistics when the workers exit.
-            statistics_connection = PgConnection(*targets[0], args.user, args.database)
+            statistics_connection = PgConnection(*targets[0], args.user, args.database,
+                                                 args.timeout_seconds)
             try:
                 after_access_path = read_access_path(statistics_connection)
             finally:
@@ -580,6 +583,7 @@ def run(args):
             "maintenance_interval_seconds": args.maintenance_interval,
             "maintenance_limit": args.maintenance_limit,
             "target_count": len(targets),
+            "timeout_seconds": args.timeout_seconds,
         },
         "results": {
             "attempted_operations": args.clients * args.operations,
@@ -677,6 +681,11 @@ def parse_args():
     )
     parser.add_argument("--user", default="postgres")
     parser.add_argument("--database", default="postgres")
+    parser.add_argument(
+        "--timeout-seconds", type=float,
+        default=os.environ.get("POS3QL_BENCH_TIMEOUT_SECONDS", "30"),
+        help="per-query socket timeout; setup retains a 300-second allowance",
+    )
     parser.add_argument("--label", required=True)
     parser.add_argument(
         "--workload",
@@ -739,6 +748,8 @@ def parse_args():
             parser.error(f"invalid target {target!r}; expected host:port")
     if args.clients < 1 or args.operations < 1 or args.rows < 1:
         parser.error("clients, operations, and rows must be positive")
+    if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
+        parser.error("timeout seconds must be positive and finite")
     if args.maintenance_interval < 0:
         parser.error("maintenance interval cannot be negative")
     if args.maintenance_limit < 0 or (args.maintenance_limit and not args.maintenance_interval):

@@ -649,10 +649,7 @@ impl BlockStore for OwnedObjectStore {
     }
 
     fn async_reads_busy(&self) -> bool {
-        self.slots.iter().any(|slot| {
-            slot.pending_id.is_some()
-                || !slot.speculative && (slot.ready_id.is_some() || slot.error_id.is_some())
-        })
+        self.slots.iter().any(|slot| slot.pending_id.is_some())
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
@@ -920,7 +917,8 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(complete, "mock packed response did not complete");
-        assert!(store.async_reads_busy());
+        assert!(!store.async_reads_busy());
+        store.disable_async_gets();
         assert_eq!(
             store
                 .get_packed(&container, 0, framed_len, &expected, &mut output, &mut [])

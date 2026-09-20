@@ -48,6 +48,13 @@ S3_PORT=$(claim_test_port "${POS3QL_BENCH_S3_PORT:-}" 19500 19599)
 POS3QL_PORT=$(claim_test_port "${POS3QL_BENCH_PORT:-}" 19600 19699)
 METRICS="$WORK/object-store-metrics.json"
 LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-2}
+DISK_CACHE_MIB=${POS3QL_BENCH_DISK_CACHE_MIB:-128}
+BENCH_TIMEOUT_SECONDS=${POS3QL_BENCH_TIMEOUT_SECONDS:-30}
+if ! [[ "$DISK_CACHE_MIB" =~ ^(0|[1-9][0-9]*)$ && "$BENCH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "POS3QL_BENCH_DISK_CACHE_MIB must be nonnegative and POS3QL_BENCH_TIMEOUT_SECONDS positive decimal integers" >&2
+  exit 2
+fi
+export POS3QL_BENCH_TIMEOUT_SECONDS=$BENCH_TIMEOUT_SECONDS
 python3 "$ROOT/tests/external/s3_test_server.py" \
   --root "$WORK/objects" --port "$S3_PORT" --bucket performance \
   --region benchmark --access-key benchmark --secret-key benchmark-secret \
@@ -103,7 +110,7 @@ max_foreign_data_wrappers = 4
 max_foreign_servers = 4
 max_user_mappings = 8
 block_cache_bytes = 32 MiB
-disk_cache_bytes = 128 MiB
+disk_cache_bytes = $DISK_CACHE_MIB MiB
 temporary_spill_bytes = 128 MiB
 max_replication_slots = 8
 max_subscriptions = 4
@@ -228,7 +235,8 @@ python3 "$ROOT/tools/benchmark-environment.py" \
   --output "$OUTPUT/environment.json" --binary "$ROOT/target/release/pos3ql" \
   --mode "$MODE" --rows "$ROWS" --table-capacity "$TABLE_CAPACITY" \
   --operations "$OPERATIONS" --clients "$CLIENTS" \
-  --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS"
+  --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS" \
+  --disk-cache-mib "$DISK_CACHE_MIB" --timeout-seconds "$BENCH_TIMEOUT_SECONDS"
 
 DATA_WARM="$WORK/data-warm"
 start_pos3ql "$DATA_WARM" primary initial-start

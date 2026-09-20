@@ -7,6 +7,21 @@
 use super::*;
 
 #[test]
+fn json_populate_record_uses_table_rowtype_fields() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE json_rowtype_test(id integer, label text); \
+         SELECT (jsonb_populate_record(NULL::json_rowtype_test, \
+                    '{\"id\":9,\"label\":\"ok\"}'::jsonb)).id",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["9"]);
+}
+
+#[test]
 fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
     use crate::storage::{MAX_TABLE_TYPE_OID_SLOTS, MAX_VALUE_ENFORCERS};
     crate::mem::guard::forbid_alloc(|| {

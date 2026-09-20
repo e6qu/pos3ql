@@ -585,6 +585,23 @@ impl ColTypeResolver for CatalogCols<'_> {
         type_name: &str,
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        if let Some(column) =
+            crate::sql::catalog::table_rowtype_field(self.storage, self.txid, type_name, index)
+        {
+            return Some((
+                crate::util::StackStr::from_str(column.name.as_str()),
+                StaticTypeMeta {
+                    ctype: column.ctype,
+                    type_oid: self.storage.routine_type_oid(
+                        column.ctype,
+                        column.user_type,
+                        self.txid,
+                    )?,
+                    type_mod: column.type_mod,
+                    collation: column.collation,
+                },
+            ));
+        }
         let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
         let definition = self.storage.composite_for(slot, self.txid);
         let field = definition.active_field(index)?;

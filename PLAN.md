@@ -231,6 +231,11 @@ storage. RAM and local disk are bounded, disposable caches.
   exhaustion during parse is SQLSTATE `54000`, not a syntax error. PostgreSQL
   18 differential and allocation-forbidden regressions cross the former
   boundaries and recover stored results with empty local caches.
+- JSON values and paths use statement memory for container members, result
+  items, accessor chains, subscripts, and rendered text. Parser and executor
+  stages report named exhaustion instead of imposing the former 1,024-item,
+  256-step, or 64 KiB ceilings. PostgreSQL 18 differential coverage crosses
+  these widths and checks JSON versus JSONB function resolution.
 - Cluster authorization is startup-sized through independent role,
   membership, role-setting, object-, column-, default-, and parameter-ACL
   capacities. Role-reachability and privilege-cascade scratch use those

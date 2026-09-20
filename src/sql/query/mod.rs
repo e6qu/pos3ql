@@ -1165,6 +1165,77 @@ pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<C
 }
 
 impl StorageCatalog<'_, '_, '_, '_> {
+    /// The composite rowtype fields of a table or view: column name, resolved
+    /// type OID, and a NULL value per column — the shape `json_populate_record`
+    /// and rowtype casts populate from.
+    fn rowtype_fields<'a>(
+        &self,
+        type_oid: i32,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        use super::types::oid;
+        let field_type_oid = |ctype: ColType,
+                              user_type: Option<crate::storage::UserTypeName>|
+         -> Result<i32, SqlError> {
+            match user_type {
+                Some(identity) => self
+                    .storage
+                    .user_type_identity_oid(identity, matches!(ctype, ColType::Array(_)), self.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "composite field type identity is unavailable"
+                        )
+                    }),
+                None => Ok(ctype.oid()),
+            }
+        };
+        let mut columns = ArenaList::new(arena);
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
+            let slot = usize::try_from(type_oid - oid::FIRST_TABLE_COMPOSITE)
+                .ok()
+                .filter(|slot| *slot < self.storage.table_count())
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
+                })?;
+            for column in self.storage.table_def(slot, self.txid).columns() {
+                let name = arena
+                    .alloc_str(column.name.as_str())
+                    .map_err(|_| arena_full())?;
+                let field_oid = field_type_oid(column.ctype, column.user_type)?;
+                columns
+                    .push(super::types::RecordField {
+                        name,
+                        type_oid: field_oid,
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
+            }
+            return Ok(columns.as_slice());
+        }
+        let slot = usize::try_from(type_oid - oid::FIRST_VIEW_COMPOSITE)
+            .ok()
+            .filter(|slot| *slot < self.storage.view_count())
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view"))?;
+        let view = self.storage.view(slot);
+        let count = view.columns_for(self.txid).names().len();
+        let described = arena
+            .alloc_slice_with(count, |_| super::types::ColDesc::new("", 0, 0))
+            .map_err(|_| arena_full())?;
+        let count = super::catalog::describe_view(self.storage, self.txid, view, arena, described)?;
+        for column in &described[..count] {
+            let name = arena.alloc_str(column.name).map_err(|_| arena_full())?;
+            columns
+                .push(super::types::RecordField {
+                    name,
+                    type_oid: column.type_oid,
+                    value: Datum::Null,
+                })
+                .map_err(|_| arena_full())?;
+        }
+        Ok(columns.as_slice())
+    }
+
     fn coerce_result<'a>(
         &self,
         value: Datum<'a>,
@@ -2185,6 +2256,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         type_oid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        use super::types::oid;
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_DOMAIN_ARRAY).contains(&type_oid) {
+            return self.rowtype_fields(type_oid, arena).map(Some);
+        }
         let Ok(slot) = usize::try_from(type_oid - super::types::oid::FIRST_COMPOSITE) else {
             return Ok(None);
         };
@@ -2229,10 +2304,22 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn composite_base_type_oid(&self, type_oid: i32) -> Option<i32> {
+        use super::types::oid;
         if matches!(ColType::from_oid(type_oid), Some(ColType::Composite(_))) {
             return Some(type_oid);
         }
-        let slot = usize::try_from(type_oid - super::types::oid::FIRST_DOMAIN).ok()?;
+        // Table/view rowtypes and named composites are their own base type.
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_DOMAIN_ARRAY).contains(&type_oid)
+            || (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE_ARRAY).contains(&type_oid)
+        {
+            return Some(type_oid);
+        }
+        if !(oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + self.storage.domain_count() as i32)
+            .contains(&type_oid)
+        {
+            return None;
+        }
+        let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN).ok()?;
         if !self.storage.domain_slot_visible_to(slot, self.txid) {
             return None;
         }
@@ -2244,6 +2331,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn composite_field_type_mod(&self, type_oid: i32, field: usize) -> Option<i32> {
+        use super::types::oid;
+        if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&type_oid) {
+            let slot = usize::try_from(type_oid - oid::FIRST_TABLE_COMPOSITE).ok()?;
+            if slot >= self.storage.table_count() {
+                return None;
+            }
+            return self
+                .storage
+                .table_def(slot, self.txid)
+                .columns()
+                .get(field)
+                .map(|column| column.type_mod);
+        }
         let slot = usize::try_from(type_oid - super::types::oid::FIRST_COMPOSITE).ok()?;
         self.storage
             .composites_with_slots_visible_to(self.txid)
@@ -2258,6 +2358,16 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         if self
             .storage
             .resolve_composite_slot(type_name, self.txid)
+            .is_some()
+        {
+            return true;
+        }
+        let (qualifier, bare) = type_name
+            .split_once('.')
+            .map_or((None, type_name), |(schema, name)| (Some(schema), name));
+        if self
+            .storage
+            .resolve_relation(qualifier, bare, self.txid)
             .is_some()
         {
             return true;
@@ -3685,6 +3795,26 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .map(Some);
         }
         let Some(slot) = self.storage.resolve_enum_slot(type_name, self.txid) else {
+            // A table/view rowtype name: NULL casts populate nothing; other
+            // values report PostgreSQL's cannot-coerce error until rowtype
+            // value decoding exists.
+            let (qualifier, bare) = type_name
+                .split_once('.')
+                .map_or((None, type_name), |(schema, name)| (Some(schema), name));
+            if self
+                .storage
+                .resolve_relation(qualifier, bare, self.txid)
+                .is_some()
+            {
+                if value.is_null() {
+                    return Ok(Some(Datum::Null));
+                }
+                return Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cannot cast type record to {}",
+                    type_name
+                ));
+            }
             return Ok(None);
         };
         super::exec::coerce_enum_value(value, slot as u16, self.storage, self.txid, arena).map(Some)
@@ -3716,33 +3846,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn user_type_oid(&self, type_name: &str) -> Option<i32> {
-        let (base, array) = match type_name.strip_suffix("[]") {
-            Some(base) => (base, true),
-            None => (type_name, false),
-        };
-        if let Some(slot) = self.storage.resolve_domain_slot(base, self.txid) {
-            return Some(if array {
-                super::types::oid::domain_array_oid(slot as u16)
-            } else {
-                super::types::oid::domain_oid(slot as u16)
-            });
-        }
-        if let Some(slot) = self.storage.resolve_enum_slot(base, self.txid) {
-            return Some(if array {
-                super::types::oid::enum_array_oid(slot as u16)
-            } else {
-                super::types::oid::enum_oid(slot as u16)
-            });
-        }
-        self.storage
-            .resolve_composite_slot(base, self.txid)
-            .map(|slot| {
-                if array {
-                    super::types::oid::composite_array_oid(slot as u16)
-                } else {
-                    super::types::oid::composite_oid(slot as u16)
-                }
-            })
+        super::catalog::user_type_oid(self.storage, self.txid, type_name)
     }
 
     fn user_type_identity_oid(
@@ -8964,6 +9068,23 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         type_name: &str,
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
+        if let Some(column) =
+            super::catalog::table_rowtype_field(self.storage, self.txid, type_name, index)
+        {
+            return Some((
+                crate::util::StackStr::from_str(column.name.as_str()),
+                super::exec::StaticTypeMeta {
+                    ctype: column.ctype,
+                    type_oid: self.storage.routine_type_oid(
+                        column.ctype,
+                        column.user_type,
+                        self.txid,
+                    )?,
+                    type_mod: column.type_mod,
+                    collation: column.collation,
+                },
+            ));
+        }
         let slot = self.storage.resolve_composite_slot(type_name, self.txid)?;
         let definition = self.storage.composite_for(slot, self.txid);
         let field = definition.active_field(index)?;

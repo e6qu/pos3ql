@@ -402,6 +402,36 @@ impl<'a, T: Copy + 'a> ArenaList<'a, T> {
     }
 }
 
+/// A growable UTF-8 string built in the arena, so text results are bounded by
+/// statement memory rather than a fixed stack buffer. Exhaustion surfaces as
+/// `Err` from the `fmt::Write` methods.
+pub(crate) struct ArenaString<'a> {
+    bytes: ArenaList<'a, u8>,
+}
+
+impl<'a> ArenaString<'a> {
+    pub(crate) const fn new(arena: &'a Arena) -> Self {
+        Self {
+            bytes: ArenaList::new(arena),
+        }
+    }
+
+    /// The accumulated text. Valid UTF-8 because only `&str` data is pushed.
+    pub(crate) fn as_str(&self) -> &'a str {
+        // UTF-8 validity: every push comes from a &str.
+        unsafe { core::str::from_utf8_unchecked(self.bytes.as_slice()) }
+    }
+}
+
+impl core::fmt::Write for ArenaString<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &byte in s.as_bytes() {
+            self.bytes.push(byte).map_err(|_| core::fmt::Error)?;
+        }
+        Ok(())
+    }
+}
+
 /// A stable sort that never touches the allocator: the standard library's
 /// stable `sort_by` draws merge scratch from the heap for large slices, which
 /// the post-startup allocation guard forbids. This stages a permutation in

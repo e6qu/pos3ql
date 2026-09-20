@@ -12,7 +12,7 @@ pos3ql implements PostgreSQL 18 SQL/JSON as typed SQL and wire behavior, not as 
 - Record conversion covers the json/jsonb populate/to-record families, named and anonymous shapes, nested composites and arrays, domains, enums, missing/extra fields, and validity checks.
 - JSONB read/write subscripting supports chained object and array paths, negative indexes, inferred containers, NULL bases, null padding, DML targets, RETURNING, triggers, PL/pgSQL locals, constraints, generated columns, rollback, WAL, and recovery.
 
-Path parsing is bounded to 256 steps and subscripts, depth 128, and 65,536 canonical bytes. One execution produces at most 1,024 path items. These are startup-bounded statement-arena limits; overflow is a named program-limit error. Set-returning rows and relational operators additionally use the ordinary bounded materialization and spill paths.
+JSON container members, path steps and subscripts, path result items, and rendered text use the fixed statement arena instead of separate width or byte limits. JSON parsing still bounds nesting at 1,000 levels and path parsing at depth 128 to protect the evaluation stack. Arena exhaustion reports a program-limit error. Set-returning rows and relational operators also use their bounded materialization and spill paths.
 
 GIN `jsonb_ops` and `jsonb_path_ops` indexes execute through object-native
 posting generations with exact SQL rechecks. Native transforms,
@@ -33,4 +33,4 @@ Catalog identities, grammar, evaluation behavior, error SQLSTATEs, and binary fo
 - [JSON and JSONB SQL functions](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/adt/jsonfuncs.c)
 - [JSONB representation utilities](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/adt/jsonb_util.c)
 
-The conformance ratchet is `tests/external/differential/147_sql_json.sql`, backed by PostgreSQL 18.4. The generated differential fuzzer also emits path operators/functions, aggregates, subscripts, lateral set-returning queries, and `JSON_TABLE`; raw-wire and type-fidelity probes cover binary and catalog metadata.
+The conformance ratchets are `tests/external/differential/147_sql_json.sql` and `tests/external/differential/183_json_value_width.sql`, backed by PostgreSQL 18.4 and 18.6 respectively. The generated differential fuzzer also emits path operators/functions, aggregates, subscripts, lateral set-returning queries, and `JSON_TABLE`; raw-wire and type-fidelity probes cover binary and catalog metadata.

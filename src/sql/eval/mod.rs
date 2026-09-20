@@ -5921,8 +5921,24 @@ pub fn json_each_pairs<'a>(
 
 /// `jsonb || jsonb`: merge two objects (right key wins), concatenate two
 /// arrays, else concatenate as arrays wrapping any non-array operand.
+/// PostgreSQL's jsonb-only operators (`||`, `-`, `#-`, `?`, `?|`, `?&`)
+/// reject a plain `json` operand at resolution (SQLSTATE 42883); an unknown
+/// text literal still coerces to jsonb.
+fn jsonb_operator_left(op: &str, l: &Datum) -> Result<(), SqlError> {
+    if matches!(l, Datum::Json { jsonb: false, .. }) {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "operator does not exist: json {}",
+            op
+        ));
+    }
+    Ok(())
+}
+
 fn jsonb_concat<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     use super::json::Json;
+    jsonb_operator_left("||", &l)?;
+    jsonb_operator_left("||", &r)?;
     let text_of = |d: Datum<'a>| -> Result<Option<&'a str>, SqlError> {
         match d {
             Datum::Json { text, .. } => Ok(Some(text)),
@@ -6033,6 +6049,7 @@ fn json_path_parts<'a>(r: Datum<'a>, arena: &'a Arena) -> Result<&'a [&'a str], 
 
 /// `jsonb - text`/`text[]`/`integer`: delete a key, several keys, or an element.
 fn jsonb_delete<'a>(l: Datum<'a>, r: Datum<'a>, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    jsonb_operator_left("-", &l)?;
     let Datum::Json { text, .. } = l else {
         return Err(type_mismatch("- requires jsonb", &l));
     };
@@ -6067,6 +6084,7 @@ fn jsonb_delete_path<'a>(
     r: Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    jsonb_operator_left("#-", &l)?;
     let text = match l {
         Datum::Json { text, .. } => text,
         Datum::Null => return Ok(Datum::Null),
@@ -6152,8 +6170,16 @@ fn json_exists<'a>(
     r: Datum<'a>,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    use super::ast::BinaryOp::{JsonExistsAll, JsonExistsAny};
+    use super::ast::BinaryOp::{JsonExists, JsonExistsAll, JsonExistsAny};
     use super::json::Json;
+    jsonb_operator_left(
+        match operator {
+            JsonExists => "?",
+            JsonExistsAny => "?|",
+            _ => "?&",
+        },
+        &l,
+    )?;
     let text = match l {
         Datum::Json { text, .. } => text,
         Datum::Null => return Ok(Datum::Null),

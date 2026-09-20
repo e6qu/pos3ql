@@ -1,0 +1,48 @@
+{
+  "database_identity": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit",
+  "label": "postgresql18-scan",
+  "results": {
+    "access_path": {
+      "index_scans": 0,
+      "index_tuples_fetched": 0,
+      "sequential_scans": 3,
+      "sequential_tuples_read": 3600
+    },
+    "attempted_operations": 3,
+    "completed_operations": 3,
+    "elapsed_seconds": 0.00125225,
+    "errors": [],
+    "fixed_memory_occupancy": null,
+    "fixed_memory_plan_bytes": null,
+    "latency_ms": {
+      "maximum": 0.820084,
+      "mean": 0.401056,
+      "minimum": 0.187167,
+      "p50": 0.195917,
+      "p95": 0.820084,
+      "p99": 0.820084
+    },
+    "maintenance_operations": 0,
+    "maximum_rss_bytes": null,
+    "object_requests_per_operation": null,
+    "object_store": null,
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 2395.687762028349
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit"
+  ],
+  "workload": {
+    "clients": 1,
+    "maintenance_interval_seconds": 0.0,
+    "maintenance_limit": 0,
+    "name": "scan",
+    "operations_per_client": 3,
+    "require_index": false,
+    "rows": 1000,
+    "synchronized": false,
+    "target_count": 1,
+    "timeout_seconds": 120.0
+  }
+}

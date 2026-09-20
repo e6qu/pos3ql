@@ -39,11 +39,19 @@ def main():
     if environment_path.exists():
         environment = json.loads(environment_path.read_text(encoding="utf-8"))
         suite = environment["suite"]
+        cache = (
+            f"{suite['disk_cache_mib']} MiB fixed disk cache, "
+            if "disk_cache_mib" in suite else ""
+        )
+        timeout = (
+            f"{suite['timeout_seconds']} s query timeout, "
+            if "timeout_seconds" in suite else ""
+        )
         print(
             f"Run identity: `{environment['git_commit']}`; "
             f"binary `{environment['pos3ql_binary_sha256'][:16]}…`; "
             f"{environment['machine']}, {environment['logical_cpu_count']} logical CPUs; "
-            f"{suite['rows']} rows, {suite['clients']} clients, "
+            f"{suite['rows']} rows, {suite['clients']} clients, {cache}{timeout}"
             f"{suite['object_latency_ms']} ms injected object latency.\n"
         )
         object_store = environment.get("pos3ql_object_store")

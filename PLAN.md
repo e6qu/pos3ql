@@ -106,18 +106,27 @@ without post-startup allocation or weaker durability.
 
 ### Performance qualification
 
-The [first exploratory baseline](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
-is complete against unmodified PostgreSQL 18 on its normal local-storage
-durability path. Matched comparison workloads used the same SQL and load.
-pos3ql published to an instrumented object-store fixture backed by local
-temporary storage. The 256-row, four-client run has complete raw artifacts,
-but its same-process point workload still made object requests. Its short
-duration cannot establish production ratios. The partial 1,000-row attempt
-timed out in SP-GiST text-prefix probing before reaching PostgreSQL.
-Diagnose that scaling boundary, settle the cache state explicitly, and
-extend the comparison to larger datasets and logical replicas before using it
-to rank concurrency
-or storage changes.
+The [256-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
+and [1,000-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs-1000/README.md)
+exploratory baselines are complete against unmodified PostgreSQL 18 on its
+normal local-storage durability path. Matched comparison workloads used the
+same SQL and load. pos3ql published to an instrumented object-store fixture
+backed by local temporary storage. Completed object reads formerly stranded
+fixed slots and parked SP-GiST probes; mixed resident/spilled scans then
+point-read immutable blocks. Both paths now advance at 1,000 rows. The larger
+run used a 1 GiB fixed disk cache and a 120-second query timeout, unlike the
+256-row run's 128 MiB cache and 30-second timeout. The same-process point
+workload still made object requests, and explicit checkpoint pressure cut
+throughput sharply. These short, shared-host runs cannot establish production
+ratios or isolate dataset size from cache changes. Measure explicit warm-RAM,
+warm-disk, and empty-cache states, then extend to larger datasets and logical
+replicas before using the comparison to rank concurrency or storage changes.
+
+Profile explicit checkpoint work by value-index rebuild, SST publication,
+and garbage deletion. The 1,000-row maintenance case completed, but its
+5,902 object requests and 4.36-second p99 query latency make checkpoint
+interference the next measured performance boundary. Preserve durability and
+fixed-memory behavior while reducing repeated reads and publication churn.
 
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local

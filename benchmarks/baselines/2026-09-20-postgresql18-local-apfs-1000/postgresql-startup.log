@@ -1,0 +1,7 @@
+2026-09-20 18:33:32.654 EEST [98524] LOG:  starting PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit
+2026-09-20 18:33:32.655 EEST [98524] LOG:  listening on IPv4 address "127.0.0.1", port 19700
+2026-09-20 18:33:32.655 EEST [98524] LOG:  listening on Unix socket "/tmp/pos3ql-postgresql18-baseline.RcGfuB/socket/.s.PGSQL.19700"
+2026-09-20 18:33:32.657 EEST [98530] LOG:  database system was shut down at 2026-09-20 18:33:32 EEST
+2026-09-20 18:33:32.658 EEST [98524] LOG:  database system is ready to accept connections
+2026-09-20 18:34:44.976 EEST [98528] LOG:  checkpoint starting: immediate force wait
+2026-09-20 18:34:44.983 EEST [98528] LOG:  checkpoint complete: wrote 303 buffers (1.8%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.003 s, sync=0.003 s, total=0.008 s; sync files=77, longest=0.001 s, average=0.001 s; distance=1950 kB, estimate=1950 kB; lsn=0/1974A68, redo lsn=0/1974A10

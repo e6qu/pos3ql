@@ -136,6 +136,24 @@ def main():
                 baseline["results"]["latency_ms"]["p99"],
             ),
         ))
+    pg_baseline = results.get("postgresql18-mixed-baseline")
+    pg_interference = results.get("postgresql18-mixed-checkpoint-interference")
+    if pg_baseline and pg_interference:
+        comparisons.append((
+            "PostgreSQL 18 checkpoint-overlap / baseline p99",
+            ratio(
+                pg_interference["results"]["latency_ms"]["p99"],
+                pg_baseline["results"]["latency_ms"]["p99"],
+            ),
+        ))
+    if interference and pg_interference:
+        comparisons.append((
+            "pos3ql / PostgreSQL 18 checkpoint-overlap p99",
+            ratio(
+                interference["results"]["latency_ms"]["p99"],
+                pg_interference["results"]["latency_ms"]["p99"],
+            ),
+        ))
     postgres = results.get("postgresql18-point")
     if postgres and warm:
         comparisons.append((

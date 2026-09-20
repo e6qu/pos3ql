@@ -582,6 +582,7 @@ def run(args):
             "require_index": args.require_index,
             "maintenance_interval_seconds": args.maintenance_interval,
             "maintenance_limit": args.maintenance_limit,
+            "required_maintenance_operations": args.require_maintenance_operations,
             "target_count": len(targets),
             "timeout_seconds": args.timeout_seconds,
         },
@@ -644,6 +645,12 @@ def validate(result):
     }:
         failures.append("object-store instrumentation has the wrong operation schema")
     workload = result.get("workload", {})
+    required_maintenance = workload.get("required_maintenance_operations", 0)
+    if required_maintenance and results.get("maintenance_operations", 0) != required_maintenance:
+        failures.append(
+            f"expected {required_maintenance} completed checkpoints, got "
+            f"{results.get('maintenance_operations', 0)}"
+        )
     access_path = results.get("access_path")
     if workload.get("require_index"):
         if access_path is None:
@@ -731,6 +738,7 @@ def parse_args():
     )
     parser.add_argument("--maintenance-interval", type=float, default=0.0)
     parser.add_argument("--maintenance-limit", type=int, default=0)
+    parser.add_argument("--require-maintenance-operations", type=int, default=0)
     parser.add_argument("--object-metrics")
     parser.add_argument("--pid", type=int)
     parser.add_argument("--fixed-memory-bytes", type=int)
@@ -754,6 +762,10 @@ def parse_args():
         parser.error("maintenance interval cannot be negative")
     if args.maintenance_limit < 0 or (args.maintenance_limit and not args.maintenance_interval):
         parser.error("maintenance limit requires a positive interval")
+    if args.require_maintenance_operations < 0 or (
+        args.require_maintenance_operations and not args.maintenance_interval
+    ):
+        parser.error("required maintenance operations need a positive interval")
     if args.require_index and (
         args.workload
         not in (

@@ -2773,6 +2773,13 @@ impl<'a> Parser<'a> {
         self.arena_slice(&[context, path, path_name, passing, columns, behavior])
     }
 
+    fn optional_xml_passing_mechanism(&mut self) -> Result<(), ParseError> {
+        if self.eat_ident("by")? && !self.eat_ident("ref")? {
+            self.expect_ident("value")?;
+        }
+        Ok(())
+    }
+
     /// Parses XMLTABLE into a bounded table-function specification shared by
     /// static description, stored queries and execution.
     fn xml_table_arguments(&mut self) -> Result<&'a [&'a Expr<'a>], ParseError> {
@@ -2807,13 +2814,9 @@ impl<'a> Parser<'a> {
         };
         let row_path = self.prefix()?;
         self.expect_ident("passing")?;
-        if self.eat_ident("by")? && !self.eat_ident("ref")? {
-            self.expect_ident("value")?;
-        }
+        self.optional_xml_passing_mechanism()?;
         let document = self.prefix()?;
-        if self.eat_ident("by")? {
-            self.expect_ident("ref")?;
-        }
+        self.optional_xml_passing_mechanism()?;
         self.expect_ident("columns")?;
         let columns = self.xml_table_columns()?;
         self.expect_op(")")?;

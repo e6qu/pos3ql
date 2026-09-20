@@ -157,6 +157,11 @@ SELECT * FROM XMLTABLE('/rows/row'
                        PASSING ('<rows><row/></rows>')::xml
                        COLUMNS ord FOR ORDINALITY) AS item;
 SELECT XMLEXISTS('/rows/row' PASSING ('<rows><row/></rows>')::xml);
+SELECT count(*) FROM XMLTABLE('/rows/row'
+  PASSING BY VALUE ('<rows><row/></rows>'::xml) BY VALUE
+  COLUMNS ord FOR ORDINALITY) AS item;
+SELECT XMLEXISTS('/rows/row'
+  PASSING BY VALUE ('<rows><row/></rows>'::xml) BY REF);
 
 DROP MATERIALIZED VIEW sql_xml_materialized;
 DROP VIEW sql_xml_view;

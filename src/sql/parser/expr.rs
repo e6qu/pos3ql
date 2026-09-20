@@ -1361,10 +1361,9 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let path = self.prefix()?;
         self.expect_ident("passing")?;
-        if self.eat_ident("by")? && !self.eat_ident("ref")? {
-            self.expect_ident("value")?;
-        }
+        self.optional_xml_passing_mechanism()?;
         let document = self.prefix()?;
+        self.optional_xml_passing_mechanism()?;
         self.expect_op(")")?;
         self.xml_call("__xmlexists", &[path, document])
     }

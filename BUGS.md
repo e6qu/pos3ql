@@ -82,7 +82,8 @@ The table-function row-width audit found no externally blocked defect.
 XMLTABLE, JSON_TABLE, and publication-introspection rows now use statement
 memory beyond 256 rows. The audit also fixed publication enumeration of the
 internal large-object relation and XML `PASSING` syntax that accepted a cast
-where PostgreSQL requires a primary expression. PostgreSQL 18 differential,
+where PostgreSQL requires a primary expression while rejecting trailing
+`BY REF` or `BY VALUE`. PostgreSQL 18 differential,
 allocation-forbidden, and empty-cache recovery regressions cover the former
 limit.
 

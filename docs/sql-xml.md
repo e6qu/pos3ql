@@ -33,6 +33,8 @@ survive WAL replay, checkpoints, and cacheless object-store recovery.
 Its `PASSING` operand follows PostgreSQL's primary-expression grammar; casts
 on compound expressions belong inside parentheses. This boundary follows
 [PostgreSQL 18's SQL/XML grammar](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/gram.y).
+`BY REF` and `BY VALUE` are accepted before or after that operand, as in
+PostgreSQL.
 
 ## XPath and resource limits
 

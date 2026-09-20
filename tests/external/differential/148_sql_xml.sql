@@ -147,6 +147,22 @@ SELECT '<root/>'::xml;
 SET xmloption = content;
 SELECT '<a/><b/>'::xml;
 
+-- XMLTABLE results cross the former 256-row materialization bound.
+SELECT count(*), max(ord)
+  FROM XMLTABLE('/rows/row'
+                PASSING (('<rows>' || repeat('<row/>', 300) || '</rows>')::xml)
+                COLUMNS ord FOR ORDINALITY) AS item;
+-- PostgreSQL's PASSING operand requires the cast inside the parentheses.
+SELECT * FROM XMLTABLE('/rows/row'
+                       PASSING ('<rows><row/></rows>')::xml
+                       COLUMNS ord FOR ORDINALITY) AS item;
+SELECT XMLEXISTS('/rows/row' PASSING ('<rows><row/></rows>')::xml);
+SELECT count(*) FROM XMLTABLE('/rows/row'
+  PASSING BY VALUE ('<rows><row/></rows>'::xml) BY VALUE
+  COLUMNS ord FOR ORDINALITY) AS item;
+SELECT XMLEXISTS('/rows/row'
+  PASSING BY VALUE ('<rows><row/></rows>'::xml) BY REF);
+
 DROP MATERIALIZED VIEW sql_xml_materialized;
 DROP VIEW sql_xml_view;
 DROP FUNCTION sql_xml_first_name(xml);

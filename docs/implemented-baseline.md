@@ -176,6 +176,12 @@ roadmap is [PLAN.md](../PLAN.md).
   to a full rewrite at that width. Allocation-forbidden PostgreSQL 18 fixtures
   cross the path and set-result boundaries, while 1,100 deletions remain a
   delta and survive checkpoint publication and empty-cache object recovery.
+- XMLTABLE, JSON_TABLE, and publication-introspection result rows use the fixed
+  statement arena rather than a shared 256-row array. Flat and nested table
+  functions cross the former boundary in PostgreSQL 18 differential tests,
+  allocation-forbidden execution, and empty-cache object recovery. Publication
+  enumeration excludes the internal large-object relation, including after
+  recovery. XML XPath indexing retains its separately documented bound.
 - SQL array values admit the durable format's complete 65,535-element count;
   the former 1,024-element stack buffer is not a client-visible limit.
   Literal and binary input, aggregates, concatenation and mutation, split

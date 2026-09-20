@@ -1843,6 +1843,9 @@ fn publication_projection_mask(
     publication: &crate::storage::PublicationDef,
     table_slot: usize,
 ) -> Option<u64> {
+    if table_slot == storage.large_object_page_table() {
+        return None;
+    }
     let implicit_mask = || {
         storage
             .table_def(table_slot, 0)

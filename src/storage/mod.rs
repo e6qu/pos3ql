@@ -23880,12 +23880,13 @@ impl Storage {
         Ok(self.schemas[slot as usize].name)
     }
 
-    /// Live tables with their slot indices.
+    /// Live SQL tables with their slot indices, excluding internal storage.
     pub fn live_tables(&self) -> impl Iterator<Item = (usize, &Table)> {
-        self.tables
-            .iter()
-            .enumerate()
-            .filter(|(_, table)| table.database == self.current_database && table.live)
+        self.tables.iter().enumerate().filter(|(slot, table)| {
+            *slot != self.large_object_page_table()
+                && table.database == self.current_database
+                && table.live
+        })
     }
 
     /// Floors every serial column's sequence at the maximum value stored in

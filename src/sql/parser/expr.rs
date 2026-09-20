@@ -1359,12 +1359,11 @@ impl<'a> Parser<'a> {
 
     fn sql_xml_exists(&mut self) -> Result<&'a Expr<'a>, ParseError> {
         self.expect_op("(")?;
-        let path = self.expression(0)?;
+        let path = self.prefix()?;
         self.expect_ident("passing")?;
-        if self.eat_ident("by")? && !self.eat_ident("ref")? {
-            self.expect_ident("value")?;
-        }
-        let document = self.expression(0)?;
+        self.optional_xml_passing_mechanism()?;
+        let document = self.prefix()?;
+        self.optional_xml_passing_mechanism()?;
         self.expect_op(")")?;
         self.xml_call("__xmlexists", &[path, document])
     }

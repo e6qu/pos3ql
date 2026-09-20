@@ -256,6 +256,15 @@ EXECUTE sql_json_prepared('{"a":[1,2]}', '$.a[*]');
 DEALLOCATE sql_json_prepared;
 COPY (SELECT id, path FROM sql_json_paths ORDER BY id) TO STDOUT;
 
+-- Flat and nested JSON_TABLE results cross the former 256-row materialization bound.
+SELECT count(*), max(ord)
+  FROM JSON_TABLE(('[' || repeat('1,', 299) || '1]')::jsonb,
+                  '$[*]' COLUMNS (ord FOR ORDINALITY)) AS item;
+SELECT count(*), max(ord)
+  FROM JSON_TABLE(('[' || repeat('1,', 299) || '1]')::jsonb,
+                  '$' COLUMNS (NESTED PATH '$[*]'
+                    COLUMNS (ord FOR ORDINALITY))) AS item;
+
 DROP MATERIALIZED VIEW sql_json_materialized;
 DROP VIEW sql_json_view;
 DROP FUNCTION sql_json_table_plpgsql(jsonb);

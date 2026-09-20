@@ -30,6 +30,11 @@ The supported SQL syntax is:
 INSERT/UPDATE/DELETE/MERGE sources, CTAS, COPY, views, materialized views,
 cursors, prepared statements, and PL/pgSQL. Stored definitions and values
 survive WAL replay, checkpoints, and cacheless object-store recovery.
+Its `PASSING` operand follows PostgreSQL's primary-expression grammar; casts
+on compound expressions belong inside parentheses. This boundary follows
+[PostgreSQL 18's SQL/XML grammar](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/gram.y).
+`BY REF` and `BY VALUE` are accepted before or after that operand, as in
+PostgreSQL.
 
 ## XPath and resource limits
 
@@ -41,7 +46,8 @@ so the query prefix need not equal the source document's prefix. Other XPath
 axes, operators, and functions are outside the executable subset and reject
 rather than being ignored.
 
-Runtime work is bounded at startup. One XML value may nest 64 elements; an
+Runtime work is bounded at startup. XMLTABLE rows use fixed statement memory
+without a separate row-count limit. One XML value may nest 64 elements; an
 element may have 128 attributes; a document may declare 128 entities; an
 XPath evaluation may index 1,024 elements and 4,096 attributes and use 64 path
 steps. Constructors and XPath scalar materialization are limited to 64 KiB.

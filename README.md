@@ -247,9 +247,10 @@ actions, aggregates, scalar subqueries, set-operation branches, GRANT role
 lists, and multi-hundred-item expression lists are described, planned,
 executed, and explained at their written width. Remaining fixed statement
 boundaries are 64 Bind/SQL-`PREPARE` parameters, 64 `GROUP BY` terms with 256
-grouping sets, 128-column results, 256 rows per XMLTABLE/JSON_TABLE call, and
-64 join relations and `USING` columns. `EXPLAIN` plan nodes live in the fixed
-statement arena rather than the worker stack, and arena exhaustion returns
+grouping sets, 128-column results, and 64 join relations and `USING` columns.
+XMLTABLE, JSON_TABLE, and publication-introspection rows use statement memory.
+`EXPLAIN` plan nodes live in the fixed statement arena rather than the worker
+stack, and arena exhaustion returns
 SQLSTATE `54000` without dropping parse warnings or partially executing the
 statement. The former boundaries are qualified before and after empty-cache
 object recovery.

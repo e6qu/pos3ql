@@ -106,7 +106,7 @@ without post-startup allocation or weaker durability.
 
 ### Performance qualification
 
-Run an early representative baseline against unmodified PostgreSQL 18 using
+Run an early exploratory baseline against unmodified PostgreSQL 18 using
 its normal local-storage durability path. Drive both systems with the same SQL,
 client load, row counts, and durability expectations; pos3ql uses its object
 store for durable state. Record PostgreSQL's storage medium and settings and
@@ -118,7 +118,8 @@ equivalent to pos3ql's.
 
 Use the early comparison to identify the largest costs before changing
 concurrency or storage paths. Repeat long-running measurements after those
-changes on pinned representative hardware. Publish schema-versioned raw
+changes on pinned representative hardware with an independently operated
+compatible object store. Publish schema-versioned raw
 artifacts and a reproducible report with throughput, latency percentiles, CPU,
 fixed-memory occupancy, object requests and bytes, recovery time, checkpoint
 interference, replica freshness, and physical access-path counters.

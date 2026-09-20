@@ -215,6 +215,10 @@ else
   CLIENTS=${POS3QL_BENCH_CLIENTS:-8}
   REPLICA_SETTING=${POS3QL_BENCH_REPLICAS:-2}
 fi
+if ! [[ "$REPLICA_SETTING" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "POS3QL_BENCH_REPLICAS must be a nonnegative decimal count" >&2
+  exit 2
+fi
 if [ "$MODE" = full ] && [ "$TABLE_CAPACITY" -lt $((ROWS + CLIENTS * OPERATIONS)) ]; then
   echo "POS3QL_BENCH_TABLE_CAPACITY must cover setup and inserted rows" >&2
   exit 2
@@ -351,7 +355,7 @@ if [ "$MODE" = full ]; then
     "CREATE PUBLICATION benchmark_scale_publication FOR TABLE benchmark_kv" >/dev/null
   REPLICA_TARGETS=
   REPLICA_COUNT=$REPLICA_SETTING
-  for replica in $(seq 1 "$REPLICA_COUNT"); do
+  for ((replica = 1; replica <= REPLICA_COUNT; replica++)); do
     replica_port=$(claim_test_port "" $((19800 + replica * 10)) $((19809 + replica * 10)))
     launch_replica "replica-$replica" "$replica_port"
     python3 "$ROOT/tools/pg-query.py" --port "$replica_port" \
@@ -386,7 +390,17 @@ if [ "$MODE" = full ]; then
     python3 "$ROOT/tools/pg-query.py" --port "$POSTGRES_PORT" --expect 1 \
       --timeout 30 "SELECT 1" >/dev/null
     docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" >"$OUTPUT/postgresql-image-id.txt"
+    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:-Docker-managed local volume; host backing unspecified}
+  else
+    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:?POS3QL_BENCH_POSTGRES_STORAGE must describe the external PostgreSQL storage}
   fi
+  postgres_container_arg=()
+  if [ -n "$POSTGRES_CONTAINER" ]; then
+    postgres_container_arg=(--docker-container "$POSTGRES_CONTAINER")
+  fi
+  python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
+    --storage-description "$POSTGRES_STORAGE" \
+    --output "$OUTPUT/postgresql-server.json" "${postgres_container_arg[@]}"
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
     --operations "$OPERATIONS" --rows "$ROWS" --setup --check \

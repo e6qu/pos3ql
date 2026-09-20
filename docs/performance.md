@@ -67,10 +67,14 @@ recovery JSON intervals for initial/warm-disk/empty-local-cache starts, one
 freshness interval per logical replica, the PostgreSQL 18 resolved image ID,
 the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
 
-The PostgreSQL comparison covers the same SQL workload, concurrency, row
-count, and operation count. PostgreSQL does not use pos3ql's durable-object
-layout, so cache-tier and object-request measurements apply only to pos3ql;
-the comparison does not pretend PostgreSQL itself has an S3 cache profile.
+The baseline runs actual, unmodified PostgreSQL 18 with its ordinary local
+storage and durability settings. Both systems receive the same SQL workload,
+concurrency, row count, and operation count. pos3ql instead publishes durable
+state to object storage. A representative comparison must record PostgreSQL's
+storage medium and settings alongside pos3ql's object store, network, and cache
+conditions. End-to-end latency and throughput can be compared directly for the
+stated setups; storage request, cache-tier, and recovery measurements describe
+each system's different persistence design and must be reported separately.
 
 ## Measured scenarios
 

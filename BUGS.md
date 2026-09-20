@@ -72,6 +72,8 @@ The JSON value-width audit found no external blocker. JSON containers, path
 steps and results, and rendered text now use statement memory; JSON and JSONB
 function families reject mismatched typed arguments. PostgreSQL 18
 differential coverage crosses the former fixed boundaries.
+The production-roadmap rebaseline found no externally blocked defect. Remaining
+compatibility limits and operational work are tracked in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

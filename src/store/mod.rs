@@ -116,7 +116,7 @@ pub(crate) const MAX_PAYLOAD: usize = BLOCK_SIZE - HEADER_LEN;
 /// What a block holds. Stored in the header so a block found on its own — in a
 /// cache, in a bucket listing, during recovery — says what it is without a
 /// catalog to consult.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum BlockType {
     /// Sorted rows: the leaf of an SST.
     SstData = 1,

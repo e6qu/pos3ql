@@ -64,6 +64,11 @@ def main():
             "logical_replicas": args.replicas,
             "object_latency_ms": args.object_latency_ms,
         },
+        "pos3ql_object_store": {
+            "implementation": "tests/external/s3_test_server.py",
+            "backing": "temporary local filesystem",
+            "independently_operated": False,
+        },
     }
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 

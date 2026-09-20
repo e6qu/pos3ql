@@ -46,6 +46,25 @@ def main():
             f"{suite['rows']} rows, {suite['clients']} clients, "
             f"{suite['object_latency_ms']} ms injected object latency.\n"
         )
+        object_store = environment.get("pos3ql_object_store")
+        if object_store and not object_store["independently_operated"]:
+            print(
+                "pos3ql uses an instrumented object-store fixture backed by "
+                "local temporary storage. Timing from this run is exploratory.\n"
+            )
+    postgresql_path = args.directory / "postgresql-server.json"
+    if postgresql_path.exists():
+        postgresql = json.loads(postgresql_path.read_text(encoding="utf-8"))
+        settings = postgresql["settings"]
+        image = postgresql["container_image_id"]
+        image_text = f"; image `{image[:20]}…`" if image else ""
+        print(
+            f"PostgreSQL baseline: version `{postgresql['version_number']}`{image_text}; "
+            f"storage: {postgresql['storage_description']}; "
+            f"fsync={settings['fsync']['value']}, "
+            f"full_page_writes={settings['full_page_writes']['value']}, "
+            f"synchronous_commit={settings['synchronous_commit']['value']}.\n"
+        )
     print("| Scenario | ops/s | p50 ms | p95 ms | p99 ms | max ms | max RSS MiB | index scans | seq scans | object req/op | errors |")
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for label, value in results.items():

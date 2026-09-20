@@ -50,8 +50,12 @@ The full suite additionally needs Docker unless
 tools/run-performance.sh full ./performance-results/local
 ```
 
-The full run records Docker's resolved PostgreSQL image ID and `version()`
-output, rather than treating a mutable image tag as provenance. Its defaults
+For an existing PostgreSQL instance, set
+`POS3QL_BENCH_POSTGRES_STORAGE` to describe its storage medium. The full run
+requires PostgreSQL 18 with `fsync`, `full_page_writes`, and
+`synchronous_commit` enabled. It records `version()`, durability and resource
+settings, and, for Docker, the resolved image ID and mounts rather than
+treating a mutable image tag as provenance. Its defaults
 can be overridden with `POS3QL_BENCH_ROWS`,
 `POS3QL_BENCH_TABLE_CAPACITY`, `POS3QL_BENCH_OPERATIONS`,
 `POS3QL_BENCH_CLIENTS`, `POS3QL_BENCH_REPLICAS`, and
@@ -64,7 +68,9 @@ The output directory contains an environment manifest with the commit, binary
 hash, toolchain, machine, resources, and workload sizing; one raw JSON file
 per workload; separate
 recovery JSON intervals for initial/warm-disk/empty-local-cache starts, one
-freshness interval per logical replica, the PostgreSQL 18 resolved image ID,
+freshness interval per logical replica, Docker's resolved PostgreSQL image ID
+when Docker is used, `postgresql-server.json` with PostgreSQL's settings and
+storage description,
 the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
 
 The baseline runs actual, unmodified PostgreSQL 18 with its ordinary local
@@ -75,6 +81,10 @@ storage medium and settings alongside pos3ql's object store, network, and cache
 conditions. End-to-end latency and throughput can be compared directly for the
 stated setups; storage request, cache-tier, and recovery measurements describe
 each system's different persistence design and must be reported separately.
+The bundled suite uses an instrumented object-store fixture backed by local
+temporary storage. Its PostgreSQL comparison is an exploratory baseline; the
+representative qualification in [PLAN.md](../PLAN.md) also requires pinned
+hardware and an independently operated compatible object store.
 
 ## Measured scenarios
 

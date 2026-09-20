@@ -74,6 +74,10 @@ function families reject mismatched typed arguments. PostgreSQL 18
 differential coverage crosses the former fixed boundaries.
 The production-roadmap rebaseline found no externally blocked defect. Remaining
 compatibility limits and operational work are tracked in PLAN.md.
+The PostgreSQL comparison provenance audit found no externally blocked defect.
+The harness now records the reference server's durability settings and storage
+setup, and labels local object-store fixture timings as exploratory. A zero
+replica count no longer enters the scale loop and launches unintended replicas.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

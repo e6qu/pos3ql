@@ -289,7 +289,8 @@ if [ "$MODE" = full ]; then
   bench_pos3ql mixed-baseline --workload mixed --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS"
   bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --maintenance-interval 0.05
+    --operations "$OPERATIONS" --rows "$ROWS" \
+    --maintenance-interval 0.05 --maintenance-limit 3
 fi
 
 stop_pos3ql
@@ -394,13 +395,16 @@ if [ "$MODE" = full ]; then
   else
     POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:?POS3QL_BENCH_POSTGRES_STORAGE must describe the external PostgreSQL storage}
   fi
-  postgres_container_arg=()
   if [ -n "$POSTGRES_CONTAINER" ]; then
-    postgres_container_arg=(--docker-container "$POSTGRES_CONTAINER")
+    python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
+      --storage-description "$POSTGRES_STORAGE" \
+      --output "$OUTPUT/postgresql-server.json" \
+      --docker-container "$POSTGRES_CONTAINER"
+  else
+    python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
+      --storage-description "$POSTGRES_STORAGE" \
+      --output "$OUTPUT/postgresql-server.json"
   fi
-  python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
-    --storage-description "$POSTGRES_STORAGE" \
-    --output "$OUTPUT/postgresql-server.json" "${postgres_container_arg[@]}"
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
     --operations "$OPERATIONS" --rows "$ROWS" --setup --check \

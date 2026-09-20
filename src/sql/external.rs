@@ -339,6 +339,26 @@ impl ExternalSorter {
         Ok(carry)
     }
 
+    /// Sorts a complete run in startup memory when no chunk has spilled.
+    /// Callers must consume these rows before resetting or reusing the sorter.
+    pub(crate) fn in_memory_rows(
+        &mut self,
+        compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+    ) -> Result<Option<usize>, SqlError> {
+        if self.level_counts.iter().any(|&count| count != 0) {
+            return Ok(None);
+        }
+        self.sort_chunk(compare)?;
+        Ok(Some(self.row_count))
+    }
+
+    pub(crate) fn in_memory_row(&self, position: usize) -> &[u8] {
+        let entry = &self.rows[position];
+        let start = entry.offset as usize + ORDINAL_BYTES;
+        let end = entry.offset as usize + entry.length as usize;
+        &self.chunk[start..end]
+    }
+
     fn flush_chunk(
         &mut self,
         store: &mut dyn BlockStore,
@@ -347,6 +367,30 @@ impl ExternalSorter {
         if self.row_count == 0 {
             return Ok(());
         }
+        self.sort_chunk(compare)?;
+        self.writer.reset();
+        let rows = self.row_count as u64;
+        for (position, entry) in self.rows[..self.row_count].iter().enumerate() {
+            let start = entry.offset as usize;
+            let end = start + entry.length as usize;
+            self.writer
+                .append(store, position as u64 + 1, &self.chunk[start..end])
+                .map_err(run_error)?;
+        }
+        let handle = self
+            .writer
+            .finish(store)
+            .map_err(run_error)?
+            .expect("non-empty run");
+        self.chunk_len = 0;
+        self.row_count = 0;
+        self.add_run(store, ExternalRun { handle, rows }, 0, compare)
+    }
+
+    fn sort_chunk(
+        &mut self,
+        compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
+    ) -> Result<(), SqlError> {
         let chunk = &self.chunk;
         let mut comparison_error = None;
         self.rows[..self.row_count].sort_unstable_by(|a, b| {
@@ -369,23 +413,7 @@ impl ExternalSorter {
         if let Some(error) = comparison_error {
             return Err(error);
         }
-        self.writer.reset();
-        let rows = self.row_count as u64;
-        for (position, entry) in self.rows[..self.row_count].iter().enumerate() {
-            let start = entry.offset as usize;
-            let end = start + entry.length as usize;
-            self.writer
-                .append(store, position as u64 + 1, &self.chunk[start..end])
-                .map_err(run_error)?;
-        }
-        let handle = self
-            .writer
-            .finish(store)
-            .map_err(run_error)?
-            .expect("non-empty run");
-        self.chunk_len = 0;
-        self.row_count = 0;
-        self.add_run(store, ExternalRun { handle, rows }, 0, compare)
+        Ok(())
     }
 
     fn add_run(
@@ -498,6 +526,41 @@ mod tests {
     use super::*;
     use crate::mem::budget::Budget;
     use crate::store::MemoryBlockStore;
+
+    #[test]
+    fn bounded_rows_sort_without_publishing_a_run() {
+        let mut budget = Budget::new(96 << 20);
+        let mut store =
+            MemoryBlockStore::new(&mut budget, "external test blocks", 32 << 20, 4096).unwrap();
+        let mut sorter = ExternalSorter::new(&mut budget).unwrap();
+        let mut compare = |left: &[u8], right: &[u8]| Ok(left.cmp(right));
+        for row in [b"b".as_slice(), b"a", b"b", b"c"] {
+            sorter.push_encoded(&mut store, row, &mut compare).unwrap();
+        }
+        assert_eq!(sorter.in_memory_rows(&mut compare).unwrap(), Some(4));
+        assert_eq!(store.len(), 0);
+        assert_eq!(
+            (0..4)
+                .map(|index| sorter.in_memory_row(index))
+                .collect::<Vec<_>>(),
+            [b"a".as_slice(), b"b", b"b", b"c"]
+        );
+
+        sorter.reset();
+        for _ in 0..ROWS_PER_CHUNK + 1 {
+            sorter.push_encoded(&mut store, b"x", &mut compare).unwrap();
+        }
+        assert_eq!(sorter.in_memory_rows(&mut compare).unwrap(), None);
+        assert!(store.len() > 0);
+        assert_eq!(
+            sorter
+                .finish(&mut store, &mut compare)
+                .unwrap()
+                .unwrap()
+                .rows(),
+            (ROWS_PER_CHUNK + 1) as u64
+        );
+    }
 
     #[test]
     fn fan_in_carry_preserves_stable_order() {

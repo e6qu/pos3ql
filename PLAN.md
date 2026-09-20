@@ -144,6 +144,16 @@ garbage deletion, and foreground latency before changing their pacing. The
 recorded 1,556 object PUTs versus 2,595 before reuse; its latency and cleanup
 counts are exploratory on a shared host.
 
+Checkpoint value-index sorting now consumes complete runs directly from the
+sorter's startup buffer and spills only when that buffer fills. The zero-cache
+one-row-update regression reduced second-checkpoint block PUTs from 19 to 11
+without changing recovered indexed results. The
+[clean focused run](benchmarks/baselines/2026-09-20-checkpoint-sort-runs-1000/README.md)
+recorded 814 object PUTs and 553 DELETEs, versus 1,556 and 1,071 before this
+change. The shared-host latency pair remains exploratory. Attribute the
+remaining SST publication and garbage-deletion costs, then qualify foreground
+interference at larger scale before changing checkpoint pacing.
+
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local
 storage medium and durability settings and pos3ql's object store, network,

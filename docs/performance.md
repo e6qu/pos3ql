@@ -138,6 +138,13 @@ The [clean focused run](../benchmarks/baselines/2026-09-20-checkpoint-block-reus
 retains the raw 1,000-row comparison: object PUTs fell from 2,595 to 1,556
 under the same workload settings. Single-run latency and cleanup counts remain
 exploratory on the shared host.
+The next [clean focused run](../benchmarks/baselines/2026-09-20-checkpoint-sort-runs-1000/README.md)
+keeps a complete value-index sort in its startup buffer. A zero-cache
+one-row-update regression counted 11 checkpoint block PUTs versus 19 before
+this change, with the same indexed result after object-cold recovery. The
+focused mixed run counted 814 object PUTs and 553 DELETEs versus 1,556 and
+1,071 before it. Its 6.96-second elapsed time and 1,259.12 ms p99 are
+exploratory single-run results; larger sorts still use external runs.
 
 ## Measured scenarios
 

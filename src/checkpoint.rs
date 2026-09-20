@@ -10336,94 +10336,103 @@ impl Checkpointer {
                     Ok(ControlFlow::Continue(()))
                 },
             )?;
-            let run = value_sorter.finish(&mut *self.blocks.borrow_mut(), &mut compare)?;
-            if let Some(run) = run {
-                value_sort_reader.start(&mut *self.blocks.borrow_mut(), run)?;
-                let mut previous_posting = None;
-                while let Some(entry) = value_sort_reader.row() {
-                    let key = value_sort_key(entry)?;
-                    let payload = value_sort_payload(entry)?;
-                    let hash = u64::from_le_bytes(entry[..8].try_into().unwrap());
-                    let rowid = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-                    let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
-                    let posting_token = if navigation.is_some_and(|navigation| {
-                        navigation.kind == crate::store::NavigationKind::Posting
-                    }) {
-                        Some(
-                            crate::sql::index_signature::PostingToken::decode(key).ok_or_else(
-                                || sql_err!(SQLSTATE_IO, "persistent GIN posting key is corrupt"),
-                            )?,
+            let mut previous_posting = None;
+            let mut append_sorted = |entry: &[u8]| -> Result<(), SqlError> {
+                let key = value_sort_key(entry)?;
+                let payload = value_sort_payload(entry)?;
+                let hash = u64::from_le_bytes(entry[..8].try_into().unwrap());
+                let rowid = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+                let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+                let posting_token = if navigation.is_some_and(|navigation| {
+                    navigation.kind == crate::store::NavigationKind::Posting
+                }) {
+                    Some(
+                        crate::sql::index_signature::PostingToken::decode(key).ok_or_else(
+                            || sql_err!(SQLSTATE_IO, "persistent GIN posting key is corrupt"),
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                if let Some(token) = posting_token {
+                    let identity = (token.encode(), rowid, commit_lsn);
+                    if previous_posting == Some(identity) {
+                        return Ok(());
+                    }
+                    previous_posting = Some(identity);
+                }
+                let mut comparison_error = None;
+                let mut compare_keys = |left: &[u8], right: &[u8]| match storage
+                    .compare_value_binding_keys(slot, binding, navigation, left, right)
+                {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        comparison_error = Some(error);
+                        core::cmp::Ordering::Equal
+                    }
+                };
+                let include_mask = storage.value_binding_include_mask(slot, binding);
+                let summary = if let Some(spec) = navigation {
+                    Some(posting_token.map_or_else(
+                        || storage.value_binding_navigation_summary(slot, binding, spec, key),
+                        |token| Ok(token.summary()),
+                    )?)
+                } else {
+                    None
+                };
+                let write = {
+                    let mut blocks = self.blocks.borrow_mut();
+                    let mut published = PublishedValueBlockStore {
+                        inner: &mut *blocks,
+                        known_blocks: &self.roster_scratch,
+                    };
+                    if let Some(spec) = navigation {
+                        self.value_writer.append_navigation(
+                            &mut published,
+                            (hash, rowid, commit_lsn),
+                            key,
+                            (include_mask != 0
+                                && spec.kind != crate::store::NavigationKind::Posting)
+                                .then_some(payload),
+                            summary.expect("navigation summary was computed"),
+                            &mut compare_keys,
+                        )
+                    } else if include_mask == 0 {
+                        self.value_writer.append(
+                            &mut published,
+                            hash,
+                            rowid,
+                            commit_lsn,
+                            key,
+                            &mut compare_keys,
                         )
                     } else {
-                        None
-                    };
-                    if let Some(token) = posting_token {
-                        let identity = (token.encode(), rowid, commit_lsn);
-                        if previous_posting == Some(identity) {
-                            value_sort_reader.advance(&mut *self.blocks.borrow_mut())?;
-                            continue;
-                        }
-                        previous_posting = Some(identity);
+                        self.value_writer.append_covering(
+                            &mut published,
+                            (hash, rowid, commit_lsn),
+                            key,
+                            payload,
+                            &mut compare_keys,
+                        )
                     }
-                    let mut comparison_error = None;
-                    let mut compare_keys = |left: &[u8], right: &[u8]| match storage
-                        .compare_value_binding_keys(slot, binding, navigation, left, right)
-                    {
-                        Ok(ordering) => ordering,
-                        Err(error) => {
-                            comparison_error = Some(error);
-                            core::cmp::Ordering::Equal
-                        }
-                    };
-                    let include_mask = storage.value_binding_include_mask(slot, binding);
-                    let summary = if let Some(spec) = navigation {
-                        Some(posting_token.map_or_else(
-                            || storage.value_binding_navigation_summary(slot, binding, spec, key),
-                            |token| Ok(token.summary()),
-                        )?)
-                    } else {
-                        None
-                    };
-                    let write = {
-                        let mut blocks = self.blocks.borrow_mut();
-                        let mut published = PublishedValueBlockStore {
-                            inner: &mut *blocks,
-                            known_blocks: &self.roster_scratch,
-                        };
-                        if let Some(spec) = navigation {
-                            self.value_writer.append_navigation(
-                                &mut published,
-                                (hash, rowid, commit_lsn),
-                                key,
-                                (include_mask != 0
-                                    && spec.kind != crate::store::NavigationKind::Posting)
-                                    .then_some(payload),
-                                summary.expect("navigation summary was computed"),
-                                &mut compare_keys,
-                            )
-                        } else if include_mask == 0 {
-                            self.value_writer.append(
-                                &mut published,
-                                hash,
-                                rowid,
-                                commit_lsn,
-                                key,
-                                &mut compare_keys,
-                            )
-                        } else {
-                            self.value_writer.append_covering(
-                                &mut published,
-                                (hash, rowid, commit_lsn),
-                                key,
-                                payload,
-                                &mut compare_keys,
-                            )
-                        }
-                    };
-                    write.map_err(value_index_to_sql)?;
-                    if let Some(error) = comparison_error {
-                        return Err(error);
-                    }
+                };
+                write.map_err(value_index_to_sql)?;
+                if let Some(error) = comparison_error {
+                    return Err(error);
+                }
+                Ok(())
+            };
+            if let Some(count) = value_sorter.in_memory_rows(&mut compare)? {
+                for position in 0..count {
+                    append_sorted(value_sorter.in_memory_row(position))?;
+                }
+            } else {
+                let run = value_sorter
+                    .finish(&mut *self.blocks.borrow_mut(), &mut compare)?
+                    .expect("spilled rows produce a run");
+                value_sort_reader.start(&mut *self.blocks.borrow_mut(), run)?;
+                while let Some(entry) = value_sort_reader.row() {
+                    append_sorted(entry)?;
                     value_sort_reader.advance(&mut *self.blocks.borrow_mut())?;
                 }
             }

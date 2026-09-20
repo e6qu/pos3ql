@@ -1,0 +1,19 @@
+{
+  "artifact_type": "recovery",
+  "elapsed_seconds": 0.035872209,
+  "label": "warm-disk-recovery",
+  "object_store": {
+    "errors": 0,
+    "request_body_bytes": 0,
+    "requests": {
+      "delete": 0,
+      "get": 7,
+      "list": 0,
+      "put": 0,
+      "range_get": 26
+    },
+    "response_body_bytes": 160377,
+    "schema_version": 1
+  },
+  "schema_version": 1
+}

@@ -86,6 +86,12 @@ where PostgreSQL requires a primary expression while rejecting trailing
 `BY REF` or `BY VALUE`. PostgreSQL 18 differential,
 allocation-forbidden, and empty-cache recovery regressions cover the former
 limit.
+The measured PostgreSQL baseline audit found no externally blocked defect.
+The harness now completes against a local PostgreSQL 18 server on macOS,
+flushes worker statistics before reading access-path deltas, builds secondary
+indexes after loading the fixture, and bounds explicit checkpoint pressure.
+The larger text-prefix performance boundary is tracked as qualification work
+in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

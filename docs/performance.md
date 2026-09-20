@@ -86,6 +86,14 @@ temporary storage. Its PostgreSQL comparison is an exploratory baseline; the
 representative qualification in [PLAN.md](../PLAN.md) also requires pinned
 hardware and an independently operated compatible object store.
 
+The first complete [measured baseline](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
+uses actual PostgreSQL 18.6 on local APFS with durability enabled, 256 rows,
+four clients, and no replicas. The raw JSON, PostgreSQL settings, startup logs,
+and derived report are preserved with the run. The same-process point workload
+recorded object reads and therefore does not qualify as a fully resident RAM
+measurement. A partial 1,000-row attempt timed out in SP-GiST text-prefix
+probing; its failure artifact is preserved alongside the completed baseline.
+
 ## Measured scenarios
 
 | Scenario | Boundary measured |

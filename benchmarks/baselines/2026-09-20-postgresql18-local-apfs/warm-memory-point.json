@@ -1,0 +1,59 @@
+{
+  "database_identity": "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin",
+  "label": "warm-memory-point",
+  "results": {
+    "access_path": {
+      "index_scans": 155,
+      "index_tuples_fetched": 80,
+      "sequential_scans": 0,
+      "sequential_tuples_read": 0
+    },
+    "attempted_operations": 80,
+    "completed_operations": 80,
+    "elapsed_seconds": 0.114397625,
+    "errors": [],
+    "fixed_memory_occupancy": 0.4227537390440101,
+    "fixed_memory_plan_bytes": 675080714,
+    "latency_ms": {
+      "maximum": 54.327792,
+      "mean": 3.829268725,
+      "minimum": 0.225791,
+      "p50": 0.490834,
+      "p95": 49.545958,
+      "p99": 54.327792
+    },
+    "maintenance_operations": 0,
+    "maximum_rss_bytes": 285392896,
+    "object_requests_per_operation": 0.375,
+    "object_store": {
+      "errors": 0,
+      "request_body_bytes": 0,
+      "requests": {
+        "delete": 0,
+        "get": 0,
+        "list": 0,
+        "put": 0,
+        "range_get": 30
+      },
+      "response_body_bytes": 9630,
+      "schema_version": 1
+    },
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 699.3152174269352
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin"
+  ],
+  "workload": {
+    "clients": 4,
+    "maintenance_interval_seconds": 0.0,
+    "maintenance_limit": 0,
+    "name": "point-read",
+    "operations_per_client": 20,
+    "require_index": true,
+    "rows": 256,
+    "synchronized": false,
+    "target_count": 1
+  }
+}

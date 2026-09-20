@@ -1,0 +1,13 @@
+pos3ql starting
+  listen_addr  127.0.0.1:19600
+  data_dir     /var/folders/93/f1fz6s6969gbkd8m9tph1rfw0000gn/T//pos3ql-performance.AQKLuy/data-cold-join
+memory plan:
+  memtable     16 MiB
+  tables       358309258 B
+  block cache  32 MiB
+  connections  193666880 B
+  server       72772928 B
+  total        675080714 B
+  disk cache   128 MiB (disk, not RAM)
+  temp spill   128 MiB (local ephemeral disk)
+startup complete: memory frozen (626760536 B of 675080714 B budget drawn); accepting connections

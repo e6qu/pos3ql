@@ -1,0 +1,59 @@
+{
+  "database_identity": "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin",
+  "label": "warm-memory-spgist-prefix",
+  "results": {
+    "access_path": null,
+    "attempted_operations": 200,
+    "completed_operations": 0,
+    "elapsed_seconds": 30.001285167,
+    "errors": [
+      "worker 3: timed out",
+      "worker 0: timed out",
+      "worker 1: timed out",
+      "worker 2: timed out",
+      "access-path result: timed out"
+    ],
+    "fixed_memory_occupancy": 0.26625160195135833,
+    "fixed_memory_plan_bytes": 704277002,
+    "latency_ms": {
+      "maximum": null,
+      "mean": null,
+      "minimum": null,
+      "p50": null,
+      "p95": null,
+      "p99": null
+    },
+    "maintenance_operations": 0,
+    "maximum_rss_bytes": 187514880,
+    "object_requests_per_operation": null,
+    "object_store": {
+      "errors": 0,
+      "request_body_bytes": 0,
+      "requests": {
+        "delete": 0,
+        "get": 2,
+        "list": 0,
+        "put": 0,
+        "range_get": 60
+      },
+      "response_body_bytes": 67573,
+      "schema_version": 1
+    },
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 0.0
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin"
+  ],
+  "workload": {
+    "clients": 4,
+    "maintenance_interval_seconds": 0.0,
+    "name": "spgist-prefix",
+    "operations_per_client": 50,
+    "require_index": true,
+    "rows": 1000,
+    "synchronized": false,
+    "target_count": 1
+  }
+}

@@ -107,6 +107,12 @@ checkpoint rebuild now reuses unchanged, typed blocks from the previously
 published index roster; a zero-cache GIN regression covers write reduction
 and recovery after an update. Remaining sort and cleanup traffic is tracked
 as performance qualification in PLAN.md.
+The bounded checkpoint-sort audit found no externally blocked defect. Small
+value-index rebuilds now consume sorted rows from startup memory without
+publishing temporary runs, while larger rebuilds retain the bounded external
+merge. Zero-cache checkpoint writes, spill-path recovery, and the clean
+focused benchmark qualify the change; remaining checkpoint work is in
+PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

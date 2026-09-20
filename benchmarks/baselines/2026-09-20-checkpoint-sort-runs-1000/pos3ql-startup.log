@@ -1,0 +1,16 @@
+pos3ql starting
+  listen_addr  127.0.0.1:19600
+  data_dir     /var/folders/93/f1fz6s6969gbkd8m9tph1rfw0000gn/T//pos3ql-performance.pAnxQk/data-warm
+memory plan:
+  memtable     16 MiB
+  tables       386882954 B
+  block cache  32 MiB
+  connections  193961792 B
+  server       73166144 B
+  total        704342538 B
+  disk cache   1 GiB (disk, not RAM)
+  temp spill   128 MiB (local ephemeral disk)
+startup complete: memory frozen (656251736 B of 704342538 B budget drawn); accepting connections
+pos3ql: shutdown requested, draining
+pos3ql: final checkpoint written
+pos3ql: shutdown complete

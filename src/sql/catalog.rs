@@ -11728,6 +11728,23 @@ pub(crate) fn type_oid_visibility(storage: &Storage, txid: u32, oid: i32) -> Opt
 /// Resolves the exact OID for a visible user-defined type spelling, including
 /// the automatically-created array type.  Call sites that dispatch routines
 /// use this instead of reducing a domain to its storage representation.
+pub(crate) fn table_rowtype_field(
+    storage: &Storage,
+    txid: u32,
+    type_name: &str,
+    index: usize,
+) -> Option<crate::storage::ColumnMeta> {
+    let (qualifier, bare) = type_name
+        .split_once('.')
+        .map_or((None, type_name), |(schema, name)| (Some(schema), name));
+    let crate::storage::ResolvedRelation::Table(slot) =
+        storage.resolve_relation(qualifier, bare, txid)?
+    else {
+        return None;
+    };
+    storage.table_def(slot, txid).columns().get(index).copied()
+}
+
 pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Option<i32> {
     use crate::sql::types::oid;
     let (base, array) = type_name
@@ -11747,13 +11764,30 @@ pub(crate) fn user_type_oid(storage: &Storage, txid: u32, type_name: &str) -> Op
             oid::enum_oid(slot as u16)
         });
     }
-    storage.resolve_composite_slot(base, txid).map(|slot| {
-        if array {
+    if let Some(slot) = storage.resolve_composite_slot(base, txid) {
+        return Some(if array {
             oid::composite_array_oid(slot as u16)
         } else {
             oid::composite_oid(slot as u16)
-        }
-    })
+        });
+    }
+    // The composite rowtype PostgreSQL gives every table and view.
+    let (qualifier, name) = base
+        .split_once('.')
+        .map_or((None, base), |(schema, name)| (Some(schema), name));
+    match storage.resolve_relation(qualifier, name, txid)? {
+        crate::storage::ResolvedRelation::Table(slot) => Some(if array {
+            FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+        } else {
+            FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32
+        }),
+        crate::storage::ResolvedRelation::View(slot) => Some(if array {
+            FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32
+        } else {
+            FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32
+        }),
+        crate::storage::ResolvedRelation::Catalog => None,
+    }
 }
 
 pub fn function_oid_is_visible(oid: i32) -> bool {

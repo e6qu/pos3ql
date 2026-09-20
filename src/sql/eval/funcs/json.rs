@@ -9,6 +9,7 @@
 
 use core::fmt::Write;
 
+use crate::mem::arena::{ArenaList, ArenaString};
 use crate::sql::ast::Expr;
 use crate::sql::json;
 use crate::sql::types::Datum;
@@ -128,9 +129,12 @@ pub(crate) fn sql_json_passing<'a>(
     if !(args.len() - start).is_multiple_of(2) {
         return Err(arity_err(name, args.len()));
     }
-    let mut names = [""; 511];
+    let n_names = (args.len() - start) / 2;
+    let names = arena
+        .alloc_slice_with(n_names, |_| "")
+        .map_err(|_| arena_full())?;
     let mut name_count = 0usize;
-    let mut buffer = crate::util::StackStr::<65536>::new();
+    let mut buffer = ArenaString::new(arena);
     buffer.write_char('{').map_err(|_| arena_full())?;
     for pair in args[start..].as_chunks::<2>().0 {
         let variable = match *pair[1] {
@@ -159,16 +163,7 @@ pub(crate) fn sql_json_passing<'a>(
         }
     }
     buffer.write_char('}').map_err(|_| arena_full())?;
-    if buffer.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "JSON passing variables exceed the supported size"
-        ));
-    }
-    arena
-        .alloc_str(buffer.as_str())
-        .map(Some)
-        .map_err(|_| arena_full())
+    Ok(Some(buffer.as_str()))
 }
 
 pub(crate) fn sql_json_cast<'a>(
@@ -286,6 +281,7 @@ fn sql_json_query_behavior<'a>(
 pub(crate) fn populate_record<'a>(
     base_expression: &'a Expr<'a>,
     json_expression: &'a Expr<'a>,
+    name: &str,
     arena: &'a crate::mem::arena::Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
@@ -293,6 +289,7 @@ pub(crate) fn populate_record<'a>(
 ) -> Result<Datum<'a>, SqlError> {
     let base = eval_full(base_expression, arena, params, row, hooks)?;
     let source = eval_full(json_expression, arena, params, row, hooks)?;
+    check_json_family(name, &source)?;
     let text = match source {
         Datum::Json { text, .. } | Datum::Text(text) => text,
         Datum::Null => return Ok(Datum::Null),
@@ -324,14 +321,22 @@ pub(crate) fn populate_record_from_json<'a>(
             super::super::ExpressionTypeIdentity::Known(type_oid) => Some(type_oid),
             super::super::ExpressionTypeIdentity::Unresolved => None,
         };
-    let (slot, base_fields) = match base {
-        Datum::Composite { slot, fields } => (slot, fields),
+    let (slot, base_fields, base_type_oid): (Option<u16>, _, i32) = match base {
+        Datum::Composite { slot, fields } => (
+            Some(slot),
+            fields,
+            crate::sql::types::oid::composite_oid(slot),
+        ),
         Datum::CompositeText {
             slot,
             physical_fields,
             text,
         } => match catalog.materialize_composite(slot, physical_fields, text, arena)? {
-            Datum::Composite { fields, .. } => (slot, fields),
+            Datum::Composite { fields, .. } => (
+                Some(slot),
+                fields,
+                crate::sql::types::oid::composite_oid(slot),
+            ),
             _ => unreachable!("catalog materializes a named composite"),
         },
         Datum::Null => {
@@ -355,14 +360,11 @@ pub(crate) fn populate_record_from_json<'a>(
                         "first argument of populate_record must be a row type"
                     )
                 })?;
-            let slot = u16::try_from(composite_oid - crate::sql::types::oid::FIRST_COMPOSITE)
-                .map_err(|_| {
-                    sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "first argument of populate_record must be a row type"
-                    )
-                })?;
-            (slot, fields)
+            // Table/view rowtypes have no named-composite slot.
+            let slot = usize::try_from(composite_oid - crate::sql::types::oid::FIRST_COMPOSITE)
+                .ok()
+                .and_then(|slot| u16::try_from(slot).ok());
+            (slot, fields, composite_oid)
         }
         other => {
             return Err(type_mismatch(
@@ -380,14 +382,13 @@ pub(crate) fn populate_record_from_json<'a>(
     let fields = arena
         .alloc_slice_copy(base_fields)
         .map_err(|_| arena_full())?;
-    let composite_oid = crate::sql::types::oid::composite_oid(slot);
     for (index, field) in fields.iter_mut().enumerate() {
         if let Some((_, value)) = members.iter().find(|(name, _)| *name == field.name) {
             field.value = json_value_to_type(
                 *value,
                 field.type_oid,
                 catalog
-                    .composite_field_type_mod(composite_oid, index)
+                    .composite_field_type_mod(base_type_oid, index)
                     .unwrap_or(-1),
                 field.value,
                 arena,
@@ -395,9 +396,13 @@ pub(crate) fn populate_record_from_json<'a>(
             )?;
         }
     }
-    let result = Datum::Composite { slot, fields };
-    let composite_oid = crate::sql::types::oid::composite_oid(slot);
-    let Some(declared_type_oid) = declared_type_oid.filter(|oid| *oid != composite_oid) else {
+    // A rowtype base yields an anonymous record carrying the declared
+    // rowtype's fields; a named-composite base keeps its catalog identity.
+    let result = match slot {
+        Some(slot) => Datum::Composite { slot, fields },
+        None => Datum::Record(fields),
+    };
+    let Some(declared_type_oid) = declared_type_oid.filter(|oid| *oid != base_type_oid) else {
         return Ok(result);
     };
     let type_name = catalog
@@ -620,6 +625,73 @@ fn json_value_to_array<'a>(
     }
 }
 
+/// PostgreSQL resolves the old-style JSON function families strictly: `jsonb_*`
+/// functions take a jsonb document and `json_*` take json, with no cross-family
+/// match (SQLSTATE 42883). An unknown-typed literal still coerces to the
+/// target type, exactly as PostgreSQL's unknown literals do. The SQL/JSON
+/// functions (`JSON_VALUE` and kin) accept either family and are not checked
+/// here.
+pub(crate) fn check_json_family(name: &str, value: &Datum) -> Result<(), SqlError> {
+    let want_jsonb = name
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("jsonb_"));
+    if !want_jsonb
+        && !name
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("json_"))
+    {
+        return Ok(());
+    }
+    if let Datum::Json { jsonb, .. } = value
+        && *jsonb != want_jsonb
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {}({}) does not exist",
+            name,
+            if *jsonb { "jsonb" } else { "json" }
+        ));
+    }
+    Ok(())
+}
+
+/// The describe-time half of [`check_json_family`]: when the document
+/// expression's type is statically known (a cast to json or jsonb), a
+/// family-mismatched call fails with PostgreSQL's resolution error before any
+/// row is read.
+pub(crate) fn check_json_family_static(name: &str, expression: &Expr) -> Result<(), SqlError> {
+    let want_jsonb = name
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("jsonb_"));
+    if !want_jsonb
+        && !name
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("json_"))
+    {
+        return Ok(());
+    }
+    let Expr::Cast { type_name, .. } = expression else {
+        return Ok(());
+    };
+    let Some(ctype) = crate::sql::types::ColType::from_sql_name(type_name) else {
+        return Ok(());
+    };
+    let jsonb = match ctype {
+        crate::sql::types::ColType::Jsonb => true,
+        crate::sql::types::ColType::Json => false,
+        _ => return Ok(()),
+    };
+    if jsonb != want_jsonb {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {}({}) does not exist",
+            name,
+            if jsonb { "jsonb" } else { "json" }
+        ));
+    }
+    Ok(())
+}
+
 /// Handles the JSON/JSONB scalar family. Returns `None` if `name` is not one of
 /// these functions, leaving the router to keep matching.
 #[allow(clippy::too_many_arguments)]
@@ -697,10 +769,44 @@ pub(crate) fn dispatch<'a>(
         }
     };
     Some((|| -> Result<Datum<'a>, SqlError> {
+        let document_index = match name {
+            "json_populate_record"
+            | "jsonb_populate_record"
+            | "jsonb_populate_record_valid"
+            | "json_populate_recordset"
+            | "jsonb_populate_recordset" => Some(1),
+            "jsonb_array_length"
+            | "json_array_length"
+            | "jsonb_typeof"
+            | "json_typeof"
+            | "json_extract_path"
+            | "jsonb_extract_path"
+            | "json_extract_path_text"
+            | "jsonb_extract_path_text"
+            | "jsonb_set"
+            | "jsonb_set_lax"
+            | "jsonb_insert"
+            | "jsonb_strip_nulls"
+            | "json_strip_nulls"
+            | "jsonb_pretty"
+            | "jsonb_path_exists"
+            | "jsonb_path_exists_tz"
+            | "jsonb_path_match"
+            | "jsonb_path_match_tz"
+            | "jsonb_path_query_array"
+            | "jsonb_path_query_array_tz"
+            | "jsonb_path_query_first"
+            | "jsonb_path_query_first_tz" => Some(0),
+            _ => None,
+        };
+        if let Some(document) = document_index.and_then(|index| args.get(index)) {
+            check_json_family_static(name, document)?;
+        }
         match name {
             "json_populate_recordset" | "jsonb_populate_recordset" => {
                 validate_json_populate_option(name, args, arena, params, row, hooks)?;
                 let source = eval_full(args[1], arena, params, row, hooks)?;
+                check_json_family(name, &source)?;
                 let text = match source {
                     Datum::Json { text, .. } | Datum::Text(text) => text,
                     Datum::Null => return Ok(Datum::Null),
@@ -723,11 +829,11 @@ pub(crate) fn dispatch<'a>(
                 };
                 let text = super::super::json_to_text_pub(item, arena)?;
                 let source = arena.alloc(Expr::Str(text)).map_err(|_| arena_full())?;
-                populate_record(args[0], source, arena, params, row, hooks)
+                populate_record(args[0], source, name, arena, params, row, hooks)
             }
             "json_populate_record" | "jsonb_populate_record" | "jsonb_populate_record_valid" => {
                 validate_json_populate_option(name, args, arena, params, row, hooks)?;
-                let result = populate_record(args[0], args[1], arena, params, row, hooks);
+                let result = populate_record(args[0], args[1], name, arena, params, row, hooks);
                 if name == "jsonb_populate_record_valid" {
                     return match result {
                         Ok(Datum::Null) => Ok(Datum::Null),
@@ -772,13 +878,9 @@ pub(crate) fn dispatch<'a>(
                     let value = eval_full(args[1], arena, params, row, hooks)?;
                     return super::geometry::set_subscript(kind, text, index, value, arena);
                 }
-                let mut path = [json::JsonSubscript::Key(""); 64];
-                if args.len() - 2 > path.len() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many jsonb subscripts"
-                    ));
-                }
+                let path = arena
+                    .alloc_slice_with(args.len() - 2, |_| json::JsonSubscript::Key(""))
+                    .map_err(|_| arena_full())?;
                 for (slot, expression) in path.iter_mut().zip(&args[2..]) {
                     *slot = match eval_full(expression, arena, params, row, hooks)? {
                         Datum::Text(key) | Datum::Bpchar(key) => json::JsonSubscript::Key(key),
@@ -912,7 +1014,7 @@ pub(crate) fn dispatch<'a>(
                         )
                     };
                 }
-                let mut buffer = crate::util::StackStr::<65536>::new();
+                let mut buffer = ArenaString::new(arena);
                 if wrap {
                     buffer.write_char('[').map_err(|_| arena_full())?;
                     for (index, value) in values.iter().enumerate() {
@@ -924,12 +1026,6 @@ pub(crate) fn dispatch<'a>(
                     buffer.write_char(']').map_err(|_| arena_full())?;
                 } else {
                     values[0].write(&mut buffer).map_err(|_| arena_full())?;
-                }
-                if buffer.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "JSON query result exceeds the supported size"
-                    ));
                 }
                 sql_json_result(buffer.as_str(), constructor, arena)
             }
@@ -1108,7 +1204,7 @@ pub(crate) fn dispatch<'a>(
             }
             constructor if constructor.starts_with("__json_array_") => {
                 let absent = constructor.contains("_absent_");
-                let mut buffer = crate::util::StackStr::<65536>::new();
+                let mut buffer = ArenaString::new(arena);
                 buffer.write_char('[').map_err(|_| arena_full())?;
                 let mut emitted = 0usize;
                 for argument in args {
@@ -1128,12 +1224,6 @@ pub(crate) fn dispatch<'a>(
                     emitted += 1;
                 }
                 buffer.write_char(']').map_err(|_| arena_full())?;
-                if buffer.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "JSON array result exceeds the supported size"
-                    ));
-                }
                 sql_json_result(buffer.as_str(), constructor, arena)
             }
             constructor if constructor.starts_with("__json_object_") => {
@@ -1142,9 +1232,8 @@ pub(crate) fn dispatch<'a>(
                 }
                 let absent = matches!(*args[args.len() - 1], Expr::Bool(true));
                 let unique = constructor.contains("_unique_");
-                let mut keys = [""; 512];
-                let mut key_count = 0usize;
-                let mut buffer = crate::util::StackStr::<65536>::new();
+                let mut keys = ArenaList::new(arena);
+                let mut buffer = ArenaString::new(arena);
                 buffer.write_char('{').map_err(|_| arena_full())?;
                 let mut emitted = 0usize;
                 for pair in args[..args.len() - 1].as_chunks::<2>().0 {
@@ -1167,20 +1256,15 @@ pub(crate) fn dispatch<'a>(
                     if absent && value.is_null() {
                         continue;
                     }
-                    if unique && keys[..key_count].contains(&key) {
+                    if unique && keys.as_slice().contains(&key) {
                         return Err(sql_err!(
                             sqlstate::DUPLICATE_JSON_OBJECT_KEY_VALUE,
                             "duplicate JSON object key value"
                         ));
                     }
-                    if key_count == keys.len() {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "JSON object has too many members"
-                        ));
+                    if unique {
+                        keys.push(key).map_err(|_| arena_full())?;
                     }
-                    keys[key_count] = key;
-                    key_count += 1;
                     if emitted > 0 {
                         buffer.write_str(", ").map_err(|_| arena_full())?;
                     }
@@ -1195,12 +1279,6 @@ pub(crate) fn dispatch<'a>(
                     emitted += 1;
                 }
                 buffer.write_char('}').map_err(|_| arena_full())?;
-                if buffer.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "JSON object result exceeds the supported size"
-                    ));
-                }
                 sql_json_result(buffer.as_str(), constructor, arena)
             }
             "__json" | "__json_unique" => {
@@ -1234,16 +1312,10 @@ pub(crate) fn dispatch<'a>(
                 if value.is_null() {
                     return Ok(Datum::Null);
                 }
-                let mut buffer = crate::util::StackStr::<65536>::new();
+                let mut buffer = ArenaString::new(arena);
                 json::write_datum_json(&value, false, &mut buffer).map_err(|_| arena_full())?;
-                if buffer.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "JSON scalar result exceeds the supported size"
-                    ));
-                }
                 Ok(Datum::Json {
-                    text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+                    text: buffer.as_str(),
                     jsonb: false,
                 })
             }
@@ -1289,6 +1361,7 @@ pub(crate) fn dispatch<'a>(
                     return Err(arity_err(name, args.len()));
                 }
                 let target = eval_full(args[0], arena, params, row, hooks)?;
+                check_json_family(name, &target)?;
                 let path = eval_full(args[1], arena, params, row, hooks)?;
                 let variables = if args.len() >= 3 {
                     Some(eval_full(args[2], arena, params, row, hooks)?)
@@ -1342,23 +1415,17 @@ pub(crate) fn dispatch<'a>(
                         None => Ok(Datum::Null),
                     };
                 }
-                let mut buffer = crate::util::StackStr::<65536>::new();
-                let _ = buffer.write_char('[');
+                let mut buffer = ArenaString::new(arena);
+                buffer.write_char('[').map_err(|_| arena_full())?;
                 for (index, value) in values.iter().enumerate() {
                     if index > 0 {
-                        let _ = buffer.write_str(", ");
+                        buffer.write_str(", ").map_err(|_| arena_full())?;
                     }
-                    let _ = value.write(&mut buffer);
+                    value.write(&mut buffer).map_err(|_| arena_full())?;
                 }
-                let _ = buffer.write_char(']');
-                if buffer.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "JSON path result exceeds the supported size"
-                    ));
-                }
+                buffer.write_char(']').map_err(|_| arena_full())?;
                 Ok(Datum::Json {
-                    text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+                    text: buffer.as_str(),
                     jsonb: true,
                 })
             }
@@ -1373,22 +1440,18 @@ pub(crate) fn dispatch<'a>(
                 if !matches!(array, Datum::Array { .. }) {
                     return Err(type_mismatch("array_to_json requires an array", &array));
                 }
-                let mut buffer = crate::util::StackStr::<16384>::new();
-                let _ = json::write_datum_json(&array, false, &mut buffer);
-                if buffer.is_truncated() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "array_to_json value exceeds the supported size"
-                    ));
-                }
+                let mut buffer = ArenaString::new(arena);
+                json::write_datum_json(&array, false, &mut buffer).map_err(|_| arena_full())?;
                 Ok(Datum::Json {
-                    text: arena.alloc_str(buffer.as_str()).map_err(|_| arena_full())?,
+                    text: buffer.as_str(),
                     jsonb: false,
                 })
             }
             "jsonb_array_length" | "json_array_length" => {
                 arity(1)?;
-                let s = match text_view(eval_full(args[0], arena, params, row, hooks)?) {
+                let document = eval_full(args[0], arena, params, row, hooks)?;
+                check_json_family(name, &document)?;
+                let s = match text_view(document) {
                     Datum::Json { text, .. } => text,
                     Datum::Text(s) => s,
                     Datum::Null => return Ok(Datum::Null),
@@ -1405,7 +1468,9 @@ pub(crate) fn dispatch<'a>(
             // The JSON type name of the value, as PostgreSQL's json_typeof.
             "jsonb_typeof" | "json_typeof" => {
                 arity(1)?;
-                let s = match text_view(eval_full(args[0], arena, params, row, hooks)?) {
+                let document = eval_full(args[0], arena, params, row, hooks)?;
+                check_json_family(name, &document)?;
+                let s = match text_view(document) {
                     Datum::Json { text, .. } => text,
                     Datum::Text(s) => s,
                     Datum::Null => return Ok(Datum::Null),
@@ -1433,8 +1498,9 @@ pub(crate) fn dispatch<'a>(
                         name
                     ));
                 }
-                let (text, jsonb) = match text_view(eval_full(args[0], arena, params, row, hooks)?)
-                {
+                let document = eval_full(args[0], arena, params, row, hooks)?;
+                check_json_family(name, &document)?;
+                let (text, jsonb) = match text_view(document) {
                     Datum::Json { text, jsonb } => (text, jsonb),
                     Datum::Text(s) => (s, name.starts_with("jsonb")),
                     Datum::Null => return Ok(Datum::Null),
@@ -1483,10 +1549,9 @@ pub(crate) fn dispatch<'a>(
                 }
                 let v = eval_full(args[0], arena, params, row, hooks)?;
                 let jsonb = name == "to_jsonb";
-                let mut buf = crate::util::StackStr::<16384>::default();
-                let _ = json::write_datum_json(&v, jsonb, &mut buf);
-                debug_assert!(!buf.is_truncated());
-                let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+                let mut buf = ArenaString::new(arena);
+                json::write_datum_json(&v, jsonb, &mut buf).map_err(|_| arena_full())?;
+                let text = buf.as_str();
                 Ok(Datum::Json { text, jsonb })
             }
             // `jsonb_set(target, path, new_value [, create_if_missing])`.
@@ -1500,6 +1565,7 @@ pub(crate) fn dispatch<'a>(
                 if target.is_null() {
                     return Ok(Datum::Null);
                 }
+                check_json_family(name, &target)?;
                 let root = json_tree_arg(target, arena)?;
                 let path = json_path_parts(eval_full(args[1], arena, params, row, hooks)?, arena)?;
                 let raw_value = eval_full(args[2], arena, params, row, hooks)?;
@@ -1569,6 +1635,7 @@ pub(crate) fn dispatch<'a>(
                 if target.is_null() {
                     return Ok(Datum::Null);
                 }
+                check_json_family(name, &target)?;
                 let root = json_tree_arg(target, arena)?;
                 let path = json_path_parts(eval_full(args[1], arena, params, row, hooks)?, arena)?;
                 let value = json_tree_arg(eval_full(args[2], arena, params, row, hooks)?, arena)?;
@@ -1594,6 +1661,7 @@ pub(crate) fn dispatch<'a>(
                 if d.is_null() {
                     return Ok(Datum::Null);
                 }
+                check_json_family(name, &d)?;
                 let jsonb =
                     matches!(d, Datum::Json { jsonb: true, .. }) || name.starts_with("jsonb");
                 let result = json::strip_nulls(json_tree_arg(d, arena)?, arena)?;
@@ -1613,6 +1681,7 @@ pub(crate) fn dispatch<'a>(
                 if d.is_null() {
                     return Ok(Datum::Null);
                 }
+                check_json_family(name, &d)?;
                 let tree = json_tree_arg(d, arena)?;
                 Ok(Datum::Text(json::pretty_to_arena(&tree, arena)?))
             }
@@ -1635,8 +1704,8 @@ pub(crate) fn dispatch<'a>(
                 }
                 let jsonb = name == "jsonb_build_object";
                 let colon = if jsonb { ": " } else { " : " };
-                let mut buf = crate::util::StackStr::<16384>::default();
-                let _ = buf.write_char('{');
+                let mut buf = ArenaString::new(arena);
+                buf.write_char('{').map_err(|_| arena_full())?;
                 for pair in args.chunks(2) {
                     let key = eval_full(pair[0], arena, params, row, hooks)?;
                     if key.is_null() {
@@ -1648,17 +1717,18 @@ pub(crate) fn dispatch<'a>(
                     }
                     let value = eval_full(pair[1], arena, params, row, hooks)?;
                     if !core::ptr::eq(pair.as_ptr(), args.as_ptr()) {
-                        let _ = buf.write_str(", ");
+                        buf.write_str(", ").map_err(|_| arena_full())?;
                     }
-                    let mut key_text = crate::util::StackStr::<4096>::default();
-                    let _ = write!(key_text, "{key}");
-                    let _ = json::write_json_raw_string(key_text.as_str(), &mut buf);
-                    let _ = buf.write_str(colon);
-                    let _ = json::write_datum_json_styled(&value, colon, ", ", &mut buf);
+                    let mut key_text = ArenaString::new(arena);
+                    write!(key_text, "{key}").map_err(|_| arena_full())?;
+                    json::write_json_raw_string(key_text.as_str(), &mut buf)
+                        .map_err(|_| arena_full())?;
+                    buf.write_str(colon).map_err(|_| arena_full())?;
+                    json::write_datum_json_styled(&value, colon, ", ", &mut buf)
+                        .map_err(|_| arena_full())?;
                 }
-                let _ = buf.write_char('}');
-                debug_assert!(!buf.is_truncated());
-                let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+                buf.write_char('}').map_err(|_| arena_full())?;
+                let text = buf.as_str();
                 Ok(Datum::Json { text, jsonb })
             }
             // `json_build_array(v1, v2, ...)` / `jsonb_build_array(...)`.
@@ -1672,18 +1742,18 @@ pub(crate) fn dispatch<'a>(
                 }
                 let jsonb = name == "jsonb_build_array";
                 let colon = if jsonb { ": " } else { " : " };
-                let mut buf = crate::util::StackStr::<16384>::default();
-                let _ = buf.write_char('[');
+                let mut buf = ArenaString::new(arena);
+                buf.write_char('[').map_err(|_| arena_full())?;
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
-                        let _ = buf.write_str(", ");
+                        buf.write_str(", ").map_err(|_| arena_full())?;
                     }
                     let value = eval_full(a, arena, params, row, hooks)?;
-                    let _ = json::write_datum_json_styled(&value, colon, ", ", &mut buf);
+                    json::write_datum_json_styled(&value, colon, ", ", &mut buf)
+                        .map_err(|_| arena_full())?;
                 }
-                let _ = buf.write_char(']');
-                debug_assert!(!buf.is_truncated());
-                let text = arena.alloc_str(buf.as_str()).map_err(|_| arena_full())?;
+                buf.write_char(']').map_err(|_| arena_full())?;
+                let text = buf.as_str();
                 Ok(Datum::Json { text, jsonb })
             }
             _ => unreachable!("dispatch guard admitted an unhandled name"),

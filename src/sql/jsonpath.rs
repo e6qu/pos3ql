@@ -7,15 +7,12 @@
 use core::cell::Cell;
 use core::fmt::Write as _;
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::numeric::Numeric;
 use crate::sql_err;
 
-const MAX_STEPS: usize = 256;
-const MAX_SUBSCRIPTS: usize = 256;
 const MAX_DEPTH: u16 = 128;
-const MAX_CANONICAL_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -167,86 +164,104 @@ pub fn parse<'a>(input: &'a str, arena: &'a Arena) -> Result<Path<'a>, SqlError>
     if parser.at != parser.bytes.len() {
         return Err(syntax_error());
     }
-    validate_expression(expression)?;
+    validate_expression(expression, arena)?;
     Ok(Path { mode, expression })
 }
 
-fn prepare_like_regex(
-    pattern: &str,
-    flags: &str,
-    output: &mut crate::util::StackStr<4096>,
-) -> Result<(), SqlError> {
+/// Rewrites a `like_regex` pattern for the engine's regex syntax: `q` escapes
+/// every metacharacter; otherwise `x`-flag comments and whitespace fold away,
+/// character classes protect their contents, and a bare `.` becomes `[^\n]`
+/// unless `s` is set. `emit` receives rewritten byte runs in order; the
+/// two-pass caller counts first, then fills an exact arena slice.
+fn like_regex_bytes(pattern: &str, flags: &str, emit: &mut impl FnMut(&[u8])) {
+    let literal = |character: char, emit: &mut dyn FnMut(&[u8])| {
+        let mut buffer = [0u8; 4];
+        emit(character.encode_utf8(&mut buffer).as_bytes());
+    };
     if flags.contains('q') {
         for character in pattern.chars() {
             if matches!(
                 character,
                 '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
             ) {
-                output.write_char('\\').map_err(|_| limit_error())?;
+                emit(b"\\");
             }
-            output.write_char(character).map_err(|_| limit_error())?;
+            literal(character, emit);
         }
-    } else {
-        let mut escaped = false;
-        let mut in_class = false;
-        let mut comment = false;
-        for character in pattern.chars() {
-            if comment {
-                if character == '\n' {
-                    comment = false;
-                }
-                continue;
-            }
-            if escaped {
-                output.write_char(character).map_err(|_| limit_error())?;
-                escaped = false;
-                continue;
-            }
-            if character == '\\' {
-                output.write_char(character).map_err(|_| limit_error())?;
-                escaped = true;
-            } else if character == '[' {
-                in_class = true;
-                output.write_char(character).map_err(|_| limit_error())?;
-            } else if character == ']' && in_class {
-                in_class = false;
-                output.write_char(character).map_err(|_| limit_error())?;
-            } else if flags.contains('x') && !in_class && character == '#' {
-                comment = true;
-            } else if flags.contains('x') && !in_class && character.is_whitespace() {
-                continue;
-            } else if !flags.contains('s') && !in_class && character == '.' {
-                output.write_str("[^\n]").map_err(|_| limit_error())?;
-            } else {
-                output.write_char(character).map_err(|_| limit_error())?;
-            }
-        }
+        return;
     }
-    if output.is_truncated() {
-        Err(limit_error())
-    } else {
-        Ok(())
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut comment = false;
+    for character in pattern.chars() {
+        if comment {
+            if character == '\n' {
+                comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            literal(character, emit);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            emit(b"\\");
+            escaped = true;
+        } else if character == '[' {
+            in_class = true;
+            emit(b"[");
+        } else if character == ']' && in_class {
+            in_class = false;
+            emit(b"]");
+        } else if flags.contains('x') && !in_class && character == '#' {
+            comment = true;
+        } else if flags.contains('x') && !in_class && character.is_whitespace() {
+            continue;
+        } else if !flags.contains('s') && !in_class && character == '.' {
+            emit(b"[^\n]");
+        } else {
+            literal(character, emit);
+        }
     }
 }
 
-fn validate_expression(expression: &Expr<'_>) -> Result<(), SqlError> {
-    fn step(step: &Step<'_>) -> Result<(), SqlError> {
+fn prepare_like_regex<'a>(
+    pattern: &str,
+    flags: &str,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let mut len = 0usize;
+    like_regex_bytes(pattern, flags, &mut &mut |bytes: &[u8]| len += bytes.len());
+    let buffer = arena
+        .alloc_slice_with(len, |_| 0u8)
+        .map_err(|_| limit_error())?;
+    let mut at = 0usize;
+    like_regex_bytes(pattern, flags, &mut &mut |bytes: &[u8]| {
+        buffer[at..at + bytes.len()].copy_from_slice(bytes);
+        at += bytes.len();
+    });
+    core::str::from_utf8(buffer).map_err(|_| limit_error())
+}
+
+fn validate_expression<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<(), SqlError> {
+    fn step<'a>(step: &Step<'a>, arena: &'a Arena) -> Result<(), SqlError> {
         match step {
             Step::Index(subscripts) => {
                 for subscript in *subscripts {
-                    validate_expression(subscript.from)?;
+                    validate_expression(subscript.from, arena)?;
                     if let Some(to) = subscript.to {
-                        validate_expression(to)?;
+                        validate_expression(to, arena)?;
                     }
                 }
             }
-            Step::Filter(expression) => validate_expression(expression)?,
+            Step::Filter(expression) => validate_expression(expression, arena)?,
             Step::Method { first, second, .. } => {
                 if let Some(first) = first {
-                    validate_expression(first)?;
+                    validate_expression(first, arena)?;
                 }
                 if let Some(second) = second {
-                    validate_expression(second)?;
+                    validate_expression(second, arena)?;
                 }
             }
             _ => {}
@@ -254,15 +269,15 @@ fn validate_expression(expression: &Expr<'_>) -> Result<(), SqlError> {
         Ok(())
     }
     match expression {
-        Expr::Unary { operand, .. } => validate_expression(operand),
+        Expr::Unary { operand, .. } => validate_expression(operand, arena),
         Expr::Binary { left, right, .. } => {
-            validate_expression(left)?;
-            validate_expression(right)
+            validate_expression(left, arena)?;
+            validate_expression(right, arena)
         }
         Expr::Chain { base, steps } => {
-            validate_expression(base)?;
+            validate_expression(base, arena)?;
             for item in *steps {
-                step(item)?;
+                step(item, arena)?;
             }
             Ok(())
         }
@@ -271,24 +286,24 @@ fn validate_expression(expression: &Expr<'_>) -> Result<(), SqlError> {
             pattern,
             flags,
         } => {
-            validate_expression(operand)?;
-            let mut prepared = crate::util::StackStr::<4096>::new();
-            prepare_like_regex(pattern, flags, &mut prepared)?;
-            crate::sql::regex::find(prepared.as_str(), "", 0, flags.contains('i')).map(|_| ())
+            validate_expression(operand, arena)?;
+            let prepared = prepare_like_regex(pattern, flags, arena)?;
+            crate::sql::regex::find(prepared, "", 0, flags.contains('i')).map(|_| ())
         }
         _ => Ok(()),
+    }
+}
+
+impl core::fmt::Display for Path<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.write(f)
     }
 }
 
 /// Validates and returns PostgreSQL's stable text output for a path.
 pub fn canonicalize<'a>(input: &'a str, arena: &'a Arena) -> Result<&'a str, SqlError> {
     let path = parse(input, arena)?;
-    let mut output = crate::util::StackStr::<MAX_CANONICAL_BYTES>::new();
-    path.write(&mut output).map_err(|_| limit_error())?;
-    if output.is_truncated() {
-        return Err(limit_error());
-    }
-    arena.alloc_str(output.as_str()).map_err(|_| {
+    arena.alloc_str_display(path).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "JSON path exceeds the statement arena"
@@ -449,8 +464,7 @@ impl<'a> Parser<'a> {
     }
 
     fn accessors(&mut self, base: &'a Expr<'a>) -> Result<&'a Expr<'a>, SqlError> {
-        let mut steps = [Step::AnyKey; MAX_STEPS];
-        let mut count = 0;
+        let mut steps = ArenaList::new(self.arena);
         loop {
             self.whitespace();
             let step = if self.eat(b'.') {
@@ -482,48 +496,38 @@ impl<'a> Parser<'a> {
                     self.expect(b']')?;
                     Step::AnyArray
                 } else {
-                    let mut values = [Subscript {
-                        from: base,
-                        to: None,
-                    }; MAX_SUBSCRIPTS];
-                    let mut length = 0;
+                    let mut values = ArenaList::new(self.arena);
                     loop {
-                        if length == MAX_SUBSCRIPTS {
-                            return Err(limit_error());
-                        }
                         let from = self.expression(0)?;
                         let to = if self.keyword("to") {
                             Some(self.expression(0)?)
                         } else {
                             None
                         };
-                        values[length] = Subscript { from, to };
-                        length += 1;
+                        values
+                            .push(Subscript { from, to })
+                            .map_err(|_| limit_error())?;
                         self.whitespace();
                         if !self.eat(b',') {
                             break;
                         }
                     }
                     self.expect(b']')?;
-                    Step::Index(self.slice(&values[..length])?)
+                    Step::Index(values.as_slice())
                 }
             } else if self.eat(b'?') {
                 Step::Filter(self.delimited()?)
             } else {
                 break;
             };
-            if count == MAX_STEPS {
-                return Err(limit_error());
-            }
-            steps[count] = step;
-            count += 1;
+            steps.push(step).map_err(|_| limit_error())?;
         }
-        if count == 0 {
+        if steps.is_empty() {
             Ok(base)
         } else {
             self.node(Expr::Chain {
                 base,
-                steps: self.slice(&steps[..count])?,
+                steps: steps.as_slice(),
             })
         }
     }
@@ -785,13 +789,6 @@ impl<'a> Parser<'a> {
         self.arena
             .alloc(expression)
             .map(|expression| &*expression)
-            .map_err(|_| limit_error())
-    }
-
-    fn slice<T: Copy>(&self, values: &[T]) -> Result<&'a [T], SqlError> {
-        self.arena
-            .alloc_slice_copy(values)
-            .map(|values| &*values)
             .map_err(|_| limit_error())
     }
 }
@@ -1092,8 +1089,6 @@ impl Method {
     }
 }
 
-const MAX_RESULTS: usize = 1024;
-
 /// Executes a validated path against a jsonb document.  Both the document and
 /// variables are parsed through the canonical JSON boundary; every result is
 /// an arena-backed JSON tree suitable for direct jsonb serialization.
@@ -1283,9 +1278,7 @@ impl<'a> Evaluator<'a> {
                         continue;
                     };
                     let insensitive = flags.contains('i');
-                    let mut prepared_pattern = crate::util::StackStr::<4096>::new();
-                    prepare_like_regex(pattern, flags, &mut prepared_pattern)?;
-                    let effective = prepared_pattern.as_str();
+                    let effective = prepare_like_regex(pattern, flags, self.arena)?;
                     let matched = if flags.contains('m') {
                         let mut matched = false;
                         for line in text.split('\n') {
@@ -1425,15 +1418,14 @@ impl<'a> Evaluator<'a> {
         step: &'a Step<'a>,
     ) -> Result<&'a [crate::sql::json::Json<'a>], SqlError> {
         use crate::sql::json::Json;
-        let mut output = [Json::Null; MAX_RESULTS];
-        let mut count = 0;
+        let mut output = ArenaList::new(self.arena);
         for value in input {
             match step {
-                Step::Key(key) => self.member(*value, key, &mut output, &mut count)?,
-                Step::AnyKey => self.any_member(*value, &mut output, &mut count)?,
+                Step::Key(key) => self.member(*value, key, &mut output)?,
+                Step::AnyKey => self.any_member(*value, &mut output)?,
                 Step::AnyArray => match value {
-                    Json::Array(items) => self.extend(&mut output, &mut count, items)?,
-                    _ if self.mode == Mode::Lax => self.push(&mut output, &mut count, *value)?,
+                    Json::Array(items) => self.extend(&mut output, items)?,
+                    _ if self.mode == Mode::Lax => self.push(&mut output, *value)?,
                     _ => return Err(array_not_found("jsonpath wildcard array accessor")),
                 },
                 Step::Index(subscripts) => {
@@ -1456,7 +1448,7 @@ impl<'a> Evaluator<'a> {
                         if from <= to {
                             for index in from..=to {
                                 if let Some(item) = items.get(index) {
-                                    self.push(&mut output, &mut count, *item)?;
+                                    self.push(&mut output, *item)?;
                                 } else if self.mode == Mode::Strict {
                                     return Err(invalid_subscript(
                                         "jsonpath array subscript is out of bounds",
@@ -1467,11 +1459,11 @@ impl<'a> Evaluator<'a> {
                     }
                 }
                 Step::Descendants { first, last, .. } => {
-                    self.descendants(*value, 0, *first, *last, &mut output, &mut count)?;
+                    self.descendants(*value, 0, *first, *last, &mut output)?;
                 }
                 Step::Filter(predicate) => {
                     if self.predicate(predicate, *value, None)? == Truth::True {
-                        self.push(&mut output, &mut count, *value)?;
+                        self.push(&mut output, *value)?;
                     }
                 }
                 Step::Method {
@@ -1479,24 +1471,23 @@ impl<'a> Evaluator<'a> {
                     first,
                     second,
                 } => {
-                    self.method(*value, *method, *first, *second, &mut output, &mut count)?;
+                    self.method(*value, *method, *first, *second, &mut output)?;
                 }
             }
         }
-        self.results(&output[..count])
+        Ok(output.as_slice())
     }
 
     fn member(
         &self,
         value: crate::sql::json::Json<'a>,
         key: &str,
-        output: &mut [crate::sql::json::Json<'a>; MAX_RESULTS],
-        count: &mut usize,
+        output: &mut ArenaList<'a, crate::sql::json::Json<'a>>,
     ) -> Result<(), SqlError> {
         use crate::sql::json::Json;
         match value {
             Json::Object(members) => match members.iter().find(|(name, _)| *name == key) {
-                Some((_, value)) => self.push(output, count, *value),
+                Some((_, value)) => self.push(output, *value),
                 None if self.mode == Mode::Lax => Ok(()),
                 None => Err(sql_err!(
                     sqlstate::SQL_JSON_MEMBER_NOT_FOUND,
@@ -1506,7 +1497,7 @@ impl<'a> Evaluator<'a> {
             },
             Json::Array(items) if self.mode == Mode::Lax => {
                 for item in items {
-                    self.member(*item, key, output, count)?;
+                    self.member(*item, key, output)?;
                 }
                 Ok(())
             }
@@ -1521,20 +1512,19 @@ impl<'a> Evaluator<'a> {
     fn any_member(
         &self,
         value: crate::sql::json::Json<'a>,
-        output: &mut [crate::sql::json::Json<'a>; MAX_RESULTS],
-        count: &mut usize,
+        output: &mut ArenaList<'a, crate::sql::json::Json<'a>>,
     ) -> Result<(), SqlError> {
         use crate::sql::json::Json;
         match value {
             Json::Object(members) => {
                 for (_, value) in members {
-                    self.push(output, count, *value)?;
+                    self.push(output, *value)?;
                 }
                 Ok(())
             }
             Json::Array(items) if self.mode == Mode::Lax => {
                 for item in items {
-                    self.any_member(*item, output, count)?;
+                    self.any_member(*item, output)?;
                 }
                 Ok(())
             }
@@ -1549,14 +1539,13 @@ impl<'a> Evaluator<'a> {
         depth: u32,
         first: Option<u32>,
         last: Option<u32>,
-        output: &mut [crate::sql::json::Json<'a>; MAX_RESULTS],
-        count: &mut usize,
+        output: &mut ArenaList<'a, crate::sql::json::Json<'a>>,
     ) -> Result<(), SqlError> {
         use crate::sql::json::Json;
         let first = first.unwrap_or(u32::MAX);
         let last = last.unwrap_or(u32::MAX);
         if depth >= first && depth <= last {
-            self.push(output, count, value)?;
+            self.push(output, value)?;
         }
         if depth == last || depth >= MAX_DEPTH.into() {
             return Ok(());
@@ -1564,12 +1553,12 @@ impl<'a> Evaluator<'a> {
         match value {
             Json::Array(items) => {
                 for item in items {
-                    self.descendants(*item, depth + 1, Some(first), Some(last), output, count)?;
+                    self.descendants(*item, depth + 1, Some(first), Some(last), output)?;
                 }
             }
             Json::Object(members) => {
                 for (_, item) in members {
-                    self.descendants(*item, depth + 1, Some(first), Some(last), output, count)?;
+                    self.descendants(*item, depth + 1, Some(first), Some(last), output)?;
                 }
             }
             _ => {}
@@ -1584,14 +1573,12 @@ impl<'a> Evaluator<'a> {
         method: Method,
         first: Option<&'a Expr<'a>>,
         second: Option<&'a Expr<'a>>,
-        output: &mut [crate::sql::json::Json<'a>; MAX_RESULTS],
-        count: &mut usize,
+        output: &mut ArenaList<'a, crate::sql::json::Json<'a>>,
     ) -> Result<(), SqlError> {
         use crate::sql::json::Json;
         match method {
             Method::Type => self.push(
                 output,
-                count,
                 Json::Str(match value {
                     Json::Null => "null",
                     Json::Bool(_) => "boolean",
@@ -1609,7 +1596,7 @@ impl<'a> Evaluator<'a> {
                     _ => return Err(array_not_found("jsonpath item method .size()")),
                 };
                 let text = self.integer_text(size as i64)?;
-                self.push(output, count, Json::Number(text))
+                self.push(output, Json::Number(text))
             }
             Method::Abs | Method::Floor | Method::Ceiling => {
                 let number = self.number(value)?;
@@ -1626,7 +1613,7 @@ impl<'a> Evaluator<'a> {
                     _ => number,
                 };
                 let text = self.numeric_text(&number)?;
-                self.push(output, count, Json::Number(text))
+                self.push(output, Json::Number(text))
             }
             Method::Double
             | Method::Bigint
@@ -1701,7 +1688,7 @@ impl<'a> Evaluator<'a> {
                     _ => unreachable!(),
                 };
                 let text = self.numeric_text(&number)?;
-                self.push(output, count, Json::Number(text))
+                self.push(output, Json::Number(text))
             }
             Method::Boolean => {
                 let boolean = match value {
@@ -1721,7 +1708,7 @@ impl<'a> Evaluator<'a> {
                     }
                     _ => return Err(method_argument_error()),
                 };
-                self.push(output, count, Json::Bool(boolean))
+                self.push(output, Json::Bool(boolean))
             }
             Method::String => {
                 let text = match value {
@@ -1734,7 +1721,7 @@ impl<'a> Evaluator<'a> {
                         return Err(method_argument_error());
                     }
                 };
-                self.push(output, count, Json::Str(text))
+                self.push(output, Json::Str(text))
             }
             Method::KeyValue => {
                 let Json::Object(members) = value else {
@@ -1750,7 +1737,7 @@ impl<'a> Evaluator<'a> {
                         .arena
                         .alloc_slice_copy(&object)
                         .map_err(|_| limit_error())?;
-                    self.push(output, count, Json::Object(object))?;
+                    self.push(output, Json::Object(object))?;
                 }
                 Ok(())
             }
@@ -1792,7 +1779,7 @@ impl<'a> Evaluator<'a> {
                     _ => return Err(datetime_method_error()),
                 };
                 let temporal = self.temporal(text, method, template, precision)?;
-                self.push(output, count, temporal)
+                self.push(output, temporal)
             }
         }
     }
@@ -2155,26 +2142,19 @@ impl<'a> Evaluator<'a> {
 
     fn push(
         &self,
-        output: &mut [crate::sql::json::Json<'a>; MAX_RESULTS],
-        count: &mut usize,
+        output: &mut ArenaList<'a, crate::sql::json::Json<'a>>,
         value: crate::sql::json::Json<'a>,
     ) -> Result<(), SqlError> {
-        if *count == output.len() {
-            return Err(limit_error());
-        }
-        output[*count] = value;
-        *count += 1;
-        Ok(())
+        output.push(value).map_err(|_| limit_error())
     }
 
     fn extend(
         &self,
-        output: &mut [crate::sql::json::Json<'a>; MAX_RESULTS],
-        count: &mut usize,
+        output: &mut ArenaList<'a, crate::sql::json::Json<'a>>,
         values: &[crate::sql::json::Json<'a>],
     ) -> Result<(), SqlError> {
         for value in values {
-            self.push(output, count, *value)?;
+            self.push(output, *value)?;
         }
         Ok(())
     }

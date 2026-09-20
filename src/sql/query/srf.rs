@@ -7,7 +7,7 @@
 //! table, and needs a definition — column names and types — that the ordinary
 //! scan machinery can resolve against, which is what is synthesized here.
 
-use crate::mem::arena::{Arena, ArenaList};
+use crate::mem::arena::{Arena, ArenaList, ArenaString};
 use crate::sql::ast::{Expr, Select, SelectItem, TableRef};
 use crate::sql::eval::{ColumnLookup, EvalHooks, ProjectSetValue, SqlError, eval_full, sqlstate};
 use crate::sql::exec::MAX_PROJ;
@@ -1023,6 +1023,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 return Err(srf_signature_error(name));
             }
             let target = eval_full(args[0], arena, params, row, hooks)?;
+            crate::sql::eval::funcs::json::check_json_family(name, &target)?;
             let path = eval_full(args[1], arena, params, row, hooks)?;
             let variables = if args.len() >= 3 {
                 Some(eval_full(args[2], arena, params, row, hooks)?)
@@ -1569,8 +1570,9 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
                 name
             ));
         }
-        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
-        {
+        let document = eval_full(args[0], arena, params, row, hooks)?;
+        crate::sql::eval::funcs::json::check_json_family(name, &document)?;
+        let text = match crate::sql::eval::text_view(document) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
@@ -1606,8 +1608,9 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
         }
         let jsonb = name.eq_ignore_ascii_case("jsonb_array_elements")
             || name.eq_ignore_ascii_case("jsonb_array_elements_text");
-        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
-        {
+        let document = eval_full(args[0], arena, params, row, hooks)?;
+        crate::sql::eval::funcs::json::check_json_family(name, &document)?;
+        let text = match crate::sql::eval::text_view(document) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
@@ -1642,8 +1645,9 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
             name.eq_ignore_ascii_case("jsonb_each") || name.eq_ignore_ascii_case("jsonb_each_text");
         let as_text = name.eq_ignore_ascii_case("json_each_text")
             || name.eq_ignore_ascii_case("jsonb_each_text");
-        let text = match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?)
-        {
+        let document = eval_full(args[0], arena, params, row, hooks)?;
+        crate::sql::eval::funcs::json::check_json_family(name, &document)?;
+        let text = match crate::sql::eval::text_view(document) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(0),
@@ -2354,31 +2358,90 @@ fn populate_record_append_columns<'a, C: ColumnLookup<'a>>(
             "first argument of populate_record must be a row type"
         ));
     };
-    let Some(ColType::Composite(slot)) = ColType::from_oid(composite_oid) else {
-        unreachable!("catalog composite base OID is a composite")
-    };
-    let definition = storage.composite_for(slot as usize, txid);
     let mut count = 0usize;
-    for field in definition.active_fields() {
+    let mut push = |column: ColumnMeta| -> Result<(), SqlError> {
         if count == output.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "populate_record output exceeds configured column capacity"
             ));
         }
-        output[count] = table_function_column(
-            field.name,
-            field.ctype,
-            field.user_type,
-            field.type_mod,
-            field.collation,
-        );
+        output[count] = column;
         count += 1;
+        Ok(())
+    };
+    use crate::sql::types::oid;
+    if let Some(ColType::Composite(slot)) = ColType::from_oid(composite_oid) {
+        for field in storage.composite_for(slot as usize, txid).active_fields() {
+            push(table_function_column(
+                field.name,
+                field.ctype,
+                field.user_type,
+                field.type_mod,
+                field.collation,
+            ))?;
+        }
+        return Ok(count);
     }
-    Ok(count)
+    // A table or view rowtype contributes its own columns.
+    if (oid::FIRST_TABLE_COMPOSITE..oid::FIRST_VIEW_COMPOSITE).contains(&composite_oid) {
+        let slot = usize::try_from(composite_oid - oid::FIRST_TABLE_COMPOSITE)
+            .ok()
+            .filter(|slot| *slot < storage.table_count())
+            .ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "table rowtype OID is not a table")
+            })?;
+        for column in storage.table_def(slot, txid).columns() {
+            push(table_function_column(
+                column.name,
+                column.ctype,
+                None,
+                column.type_mod,
+                column.collation,
+            ))?;
+        }
+        return Ok(count);
+    }
+    if (oid::FIRST_VIEW_COMPOSITE..oid::FIRST_DOMAIN_ARRAY).contains(&composite_oid) {
+        let slot = usize::try_from(composite_oid - oid::FIRST_VIEW_COMPOSITE)
+            .ok()
+            .filter(|slot| *slot < storage.view_count())
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "view rowtype OID is not a view"))?;
+        let view = storage.view(slot);
+        let width = view.columns_for(txid).names().len();
+        let described = arena
+            .alloc_slice_with(width, |_| crate::sql::types::ColDesc::new("", 0, 0))
+            .map_err(|_| arena_full())?;
+        let count = crate::sql::catalog::describe_view(storage, txid, view, arena, described)?;
+        for column in &described[..count] {
+            let (ctype, user_type) =
+                crate::sql::exec::catalog_column_type(storage, txid, column.type_oid).ok_or_else(
+                    || {
+                        sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "view rowtype field has unsupported type OID {}",
+                            column.type_oid
+                        )
+                    },
+                )?;
+            push(table_function_column(
+                crate::storage::SqlName::parse(column.name)?,
+                ctype,
+                user_type,
+                column.type_mod,
+                column.collation,
+            ))?;
+        }
+        return Ok(count);
+    }
+    Err(sql_err!(
+        sqlstate::DATATYPE_MISMATCH,
+        "first argument of populate_record must be a row type"
+    ))
 }
 
 fn json_to_record_append_columns(
+    name: &str,
     args: &[&Expr<'_>],
     storage: &Storage,
     txid: u32,
@@ -2390,6 +2453,7 @@ fn json_to_record_append_columns(
             "a column definition list is required for functions returning record"
         ));
     }
+    crate::sql::eval::funcs::json::check_json_family_static(name, args[0])?;
     let Expr::Call {
         name: "__json_record_columns",
         args: definitions,
@@ -2581,6 +2645,11 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
             tref.table
         ));
     }
+    if (is_keys || is_elems || is_each)
+        && let Some(document) = tref.func_args.unwrap_or(&[]).first()
+    {
+        crate::sql::eval::funcs::json::check_json_family_static(tref.table, document)?;
+    }
     let name = tref.alias.unwrap_or(tref.table);
     // Each supported function's output columns: `key`/`value` for the `each`
     // family (two columns), a single column named per the function otherwise.
@@ -2664,14 +2733,19 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         1
     } else if is_json_to_record {
         json_to_record_append_columns(
+            tref.table,
             tref.func_args.unwrap_or(&[]),
             storage,
             txid,
             &mut default_cols,
         )?
     } else if is_populate_record {
+        let args = tref.func_args.unwrap_or(&[]);
+        if let Some(document) = args.get(1) {
+            crate::sql::eval::funcs::json::check_json_family_static(tref.table, document)?;
+        }
         populate_record_append_columns(
-            tref.func_args.unwrap_or(&[]),
+            args,
             storage,
             txid,
             arena,
@@ -4216,7 +4290,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
         let as_text = tref.table.eq_ignore_ascii_case("json_each_text")
             || tref.table.eq_ignore_ascii_case("jsonb_each_text");
-        let text = match crate::sql::eval::text_view(eval_argument(args[0])?) {
+        let document = eval_argument(args[0])?;
+        crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
+        let text = match crate::sql::eval::text_view(document) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -4450,7 +4526,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         || tref.table.eq_ignore_ascii_case("json_object_keys")
     {
         let jsonb = tref.table.eq_ignore_ascii_case("jsonb_object_keys");
-        let text = match crate::sql::eval::text_view(eval_argument(args[0])?) {
+        let document = eval_argument(args[0])?;
+        crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
+        let text = match crate::sql::eval::text_view(document) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -4541,7 +4619,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             || tref.table.eq_ignore_ascii_case("jsonb_array_elements_text");
         let as_text = tref.table.eq_ignore_ascii_case("jsonb_array_elements_text")
             || tref.table.eq_ignore_ascii_case("json_array_elements_text");
-        let text = match crate::sql::eval::text_view(eval_argument(args[0])?) {
+        let document = eval_argument(args[0])?;
+        crate::sql::eval::funcs::json::check_json_family(tref.table, &document)?;
+        let text = match crate::sql::eval::text_view(document) {
             Datum::Json { text, .. } => text,
             Datum::Text(s) => s,
             Datum::Null => return Ok(&[]),
@@ -5159,7 +5239,9 @@ fn json_to_record_rows<'a, C: ColumnLookup<'a>>(
         ));
     }
     let recordset = name.ends_with("recordset");
-    let source = match eval_full(args[0], arena, params, columns, hooks)? {
+    let document = eval_full(args[0], arena, params, columns, hooks)?;
+    crate::sql::eval::funcs::json::check_json_family(name, &document)?;
+    let source = match document {
         Datum::Json { text, .. } | Datum::Text(text) => text,
         Datum::Null if recordset => return Ok(&[]),
         Datum::Null => {
@@ -5981,7 +6063,7 @@ fn json_table_query_datum<'a>(
     {
         return Ok(Datum::Text(value));
     }
-    let mut text = StackStr::<65536>::new();
+    let mut text = ArenaString::new(arena);
     if wrap {
         text.write_char('[').map_err(|_| arena_full())?;
         for (index, value) in values.iter().enumerate() {
@@ -5994,14 +6076,8 @@ fn json_table_query_datum<'a>(
     } else {
         values[0].write(&mut text).map_err(|_| arena_full())?;
     }
-    if text.is_truncated() {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "JSON_TABLE column value is too large"
-        ));
-    }
     Ok(Datum::Json {
-        text: arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
+        text: text.as_str(),
         jsonb: true,
     })
 }

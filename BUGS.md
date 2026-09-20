@@ -68,6 +68,10 @@ rather than a syntax error, and removed a silent cap that dropped correlated
 subqueries in grouped output beyond 64. PostgreSQL 18 differential,
 allocation-forbidden, and empty-cache recovery regressions cross the former
 64-item and 256-row boundaries.
+The JSON value-width audit found no external blocker. JSON containers, path
+steps and results, and rendered text now use statement memory; JSON and JSONB
+function families reject mismatched typed arguments. PostgreSQL 18
+differential coverage crosses the former fixed boundaries.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

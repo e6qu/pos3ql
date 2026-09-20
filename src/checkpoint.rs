@@ -20,8 +20,8 @@ use crate::storage::{
     TableDef,
 };
 use crate::store::{
-    BlockId, BlockStore, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter, StackPlan,
-    TieredStore, ValueIndexHandle, ValueIndexWriter,
+    BlockId, BlockStore, BlockType, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter,
+    StackPlan, StoreError, TieredStore, ValueIndexHandle, ValueIndexWriter,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -34,6 +34,38 @@ const LEGACY_MANIFEST_HEADER: &str = "pos3ql-manifest-v13";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
+
+/// A published roster proves these immutable blocks already reached the
+/// durable tier. Their content identity lets a rebuild reuse unchanged blocks.
+struct PublishedValueBlockStore<'a> {
+    inner: &'a mut dyn BlockStore,
+    known_blocks: &'a [(BlockId, Option<BlockType>)],
+}
+
+impl BlockStore for PublishedValueBlockStore<'_> {
+    fn put(
+        &mut self,
+        payload: &[u8],
+        block_type: BlockType,
+        lsn: u64,
+    ) -> Result<BlockId, StoreError> {
+        if lsn == 0 {
+            let id = BlockId::of(payload);
+            if self
+                .known_blocks
+                .binary_search(&(id, Some(block_type)))
+                .is_ok()
+            {
+                return Ok(id);
+            }
+        }
+        self.inner.put(payload, block_type, lsn)
+    }
+
+    fn get(&mut self, id: &BlockId, into: &mut [u8]) -> Result<(usize, BlockType), StoreError> {
+        self.inner.get(id, into)
+    }
+}
 
 /// io_error — object storage trouble surfaced to a statement.
 const SQLSTATE_IO: &str = "58030";
@@ -485,9 +517,9 @@ pub(crate) struct Checkpointer {
     pending_value_installs: Vec<ValueInstall>,
     /// Pre-reserved physical-version schedule: (key, source-and-kind).
     merge_scratch: Vec<(SstKey, u8)>,
-    /// Rosters of the SSTs the current manifest references (GC keep-set
-    /// source) and their sweep scratch.
-    roster_scratch: Vec<BlockId>,
+    /// Published index identities during a rebuild; untyped block identities
+    /// during garbage collection. Both uses fit checkpoint_live_blocks.
+    roster_scratch: Vec<(BlockId, Option<BlockType>)>,
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
     manifest_etag: Option<EntityTag>,
@@ -595,7 +627,7 @@ impl Checkpointer {
             + table_capacity
                 * crate::storage::MAX_VALUE_ENFORCERS
                 * core::mem::size_of::<ValueInstall>()
-            + config.checkpoint_live_blocks * core::mem::size_of::<BlockId>()
+            + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
             + config.checkpoint_garbage_batch_objects
                 * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
             + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
@@ -10179,10 +10211,40 @@ impl Checkpointer {
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index sort scratch"))?;
+        let roster_read = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
         let published_lsn = storage.lsn();
         for binding in 0..storage.value_binding_count(slot) {
             if !storage.value_binding_is_committed(slot, binding) {
                 continue;
+            }
+            self.roster_scratch.clear();
+            if let Some(previous) = storage.value_binding_handle(slot, binding) {
+                let known = &mut self.roster_scratch;
+                let complete = crate::store::walk_value_roster(
+                    &mut *self.blocks.borrow_mut(),
+                    previous.roster,
+                    roster_read,
+                    |id, kind| {
+                        if known.len() == known.capacity() {
+                            return false;
+                        }
+                        known.push((id, Some(kind)));
+                        true
+                    },
+                )
+                .map_err(value_index_to_sql)?;
+                if !complete {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "published value-index blocks exceed checkpoint_live_blocks ({})",
+                        self.roster_scratch.capacity()
+                    ));
+                }
+                self.roster_scratch.sort_unstable();
+                self.roster_scratch.dedup();
             }
             value_sorter.reset();
             let navigation = storage.value_binding_navigation(slot, binding);
@@ -10314,38 +10376,49 @@ impl Checkpointer {
                         }
                     };
                     let include_mask = storage.value_binding_include_mask(slot, binding);
-                    let write = if let Some(spec) = navigation {
-                        let summary = posting_token.map_or_else(
+                    let summary = if let Some(spec) = navigation {
+                        Some(posting_token.map_or_else(
                             || storage.value_binding_navigation_summary(slot, binding, spec, key),
                             |token| Ok(token.summary()),
-                        )?;
-                        self.value_writer.append_navigation(
-                            &mut *self.blocks.borrow_mut(),
-                            (hash, rowid, commit_lsn),
-                            key,
-                            (include_mask != 0
-                                && spec.kind != crate::store::NavigationKind::Posting)
-                                .then_some(payload),
-                            summary,
-                            &mut compare_keys,
-                        )
-                    } else if include_mask == 0 {
-                        self.value_writer.append(
-                            &mut *self.blocks.borrow_mut(),
-                            hash,
-                            rowid,
-                            commit_lsn,
-                            key,
-                            &mut compare_keys,
-                        )
+                        )?)
                     } else {
-                        self.value_writer.append_covering(
-                            &mut *self.blocks.borrow_mut(),
-                            (hash, rowid, commit_lsn),
-                            key,
-                            payload,
-                            &mut compare_keys,
-                        )
+                        None
+                    };
+                    let write = {
+                        let mut blocks = self.blocks.borrow_mut();
+                        let mut published = PublishedValueBlockStore {
+                            inner: &mut *blocks,
+                            known_blocks: &self.roster_scratch,
+                        };
+                        if let Some(spec) = navigation {
+                            self.value_writer.append_navigation(
+                                &mut published,
+                                (hash, rowid, commit_lsn),
+                                key,
+                                (include_mask != 0
+                                    && spec.kind != crate::store::NavigationKind::Posting)
+                                    .then_some(payload),
+                                summary.expect("navigation summary was computed"),
+                                &mut compare_keys,
+                            )
+                        } else if include_mask == 0 {
+                            self.value_writer.append(
+                                &mut published,
+                                hash,
+                                rowid,
+                                commit_lsn,
+                                key,
+                                &mut compare_keys,
+                            )
+                        } else {
+                            self.value_writer.append_covering(
+                                &mut published,
+                                (hash, rowid, commit_lsn),
+                                key,
+                                payload,
+                                &mut compare_keys,
+                            )
+                        }
                     };
                     write.map_err(value_index_to_sql)?;
                     if let Some(error) = comparison_error {
@@ -10354,10 +10427,16 @@ impl Checkpointer {
                     value_sort_reader.advance(&mut *self.blocks.borrow_mut())?;
                 }
             }
-            let handle = self
-                .value_writer
-                .finish(&mut *self.blocks.borrow_mut(), published_lsn)
-                .map_err(value_index_to_sql)?;
+            let handle = {
+                let mut blocks = self.blocks.borrow_mut();
+                let mut published = PublishedValueBlockStore {
+                    inner: &mut *blocks,
+                    known_blocks: &self.roster_scratch,
+                };
+                self.value_writer
+                    .finish(&mut published, published_lsn)
+                    .map_err(value_index_to_sql)?
+            };
             let (columns, n_columns) = storage.value_binding_columns(slot, binding);
             let include_mask = storage.value_binding_include_mask(slot, binding);
             self.pending_value_installs.push(ValueInstall {
@@ -10398,7 +10477,7 @@ impl Checkpointer {
                         self.roster_scratch.capacity()
                     ));
                 }
-                self.roster_scratch.push(*id);
+                self.roster_scratch.push((*id, None));
             }
         }
         for prev in self.prev_ssts.iter().flat_map(SlotList::iter) {
@@ -10410,7 +10489,7 @@ impl Checkpointer {
                     self.roster_scratch.capacity()
                 ));
             }
-            self.roster_scratch.push(h.roster);
+            self.roster_scratch.push((h.roster, None));
             let n = self
                 .blocks
                 .borrow_mut()
@@ -10433,7 +10512,7 @@ impl Checkpointer {
                 }
                 let mut id = [0u8; 32];
                 id.copy_from_slice(id_bytes);
-                self.roster_scratch.push(BlockId(id));
+                self.roster_scratch.push((BlockId(id), None));
             }
         }
         for slot in 0..storage.physical_table_count() {
@@ -10445,11 +10524,11 @@ impl Checkpointer {
                     &mut *self.blocks.borrow_mut(),
                     handle.roster,
                     scratch,
-                    |id| {
+                    |id, _| {
                         if self.roster_scratch.len() == self.roster_scratch.capacity() {
                             return false;
                         }
-                        self.roster_scratch.push(id);
+                        self.roster_scratch.push((id, None));
                         true
                     },
                 )
@@ -10472,8 +10551,8 @@ impl Checkpointer {
         // Listing may visit many obsolete objects. Sort the fixed keep-set
         // once so each membership probe is logarithmic rather than scanning
         // every live block for every listed key.
-        self.roster_scratch.sort_unstable();
-        self.roster_scratch.dedup();
+        self.roster_scratch.sort_unstable_by_key(|(id, _)| *id);
+        self.roster_scratch.dedup_by_key(|(id, _)| *id);
         self.doomed_blocks.clear();
         let keep = &self.roster_scratch;
         let doomed = &mut self.doomed_blocks;
@@ -10482,7 +10561,7 @@ impl Checkpointer {
             .list("blocks/", |key| {
                 let hex = key.strip_prefix("blocks/").unwrap_or(key);
                 let known = parse_block_id(hex)
-                    .map(|id| keep.binary_search(&id).is_ok())
+                    .map(|id| keep.binary_search_by_key(&id, |(known, _)| *known).is_ok())
                     .unwrap_or(false);
                 if !known {
                     if doomed.len() < doomed.capacity() {
@@ -12957,7 +13036,7 @@ mod stored_dependency_tests {
         live_blocks.checkpoint_live_blocks += 1;
         assert_eq!(
             Checkpointer::budget_bytes(&live_blocks) - base_bytes,
-            core::mem::size_of::<BlockId>()
+            core::mem::size_of::<(BlockId, Option<BlockType>)>()
         );
 
         let mut garbage = base.clone();

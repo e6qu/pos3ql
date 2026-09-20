@@ -462,13 +462,13 @@ fn roster_ref<'a>(
     Ok((BlockId(id), filter, bounds))
 }
 
-/// Walks every roster node and data-block identity in a generation. Returning
-/// false from `visit` stops before any caller-owned keep-set can overflow.
+/// Walks every roster node and data-block identity with its physical type.
+/// Returning false from `visit` stops before caller-owned scratch overflows.
 pub(crate) fn walk_value_roster(
     store: &mut dyn BlockStore,
     root: BlockId,
     scratch: &mut [u8],
-    mut visit: impl FnMut(BlockId) -> bool,
+    mut visit: impl FnMut(BlockId, BlockType) -> bool,
 ) -> Result<bool, ValueIndexError> {
     let first_roster = store.get(&root, scratch)?;
     let root_kind = first_roster.1;
@@ -480,7 +480,7 @@ pub(crate) fn walk_value_roster(
         let mut stopped = false;
         loop {
             let leaf = cursor.next(store, scratch, &mut |_, _| true, &mut |id| {
-                let keep_going = visit(id);
+                let keep_going = visit(id, root_kind);
                 stopped |= !keep_going;
                 keep_going
             })?;
@@ -490,14 +490,14 @@ pub(crate) fn walk_value_roster(
             let Some((id, _, _)) = leaf else {
                 return Ok(true);
             };
-            if !visit(id) {
+            if !visit(id, BlockType::ValueIndexData) {
                 return Ok(false);
             }
         }
     }
     let mut next = Some(root);
     while let Some(roster) = next {
-        if !visit(roster) {
+        if !visit(roster, BlockType::ValueIndexRoster) {
             return Ok(false);
         }
         let (roster_len, kind) = if roster == root {
@@ -520,7 +520,7 @@ pub(crate) fn walk_value_roster(
         let mut cursor = ROSTER_HEADER;
         for _ in 0..block_count {
             let (id, _, _) = roster_ref(&scratch[..roster_len], format, &mut cursor)?;
-            if !visit(id) {
+            if !visit(id, BlockType::ValueIndexData) {
                 return Ok(false);
             }
         }
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(total, 2000);
         let mut nodes = 0;
         assert!(
-            walk_value_roster(&mut store, handle.roster, &mut roster, |_| {
+            walk_value_roster(&mut store, handle.roster, &mut roster, |_, _| {
                 nodes += 1;
                 true
             })
@@ -1023,7 +1023,7 @@ mod tests {
         );
         let mut bounded = 0;
         assert!(
-            !walk_value_roster(&mut store, handle.roster, &mut roster, |_| {
+            !walk_value_roster(&mut store, handle.roster, &mut roster, |_, _| {
                 bounded += 1;
                 bounded < 3
             })
@@ -1496,7 +1496,7 @@ mod tests {
 
         let mut identities = 0;
         assert!(
-            walk_value_roster(&mut store, root, &mut roster, |_| {
+            walk_value_roster(&mut store, root, &mut roster, |_, _| {
                 identities += 1;
                 true
             })
@@ -1526,7 +1526,7 @@ mod tests {
             ValueIndexError::Corrupt
         );
         assert_eq!(
-            walk_value_roster(&mut store, obsolete, &mut roster, |_| true).unwrap_err(),
+            walk_value_roster(&mut store, obsolete, &mut roster, |_, _| true).unwrap_err(),
             ValueIndexError::Corrupt
         );
     }

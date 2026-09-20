@@ -128,6 +128,16 @@ empty-cache recovery. The regression source is
 That fixture isolates repeated reads. It does not establish a representative
 end-to-end speedup; publication and garbage collection remain in the measured
 checkpoint path.
+The next checkpoint change reuses unchanged index data, navigation, and roster
+blocks whose identities appear in the published generation. In a zero-cache
+1,000-row GIN fixture, the second checkpoint made 30 block PUTs on merged main
+`c80eca72` and 19 after reuse; the updated row remained searchable after
+object-cold recovery. This count includes sort-run and row-SST writes, so it
+understates the fraction of index-writer requests avoided.
+The [clean focused run](../benchmarks/baselines/2026-09-20-checkpoint-block-reuse-1000/README.md)
+retains the raw 1,000-row comparison: object PUTs fell from 2,595 to 1,556
+under the same workload settings. Single-run latency and cleanup counts remain
+exploratory on the shared host.
 
 ## Measured scenarios
 

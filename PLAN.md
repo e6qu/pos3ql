@@ -134,6 +134,16 @@ before ranking further changes. A focused
 records the revised path but is not a controlled timing comparison with the
 earlier full suite. Preserve durability and fixed-memory behavior.
 
+Checkpoint index writers now compare content identities against their last
+published generation and reuse blocks already durable in that generation.
+A zero-cache update-and-recovery regression reduced second-checkpoint block
+PUTs from 30 on merged main to 19, including the unchanged GIN generation
+blocks. Continue to attribute the remaining sort-run writes, SST publication,
+garbage deletion, and foreground latency before changing their pacing. The
+[clean 1,000-row focused run](benchmarks/baselines/2026-09-20-checkpoint-block-reuse-1000/README.md)
+recorded 1,556 object PUTs versus 2,595 before reuse; its latency and cleanup
+counts are exploratory on a shared host.
+
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local
 storage medium and durability settings and pos3ql's object store, network,

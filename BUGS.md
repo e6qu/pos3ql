@@ -102,6 +102,11 @@ instead of reopening each spilled row. A zero-cache regression qualifies
 primary, covering, and posting indexes across updates, deletes, insertion,
 and object-cold recovery. Remaining checkpoint interference is performance
 qualification work in PLAN.md.
+The published-block reuse audit found no externally blocked defect. A
+checkpoint rebuild now reuses unchanged, typed blocks from the previously
+published index roster; a zero-cache GIN regression covers write reduction
+and recovery after an update. Remaining sort and cleanup traffic is tracked
+as performance qualification in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

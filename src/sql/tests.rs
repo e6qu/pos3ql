@@ -64552,6 +64552,75 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
+fn checkpoint_reuses_published_index_blocks_after_small_update() {
+    let mut config = test_config("checkpoint-value-block-reuse");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-value-block-reuse-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_bytes = 4 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.table_rows = 2048;
+    config.value_index_rows = 2048;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE block_reuse (id integer PRIMARY KEY, document jsonb, payload text); \
+         INSERT INTO block_reuse SELECT i, jsonb_build_object('key' || i::text, 'value'), 'before' \
+           FROM generate_series(1, 1000) AS g(i); \
+         CREATE INDEX block_reuse_document ON block_reuse USING gin (document)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE block_reuse SET payload = 'after' WHERE id = 500",
+    );
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    let before = engine.storage.block_io_stats();
+    assert!(engine.checkpoint().unwrap());
+    let writes = engine.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        writes.object_puts <= 22,
+        "checkpoint uploaded unchanged published index blocks: {writes:?}"
+    );
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, payload FROM block_reuse WHERE document ? 'key500'; \
+             SELECT count(*) FROM block_reuse WHERE document ? 'key999'",
+        )),
+        ["500|after", "1"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

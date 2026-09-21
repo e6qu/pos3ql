@@ -426,7 +426,7 @@ impl Config {
             checkpoint_manifest_bytes: 256 * KIB,
             checkpoint_commit_batches: 4096,
             checkpoint_live_blocks: 64 * 1024,
-            checkpoint_garbage_batch_objects: 4096,
+            checkpoint_garbage_batch_objects: 16,
             checkpoint_merge_entries: 512 * 1024,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
             object_store_bucket: "pos3ql".to_string(),

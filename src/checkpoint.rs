@@ -597,6 +597,8 @@ pub(crate) struct Checkpointer {
     /// A manifest is durable but its bounded garbage sweep still needs a
     /// retry. Its LSN is withheld until maintenance completes.
     published_lsn_pending_maintenance: Option<u64>,
+    /// Durable-WAL boundary awaiting paced commit-object deletion.
+    commit_prune_through: Option<u64>,
     legacy_garbage_pending: bool,
     block_garbage_pending: bool,
     sliced_generation: Vec<u64>,
@@ -1113,6 +1115,7 @@ impl Checkpointer {
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             sweeping: false,
             published_lsn_pending_maintenance: None,
+            commit_prune_through: None,
             legacy_garbage_pending: false,
             block_garbage_pending: false,
             sliced_generation: vec![0; table_capacity],
@@ -1408,82 +1411,80 @@ impl Checkpointer {
         Ok(Some(end_lsn))
     }
 
-    /// Deletes commit batches whose records are entirely covered by
-    /// the current manifest LSN. Called after a checkpoint.
-    pub(crate) fn prune_commit_batches(&mut self, up_to_lsn: u64) -> Result<(), SqlError> {
+    /// Schedules deletion of commit objects covered by a durable manifest.
+    /// Repeated scheduling keeps the more conservative boundary.
+    pub(crate) fn schedule_commit_prune(&mut self, up_to_lsn: u64) {
+        self.commit_prune_through = Some(
+            self.commit_prune_through
+                .map_or(up_to_lsn, |pending| pending.min(up_to_lsn)),
+        );
+    }
+
+    /// Deletes at most one configured batch of commit objects. The newest
+    /// covered batch and its descriptor remain because that batch may
+    /// straddle the recovery boundary. Returns true once no older objects
+    /// remain.
+    fn prune_commit_batch(&mut self, up_to_lsn: u64) -> Result<bool, SqlError> {
         #[cfg(feature = "checkpoint-profile")]
         let started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let before = self.blocks.borrow().io_stats();
         #[cfg(feature = "checkpoint-profile")]
         let mut deleted = 0;
-        // Listing borrows the client, so each pass collects one pre-reserved
-        // deletion batch and deletes it afterwards. Re-listing drains any
-        // larger history without turning the batch size into a scale ceiling.
-        // The highest doomed segment is always retained because it may
-        // straddle the checkpoint boundary.
-        loop {
-            self.garbage_scratch.clear();
-            let mut max_key = StackStr::<64>::new();
-            self.client
-                .list("commits/", |k| {
-                    let is_doomed = k
-                        .strip_prefix("commits/")
-                        .and_then(|x| x.strip_suffix(".batch"))
-                        .and_then(|d| d.split_once('-'))
-                        .and_then(|(first, _)| first.parse::<u64>().ok())
-                        .is_some_and(|first| first <= up_to_lsn);
-                    if is_doomed && k > max_key.as_str() {
-                        max_key = crate::stack_format!(64, "{}", k);
-                    }
-                })
-                .map_err(object_store_to_sql)?;
-            if max_key.is_empty() {
-                break;
-            }
-            // Select deletions in a second pass so progress does not depend
-            // on an implementation-specific listing order. In particular, a
-            // one-entry batch must not repeatedly select only the retained
-            // boundary object when more history follows it.
-            let doomed = &mut self.garbage_scratch;
-            let mut overflow = false;
-            self.client
-                .list("commits/", |k| {
-                    let is_doomed = k != max_key.as_str()
-                        && k.strip_prefix("commits/")
-                            .and_then(|x| x.strip_suffix(".batch"))
-                            .and_then(|d| d.split_once('-'))
-                            .and_then(|(first, _)| first.parse::<u64>().ok())
-                            .is_some_and(|first| first <= up_to_lsn);
-                    if is_doomed {
-                        if doomed.len() < doomed.capacity() {
-                            doomed.push(crate::stack_format!(64, "{}", k));
-                        } else {
-                            overflow = true;
-                        }
-                    }
-                })
-                .map_err(object_store_to_sql)?;
-            for i in 0..self.garbage_scratch.len() {
-                let key = self.garbage_scratch[i];
-                self.client
-                    .delete(key.as_str())
-                    .map_err(object_store_to_sql)?;
-                let descriptor = key
-                    .as_str()
-                    .strip_suffix(".batch")
-                    .map(|stem| crate::stack_format!(72, "{}.head", stem))
-                    .expect("listed commit batch has its checked suffix");
-                self.client
-                    .delete(descriptor.as_str())
-                    .map_err(object_store_to_sql)?;
-                #[cfg(feature = "checkpoint-profile")]
-                {
-                    deleted += 2;
+        // Listing borrows the client, so collect one pre-reserved deletion
+        // batch and delete it afterwards. Both the batch and descriptor count
+        // toward the configured object limit, including when that limit is 1.
+        self.garbage_scratch.clear();
+        let mut boundary = StackStr::<64>::new();
+        self.client
+            .list("commits/", |key| {
+                let is_covered_batch = key
+                    .strip_prefix("commits/")
+                    .and_then(|name| name.strip_suffix(".batch"))
+                    .and_then(|stem| stem.split_once('-'))
+                    .and_then(|(first, _)| first.parse::<u64>().ok())
+                    .is_some_and(|first| first <= up_to_lsn);
+                if is_covered_batch && key > boundary.as_str() {
+                    boundary = crate::stack_format!(64, "{}", key);
                 }
-            }
-            if !overflow {
-                break;
+            })
+            .map_err(object_store_to_sql)?;
+        if boundary.is_empty() {
+            return Ok(true);
+        }
+        let boundary_name = boundary
+            .as_str()
+            .strip_prefix("commits/")
+            .and_then(|name| name.strip_suffix(".batch"))
+            .expect("boundary was selected from commit batches");
+        let doomed = &mut self.garbage_scratch;
+        let mut overflow = false;
+        self.client
+            .list("commits/", |key| {
+                let stem = key.strip_prefix("commits/").and_then(|name| {
+                    name.strip_suffix(".batch")
+                        .or_else(|| name.strip_suffix(".head"))
+                });
+                let is_doomed = stem
+                    .and_then(|stem| stem.split_once('-').map(|(first, _)| (stem, first)))
+                    .and_then(|(stem, first)| first.parse::<u64>().ok().map(|first| (stem, first)))
+                    .is_some_and(|(stem, first)| first <= up_to_lsn && stem != boundary_name);
+                if is_doomed {
+                    if doomed.len() < doomed.capacity() {
+                        doomed.push(crate::stack_format!(64, "{}", key));
+                    } else {
+                        overflow = true;
+                    }
+                }
+            })
+            .map_err(object_store_to_sql)?;
+        for key in &self.garbage_scratch {
+            self.client
+                .delete(key.as_str())
+                .map_err(object_store_to_sql)?;
+            #[cfg(feature = "checkpoint-profile")]
+            {
+                deleted += 1;
             }
         }
         #[cfg(feature = "checkpoint-profile")]
@@ -1496,7 +1497,7 @@ impl Checkpointer {
             self.blocks.borrow().io_stats(),
             deleted,
         );
-        Ok(())
+        Ok(!overflow)
     }
 
     /// Cold start: loads the manifest (if any) and rehydrates every SST
@@ -6579,6 +6580,12 @@ impl Checkpointer {
     /// publication transition; ordinary event-loop beats use the paced path.
     pub(crate) fn finish_maintenance(&mut self, storage: &Storage) -> Result<(), SqlError> {
         while self.published_lsn_pending_maintenance.is_some() {
+            if let Some(up_to_lsn) = self.commit_prune_through {
+                if self.prune_commit_batch(up_to_lsn)? {
+                    self.commit_prune_through = None;
+                }
+                continue;
+            }
             if self.legacy_garbage_pending {
                 self.legacy_garbage_pending = !self.collect_garbage_batch()?;
                 continue;
@@ -6612,6 +6619,12 @@ impl Checkpointer {
         sort_scratch: &mut FixedVec<(u64, RowHome)>,
     ) -> Result<CheckpointStep, SqlError> {
         if self.published_lsn_pending_maintenance.is_some() {
+            if let Some(up_to_lsn) = self.commit_prune_through {
+                if self.prune_commit_batch(up_to_lsn)? {
+                    self.commit_prune_through = None;
+                }
+                return Ok(CheckpointStep::Working);
+            }
             if self.legacy_garbage_pending {
                 self.legacy_garbage_pending = !self.collect_garbage_batch()?;
                 return Ok(CheckpointStep::Working);

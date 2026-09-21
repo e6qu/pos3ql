@@ -62,6 +62,13 @@ def main():
                 "pos3ql uses an instrumented object-store fixture backed by "
                 "local temporary storage. Timing from this run is exploratory.\n"
             )
+        duration = suite.get("checkpoint_duration_seconds", 0)
+        if suite_mode == "checkpoint" and duration:
+            print(
+                f"Mixed workloads run for at least {duration} seconds and "
+                f"{suite['operations_per_client']} operations per client; "
+                "operation counts may differ across engines.\n"
+            )
     postgresql_path = args.directory / "postgresql-server.json"
     if postgresql_path.exists():
         postgresql = json.loads(postgresql_path.read_text(encoding="utf-8"))
@@ -96,6 +103,29 @@ def main():
             f"{access_path.get('index_scans', '—')} | "
             f"{access_path.get('sequential_scans', '—')} | "
             f"{number(object_requests, 3)} | {len(measured['errors'])} |"
+        )
+
+    profile_path = args.directory / "checkpoint-profile.json"
+    if profile_path.exists():
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        print("\n## Checkpoint phases\n")
+        print("Profiled pos3ql build; totals cover explicit and automatic checkpoint work "
+              "from the workload start through server stop.")
+        print(
+            "Times sum phase spans and are not query latency or a cross-system metric. "
+            "The profile request window includes cleanup after the timed workload ends.\n"
+        )
+        print("| Phase | Events | Elapsed ms | Block GET | Block PUT | Object DELETE |")
+        print("|---|---:|---:|---:|---:|---:|")
+        for phase, totals in sorted(profile["totals"].items()):
+            print(
+                f"| {phase} | {totals['events']} | {number(totals['elapsed_us'] / 1000)} | "
+                f"{totals['block_gets']} | {totals['block_puts']} | {totals['deleted']} |"
+            )
+        requests = profile["object_requests"]
+        print(
+            f"\nFull profile window: {requests['put']} object PUT, "
+            f"{requests['delete']} object DELETE, {requests['list']} LIST."
         )
 
     if recoveries:

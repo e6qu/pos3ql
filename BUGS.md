@@ -118,6 +118,12 @@ defect. The harness now verifies that both systems complete three explicit
 checkpoints during the same mixed SQL workload, records PostgreSQL 18
 durability and local storage, and preserves raw evidence. Larger and isolated
 performance qualification remains in PLAN.md.
+The checkpoint-profile audit found no externally blocked defect. A fixed
+operation-count comparison could finish on PostgreSQL before all three
+checkpoint commands completed, so the focused harness now runs for a minimum
+duration and verifies the checkpoint count. Its fixed-memory phase log and
+aligned object-store request window account for all measured cleanup DELETEs.
+Foreground overlap and larger-scale qualification remain in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

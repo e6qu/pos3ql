@@ -51,8 +51,18 @@ METRICS="$WORK/object-store-metrics.json"
 LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-2}
 DISK_CACHE_MIB=${POS3QL_BENCH_DISK_CACHE_MIB:-128}
 BENCH_TIMEOUT_SECONDS=${POS3QL_BENCH_TIMEOUT_SECONDS:-30}
+CHECKPOINT_PROFILE=${POS3QL_BENCH_CHECKPOINT_PROFILE:-0}
+CHECKPOINT_DURATION=${POS3QL_BENCH_CHECKPOINT_SECONDS:-4}
 if ! [[ "$DISK_CACHE_MIB" =~ ^(0|[1-9][0-9]*)$ && "$BENCH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "POS3QL_BENCH_DISK_CACHE_MIB must be nonnegative and POS3QL_BENCH_TIMEOUT_SECONDS positive decimal integers" >&2
+  exit 2
+fi
+if [[ "$CHECKPOINT_PROFILE" != 0 && "$CHECKPOINT_PROFILE" != 1 ]]; then
+  echo "POS3QL_BENCH_CHECKPOINT_PROFILE must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$CHECKPOINT_PROFILE" = 1 && "$MODE" != checkpoint ]]; then
+  echo "checkpoint profiling requires checkpoint mode" >&2
   exit 2
 fi
 export POS3QL_BENCH_TIMEOUT_SECONDS=$BENCH_TIMEOUT_SECONDS
@@ -74,7 +84,9 @@ for attempt in $(seq 1 100); do
   sleep 0.05
 done
 
-cargo build --release --locked --manifest-path "$ROOT/Cargo.toml"
+BUILD_FEATURES=()
+if [ "$CHECKPOINT_PROFILE" = 1 ]; then BUILD_FEATURES=(--features checkpoint-profile); fi
+cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" "${BUILD_FEATURES[@]}"
 
 write_config() {
   config=$1
@@ -276,7 +288,9 @@ python3 "$ROOT/tools/benchmark-environment.py" \
   --mode "$MODE" --rows "$ROWS" --table-capacity "$TABLE_CAPACITY" \
   --operations "$OPERATIONS" --clients "$CLIENTS" \
   --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS" \
-  --disk-cache-mib "$DISK_CACHE_MIB" --timeout-seconds "$BENCH_TIMEOUT_SECONDS"
+  --disk-cache-mib "$DISK_CACHE_MIB" --timeout-seconds "$BENCH_TIMEOUT_SECONDS" \
+  --checkpoint-profile "$CHECKPOINT_PROFILE" \
+  --checkpoint-duration-seconds "$CHECKPOINT_DURATION"
 
 DATA_WARM="$WORK/data-warm"
 start_pos3ql "$DATA_WARM" primary initial-start
@@ -284,12 +298,21 @@ bench_pos3ql point-concurrency-1 --workload point-read --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --setup --require-index
 if [ "$MODE" = checkpoint ]; then
   bench_pos3ql mixed-baseline --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS"
+    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION"
+  PROFILE_OFFSET=0
+  if [ "$CHECKPOINT_PROFILE" = 1 ]; then
+    PROFILE_OFFSET=$(wc -c < "$WORK/pos3ql-primary.log")
+    cp "$METRICS" "$WORK/checkpoint-profile-before.json"
+  fi
   bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
     --maintenance-interval 0.001 --maintenance-limit 3 \
     --require-maintenance-operations 3
   stop_pos3ql
+  if [ "$CHECKPOINT_PROFILE" = 1 ]; then
+    sleep 0.1
+    cp "$METRICS" "$WORK/checkpoint-profile-after.json"
+  fi
   start_postgresql_baseline
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
@@ -297,15 +320,22 @@ if [ "$MODE" = checkpoint ]; then
     --output "$OUTPUT/postgresql18-point-concurrency-1.json" >/dev/null
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-mixed-baseline --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" --check \
     --output "$OUTPUT/postgresql18-mixed-baseline.json" >/dev/null
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
     --maintenance-interval 0.001 --maintenance-limit 3 \
     --require-maintenance-operations 3 --check \
     --output "$OUTPUT/postgresql18-mixed-checkpoint-interference.json" >/dev/null
   cp "$WORK/pos3ql-primary.log" "$OUTPUT/pos3ql-startup.log"
+  if [ "$CHECKPOINT_PROFILE" = 1 ]; then
+    python3 "$ROOT/tools/checkpoint-profile.py" \
+      "$OUTPUT/pos3ql-startup.log" "$OUTPUT/checkpoint-profile.json" \
+      --after-byte-offset "$PROFILE_OFFSET" \
+      --metrics-before "$WORK/checkpoint-profile-before.json" \
+      --metrics-after "$WORK/checkpoint-profile-after.json"
+  fi
   python3 "$ROOT/tools/benchmark-report.py" "$OUTPUT" >"$OUTPUT/report.md"
   echo "performance results: $OUTPUT"
   exit 0

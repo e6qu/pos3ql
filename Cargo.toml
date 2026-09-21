@@ -20,5 +20,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Compiled-in Mozilla root certificates (pure data, no code paths).
 webpki-roots = "0.26"
 
+[features]
+checkpoint-profile = []
+
 [profile.release]
 panic = "abort"

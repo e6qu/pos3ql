@@ -482,15 +482,22 @@ def run(args):
     operation_barrier = threading.Barrier(args.clients) if args.synchronized else None
     stop_maintenance = threading.Event()
     maintenance_count = [0]
+    attempted = [0] * args.clients
+    deadline_ns = [0]
 
     def worker(worker_id):
         local = []
+        operation = 0
         try:
             start_barrier.wait()
-            for operation in range(args.operations):
+            while operation < args.operations or (
+                args.duration_seconds
+                and time.perf_counter_ns() < deadline_ns[0]
+            ):
                 if operation_barrier:
                     operation_barrier.wait()
                 sql = workload_sql(args.workload, worker_id, operation, args.rows)
+                operation += 1
                 started = time.perf_counter_ns()
                 connections[worker_id].query(sql)
                 local.append(time.perf_counter_ns() - started)
@@ -504,6 +511,7 @@ def run(args):
                 operation_barrier.abort()
         finally:
             with result_lock:
+                attempted[worker_id] = operation
                 latencies.extend(local)
 
     def maintain():
@@ -534,6 +542,7 @@ def run(args):
     for thread in workers:
         thread.start()
     started = time.perf_counter_ns()
+    deadline_ns[0] = started + int(args.duration_seconds * 1_000_000_000)
     start_barrier.wait()
     for thread in workers:
         thread.join()
@@ -577,6 +586,7 @@ def run(args):
             "name": args.workload,
             "clients": args.clients,
             "operations_per_client": args.operations,
+            "minimum_duration_seconds": args.duration_seconds,
             "rows": args.rows,
             "synchronized": args.synchronized,
             "require_index": args.require_index,
@@ -587,7 +597,7 @@ def run(args):
             "timeout_seconds": args.timeout_seconds,
         },
         "results": {
-            "attempted_operations": args.clients * args.operations,
+            "attempted_operations": sum(attempted),
             "completed_operations": completed,
             "errors": errors,
             "elapsed_seconds": elapsed_seconds,
@@ -728,6 +738,8 @@ def parse_args():
     )
     parser.add_argument("--clients", type=int, default=1)
     parser.add_argument("--operations", type=int, default=100)
+    parser.add_argument("--duration-seconds", type=float, default=0.0,
+                        help="run at least this long and at least --operations per client")
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--setup", action="store_true")
     parser.add_argument("--synchronized", action="store_true")
@@ -758,6 +770,10 @@ def parse_args():
         parser.error("clients, operations, and rows must be positive")
     if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
         parser.error("timeout seconds must be positive and finite")
+    if not math.isfinite(args.duration_seconds) or args.duration_seconds < 0:
+        parser.error("duration seconds must be nonnegative and finite")
+    if args.duration_seconds and args.synchronized:
+        parser.error("duration-bound workloads cannot use an operation barrier")
     if args.maintenance_interval < 0:
         parser.error("maintenance interval cannot be negative")
     if args.maintenance_limit < 0 or (args.maintenance_limit and not args.maintenance_interval):

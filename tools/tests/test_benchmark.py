@@ -340,6 +340,7 @@ class BenchmarkTest(unittest.TestCase):
             rows=8,
             clients=4,
             operations=2,
+            duration_seconds=0.0,
             synchronized=True,
             require_index=False,
             workload="update",

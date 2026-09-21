@@ -132,6 +132,13 @@ profiled phase, and cross-process placement uses a common realtime axis because
 Python's macOS monotonic clock and POSIX `CLOCK_MONOTONIC` have different
 suspend behavior. Per-process durations remain monotonic. The resulting clean
 run ranks publication and cleanup overlap in PLAN.md.
+The final-slice publication audit found no externally blocked defect. A paced
+sweep yielded after writing its last outdated table, allowing the next
+foreground statement to invalidate that slice before the manifest beat. The
+sweep now publishes while every captured generation is still current. A
+two-table regression proves the first slice remains paced, the final slice
+publishes in its own beat, manifest retry remains idempotent, and object-cold
+recovery retains both updates.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

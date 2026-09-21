@@ -1,0 +1,61 @@
+{
+  "artifact_type": "postgresql_baseline",
+  "container_image_id": null,
+  "container_mounts": null,
+  "schema_version": 1,
+  "settings": {
+    "block_size": {
+      "source": "default",
+      "unit": null,
+      "value": "8192"
+    },
+    "checkpoint_timeout": {
+      "source": "default",
+      "unit": "s",
+      "value": "300"
+    },
+    "data_directory": {
+      "source": "override",
+      "unit": null,
+      "value": "/tmp/pos3ql-pg18-final-slice.ZSLXLe"
+    },
+    "fsync": {
+      "source": "configuration file",
+      "unit": null,
+      "value": "on"
+    },
+    "full_page_writes": {
+      "source": "configuration file",
+      "unit": null,
+      "value": "on"
+    },
+    "max_connections": {
+      "source": "configuration file",
+      "unit": null,
+      "value": "100"
+    },
+    "max_wal_size": {
+      "source": "configuration file",
+      "unit": "MB",
+      "value": "1024"
+    },
+    "shared_buffers": {
+      "source": "configuration file",
+      "unit": "8kB",
+      "value": "16384"
+    },
+    "synchronous_commit": {
+      "source": "configuration file",
+      "unit": null,
+      "value": "on"
+    },
+    "wal_level": {
+      "source": "default",
+      "unit": null,
+      "value": "replica"
+    }
+  },
+  "storage_description": "Local APFS, isolated PostgreSQL 18 data directory; fsync enabled",
+  "version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit",
+  "version_number": 180006
+}

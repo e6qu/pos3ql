@@ -1,0 +1,50 @@
+{
+  "database_identity": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit",
+  "label": "postgresql18-mixed-checkpoint-interference",
+  "results": {
+    "access_path": {
+      "index_scans": 74276,
+      "index_tuples_fetched": 74276,
+      "sequential_scans": 0,
+      "sequential_tuples_read": 0
+    },
+    "attempted_operations": 74276,
+    "completed_operations": 74276,
+    "elapsed_seconds": 4.001627958,
+    "errors": [],
+    "fixed_memory_occupancy": null,
+    "fixed_memory_plan_bytes": null,
+    "latency_ms": {
+      "maximum": 28.939542,
+      "mean": 0.21463855541493887,
+      "minimum": 0.042667,
+      "p50": 0.187334,
+      "p95": 0.368125,
+      "p99": 0.758166
+    },
+    "maintenance_operations": 3,
+    "maximum_rss_bytes": null,
+    "object_requests_per_operation": null,
+    "object_store": null,
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 18561.445686500774
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin24.6.0, compiled by Apple clang version 17.0.0 (clang-1700.6.4.2), 64-bit"
+  ],
+  "workload": {
+    "clients": 4,
+    "maintenance_interval_seconds": 0.001,
+    "maintenance_limit": 3,
+    "minimum_duration_seconds": 4.0,
+    "name": "mixed",
+    "operations_per_client": 50,
+    "require_index": false,
+    "required_maintenance_operations": 3,
+    "rows": 1000,
+    "synchronized": false,
+    "target_count": 1,
+    "timeout_seconds": 120.0
+  }
+}

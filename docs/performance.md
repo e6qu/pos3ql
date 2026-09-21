@@ -170,6 +170,14 @@ publication 13.23 seconds, block deletion 6.74 seconds, and commit pruning
 5.79 seconds. Local post-publication cleanup intersected only 3 milliseconds.
 These are associations across explicit and automatic checkpoint work, not an
 exclusive causal decomposition or a production ratio.
+The following [final-slice run](../benchmarks/baselines/2026-09-21-checkpoint-final-slice-1000/README.md)
+closes the dispatch gap between writing the last stale table slice and
+publishing its manifest. Against the clean correlation run, manifest count
+remained nine while row and value-index rebuild counts fell from fourteen to
+nine. Total object PUTs fell from 1,621 to 1,047 and summed foreground phase
+intersection fell from 44.01 to 28.43 seconds. The same 200 operations
+completed in 8.47 rather than 12.65 seconds; shared-host latency remains
+exploratory.
 
 ## Measured scenarios
 

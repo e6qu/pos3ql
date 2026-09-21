@@ -5,6 +5,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import pathlib
 import platform
@@ -40,7 +41,12 @@ def main():
     parser.add_argument("--disk-cache-mib", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument("--checkpoint-profile", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--checkpoint-duration-seconds", type=float, default=0.0)
     args = parser.parse_args()
+    if not math.isfinite(args.checkpoint_duration_seconds) or args.checkpoint_duration_seconds < 0:
+        parser.error("checkpoint duration must be nonnegative and finite")
+    if args.mode == "checkpoint" and args.checkpoint_duration_seconds == 0:
+        parser.error("checkpoint mode requires a positive duration")
     binary_bytes = args.binary.read_bytes()
     status = command("git", "status", "--porcelain")
     result = {
@@ -69,6 +75,7 @@ def main():
             "disk_cache_mib": args.disk_cache_mib,
             "timeout_seconds": args.timeout_seconds,
             "checkpoint_profile_enabled": bool(args.checkpoint_profile),
+            "checkpoint_duration_seconds": args.checkpoint_duration_seconds,
         },
         "pos3ql_object_store": {
             "implementation": "tests/external/s3_test_server.py",

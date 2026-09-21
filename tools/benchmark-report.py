@@ -62,6 +62,13 @@ def main():
                 "pos3ql uses an instrumented object-store fixture backed by "
                 "local temporary storage. Timing from this run is exploratory.\n"
             )
+        duration = suite.get("checkpoint_duration_seconds", 0)
+        if suite_mode == "checkpoint" and duration:
+            print(
+                f"Mixed workloads run for at least {duration} seconds and "
+                f"{suite['operations_per_client']} operations per client; "
+                "operation counts may differ across engines.\n"
+            )
     postgresql_path = args.directory / "postgresql-server.json"
     if postgresql_path.exists():
         postgresql = json.loads(postgresql_path.read_text(encoding="utf-8"))

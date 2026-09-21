@@ -1213,6 +1213,20 @@ impl Checkpointer {
         self.prev_ssts.get(slot).map_or(0, |list| list.n)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_value_index_handle(
+        &self,
+        slot: usize,
+        index_created_at: u64,
+    ) -> Option<ValueIndexHandle> {
+        self.pending_value_installs
+            .iter()
+            .find(|install| {
+                install.slot == slot && install.index_created_at == Some(index_created_at)
+            })
+            .and_then(|install| install.handle)
+    }
+
     pub(crate) fn enable_async_block_reads(&mut self) {
         self.blocks.borrow_mut().enable_async_gets();
     }
@@ -10261,6 +10275,27 @@ impl Checkpointer {
             self.slice_scratch.copy_from(&self.prev_ssts[slot]);
         }
         self.slice_value_installs.clear();
+        if let Some(floor) = changed_after_lsn {
+            for install in self
+                .pending_value_installs
+                .iter()
+                .filter(|install| install.slot == slot)
+            {
+                let unchanged = (0..storage.value_binding_count(slot)).any(|binding| {
+                    let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+                    storage.value_binding_is_committed(slot, binding)
+                        && !storage.value_binding_needs_publish_after(slot, binding, floor)
+                        && install.n_columns == n_columns
+                        && install.columns[..n_columns] == columns[..n_columns]
+                        && install.index_created_at
+                            == storage.value_binding_created_at(slot, binding)
+                        && install.include_mask == storage.value_binding_include_mask(slot, binding)
+                });
+                if unchanged {
+                    self.slice_value_installs.push(*install);
+                }
+            }
+        }
         // Stage every fallible write before changing the retained slice. A
         // failed fallback from a full unpublished list must keep that list
         // and its LSN boundary intact for the retry.
@@ -10268,7 +10303,7 @@ impl Checkpointer {
         let index_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let index_before = self.blocks.borrow().io_stats();
-        self.build_value_indexes(storage, slot)?;
+        self.build_value_indexes(storage, slot, changed_after_lsn)?;
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
             "value_indexes",
@@ -10537,10 +10572,19 @@ impl Checkpointer {
     /// retains its prior immutable handle; changed bindings still receive a
     /// full logical rebuild so stale keys disappear atomically with the row
     /// generation through the same manifest CAS.
-    fn build_value_indexes(&mut self, storage: &Storage, slot: usize) -> Result<(), SqlError> {
-        if !(0..storage.value_binding_count(slot))
-            .any(|binding| storage.value_binding_needs_publish(slot, binding))
-        {
+    fn build_value_indexes(
+        &mut self,
+        storage: &Storage,
+        slot: usize,
+        changed_after_lsn: Option<u64>,
+    ) -> Result<(), SqlError> {
+        let needs_publish = |binding| {
+            changed_after_lsn.map_or_else(
+                || storage.value_binding_needs_publish(slot, binding),
+                |floor| storage.value_binding_needs_publish_after(slot, binding, floor),
+            )
+        };
+        if !(0..storage.value_binding_count(slot)).any(needs_publish) {
             return Ok(());
         }
         // Checkpoints run between statements, so they can lease the same
@@ -10563,9 +10607,7 @@ impl Checkpointer {
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
         let published_lsn = storage.lsn();
         for binding in 0..storage.value_binding_count(slot) {
-            if !storage.value_binding_is_committed(slot, binding)
-                || !storage.value_binding_needs_publish(slot, binding)
-            {
+            if !storage.value_binding_is_committed(slot, binding) || !needs_publish(binding) {
                 continue;
             }
             self.roster_scratch.clear();

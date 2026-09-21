@@ -64793,6 +64793,175 @@ fn checkpoint_rebuilds_only_value_indexes_dependent_on_changed_columns() {
 }
 
 #[test]
+fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
+    let mut config = test_config("create-index-value-publication");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-create-index-value-publication-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.max_indexes = 8;
+    config.max_value_indexes = 8;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sequential_indexes (
+             id integer PRIMARY KEY,
+             span int4range NOT NULL,
+             tags integer[] NOT NULL
+         );
+         CREATE TABLE sequential_index_tail (id integer PRIMARY KEY, value text);
+         INSERT INTO sequential_indexes
+           SELECT value, int4range(value, value + 2), ARRAY[value]
+             FROM generate_series(1,128) AS source(value);
+         INSERT INTO sequential_index_tail VALUES (1, 'before');
+         CREATE INDEX sequential_span
+           ON sequential_indexes USING gist (span)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let table = engine
+        .storage
+        .find_table("public", "sequential_indexes")
+        .unwrap();
+    let binding_for = |engine: &Engine, name: &str| {
+        let index = engine.storage.index_slot("public", name, 0).unwrap();
+        let created_at = engine
+            .storage
+            .index_visible_to(index, 0)
+            .unwrap()
+            .created_at;
+        engine
+            .storage
+            .value_binding_for_index(table, created_at)
+            .unwrap()
+    };
+    let span = binding_for(&engine, "sequential_span");
+    let span_handle = engine.storage.value_binding_handle(table, span);
+    assert!(span_handle.is_some());
+
+    let added = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX sequential_tags
+           ON sequential_indexes USING gin (tags)",
+    );
+    assert!(
+        !message_types(&added).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&added)
+    );
+    let span = binding_for(&engine, "sequential_span");
+    let tags = binding_for(&engine, "sequential_tags");
+    assert!(
+        !engine.storage.value_binding_needs_publish(table, span),
+        "creating one index must not dirty an existing published binding"
+    );
+    assert!(engine.storage.value_binding_needs_publish(table, tags));
+    assert_eq!(
+        engine.storage.value_binding_handle(table, span),
+        span_handle
+    );
+
+    let reslice = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX sequential_tags_second
+           ON sequential_indexes USING gin (tags);
+         UPDATE sequential_index_tail SET value = 'after' WHERE id = 1",
+    );
+    assert!(!message_types(&reslice).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    let second_index = engine
+        .storage
+        .index_visible_to(
+            engine
+                .storage
+                .index_slot("public", "sequential_tags_second", 0)
+                .unwrap(),
+            0,
+        )
+        .unwrap()
+        .created_at;
+    let staged = engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .pending_value_index_handle(table, second_index)
+        .expect("the first slice staged the new value index");
+
+    let changed_again = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX sequential_tags_third
+           ON sequential_indexes USING gin (tags)",
+    );
+    assert!(!message_types(&changed_again).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .pending_value_index_handle(table, second_index),
+        Some(staged),
+        "reslicing for a later CREATE INDEX must retain the earlier staged generation"
+    );
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM sequential_indexes WHERE tags @> ARRAY[17];
+             SELECT value FROM sequential_index_tail WHERE id = 1"
+        )),
+        ["1", "after"]
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*) FROM sequential_indexes WHERE tags @> ARRAY[17];
+             SELECT value FROM sequential_index_tail WHERE id = 1"
+        )),
+        ["1", "after"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn one_protocol_flush_publishes_many_commits_as_one_immutable_batch() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

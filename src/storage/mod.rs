@@ -3571,6 +3571,10 @@ pub(crate) struct Enforcer {
     /// The committed image differs from `durable`. A clean binding can retain
     /// its immutable generation when an unrelated table column changes.
     durable_dirty: bool,
+    /// Last logical WAL boundary that changed the binding. Checkpoint
+    /// reslices use it to retain an unpublished generation when only another
+    /// binding changed after the prior slice.
+    durable_dirty_lsn: u64,
 }
 
 impl Enforcer {
@@ -26774,7 +26778,7 @@ impl Storage {
     pub fn remove_committed(&mut self, table_index: usize, rowid: u64, commit_lsn: u64) {
         if self.tables[table_index].n_spill_ssts == 0 {
             if self.remove_row_state(table_index, rowid).is_some() {
-                self.mark_value_bindings_dirty(table_index);
+                self.mark_value_bindings_dirty_at(table_index, commit_lsn);
                 self.tables[table_index].mark_dirty();
             }
             return;
@@ -26793,7 +26797,7 @@ impl Storage {
                 pending: PendingVersions::empty(),
             },
         );
-        self.mark_value_bindings_dirty(table_index);
+        self.mark_value_bindings_dirty_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
     }
@@ -26822,6 +26826,7 @@ impl Storage {
             if pending.changes_existence || enforcer.dependency_mask & pending.changed_columns != 0
             {
                 enforcer.durable_dirty = true;
+                enforcer.durable_dirty_lsn = commit_lsn;
             }
         }
 
@@ -26932,7 +26937,7 @@ impl Storage {
         if state.committed.is_none() && table.n_spill_ssts == 0 {
             table.rows.remove(&rowid);
         }
-        self.mark_value_bindings_dirty(table_index);
+        self.mark_value_bindings_dirty_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
     }
@@ -28305,16 +28310,32 @@ impl Storage {
             .durable_dirty
     }
 
+    pub(crate) fn value_binding_needs_publish_after(
+        &self,
+        table_index: usize,
+        binding: usize,
+        lsn: u64,
+    ) -> bool {
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        enforcer.durable_dirty && enforcer.durable_dirty_lsn > lsn
+    }
+
     /// Invalidates every durable value generation after a committed row-set
     /// replacement that bypasses [`Self::commit_row`] (replay, rewrite,
     /// truncation, or explicit REINDEX maintenance).
     pub(crate) fn mark_value_bindings_dirty(&mut self, table_index: usize) {
+        let dirty_lsn = self.lsn.saturating_add(1);
+        self.mark_value_bindings_dirty_at(table_index, dirty_lsn);
+    }
+
+    fn mark_value_bindings_dirty_at(&mut self, table_index: usize, dirty_lsn: u64) {
         let n_enforcers = self.tables[table_index].n_enforcers;
         for enforcer in self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
         {
             enforcer.durable_dirty = true;
+            enforcer.durable_dirty_lsn = dirty_lsn;
         }
     }
 
@@ -28674,6 +28695,7 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
+        let new_dirty_lsn = self.lsn.saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
         let mut published = [None; MAX_VALUE_ENFORCERS];
@@ -28908,6 +28930,8 @@ impl Storage {
                 dependency_mask: wanted.dependency_mask,
                 durable: prior.and_then(|enforcer| enforcer.durable),
                 durable_dirty: prior.is_none_or(|enforcer| enforcer.durable_dirty),
+                durable_dirty_lsn: prior
+                    .map_or(new_dirty_lsn, |enforcer| enforcer.durable_dirty_lsn),
             });
             // Keep the installed prefix visible to `release_enforcers`, so an
             // acquire failure later in this loop returns every slot already

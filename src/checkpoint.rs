@@ -10501,7 +10501,11 @@ impl Checkpointer {
         #[cfg(feature = "checkpoint-profile")]
         if !clean {
             profile_checkpoint_phase(
-                "row_sst",
+                if delta {
+                    "row_sst_delta"
+                } else {
+                    "row_sst_full"
+                },
                 storage.lsn(),
                 Some(slot),
                 row_started,

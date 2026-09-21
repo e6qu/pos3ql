@@ -64556,11 +64556,11 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
-fn analyze_streams_wide_spilled_rows_after_cold_recovery() {
-    let mut config = test_config("analyze-spilled-stream");
+fn analyze_coalesces_wide_pax_container_reads_after_cold_recovery() {
+    let mut config = test_config("analyze-pax-container");
     config.object_store_on = true;
     config.object_store_sim = true;
-    config.object_store_bucket = format!("sql-analyze-spilled-stream-{}", std::process::id());
+    config.object_store_bucket = format!("sql-analyze-pax-container-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.txn_rows = 1024;
     config.table_rows = 1024;
@@ -64578,14 +64578,28 @@ fn analyze_streams_wide_spilled_rows_after_cold_recovery() {
     let setup = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE analyze_stream (
-             id integer PRIMARY KEY,
-             category integer NOT NULL,
-             payload text NOT NULL
-         );
-         INSERT INTO analyze_stream
-           SELECT value, value % 17, repeat(md5(value::text), 128)
-             FROM generate_series(1,512) AS source(value)",
+        "CREATE TABLE analyze_stream(
+             id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL,
+             brin_span int4range NOT NULL, gist_span int4range NOT NULL,
+             gist_spans int4multirange NOT NULL, gist_address inet NOT NULL,
+             gist_location point NOT NULL, gin_tags integer[] NOT NULL,
+             gin_document tsvector NOT NULL, gist_document tsvector NOT NULL,
+             json_ops jsonb NOT NULL, json_path jsonb NOT NULL,
+             spgist_label text NOT NULL, spgist_span int4range NOT NULL,
+             spgist_address inet NOT NULL, spgist_location point NOT NULL,
+             payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192));
+         INSERT INTO analyze_stream(id, hash_key, brin_key, brin_span, gist_span, gist_spans, gist_address, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_span, spgist_address, spgist_location, payload)
+         SELECT value, value, value, int4range(value * 2, value * 2 + 2),
+            int4range(value * 3, value * 3 + 3),
+            int4multirange(int4range(value * 7, value * 7 + 2), int4range(value * 7 + 4, value * 7 + 6)),
+            '10.0.0.0'::inet + value, point(value, value), ARRAY[value],
+            to_tsvector('simple','token' || value::text),
+            to_tsvector('simple','gisttoken' || value::text),
+            jsonb_build_object('key' || value::text,'value' || value::text),
+            jsonb_build_object('token','value' || value::text),
+            'key-' || value::text, int4range(value * 5, value * 5 + 2),
+            '11.0.0.0'::inet + value, point(value, -value), 0
+         FROM generate_series(1,512) AS value",
     );
     assert!(
         !message_types(&setup).contains(&b'E'),
@@ -64611,8 +64625,8 @@ fn analyze_streams_wide_spilled_rows_after_cold_recovery() {
     );
     let reads = recovered.storage.block_io_stats().saturating_sub(before);
     assert!(
-        reads.object_gets < 512,
-        "ANALYZE point-read the spilled fixture: {reads:?}"
+        reads.object_gets < 128,
+        "ANALYZE fetched PAX extents separately: {reads:?}"
     );
     let slot = recovered
         .storage
@@ -64620,8 +64634,8 @@ fn analyze_streams_wide_spilled_rows_after_cold_recovery() {
         .unwrap();
     let statistics = recovered.storage.table_statistics(slot, 0);
     assert_eq!(statistics.rows, 512);
-    assert!((10..=30).contains(&statistics.columns[1].distinct_values));
-    assert!(statistics.average_row_width > 4_000);
+    assert!(statistics.columns[1].distinct_values > 100);
+    assert!(statistics.average_row_width > 8_000);
 
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

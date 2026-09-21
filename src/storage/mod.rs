@@ -24416,6 +24416,7 @@ impl Storage {
                         } = &mut *context;
                         let mut blocks = spill.relation_blocks(table);
                         let mut at = 0usize;
+                        let mut loaded_container = None;
                         pax_value_extents.fill(None);
                         for column in 0..layout.columns() {
                             if decoded_columns.is_some_and(|columns| !columns[column]) {
@@ -24427,13 +24428,56 @@ impl Storage {
                                     column,
                                 )
                                 .map_err(spill_read_error)?;
-                            let (len, block_type) = crate::store::read_data_block_raw_ref(
-                                &mut *blocks,
-                                reference,
-                                pax_column_buf,
-                                &mut member_blocks[member as usize],
-                            )
-                            .map_err(spill_read_error)?;
+                            let (len, block_type) = match reference {
+                                crate::store::DataBlockRef::Packed {
+                                    container,
+                                    offset,
+                                    length,
+                                    id,
+                                } if decoded_columns.is_none() => {
+                                    let container_len = if let Some((loaded, len)) =
+                                        loaded_container
+                                        && loaded == container
+                                    {
+                                        len
+                                    } else {
+                                        let (len, block_type) = blocks
+                                            .get(&container, pax_column_buf)
+                                            .map_err(|error| {
+                                                spill_read_error(crate::store::SstError::Store(
+                                                    error,
+                                                ))
+                                            })?;
+                                        if block_type
+                                            != crate::store::BlockType::SstPackedContainerV1
+                                        {
+                                            return Err(sql_err!(
+                                                sqlstate::INTERNAL_ERROR,
+                                                "PAX column container has the wrong block type"
+                                            ));
+                                        }
+                                        loaded_container = Some((container, len));
+                                        len
+                                    };
+                                    crate::store::decode_packed_extent(
+                                        &pax_column_buf[..container_len],
+                                        offset as usize,
+                                        length as usize,
+                                        &id,
+                                        &mut member_blocks[member as usize],
+                                    )
+                                    .map_err(|error| {
+                                        spill_read_error(crate::store::SstError::Store(error))
+                                    })?
+                                }
+                                _ => crate::store::read_data_block_raw_ref(
+                                    &mut *blocks,
+                                    reference,
+                                    &mut member_blocks[member as usize],
+                                    pax_column_buf,
+                                )
+                                .map_err(spill_read_error)?,
+                            };
                             if block_type != crate::store::BlockType::SstDataPaxColumnV1 {
                                 return Err(sql_err!(
                                     sqlstate::INTERNAL_ERROR,
@@ -24449,7 +24493,8 @@ impl Storage {
                                     "PAX column extents exceed the fixed scan vector buffer"
                                 ));
                             }
-                            pax_values_buf[at..end].copy_from_slice(&pax_column_buf[..len]);
+                            pax_values_buf[at..end]
+                                .copy_from_slice(&member_blocks[member as usize][..len]);
                             pax_value_extents[column] = Some((at, end));
                             at = end;
                         }

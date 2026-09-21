@@ -193,6 +193,17 @@ run, value-index block PUTs fell from 224 to 24 and their phase time from
 also preserves a matched workload against actual PostgreSQL 18.6 on its
 recorded Docker-managed local durable tier. Timing remains exploratory on the
 shared host, and PostgreSQL has no corresponding object-request measure.
+The [incremental row-reslice run](../benchmarks/baselines/2026-09-21-checkpoint-row-reslice-1000/README.md)
+retains compatible unpublished row generations when foreground commits make a
+previous table slice stale. Later slices include only versions newer than the
+captured LSN. Its deterministic regression wrote 13 blocks for the first
+128-row slice and 5 for a one-row reslice, with deferred-eviction and
+empty-cache recovery checks. The mixed profile exercised two 39-then-5 block
+sweeps and a 137-block slice followed by four 5-block reslices. The run also
+preserves the matched workload and durability settings from actual PostgreSQL
+18.6. Its 12 row events and seven manifests differ from the prior settled run,
+so aggregate latency and request totals are exploratory rather than a
+controlled comparison.
 
 ## Measured scenarios
 

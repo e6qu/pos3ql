@@ -1,0 +1,149 @@
+pos3ql starting
+  listen_addr  127.0.0.1:19600
+  data_dir     /var/folders/93/f1fz6s6969gbkd8m9tph1rfw0000gn/T//pos3ql-performance.mxD02Z/data-warm
+memory plan:
+  memtable     16 MiB
+  tables       387319180 B
+  block cache  32 MiB
+  connections  193961792 B
+  server       73166144 B
+  total        704778764 B
+  disk cache   1 GiB (disk, not RAM)
+  temp spill   128 MiB (local ephemeral disk)
+startup complete: memory frozen (656672424 B of 704778764 B budget drawn); accepting connections
+checkpoint_phase lsn=2132 phase=value_indexes slot=0 started_ns=1790001356880826000 ended_ns=1790001357371627959 elapsed_us=490801 block_gets=0 block_puts=152 deleted=0
+checkpoint_phase lsn=2132 phase=row_sst slot=0 started_ns=1790001357371630000 ended_ns=1790001357947891208 elapsed_us=576261 block_gets=0 block_puts=137 deleted=0
+checkpoint_phase lsn=2132 phase=manifest slot=-1 started_ns=1790001357947901000 ended_ns=1790001357951378292 elapsed_us=3477 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=local_cleanup slot=-1 started_ns=1790001357951399000 ended_ns=1790001357951445250 elapsed_us=46 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=commit_prune slot=-1 started_ns=1790001357951450000 ended_ns=1790001358008601250 elapsed_us=57151 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=2132 phase=commit_prune slot=-1 started_ns=1790001358008613000 ended_ns=1790001358053660292 elapsed_us=45047 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=2132 phase=commit_prune slot=-1 started_ns=1790001358053673000 ended_ns=1790001358093704792 elapsed_us=40031 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=2132 phase=commit_prune slot=-1 started_ns=1790001358093718000 ended_ns=1790001358115494791 elapsed_us=21776 block_gets=0 block_puts=0 deleted=8
+checkpoint_phase lsn=2132 phase=legacy_gc slot=-1 started_ns=1790001358115508000 ended_ns=1790001358120683375 elapsed_us=5175 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=gc_keep slot=-1 started_ns=1790001358120690000 ended_ns=1790001358121003416 elapsed_us=313 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=gc_list slot=-1 started_ns=1790001358121021000 ended_ns=1790001358127289333 elapsed_us=6268 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=gc_delete slot=-1 started_ns=1790001358127296000 ended_ns=1790001358127296333 elapsed_us=0 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3192 phase=value_indexes slot=0 started_ns=1790001365081403000 ended_ns=1790001365185605625 elapsed_us=104202 block_gets=0 block_puts=12 deleted=0
+checkpoint_phase lsn=3192 phase=row_sst slot=0 started_ns=1790001365185617000 ended_ns=1790001365517003959 elapsed_us=331386 block_gets=0 block_puts=39 deleted=0
+checkpoint_phase lsn=3192 phase=manifest slot=-1 started_ns=1790001365517018000 ended_ns=1790001365521829500 elapsed_us=4811 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3192 phase=local_cleanup slot=-1 started_ns=1790001365521844000 ended_ns=1790001365521864250 elapsed_us=20 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365521876000 ended_ns=1790001365597942292 elapsed_us=76066 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365597957000 ended_ns=1790001365666076542 elapsed_us=68119 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365666119000 ended_ns=1790001365745378125 elapsed_us=79259 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365745387000 ended_ns=1790001365802010459 elapsed_us=56623 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365802068000 ended_ns=1790001365867116500 elapsed_us=65048 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365867137000 ended_ns=1790001365932287500 elapsed_us=65150 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365932415000 ended_ns=1790001365998637000 elapsed_us=66222 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001365998646000 ended_ns=1790001366042901042 elapsed_us=44255 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366042916000 ended_ns=1790001366086313042 elapsed_us=43397 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366086328000 ended_ns=1790001366128725000 elapsed_us=42397 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366128736000 ended_ns=1790001366170219750 elapsed_us=41483 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366170230000 ended_ns=1790001366214820375 elapsed_us=44590 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366214827000 ended_ns=1790001366260194750 elapsed_us=45367 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366260205000 ended_ns=1790001366303744834 elapsed_us=43539 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366303752000 ended_ns=1790001366346165042 elapsed_us=42413 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366346176000 ended_ns=1790001366389960209 elapsed_us=43784 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366389967000 ended_ns=1790001366452758500 elapsed_us=62791 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366452767000 ended_ns=1790001366495273333 elapsed_us=42506 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366495310000 ended_ns=1790001366540132625 elapsed_us=44822 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366540141000 ended_ns=1790001366582098667 elapsed_us=41957 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366582107000 ended_ns=1790001366624528709 elapsed_us=42421 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366624539000 ended_ns=1790001366671265125 elapsed_us=46726 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366671284000 ended_ns=1790001366716232875 elapsed_us=44948 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366716244000 ended_ns=1790001366760975334 elapsed_us=44731 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366760986000 ended_ns=1790001366803811500 elapsed_us=42825 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366803820000 ended_ns=1790001366856025916 elapsed_us=52205 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3192 phase=commit_prune slot=-1 started_ns=1790001366856249000 ended_ns=1790001366898382583 elapsed_us=42133 block_gets=0 block_puts=0 deleted=14
+checkpoint_phase lsn=3192 phase=legacy_gc slot=-1 started_ns=1790001366898398000 ended_ns=1790001366905153209 elapsed_us=6755 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3192 phase=gc_keep slot=-1 started_ns=1790001366905167000 ended_ns=1790001366905449208 elapsed_us=282 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3192 phase=gc_list slot=-1 started_ns=1790001366905453000 ended_ns=1790001366912545750 elapsed_us=7092 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3192 phase=gc_delete slot=-1 started_ns=1790001366912554000 ended_ns=1790001366943610625 elapsed_us=31056 block_gets=0 block_puts=0 deleted=12
+checkpoint_phase lsn=3208 phase=value_indexes slot=0 started_ns=1790001367156205000 ended_ns=1790001367253250959 elapsed_us=97045 block_gets=18 block_puts=6 deleted=0
+checkpoint_phase lsn=3208 phase=row_sst slot=0 started_ns=1790001367253257000 ended_ns=1790001367515953833 elapsed_us=262696 block_gets=0 block_puts=39 deleted=0
+checkpoint_phase lsn=3208 phase=manifest slot=-1 started_ns=1790001367515958000 ended_ns=1790001367519125417 elapsed_us=3167 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3208 phase=local_cleanup slot=-1 started_ns=1790001367519132000 ended_ns=1790001367519216666 elapsed_us=84 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3208 phase=commit_prune slot=-1 started_ns=1790001367519219000 ended_ns=1790001367548121125 elapsed_us=28902 block_gets=0 block_puts=0 deleted=6
+checkpoint_phase lsn=3208 phase=legacy_gc slot=-1 started_ns=1790001367548128000 ended_ns=1790001367554259292 elapsed_us=6131 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3208 phase=gc_keep slot=-1 started_ns=1790001367554267000 ended_ns=1790001367554552833 elapsed_us=285 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3208 phase=gc_list slot=-1 started_ns=1790001367554556000 ended_ns=1790001367561571125 elapsed_us=7015 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3208 phase=gc_delete slot=-1 started_ns=1790001367561578000 ended_ns=1790001367578265709 elapsed_us=16687 block_gets=0 block_puts=0 deleted=6
+checkpoint_phase lsn=3216 phase=value_indexes slot=0 started_ns=1790001367600092000 ended_ns=1790001367644239041 elapsed_us=44147 block_gets=1 block_puts=6 deleted=0
+checkpoint_phase lsn=3216 phase=row_sst slot=0 started_ns=1790001367644246000 ended_ns=1790001367801637042 elapsed_us=157391 block_gets=0 block_puts=39 deleted=0
+checkpoint_phase lsn=3216 phase=manifest slot=-1 started_ns=1790001367801646000 ended_ns=1790001367805321250 elapsed_us=3675 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=local_cleanup slot=-1 started_ns=1790001367805335000 ended_ns=1790001367805396000 elapsed_us=61 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=commit_prune slot=-1 started_ns=1790001367805399000 ended_ns=1790001367824092959 elapsed_us=18693 block_gets=0 block_puts=0 deleted=2
+checkpoint_phase lsn=3216 phase=legacy_gc slot=-1 started_ns=1790001367824104000 ended_ns=1790001367830687208 elapsed_us=6583 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=gc_keep slot=-1 started_ns=1790001367830698000 ended_ns=1790001367831005291 elapsed_us=307 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=gc_list slot=-1 started_ns=1790001367831011000 ended_ns=1790001367839643958 elapsed_us=8632 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=gc_delete slot=-1 started_ns=1790001367839659000 ended_ns=1790001367857186250 elapsed_us=17527 block_gets=0 block_puts=0 deleted=6
+checkpoint_phase lsn=3220 phase=value_indexes slot=0 started_ns=1790001367874855000 ended_ns=1790001367920349917 elapsed_us=45494 block_gets=1 block_puts=6 deleted=0
+checkpoint_phase lsn=3220 phase=row_sst slot=0 started_ns=1790001367920360000 ended_ns=1790001368073153333 elapsed_us=152793 block_gets=0 block_puts=39 deleted=0
+checkpoint_phase lsn=3224 phase=value_indexes slot=0 started_ns=1790001368426043000 ended_ns=1790001368466483292 elapsed_us=40440 block_gets=0 block_puts=6 deleted=0
+checkpoint_phase lsn=3224 phase=row_sst slot=0 started_ns=1790001368466489000 ended_ns=1790001368481878750 elapsed_us=15389 block_gets=0 block_puts=5 deleted=0
+checkpoint_phase lsn=3224 phase=manifest slot=-1 started_ns=1790001368784954000 ended_ns=1790001368788239292 elapsed_us=3285 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3224 phase=local_cleanup slot=-1 started_ns=1790001368788247000 ended_ns=1790001368788302667 elapsed_us=55 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3224 phase=commit_prune slot=-1 started_ns=1790001368788306000 ended_ns=1790001368811327375 elapsed_us=23021 block_gets=0 block_puts=0 deleted=4
+checkpoint_phase lsn=3224 phase=legacy_gc slot=-1 started_ns=1790001368811342000 ended_ns=1790001368817397917 elapsed_us=6055 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3224 phase=gc_keep slot=-1 started_ns=1790001368817407000 ended_ns=1790001368819162709 elapsed_us=1755 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3224 phase=gc_list slot=-1 started_ns=1790001368819169000 ended_ns=1790001368826065667 elapsed_us=6896 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3224 phase=gc_delete slot=-1 started_ns=1790001368826077000 ended_ns=1790001368858348125 elapsed_us=32271 block_gets=0 block_puts=0 deleted=12
+checkpoint_phase lsn=3232 phase=value_indexes slot=0 started_ns=1790001369015180000 ended_ns=1790001369064594250 elapsed_us=49414 block_gets=2 block_puts=6 deleted=0
+checkpoint_phase lsn=3232 phase=row_sst slot=0 started_ns=1790001369064602000 ended_ns=1790001369218050375 elapsed_us=153448 block_gets=0 block_puts=39 deleted=0
+checkpoint_phase lsn=3240 phase=value_indexes slot=0 started_ns=1790001369260252000 ended_ns=1790001369302588292 elapsed_us=42336 block_gets=0 block_puts=6 deleted=0
+checkpoint_phase lsn=3240 phase=row_sst slot=0 started_ns=1790001369302594000 ended_ns=1790001369319305917 elapsed_us=16711 block_gets=0 block_puts=5 deleted=0
+checkpoint_phase lsn=3240 phase=manifest slot=-1 started_ns=1790001369342575000 ended_ns=1790001369345800000 elapsed_us=3225 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3240 phase=local_cleanup slot=-1 started_ns=1790001369345808000 ended_ns=1790001369345891167 elapsed_us=83 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3240 phase=commit_prune slot=-1 started_ns=1790001369369601000 ended_ns=1790001369398717042 elapsed_us=29116 block_gets=0 block_puts=0 deleted=6
+checkpoint_phase lsn=3240 phase=legacy_gc slot=-1 started_ns=1790001369412719000 ended_ns=1790001369419433250 elapsed_us=6714 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3256 phase=gc_keep slot=-1 started_ns=1790001369433252000 ended_ns=1790001369433668542 elapsed_us=416 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3256 phase=gc_list slot=-1 started_ns=1790001369433687000 ended_ns=1790001369441792791 elapsed_us=8105 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3256 phase=gc_delete slot=-1 started_ns=1790001369441809000 ended_ns=1790001369474577416 elapsed_us=32768 block_gets=0 block_puts=0 deleted=12
+checkpoint_phase lsn=3256 phase=value_indexes slot=0 started_ns=1790001369492635000 ended_ns=1790001369542882958 elapsed_us=50247 block_gets=3 block_puts=6 deleted=0
+checkpoint_phase lsn=3256 phase=row_sst slot=0 started_ns=1790001369542888000 ended_ns=1790001370140223375 elapsed_us=597335 block_gets=0 block_puts=137 deleted=0
+checkpoint_phase lsn=3268 phase=value_indexes slot=0 started_ns=1790001370198161000 ended_ns=1790001370245651250 elapsed_us=47490 block_gets=0 block_puts=8 deleted=0
+checkpoint_phase lsn=3268 phase=row_sst slot=0 started_ns=1790001370245658000 ended_ns=1790001370262221333 elapsed_us=16563 block_gets=0 block_puts=5 deleted=0
+checkpoint_phase lsn=3272 phase=value_indexes slot=0 started_ns=1790001370295114000 ended_ns=1790001370342210334 elapsed_us=47096 block_gets=0 block_puts=8 deleted=0
+checkpoint_phase lsn=3272 phase=row_sst slot=0 started_ns=1790001370342218000 ended_ns=1790001370358333541 elapsed_us=16115 block_gets=0 block_puts=5 deleted=0
+checkpoint_phase lsn=3280 phase=value_indexes slot=0 started_ns=1790001370394291000 ended_ns=1790001370446652083 elapsed_us=52361 block_gets=0 block_puts=8 deleted=0
+checkpoint_phase lsn=3280 phase=row_sst slot=0 started_ns=1790001370446662000 ended_ns=1790001370469015625 elapsed_us=22353 block_gets=0 block_puts=5 deleted=0
+checkpoint_phase lsn=3288 phase=value_indexes slot=0 started_ns=1790001370520542000 ended_ns=1790001370570214542 elapsed_us=49672 block_gets=0 block_puts=8 deleted=0
+checkpoint_phase lsn=3288 phase=row_sst slot=0 started_ns=1790001370570219000 ended_ns=1790001370587354666 elapsed_us=17135 block_gets=0 block_puts=5 deleted=0
+checkpoint_phase lsn=3288 phase=manifest slot=-1 started_ns=1790001370605784000 ended_ns=1790001370609082541 elapsed_us=3298 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3288 phase=local_cleanup slot=-1 started_ns=1790001370609091000 ended_ns=1790001370609199334 elapsed_us=108 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3288 phase=commit_prune slot=-1 started_ns=1790001370634808000 ended_ns=1790001370749196083 elapsed_us=114388 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3288 phase=commit_prune slot=-1 started_ns=1790001370802379000 ended_ns=1790001370809978125 elapsed_us=7599 block_gets=0 block_puts=0 deleted=2
+checkpoint_phase lsn=3288 phase=legacy_gc slot=-1 started_ns=1790001370847413000 ended_ns=1790001370855552834 elapsed_us=8139 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3304 phase=gc_keep slot=-1 started_ns=1790001370859288000 ended_ns=1790001370859572750 elapsed_us=284 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3304 phase=gc_list slot=-1 started_ns=1790001370862991000 ended_ns=1790001370872271625 elapsed_us=9280 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3304 phase=gc_delete slot=-1 started_ns=1790001370872282000 ended_ns=1790001370918017500 elapsed_us=45735 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3320 phase=gc_delete slot=-1 started_ns=1790001370943079000 ended_ns=1790001370984973666 elapsed_us=41894 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3332 phase=gc_delete slot=-1 started_ns=1790001371017103000 ended_ns=1790001371058682333 elapsed_us=41579 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3336 phase=gc_delete slot=-1 started_ns=1790001371076928000 ended_ns=1790001371122136459 elapsed_us=45208 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3344 phase=gc_delete slot=-1 started_ns=1790001371146653000 ended_ns=1790001371189087791 elapsed_us=42434 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371211898000 ended_ns=1790001371257130125 elapsed_us=45232 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371260757000 ended_ns=1790001371305387042 elapsed_us=44630 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371306054000 ended_ns=1790001371348847000 elapsed_us=42793 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371352536000 ended_ns=1790001371397171834 elapsed_us=44635 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371397283000 ended_ns=1790001371443155375 elapsed_us=45872 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371443192000 ended_ns=1790001371486226250 elapsed_us=43034 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371486319000 ended_ns=1790001371492042208 elapsed_us=5723 block_gets=0 block_puts=0 deleted=2
+checkpoint_phase lsn=3352 phase=value_indexes slot=0 started_ns=1790001371492190000 ended_ns=1790001371680168583 elapsed_us=187978 block_gets=46 block_puts=8 deleted=0
+checkpoint_phase lsn=3352 phase=row_sst slot=0 started_ns=1790001371680176000 ended_ns=1790001371848805208 elapsed_us=168629 block_gets=0 block_puts=39 deleted=0
+checkpoint_phase lsn=3352 phase=manifest slot=-1 started_ns=1790001371849221000 ended_ns=1790001371853289625 elapsed_us=4068 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=local_cleanup slot=-1 started_ns=1790001371853300000 ended_ns=1790001371853396458 elapsed_us=96 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=commit_prune slot=-1 started_ns=1790001371853447000 ended_ns=1790001371913085166 elapsed_us=59638 block_gets=0 block_puts=0 deleted=16
+pos3ql: shutdown requested, draining
+checkpoint_phase lsn=3352 phase=legacy_gc slot=-1 started_ns=1790001371913100000 ended_ns=1790001371919535084 elapsed_us=6435 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=gc_keep slot=-1 started_ns=1790001371919552000 ended_ns=1790001371919838334 elapsed_us=286 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=gc_list slot=-1 started_ns=1790001371919842000 ended_ns=1790001371927228041 elapsed_us=7386 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371927236000 ended_ns=1790001371970453041 elapsed_us=43217 block_gets=0 block_puts=0 deleted=16
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001371970467000 ended_ns=1790001372006741500 elapsed_us=36274 block_gets=0 block_puts=0 deleted=13
+checkpoint_phase lsn=3352 phase=manifest slot=-1 started_ns=1790001372129035000 ended_ns=1790001372131928625 elapsed_us=2893 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=local_cleanup slot=-1 started_ns=1790001372131938000 ended_ns=1790001372131956417 elapsed_us=18 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=commit_prune slot=-1 started_ns=1790001372131959000 ended_ns=1790001372144497750 elapsed_us=12538 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=legacy_gc slot=-1 started_ns=1790001372144516000 ended_ns=1790001372150162333 elapsed_us=5646 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=gc_keep slot=-1 started_ns=1790001372150176000 ended_ns=1790001372150214500 elapsed_us=38 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=gc_list slot=-1 started_ns=1790001372150218000 ended_ns=1790001372157378500 elapsed_us=7160 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3352 phase=gc_delete slot=-1 started_ns=1790001372157390000 ended_ns=1790001372185003542 elapsed_us=27613 block_gets=0 block_puts=0 deleted=10
+pos3ql: final checkpoint written
+pos3ql: shutdown complete

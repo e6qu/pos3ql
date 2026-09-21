@@ -228,9 +228,23 @@ block PUTs fell from 224 to 24 and measured phase time from 1.03 seconds to
 0.19 seconds; full-window PUTs fell from 765 to 576. Actual PostgreSQL 18.6
 completed the matched SQL and checkpoint workload on its recorded local
 durable tier. These shared-host measurements are exploratory and do not equate
-PostgreSQL storage with pos3ql object traffic. Next, reduce repeated row SST
-generations and reslicing, then repeat at larger scale on representative
-hardware.
+PostgreSQL storage with pos3ql object traffic.
+Checkpoint row reslicing now retains a compatible earlier slice and appends
+only versions committed after its captured LSN. Physical-layout changes and a
+full generation roster rebuild from the published base. Fixed startup metadata
+preserves warm reads after publication and maps rows to their containing SST
+when later memory pressure evicts them. A deterministic regression reduced a
+one-row reslice from the first slice's 13 block PUTs to 5, then qualified
+deferred eviction and object-cold recovery. The
+[incremental-reslice run](benchmarks/baselines/2026-09-21-checkpoint-row-reslice-1000/README.md)
+exercised two 39-then-5 block sweeps and one 137-block slice followed by four
+5-block reslices. Its matched actual PostgreSQL 18.6 workload completed with
+durability enabled on the recorded local tier. The run contained substantially
+more automatic checkpoint work than the prior profile, so its timing and total
+traffic are not a controlled comparison. Next, repeat at larger scale on
+representative hardware and determine whether complete row images or repeated
+value-index rebuilds dominate within resliced sweeps before changing the
+durable representation.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

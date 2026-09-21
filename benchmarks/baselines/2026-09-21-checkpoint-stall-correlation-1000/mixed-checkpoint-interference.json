@@ -1,0 +1,1464 @@
+{
+  "database_identity": "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin",
+  "label": "mixed-checkpoint-interference",
+  "results": {
+    "access_path": {
+      "index_scans": 200,
+      "index_tuples_fetched": 200,
+      "sequential_scans": 0,
+      "sequential_tuples_read": 0
+    },
+    "attempted_operations": 200,
+    "completed_operations": 200,
+    "elapsed_seconds": 12.647814584,
+    "errors": [],
+    "fixed_memory_occupancy": 0.44175742229557063,
+    "fixed_memory_plan_bytes": 704342538,
+    "latency_ms": {
+      "maximum": 2551.716125,
+      "mean": 252.89669377,
+      "minimum": 0.263959,
+      "p50": 46.358042,
+      "p95": 945.929833,
+      "p99": 2548.019875
+    },
+    "maintenance_operations": 3,
+    "maximum_rss_bytes": 311148544,
+    "object_requests_per_operation": 14.35,
+    "object_store": {
+      "errors": 0,
+      "request_body_bytes": 53694189,
+      "requests": {
+        "delete": 967,
+        "get": 0,
+        "list": 32,
+        "put": 1583,
+        "range_get": 288
+      },
+      "response_body_bytes": 702633,
+      "schema_version": 1
+    },
+    "operation_trace": [
+      {
+        "ended_ns": 1789971687509980291,
+        "kind": "write",
+        "operation": 0,
+        "started_ns": 1789971687492520000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971687534724000,
+        "kind": "write",
+        "operation": 0,
+        "started_ns": 1789971687492541000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971687534642750,
+        "kind": "write",
+        "operation": 0,
+        "started_ns": 1789971687492550000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971687534735000,
+        "kind": "write",
+        "operation": 0,
+        "started_ns": 1789971687492562000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971687534961458,
+        "kind": "read",
+        "operation": 1,
+        "started_ns": 1789971687509995000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971687535211000,
+        "kind": "read",
+        "operation": 1,
+        "started_ns": 1789971687534656000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971687535316000,
+        "kind": "read",
+        "operation": 1,
+        "started_ns": 1789971687534726000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971687535322459,
+        "kind": "read",
+        "operation": 1,
+        "started_ns": 1789971687534736000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971687535374000,
+        "kind": "read",
+        "operation": 2,
+        "started_ns": 1789971687534963000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971687535589250,
+        "kind": "read",
+        "operation": 2,
+        "started_ns": 1789971687535212000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971687535580959,
+        "kind": "read",
+        "operation": 2,
+        "started_ns": 1789971687535317000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971687535851000,
+        "kind": "read",
+        "operation": 2,
+        "started_ns": 1789971687535324000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971687535846083,
+        "kind": "read",
+        "operation": 3,
+        "started_ns": 1789971687535375000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971687536029958,
+        "kind": "read",
+        "operation": 3,
+        "started_ns": 1789971687535582000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971687536013584,
+        "kind": "read",
+        "operation": 3,
+        "started_ns": 1789971687535590000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971687536296917,
+        "kind": "read",
+        "operation": 4,
+        "started_ns": 1789971687535847000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971687536278459,
+        "kind": "read",
+        "operation": 3,
+        "started_ns": 1789971687535851000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971687536540792,
+        "kind": "read",
+        "operation": 4,
+        "started_ns": 1789971687536014000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971687536568958,
+        "kind": "read",
+        "operation": 4,
+        "started_ns": 1789971687536030000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971687552051000,
+        "kind": "read",
+        "operation": 4,
+        "started_ns": 1789971687536279000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971687552025750,
+        "kind": "write",
+        "operation": 5,
+        "started_ns": 1789971687536301000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971690084564875,
+        "kind": "write",
+        "operation": 5,
+        "started_ns": 1789971687536545000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971690084586250,
+        "kind": "write",
+        "operation": 5,
+        "started_ns": 1789971687536571000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971690103752125,
+        "kind": "read",
+        "operation": 6,
+        "started_ns": 1789971687552036000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971690103717041,
+        "kind": "write",
+        "operation": 5,
+        "started_ns": 1789971687552057000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971690736499625,
+        "kind": "read",
+        "operation": 6,
+        "started_ns": 1789971690084567000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971690736475000,
+        "kind": "read",
+        "operation": 6,
+        "started_ns": 1789971690084582000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971690736744875,
+        "kind": "read",
+        "operation": 6,
+        "started_ns": 1789971690103721000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971690736777750,
+        "kind": "read",
+        "operation": 7,
+        "started_ns": 1789971690103749000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971690737017667,
+        "kind": "read",
+        "operation": 7,
+        "started_ns": 1789971690736483000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971690737022709,
+        "kind": "read",
+        "operation": 7,
+        "started_ns": 1789971690736502000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971690737258125,
+        "kind": "read",
+        "operation": 7,
+        "started_ns": 1789971690736744000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971690737282458,
+        "kind": "read",
+        "operation": 8,
+        "started_ns": 1789971690736779000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971690737437708,
+        "kind": "read",
+        "operation": 8,
+        "started_ns": 1789971690737019000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971690737446584,
+        "kind": "read",
+        "operation": 8,
+        "started_ns": 1789971690737024000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971690737715625,
+        "kind": "read",
+        "operation": 8,
+        "started_ns": 1789971690737259000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971690737754458,
+        "kind": "read",
+        "operation": 9,
+        "started_ns": 1789971690737283000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971690737934333,
+        "kind": "read",
+        "operation": 9,
+        "started_ns": 1789971690737438000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971690737919917,
+        "kind": "read",
+        "operation": 9,
+        "started_ns": 1789971690737448000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971690759972625,
+        "kind": "read",
+        "operation": 9,
+        "started_ns": 1789971690737720000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971690759828459,
+        "kind": "write",
+        "operation": 10,
+        "started_ns": 1789971690737761000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971691376125500,
+        "kind": "write",
+        "operation": 10,
+        "started_ns": 1789971690737923000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971691376203334,
+        "kind": "write",
+        "operation": 10,
+        "started_ns": 1789971690737946000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971691398552875,
+        "kind": "read",
+        "operation": 11,
+        "started_ns": 1789971690759883000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971691398522958,
+        "kind": "write",
+        "operation": 10,
+        "started_ns": 1789971690759984000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971691840130333,
+        "kind": "read",
+        "operation": 11,
+        "started_ns": 1789971691376136000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971691840003042,
+        "kind": "read",
+        "operation": 11,
+        "started_ns": 1789971691376196000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971691840215917,
+        "kind": "read",
+        "operation": 11,
+        "started_ns": 1789971691398531000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971691839802500,
+        "kind": "read",
+        "operation": 12,
+        "started_ns": 1789971691398554000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971692233919875,
+        "kind": "read",
+        "operation": 13,
+        "started_ns": 1789971691839815000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971692234033834,
+        "kind": "read",
+        "operation": 12,
+        "started_ns": 1789971691840020000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971692234059459,
+        "kind": "read",
+        "operation": 12,
+        "started_ns": 1789971691840132000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971692233945375,
+        "kind": "read",
+        "operation": 12,
+        "started_ns": 1789971691840216000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971692260295500,
+        "kind": "read",
+        "operation": 14,
+        "started_ns": 1789971692233930000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971692260328333,
+        "kind": "read",
+        "operation": 13,
+        "started_ns": 1789971692233948000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971692260344666,
+        "kind": "read",
+        "operation": 13,
+        "started_ns": 1789971692234037000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971692260169708,
+        "kind": "read",
+        "operation": 13,
+        "started_ns": 1789971692234061000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971692292469792,
+        "kind": "read",
+        "operation": 14,
+        "started_ns": 1789971692260199000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971692292319833,
+        "kind": "write",
+        "operation": 15,
+        "started_ns": 1789971692260307000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971692292403167,
+        "kind": "read",
+        "operation": 14,
+        "started_ns": 1789971692260332000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971692292461250,
+        "kind": "read",
+        "operation": 14,
+        "started_ns": 1789971692260346000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971692456832083,
+        "kind": "read",
+        "operation": 16,
+        "started_ns": 1789971692292331000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971692456789833,
+        "kind": "write",
+        "operation": 15,
+        "started_ns": 1789971692292409000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971692456815334,
+        "kind": "write",
+        "operation": 15,
+        "started_ns": 1789971692292463000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971692456761709,
+        "kind": "write",
+        "operation": 15,
+        "started_ns": 1789971692292471000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971692814629416,
+        "kind": "read",
+        "operation": 16,
+        "started_ns": 1789971692456771000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971692814873667,
+        "kind": "read",
+        "operation": 16,
+        "started_ns": 1789971692456792000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971692815055083,
+        "kind": "read",
+        "operation": 16,
+        "started_ns": 1789971692456818000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971692814954042,
+        "kind": "read",
+        "operation": 17,
+        "started_ns": 1789971692456834000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971693277882583,
+        "kind": "read",
+        "operation": 17,
+        "started_ns": 1789971692814679000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971693277672875,
+        "kind": "read",
+        "operation": 17,
+        "started_ns": 1789971692814877000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971693277867000,
+        "kind": "read",
+        "operation": 18,
+        "started_ns": 1789971692814960000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971693277743291,
+        "kind": "read",
+        "operation": 17,
+        "started_ns": 1789971692815056000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971693379006292,
+        "kind": "read",
+        "operation": 18,
+        "started_ns": 1789971693277684000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971693378997625,
+        "kind": "read",
+        "operation": 18,
+        "started_ns": 1789971693277745000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971693378918166,
+        "kind": "read",
+        "operation": 19,
+        "started_ns": 1789971693277870000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971693378688500,
+        "kind": "read",
+        "operation": 18,
+        "started_ns": 1789971693277884000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971693436574833,
+        "kind": "read",
+        "operation": 19,
+        "started_ns": 1789971693378717000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971693436533625,
+        "kind": "write",
+        "operation": 20,
+        "started_ns": 1789971693378931000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971693436467417,
+        "kind": "read",
+        "operation": 19,
+        "started_ns": 1789971693379000000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971693436593459,
+        "kind": "read",
+        "operation": 19,
+        "started_ns": 1789971693379009000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971693472013459,
+        "kind": "write",
+        "operation": 20,
+        "started_ns": 1789971693436495000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971693472077667,
+        "kind": "read",
+        "operation": 21,
+        "started_ns": 1789971693436543000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971693472048958,
+        "kind": "write",
+        "operation": 20,
+        "started_ns": 1789971693436578000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971693471937750,
+        "kind": "write",
+        "operation": 20,
+        "started_ns": 1789971693436596000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971693602132708,
+        "kind": "read",
+        "operation": 21,
+        "started_ns": 1789971693471969000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971693602077917,
+        "kind": "read",
+        "operation": 21,
+        "started_ns": 1789971693472014000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971693602119958,
+        "kind": "read",
+        "operation": 21,
+        "started_ns": 1789971693472052000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971693602171500,
+        "kind": "read",
+        "operation": 22,
+        "started_ns": 1789971693472103000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971693605707000,
+        "kind": "read",
+        "operation": 22,
+        "started_ns": 1789971693602091000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971693605751458,
+        "kind": "read",
+        "operation": 22,
+        "started_ns": 1789971693602123000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971693605732792,
+        "kind": "read",
+        "operation": 22,
+        "started_ns": 1789971693602134000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971693605741875,
+        "kind": "read",
+        "operation": 23,
+        "started_ns": 1789971693602175000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971694031571750,
+        "kind": "read",
+        "operation": 23,
+        "started_ns": 1789971693605709000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971694031547208,
+        "kind": "read",
+        "operation": 23,
+        "started_ns": 1789971693605735000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971694031503208,
+        "kind": "read",
+        "operation": 24,
+        "started_ns": 1789971693605744000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971694031471750,
+        "kind": "read",
+        "operation": 23,
+        "started_ns": 1789971693605752000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971694050242500,
+        "kind": "read",
+        "operation": 24,
+        "started_ns": 1789971694031480000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971694050161125,
+        "kind": "write",
+        "operation": 25,
+        "started_ns": 1789971694031512000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971694050260417,
+        "kind": "read",
+        "operation": 24,
+        "started_ns": 1789971694031549000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971694050223791,
+        "kind": "read",
+        "operation": 24,
+        "started_ns": 1789971694031572000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971694560796709,
+        "kind": "read",
+        "operation": 26,
+        "started_ns": 1789971694050173000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971694560745625,
+        "kind": "write",
+        "operation": 25,
+        "started_ns": 1789971694050231000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971694560695333,
+        "kind": "write",
+        "operation": 25,
+        "started_ns": 1789971694050248000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971694560779584,
+        "kind": "write",
+        "operation": 25,
+        "started_ns": 1789971694050263000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971694561966083,
+        "kind": "read",
+        "operation": 26,
+        "started_ns": 1789971694560706000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971694561976208,
+        "kind": "read",
+        "operation": 26,
+        "started_ns": 1789971694560747000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971694562005041,
+        "kind": "read",
+        "operation": 26,
+        "started_ns": 1789971694560781000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971694562011042,
+        "kind": "read",
+        "operation": 27,
+        "started_ns": 1789971694560798000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971695017911916,
+        "kind": "read",
+        "operation": 27,
+        "started_ns": 1789971694561967000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971695017875709,
+        "kind": "read",
+        "operation": 27,
+        "started_ns": 1789971694561978000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971695017898583,
+        "kind": "read",
+        "operation": 27,
+        "started_ns": 1789971694562006000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971695017951125,
+        "kind": "read",
+        "operation": 28,
+        "started_ns": 1789971694562012000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971695041604791,
+        "kind": "read",
+        "operation": 28,
+        "started_ns": 1789971695017884000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971695041577875,
+        "kind": "read",
+        "operation": 28,
+        "started_ns": 1789971695017900000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971695041642292,
+        "kind": "read",
+        "operation": 28,
+        "started_ns": 1789971695017912000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971695041549084,
+        "kind": "read",
+        "operation": 29,
+        "started_ns": 1789971695017952000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971695105340041,
+        "kind": "write",
+        "operation": 30,
+        "started_ns": 1789971695041560000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971695105394666,
+        "kind": "read",
+        "operation": 29,
+        "started_ns": 1789971695041582000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971695105374875,
+        "kind": "read",
+        "operation": 29,
+        "started_ns": 1789971695041608000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971695105311875,
+        "kind": "read",
+        "operation": 29,
+        "started_ns": 1789971695041644000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971695139110208,
+        "kind": "write",
+        "operation": 30,
+        "started_ns": 1789971695105324000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971695139174625,
+        "kind": "read",
+        "operation": 31,
+        "started_ns": 1789971695105346000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971695139161042,
+        "kind": "write",
+        "operation": 30,
+        "started_ns": 1789971695105377000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971695139059209,
+        "kind": "write",
+        "operation": 30,
+        "started_ns": 1789971695105398000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971695518729625,
+        "kind": "read",
+        "operation": 31,
+        "started_ns": 1789971695139069000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971695518684458,
+        "kind": "read",
+        "operation": 31,
+        "started_ns": 1789971695139113000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971695518793208,
+        "kind": "read",
+        "operation": 31,
+        "started_ns": 1789971695139164000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971695518765042,
+        "kind": "read",
+        "operation": 32,
+        "started_ns": 1789971695139180000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971695536674042,
+        "kind": "read",
+        "operation": 32,
+        "started_ns": 1789971695518693000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971695536579416,
+        "kind": "read",
+        "operation": 32,
+        "started_ns": 1789971695518731000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971695536755542,
+        "kind": "read",
+        "operation": 33,
+        "started_ns": 1789971695518766000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971695536741542,
+        "kind": "read",
+        "operation": 32,
+        "started_ns": 1789971695518796000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971695975544459,
+        "kind": "read",
+        "operation": 33,
+        "started_ns": 1789971695536595000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971695975577708,
+        "kind": "read",
+        "operation": 33,
+        "started_ns": 1789971695536675000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971695975555708,
+        "kind": "read",
+        "operation": 33,
+        "started_ns": 1789971695536742000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971695975460583,
+        "kind": "read",
+        "operation": 34,
+        "started_ns": 1789971695536760000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971696016716875,
+        "kind": "write",
+        "operation": 35,
+        "started_ns": 1789971695975472000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971696016825916,
+        "kind": "read",
+        "operation": 34,
+        "started_ns": 1789971695975548000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971696016879000,
+        "kind": "read",
+        "operation": 34,
+        "started_ns": 1789971695975556000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971696016863834,
+        "kind": "read",
+        "operation": 34,
+        "started_ns": 1789971695975578000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971696526480417,
+        "kind": "read",
+        "operation": 36,
+        "started_ns": 1789971696016727000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971696526444792,
+        "kind": "write",
+        "operation": 35,
+        "started_ns": 1789971696016835000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971696526321666,
+        "kind": "write",
+        "operation": 35,
+        "started_ns": 1789971696016867000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971696526278292,
+        "kind": "write",
+        "operation": 35,
+        "started_ns": 1789971696016881000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971696546994083,
+        "kind": "read",
+        "operation": 36,
+        "started_ns": 1789971696526297000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971696546921167,
+        "kind": "read",
+        "operation": 36,
+        "started_ns": 1789971696526323000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971696547070500,
+        "kind": "read",
+        "operation": 36,
+        "started_ns": 1789971696526447000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971696547030500,
+        "kind": "read",
+        "operation": 37,
+        "started_ns": 1789971696526484000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971697049459500,
+        "kind": "read",
+        "operation": 37,
+        "started_ns": 1789971696546950000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971697049397208,
+        "kind": "read",
+        "operation": 37,
+        "started_ns": 1789971696546997000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971697049208792,
+        "kind": "read",
+        "operation": 38,
+        "started_ns": 1789971696547041000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971697049471250,
+        "kind": "read",
+        "operation": 37,
+        "started_ns": 1789971696547072000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971697067525375,
+        "kind": "read",
+        "operation": 39,
+        "started_ns": 1789971697049304000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971697067540459,
+        "kind": "read",
+        "operation": 38,
+        "started_ns": 1789971697049398000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971697067431416,
+        "kind": "read",
+        "operation": 38,
+        "started_ns": 1789971697049460000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971697067372000,
+        "kind": "read",
+        "operation": 38,
+        "started_ns": 1789971697049471000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971697138872250,
+        "kind": "read",
+        "operation": 39,
+        "started_ns": 1789971697067377000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971697138906041,
+        "kind": "read",
+        "operation": 39,
+        "started_ns": 1789971697067435000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971697138710875,
+        "kind": "write",
+        "operation": 40,
+        "started_ns": 1789971697067532000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971697138830541,
+        "kind": "read",
+        "operation": 39,
+        "started_ns": 1789971697067543000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971697185084042,
+        "kind": "read",
+        "operation": 41,
+        "started_ns": 1789971697138726000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971697185074875,
+        "kind": "write",
+        "operation": 40,
+        "started_ns": 1789971697138838000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971697185055292,
+        "kind": "write",
+        "operation": 40,
+        "started_ns": 1789971697138878000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971697185028709,
+        "kind": "write",
+        "operation": 40,
+        "started_ns": 1789971697138909000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971697574382250,
+        "kind": "read",
+        "operation": 41,
+        "started_ns": 1789971697185040000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971697574338625,
+        "kind": "read",
+        "operation": 41,
+        "started_ns": 1789971697185058000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971697574371208,
+        "kind": "read",
+        "operation": 41,
+        "started_ns": 1789971697185078000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971697574292875,
+        "kind": "read",
+        "operation": 42,
+        "started_ns": 1789971697185086000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971697593139042,
+        "kind": "read",
+        "operation": 43,
+        "started_ns": 1789971697574317000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971697593156542,
+        "kind": "read",
+        "operation": 42,
+        "started_ns": 1789971697574344000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971697592914583,
+        "kind": "read",
+        "operation": 42,
+        "started_ns": 1789971697574373000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971697593107584,
+        "kind": "read",
+        "operation": 42,
+        "started_ns": 1789971697574382000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971698538880875,
+        "kind": "read",
+        "operation": 43,
+        "started_ns": 1789971697592956000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971698539074500,
+        "kind": "read",
+        "operation": 43,
+        "started_ns": 1789971697593116000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971698539145250,
+        "kind": "read",
+        "operation": 44,
+        "started_ns": 1789971697593147000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971698539088833,
+        "kind": "read",
+        "operation": 43,
+        "started_ns": 1789971697593159000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971698582643417,
+        "kind": "read",
+        "operation": 44,
+        "started_ns": 1789971698538892000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971698582685208,
+        "kind": "read",
+        "operation": 44,
+        "started_ns": 1789971698539076000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971698582660875,
+        "kind": "read",
+        "operation": 44,
+        "started_ns": 1789971698539088000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971698582537125,
+        "kind": "write",
+        "operation": 45,
+        "started_ns": 1789971698539151000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971699572519833,
+        "kind": "read",
+        "operation": 46,
+        "started_ns": 1789971698582550000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971699572471375,
+        "kind": "write",
+        "operation": 45,
+        "started_ns": 1789971698582651000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971699572461666,
+        "kind": "write",
+        "operation": 45,
+        "started_ns": 1789971698582664000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971699572350292,
+        "kind": "write",
+        "operation": 45,
+        "started_ns": 1789971698582688000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971699605513084,
+        "kind": "read",
+        "operation": 46,
+        "started_ns": 1789971699572383000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971699605621208,
+        "kind": "read",
+        "operation": 46,
+        "started_ns": 1789971699572461000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971699605539042,
+        "kind": "read",
+        "operation": 46,
+        "started_ns": 1789971699572472000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971699605614292,
+        "kind": "read",
+        "operation": 47,
+        "started_ns": 1789971699572519000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971700082266667,
+        "kind": "read",
+        "operation": 47,
+        "started_ns": 1789971699605524000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971700082226125,
+        "kind": "read",
+        "operation": 47,
+        "started_ns": 1789971699605542000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971700082353250,
+        "kind": "read",
+        "operation": 48,
+        "started_ns": 1789971699605617000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971700082115334,
+        "kind": "read",
+        "operation": 47,
+        "started_ns": 1789971699605623000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971700130411250,
+        "kind": "read",
+        "operation": 48,
+        "started_ns": 1789971700082151000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971700130419667,
+        "kind": "read",
+        "operation": 48,
+        "started_ns": 1789971700082226000,
+        "worker": 1
+      },
+      {
+        "ended_ns": 1789971700130386959,
+        "kind": "read",
+        "operation": 48,
+        "started_ns": 1789971700082340000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971700130446500,
+        "kind": "read",
+        "operation": 49,
+        "started_ns": 1789971700082357000,
+        "worker": 0
+      },
+      {
+        "ended_ns": 1789971700140217958,
+        "kind": "read",
+        "operation": 49,
+        "started_ns": 1789971700130398000,
+        "worker": 3
+      },
+      {
+        "ended_ns": 1789971700140055875,
+        "kind": "read",
+        "operation": 49,
+        "started_ns": 1789971700130414000,
+        "worker": 2
+      },
+      {
+        "ended_ns": 1789971700140125292,
+        "kind": "read",
+        "operation": 49,
+        "started_ns": 1789971700130421000,
+        "worker": 1
+      }
+    ],
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 15.81300853769695
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin"
+  ],
+  "workload": {
+    "clients": 4,
+    "maintenance_interval_seconds": 0.001,
+    "maintenance_limit": 3,
+    "minimum_duration_seconds": 4.0,
+    "name": "mixed",
+    "operations_per_client": 50,
+    "require_index": false,
+    "required_maintenance_operations": 3,
+    "rows": 1000,
+    "synchronized": false,
+    "target_count": 1,
+    "timeout_seconds": 120.0
+  }
+}

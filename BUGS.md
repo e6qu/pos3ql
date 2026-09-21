@@ -124,6 +124,14 @@ checkpoint commands completed, so the focused harness now runs for a minimum
 duration and verifies the checkpoint count. Its fixed-memory phase log and
 aligned object-store request window account for all measured cleanup DELETEs.
 Foreground overlap and larger-scale qualification remain in PLAN.md.
+The checkpoint-correlation audit found no externally blocked defect. The
+maintenance thread could complete its three commands before foreground workers
+left their barrier, so command count alone did not prove overlap. Maintenance
+now starts after the worker barrier, traced client intervals must overlap a
+profiled phase, and cross-process placement uses a common realtime axis because
+Python's macOS monotonic clock and POSIX `CLOCK_MONOTONIC` have different
+suspend behavior. Per-process durations remain monotonic. The resulting clean
+run ranks publication and cleanup overlap in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

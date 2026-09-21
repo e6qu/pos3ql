@@ -113,6 +113,11 @@ publishing temporary runs, while larger rebuilds retain the bounded external
 merge. Zero-cache checkpoint writes, spill-path recovery, and the clean
 focused benchmark qualify the change; remaining checkpoint work is in
 PLAN.md.
+The paired PostgreSQL checkpoint-baseline audit found no externally blocked
+defect. The harness now verifies that both systems complete three explicit
+checkpoints during the same mixed SQL workload, records PostgreSQL 18
+durability and local storage, and preserves raw evidence. Larger and isolated
+performance qualification remains in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

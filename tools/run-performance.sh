@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=tests/external/liveness.sh
 . "$ROOT/tests/external/liveness.sh"
 TEST_PORT_HELPER="$ROOT/tests/external/test_ports.py"
 
@@ -209,6 +210,38 @@ bench_pos3ql() {
     --output "$OUTPUT/$label.json" --check "$@" >/dev/null
 }
 
+start_postgresql_baseline() {
+  POSTGRES_PORT=${POS3QL_BENCH_POSTGRES_PORT:-}
+  if [ -z "${POS3QL_BENCH_POSTGRES_PORT:-}" ]; then
+    POSTGRES_PORT=$(claim_test_port "" 19700 19799)
+    POSTGRES_IMAGE=${POS3QL_BENCH_POSTGRES_IMAGE:-postgres:18}
+    POSTGRES_CONTAINER="pos3ql-performance-$$"
+    docker run -d --name "$POSTGRES_CONTAINER" -p "$POSTGRES_PORT:5432" \
+      -e POSTGRES_HOST_AUTH_METHOD=trust "$POSTGRES_IMAGE" >/dev/null
+    for attempt in $(seq 1 200); do
+      if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then break; fi
+      if [ "$attempt" = 200 ]; then docker logs "$POSTGRES_CONTAINER" >&2; exit 1; fi
+      sleep 0.1
+    done
+    python3 "$ROOT/tools/pg-query.py" --port "$POSTGRES_PORT" --expect 1 \
+      --timeout 30 "SELECT 1" >/dev/null
+    docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" >"$OUTPUT/postgresql-image-id.txt"
+    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:-Docker-managed local volume; host backing unspecified}
+  else
+    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:?POS3QL_BENCH_POSTGRES_STORAGE must describe the external PostgreSQL storage}
+  fi
+  if [ -n "$POSTGRES_CONTAINER" ]; then
+    python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
+      --storage-description "$POSTGRES_STORAGE" \
+      --output "$OUTPUT/postgresql-server.json" \
+      --docker-container "$POSTGRES_CONTAINER"
+  else
+    python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
+      --storage-description "$POSTGRES_STORAGE" \
+      --output "$OUTPUT/postgresql-server.json"
+  fi
+}
+
 if [ "$MODE" = smoke ]; then
   ROWS=128
   TABLE_CAPACITY=512
@@ -250,10 +283,28 @@ start_pos3ql "$DATA_WARM" primary initial-start
 bench_pos3ql point-concurrency-1 --workload point-read --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --setup --require-index
 if [ "$MODE" = checkpoint ]; then
+  bench_pos3ql mixed-baseline --workload mixed --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS"
   bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" \
-    --maintenance-interval 0.05 --maintenance-limit 3
+    --maintenance-interval 0.001 --maintenance-limit 3 \
+    --require-maintenance-operations 3
   stop_pos3ql
+  start_postgresql_baseline
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
+    --operations "$OPERATIONS" --rows "$ROWS" --setup --check \
+    --output "$OUTPUT/postgresql18-point-concurrency-1.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label postgresql18-mixed-baseline --workload mixed --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/postgresql18-mixed-baseline.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label postgresql18-mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" \
+    --maintenance-interval 0.001 --maintenance-limit 3 \
+    --require-maintenance-operations 3 --check \
+    --output "$OUTPUT/postgresql18-mixed-checkpoint-interference.json" >/dev/null
   cp "$WORK/pos3ql-primary.log" "$OUTPUT/pos3ql-startup.log"
   python3 "$ROOT/tools/benchmark-report.py" "$OUTPUT" >"$OUTPUT/report.md"
   echo "performance results: $OUTPUT"
@@ -401,35 +452,7 @@ if [ "$MODE" = full ]; then
       --output "$OUTPUT/logical-replicas-$replica.json" >/dev/null
   done
 
-  POSTGRES_PORT=${POS3QL_BENCH_POSTGRES_PORT:-}
-  if [ -z "${POS3QL_BENCH_POSTGRES_PORT:-}" ]; then
-    POSTGRES_PORT=$(claim_test_port "" 19700 19799)
-    POSTGRES_IMAGE=${POS3QL_BENCH_POSTGRES_IMAGE:-postgres:18}
-    POSTGRES_CONTAINER="pos3ql-performance-$$"
-    docker run -d --name "$POSTGRES_CONTAINER" -p "$POSTGRES_PORT:5432" \
-      -e POSTGRES_HOST_AUTH_METHOD=trust "$POSTGRES_IMAGE" >/dev/null
-    for attempt in $(seq 1 200); do
-      if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then break; fi
-      if [ "$attempt" = 200 ]; then docker logs "$POSTGRES_CONTAINER" >&2; exit 1; fi
-      sleep 0.1
-    done
-    python3 "$ROOT/tools/pg-query.py" --port "$POSTGRES_PORT" --expect 1 \
-      --timeout 30 "SELECT 1" >/dev/null
-    docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" >"$OUTPUT/postgresql-image-id.txt"
-    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:-Docker-managed local volume; host backing unspecified}
-  else
-    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:?POS3QL_BENCH_POSTGRES_STORAGE must describe the external PostgreSQL storage}
-  fi
-  if [ -n "$POSTGRES_CONTAINER" ]; then
-    python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
-      --storage-description "$POSTGRES_STORAGE" \
-      --output "$OUTPUT/postgresql-server.json" \
-      --docker-container "$POSTGRES_CONTAINER"
-  else
-    python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
-      --storage-description "$POSTGRES_STORAGE" \
-      --output "$OUTPUT/postgresql-server.json"
-  fi
+  start_postgresql_baseline
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
     --operations "$OPERATIONS" --rows "$ROWS" --setup --check \

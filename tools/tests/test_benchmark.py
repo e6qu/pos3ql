@@ -195,11 +195,12 @@ class BenchmarkTest(unittest.TestCase):
 
     def test_validation_enforces_required_index_access(self):
         result = {
-            "workload": {"require_index": True},
+            "workload": {"require_index": True, "required_maintenance_operations": 3},
             "results": {
                 "attempted_operations": 4,
                 "completed_operations": 4,
                 "errors": [],
+                "maintenance_operations": 2,
                 "latency_ms": {
                     "minimum": 1,
                     "p50": 1,
@@ -220,6 +221,7 @@ class BenchmarkTest(unittest.TestCase):
         failures = benchmark.validate(result)
         self.assertIn("workload did not execute an index scan per operation", failures)
         self.assertIn("workload unexpectedly executed sequential scans", failures)
+        self.assertIn("expected 3 completed checkpoints, got 2", failures)
 
     def test_ordered_limit_validation_requires_index_only_execution(self):
         result = {
@@ -343,6 +345,7 @@ class BenchmarkTest(unittest.TestCase):
             workload="update",
             maintenance_interval=0.0,
             maintenance_limit=0,
+            require_maintenance_operations=0,
             object_metrics=None,
             pid=None,
             fixed_memory_bytes=None,

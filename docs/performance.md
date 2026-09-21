@@ -145,6 +145,13 @@ this change, with the same indexed result after object-cold recovery. The
 focused mixed run counted 814 object PUTs and 553 DELETEs versus 1,556 and
 1,071 before it. Its 6.96-second elapsed time and 1,259.12 ms p99 are
 exploratory single-run results; larger sorts still use external runs.
+The [paired checkpoint run](../benchmarks/baselines/2026-09-21-postgresql18-checkpoint-1000/README.md)
+now applies the same mixed SQL workload and three explicit checkpoints to
+actual PostgreSQL 18 and pos3ql. Both completed 200 operations without errors.
+The report records each engine's baseline and checkpoint p99, while keeping
+PostgreSQL's local storage and pos3ql's object requests distinct. The 1,000-row
+shared-host samples are too short to establish production ratios, particularly
+for PostgreSQL's subsecond workloads.
 
 ## Measured scenarios
 

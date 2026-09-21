@@ -12,6 +12,12 @@ SPEC.loader.exec_module(benchmark)
 
 
 class BenchmarkTest(unittest.TestCase):
+    def test_operation_kind_distinguishes_mixed_reads_and_writes(self):
+        self.assertEqual(benchmark.operation_kind("mixed", 0), "write")
+        self.assertEqual(benchmark.operation_kind("mixed", 1), "read")
+        self.assertEqual(benchmark.operation_kind("update", 1), "write")
+        self.assertEqual(benchmark.operation_kind("point-read", 0), "read")
+
     def test_nearest_rank_percentiles(self):
         values = [1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000]
         self.assertEqual(benchmark.percentile(values, 50), 3.0)
@@ -363,6 +369,41 @@ class BenchmarkTest(unittest.TestCase):
             benchmark.PgConnection = original
         self.assertTrue(outcome)
         self.assertTrue(outcome[0]["results"]["errors"])
+
+    def test_checkpoint_maintenance_starts_after_foreground_work(self):
+        original = benchmark.PgConnection
+        statements = []
+
+        class Connection:
+            def __init__(self, *_args):
+                pass
+
+            def close(self):
+                pass
+
+            def query(self, sql):
+                statements.append(sql)
+                if sql == "SELECT version()":
+                    return [["PostgreSQL 18 test double"]]
+                return []
+
+        args = types.SimpleNamespace(
+            targets=[], host="127.0.0.1", port=5432, user="postgres", database="postgres",
+            timeout_seconds=30, setup=False, rows=8, clients=1, operations=1,
+            duration_seconds=0.02, synchronized=False, require_index=False,
+            workload="point-read", maintenance_interval=0.001, maintenance_limit=1,
+            require_maintenance_operations=1, object_metrics=None, pid=None,
+            fixed_memory_bytes=None, label="maintenance-order", trace_operations=False,
+        )
+        benchmark.PgConnection = Connection
+        try:
+            benchmark.run(args)
+        finally:
+            benchmark.PgConnection = original
+        first_query = next(index for index, sql in enumerate(statements)
+                           if sql.startswith("SELECT payload"))
+        checkpoint = statements.index("CHECKPOINT")
+        self.assertLess(first_query, checkpoint)
 
 
 if __name__ == "__main__":

@@ -85,7 +85,11 @@ for attempt in $(seq 1 100); do
 done
 
 BUILD_FEATURES=()
-if [ "$CHECKPOINT_PROFILE" = 1 ]; then BUILD_FEATURES=(--features checkpoint-profile); fi
+TRACE_FEATURES=()
+if [ "$CHECKPOINT_PROFILE" = 1 ]; then
+  BUILD_FEATURES=(--features checkpoint-profile)
+  TRACE_FEATURES=(--trace-operations)
+fi
 cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" "${BUILD_FEATURES[@]}"
 
 write_config() {
@@ -307,7 +311,7 @@ if [ "$MODE" = checkpoint ]; then
   bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
     --maintenance-interval 0.001 --maintenance-limit 3 \
-    --require-maintenance-operations 3
+    --require-maintenance-operations 3 "${TRACE_FEATURES[@]}"
   stop_pos3ql
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
     sleep 0.1
@@ -334,7 +338,8 @@ if [ "$MODE" = checkpoint ]; then
       "$OUTPUT/pos3ql-startup.log" "$OUTPUT/checkpoint-profile.json" \
       --after-byte-offset "$PROFILE_OFFSET" \
       --metrics-before "$WORK/checkpoint-profile-before.json" \
-      --metrics-after "$WORK/checkpoint-profile-after.json"
+      --metrics-after "$WORK/checkpoint-profile-after.json" \
+      --operation-trace "$OUTPUT/mixed-checkpoint-interference.json"
   fi
   python3 "$ROOT/tools/benchmark-report.py" "$OUTPUT" >"$OUTPUT/report.md"
   echo "performance results: $OUTPUT"

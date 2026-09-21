@@ -8149,6 +8149,8 @@ impl Engine {
                 self.wal.reset_after_checkpoint();
             }
         }
+        #[cfg(feature = "checkpoint-profile")]
+        let local_profile = self.ckpt.as_ref().map(Checkpointer::profile_start);
         // The checkpoint installed each table's spill-SST list as it
         // wrote (full rewrites collapse a list, deltas append).
         self.storage.release_durable_histories();
@@ -8168,6 +8170,10 @@ impl Engine {
         // pressure sheds bytes: the overlay keeps the working set, the
         // bucket keeps the rows.
         self.storage.evict_entries();
+        #[cfg(feature = "checkpoint-profile")]
+        if let (Some(ckpt), Some((started, before))) = (self.ckpt.as_ref(), local_profile) {
+            ckpt.profile_phase("local_cleanup", lsn, started, before);
+        }
         Ok(())
     }
 

@@ -160,6 +160,16 @@ matching all 846 DELETEs in the profile request window. Value-index rebuild
 made 311 block PUTs and took 1.52 seconds; row SST publication made 117 and
 took 0.54 seconds. The window includes cleanup after timed queries end, so
 these phase totals do not measure query stall time or a production ratio.
+The next [foreground-correlation run](../benchmarks/baselines/2026-09-21-checkpoint-stall-correlation-1000/README.md)
+records every client operation and checkpoint phase on a common realtime axis,
+while retaining monotonic durations within each process. It also fixes a
+harness race that allowed all three checkpoint commands to finish before the
+foreground barrier opened. In the clean four-second run, value-index rebuild
+intersected 17.65 seconds of summed concurrent client latency, row SST
+publication 13.23 seconds, block deletion 6.74 seconds, and commit pruning
+5.79 seconds. Local post-publication cleanup intersected only 3 milliseconds.
+These are associations across explicit and automatic checkpoint work, not an
+exclusive causal decomposition or a production ratio.
 
 ## Measured scenarios
 

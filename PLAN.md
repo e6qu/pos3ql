@@ -163,15 +163,23 @@ checkpoints and 1,447.94 ms with them; PostgreSQL p99 was 2.76 and 1.51 ms
 in its much shorter samples. These shared-host timings are exploratory, and
 PostgreSQL's local persistence has no equivalent object-request metric.
 The [fixed-memory phase profile](benchmarks/baselines/2026-09-21-checkpoint-phase-1000/README.md)
-now attributes publication and cleanup in a four-second, 1,000-row run. Its
+attributes publication and cleanup in a four-second, 1,000-row run. Its
 full request window reconciles all 846 object DELETEs: 550 from commit-batch
 pruning and 296 from block garbage collection. The measured phase spans were
 1.59 seconds for commit pruning, 1.52 seconds for value-index rebuild, 0.82
 seconds for block deletion, and 0.54 seconds for row SST publication. The
 profile includes cleanup after timed queries end, so these spans do not by
-themselves identify foreground stall time. Next, correlate phase timing with
-query stalls, then reduce the measured commit cleanup and index publication
-costs while preserving durability, fixed memory, and provider neutrality.
+themselves identify foreground stall time.
+The [foreground-correlation run](benchmarks/baselines/2026-09-21-checkpoint-stall-correlation-1000/README.md)
+now aligns fixed-memory phase events with each client operation after the
+worker barrier. Value-index publication intersected 17.65 seconds of summed
+concurrent client latency, row SST publication 13.23 seconds, block deletion
+6.74 seconds, and commit pruning 5.79 seconds; local cleanup intersected only
+3 milliseconds. The profile covers automatic work and the three explicit
+commands, and one operation may span several phases, so these associations do
+not form an exclusive causal decomposition. Next, reduce publication writes
+and bound cleanup work per dispatch beat while preserving durability, fixed
+memory, and provider neutrality.
 Repeat on larger datasets and representative hardware before changing
 checkpoint pacing or asserting production ratios.
 

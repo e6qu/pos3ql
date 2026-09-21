@@ -178,6 +178,13 @@ the retained slice, so a failed object write retries with the same tombstone
 and LSN boundary. A focused fault-injection regression, the storage VOPR
 corpus, checkpoint suite, clean profile, and object-cold recovery qualify the
 change; larger representative measurement remains in PLAN.md.
+The 10,000-row checkpoint-scale audit found no externally blocked defect.
+Checkpoint reslices now retain unchanged staged value-index generations, and
+cold `ANALYZE`, `CREATE INDEX` validation, and value-cache population stream
+the merged PAX cursor without per-row or per-column-range amplification. Full
+container reads remain limited to dense column demand, so selective query and
+startup cache paths preserve column pruning. The completed profile identifies
+the full-roster row rewrite as the next bounded-dispatch target in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

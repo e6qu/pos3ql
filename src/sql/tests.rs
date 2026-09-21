@@ -64746,6 +64746,7 @@ fn configured_commit_chain_capacity_controls_object_cold_recovery() {
     config.wal_upload_sync = true;
     config.checkpoint_commit_batches = 5;
     config.checkpoint_garbage_batch_objects = 1;
+    config.checkpoint_delete_objects_per_beat = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
@@ -64821,6 +64822,7 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
     config.object_store_bucket = format!("sql-checkpoint-garbage-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.checkpoint_garbage_batch_objects = 2;
+    config.checkpoint_delete_objects_per_beat = 2;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
@@ -64901,7 +64903,8 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     config.object_store_response_bytes = 1 << 20;
     config.wal_upload = true;
     config.wal_upload_sync = true;
-    config.checkpoint_garbage_batch_objects = 1;
+    config.checkpoint_garbage_batch_objects = 8;
+    config.checkpoint_delete_objects_per_beat = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
@@ -64962,6 +64965,7 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     };
     engine.begin_post_publish_cleanup(published_lsn);
     engine.finish_post_publish_cleanup().unwrap();
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
 
     fn obsolete_objects(engine: &mut Engine) -> usize {
         let ckpt = engine.ckpt.as_mut().unwrap();
@@ -64983,21 +64987,24 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     }
 
     let mut remaining = obsolete_objects(&mut engine);
-    assert!(remaining > config.checkpoint_garbage_batch_objects);
+    assert!(remaining > config.checkpoint_delete_objects_per_beat);
     let mut beats = 0usize;
+    let mut maintenance_lists = 0u64;
     while engine.ckpt.as_ref().unwrap().maintenance_pending() {
+        let lists_before = namespace.borrow().list_count;
         engine
             .ckpt
             .as_mut()
             .unwrap()
             .checkpoint_step(&mut engine.storage, &mut engine.scratch)
             .unwrap();
+        maintenance_lists += namespace.borrow().list_count - lists_before;
         let after = obsolete_objects(&mut engine);
         assert!(
-            remaining.saturating_sub(after) <= config.checkpoint_garbage_batch_objects,
+            remaining.saturating_sub(after) <= config.checkpoint_delete_objects_per_beat,
             "one maintenance beat deleted {} objects with a configured limit of {}",
             remaining.saturating_sub(after),
-            config.checkpoint_garbage_batch_objects
+            config.checkpoint_delete_objects_per_beat
         );
         remaining = after;
         beats += 1;
@@ -65005,6 +65012,10 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     }
     assert_eq!(remaining, 0);
     assert!(beats > 1, "maintenance was not paced across dispatch beats");
+    assert_eq!(
+        maintenance_lists, 4,
+        "commit pruning scans twice; legacy and block garbage scan once each"
+    );
 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

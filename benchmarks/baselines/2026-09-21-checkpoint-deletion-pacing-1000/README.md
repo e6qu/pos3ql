@@ -11,9 +11,9 @@ interference window.
 
 Automatic checkpoint maintenance now schedules covered commit-object pruning
 after manifest publication and deletes at most
-`checkpoint_garbage_batch_objects` objects from one namespace in each dispatch
-beat. The same limit already applied to legacy SST and block garbage collection;
-its default is now 16 instead of 4,096. A value-one simulator regression covers
+`checkpoint_delete_objects_per_beat` objects from one namespace in each
+dispatch beat. Its default is 16; the independent 4,096-object staging batch
+retains a scanned candidate set across beats. A value-one simulator regression covers
 commit batches and descriptors, legacy SSTs, block orphans, retries, complete
 drain, and object-cold recovery. Explicit `CHECKPOINT` retains its synchronous
 contract and drains all pending maintenance before returning.

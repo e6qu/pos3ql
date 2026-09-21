@@ -199,9 +199,11 @@ transaction identity.
 
 Checkpoint commit pruning now joins legacy SST and block garbage collection in
 the paced post-publication maintenance state machine. One dispatch beat deletes
-at most `checkpoint_garbage_batch_objects` objects from one namespace, counting
-commit batches and descriptors separately; the practical default is 16 rather
-than 4,096. Explicit `CHECKPOINT` still drains all batches before returning.
+at most `checkpoint_delete_objects_per_beat` objects from one namespace,
+counting commit batches and descriptors separately; its default is 16. The
+larger fixed garbage staging batch remains 4,096 so paced beats do not repeat a
+complete namespace scan. Explicit `CHECKPOINT` still drains all batches before
+returning.
 The [clean pacing run](benchmarks/baselines/2026-09-21-checkpoint-deletion-pacing-1000/README.md)
 limited every profiled commit and block deletion event to 16 objects. Maximum
 event spans were 100 ms for commit pruning and 90 ms for block deletion, versus

@@ -7310,7 +7310,9 @@ impl Engine {
                 {
                     txn.record_statistics(slot as u32)?;
                     let started = datetime::now_micros();
-                    let statistics = self.storage.analyze_table(slot, txn.txid, &[])?;
+                    let statistics = self
+                        .storage
+                        .analyze_table(slot, txn.txid, &[], &self.work)?;
                     self.storage.record_relation_analyze(
                         slot,
                         statistics.rows,
@@ -7354,9 +7356,12 @@ impl Engine {
                 }
                 txn.record_statistics(slot as u32)?;
                 let started = datetime::now_micros();
-                let statistics =
-                    self.storage
-                        .analyze_table(slot, txn.txid, &selected[..selected_count]);
+                let statistics = self.storage.analyze_table(
+                    slot,
+                    txn.txid,
+                    &selected[..selected_count],
+                    &self.work,
+                );
                 let statistics = statistics?;
                 self.storage.record_relation_analyze(
                     slot,

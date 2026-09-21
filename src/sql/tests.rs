@@ -64556,6 +64556,79 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
+fn analyze_streams_wide_spilled_rows_after_cold_recovery() {
+    let mut config = test_config("analyze-spilled-stream");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-analyze-spilled-stream-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.txn_rows = 1024;
+    config.table_rows = 1024;
+    config.value_index_rows = 1024;
+    config.work_arena_bytes = 96 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 8 << 20;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE analyze_stream (
+             id integer PRIMARY KEY,
+             category integer NOT NULL,
+             payload text NOT NULL
+         );
+         INSERT INTO analyze_stream
+           SELECT value, value % 17, repeat(md5(value::text), 128)
+             FROM generate_series(1,512) AS source(value)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let before = recovered.storage.block_io_stats();
+    let analyzed = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "ANALYZE analyze_stream",
+    );
+    assert!(
+        !message_types(&analyzed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&analyzed)
+    );
+    let reads = recovered.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        reads.object_gets < 512,
+        "ANALYZE point-read the spilled fixture: {reads:?}"
+    );
+    let slot = recovered
+        .storage
+        .find_table("public", "analyze_stream")
+        .unwrap();
+    let statistics = recovered.storage.table_statistics(slot, 0);
+    assert_eq!(statistics.rows, 512);
+    assert!((10..=30).contains(&statistics.columns[1].distinct_values));
+    assert!(statistics.average_row_width > 4_000);
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn checkpoint_reuses_published_index_blocks_after_small_update() {
     let mut config = test_config("checkpoint-value-block-reuse");
     config.object_store_on = true;

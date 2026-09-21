@@ -25153,6 +25153,7 @@ impl Storage {
         table_slot: usize,
         txid: u32,
         selected_columns: &[usize],
+        arena: &crate::mem::arena::Arena,
     ) -> Result<TableStatistics, SqlError> {
         const REGISTERS: usize = 64;
 
@@ -25198,38 +25199,63 @@ impl Storage {
         let mut widths = [0u64; MAX_COLUMNS];
         let mut non_nulls = [0u64; MAX_COLUMNS];
         let mut registers = [[0u8; REGISTERS]; MAX_COLUMNS];
-        self.for_each_row_state(table_slot, &mut |rowid, state| {
+        let mut observe = |values: &[Datum], encoded_len: usize| {
+            rows = rows.saturating_add(1);
+            row_bytes = row_bytes.saturating_add(encoded_len as u64);
+            for column in 0..n_columns {
+                if !selected[column] {
+                    continue;
+                }
+                let value = values[column];
+                if value.is_null() {
+                    nulls[column] = nulls[column].saturating_add(1);
+                    continue;
+                }
+                non_nulls[column] = non_nulls[column].saturating_add(1);
+                // A one-column row encoding contributes a two-byte count
+                // and one bitmap byte; remove that framing to retain the
+                // value's actual stored width.
+                let width = rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3);
+                widths[column] = widths[column].saturating_add(width as u64);
+                let index = [column as u16];
+                add_distinct(&mut registers[column], hash_key(values, &index));
+            }
+        };
+        // Overlay rows carry every pending or newer committed image. Spilled
+        // rows absent from that overlay stream below with their payload from
+        // the already resident merge cursor, avoiding one object point read
+        // per row during cold ANALYZE.
+        let _ = self.for_each_scan_overlay_row_state(table_slot, &mut |rowid, state| {
             let Some(home) = self.visible_row_home(table_slot, rowid, state, txid)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
             self.with_row_bytes(table_slot, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-                rows = rows.saturating_add(1);
-                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
-                for column in 0..n_columns {
-                    if !selected[column] {
-                        continue;
-                    }
-                    let value = values[column];
-                    if value.is_null() {
-                        nulls[column] = nulls[column].saturating_add(1);
-                        continue;
-                    }
-                    non_nulls[column] = non_nulls[column].saturating_add(1);
-                    // A one-column row encoding contributes a two-byte count
-                    // and one bitmap byte; remove that framing to retain the
-                    // value's actual stored width.
-                    let width =
-                        rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3);
-                    widths[column] = widths[column].saturating_add(width as u64);
-                    let index = [column as u16];
-                    add_distinct(&mut registers[column], hash_key(&values, &index));
-                }
+                observe(&values[..n_columns], bytes.len());
                 Ok(())
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
+        self.spill_merged_walk_bytes(
+            table_slot,
+            arena,
+            true,
+            None,
+            &mut |_rowid, _commit_lsn, representation| {
+                match representation {
+                    SpilledRowRepresentation::Encoded(bytes) => {
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+                        observe(&values[..n_columns], bytes.len());
+                    }
+                    SpilledRowRepresentation::Values(values) => {
+                        observe(values, rowenc::encoded_len(values));
+                    }
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            },
+        )?;
 
         let mut statistics = self.table_statistics(table_slot, txid);
         statistics.valid = true;

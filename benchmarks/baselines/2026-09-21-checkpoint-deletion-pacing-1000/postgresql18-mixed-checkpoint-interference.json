@@ -3,31 +3,31 @@
   "label": "postgresql18-mixed-checkpoint-interference",
   "results": {
     "access_path": {
-      "index_scans": 70652,
-      "index_tuples_fetched": 70652,
+      "index_scans": 75195,
+      "index_tuples_fetched": 75195,
       "sequential_scans": 0,
       "sequential_tuples_read": 0
     },
-    "attempted_operations": 70652,
-    "completed_operations": 70652,
-    "elapsed_seconds": 4.0014185,
+    "attempted_operations": 75195,
+    "completed_operations": 75195,
+    "elapsed_seconds": 4.000600917,
     "errors": [],
     "fixed_memory_occupancy": null,
     "fixed_memory_plan_bytes": null,
     "latency_ms": {
-      "maximum": 2.774791,
-      "mean": 0.22550076007756326,
-      "minimum": 0.043792,
-      "p50": 0.208334,
-      "p95": 0.408333,
-      "p99": 0.582709
+      "maximum": 5.314583,
+      "mean": 0.21195772576634087,
+      "minimum": 0.043916,
+      "p50": 0.200333,
+      "p95": 0.368333,
+      "p99": 0.496417
     },
     "maintenance_operations": 3,
     "maximum_rss_bytes": null,
     "object_requests_per_operation": null,
     "object_store": null,
     "process_cpu_seconds": null,
-    "throughput_ops_per_second": 17656.738479116844
+    "throughput_ops_per_second": 18795.92630208858
   },
   "schema_version": 1,
   "target_identities": [

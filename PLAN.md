@@ -206,12 +206,15 @@ complete namespace scan. Explicit `CHECKPOINT` still drains all batches before
 returning.
 The [clean pacing run](benchmarks/baselines/2026-09-21-checkpoint-deletion-pacing-1000/README.md)
 limited every profiled commit and block deletion event to 16 objects. Maximum
-event spans were 100 ms for commit pruning and 90 ms for block deletion, versus
+event spans were 54 ms for commit pruning and 52 ms for block deletion, versus
 665 ms and 340 ms when the prior run placed as many as 244 and 131 deletes in
-one event. Total work and foreground samples differ, and explicit checkpoints
-execute their batches contiguously, so this establishes the per-beat boundary
-rather than an end-to-end latency ratio. Actual PostgreSQL 18.6 remains the
-reference for the paired SQL workload on its documented local durable tier.
+one event. The run made exactly four namespace scans per publication even
+though block deletion took 33 beats, matching the prior unpaced run's four
+scans per publication. Total work and foreground samples differ, and explicit
+checkpoints execute their batches contiguously, so this establishes the
+per-beat and scan boundaries rather than an end-to-end latency ratio. Actual
+PostgreSQL 18.6 remains the reference for the paired SQL workload on its
+documented local durable tier.
 Next, reduce the remaining per-checkpoint value-index and row publication
 traffic, then repeat at larger scale on representative hardware.
 

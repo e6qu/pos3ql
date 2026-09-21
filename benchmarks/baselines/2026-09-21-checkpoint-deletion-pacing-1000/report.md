@@ -2,7 +2,7 @@
 
 Raw JSON files are the evidence; this report derives comparisons without hiding errors.
 
-Run identity: `b631d2e84cfc922bc14bd69910f6fff2933135c3`; binary `7e8ffb6ed8b97bca…`; arm64, 12 logical CPUs; 1000 rows, 4 clients, 1024 MiB fixed disk cache, 120.0 s query timeout, 2.0 ms injected object latency.
+Run identity: `6638cc2a08ea87ff1f7fd96bc50f69609faabd6d`; binary `168a1da85b80d5ec…`; arm64, 12 logical CPUs; 1000 rows, 4 clients, 1024 MiB fixed disk cache, 120.0 s query timeout, 2.0 ms injected object latency.
 
 pos3ql uses an instrumented object-store fixture backed by local temporary storage. Timing from this run is exploratory.
 
@@ -14,12 +14,12 @@ PostgreSQL baseline: version `180006`; storage: Local APFS, isolated PostgreSQL 
 
 | Scenario | ops/s | p50 ms | p95 ms | p99 ms | max ms | max RSS MiB | index scans | seq scans | object req/op | errors |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| mixed-baseline | 315.78 | 12.58 | 43.29 | 82.92 | 186.02 | 290.70 | 1647 | 0 | 0.696 | 0 |
-| mixed-checkpoint-interference | 155.26 | 13.35 | 30.44 | 640.92 | 1034.87 | 303.92 | 623 | 0 | 1.490 | 0 |
-| point-concurrency-1 | 20.06 | 47.43 | 59.18 | 94.76 | 94.76 | 290.38 | 852 | 0 | 16.040 | 0 |
-| postgresql18-mixed-baseline | 16970.55 | 0.20 | 0.40 | 0.72 | 8.05 | — | 67891 | 0 | — | 0 |
-| postgresql18-mixed-checkpoint-interference | 17656.74 | 0.21 | 0.41 | 0.58 | 2.77 | — | 70652 | 0 | — | 0 |
-| postgresql18-point-concurrency-1 | 8865.18 | 0.08 | 0.16 | 0.94 | 0.94 | — | 50 | 0 | — | 0 |
+| mixed-baseline | 309.02 | 13.23 | 41.08 | 76.10 | 133.02 | 290.80 | 1519 | 0 | 0.679 | 0 |
+| mixed-checkpoint-interference | 26.31 | 48.06 | 602.32 | 1876.28 | 1894.58 | 306.47 | 200 | 0 | 8.700 | 0 |
+| point-concurrency-1 | 19.50 | 51.18 | 56.41 | 64.39 | 64.39 | 290.50 | 852 | 0 | 16.040 | 0 |
+| postgresql18-mixed-baseline | 17787.67 | 0.21 | 0.39 | 0.53 | 4.16 | — | 71163 | 0 | — | 0 |
+| postgresql18-mixed-checkpoint-interference | 18795.93 | 0.20 | 0.37 | 0.50 | 5.31 | — | 75195 | 0 | — | 0 |
+| postgresql18-point-concurrency-1 | 8720.61 | 0.10 | 0.17 | 0.80 | 0.80 | — | 50 | 0 | — | 0 |
 
 ## Checkpoint phases
 
@@ -28,17 +28,17 @@ Times sum phase spans and are not query latency or a cross-system metric. The pr
 
 | Phase | Events | Elapsed ms | Block GET | Block PUT | Object DELETE |
 |---|---:|---:|---:|---:|---:|
-| commit_prune | 17 | 1016.60 | 0 | 0 | 232 |
-| gc_delete | 15 | 670.20 | 0 | 0 | 207 |
-| gc_keep | 15 | 1.62 | 0 | 0 | 0 |
-| gc_list | 15 | 121.57 | 0 | 0 | 0 |
-| legacy_gc | 4 | 27.19 | 0 | 0 | 0 |
-| local_cleanup | 4 | 0.27 | 0 | 0 | 0 |
-| manifest | 4 | 14.17 | 0 | 0 | 0 |
-| row_sst | 3 | 517.48 | 19 | 111 | 0 |
-| value_indexes | 3 | 1050.65 | 0 | 214 | 0 |
+| commit_prune | 8 | 251.10 | 0 | 0 | 42 |
+| gc_delete | 33 | 1440.52 | 0 | 0 | 468 |
+| gc_keep | 8 | 2.61 | 0 | 0 | 0 |
+| gc_list | 8 | 65.63 | 0 | 0 | 0 |
+| legacy_gc | 8 | 59.99 | 0 | 0 | 0 |
+| local_cleanup | 8 | 0.58 | 0 | 0 | 0 |
+| manifest | 8 | 29.48 | 0 | 0 | 0 |
+| row_sst | 11 | 1816.95 | 29 | 407 | 0 |
+| value_indexes | 11 | 3129.27 | 0 | 534 | 0 |
 
-Full profile window: 714 object PUT, 448 object DELETE, 54 LIST.
+Full profile window: 1086 object PUT, 516 object DELETE, 32 LIST.
 
 ### Foreground overlap
 
@@ -46,28 +46,28 @@ Operations are grouped when their client-observed interval intersects a phase on
 
 | Phase | operations | reads | writes | intersection ms | p50 ms | p95 ms | p99 ms | max ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| no phase overlap | 611 | 487 | 124 | — | 13.30 | 28.38 | 35.44 | 56.43 |
-| commit_prune | 12 | 10 | 2 | 256.32 | 640.92 | 1034.87 | 1034.87 | 1034.87 |
-| gc_delete | 12 | 10 | 2 | 896.31 | 640.92 | 1034.87 | 1034.87 | 1034.87 |
-| gc_keep | 12 | 10 | 2 | 4.14 | 640.92 | 1034.87 | 1034.87 | 1034.87 |
-| gc_list | 12 | 10 | 2 | 205.22 | 640.92 | 1034.87 | 1034.87 | 1034.87 |
-| legacy_gc | 12 | 10 | 2 | 79.39 | 640.92 | 1034.87 | 1034.87 | 1034.87 |
-| local_cleanup | 12 | 10 | 2 | 0.73 | 640.92 | 1034.87 | 1034.87 | 1034.87 |
-| manifest | 12 | 10 | 2 | 44.06 | 640.92 | 1034.87 | 1034.87 | 1034.87 |
-| row_sst | 8 | 6 | 2 | 1433.39 | 636.90 | 641.42 | 641.42 | 641.42 |
-| value_indexes | 8 | 6 | 2 | 2018.46 | 636.90 | 641.42 | 641.42 | 641.42 |
+| no phase overlap | 26 | 25 | 1 | — | 0.77 | 104.78 | 104.94 | 104.94 |
+| commit_prune | 36 | 17 | 19 | 835.46 | 71.94 | 1876.37 | 1894.58 | 1894.58 |
+| gc_delete | 78 | 59 | 19 | 4931.28 | 59.44 | 1876.19 | 1894.58 | 1894.58 |
+| gc_keep | 35 | 28 | 7 | 7.66 | 59.51 | 1876.37 | 1894.58 | 1894.58 |
+| gc_list | 25 | 18 | 7 | 199.82 | 59.87 | 1876.37 | 1894.58 | 1894.58 |
+| legacy_gc | 36 | 23 | 13 | 179.31 | 71.94 | 1876.37 | 1894.58 | 1894.58 |
+| local_cleanup | 24 | 11 | 13 | 1.98 | 28.62 | 1876.37 | 1894.58 | 1894.58 |
+| manifest | 36 | 23 | 13 | 89.19 | 28.43 | 1876.37 | 1894.58 | 1894.58 |
+| row_sst | 60 | 45 | 15 | 6553.09 | 446.03 | 1876.19 | 1894.58 | 1894.58 |
+| value_indexes | 36 | 25 | 11 | 11468.98 | 505.69 | 1876.37 | 1894.58 | 1894.58 |
 
-Profiled phases intersected 4938.01 ms of 16044.57 ms summed foreground latency.
+Profiled phases intersected 24266.76 ms of 30308.92 ms summed foreground latency.
 
 ## Recovery and cache-fill intervals
 
 | Cache state | startup s | GET | ranged GET | LIST | response MiB |
 |---|---:|---:|---:|---:|---:|
-| initial-start | 0.319 | 0 | 0 | 1 | 0.000 |
+| initial-start | 0.341 | 0 | 0 | 1 | 0.000 |
 
 ## Derived comparisons
 
-- checkpoint-overlap / baseline p99: 7.73x
+- checkpoint-overlap / baseline p99: 24.65x
 - Matched checkpoint commands completed: pos3ql 3, PostgreSQL 18 3. This short shared-host run compares SQL workloads on distinct persistence tiers; the p99 samples above do not establish production ratios.
 
 ## Recorded database identities

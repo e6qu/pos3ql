@@ -4604,16 +4604,6 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
-        // This transaction no longer needs its historical view. Release it
-        // before promotion so only other live snapshots cause old row images
-        // to be retained.
-        if prepared_slot.is_none() {
-            self.storage.release_snapshot(txn.txid);
-            self.storage.release_serializable(txn.txid);
-            self.storage.release_table_locks(txn.txid);
-            self.storage.release_row_locks(txn.txid);
-            self.storage.release_advisory_transaction_locks(txn.txid);
-        }
         for event_index in 0..txn.truncates().len() {
             let event = txn.truncates()[event_index];
             let transaction_id = txn.txid;
@@ -4728,7 +4718,11 @@ impl Engine {
                 (None, None) => continue,
             };
             if let Err(e) = appended {
-                self.rollback_txn(txn, guc);
+                if e.sqlstate != sqlstate::INTERNAL_IO_WAIT
+                    && e.sqlstate != sqlstate::INTERNAL_LOCK_WAIT
+                {
+                    self.rollback_txn(txn, guc);
+                }
                 return Err(e);
             }
             self.storage.set_lsn(lsn);
@@ -5494,6 +5488,17 @@ impl Engine {
                 return Err(error);
             }
         };
+        // A cold row needed for final WAL staging can park this COMMIT. Keep
+        // transaction state and locks live until every staged image and the
+        // commit boundary are complete, so the statement retry can resume the
+        // same transaction instead of observing cleared undo buffers.
+        if prepared_slot.is_none() {
+            self.storage.release_snapshot(txn.txid);
+            self.storage.release_serializable(txn.txid);
+            self.storage.release_table_locks(txn.txid);
+            self.storage.release_row_locks(txn.txid);
+            self.storage.release_advisory_transaction_locks(txn.txid);
+        }
         if subscription_advance_count != 0 {
             debug_assert_eq!(
                 subscription_origin_lsn, commit_lsn,

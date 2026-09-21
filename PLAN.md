@@ -193,6 +193,11 @@ exposed redundant generations but is not a controlled timing comparison with
 this corrected boundary. Next, bound commit and block deletion work per
 dispatch beat, then reduce the remaining per-checkpoint value-index and row
 publication traffic.
+The same CI run closed a transaction retry defect exposed by this scheduling
+change: a cold row that parks final WAL staging now preserves the transaction
+and its locks for retry, and a mark from any cleared transaction is no longer
+treated as live undo state merely because cleanup retained the same numeric
+transaction identity.
 Repeat on larger datasets and representative hardware before changing
 checkpoint pacing or asserting production ratios.
 

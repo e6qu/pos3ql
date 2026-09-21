@@ -30318,6 +30318,19 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
 }
 
 #[test]
+fn cleared_transaction_does_not_own_prior_statement_mark() {
+    let mut budget = Budget::new(8 << 20);
+    let mut transaction = TxnState::new_with_large_objects(&mut budget, 16, 1, 1).unwrap();
+    transaction.txid = 7;
+    transaction.mode = TxnMode::Implicit;
+    let mark = transaction.statement_mark(0, 0);
+    assert!(transaction.owns_statement_mark(mark));
+
+    transaction.clear();
+    assert!(!transaction.owns_statement_mark(mark));
+}
+
+#[test]
 fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
     let mut config = test_config("routine_creation_dependencies");
     config.max_tables = 16;

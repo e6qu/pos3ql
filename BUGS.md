@@ -145,6 +145,15 @@ before interference counters begin. A two-table regression proves the paced
 and same-beat paths, the long-history regression proves bounded merge progress,
 manifest retry remains idempotent, and object-cold recovery retains both
 updates.
+The final-slice CI audit also found no externally blocked defect in transaction
+retry. A cold row needed for final WAL staging could park COMMIT after its
+error path had rolled back and cleared the transaction. Cleanup retains the
+numeric identity for diagnostics, so the generic retry path then mistook the
+statement mark for live undo state and rewound a cleared deferred-trigger byte
+buffer. Retryable waits now preserve the transaction and its locks through WAL
+staging, and statement-mark ownership also requires an active transaction. A
+direct boundary regression and the exact forced-spill differential corpus
+cover the fix.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

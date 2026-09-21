@@ -216,6 +216,17 @@ wrote 1,337, and took 27.50 seconds. It was the largest single phase and
 coincided with the 30.27-second maximum foreground latency. This establishes
 the next dispatch-bound target; it does not imply that PostgreSQL shares the
 same persistence costs.
+The [bounded full-roster rerun](../benchmarks/baselines/2026-09-21-checkpoint-full-roster-bounded-10000/README.md)
+routes a dirty filled row-generation list through restartable pair-merge beats
+before appending its delta. The exact profile contained no `row_sst_full`
+event. Its 64 schedule beats read 4,712 blocks over 16.10 seconds, and 207
+write beats wrote 844 blocks over 4.24 seconds; the largest events took 447.94
+and 61.66 ms. Maximum foreground latency fell from 30.27 to 6.24 seconds and
+p99 from 5.60 to 4.03 seconds. Other phase counts differed across the two
+shared-host runs, so the change in aggregate timing is diagnostic rather than
+a controlled production ratio. Actual PostgreSQL 18.6 completed the matched
+local-durable workload at 3.90 ms p99 and 79.31 ms maximum latency. The largest
+remaining checkpoint phase event was a 3.91-second value-index publication.
 
 ## Measured scenarios
 

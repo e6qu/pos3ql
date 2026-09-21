@@ -1,8 +1,7 @@
 # Implemented baseline
 
-This record preserves the completed implementation evidence from the roadmap
-through the JSON value-width work merged on 2026-09-20. The active production
-roadmap is [PLAN.md](../PLAN.md).
+This record preserves completed implementation evidence from the roadmap. The
+active production roadmap is [PLAN.md](../PLAN.md).
 
 - Object-native commit publication, checkpoints, crash recovery, and recovery
   with empty RAM and disk caches.
@@ -37,6 +36,10 @@ roadmap is [PLAN.md](../PLAN.md).
   scale error. Manifest publication is handed to local WAL, heap, and overlay
   cleanup in the same beat before a newer statement can run; remote deletion
   remains paced, while explicit checkpoints wait for it to complete.
+  Dirty filled SST generation lists merge an adjacent pair across bounded,
+  restartable beats before appending a new delta. Completed merges have one
+  fixed startup slot per table so several filled tables can prepare for one
+  manifest publish without a monolithic row rewrite.
   Commit-batch pruning drains histories larger than one batch while retaining
   the replay boundary. The sorted live-block set gives each listed-object
   membership test logarithmic cost. Exact memory deltas, named exhaustion,

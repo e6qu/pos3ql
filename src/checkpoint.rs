@@ -1363,6 +1363,12 @@ impl Checkpointer {
     /// Deletes commit batches whose records are entirely covered by
     /// the current manifest LSN. Called after a checkpoint.
     pub(crate) fn prune_commit_batches(&mut self, up_to_lsn: u64) -> Result<(), SqlError> {
+        #[cfg(feature = "checkpoint-profile")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let before = self.blocks.borrow().io_stats();
+        #[cfg(feature = "checkpoint-profile")]
+        let mut deleted = 0;
         // Listing borrows the client, so each pass collects one pre-reserved
         // deletion batch and deletes it afterwards. Re-listing drains any
         // larger history without turning the batch size into a scale ceiling.
@@ -1385,7 +1391,7 @@ impl Checkpointer {
                 })
                 .map_err(object_store_to_sql)?;
             if max_key.is_empty() {
-                return Ok(());
+                break;
             }
             // Select deletions in a second pass so progress does not depend
             // on an implementation-specific listing order. In particular, a
@@ -1423,11 +1429,26 @@ impl Checkpointer {
                 self.client
                     .delete(descriptor.as_str())
                     .map_err(object_store_to_sql)?;
+                #[cfg(feature = "checkpoint-profile")]
+                {
+                    deleted += 2;
+                }
             }
             if !overflow {
-                return Ok(());
+                break;
             }
         }
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "commit_prune",
+            up_to_lsn,
+            None,
+            started,
+            before,
+            self.blocks.borrow().io_stats(),
+            deleted,
+        );
+        Ok(())
     }
 
     /// Cold start: loads the manifest (if any) and rehydrates every SST

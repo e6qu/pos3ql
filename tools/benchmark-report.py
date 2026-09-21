@@ -109,7 +109,8 @@ def main():
     if profile_path.exists():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         print("\n## Checkpoint phases\n")
-        print("Profiled pos3ql build; totals cover the measured checkpoint workload interval only. ")
+        print("Profiled pos3ql build; totals cover explicit and automatic checkpoint work "
+              "during the measured workload interval.")
         print("Times sum phase spans and are not query latency or a cross-system metric.\n")
         print("| Phase | Events | Elapsed ms | Block GET | Block PUT | Object DELETE |")
         print("|---|---:|---:|---:|---:|---:|")

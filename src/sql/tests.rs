@@ -65419,6 +65419,165 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
 }
 
 #[test]
+fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
+    let mut config = test_config("checkpoint-incremental-reslice");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-incremental-reslice-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.table_rows = 512;
+    config.value_index_rows = 512;
+    config.memtable_bytes = 8 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE resliced_rows (id integer PRIMARY KEY, payload text); \
+         CREATE TABLE reslice_tail (id integer PRIMARY KEY, payload text); \
+         INSERT INTO resliced_rows \
+           SELECT value, repeat('x', 4096) FROM generate_series(1,256) value; \
+         INSERT INTO reslice_tail VALUES (1, 'before')",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let table = engine
+        .storage
+        .find_table("public", "resliced_rows")
+        .unwrap();
+    engine.storage.evict_committed_table(table);
+
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE resliced_rows \
+            SET payload = repeat(md5((id + 1000)::text), 128) \
+          WHERE id <= 128; \
+         UPDATE reslice_tail SET payload = 'after' WHERE id = 1",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    let before_first = engine.storage.block_io_stats();
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    let first_slice = engine.storage.block_io_stats().saturating_sub(before_first);
+
+    let changed_again = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE resliced_rows SET payload = 'final' WHERE id = 128",
+    );
+    assert!(!message_types(&changed_again).contains(&b'E'));
+    let before_reslice = engine.storage.block_io_stats();
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    let reslice = engine
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_reslice);
+    assert!(
+        reslice.object_puts < first_slice.object_puts,
+        "reslice rewrote the prior slice: first={first_slice:?}, second={reslice:?}"
+    );
+
+    let published_lsn = match engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+        .unwrap()
+    {
+        crate::checkpoint::CheckpointStep::Published { lsn } => lsn,
+        crate::checkpoint::CheckpointStep::Working => {
+            panic!("tail slice yielded before publishing the completed sweep")
+        }
+        crate::checkpoint::CheckpointStep::Idle => {
+            panic!("dirty sweep became idle before publication")
+        }
+    };
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(table),
+        3,
+        "initial generation plus the original slice and incremental reslice"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT length(payload) FROM resliced_rows WHERE id = 1; \
+             SELECT payload FROM resliced_rows WHERE id = 128; \
+             SELECT count(*) FROM resliced_rows",
+        )),
+        ["4096", "final", "256"]
+    );
+    engine.storage.evict_committed_table(table);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT length(payload) FROM resliced_rows WHERE id = 1; \
+             SELECT payload FROM resliced_rows WHERE id = 128; \
+             SELECT count(*) FROM resliced_rows",
+        )),
+        ["4096", "final", "256"],
+        "deferred eviction must map rows to the slice containing their version"
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT length(payload) FROM resliced_rows WHERE id = 1; \
+             SELECT payload FROM resliced_rows WHERE id = 128; \
+             SELECT count(*) FROM resliced_rows; \
+             SELECT payload FROM reslice_tail WHERE id = 1",
+        )),
+        ["4096", "final", "256", "after"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn checkpoint_live_block_capacity_exhausts_loudly() {
     let mut config = test_config("checkpoint-live-block-capacity");
     config.object_store_on = true;

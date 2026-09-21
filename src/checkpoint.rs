@@ -6672,6 +6672,7 @@ impl Checkpointer {
             self.pending_installs.clear();
             self.pending_value_installs.clear();
         }
+        let mut wrote_slice = false;
         for slot in 0..storage.physical_table_count() {
             if !self.needs_slice(storage, slot) {
                 continue;
@@ -6680,8 +6681,20 @@ impl Checkpointer {
             self.build_table_list(storage, sort_scratch, slot)?;
             self.sliced_generation[slot] = generation;
             self.sliced_this_sweep[slot] = true;
+            wrote_slice = true;
+            break;
+        }
+        if wrote_slice
+            && (merge_due
+                || (0..storage.physical_table_count()).any(|slot| self.needs_slice(storage, slot)))
+        {
             return Ok(CheckpointStep::Working);
         }
+        // Without a merge beat due, publish with the final slice while
+        // every captured generation is still current. Yielding here lets the
+        // next statement invalidate that slice and forces its immutable
+        // blocks to be written again. An owed merge retains its alternating
+        // beat so long histories keep making bounded progress.
         let lsn = storage.lsn();
         #[cfg(feature = "checkpoint-profile")]
         let publish_started = checkpoint_profile_start();

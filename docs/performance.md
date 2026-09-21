@@ -170,6 +170,18 @@ publication 13.23 seconds, block deletion 6.74 seconds, and commit pruning
 5.79 seconds. Local post-publication cleanup intersected only 3 milliseconds.
 These are associations across explicit and automatic checkpoint work, not an
 exclusive causal decomposition or a production ratio.
+The following [final-slice run](../benchmarks/baselines/2026-09-21-checkpoint-final-slice-1000/README.md)
+closes the dispatch gap between writing the last stale table slice and
+publishing its manifest when no merge beat is due. The harness also
+completes an unmeasured checkpoint after each engine's baseline so earlier
+automatic work cannot enter the interference profile. In the resulting
+four-second window, three explicit checkpoints produced three row SST and
+value-index generations; a fourth metadata-only manifest was published at
+shutdown. The run recorded 765 object PUTs, 725 completed pos3ql operations,
+and a 624.60 ms p99. PostgreSQL 18.6 completed 73,534 operations with a
+0.59 ms p99 on isolated local APFS. The corrected window boundary prevents a
+controlled timing comparison with the earlier correlation run, and these
+shared-host measurements remain exploratory.
 
 ## Measured scenarios
 

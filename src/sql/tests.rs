@@ -30318,6 +30318,19 @@ fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
 }
 
 #[test]
+fn cleared_transaction_does_not_own_prior_statement_mark() {
+    let mut budget = Budget::new(8 << 20);
+    let mut transaction = TxnState::new_with_large_objects(&mut budget, 16, 1, 1).unwrap();
+    transaction.txid = 7;
+    transaction.mode = TxnMode::Implicit;
+    let mark = transaction.statement_mark(0, 0);
+    assert!(transaction.owns_statement_mark(mark));
+
+    transaction.clear();
+    assert!(!transaction.owns_statement_mark(mark));
+}
+
+#[test]
 fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
     let mut config = test_config("routine_creation_dependencies");
     config.max_tables = 16;
@@ -53925,24 +53938,15 @@ fn configured_table_capacity_survives_checkpoint_retry_and_object_cold_recovery(
     }
     assert!(engine.checkpoint().unwrap());
 
-    // Drive one sliced beat, then lose the response to the manifest PUT. The
-    // retry must adopt its own landed manifest and publish the same complete
-    // above-boundary table state without reallocating checkpoint scratch.
+    // Lose the response to the manifest PUT. The retry must adopt its own
+    // landed manifest and publish the same complete above-boundary table state
+    // without reallocating checkpoint scratch.
     let updated = run_with(
         &mut engine,
         &mut budget,
         "UPDATE checkpoint_reused_1024 SET value = 2048",
     );
     assert!(!message_types(&updated).contains(&b'E'));
-    assert!(matches!(
-        engine
-            .ckpt
-            .as_mut()
-            .unwrap()
-            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
-            .unwrap(),
-        crate::checkpoint::CheckpointStep::Working
-    ));
     namespace.borrow_mut().faults.ambiguous_put_per_mille = 1000;
     assert!(
         engine
@@ -65019,6 +65023,87 @@ fn checkpoint_reports_publication_before_paced_maintenance() {
     );
 
     drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
+    let mut config = test_config("checkpoint-final-slice-publish");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-final-slice-publish-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE first_slice (id integer PRIMARY KEY, value text); \
+         CREATE TABLE final_slice (id integer PRIMARY KEY, value text); \
+         INSERT INTO first_slice VALUES (1, 'before'); \
+         INSERT INTO final_slice VALUES (1, 'before')",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+
+    let updated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE first_slice SET value = 'after' WHERE id = 1; \
+         UPDATE final_slice SET value = 'after' WHERE id = 1",
+    );
+    assert!(!message_types(&updated).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    let published_lsn = match engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+        .unwrap()
+    {
+        crate::checkpoint::CheckpointStep::Published { lsn } => lsn,
+        crate::checkpoint::CheckpointStep::Working => {
+            panic!("final dirty slice yielded before publication")
+        }
+        crate::checkpoint::CheckpointStep::Idle => {
+            panic!("dirty storage became idle before publication")
+        }
+    };
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT value FROM first_slice WHERE id = 1; \
+             SELECT value FROM final_slice WHERE id = 1"
+        )),
+        ["after", "after"]
+    );
+    drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let _ = std::fs::remove_dir_all(&config.data_dir);
 }

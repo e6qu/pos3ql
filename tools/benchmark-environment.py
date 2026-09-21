@@ -76,6 +76,7 @@ def main():
             "timeout_seconds": args.timeout_seconds,
             "checkpoint_profile_enabled": bool(args.checkpoint_profile),
             "checkpoint_duration_seconds": args.checkpoint_duration_seconds,
+            "checkpoint_settled_before_interference": args.mode == "checkpoint",
         },
         "pos3ql_object_store": {
             "implementation": "tests/external/s3_test_server.py",

@@ -69,6 +69,11 @@ def main():
                 f"{suite['operations_per_client']} operations per client; "
                 "operation counts may differ across engines.\n"
             )
+            if suite.get("checkpoint_settled_before_interference"):
+                print(
+                    "Each engine completes an unmeasured settling checkpoint before "
+                    "the checkpoint-interference window.\n"
+                )
     postgresql_path = args.directory / "postgresql-server.json"
     if postgresql_path.exists():
         postgresql = json.loads(postgresql_path.read_text(encoding="utf-8"))

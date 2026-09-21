@@ -24,7 +24,9 @@ def main():
     started = time.monotonic()
     while True:
         try:
-            connection = PgConnection(args.host, args.port, args.user, args.database)
+            connection = PgConnection(
+                args.host, args.port, args.user, args.database, args.timeout or 30
+            )
             try:
                 rows = connection.query(args.sql)
             finally:

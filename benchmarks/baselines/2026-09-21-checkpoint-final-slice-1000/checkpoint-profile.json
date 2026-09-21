@@ -1,0 +1,580 @@
+{
+  "artifact_type": "checkpoint_profile",
+  "events": [
+    {
+      "block_gets": 18,
+      "block_puts": 39,
+      "deleted": 0,
+      "elapsed_us": 192776,
+      "ended_ns": 1789977792394631042,
+      "lsn": 3196,
+      "phase": "row_sst",
+      "slot": 0,
+      "started_ns": 1789977792201855000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 47,
+      "deleted": 0,
+      "elapsed_us": 249298,
+      "ended_ns": 1789977792643936458,
+      "lsn": 3196,
+      "phase": "value_indexes",
+      "slot": 0,
+      "started_ns": 1789977792394638000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 3279,
+      "ended_ns": 1789977792647221458,
+      "lsn": 3196,
+      "phase": "manifest",
+      "slot": null,
+      "started_ns": 1789977792643942000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 8,
+      "elapsed_us": 33321,
+      "ended_ns": 1789977792680551709,
+      "lsn": 3196,
+      "phase": "commit_prune",
+      "slot": null,
+      "started_ns": 1789977792647230000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 103,
+      "ended_ns": 1789977792680670542,
+      "lsn": 3196,
+      "phase": "local_cleanup",
+      "slot": null,
+      "started_ns": 1789977792680567000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 6017,
+      "ended_ns": 1789977792686710958,
+      "lsn": 3196,
+      "phase": "legacy_gc",
+      "slot": null,
+      "started_ns": 1789977792680693000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 293,
+      "ended_ns": 1789977792687016375,
+      "lsn": 3196,
+      "phase": "gc_keep",
+      "slot": null,
+      "started_ns": 1789977792686723000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 7366,
+      "ended_ns": 1789977792694390166,
+      "lsn": 3196,
+      "phase": "gc_list",
+      "slot": null,
+      "started_ns": 1789977792687024000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 44,
+      "elapsed_us": 112148,
+      "ended_ns": 1789977792806558583,
+      "lsn": 3196,
+      "phase": "gc_delete",
+      "slot": null,
+      "started_ns": 1789977792694410000
+    },
+    {
+      "block_gets": 2,
+      "block_puts": 39,
+      "deleted": 0,
+      "elapsed_us": 153658,
+      "ended_ns": 1789977792981722750,
+      "lsn": 3204,
+      "phase": "row_sst",
+      "slot": 0,
+      "started_ns": 1789977792828064000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 40,
+      "deleted": 0,
+      "elapsed_us": 227386,
+      "ended_ns": 1789977793209114333,
+      "lsn": 3204,
+      "phase": "value_indexes",
+      "slot": 0,
+      "started_ns": 1789977792981728000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 2958,
+      "ended_ns": 1789977793212076583,
+      "lsn": 3204,
+      "phase": "manifest",
+      "slot": null,
+      "started_ns": 1789977793209118000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 2,
+      "elapsed_us": 17522,
+      "ended_ns": 1789977793229606291,
+      "lsn": 3204,
+      "phase": "commit_prune",
+      "slot": null,
+      "started_ns": 1789977793212084000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 71,
+      "ended_ns": 1789977793229691750,
+      "lsn": 3204,
+      "phase": "local_cleanup",
+      "slot": null,
+      "started_ns": 1789977793229620000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 6159,
+      "ended_ns": 1789977793235856208,
+      "lsn": 3204,
+      "phase": "legacy_gc",
+      "slot": null,
+      "started_ns": 1789977793229697000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 293,
+      "ended_ns": 1789977793236156625,
+      "lsn": 3204,
+      "phase": "gc_keep",
+      "slot": null,
+      "started_ns": 1789977793235863000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 7359,
+      "ended_ns": 1789977793243519333,
+      "lsn": 3204,
+      "phase": "gc_list",
+      "slot": null,
+      "started_ns": 1789977793236160000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 37,
+      "elapsed_us": 96493,
+      "ended_ns": 1789977793340021583,
+      "lsn": 3204,
+      "phase": "gc_delete",
+      "slot": null,
+      "started_ns": 1789977793243528000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 3286,
+      "ended_ns": 1789977794220686542,
+      "lsn": 3204,
+      "phase": "manifest",
+      "slot": null,
+      "started_ns": 1789977794217400000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 11892,
+      "ended_ns": 1789977794232590500,
+      "lsn": 3204,
+      "phase": "commit_prune",
+      "slot": null,
+      "started_ns": 1789977794220698000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 20,
+      "ended_ns": 1789977794232618000,
+      "lsn": 3204,
+      "phase": "local_cleanup",
+      "slot": null,
+      "started_ns": 1789977794232598000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 6046,
+      "ended_ns": 1789977794238668167,
+      "lsn": 3204,
+      "phase": "legacy_gc",
+      "slot": null,
+      "started_ns": 1789977794232622000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 300,
+      "ended_ns": 1789977794238977083,
+      "lsn": 3204,
+      "phase": "gc_keep",
+      "slot": null,
+      "started_ns": 1789977794238677000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 6591,
+      "ended_ns": 1789977794245572875,
+      "lsn": 3204,
+      "phase": "gc_list",
+      "slot": null,
+      "started_ns": 1789977794238981000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 6,
+      "elapsed_us": 14941,
+      "ended_ns": 1789977794260524583,
+      "lsn": 3204,
+      "phase": "gc_delete",
+      "slot": null,
+      "started_ns": 1789977794245583000
+    },
+    {
+      "block_gets": 1,
+      "block_puts": 39,
+      "deleted": 0,
+      "elapsed_us": 160037,
+      "ended_ns": 1789977796406966500,
+      "lsn": 3760,
+      "phase": "row_sst",
+      "slot": 0,
+      "started_ns": 1789977796246929000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 137,
+      "deleted": 0,
+      "elapsed_us": 558259,
+      "ended_ns": 1789977796965232583,
+      "lsn": 3760,
+      "phase": "value_indexes",
+      "slot": 0,
+      "started_ns": 1789977796406973000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 2965,
+      "ended_ns": 1789977796968203958,
+      "lsn": 3760,
+      "phase": "manifest",
+      "slot": null,
+      "started_ns": 1789977796965238000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 244,
+      "elapsed_us": 664625,
+      "ended_ns": 1789977797632836833,
+      "lsn": 3760,
+      "phase": "commit_prune",
+      "slot": null,
+      "started_ns": 1789977796968211000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 89,
+      "ended_ns": 1789977797632967625,
+      "lsn": 3760,
+      "phase": "local_cleanup",
+      "slot": null,
+      "started_ns": 1789977797632878000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 7487,
+      "ended_ns": 1789977797640465584,
+      "lsn": 3760,
+      "phase": "legacy_gc",
+      "slot": null,
+      "started_ns": 1789977797632978000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 308,
+      "ended_ns": 1789977797640786750,
+      "lsn": 3760,
+      "phase": "gc_keep",
+      "slot": null,
+      "started_ns": 1789977797640478000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 8946,
+      "ended_ns": 1789977797649743500,
+      "lsn": 3760,
+      "phase": "gc_list",
+      "slot": null,
+      "started_ns": 1789977797640797000
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 131,
+      "elapsed_us": 340330,
+      "ended_ns": 1789977797990086167,
+      "lsn": 3760,
+      "phase": "gc_delete",
+      "slot": null,
+      "started_ns": 1789977797649756000
+    }
+  ],
+  "object_requests": {
+    "delete": 475,
+    "get": 0,
+    "list": 16,
+    "put": 765,
+    "range_get": 296
+  },
+  "operation_overlap": {
+    "by_phase": {
+      "commit_prune": {
+        "maximum_intersection_ms": 33.321709,
+        "maximum_ms": 920.185708,
+        "mean_ms": 692.7685796666666,
+        "operation_intersection_ms": 250.946,
+        "operations": 12,
+        "p50_ms": 624.731208,
+        "p95_ms": 920.185708,
+        "p99_ms": 920.185708,
+        "reads": 8,
+        "writes": 4
+      },
+      "gc_delete": {
+        "maximum_intersection_ms": 112.148583,
+        "maximum_ms": 920.185708,
+        "mean_ms": 692.7685796666666,
+        "operation_intersection_ms": 894.334996,
+        "operations": 12,
+        "p50_ms": 624.731208,
+        "p95_ms": 920.185708,
+        "p99_ms": 920.185708,
+        "reads": 8,
+        "writes": 4
+      },
+      "gc_keep": {
+        "maximum_intersection_ms": 0.300083,
+        "maximum_ms": 920.185708,
+        "mean_ms": 692.7685796666666,
+        "operation_intersection_ms": 3.548332,
+        "operations": 12,
+        "p50_ms": 624.731208,
+        "p95_ms": 920.185708,
+        "p99_ms": 920.185708,
+        "reads": 8,
+        "writes": 4
+      },
+      "gc_list": {
+        "maximum_intersection_ms": 7.366166,
+        "maximum_ms": 920.185708,
+        "mean_ms": 692.7685796666666,
+        "operation_intersection_ms": 85.269496,
+        "operations": 12,
+        "p50_ms": 624.731208,
+        "p95_ms": 920.185708,
+        "p99_ms": 920.185708,
+        "reads": 8,
+        "writes": 4
+      },
+      "legacy_gc": {
+        "maximum_intersection_ms": 6.159208,
+        "maximum_ms": 920.185708,
+        "mean_ms": 692.7685796666666,
+        "operation_intersection_ms": 72.893332,
+        "operations": 12,
+        "p50_ms": 624.731208,
+        "p95_ms": 920.185708,
+        "p99_ms": 920.185708,
+        "reads": 8,
+        "writes": 4
+      },
+      "local_cleanup": {
+        "maximum_intersection_ms": 0.103542,
+        "maximum_ms": 920.185708,
+        "mean_ms": 692.7685796666666,
+        "operation_intersection_ms": 0.781168,
+        "operations": 12,
+        "p50_ms": 624.731208,
+        "p95_ms": 920.185708,
+        "p99_ms": 920.185708,
+        "reads": 8,
+        "writes": 4
+      },
+      "manifest": {
+        "maximum_intersection_ms": 3.286542,
+        "maximum_ms": 920.185708,
+        "mean_ms": 692.7685796666666,
+        "operation_intersection_ms": 38.098332,
+        "operations": 12,
+        "p50_ms": 624.731208,
+        "p95_ms": 920.185708,
+        "p99_ms": 920.185708,
+        "reads": 8,
+        "writes": 4
+      },
+      "row_sst": {
+        "maximum_intersection_ms": 192.776042,
+        "maximum_ms": 644.980167,
+        "mean_ms": 579.099895625,
+        "operation_intersection_ms": 1385.739168,
+        "operations": 8,
+        "p50_ms": 533.674042,
+        "p95_ms": 644.980167,
+        "p99_ms": 644.980167,
+        "reads": 4,
+        "writes": 4
+      },
+      "value_indexes": {
+        "maximum_intersection_ms": 249.298458,
+        "maximum_ms": 644.980167,
+        "mean_ms": 579.099895625,
+        "operation_intersection_ms": 1906.739164,
+        "operations": 8,
+        "p50_ms": 533.674042,
+        "p95_ms": 644.980167,
+        "p99_ms": 644.980167,
+        "reads": 4,
+        "writes": 4
+      }
+    },
+    "clock": "CLOCK_REALTIME",
+    "outside_phases": {
+      "maximum_ms": 71.705,
+      "mean_ms": 10.884942739130436,
+      "operations": 713,
+      "p50_ms": 13.284125,
+      "p95_ms": 31.337375,
+      "p99_ms": 36.957542,
+      "reads": 570,
+      "writes": 143
+    },
+    "profiled_phase_intersection_ms": 4638.349988,
+    "total_operation_latency_ms": 16074.187129,
+    "traced_operations": 725,
+    "unprofiled_operation_latency_ms": 11435.837141
+  },
+  "schema_version": 1,
+  "source_byte_offset": 3430,
+  "totals": {
+    "commit_prune": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 254,
+      "elapsed_us": 727360,
+      "events": 4
+    },
+    "gc_delete": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 218,
+      "elapsed_us": 563912,
+      "events": 4
+    },
+    "gc_keep": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 1194,
+      "events": 4
+    },
+    "gc_list": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 30262,
+      "events": 4
+    },
+    "legacy_gc": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 25709,
+      "events": 4
+    },
+    "local_cleanup": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 283,
+      "events": 4
+    },
+    "manifest": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 12488,
+      "events": 4
+    },
+    "row_sst": {
+      "block_gets": 21,
+      "block_puts": 117,
+      "deleted": 0,
+      "elapsed_us": 506471,
+      "events": 3
+    },
+    "value_indexes": {
+      "block_gets": 0,
+      "block_puts": 224,
+      "deleted": 0,
+      "elapsed_us": 1034943,
+      "events": 3
+    }
+  }
+}

@@ -2036,7 +2036,7 @@ impl TxnState {
     }
 
     pub(crate) fn owns_statement_mark(&self, mark: StatementMark) -> bool {
-        self.txid == mark.txid
+        self.is_active() && self.txid == mark.txid
     }
 
     /// Index of the most recent savepoint with this name.

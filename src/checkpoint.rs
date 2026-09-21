@@ -621,6 +621,10 @@ pub(crate) struct Checkpointer {
     /// Pre-reserved scratch built during a checkpoint, then swapped into the
     /// fields above; keeps the post-freeze path allocation-free.
     prev_scratch: Vec<SlotList>,
+    /// One table's next slice, committed into `prev_scratch` only after every
+    /// fallible row and value-index write succeeds.
+    slice_scratch: SlotList,
+    slice_value_installs: Vec<ValueInstall>,
     /// Pre-reserved scratch for cold commit replay and object deletion batches.
     commit_scratch: Vec<StackStr<64>>,
     garbage_scratch: Vec<StackStr<64>>,
@@ -746,12 +750,10 @@ impl Checkpointer {
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + table_bookkeeping
-            + 2usize
-                .saturating_mul(table_capacity)
+            + (2usize.saturating_mul(table_capacity) + 1)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(core::mem::size_of::<Option<PrevSst>>())
-            + table_capacity
-                * crate::storage::MAX_VALUE_ENFORCERS
+            + (table_capacity + 1).saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
                 * core::mem::size_of::<ValueInstall>()
             + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
             + config.checkpoint_garbage_batch_objects
@@ -1133,6 +1135,7 @@ impl Checkpointer {
             .draw_array(
                 2usize
                     .saturating_mul(table_capacity)
+                    .saturating_add(1)
                     .saturating_mul(config.max_spill_generations_per_table),
                 core::mem::size_of::<Option<PrevSst>>(),
                 "checkpoint spill-generation rosters",
@@ -1167,6 +1170,8 @@ impl Checkpointer {
             commit_head: None,
             prev_ssts,
             prev_scratch,
+            slice_scratch: SlotList::new(config.max_spill_generations_per_table),
+            slice_value_installs: Vec::with_capacity(crate::storage::MAX_VALUE_ENFORCERS),
             commit_scratch: Vec::with_capacity(config.checkpoint_commit_batches),
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             delete_objects_per_beat: config.checkpoint_delete_objects_per_beat,
@@ -10250,15 +10255,15 @@ impl Checkpointer {
             && self.sliced_layout[slot] == layout
             && self.prev_scratch[slot].n < self.prev_scratch[slot].capacity();
         let changed_after_lsn = reuse_slice.then_some(self.sliced_lsn[slot]);
-        if !reuse_slice {
-            self.pending_installs.retain(|(s, _)| *s != slot);
-            self.prev_scratch[slot].copy_from(&self.prev_ssts[slot]);
+        if reuse_slice {
+            self.slice_scratch.copy_from(&self.prev_scratch[slot]);
+        } else {
+            self.slice_scratch.copy_from(&self.prev_ssts[slot]);
         }
-        self.pending_value_installs
-            .retain(|install| install.slot != slot);
-        // Finish the fallible value-index rebuild before changing the retained
-        // row slice. A retry can discard its pending value installs, while a
-        // row append must remain paired with the LSN recorded by the caller.
+        self.slice_value_installs.clear();
+        // Stage every fallible write before changing the retained slice. A
+        // failed fallback from a full unpublished list must keep that list
+        // and its LSN boundary intact for the retry.
         #[cfg(feature = "checkpoint-profile")]
         let index_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
@@ -10280,23 +10285,23 @@ impl Checkpointer {
         let completed = (!reuse_slice).then(|| {
             self.merge_done.as_ref().and_then(|done| {
                 (done.slot == slot
-                    && pair_at(&self.prev_scratch[slot], done.at)
+                    && pair_at(&self.slice_scratch, done.at)
                         == Some((done.old0.handle, done.old1.handle)))
                 .then_some((done.at, done.merged))
             })
         });
+        let mut staged_installs = [None; 2];
+        let mut staged_install_count = 0usize;
         if let Some((at, merged)) = completed.flatten() {
-            self.prev_scratch[slot].replace_pair(at, merged);
-            self.pending_installs.push((
-                slot,
-                SlotInstall::MergePair {
-                    at,
-                    handle: merged.map(|prior| prior.handle),
-                },
-            ));
+            self.slice_scratch.replace_pair(at, merged);
+            staged_installs[staged_install_count] = Some(SlotInstall::MergePair {
+                at,
+                handle: merged.map(|prior| prior.handle),
+            });
+            staged_install_count += 1;
         }
         // A clean table carries its whole SST list forward untouched.
-        let clean = !storage.table(slot).dirty && self.prev_scratch[slot].n > 0;
+        let clean = !storage.table(slot).dirty && self.slice_scratch.n > 0;
         // A dirty table with spilled SSTs and room flushes a *delta*:
         // its heap-resident committed rows plus deletion markers retained in
         // the row overlay since the last checkpoint. Otherwise it rewrites
@@ -10304,8 +10309,8 @@ impl Checkpointer {
         // there is no second compiled tombstone limit.
         let delta = !clean
             && storage.table(slot).dirty
-            && self.prev_scratch[slot].n > 0
-            && self.prev_scratch[slot].n < self.prev_scratch[slot].capacity();
+            && self.slice_scratch.n > 0
+            && self.slice_scratch.n < self.slice_scratch.capacity();
         if storage.has_active_snapshots()
             && !clean
             && storage.table(slot).n_spill_ssts > 0
@@ -10450,36 +10455,32 @@ impl Checkpointer {
             // consistent with the still-current manifest.
             match (delta, handle) {
                 (true, Some(h)) => {
-                    if !self.prev_scratch[slot].push(PrevSst {
+                    if !self.slice_scratch.push(PrevSst {
                         handle: h,
                         count,
                         crc,
                     }) {
                         return Err(sql_err!(SQLSTATE_IO, "delta flush into a full spill list"));
                     }
-                    self.pending_installs.push((
-                        slot,
-                        SlotInstall::Append {
-                            handle: h,
-                            through_lsn: storage.lsn(),
-                        },
-                    ));
+                    staged_installs[staged_install_count] = Some(SlotInstall::Append {
+                        handle: h,
+                        through_lsn: storage.lsn(),
+                    });
+                    staged_install_count += 1;
                 }
                 (true, None) => {
                     // Dirty but nothing new to flush (e.g. the change was
                     // rolled back): the list stands.
                 }
                 (false, Some(h)) => {
-                    self.pending_installs.push((
-                        slot,
-                        SlotInstall::Replace {
-                            handle: Some(h),
-                            through_lsn: storage.lsn(),
-                        },
-                    ));
-                    self.prev_scratch[slot].clear();
+                    staged_installs[staged_install_count] = Some(SlotInstall::Replace {
+                        handle: Some(h),
+                        through_lsn: storage.lsn(),
+                    });
+                    staged_install_count += 1;
+                    self.slice_scratch.clear();
                     push_slot_list(
-                        &mut self.prev_scratch[slot],
+                        &mut self.slice_scratch,
                         PrevSst {
                             handle: h,
                             count,
@@ -10488,14 +10489,12 @@ impl Checkpointer {
                     )?;
                 }
                 (false, None) => {
-                    self.pending_installs.push((
-                        slot,
-                        SlotInstall::Replace {
-                            handle: None,
-                            through_lsn: storage.lsn(),
-                        },
-                    ));
-                    self.prev_scratch[slot].clear();
+                    staged_installs[staged_install_count] = Some(SlotInstall::Replace {
+                        handle: None,
+                        through_lsn: storage.lsn(),
+                    });
+                    staged_install_count += 1;
+                    self.slice_scratch.clear();
                 }
             }
         }
@@ -10511,6 +10510,21 @@ impl Checkpointer {
                 0,
             );
         }
+        if !reuse_slice {
+            self.pending_installs.retain(|(s, _)| *s != slot);
+        }
+        for install in staged_installs[..staged_install_count]
+            .iter()
+            .copied()
+            .flatten()
+        {
+            self.pending_installs.push((slot, install));
+        }
+        self.prev_scratch[slot].copy_from(&self.slice_scratch);
+        self.pending_value_installs
+            .retain(|install| install.slot != slot);
+        self.pending_value_installs
+            .extend_from_slice(&self.slice_value_installs);
         Ok(())
     }
 
@@ -10778,7 +10792,7 @@ impl Checkpointer {
             };
             let (columns, n_columns) = storage.value_binding_columns(slot, binding);
             let include_mask = storage.value_binding_include_mask(slot, binding);
-            self.pending_value_installs.push(ValueInstall {
+            self.slice_value_installs.push(ValueInstall {
                 slot,
                 columns,
                 n_columns,

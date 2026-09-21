@@ -233,9 +233,12 @@ Checkpoint row reslicing now retains a compatible earlier slice and appends
 only versions committed after its captured LSN. Physical-layout changes and a
 full generation roster rebuild from the published base. Fixed startup metadata
 preserves warm reads after publication and maps rows to their containing SST
-when later memory pressure evicts them. A deterministic regression reduced a
-one-row reslice from the first slice's 13 block PUTs to 5, then qualified
-deferred eviction and object-cold recovery. The
+when later memory pressure evicts them. Full-roster fallback also stages its
+replacement row list and value-index installs in fixed startup scratch, so an
+object-store failure retains the earlier slice and its LSN boundary for retry.
+A deterministic regression reduced a one-row reslice from the first slice's 13
+block PUTs to 5; focused fault injection and the storage VOPR corpus qualify
+retry, deferred eviction, and object-cold recovery. The
 [incremental-reslice run](benchmarks/baselines/2026-09-21-checkpoint-row-reslice-1000/README.md)
 exercised two 39-then-5 block sweeps and one 137-block slice followed by four
 5-block reslices. Its matched actual PostgreSQL 18.6 workload completed with

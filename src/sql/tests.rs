@@ -65578,6 +65578,93 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
 }
 
 #[test]
+fn failed_full_roster_reslice_keeps_the_prior_slice_for_retry() {
+    let mut config = test_config("checkpoint-reslice-retry");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-checkpoint-reslice-retry-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.max_spill_generations_per_table = 2;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 91);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE retry_rows (id integer PRIMARY KEY, value text); \
+         CREATE TABLE retry_tail (id integer PRIMARY KEY, value text); \
+         INSERT INTO retry_rows VALUES (1, 'deleted'); \
+         INSERT INTO retry_tail VALUES (1, 'before')",
+    );
+    assert!(!message_types(&created).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "DELETE FROM retry_rows WHERE id = 1; \
+         UPDATE retry_tail SET value = 'after' WHERE id = 1",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+
+    let changed_again = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO retry_rows VALUES (2, 'survives')",
+    );
+    assert!(!message_types(&changed_again).contains(&b'E'));
+    namespace.borrow_mut().faults.transient_per_mille = 1000;
+    assert!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .is_err(),
+        "the full-roster fallback must reach a fallible object-store write"
+    );
+    namespace.borrow_mut().faults.transient_per_mille = 0;
+
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM retry_rows ORDER BY id"
+        )),
+        ["2|survives"]
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, value FROM retry_rows ORDER BY id; \
+             SELECT value FROM retry_tail WHERE id = 1"
+        )),
+        ["2|survives", "after"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn checkpoint_live_block_capacity_exhausts_loudly() {
     let mut config = test_config("checkpoint-live-block-capacity");
     config.object_store_on = true;

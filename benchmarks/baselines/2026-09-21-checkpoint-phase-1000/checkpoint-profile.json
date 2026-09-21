@@ -1,0 +1,288 @@
+{
+  "artifact_type": "checkpoint_profile",
+  "events": [
+    {
+      "block_gets": 0,
+      "block_puts": 39,
+      "deleted": 0,
+      "elapsed_us": 165947,
+      "lsn": 3204,
+      "phase": "row_sst",
+      "slot": 0
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 152,
+      "deleted": 0,
+      "elapsed_us": 597475,
+      "lsn": 3204,
+      "phase": "value_indexes",
+      "slot": 0
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 3297,
+      "lsn": 3204,
+      "phase": "manifest",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 432,
+      "elapsed_us": 1224974,
+      "lsn": 3204,
+      "phase": "commit_prune",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 8347,
+      "lsn": 3204,
+      "phase": "legacy_gc",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 307,
+      "lsn": 3204,
+      "phase": "gc_keep",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 9011,
+      "lsn": 3204,
+      "phase": "gc_list",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 146,
+      "elapsed_us": 401814,
+      "lsn": 3204,
+      "phase": "gc_delete",
+      "slot": null
+    },
+    {
+      "block_gets": 18,
+      "block_puts": 39,
+      "deleted": 0,
+      "elapsed_us": 209008,
+      "lsn": 3216,
+      "phase": "row_sst",
+      "slot": 0
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 40,
+      "deleted": 0,
+      "elapsed_us": 237624,
+      "lsn": 3216,
+      "phase": "value_indexes",
+      "slot": 0
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 3375,
+      "lsn": 3216,
+      "phase": "manifest",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 4,
+      "elapsed_us": 23243,
+      "lsn": 3216,
+      "phase": "commit_prune",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 5977,
+      "lsn": 3216,
+      "phase": "legacy_gc",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 296,
+      "lsn": 3216,
+      "phase": "gc_keep",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 7126,
+      "lsn": 3216,
+      "phase": "gc_list",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 37,
+      "elapsed_us": 103024,
+      "lsn": 3216,
+      "phase": "gc_delete",
+      "slot": null
+    },
+    {
+      "block_gets": 1,
+      "block_puts": 39,
+      "deleted": 0,
+      "elapsed_us": 168381,
+      "lsn": 3508,
+      "phase": "row_sst",
+      "slot": 0
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 119,
+      "deleted": 0,
+      "elapsed_us": 684009,
+      "lsn": 3508,
+      "phase": "value_indexes",
+      "slot": 0
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 3099,
+      "lsn": 3508,
+      "phase": "manifest",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 114,
+      "elapsed_us": 341902,
+      "lsn": 3508,
+      "phase": "commit_prune",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 7697,
+      "lsn": 3508,
+      "phase": "legacy_gc",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 293,
+      "lsn": 3508,
+      "phase": "gc_keep",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 8780,
+      "lsn": 3508,
+      "phase": "gc_list",
+      "slot": null
+    },
+    {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 113,
+      "elapsed_us": 314734,
+      "lsn": 3508,
+      "phase": "gc_delete",
+      "slot": null
+    }
+  ],
+  "object_requests": {
+    "delete": 846,
+    "get": 0,
+    "list": 12,
+    "put": 614,
+    "range_get": 19
+  },
+  "schema_version": 1,
+  "source_byte_offset": 1313,
+  "totals": {
+    "commit_prune": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 550,
+      "elapsed_us": 1590119,
+      "events": 3
+    },
+    "gc_delete": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 296,
+      "elapsed_us": 819572,
+      "events": 3
+    },
+    "gc_keep": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 896,
+      "events": 3
+    },
+    "gc_list": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 24917,
+      "events": 3
+    },
+    "legacy_gc": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 22021,
+      "events": 3
+    },
+    "manifest": {
+      "block_gets": 0,
+      "block_puts": 0,
+      "deleted": 0,
+      "elapsed_us": 9771,
+      "events": 3
+    },
+    "row_sst": {
+      "block_gets": 19,
+      "block_puts": 117,
+      "deleted": 0,
+      "elapsed_us": 543336,
+      "events": 3
+    },
+    "value_indexes": {
+      "block_gets": 0,
+      "block_puts": 311,
+      "deleted": 0,
+      "elapsed_us": 1519108,
+      "events": 3
+    }
+  }
+}

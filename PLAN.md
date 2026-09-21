@@ -162,9 +162,18 @@ completed without errors: pos3ql p99 was 72.39 ms without explicit
 checkpoints and 1,447.94 ms with them; PostgreSQL p99 was 2.76 and 1.51 ms
 in its much shorter samples. These shared-host timings are exploratory, and
 PostgreSQL's local persistence has no equivalent object-request metric.
-Next, attribute pos3ql's remaining SST publication and deletion time using
-phase-specific measurements, then repeat checkpoint interference on larger
-datasets and representative hardware.
+The [fixed-memory phase profile](benchmarks/baselines/2026-09-21-checkpoint-phase-1000/README.md)
+now attributes publication and cleanup in a four-second, 1,000-row run. Its
+full request window reconciles all 846 object DELETEs: 550 from commit-batch
+pruning and 296 from block garbage collection. The measured phase spans were
+1.59 seconds for commit pruning, 1.52 seconds for value-index rebuild, 0.82
+seconds for block deletion, and 0.54 seconds for row SST publication. The
+profile includes cleanup after timed queries end, so these spans do not by
+themselves identify foreground stall time. Next, correlate phase timing with
+query stalls, then reduce the measured commit cleanup and index publication
+costs while preserving durability, fixed memory, and provider neutrality.
+Repeat on larger datasets and representative hardware before changing
+checkpoint pacing or asserting production ratios.
 
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local

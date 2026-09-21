@@ -152,6 +152,14 @@ The report records each engine's baseline and checkpoint p99, while keeping
 PostgreSQL's local storage and pos3ql's object requests distinct. The 1,000-row
 shared-host samples are too short to establish production ratios, particularly
 for PostgreSQL's subsecond workloads.
+The [checkpoint phase profile](../benchmarks/baselines/2026-09-21-checkpoint-phase-1000/README.md)
+uses a compile-time diagnostic feature and a fixed stack log line for each
+publication or cleanup phase. The focused four-second run attributed 550
+object DELETEs to commit-batch pruning and 296 to block garbage collection,
+matching all 846 DELETEs in the profile request window. Value-index rebuild
+made 311 block PUTs and took 1.52 seconds; row SST publication made 117 and
+took 0.54 seconds. The window includes cleanup after timed queries end, so
+these phase totals do not measure query stall time or a production ratio.
 
 ## Measured scenarios
 

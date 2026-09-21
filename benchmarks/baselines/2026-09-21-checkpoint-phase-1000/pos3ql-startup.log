@@ -1,0 +1,48 @@
+pos3ql starting
+  listen_addr  127.0.0.1:19600
+  data_dir     /var/folders/93/f1fz6s6969gbkd8m9tph1rfw0000gn/T//pos3ql-performance.IwJfXn/data-warm
+memory plan:
+  memtable     16 MiB
+  tables       386882954 B
+  block cache  32 MiB
+  connections  193961792 B
+  server       73166144 B
+  total        704342538 B
+  disk cache   1 GiB (disk, not RAM)
+  temp spill   128 MiB (local ephemeral disk)
+startup complete: memory frozen (656251736 B of 704342538 B budget drawn); accepting connections
+checkpoint_phase lsn=2132 phase=row_sst slot=0 elapsed_us=582330 block_gets=0 block_puts=137 deleted=0
+checkpoint_phase lsn=2132 phase=value_indexes slot=0 elapsed_us=504746 block_gets=0 block_puts=152 deleted=0
+checkpoint_phase lsn=2132 phase=manifest slot=-1 elapsed_us=3565 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=commit_prune slot=-1 elapsed_us=156800 block_gets=0 block_puts=0 deleted=56
+checkpoint_phase lsn=2132 phase=legacy_gc slot=-1 elapsed_us=6069 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=gc_keep slot=-1 elapsed_us=212 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=gc_list slot=-1 elapsed_us=6513 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=2132 phase=gc_delete slot=-1 elapsed_us=0 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3204 phase=row_sst slot=0 elapsed_us=165947 block_gets=0 block_puts=39 deleted=0
+checkpoint_phase lsn=3204 phase=value_indexes slot=0 elapsed_us=597475 block_gets=0 block_puts=152 deleted=0
+checkpoint_phase lsn=3204 phase=manifest slot=-1 elapsed_us=3297 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3204 phase=commit_prune slot=-1 elapsed_us=1224974 block_gets=0 block_puts=0 deleted=432
+checkpoint_phase lsn=3204 phase=legacy_gc slot=-1 elapsed_us=8347 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3204 phase=gc_keep slot=-1 elapsed_us=307 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3204 phase=gc_list slot=-1 elapsed_us=9011 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3204 phase=gc_delete slot=-1 elapsed_us=401814 block_gets=0 block_puts=0 deleted=146
+checkpoint_phase lsn=3216 phase=row_sst slot=0 elapsed_us=209008 block_gets=18 block_puts=39 deleted=0
+checkpoint_phase lsn=3216 phase=value_indexes slot=0 elapsed_us=237624 block_gets=0 block_puts=40 deleted=0
+checkpoint_phase lsn=3216 phase=manifest slot=-1 elapsed_us=3375 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=commit_prune slot=-1 elapsed_us=23243 block_gets=0 block_puts=0 deleted=4
+checkpoint_phase lsn=3216 phase=legacy_gc slot=-1 elapsed_us=5977 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=gc_keep slot=-1 elapsed_us=296 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=gc_list slot=-1 elapsed_us=7126 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3216 phase=gc_delete slot=-1 elapsed_us=103024 block_gets=0 block_puts=0 deleted=37
+pos3ql: shutdown requested, draining
+checkpoint_phase lsn=3508 phase=row_sst slot=0 elapsed_us=168381 block_gets=1 block_puts=39 deleted=0
+checkpoint_phase lsn=3508 phase=value_indexes slot=0 elapsed_us=684009 block_gets=0 block_puts=119 deleted=0
+checkpoint_phase lsn=3508 phase=manifest slot=-1 elapsed_us=3099 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3508 phase=commit_prune slot=-1 elapsed_us=341902 block_gets=0 block_puts=0 deleted=114
+checkpoint_phase lsn=3508 phase=legacy_gc slot=-1 elapsed_us=7697 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3508 phase=gc_keep slot=-1 elapsed_us=293 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3508 phase=gc_list slot=-1 elapsed_us=8780 block_gets=0 block_puts=0 deleted=0
+checkpoint_phase lsn=3508 phase=gc_delete slot=-1 elapsed_us=314734 block_gets=0 block_puts=0 deleted=113
+pos3ql: final checkpoint written
+pos3ql: shutdown complete

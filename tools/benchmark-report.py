@@ -111,8 +111,10 @@ def main():
         print("\n## Checkpoint phases\n")
         print("Profiled pos3ql build; totals cover explicit and automatic checkpoint work "
               "from the workload start through server stop.")
-        print("Times sum phase spans and are not query latency or a cross-system metric. ")
-        print("The profile request window includes cleanup after the timed workload ends.\n")
+        print(
+            "Times sum phase spans and are not query latency or a cross-system metric. "
+            "The profile request window includes cleanup after the timed workload ends.\n"
+        )
         print("| Phase | Events | Elapsed ms | Block GET | Block PUT | Object DELETE |")
         print("|---|---:|---:|---:|---:|---:|")
         for phase, totals in sorted(profile["totals"].items()):

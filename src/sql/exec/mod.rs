@@ -50416,6 +50416,7 @@ pub fn reindex(
         }
     }
     for &table in &tables[..table_count] {
+        storage.mark_value_bindings_dirty(table);
         if let Err(error) = storage.refresh_enforcers(table) {
             return sql_fail(error);
         }

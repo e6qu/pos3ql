@@ -19506,6 +19506,8 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
                     message: stack_format!(192, "journal replay overflows {}", e.what),
                 })?;
+            storage.mark_value_bindings_dirty(index);
+            storage.table_mut(index).mark_dirty();
         }
         WalOp::Delete {
             schema,

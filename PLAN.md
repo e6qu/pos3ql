@@ -215,8 +215,22 @@ checkpoints execute their batches contiguously, so this establishes the
 per-beat and scan boundaries rather than an end-to-end latency ratio. Actual
 PostgreSQL 18.6 remains the reference for the paired SQL workload on its
 documented local durable tier.
-Next, reduce the remaining per-checkpoint value-index and row publication
-traffic, then repeat at larger scale on representative hardware.
+Value-index publication now follows physical column dependencies. Each binding
+records the columns used by its key, partial predicate, and included payload;
+the precommit row path compares encoded column payloads without allocation and
+dirties only intersecting bindings. Insert, delete, replay, rewrite, and index
+maintenance retain conservative invalidation. A recovery regression covers
+primary, covering, expression, partial, and GIN indexes, including a WAL-only
+insert checkpointed after an object-cold restart.
+The [selective publication run](benchmarks/baselines/2026-09-21-checkpoint-value-dependencies-1000/README.md)
+had the same settled three value-index events as the final-slice run. Their
+block PUTs fell from 224 to 24 and measured phase time from 1.03 seconds to
+0.19 seconds; full-window PUTs fell from 765 to 576. Actual PostgreSQL 18.6
+completed the matched SQL and checkpoint workload on its recorded local
+durable tier. These shared-host measurements are exploratory and do not equate
+PostgreSQL storage with pos3ql object traffic. Next, reduce repeated row SST
+generations and reslicing, then repeat at larger scale on representative
+hardware.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

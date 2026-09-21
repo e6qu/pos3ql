@@ -10396,12 +10396,15 @@ impl Checkpointer {
         Ok(())
     }
 
-    /// Rebuilds each distinct constrained/named tuple as a compact key-only
-    /// generation. This is deliberately a full logical rebuild: stale keys
-    /// disappear at every publish, while publication remains atomic with the
-    /// row generation through the same manifest CAS.
+    /// Rebuilds each changed constrained or named tuple as a compact key-only
+    /// generation. A binding whose dependent physical columns did not change
+    /// retains its prior immutable handle; changed bindings still receive a
+    /// full logical rebuild so stale keys disappear atomically with the row
+    /// generation through the same manifest CAS.
     fn build_value_indexes(&mut self, storage: &Storage, slot: usize) -> Result<(), SqlError> {
-        if storage.value_binding_count(slot) == 0 {
+        if !(0..storage.value_binding_count(slot))
+            .any(|binding| storage.value_binding_needs_publish(slot, binding))
+        {
             return Ok(());
         }
         // Checkpoints run between statements, so they can lease the same
@@ -10424,7 +10427,9 @@ impl Checkpointer {
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
         let published_lsn = storage.lsn();
         for binding in 0..storage.value_binding_count(slot) {
-            if !storage.value_binding_is_committed(slot, binding) {
+            if !storage.value_binding_is_committed(slot, binding)
+                || !storage.value_binding_needs_publish(slot, binding)
+            {
                 continue;
             }
             self.roster_scratch.clear();

@@ -182,6 +182,17 @@ and a 624.60 ms p99. PostgreSQL 18.6 completed 73,534 operations with a
 0.59 ms p99 on isolated local APFS. The corrected window boundary prevents a
 controlled timing comparison with the earlier correlation run, and these
 shared-host measurements remain exploratory.
+The [selective value-index run](../benchmarks/baselines/2026-09-21-checkpoint-value-dependencies-1000/README.md)
+records dependency-aware publication from a clean commit. The precommit row
+path compares encoded physical columns and invalidates only bindings whose key,
+partial predicate, or included payload can change. Conservative invalidation
+still covers membership changes, rewrites, maintenance, and WAL replay. With
+the same settled shape of three row/value publication events as the final-slice
+run, value-index block PUTs fell from 224 to 24 and their phase time from
+1.03 seconds to 0.19 seconds; full-window PUTs fell from 765 to 576. The run
+also preserves a matched workload against actual PostgreSQL 18.6 on its
+recorded Docker-managed local durable tier. Timing remains exploratory on the
+shared host, and PostgreSQL has no corresponding object-request measure.
 
 ## Measured scenarios
 

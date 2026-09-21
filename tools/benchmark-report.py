@@ -98,6 +98,20 @@ def main():
             f"{number(object_requests, 3)} | {len(measured['errors'])} |"
         )
 
+    profile_path = args.directory / "checkpoint-profile.json"
+    if profile_path.exists():
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        print("\n## Checkpoint phases\n")
+        print("Profiled pos3ql build; totals cover the measured checkpoint workload interval only. ")
+        print("Times sum phase spans and are not query latency or a cross-system metric.\n")
+        print("| Phase | Events | Elapsed ms | Block GET | Block PUT | Object DELETE |")
+        print("|---|---:|---:|---:|---:|---:|")
+        for phase, totals in sorted(profile["totals"].items()):
+            print(
+                f"| {phase} | {totals['events']} | {number(totals['elapsed_us'] / 1000)} | "
+                f"{totals['block_gets']} | {totals['block_puts']} | {totals['deleted']} |"
+            )
+
     if recoveries:
         print("\n## Recovery and cache-fill intervals\n")
         print("| Cache state | startup s | GET | ranged GET | LIST | response MiB |")

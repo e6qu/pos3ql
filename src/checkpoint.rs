@@ -35,6 +35,34 @@ const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
 
+#[cfg(feature = "checkpoint-profile")]
+fn profile_checkpoint_phase(
+    phase: &'static str,
+    lsn: u64,
+    slot: Option<usize>,
+    started: std::time::Instant,
+    before: crate::store::BlockIoStats,
+    after: crate::store::BlockIoStats,
+    deleted: usize,
+) {
+    let io = after.saturating_sub(before);
+    let line = stack_format!(
+        256,
+        "checkpoint_phase lsn={} phase={} slot={} elapsed_us={} block_gets={} block_puts={} deleted={}\n",
+        lsn,
+        phase,
+        slot.map_or(-1, |slot| slot as i64),
+        started.elapsed().as_micros(),
+        io.object_gets,
+        io.object_puts,
+        deleted
+    );
+    // A fixed stack line keeps diagnostics outside the runtime heap budget.
+    unsafe {
+        libc::write(2, line.as_str().as_ptr().cast(), line.as_str().len());
+    }
+}
+
 /// A published roster proves these immutable blocks already reached the
 /// durable tier. Their content identity lets a rebuild reuse unchanged blocks.
 struct PublishedValueBlockStore<'a> {
@@ -6586,7 +6614,22 @@ impl Checkpointer {
             return Ok(CheckpointStep::Working);
         }
         let lsn = storage.lsn();
-        self.publish(storage, lsn)?;
+        #[cfg(feature = "checkpoint-profile")]
+        let publish_started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let publish_before = self.blocks.borrow().io_stats();
+        let published = self.publish(storage, lsn);
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "manifest",
+            lsn,
+            None,
+            publish_started,
+            publish_before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
+        published?;
         storage.clear_dirty_through(&self.sliced_generation);
         self.sweeping = false;
         Ok(CheckpointStep::Published { lsn })
@@ -10035,6 +10078,10 @@ impl Checkpointer {
             ));
         }
 
+        #[cfg(feature = "checkpoint-profile")]
+        let row_started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let row_before = self.blocks.borrow().io_stats();
         if !clean {
             // Collect rowids; each rowid expands to its current image plus
             // every snapshot-retained committed version. The scratch remains
@@ -10185,7 +10232,33 @@ impl Checkpointer {
                 (false, None) => self.prev_scratch[slot].clear(),
             }
         }
+        #[cfg(feature = "checkpoint-profile")]
+        if !clean {
+            profile_checkpoint_phase(
+                "row_sst",
+                storage.lsn(),
+                Some(slot),
+                row_started,
+                row_before,
+                self.blocks.borrow().io_stats(),
+                0,
+            );
+        }
+        #[cfg(feature = "checkpoint-profile")]
+        let index_started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let index_before = self.blocks.borrow().io_stats();
         self.build_value_indexes(storage, slot)?;
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "value_indexes",
+            storage.lsn(),
+            Some(slot),
+            index_started,
+            index_before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
         Ok(())
     }
 
@@ -10469,6 +10542,10 @@ impl Checkpointer {
     /// Returns true once the namespace is clean; false means another paced
     /// deletion batch remains.
     fn collect_block_garbage_batch(&mut self, storage: &Storage) -> Result<bool, SqlError> {
+        #[cfg(feature = "checkpoint-profile")]
+        let keep_started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let keep_before = self.blocks.borrow().io_stats();
         self.roster_scratch.clear();
         self.sst_arena.reset();
         let scratch = self
@@ -10562,10 +10639,24 @@ impl Checkpointer {
         // every live block for every listed key.
         self.roster_scratch.sort_unstable_by_key(|(id, _)| *id);
         self.roster_scratch.dedup_by_key(|(id, _)| *id);
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "gc_keep",
+            storage.lsn(),
+            None,
+            keep_started,
+            keep_before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
         self.doomed_blocks.clear();
         let keep = &self.roster_scratch;
         let doomed = &mut self.doomed_blocks;
         let mut overflow = false;
+        #[cfg(feature = "checkpoint-profile")]
+        let list_started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let list_before = self.blocks.borrow().io_stats();
         self.client
             .list("blocks/", |key| {
                 let hex = key.strip_prefix("blocks/").unwrap_or(key);
@@ -10581,12 +10672,36 @@ impl Checkpointer {
                 }
             })
             .map_err(object_store_to_sql)?;
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "gc_list",
+            storage.lsn(),
+            None,
+            list_started,
+            list_before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
+        #[cfg(feature = "checkpoint-profile")]
+        let delete_started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let delete_before = self.blocks.borrow().io_stats();
         for i in 0..self.doomed_blocks.len() {
             let key = self.doomed_blocks[i];
             self.client
                 .delete(key.as_str())
                 .map_err(object_store_to_sql)?;
         }
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "gc_delete",
+            storage.lsn(),
+            None,
+            delete_started,
+            delete_before,
+            self.blocks.borrow().io_stats(),
+            self.doomed_blocks.len(),
+        );
         Ok(!overflow)
     }
 
@@ -10595,6 +10710,10 @@ impl Checkpointer {
     /// Returns true once the namespace is clean; false means another paced
     /// deletion batch remains.
     fn collect_garbage_batch(&mut self) -> Result<bool, SqlError> {
+        #[cfg(feature = "checkpoint-profile")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "checkpoint-profile")]
+        let before = self.blocks.borrow().io_stats();
         // Two passes because list borrows the client: collect keys first
         // into pre-reserved scratch (no allocation post-freeze).
         self.garbage_scratch.clear();
@@ -10615,6 +10734,16 @@ impl Checkpointer {
                 .delete(key.as_str())
                 .map_err(object_store_to_sql)?;
         }
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "legacy_gc",
+            self.manifest_lsn,
+            None,
+            started,
+            before,
+            self.blocks.borrow().io_stats(),
+            self.garbage_scratch.len(),
+        );
         Ok(!overflow)
     }
 }

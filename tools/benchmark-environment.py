@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--object-latency-ms", type=float, required=True)
     parser.add_argument("--disk-cache-mib", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=float, required=True)
+    parser.add_argument("--checkpoint-profile", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
     binary_bytes = args.binary.read_bytes()
     status = command("git", "status", "--porcelain")
@@ -67,6 +68,7 @@ def main():
             "object_latency_ms": args.object_latency_ms,
             "disk_cache_mib": args.disk_cache_mib,
             "timeout_seconds": args.timeout_seconds,
+            "checkpoint_profile_enabled": bool(args.checkpoint_profile),
         },
         "pos3ql_object_store": {
             "implementation": "tests/external/s3_test_server.py",

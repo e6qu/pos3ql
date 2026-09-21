@@ -2579,11 +2579,16 @@ pub struct Table {
     pub serial_last: [i64; MAX_COLUMNS],
     /// Whether `serial_last` changed since it was last written to the WAL.
     pub serial_dirty: bool,
-    /// The SSTs holding this table's spilled rows, in flush order: a full
-    /// checkpoint writes one, each delta checkpoint appends one, and a merge
-    /// (list full) collapses back to one. A row's map entry names which list
-    /// slot its bytes live in.
+    /// The SSTs holding this table's spilled rows, in flush order. Full
+    /// rewrites replace the list, delta checkpoints append, and paced
+    /// compaction merges adjacent members. A row's map entry names the list
+    /// slot containing its bytes.
     pub(crate) spill_ssts: Box<[Option<crate::store::SstHandle>]>,
+    /// Highest commit LSN captured by each generation in this process. Cold
+    /// recovery leaves these zero because recovered rows already name their
+    /// exact SST; local heap rows use the boundaries when pressure later
+    /// evicts them without sacrificing warm-memory reads after publication.
+    pub(crate) spill_through_lsn: Box<[u64]>,
     pub(crate) n_spill_ssts: usize,
     /// Value caches accelerating this table's uniqueness and equality probes,
     /// one per distinct constrained or named-index tuple, rebuilt whenever the
@@ -14883,7 +14888,7 @@ impl Storage {
                 * (size_of::<Table>() + FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + table_slot_capacity(config)
                 .saturating_mul(config.max_spill_generations_per_table)
-                .saturating_mul(size_of::<Option<crate::store::SstHandle>>())
+                .saturating_mul(size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>())
             + pending_row_version_capacity(config).saturating_mul(size_of::<PendingVersionSlot>())
             + committed_row_version_capacity(config)
                 .saturating_mul(size_of::<CommittedVersionSlot>())
@@ -15002,7 +15007,7 @@ impl Storage {
         let mut tables = FixedVec::new(budget, "tables", table_capacity)?;
         budget.draw_array(
             table_capacity.saturating_mul(config.max_spill_generations_per_table),
-            size_of::<Option<crate::store::SstHandle>>(),
+            size_of::<Option<crate::store::SstHandle>>() + size_of::<u64>(),
             "table spill-generation rosters",
         )?;
         let pending_row_versions = FixedVec::new(
@@ -15061,6 +15066,8 @@ impl Storage {
                     serial_last: [0; MAX_COLUMNS],
                     serial_dirty: false,
                     spill_ssts: vec![None; config.max_spill_generations_per_table]
+                        .into_boxed_slice(),
+                    spill_through_lsn: vec![0; config.max_spill_generations_per_table]
                         .into_boxed_slice(),
                     n_spill_ssts: 0,
                     enforcers: [None; MAX_VALUE_ENFORCERS],
@@ -25651,18 +25658,36 @@ impl Storage {
             return;
         }
         let table = &mut self.tables[slot];
-        // The newest SST is the delta just written, and it carries every
-        // committed heap image selected for eviction.
         let newest = (table.n_spill_ssts - 1) as u32;
         for (_, state) in table.rows.iter_mut() {
             if let Some(RowHome::Heap(loc)) = state.committed {
+                let sst = table
+                    .spill_through_lsn
+                    .iter()
+                    .take(table.n_spill_ssts)
+                    .position(|&through_lsn| through_lsn != 0 && state.committed_lsn <= through_lsn)
+                    .map_or(newest, |generation| generation as u32);
                 state.committed = Some(RowHome::Spilled {
                     len: loc.len,
-                    sst: newest,
+                    sst,
                     commit_lsn: state.committed_lsn,
                 });
             }
         }
+    }
+
+    /// Records the commit boundary captured by a locally published generation.
+    /// Heap rows remain warm until pressure evicts them; the boundaries then
+    /// map each row to the first generation that contains its current image.
+    pub(crate) fn set_spill_generation_through(
+        &mut self,
+        slot: usize,
+        generation: usize,
+        through_lsn: u64,
+    ) {
+        let table = &mut self.tables[slot];
+        debug_assert!(generation < table.n_spill_ssts);
+        table.spill_through_lsn[generation] = through_lsn;
     }
 
     pub(crate) fn release_table_histories(&mut self, slot: usize) {
@@ -25684,10 +25709,10 @@ impl Storage {
 
     /// A full rewrite: the new SST holds every committed row, so the list
     /// collapses to it and every spilled map entry is remapped to slot 0.
-    /// Clears the tombstones the rewrite made moot.
     pub(crate) fn collapse_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
         let table = &mut self.tables[slot];
         table.spill_ssts.fill(None);
+        table.spill_through_lsn.fill(0);
         table.spill_ssts[0] = Some(handle);
         table.n_spill_ssts = 1;
         for (_, state) in table.rows.iter_mut() {
@@ -25719,16 +25744,21 @@ impl Storage {
         let removed = if handle.is_some() { 1u32 } else { 2u32 };
         let mut n = 0;
         table.spill_ssts.copy_within(0..at, 0);
+        table.spill_through_lsn.copy_within(0..at, 0);
         n += at;
         if let Some(h) = handle {
             table.spill_ssts[n] = Some(h);
+            table.spill_through_lsn[n] =
+                table.spill_through_lsn[at].max(table.spill_through_lsn[at + 1]);
             n += 1;
         }
         for i in at + 2..table.n_spill_ssts {
             table.spill_ssts[n] = table.spill_ssts[i];
+            table.spill_through_lsn[n] = table.spill_through_lsn[i];
             n += 1;
         }
         table.spill_ssts[n..].fill(None);
+        table.spill_through_lsn[n..].fill(0);
         table.n_spill_ssts = n;
         let at = at as u32;
         for (_, state) in table.rows.iter_mut() {
@@ -25755,8 +25785,8 @@ impl Storage {
     }
 
     /// A delta flush: the new SST (heap rows + tombstones) joins the list;
-    /// existing spilled entries keep their slots. Clears the flushed
-    /// tombstones. The caller guarantees the list has room.
+    /// existing spilled entries keep their slots. The caller guarantees the
+    /// list has room.
     pub(crate) fn append_spill(&mut self, slot: usize, handle: crate::store::SstHandle) {
         let table = &mut self.tables[slot];
         assert!(
@@ -25764,6 +25794,7 @@ impl Storage {
             "delta flush into a full list"
         );
         table.spill_ssts[table.n_spill_ssts] = Some(handle);
+        table.spill_through_lsn[table.n_spill_ssts] = 0;
         table.n_spill_ssts += 1;
     }
 
@@ -25785,6 +25816,7 @@ impl Storage {
             "validated spill list fits configured capacity"
         );
         table.spill_ssts.fill(None);
+        table.spill_through_lsn.fill(0);
         let mut installed = 0;
         for handle in handles {
             assert!(installed < len, "spill iterator exceeds declared length");
@@ -29251,6 +29283,7 @@ impl Storage {
         table.serial_last = [0; MAX_COLUMNS];
         table.serial_dirty = false;
         table.spill_ssts.fill(None);
+        table.spill_through_lsn.fill(0);
         table.n_spill_ssts = 0;
         let schema = table.def.schema;
         let name = table.def.name;

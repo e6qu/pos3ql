@@ -167,6 +167,17 @@ dependencies. Unrelated updates retain published generations; row-set
 replacement and replay paths invalidate conservatively. A WAL-only recovery
 regression caught and closes the direct-replay invalidation gap, and the clean
 profile plus actual PostgreSQL 18 comparison are recorded in PLAN.md.
+The checkpoint row-reslice audit found no externally blocked defect. Compatible
+stale slices now remain in the pending manifest and later slices include only
+newer committed versions. Startup-bounded generation LSNs preserve warm reads
+and guide later eviction, while physical-layout changes and full rosters take
+the rebuild path. Value-index work completes before the retained row slice is
+advanced so an I/O retry cannot duplicate an interval. Full-roster fallback
+now stages its replacement row list and value-index installs before discarding
+the retained slice, so a failed object write retries with the same tombstone
+and LSN boundary. A focused fault-injection regression, the storage VOPR
+corpus, checkpoint suite, clean profile, and object-cold recovery qualify the
+change; larger representative measurement remains in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

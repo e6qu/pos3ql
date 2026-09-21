@@ -4,41 +4,50 @@ The [environment manifest](environment.json), [PostgreSQL settings](postgresql-s
 [raw mixed workload](mixed-checkpoint-interference.json), [checkpoint phase events](checkpoint-profile.json),
 [server log](pos3ql-startup.log), and [derived report](report.md) preserve a
 feature-enabled run from clean commit
-`107f97f4f5e200a3ac3d5bf0ece5be91c9962a51`. The manifest records the
+`8fe85e06cad590b9a3cac2392801837270f538fa`. The manifest records the
 release binary SHA-256, host, toolchain, cache, four-second minimum workload
-duration, and 120-second query timeout.
+duration, 120-second query timeout, and the settling checkpoint before the
+interference window.
 
-This run repeats the settings from the clean
-[foreground-correlation baseline](../2026-09-21-checkpoint-stall-correlation-1000/README.md).
 The change publishes a manifest in the same beat that writes the final stale
-table slice. Earlier code yielded after that slice, so a foreground write
-could invalidate it before the next beat and force another immutable row SST
-and value-index generation.
+table slice when no merge beat is due. Earlier code always yielded after
+that slice, so a foreground write could invalidate it before the next beat and
+force another immutable row SST and value-index generation. When compaction is
+pending, the yield remains so the alternating bounded merge beat cannot be
+starved. A two-table regression proves the first slice remains paced and the
+final slice publishes without a dispatch gap; the existing long-history
+regression proves merge progress remains within fixed scratch.
 
-| pos3ql measure | Before | Final-slice publish | Change |
-|---|---:|---:|---:|
-| Manifest publications | 9 | 9 | 0% |
-| Row SST rebuilds | 14 | 9 | -36% |
-| Value-index rebuilds | 14 | 9 | -36% |
-| Row SST block PUTs | 718 | 465 | -35% |
-| Value-index block PUTs | 754 | 505 | -33% |
-| All object PUTs | 1,621 | 1,047 | -35% |
-| Summed foreground phase intersection | 44,007 ms | 28,428 ms | -35% |
+The harness now completes one unmeasured checkpoint on each engine after its
+baseline workload. This drains baseline publication and cleanup before the
+profile offsets and request counters are captured. The measured window then
+runs three explicit checkpoints. pos3ql produced three row and value-index
+generations for those checkpoints. A fourth metadata-only manifest was written
+during server shutdown, which is inside the full profile and object-request
+window.
 
-Both clean runs completed all 200 pos3ql checkpoint-overlap operations and
-three explicit checkpoints. The new run completed them in 8.47 seconds rather
-than 12.65 seconds; p99 was 2,387.70 ms rather than 2,548.02 ms. These timing
-differences are exploratory on an unreserved shared host. The request counts
-and equal publication count directly show that the five invalidated
-generations were removed without skipping a durable manifest.
+| pos3ql phase | Events | Phase time | Summed foreground intersection | Block PUT | Object DELETE |
+|---|---:|---:|---:|---:|---:|
+| Value-index rebuild | 3 | 1,035 ms | 1,907 ms | 224 | 0 |
+| Row SST publication | 3 | 506 ms | 1,386 ms | 117 | 0 |
+| Commit-batch pruning | 4 | 727 ms | 251 ms | 0 | 254 |
+| Block garbage deletion | 4 | 564 ms | 894 ms | 0 | 218 |
+| Manifest publication | 4 | 12 ms | 38 ms | 0 | 0 |
 
-Actual PostgreSQL 18.6 completed 74,276 operations and three explicit
-checkpoints in the new four-second comparison window. Its p99 was 0.37 ms
-without explicit checkpoints and 0.76 ms with them. PostgreSQL used an
-isolated local APFS data directory with `fsync`, `full_page_writes`, and
-`synchronous_commit` on; pos3ql used a 1 GiB fixed disk cache and an
-instrumented S3-compatible fixture backed by temporary local storage with 2
-ms injected request latency. The systems use distinct persistence tiers.
+The full window recorded 765 object PUTs, 475 DELETEs, 16 LISTs, and 296
+ranged GETs. Commit pruning and block garbage deletion account for 472
+DELETEs; three requests fall outside those attributed delete counters. The
+phase counters account for 341 block PUTs. The remaining PUTs include commit
+publication and manifest writes outside the block-writer phases.
+
+All 725 pos3ql foreground operations completed in 4.03 seconds. Its p99 was
+75.12 ms without explicit checkpoints and 624.60 ms in the checkpoint-overlap
+workload. Actual PostgreSQL 18.6 completed 73,534 operations and three explicit
+checkpoints; its p99 was 0.61 ms and 0.59 ms. These shared-host timings are
+exploratory. PostgreSQL used an isolated local APFS data directory with
+`fsync`, `full_page_writes`, and `synchronous_commit` on. pos3ql used a 1 GiB
+fixed disk cache and an instrumented S3-compatible fixture backed by temporary
+local storage with 2 ms injected request latency.
 
 Reproduce with an isolated PostgreSQL 18 server configured as recorded in
 `postgresql-server.json`, then run:

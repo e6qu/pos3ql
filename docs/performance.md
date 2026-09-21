@@ -172,12 +172,16 @@ These are associations across explicit and automatic checkpoint work, not an
 exclusive causal decomposition or a production ratio.
 The following [final-slice run](../benchmarks/baselines/2026-09-21-checkpoint-final-slice-1000/README.md)
 closes the dispatch gap between writing the last stale table slice and
-publishing its manifest. Against the clean correlation run, manifest count
-remained nine while row and value-index rebuild counts fell from fourteen to
-nine. Total object PUTs fell from 1,621 to 1,047 and summed foreground phase
-intersection fell from 44.01 to 28.43 seconds. The same 200 operations
-completed in 8.47 rather than 12.65 seconds; shared-host latency remains
-exploratory.
+publishing its manifest when no merge beat is due. The harness also
+completes an unmeasured checkpoint after each engine's baseline so earlier
+automatic work cannot enter the interference profile. In the resulting
+four-second window, three explicit checkpoints produced three row SST and
+value-index generations; a fourth metadata-only manifest was published at
+shutdown. The run recorded 765 object PUTs, 725 completed pos3ql operations,
+and a 624.60 ms p99. PostgreSQL 18.6 completed 73,534 operations with a
+0.59 ms p99 on isolated local APFS. The corrected window boundary prevents a
+controlled timing comparison with the earlier correlation run, and these
+shared-host measurements remain exploratory.
 
 ## Measured scenarios
 

@@ -6690,7 +6690,7 @@ impl Checkpointer {
         {
             return Ok(CheckpointStep::Working);
         }
-        // Without compaction work owed, publish with the final slice while
+        // Without a merge beat due, publish with the final slice while
         // every captured generation is still current. Yielding here lets the
         // next statement invalidate that slice and forces its immutable
         // blocks to be written again. An owed merge retains its alternating

@@ -182,13 +182,17 @@ and bound cleanup work per dispatch beat while preserving durability, fixed
 memory, and provider neutrality.
 The [final-slice publication run](benchmarks/baselines/2026-09-21-checkpoint-final-slice-1000/README.md)
 removes one source of repeated publication. A sweep now publishes in the beat
-that writes its final stale table slice, while still yielding after a slice
-when another table remains. Across matching clean runs, manifest publications
-stayed at nine while row and value-index rebuilds fell from fourteen to nine;
-object PUTs fell from 1,621 to 1,047 and summed foreground phase intersection
-fell from 44.01 to 28.43 seconds. Next, bound commit and block deletion work
-per dispatch beat, then reduce the remaining per-checkpoint value-index and
-row publication traffic.
+that writes its final stale table slice when no merge beat is due. It
+still yields when another table is stale or a bounded merge beat is due. The
+benchmark now completes an unmeasured settling checkpoint after each engine's
+baseline, preventing earlier automatic work from entering the interference
+window. In the clean settled run, three explicit checkpoints produced three
+row SST and value-index generations, while shutdown added one metadata-only
+manifest; the window recorded 765 object PUTs. The earlier un-settled profile
+exposed redundant generations but is not a controlled timing comparison with
+this corrected boundary. Next, bound commit and block deletion work per
+dispatch beat, then reduce the remaining per-checkpoint value-index and row
+publication traffic.
 Repeat on larger datasets and representative hardware before changing
 checkpoint pacing or asserting production ratios.
 

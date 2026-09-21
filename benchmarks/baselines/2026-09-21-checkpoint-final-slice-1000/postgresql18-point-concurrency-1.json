@@ -10,24 +10,24 @@
     },
     "attempted_operations": 50,
     "completed_operations": 50,
-    "elapsed_seconds": 0.003447875,
+    "elapsed_seconds": 0.00570425,
     "errors": [],
     "fixed_memory_occupancy": null,
     "fixed_memory_plan_bytes": null,
     "latency_ms": {
-      "maximum": 0.65925,
-      "mean": 0.06720752,
-      "minimum": 0.045208,
-      "p50": 0.052625,
-      "p95": 0.087417,
-      "p99": 0.65925
+      "maximum": 0.635416,
+      "mean": 0.1123059,
+      "minimum": 0.070334,
+      "p50": 0.082916,
+      "p95": 0.2285,
+      "p99": 0.635416
     },
     "maintenance_operations": 0,
     "maximum_rss_bytes": null,
     "object_requests_per_operation": null,
     "object_store": null,
     "process_cpu_seconds": null,
-    "throughput_ops_per_second": 14501.685820976689
+    "throughput_ops_per_second": 8765.394223605206
   },
   "schema_version": 1,
   "target_identities": [

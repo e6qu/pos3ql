@@ -1,14 +1,14 @@
 {
   "artifact_type": "environment",
   "docker_version": "6.0.2",
-  "generated_utc": "2026-09-21T07:26:46.639335+00:00",
-  "git_commit": "107f97f4f5e200a3ac3d5bf0ece5be91c9962a51",
+  "generated_utc": "2026-09-21T08:02:59.016444+00:00",
+  "git_commit": "8fe85e06cad590b9a3cac2392801837270f538fa",
   "git_dirty": false,
   "logical_cpu_count": 12,
   "machine": "arm64",
   "physical_memory_bytes": 25769803776,
   "platform": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
-  "pos3ql_binary_sha256": "62de1a1b8b4b1745a8ffc516b7e386bd159822d5f918eaf79fcfe490e387dfca",
+  "pos3ql_binary_sha256": "16e785f9b1e91efd34fd75b7a252403f814859cb096b505ab7a15524e0ceb4fd",
   "pos3ql_object_store": {
     "backing": "temporary local filesystem",
     "implementation": "tests/external/s3_test_server.py",
@@ -21,6 +21,7 @@
   "suite": {
     "checkpoint_duration_seconds": 4.0,
     "checkpoint_profile_enabled": true,
+    "checkpoint_settled_before_interference": true,
     "clients": 4,
     "disk_cache_mib": 1024,
     "logical_replicas": 0,

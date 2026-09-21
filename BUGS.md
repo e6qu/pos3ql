@@ -135,10 +135,16 @@ run ranks publication and cleanup overlap in PLAN.md.
 The final-slice publication audit found no externally blocked defect. A paced
 sweep yielded after writing its last outdated table, allowing the next
 foreground statement to invalidate that slice before the manifest beat. The
-sweep now publishes while every captured generation is still current. A
-two-table regression proves the first slice remains paced, the final slice
-publishes in its own beat, manifest retry remains idempotent, and object-cold
-recovery retains both updates.
+sweep now publishes while every captured generation is still current when no
+merge beat is due. The full test suite exposed that unconditional same-beat
+publication could starve alternating compaction until fixed checkpoint scratch
+filled; the publication path now preserves that merge yield. The performance
+harness also allowed automatic checkpoint work from the baseline to enter the
+profile window, so each engine now completes an unmeasured settling checkpoint
+before interference counters begin. A two-table regression proves the paced
+and same-beat paths, the long-history regression proves bounded merge progress,
+manifest retry remains idempotent, and object-cold recovery retains both
+updates.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

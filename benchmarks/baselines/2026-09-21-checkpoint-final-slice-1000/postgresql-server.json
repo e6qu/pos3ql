@@ -17,7 +17,7 @@
     "data_directory": {
       "source": "override",
       "unit": null,
-      "value": "/tmp/pos3ql-pg18-final-slice.ZSLXLe"
+      "value": "/tmp/pos3ql-pg18-final-slice-settled.3EAYvv"
     },
     "fsync": {
       "source": "configuration file",

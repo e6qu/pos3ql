@@ -1,14 +1,14 @@
 {
   "artifact_type": "environment",
   "docker_version": "6.0.2",
-  "generated_utc": "2026-09-21T14:35:54.209930+00:00",
-  "git_commit": "c0c46276a7b376af00b015e81e7252cb4239dc76",
+  "generated_utc": "2026-09-21T15:21:01.734831+00:00",
+  "git_commit": "6591700f931989fa2a8e0be84d05782097b4b159",
   "git_dirty": false,
   "logical_cpu_count": 12,
   "machine": "arm64",
   "physical_memory_bytes": 25769803776,
   "platform": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
-  "pos3ql_binary_sha256": "4717b6b17d8e3ba76953627c6078590176db919d366d3ece67488caa894f996f",
+  "pos3ql_binary_sha256": "2327dfcff37ad87532c43b3d1a0bc6f4cbe3c46bc600c7838ab4395713e17d58",
   "pos3ql_object_store": {
     "backing": "temporary local filesystem",
     "implementation": "tests/external/s3_test_server.py",

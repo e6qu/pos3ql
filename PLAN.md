@@ -240,8 +240,8 @@ A deterministic regression reduced a one-row reslice from the first slice's 13
 block PUTs to 5; focused fault injection and the storage VOPR corpus qualify
 retry, deferred eviction, and object-cold recovery. The
 [incremental-reslice run](benchmarks/baselines/2026-09-21-checkpoint-row-reslice-1000/README.md)
-exercised two 39-then-5 block sweeps and one 137-block slice followed by four
-5-block reslices. Its matched actual PostgreSQL 18.6 workload completed with
+exercised 35-then-5 and 137-then-5 block sweeps plus the required full-roster
+rebuild path. Its matched actual PostgreSQL 18.6 workload completed with
 durability enabled on the recorded local tier. The run contained substantially
 more automatic checkpoint work than the prior profile, so its timing and total
 traffic are not a controlled comparison. Next, repeat at larger scale on

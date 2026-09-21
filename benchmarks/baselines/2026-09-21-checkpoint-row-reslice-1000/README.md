@@ -3,7 +3,7 @@
 The [environment manifest](environment.json), [PostgreSQL settings](postgresql-server.json),
 [raw mixed workload](mixed-checkpoint-interference.json), [checkpoint phase events](checkpoint-profile.json),
 [server log](pos3ql-startup.log), and [derived report](report.md) preserve a
-run from clean commit `c0c46276a7b376af00b015e81e7252cb4239dc76`. The
+run from clean commit `6591700f931989fa2a8e0be84d05782097b4b159`. The
 manifest records the release binary SHA-256, host, toolchain, cache, four-second
 minimum workload duration, 120-second query timeout, and settling checkpoint
 before the interference window.
@@ -14,23 +14,27 @@ LSN. A changed physical layout or a full spill-generation roster rebuilds from
 the published base. Startup-sized LSN boundaries map warm heap rows to the SST
 that contains them if later memory pressure evicts them; publication itself
 keeps those reads warm.
+Full-roster fallback stages its replacement row list and value-index installs
+in fixed startup scratch, so a failed object-store write leaves the retained
+slice and its LSN boundary available to the retry.
 
 The deterministic two-table regression writes 13 blocks for its first
 128-row slice and 5 for a one-row reslice, then verifies deferred eviction and
 empty-cache recovery across all three row generations. This profile also
-exercised reslicing under the mixed workload. Two sweeps wrote a 39-block slice
-followed by a 5-block reslice before publication. Another wrote a 137-block
-slice followed by four 5-block reslices. In total, 12 row-SST events wrote 362
-blocks across seven manifest events. These counts show that later slices carry
-only their new versions; they do not form a controlled before-and-after timing
-comparison because the run performed more automatic checkpoint work than the
-preceding selective-index profile.
+exercised reslicing under the mixed workload. One sweep wrote a 35-block slice
+followed by a 5-block reslice before publication; another wrote a 137-block
+slice followed by a 5-block reslice. A full-roster sweep rebuilt three
+35-block slices from the published base. In total, 11 row-SST events wrote 427
+blocks across seven manifest events. These counts show both the incremental
+compatible path and the required full-roster fallback; they do not form a
+controlled before-and-after timing comparison because the run performed more
+automatic checkpoint work than the preceding selective-index profile.
 
 All 200 pos3ql foreground operations and three explicit checkpoints completed.
-Its p99 was 69.56 ms without explicit checkpoints and 983.23 ms with them.
-Actual PostgreSQL 18.6 completed 8,038 operations and three explicit
-checkpoints in its matched interference workload, with p99 of 9.55 ms in the
-baseline and 11.82 ms under checkpoint pressure. PostgreSQL ran unmodified in
+Its p99 was 78.35 ms without explicit checkpoints and 717.67 ms with them.
+Actual PostgreSQL 18.6 completed 6,745 operations and three explicit
+checkpoints in its matched interference workload, with p99 of 9.92 ms in the
+baseline and 21.83 ms under checkpoint pressure. PostgreSQL ran unmodified in
 the recorded Docker image with `fsync`, `full_page_writes`, and
 `synchronous_commit` enabled on a Docker-managed local volume. pos3ql used a
 1 GiB fixed disk cache and an instrumented S3-compatible fixture backed by

@@ -3,43 +3,43 @@
   "label": "mixed-baseline",
   "results": {
     "access_path": {
-      "index_scans": 1703,
-      "index_tuples_fetched": 1703,
+      "index_scans": 1570,
+      "index_tuples_fetched": 1570,
       "sequential_scans": 0,
       "sequential_tuples_read": 0
     },
-    "attempted_operations": 1315,
-    "completed_operations": 1315,
-    "elapsed_seconds": 4.052733209,
+    "attempted_operations": 1197,
+    "completed_operations": 1197,
+    "elapsed_seconds": 4.000442333,
     "errors": [],
-    "fixed_memory_occupancy": 0.4316040146748803,
-    "fixed_memory_plan_bytes": 704778764,
+    "fixed_memory_occupancy": 0.43295616616770033,
+    "fixed_memory_plan_bytes": 704810380,
     "latency_ms": {
-      "maximum": 113.478458,
-      "mean": 12.304128882889735,
-      "minimum": 0.145959,
-      "p50": 13.014625,
-      "p95": 45.092958,
-      "p99": 69.561375
+      "maximum": 127.210083,
+      "mean": 13.362423213032582,
+      "minimum": 0.146458,
+      "p50": 13.678959,
+      "p95": 54.759125,
+      "p99": 78.352
     },
     "maintenance_operations": 0,
-    "maximum_rss_bytes": 304185344,
-    "object_requests_per_operation": 0.6988593155893537,
+    "maximum_rss_bytes": 305152000,
+    "object_requests_per_operation": 0.697577276524645,
     "object_store": {
       "errors": 0,
-      "request_body_bytes": 4560204,
+      "request_body_bytes": 4128819,
       "requests": {
         "delete": 0,
         "get": 0,
         "list": 0,
-        "put": 645,
+        "put": 561,
         "range_get": 274
       },
       "response_body_bytes": 195468,
       "schema_version": 1
     },
     "process_cpu_seconds": null,
-    "throughput_ops_per_second": 324.47238250959833
+    "throughput_ops_per_second": 299.21691162145794
   },
   "schema_version": 1,
   "target_identities": [

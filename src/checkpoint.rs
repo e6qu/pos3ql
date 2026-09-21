@@ -10256,6 +10256,24 @@ impl Checkpointer {
         }
         self.pending_value_installs
             .retain(|install| install.slot != slot);
+        // Finish the fallible value-index rebuild before changing the retained
+        // row slice. A retry can discard its pending value installs, while a
+        // row append must remain paired with the LSN recorded by the caller.
+        #[cfg(feature = "checkpoint-profile")]
+        let index_started = checkpoint_profile_start();
+        #[cfg(feature = "checkpoint-profile")]
+        let index_before = self.blocks.borrow().io_stats();
+        self.build_value_indexes(storage, slot)?;
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "value_indexes",
+            storage.lsn(),
+            Some(slot),
+            index_started,
+            index_before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
         // A completed paced merge is part of this publish's base before a
         // dirty table decides whether its new versions fit as a delta. A
         // retained slice already incorporated this merge.
@@ -10493,21 +10511,6 @@ impl Checkpointer {
                 0,
             );
         }
-        #[cfg(feature = "checkpoint-profile")]
-        let index_started = checkpoint_profile_start();
-        #[cfg(feature = "checkpoint-profile")]
-        let index_before = self.blocks.borrow().io_stats();
-        self.build_value_indexes(storage, slot)?;
-        #[cfg(feature = "checkpoint-profile")]
-        profile_checkpoint_phase(
-            "value_indexes",
-            storage.lsn(),
-            Some(slot),
-            index_started,
-            index_before,
-            self.blocks.borrow().io_stats(),
-            0,
-        );
         Ok(())
     }
 

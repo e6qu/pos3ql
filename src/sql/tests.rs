@@ -64556,6 +64556,110 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
+fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
+    let mut config = test_config("analyze-pax-container");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-analyze-pax-container-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.txn_rows = 1024;
+    config.table_rows = 1024;
+    config.value_index_rows = 1024;
+    config.work_arena_bytes = 96 << 20;
+    config.memtable_bytes = 8 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 8 << 20;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE analyze_stream(
+             id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL,
+             brin_span int4range NOT NULL, gist_span int4range NOT NULL,
+             gist_spans int4multirange NOT NULL, gist_address inet NOT NULL,
+             gist_location point NOT NULL, gin_tags integer[] NOT NULL,
+             gin_document tsvector NOT NULL, gist_document tsvector NOT NULL,
+             json_ops jsonb NOT NULL, json_path jsonb NOT NULL,
+             spgist_label text NOT NULL, spgist_span int4range NOT NULL,
+             spgist_address inet NOT NULL, spgist_location point NOT NULL,
+             payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192));
+         INSERT INTO analyze_stream(id, hash_key, brin_key, brin_span, gist_span, gist_spans, gist_address, gist_location, gin_tags, gin_document, gist_document, json_ops, json_path, spgist_label, spgist_span, spgist_address, spgist_location, payload)
+         SELECT value, value, value, int4range(value * 2, value * 2 + 2),
+            int4range(value * 3, value * 3 + 3),
+            int4multirange(int4range(value * 7, value * 7 + 2), int4range(value * 7 + 4, value * 7 + 6)),
+            '10.0.0.0'::inet + value, point(value, value), ARRAY[value],
+            to_tsvector('simple','token' || value::text),
+            to_tsvector('simple','gisttoken' || value::text),
+            jsonb_build_object('key' || value::text,'value' || value::text),
+            jsonb_build_object('token','value' || value::text),
+            'key-' || value::text, int4range(value * 5, value * 5 + 2),
+            '11.0.0.0'::inet + value, point(value, -value), 0
+         FROM generate_series(1,512) AS value",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let before = recovered.storage.block_io_stats();
+    let analyzed = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "ANALYZE analyze_stream",
+    );
+    assert!(
+        !message_types(&analyzed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&analyzed)
+    );
+    let reads = recovered.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        reads.object_gets < 128,
+        "ANALYZE fetched PAX extents separately: {reads:?}"
+    );
+    let slot = recovered
+        .storage
+        .find_table("public", "analyze_stream")
+        .unwrap();
+    let statistics = recovered.storage.table_statistics(slot, 0);
+    assert_eq!(statistics.rows, 512);
+    assert!(statistics.columns[1].distinct_values > 100);
+    assert!(statistics.average_row_width > 8_000);
+
+    let before = recovered.storage.block_io_stats();
+    let created = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "CREATE INDEX analyze_stream_hash ON analyze_stream USING hash (hash_key)",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let reads = recovered.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        reads.object_gets < 384,
+        "CREATE INDEX point-read each row or binding: {reads:?}"
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn checkpoint_reuses_published_index_blocks_after_small_update() {
     let mut config = test_config("checkpoint-value-block-reuse");
     config.object_store_on = true;
@@ -64790,6 +64894,175 @@ fn checkpoint_rebuilds_only_value_indexes_dependent_on_changed_columns() {
     drop(second);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
+    let mut config = test_config("create-index-value-publication");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-create-index-value-publication-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.max_indexes = 8;
+    config.max_value_indexes = 8;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sequential_indexes (
+             id integer PRIMARY KEY,
+             span int4range NOT NULL,
+             tags integer[] NOT NULL
+         );
+         CREATE TABLE sequential_index_tail (id integer PRIMARY KEY, value text);
+         INSERT INTO sequential_indexes
+           SELECT value, int4range(value, value + 2), ARRAY[value]
+             FROM generate_series(1,128) AS source(value);
+         INSERT INTO sequential_index_tail VALUES (1, 'before');
+         CREATE INDEX sequential_span
+           ON sequential_indexes USING gist (span)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let table = engine
+        .storage
+        .find_table("public", "sequential_indexes")
+        .unwrap();
+    let binding_for = |engine: &Engine, name: &str| {
+        let index = engine.storage.index_slot("public", name, 0).unwrap();
+        let created_at = engine
+            .storage
+            .index_visible_to(index, 0)
+            .unwrap()
+            .created_at;
+        engine
+            .storage
+            .value_binding_for_index(table, created_at)
+            .unwrap()
+    };
+    let span = binding_for(&engine, "sequential_span");
+    let span_handle = engine.storage.value_binding_handle(table, span);
+    assert!(span_handle.is_some());
+
+    let added = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX sequential_tags
+           ON sequential_indexes USING gin (tags)",
+    );
+    assert!(
+        !message_types(&added).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&added)
+    );
+    let span = binding_for(&engine, "sequential_span");
+    let tags = binding_for(&engine, "sequential_tags");
+    assert!(
+        !engine.storage.value_binding_needs_publish(table, span),
+        "creating one index must not dirty an existing published binding"
+    );
+    assert!(engine.storage.value_binding_needs_publish(table, tags));
+    assert_eq!(
+        engine.storage.value_binding_handle(table, span),
+        span_handle
+    );
+
+    let reslice = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX sequential_tags_second
+           ON sequential_indexes USING gin (tags);
+         UPDATE sequential_index_tail SET value = 'after' WHERE id = 1",
+    );
+    assert!(!message_types(&reslice).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    let second_index = engine
+        .storage
+        .index_visible_to(
+            engine
+                .storage
+                .index_slot("public", "sequential_tags_second", 0)
+                .unwrap(),
+            0,
+        )
+        .unwrap()
+        .created_at;
+    let staged = engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .pending_value_index_handle(table, second_index)
+        .expect("the first slice staged the new value index");
+
+    let changed_again = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX sequential_tags_third
+           ON sequential_indexes USING gin (tags)",
+    );
+    assert!(!message_types(&changed_again).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .pending_value_index_handle(table, second_index),
+        Some(staged),
+        "reslicing for a later CREATE INDEX must retain the earlier staged generation"
+    );
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM sequential_indexes WHERE tags @> ARRAY[17];
+             SELECT value FROM sequential_index_tail WHERE id = 1"
+        )),
+        ["1", "after"]
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*) FROM sequential_indexes WHERE tags @> ARRAY[17];
+             SELECT value FROM sequential_index_tail WHERE id = 1"
+        )),
+        ["1", "after"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
 }
 
 #[test]

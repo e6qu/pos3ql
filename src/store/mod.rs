@@ -338,14 +338,10 @@ pub(crate) trait BlockStore {
         scratch: &mut [u8],
     ) -> Result<(usize, BlockType), StoreError> {
         let (container_len, container_type) = self.get(container, scratch)?;
-        if container_type != BlockType::SstPackedContainerV1
-            || offset
-                .checked_add(length)
-                .is_none_or(|end| end > container_len)
-        {
+        if container_type != BlockType::SstPackedContainerV1 {
             return Err(StoreError::Corrupt(BlockError::Truncated));
         }
-        decode_packed_block(&scratch[offset..offset + length], expected, into)
+        decode_packed_extent(&scratch[..container_len], offset, length, expected, into)
     }
 
     /// Enables non-blocking object reads for this stack. The server owns the
@@ -439,6 +435,23 @@ pub(crate) fn decode_packed_block(
     }
     into[..block.payload.len()].copy_from_slice(block.payload);
     Ok((block.payload.len(), block.block_type))
+}
+
+/// Validates and decodes one framed logical block from an already verified
+/// packed-container payload. Sequential readers use this after one full
+/// container fetch so adjacent extents do not each require a ranged GET.
+pub(crate) fn decode_packed_extent(
+    container: &[u8],
+    offset: usize,
+    length: usize,
+    expected: &BlockId,
+    into: &mut [u8],
+) -> Result<(usize, BlockType), StoreError> {
+    let end = offset
+        .checked_add(length)
+        .filter(|&end| end <= container.len())
+        .ok_or(StoreError::Corrupt(BlockError::Truncated))?;
+    decode_packed_block(&container[offset..end], expected, into)
 }
 
 /// Cumulative traffic through the tiered block stack.

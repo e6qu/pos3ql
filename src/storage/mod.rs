@@ -3571,6 +3571,10 @@ pub(crate) struct Enforcer {
     /// The committed image differs from `durable`. A clean binding can retain
     /// its immutable generation when an unrelated table column changes.
     durable_dirty: bool,
+    /// Last logical WAL boundary that changed the binding. Checkpoint
+    /// reslices use it to retain an unpublished generation when only another
+    /// binding changed after the prior slice.
+    durable_dirty_lsn: u64,
 }
 
 impl Enforcer {
@@ -24268,6 +24272,7 @@ impl Storage {
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
+        coalesce_packed: bool,
         emit: &mut dyn FnMut(
             u64,
             u64,
@@ -24412,6 +24417,7 @@ impl Storage {
                         } = &mut *context;
                         let mut blocks = spill.relation_blocks(table);
                         let mut at = 0usize;
+                        let mut loaded_container = None;
                         pax_value_extents.fill(None);
                         for column in 0..layout.columns() {
                             if decoded_columns.is_some_and(|columns| !columns[column]) {
@@ -24423,13 +24429,56 @@ impl Storage {
                                     column,
                                 )
                                 .map_err(spill_read_error)?;
-                            let (len, block_type) = crate::store::read_data_block_raw_ref(
-                                &mut *blocks,
-                                reference,
-                                pax_column_buf,
-                                &mut member_blocks[member as usize],
-                            )
-                            .map_err(spill_read_error)?;
+                            let (len, block_type) = match reference {
+                                crate::store::DataBlockRef::Packed {
+                                    container,
+                                    offset,
+                                    length,
+                                    id,
+                                } if coalesce_packed => {
+                                    let container_len = if let Some((loaded, len)) =
+                                        loaded_container
+                                        && loaded == container
+                                    {
+                                        len
+                                    } else {
+                                        let (len, block_type) = blocks
+                                            .get(&container, pax_column_buf)
+                                            .map_err(|error| {
+                                                spill_read_error(crate::store::SstError::Store(
+                                                    error,
+                                                ))
+                                            })?;
+                                        if block_type
+                                            != crate::store::BlockType::SstPackedContainerV1
+                                        {
+                                            return Err(sql_err!(
+                                                sqlstate::INTERNAL_ERROR,
+                                                "PAX column container has the wrong block type"
+                                            ));
+                                        }
+                                        loaded_container = Some((container, len));
+                                        len
+                                    };
+                                    crate::store::decode_packed_extent(
+                                        &pax_column_buf[..container_len],
+                                        offset as usize,
+                                        length as usize,
+                                        &id,
+                                        &mut member_blocks[member as usize],
+                                    )
+                                    .map_err(|error| {
+                                        spill_read_error(crate::store::SstError::Store(error))
+                                    })?
+                                }
+                                _ => crate::store::read_data_block_raw_ref(
+                                    &mut *blocks,
+                                    reference,
+                                    &mut member_blocks[member as usize],
+                                    pax_column_buf,
+                                )
+                                .map_err(spill_read_error)?,
+                            };
                             if block_type != crate::store::BlockType::SstDataPaxColumnV1 {
                                 return Err(sql_err!(
                                     sqlstate::INTERNAL_ERROR,
@@ -24445,7 +24494,8 @@ impl Storage {
                                     "PAX column extents exceed the fixed scan vector buffer"
                                 ));
                             }
-                            pax_values_buf[at..end].copy_from_slice(&pax_column_buf[..len]);
+                            pax_values_buf[at..end]
+                                .copy_from_slice(&member_blocks[member as usize][..len]);
                             pax_value_extents[column] = Some((at, end));
                             at = end;
                         }
@@ -24592,6 +24642,7 @@ impl Storage {
             arena,
             false,
             decoded_columns.as_ref(),
+            decoded_columns.is_none(),
             &mut |rowid, _commit_lsn, representation| {
                 rows[len] = SpilledRow {
                     rowid,
@@ -25004,6 +25055,7 @@ impl Storage {
             arena,
             true,
             None,
+            true,
             &mut |rowid, commit_lsn, representation| {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match representation {
@@ -25149,6 +25201,7 @@ impl Storage {
         table_slot: usize,
         txid: u32,
         selected_columns: &[usize],
+        arena: &crate::mem::arena::Arena,
     ) -> Result<TableStatistics, SqlError> {
         const REGISTERS: usize = 64;
 
@@ -25194,38 +25247,64 @@ impl Storage {
         let mut widths = [0u64; MAX_COLUMNS];
         let mut non_nulls = [0u64; MAX_COLUMNS];
         let mut registers = [[0u8; REGISTERS]; MAX_COLUMNS];
-        self.for_each_row_state(table_slot, &mut |rowid, state| {
+        let mut observe = |values: &[Datum], encoded_len: usize| {
+            rows = rows.saturating_add(1);
+            row_bytes = row_bytes.saturating_add(encoded_len as u64);
+            for column in 0..n_columns {
+                if !selected[column] {
+                    continue;
+                }
+                let value = values[column];
+                if value.is_null() {
+                    nulls[column] = nulls[column].saturating_add(1);
+                    continue;
+                }
+                non_nulls[column] = non_nulls[column].saturating_add(1);
+                // A one-column row encoding contributes a two-byte count
+                // and one bitmap byte; remove that framing to retain the
+                // value's actual stored width.
+                let width = rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3);
+                widths[column] = widths[column].saturating_add(width as u64);
+                let index = [column as u16];
+                add_distinct(&mut registers[column], hash_key(values, &index));
+            }
+        };
+        // Overlay rows carry every pending or newer committed image. Spilled
+        // rows absent from that overlay stream below with their payload from
+        // the already resident merge cursor, avoiding one object point read
+        // per row during cold ANALYZE.
+        let _ = self.for_each_scan_overlay_row_state(table_slot, &mut |rowid, state| {
             let Some(home) = self.visible_row_home(table_slot, rowid, state, txid)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
             };
             self.with_row_bytes(table_slot, rowid, home, |bytes| {
                 let mut values = [Datum::Null; MAX_COLUMNS];
                 rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
-                rows = rows.saturating_add(1);
-                row_bytes = row_bytes.saturating_add(bytes.len() as u64);
-                for column in 0..n_columns {
-                    if !selected[column] {
-                        continue;
-                    }
-                    let value = values[column];
-                    if value.is_null() {
-                        nulls[column] = nulls[column].saturating_add(1);
-                        continue;
-                    }
-                    non_nulls[column] = non_nulls[column].saturating_add(1);
-                    // A one-column row encoding contributes a two-byte count
-                    // and one bitmap byte; remove that framing to retain the
-                    // value's actual stored width.
-                    let width =
-                        rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3);
-                    widths[column] = widths[column].saturating_add(width as u64);
-                    let index = [column as u16];
-                    add_distinct(&mut registers[column], hash_key(&values, &index));
-                }
+                observe(&values[..n_columns], bytes.len());
                 Ok(())
             })?;
             Ok(core::ops::ControlFlow::Continue(()))
         })?;
+        self.spill_merged_walk_bytes(
+            table_slot,
+            arena,
+            true,
+            None,
+            true,
+            &mut |_rowid, _commit_lsn, representation| {
+                match representation {
+                    SpilledRowRepresentation::Encoded(bytes) => {
+                        let mut values = [Datum::Null; MAX_COLUMNS];
+                        rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+                        observe(&values[..n_columns], bytes.len());
+                    }
+                    SpilledRowRepresentation::Values(values) => {
+                        observe(values, rowenc::encoded_len(values));
+                    }
+                }
+                Ok(core::ops::ControlFlow::Continue(()))
+            },
+        )?;
 
         let mut statistics = self.table_statistics(table_slot, txid);
         statistics.valid = true;
@@ -26774,7 +26853,7 @@ impl Storage {
     pub fn remove_committed(&mut self, table_index: usize, rowid: u64, commit_lsn: u64) {
         if self.tables[table_index].n_spill_ssts == 0 {
             if self.remove_row_state(table_index, rowid).is_some() {
-                self.mark_value_bindings_dirty(table_index);
+                self.mark_value_bindings_dirty_at(table_index, commit_lsn);
                 self.tables[table_index].mark_dirty();
             }
             return;
@@ -26793,7 +26872,7 @@ impl Storage {
                 pending: PendingVersions::empty(),
             },
         );
-        self.mark_value_bindings_dirty(table_index);
+        self.mark_value_bindings_dirty_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
     }
@@ -26822,6 +26901,7 @@ impl Storage {
             if pending.changes_existence || enforcer.dependency_mask & pending.changed_columns != 0
             {
                 enforcer.durable_dirty = true;
+                enforcer.durable_dirty_lsn = commit_lsn;
             }
         }
 
@@ -26932,7 +27012,7 @@ impl Storage {
         if state.committed.is_none() && table.n_spill_ssts == 0 {
             table.rows.remove(&rowid);
         }
-        self.mark_value_bindings_dirty(table_index);
+        self.mark_value_bindings_dirty_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
     }
@@ -26948,14 +27028,30 @@ impl Storage {
         home: RowHome,
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
-        let table = &self.tables[table_index];
-        let n_enf = table.n_enforcers;
-        if n_enf == 0 {
-            return Ok(0);
-        }
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = self.tables[table_index].def.schema(&mut schema);
+        let mark = self.index_arena.mark();
+        let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+            self.values_enforcer_hashes(table_index, &values[..n_columns], out)
+        });
+        // SAFETY: callers receive only hashes and binding ordinals; expression
+        // evaluation cannot retain values allocated above this row-local mark.
+        unsafe { self.index_arena.rewind_to(mark) };
+        result
+    }
+
+    fn values_enforcer_hashes(
+        &self,
+        table_index: usize,
+        values: &[Datum],
+        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+    ) -> Result<usize, SqlError> {
+        let n_enforcers = self.tables[table_index].n_enforcers;
         let mut n_out = 0;
-        for binding in 0..n_enf {
-            self.with_value_binding_key(table_index, binding, rowid, home, |key, _, enforcer| {
+        for binding in 0..n_enforcers {
+            self.with_value_binding_values(table_index, binding, values, |key, _, enforcer| {
                 let Some(key) = key else { return Ok(()) };
                 if key.iter().any(Datum::is_null) {
                     return Ok(());
@@ -28305,16 +28401,32 @@ impl Storage {
             .durable_dirty
     }
 
+    pub(crate) fn value_binding_needs_publish_after(
+        &self,
+        table_index: usize,
+        binding: usize,
+        lsn: u64,
+    ) -> bool {
+        let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
+        enforcer.durable_dirty && enforcer.durable_dirty_lsn > lsn
+    }
+
     /// Invalidates every durable value generation after a committed row-set
     /// replacement that bypasses [`Self::commit_row`] (replay, rewrite,
     /// truncation, or explicit REINDEX maintenance).
     pub(crate) fn mark_value_bindings_dirty(&mut self, table_index: usize) {
+        let dirty_lsn = self.lsn.saturating_add(1);
+        self.mark_value_bindings_dirty_at(table_index, dirty_lsn);
+    }
+
+    fn mark_value_bindings_dirty_at(&mut self, table_index: usize, dirty_lsn: u64) {
         let n_enforcers = self.tables[table_index].n_enforcers;
         for enforcer in self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
             .flatten()
         {
             enforcer.durable_dirty = true;
+            enforcer.durable_dirty_lsn = dirty_lsn;
         }
     }
 
@@ -28674,6 +28786,7 @@ impl Storage {
         table_index: usize,
         txid: Option<u32>,
     ) -> Result<(), SqlError> {
+        let new_dirty_lsn = self.lsn.saturating_add(1);
         // DDL reshapes the cache slots, but an unchanged column tuple keeps
         // its manifest-published object generation.
         let mut published = [None; MAX_VALUE_ENFORCERS];
@@ -28908,6 +29021,8 @@ impl Storage {
                 dependency_mask: wanted.dependency_mask,
                 durable: prior.and_then(|enforcer| enforcer.durable),
                 durable_dirty: prior.is_none_or(|enforcer| enforcer.durable_dirty),
+                durable_dirty_lsn: prior
+                    .map_or(new_dirty_lsn, |enforcer| enforcer.durable_dirty_lsn),
             });
             // Keep the installed prefix visible to `release_enforcers`, so an
             // acquire failure later in this loop returns every slot already
@@ -28939,35 +29054,64 @@ impl Storage {
                 .expect("enforcer")
                 .slot;
         }
-        let mut decode_error: Result<(), SqlError> = Ok(());
         let mut incomplete = false;
         let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-        self.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = state.committed else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            let n = match self.row_enforcer_hashes(table_index, rowid, home, &mut buf) {
-                Ok(n) => n,
-                Err(e) => {
-                    decode_error = Err(e);
-                    return Ok(ControlFlow::Break(()));
-                }
-            };
-            for &(ei, hash) in &buf[..n] {
-                let index = pool.get_mut(slots[ei]);
+        let mut insert_hashes = |rowid: u64, hashes: &[(usize, u64)]| {
+            for &(binding, hash) in hashes {
+                let index = pool.get_mut(slots[binding]);
                 if index.insert(hash, rowid).is_err() {
                     incomplete = true;
-                    return Ok(ControlFlow::Break(()));
+                    return core::ops::ControlFlow::Break(());
                 }
             }
-            Ok(ControlFlow::Continue(()))
+            core::ops::ControlFlow::Continue(())
+        };
+        let overlay = self.for_each_scan_overlay_row_state(table_index, &mut |rowid, state| {
+            let Some(home) = state.committed else {
+                return Ok(core::ops::ControlFlow::Continue(()));
+            };
+            let count = self.row_enforcer_hashes(table_index, rowid, home, &mut buf)?;
+            Ok(insert_hashes(rowid, &buf[..count]))
         })?;
-        decode_error?;
+        if overlay.is_continue() {
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            let n_columns = self.tables[table_index].def.schema(&mut schema);
+            let dependency_mask = self.tables[table_index].enforcers[..n_enf]
+                .iter()
+                .flatten()
+                .fold(0u64, |mask, enforcer| mask | enforcer.dependency_mask);
+            let demanded = core::array::from_fn(|column| {
+                column < n_columns && dependency_mask & (1u64 << column) != 0
+            });
+            let demanded_count = demanded[..n_columns].iter().filter(|&&set| set).count();
+            self.spill_merged_walk_bytes(
+                table_index,
+                &self.index_arena,
+                true,
+                Some(&demanded),
+                demanded_count.saturating_mul(2) >= n_columns,
+                &mut |rowid, _commit_lsn, representation| {
+                    let mark = self.index_arena.mark();
+                    let mut decoded = [Datum::Null; MAX_COLUMNS];
+                    let values = match representation {
+                        SpilledRowRepresentation::Encoded(bytes) => {
+                            rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+                            &decoded[..n_columns]
+                        }
+                        SpilledRowRepresentation::Values(values) => values,
+                    };
+                    let hashes = self.values_enforcer_hashes(table_index, values, &mut buf);
+                    // SAFETY: `hashes` retains only fixed hash values and
+                    // binding ordinals from expression evaluation.
+                    unsafe { self.index_arena.rewind_to(mark) };
+                    let count = hashes?;
+                    Ok(insert_hashes(rowid, &buf[..count]))
+                },
+            )?;
+        }
         if incomplete {
-            // The walk stopped at the first exhausted cache. Every enforcer
-            // may therefore be missing later rows, including caches that did
-            // not themselves fill, so completeness is invalidated as a set.
+            // A stopped walk can leave any cache without later rows, including
+            // one that still had room when another binding filled.
             for &slot in &slots[..n_enf] {
                 pool.get_mut(slot).mark_incomplete();
             }

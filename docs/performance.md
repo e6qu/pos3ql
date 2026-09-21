@@ -204,6 +204,18 @@ preserves the matched workload and durability settings from actual PostgreSQL
 18.6. Its 12 row events and seven manifests differ from the prior settled run,
 so aggregate latency and request totals are exploratory rather than a
 controlled comparison.
+The [10,000-row checkpoint scale run](../benchmarks/baselines/2026-09-21-checkpoint-reslice-scale-10000/README.md)
+retains staged value-index generations whose dependencies did not change after
+an earlier slice and streams object-resident rows through `ANALYZE`, `CREATE
+INDEX` validation, and value-cache population. Full PAX scans verify one packed
+container and its logical column frames per request group; selective execution
+still uses ranged column reads. In the completed profile, 14 affected
+value-index events wrote 1,017 blocks over 41.03 seconds, while 13 row deltas
+wrote 197 over 0.92 seconds. One full-roster row rewrite read 6,600 blocks,
+wrote 1,337, and took 27.50 seconds. It was the largest single phase and
+coincided with the 30.27-second maximum foreground latency. This establishes
+the next dispatch-bound target; it does not imply that PostgreSQL shares the
+same persistence costs.
 
 ## Measured scenarios
 

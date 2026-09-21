@@ -244,10 +244,20 @@ exercised 35-then-5 and 137-then-5 block sweeps plus the required full-roster
 rebuild path. Its matched actual PostgreSQL 18.6 workload completed with
 durability enabled on the recorded local tier. The run contained substantially
 more automatic checkpoint work than the prior profile, so its timing and total
-traffic are not a controlled comparison. Next, repeat at larger scale on
-representative hardware and determine whether complete row images or repeated
-value-index rebuilds dominate within resliced sweeps before changing the
-durable representation.
+traffic are not a controlled comparison.
+The [10,000-row scale run](benchmarks/baselines/2026-09-21-checkpoint-reslice-scale-10000/README.md)
+found and closed repeated staged value-index rebuilds plus row-by-row cold
+`ANALYZE` and `CREATE INDEX` reads. In the completed profile, affected value
+indexes dominated compatible reslices in aggregate: 14 events took 41.03
+seconds and wrote 1,017 blocks, while 13 row deltas took 0.92 seconds and wrote
+197. Most value-index events read no durable blocks, confirming that unchanged
+staged bindings were retained. One full-roster row rewrite remained the largest
+individual event at 27.50 seconds, 6,600 block reads, and 1,337 writes; it drove
+the 30.27-second maximum foreground latency. Next, make that fallback a bounded,
+restartable sequence of checkpoint beats and repeat this exact profile before
+changing the durable row representation. Then apply the same dispatch bound to
+the remaining affected value-index writers if their roughly 2.7-second events
+still control foreground tails.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

@@ -154,6 +154,12 @@ buffer. Retryable waits now preserve the transaction and its locks through WAL
 staging, and statement-mark ownership also requires an active transaction. A
 direct boundary regression and the exact forced-spill differential corpus
 cover the fix.
+The checkpoint-deletion pacing audit found no externally blocked defect.
+Commit pruning now runs as retryable post-publication maintenance, and the
+configured per-beat object limit applies separately to commit, legacy SST, and
+block namespaces. A one-object regression covers complete progress, retry,
+explicit drain, and object-cold recovery. Remaining checkpoint publication
+traffic and representative performance qualification are tracked in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

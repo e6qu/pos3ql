@@ -303,6 +303,10 @@ bench_pos3ql point-concurrency-1 --workload point-read --clients 1 \
 if [ "$MODE" = checkpoint ]; then
   bench_pos3ql mixed-baseline --workload mixed --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION"
+  # Drain publication and cleanup triggered by the baseline before opening
+  # the interference profile window.
+  python3 "$ROOT/tools/pg-query.py" --port "$POS3QL_PORT" \
+    --timeout "$BENCH_TIMEOUT_SECONDS" "CHECKPOINT" >/dev/null
   PROFILE_OFFSET=0
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
     PROFILE_OFFSET=$(wc -c < "$WORK/pos3ql-primary.log")
@@ -326,6 +330,8 @@ if [ "$MODE" = checkpoint ]; then
     --label postgresql18-mixed-baseline --workload mixed --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" --check \
     --output "$OUTPUT/postgresql18-mixed-baseline.json" >/dev/null
+  python3 "$ROOT/tools/pg-query.py" --port "$POSTGRES_PORT" \
+    --timeout "$BENCH_TIMEOUT_SECONDS" "CHECKPOINT" >/dev/null
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \

@@ -21937,7 +21937,7 @@ fn information_schema_column_udt_usage_is_not_silently_capped() {
     config.max_tables = 17;
     config.max_value_indexes = 17 * 64;
     config.wal_buffer_bytes = 1 << 20;
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + (1 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut definition = String::new();
     for table in 0..17 {
@@ -64620,6 +64620,174 @@ fn checkpoint_reuses_published_index_blocks_after_small_update() {
         ["500|after", "1"]
     );
     drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn checkpoint_rebuilds_only_value_indexes_dependent_on_changed_columns() {
+    let mut config = test_config("checkpoint-value-dependencies");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-value-dependencies-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_bytes = 4 << 20;
+    config.wal_buffer_bytes = 1 << 20;
+    config.max_indexes = 8;
+    config.max_value_indexes = 8;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE value_dependencies (
+             id integer PRIMARY KEY,
+             code text,
+             document jsonb,
+             payload text,
+             padding text
+         );
+         CREATE INDEX value_dependencies_cover
+           ON value_dependencies (code) INCLUDE (payload);
+         CREATE INDEX value_dependencies_expression
+           ON value_dependencies ((lower(code))) WHERE payload <> 'skip';
+         CREATE INDEX value_dependencies_document
+           ON value_dependencies USING gin (document);
+         INSERT INTO value_dependencies
+           SELECT value,
+                  'k-' || value::text,
+                  jsonb_build_object('key' || value::text, 'value'),
+                  'before',
+                  'padding'
+             FROM generate_series(1,128) AS source(value)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let table = engine
+        .storage
+        .find_table("public", "value_dependencies")
+        .unwrap();
+    let binding_for = |engine: &Engine, name: &str| {
+        let index = engine.storage.index_slot("public", name, 0).unwrap();
+        let created_at = engine
+            .storage
+            .index_visible_to(index, 0)
+            .unwrap()
+            .created_at;
+        engine
+            .storage
+            .value_binding_for_index(table, created_at)
+            .unwrap()
+    };
+    let expression = binding_for(&engine, "value_dependencies_expression");
+    let document = binding_for(&engine, "value_dependencies_document");
+    let primary = (0..engine.storage.value_binding_count(table))
+        .find(|binding| {
+            let (columns, count) = engine.storage.value_binding_columns(table, *binding);
+            count == 1
+                && columns[0] == 0
+                && engine
+                    .storage
+                    .value_binding_created_at(table, *binding)
+                    .is_none()
+        })
+        .unwrap();
+    let covering = (0..engine.storage.value_binding_count(table))
+        .find(|binding| {
+            let (columns, count) = engine.storage.value_binding_columns(table, *binding);
+            count == 1
+                && columns[0] == 1
+                && engine
+                    .storage
+                    .value_binding_created_at(table, *binding)
+                    .is_none()
+        })
+        .unwrap();
+    let initial_handles = [primary, covering, expression, document]
+        .map(|binding| engine.storage.value_binding_handle(table, binding));
+
+    let unrelated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE value_dependencies SET padding = 'changed' WHERE id = 17",
+    );
+    assert!(!message_types(&unrelated).contains(&b'E'));
+    assert!(
+        [primary, covering, expression, document]
+            .iter()
+            .all(|binding| !engine.storage.value_binding_needs_publish(table, *binding)),
+        "an unrelated physical column must not invalidate any durable value index"
+    );
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        [primary, covering, expression, document]
+            .map(|binding| engine.storage.value_binding_handle(table, binding)),
+        initial_handles,
+        "the checkpoint must carry every unaffected immutable generation forward"
+    );
+
+    let included = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE value_dependencies SET payload = 'after' WHERE id = 17",
+    );
+    assert!(!message_types(&included).contains(&b'E'));
+    assert!(!engine.storage.value_binding_needs_publish(table, primary));
+    assert!(engine.storage.value_binding_needs_publish(table, covering));
+    assert!(
+        engine
+            .storage
+            .value_binding_needs_publish(table, expression)
+    );
+    assert!(!engine.storage.value_binding_needs_publish(table, document));
+    assert!(engine.checkpoint().unwrap());
+    let replayed = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO value_dependencies VALUES
+           (129, 'replayed', '{\"new\":true}'::jsonb, 'wal', 'padding')",
+    );
+    assert!(!message_types(&replayed).contains(&b'E'));
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, payload FROM value_dependencies WHERE code = 'k-17';
+             SELECT id FROM value_dependencies WHERE lower(code) = 'k-17';
+             SELECT count(*) FROM value_dependencies WHERE document ? 'key17';
+             SELECT id, payload FROM value_dependencies WHERE code = 'replayed'",
+        )),
+        ["17|after", "17", "1", "129|wal"]
+    );
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut second_budget = Budget::new(1 << 30);
+    let mut second = Engine::new(&config, &mut second_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut second,
+            &mut second_budget,
+            "SELECT id, payload FROM value_dependencies WHERE code = 'replayed';
+             SELECT count(*) FROM value_dependencies WHERE document ? 'new'",
+        )),
+        ["129|wal", "1"]
+    );
+    drop(second);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

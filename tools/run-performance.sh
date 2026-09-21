@@ -302,12 +302,17 @@ if [ "$MODE" = checkpoint ]; then
   PROFILE_OFFSET=0
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
     PROFILE_OFFSET=$(wc -c < "$WORK/pos3ql-primary.log")
+    cp "$METRICS" "$WORK/checkpoint-profile-before.json"
   fi
   bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
     --maintenance-interval 0.001 --maintenance-limit 3 \
     --require-maintenance-operations 3
   stop_pos3ql
+  if [ "$CHECKPOINT_PROFILE" = 1 ]; then
+    sleep 0.1
+    cp "$METRICS" "$WORK/checkpoint-profile-after.json"
+  fi
   start_postgresql_baseline
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
@@ -327,7 +332,9 @@ if [ "$MODE" = checkpoint ]; then
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
     python3 "$ROOT/tools/checkpoint-profile.py" \
       "$OUTPUT/pos3ql-startup.log" "$OUTPUT/checkpoint-profile.json" \
-      --after-byte-offset "$PROFILE_OFFSET"
+      --after-byte-offset "$PROFILE_OFFSET" \
+      --metrics-before "$WORK/checkpoint-profile-before.json" \
+      --metrics-after "$WORK/checkpoint-profile-after.json"
   fi
   python3 "$ROOT/tools/benchmark-report.py" "$OUTPUT" >"$OUTPUT/report.md"
   echo "performance results: $OUTPUT"

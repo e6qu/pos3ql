@@ -110,8 +110,9 @@ def main():
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
         print("\n## Checkpoint phases\n")
         print("Profiled pos3ql build; totals cover explicit and automatic checkpoint work "
-              "during the measured workload interval.")
-        print("Times sum phase spans and are not query latency or a cross-system metric.\n")
+              "from the workload start through server stop.")
+        print("Times sum phase spans and are not query latency or a cross-system metric. ")
+        print("The profile request window includes cleanup after the timed workload ends.\n")
         print("| Phase | Events | Elapsed ms | Block GET | Block PUT | Object DELETE |")
         print("|---|---:|---:|---:|---:|---:|")
         for phase, totals in sorted(profile["totals"].items()):
@@ -119,6 +120,11 @@ def main():
                 f"| {phase} | {totals['events']} | {number(totals['elapsed_us'] / 1000)} | "
                 f"{totals['block_gets']} | {totals['block_puts']} | {totals['deleted']} |"
             )
+        requests = profile["object_requests"]
+        print(
+            f"\nFull profile window: {requests['put']} object PUT, "
+            f"{requests['delete']} object DELETE, {requests['list']} LIST."
+        )
 
     if recoveries:
         print("\n## Recovery and cache-fill intervals\n")

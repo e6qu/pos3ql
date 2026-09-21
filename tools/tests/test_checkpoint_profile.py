@@ -34,3 +34,13 @@ class CheckpointProfileTest(unittest.TestCase):
             profile.parse(b"checkpoint_phase lsn=1 phase=manifest\n", 0)
         with self.assertRaisesRegex(ValueError, "no checkpoint phase lines"):
             profile.parse(b"server started\n", 0)
+
+    def test_request_window_rejects_a_decreasing_counter(self):
+        before = {"schema_version": 1, "requests": {
+            "delete": 1, "get": 2, "list": 3, "put": 4, "range_get": 5}}
+        after = {"schema_version": 1, "requests": {
+            "delete": 2, "get": 2, "list": 3, "put": 6, "range_get": 5}}
+        self.assertEqual(profile.request_delta(before, after)["put"], 2)
+        after["requests"]["delete"] = 0
+        with self.assertRaisesRegex(ValueError, "delete counter decreased"):
+            profile.request_delta(before, after)

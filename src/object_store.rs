@@ -15,6 +15,10 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::object_store::http::S3Client;
 use crate::util::StackStr;
 
+/// S3 object keys are at most 1,024 bytes. Both concrete clients enforce the
+/// same provider-neutral boundary before issuing or simulating an operation.
+pub(crate) const MAX_OBJECT_KEY_BYTES: usize = 1024;
+
 pub mod http;
 pub(crate) mod signature_v4;
 pub(crate) mod sim;

@@ -16,7 +16,9 @@ use crate::config::{Config, ObjectStoreAddressing};
 use crate::crypto::sha256::{HexDigest, sha256};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
-use crate::object_store::{ByteRange, EntityTag, Error, GetResult, Precondition};
+use crate::object_store::{
+    ByteRange, EntityTag, Error, GetResult, MAX_OBJECT_KEY_BYTES, Precondition,
+};
 use crate::stack_format;
 use crate::util::StackStr;
 
@@ -26,7 +28,6 @@ type S3Error = Error;
 
 const MAX_ATTEMPTS: u32 = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_OBJECT_KEY_BYTES: usize = 1024;
 const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 #[derive(Debug)]

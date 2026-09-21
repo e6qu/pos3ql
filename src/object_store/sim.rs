@@ -34,8 +34,11 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::prng::Pcg32;
 use crate::stack_format;
+use crate::util::StackStr;
 
-use crate::object_store::{ByteRange, EntityTag, Error, GetResult, Precondition};
+use crate::object_store::{
+    ByteRange, EntityTag, Error, GetResult, MAX_OBJECT_KEY_BYTES, Precondition,
+};
 
 /// Fault probabilities in parts per thousand, plus the outage schedule.
 /// All zeros (the default) is a perfectly healthy namespace.
@@ -190,11 +193,16 @@ impl SimClient {
         })
     }
 
-    fn full_key(&self, key: &str) -> String {
-        let mut full = String::with_capacity(self.key_prefix.len() + key.len());
-        full.push_str(&self.key_prefix);
-        full.push_str(key);
-        full
+    fn full_key(&self, key: &str) -> Result<StackStr<MAX_OBJECT_KEY_BYTES>, Error> {
+        use core::fmt::Write;
+
+        let mut full = StackStr::new();
+        let _ = full.write_str(&self.key_prefix);
+        let _ = full.write_str(key);
+        if full.is_truncated() {
+            return Err(Error::Protocol("object key exceeds S3 key limit"));
+        }
+        Ok(full)
     }
 
     pub(crate) fn put(
@@ -203,10 +211,10 @@ impl SimClient {
         body: &[u8],
         precondition: Precondition,
     ) -> Result<EntityTag, Error> {
-        let full = self.full_key(key);
+        let full = self.full_key(key)?;
         let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
-        let position = bucket.find(&full);
+        let position = bucket.find(full.as_str());
         match (&precondition, &position) {
             (Precondition::IfNoneMatchAny, Ok(_)) => {
                 return Err(status(412, "precondition failed: object exists"));
@@ -223,12 +231,10 @@ impl SimClient {
         }
         if let (Precondition::None, Ok(at)) = (&precondition, &position) {
             let old = bucket.objects[*at].bytes.as_slice();
-            let logical = &full[self.key_prefix.len()..];
             let segment_growth =
-                logical.starts_with("wal/") && body.len() > old.len() && body.starts_with(old);
+                key.starts_with("wal/") && body.len() > old.len() && body.starts_with(old);
             if old != body && !segment_growth {
-                let key = full.clone();
-                bucket.blind_overwrites.push(key);
+                bucket.blind_overwrites.push(full.as_str().to_string());
             }
         }
         let etag = bucket.next_etag;
@@ -241,7 +247,7 @@ impl SimClient {
             Err(at) => bucket.objects.insert(
                 at,
                 StoredObject {
-                    key: full,
+                    key: full.as_str().to_string(),
                     bytes: body.to_vec(),
                     etag,
                 },
@@ -256,10 +262,10 @@ impl SimClient {
     }
 
     pub(crate) fn get(&mut self, key: &str, range: Option<ByteRange>) -> Result<GetResult, Error> {
-        let full = self.full_key(key);
+        let full = self.full_key(key)?;
         let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
-        let at = match bucket.find(&full) {
+        let at = match bucket.find(full.as_str()) {
             Ok(at) => at,
             Err(_) => return Err(status(404, "no such object")),
         };
@@ -307,10 +313,10 @@ impl SimClient {
     }
 
     pub(crate) fn delete(&mut self, key: &str) -> Result<(), Error> {
-        let full = self.full_key(key);
+        let full = self.full_key(key)?;
         let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
-        if let Ok(at) = bucket.find(&full) {
+        if let Ok(at) = bucket.find(full.as_str()) {
             bucket.objects.remove(at);
         }
         Ok(())
@@ -321,7 +327,7 @@ impl SimClient {
         prefix: &str,
         mut each: impl FnMut(&str),
     ) -> Result<usize, Error> {
-        let full_prefix = self.full_key(prefix);
+        let full_prefix = self.full_key(prefix)?;
         let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
         #[cfg(test)]
@@ -330,7 +336,7 @@ impl SimClient {
         }
         let mut count = 0usize;
         for object in &bucket.objects {
-            if object.key.starts_with(&full_prefix) {
+            if object.key.starts_with(full_prefix.as_str()) {
                 each(&object.key[self.key_prefix.len()..]);
                 count += 1;
             }
@@ -376,7 +382,7 @@ mod tests {
         let (mut c, _) = client("sim-rt");
         assert!(c.get("k", None).unwrap_err().is_not_found());
         let tag = c.put("k", b"hello world", Precondition::None).unwrap();
-        let got = c.get("k", None).unwrap();
+        let got = crate::mem::guard::forbid_alloc(|| c.get("k", None)).unwrap();
         assert_eq!(c.body_bytes(), b"hello world");
         assert_eq!(got.etag.as_str(), tag.as_str());
         // Inclusive range; a range past the end clamps; one starting past

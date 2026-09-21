@@ -64556,7 +64556,7 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
-fn analyze_coalesces_wide_pax_container_reads_after_cold_recovery() {
+fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
     let mut config = test_config("analyze-pax-container");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -64636,6 +64636,23 @@ fn analyze_coalesces_wide_pax_container_reads_after_cold_recovery() {
     assert_eq!(statistics.rows, 512);
     assert!(statistics.columns[1].distinct_values > 100);
     assert!(statistics.average_row_width > 8_000);
+
+    let before = recovered.storage.block_io_stats();
+    let created = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "CREATE INDEX analyze_stream_hash ON analyze_stream USING hash (hash_key)",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let reads = recovered.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        reads.object_gets < 384,
+        "CREATE INDEX point-read each row or binding: {reads:?}"
+    );
 
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

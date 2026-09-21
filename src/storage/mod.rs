@@ -24272,6 +24272,7 @@ impl Storage {
         arena: &'a crate::mem::arena::Arena,
         recycle_rows: bool,
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
+        coalesce_packed: bool,
         emit: &mut dyn FnMut(
             u64,
             u64,
@@ -24434,7 +24435,7 @@ impl Storage {
                                     offset,
                                     length,
                                     id,
-                                } if decoded_columns.is_none() => {
+                                } if coalesce_packed => {
                                     let container_len = if let Some((loaded, len)) =
                                         loaded_container
                                         && loaded == container
@@ -24641,6 +24642,7 @@ impl Storage {
             arena,
             false,
             decoded_columns.as_ref(),
+            decoded_columns.is_none(),
             &mut |rowid, _commit_lsn, representation| {
                 rows[len] = SpilledRow {
                     rowid,
@@ -25053,6 +25055,7 @@ impl Storage {
             arena,
             true,
             None,
+            true,
             &mut |rowid, commit_lsn, representation| {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match representation {
@@ -25287,6 +25290,7 @@ impl Storage {
             arena,
             true,
             None,
+            true,
             &mut |_rowid, _commit_lsn, representation| {
                 match representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
@@ -27024,14 +27028,30 @@ impl Storage {
         home: RowHome,
         out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
     ) -> Result<usize, SqlError> {
-        let table = &self.tables[table_index];
-        let n_enf = table.n_enforcers;
-        if n_enf == 0 {
-            return Ok(0);
-        }
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let n_columns = self.tables[table_index].def.schema(&mut schema);
+        let mark = self.index_arena.mark();
+        let result = self.with_row_bytes(table_index, rowid, home, |bytes| {
+            let mut values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(bytes, &schema[..n_columns], &mut values)?;
+            self.values_enforcer_hashes(table_index, &values[..n_columns], out)
+        });
+        // SAFETY: callers receive only hashes and binding ordinals; expression
+        // evaluation cannot retain values allocated above this row-local mark.
+        unsafe { self.index_arena.rewind_to(mark) };
+        result
+    }
+
+    fn values_enforcer_hashes(
+        &self,
+        table_index: usize,
+        values: &[Datum],
+        out: &mut [(usize, u64); MAX_VALUE_ENFORCERS],
+    ) -> Result<usize, SqlError> {
+        let n_enforcers = self.tables[table_index].n_enforcers;
         let mut n_out = 0;
-        for binding in 0..n_enf {
-            self.with_value_binding_key(table_index, binding, rowid, home, |key, _, enforcer| {
+        for binding in 0..n_enforcers {
+            self.with_value_binding_values(table_index, binding, values, |key, _, enforcer| {
                 let Some(key) = key else { return Ok(()) };
                 if key.iter().any(Datum::is_null) {
                     return Ok(());
@@ -29034,35 +29054,64 @@ impl Storage {
                 .expect("enforcer")
                 .slot;
         }
-        let mut decode_error: Result<(), SqlError> = Ok(());
         let mut incomplete = false;
         let mut buf = [(0usize, 0u64); MAX_VALUE_ENFORCERS];
-        self.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = state.committed else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            let n = match self.row_enforcer_hashes(table_index, rowid, home, &mut buf) {
-                Ok(n) => n,
-                Err(e) => {
-                    decode_error = Err(e);
-                    return Ok(ControlFlow::Break(()));
-                }
-            };
-            for &(ei, hash) in &buf[..n] {
-                let index = pool.get_mut(slots[ei]);
+        let mut insert_hashes = |rowid: u64, hashes: &[(usize, u64)]| {
+            for &(binding, hash) in hashes {
+                let index = pool.get_mut(slots[binding]);
                 if index.insert(hash, rowid).is_err() {
                     incomplete = true;
-                    return Ok(ControlFlow::Break(()));
+                    return core::ops::ControlFlow::Break(());
                 }
             }
-            Ok(ControlFlow::Continue(()))
+            core::ops::ControlFlow::Continue(())
+        };
+        let overlay = self.for_each_scan_overlay_row_state(table_index, &mut |rowid, state| {
+            let Some(home) = state.committed else {
+                return Ok(core::ops::ControlFlow::Continue(()));
+            };
+            let count = self.row_enforcer_hashes(table_index, rowid, home, &mut buf)?;
+            Ok(insert_hashes(rowid, &buf[..count]))
         })?;
-        decode_error?;
+        if overlay.is_continue() {
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            let n_columns = self.tables[table_index].def.schema(&mut schema);
+            let dependency_mask = self.tables[table_index].enforcers[..n_enf]
+                .iter()
+                .flatten()
+                .fold(0u64, |mask, enforcer| mask | enforcer.dependency_mask);
+            let demanded = core::array::from_fn(|column| {
+                column < n_columns && dependency_mask & (1u64 << column) != 0
+            });
+            let demanded_count = demanded[..n_columns].iter().filter(|&&set| set).count();
+            self.spill_merged_walk_bytes(
+                table_index,
+                &self.index_arena,
+                true,
+                Some(&demanded),
+                demanded_count.saturating_mul(2) >= n_columns,
+                &mut |rowid, _commit_lsn, representation| {
+                    let mark = self.index_arena.mark();
+                    let mut decoded = [Datum::Null; MAX_COLUMNS];
+                    let values = match representation {
+                        SpilledRowRepresentation::Encoded(bytes) => {
+                            rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+                            &decoded[..n_columns]
+                        }
+                        SpilledRowRepresentation::Values(values) => values,
+                    };
+                    let hashes = self.values_enforcer_hashes(table_index, values, &mut buf);
+                    // SAFETY: `hashes` retains only fixed hash values and
+                    // binding ordinals from expression evaluation.
+                    unsafe { self.index_arena.rewind_to(mark) };
+                    let count = hashes?;
+                    Ok(insert_hashes(rowid, &buf[..count]))
+                },
+            )?;
+        }
         if incomplete {
-            // The walk stopped at the first exhausted cache. Every enforcer
-            // may therefore be missing later rows, including caches that did
-            // not themselves fill, so completeness is invalidated as a set.
+            // A stopped walk can leave any cache without later rows, including
+            // one that still had room when another binding filled.
             for &slot in &slots[..n_enf] {
                 pool.get_mut(slot).mark_incomplete();
             }

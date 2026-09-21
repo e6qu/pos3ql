@@ -47976,32 +47976,50 @@ pub fn create_index(
     // UNIQUE additionally checks authoritative rows for duplicate keys. A
     // conflict is deferred so rollback can remove the pending catalog entry
     // after the shared row walk releases its borrows.
-    let validation = storage.for_each_row_state(table_index, &mut |rowid, state| {
-        use core::ops::ControlFlow;
+    let validate_values = |rowid: u64, values: &[Datum]| -> Result<(), SqlError> {
+        check_index_tuple_sizes(storage, &tdef, values, txn.txid, arena)?;
+        if command.unique {
+            check_unique_indexes(
+                storage,
+                table_index,
+                &tdef,
+                &schema[..tdef.n_columns],
+                values,
+                Some(rowid),
+                // The just-registered index is an uncommitted CREATE owned
+                // by this transaction; validation must see it.
+                txn.txid,
+                arena,
+            )?;
+        }
+        Ok(())
+    };
+    let validation = storage.for_each_scan_overlay_row_state(table_index, &mut |rowid, state| {
         let Some(home) = state.committed else {
-            return Ok(ControlFlow::Continue(()));
+            return Ok(core::ops::ControlFlow::Continue(()));
         };
         storage.with_row_bytes(table_index, rowid, home, |bytes| {
             let mut values = [Datum::Null; MAX_COLUMNS];
             rowenc::decode(bytes, &schema[..tdef.n_columns], &mut values)?;
-            check_index_tuple_sizes(storage, &tdef, &values[..tdef.n_columns], txn.txid, arena)?;
-            if command.unique {
-                check_unique_indexes(
-                    storage,
-                    table_index,
-                    &tdef,
-                    &schema[..tdef.n_columns],
-                    &values[..tdef.n_columns],
-                    Some(rowid),
-                    // The just-registered index is an uncommitted CREATE owned
-                    // by this transaction; validation must see it.
-                    txn.txid,
-                    arena,
-                )?;
-            }
-            Ok(())
+            validate_values(rowid, &values[..tdef.n_columns])
         })?;
-        Ok(ControlFlow::Continue(()))
+        Ok(core::ops::ControlFlow::Continue(()))
+    });
+    let validation = validation.and_then(|_| {
+        storage.for_each_spilled_row_batch(table_index, arena, true, None, &mut |rows| {
+            for spilled in rows {
+                let mut decoded = [Datum::Null; MAX_COLUMNS];
+                let values = match spilled.representation {
+                    crate::storage::SpilledRowRepresentation::Encoded(bytes) => {
+                        rowenc::decode(bytes, &schema[..tdef.n_columns], &mut decoded)?;
+                        &decoded[..tdef.n_columns]
+                    }
+                    crate::storage::SpilledRowRepresentation::Values(values) => values,
+                };
+                validate_values(spilled.rowid, values)?;
+            }
+            Ok(core::ops::ControlFlow::Continue(()))
+        })
     });
     if let Err(error) = validation {
         storage.rollback_index_create(slot);

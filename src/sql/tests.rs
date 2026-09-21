@@ -64746,6 +64746,7 @@ fn configured_commit_chain_capacity_controls_object_cold_recovery() {
     config.wal_upload_sync = true;
     config.checkpoint_commit_batches = 5;
     config.checkpoint_garbage_batch_objects = 1;
+    config.checkpoint_delete_objects_per_beat = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
@@ -64821,6 +64822,7 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
     config.object_store_bucket = format!("sql-checkpoint-garbage-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
     config.checkpoint_garbage_batch_objects = 2;
+    config.checkpoint_delete_objects_per_beat = 2;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
@@ -64886,6 +64888,146 @@ fn checkpoint_garbage_is_drained_in_configured_batches_before_success() {
             "SELECT id FROM garbage_survivor"
         )),
         ["1"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
+    let mut config = test_config("checkpoint-delete-pacing");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-checkpoint-delete-pacing-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.checkpoint_garbage_batch_objects = 8;
+    config.checkpoint_delete_objects_per_beat = 1;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    stage_without_publication(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE paced_deletes (id integer PRIMARY KEY)",
+    );
+    engine.commit_wal().unwrap();
+    for id in 1..=4 {
+        stage_without_publication(
+            &mut engine,
+            &mut budget,
+            &format!("INSERT INTO paced_deletes VALUES ({id})"),
+        );
+        engine.commit_wal().unwrap();
+    }
+    for index in 0..3 {
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .client
+            .put(
+                &format!("sst/paced-orphan-{index}"),
+                b"obsolete",
+                crate::object_store::Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .client
+            .put(
+                &format!("blocks/paced-orphan-{index}"),
+                b"obsolete",
+                crate::object_store::Precondition::IfNoneMatchAny,
+            )
+            .unwrap();
+    }
+
+    let published_lsn = loop {
+        match engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap()
+        {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty storage became idle before publication")
+            }
+        }
+    };
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
+
+    fn obsolete_objects(engine: &mut Engine) -> usize {
+        let ckpt = engine.ckpt.as_mut().unwrap();
+        let mut commit_objects = 0usize;
+        let mut legacy_objects = 0usize;
+        let mut block_objects = 0usize;
+        ckpt.client
+            .list("commits/", |key| {
+                commit_objects += usize::from(key.ends_with(".batch") || key.ends_with(".head"));
+            })
+            .unwrap();
+        ckpt.client
+            .list("sst/paced-orphan-", |_| legacy_objects += 1)
+            .unwrap();
+        ckpt.client
+            .list("blocks/paced-orphan-", |_| block_objects += 1)
+            .unwrap();
+        commit_objects.saturating_sub(2) + legacy_objects + block_objects
+    }
+
+    let mut remaining = obsolete_objects(&mut engine);
+    assert!(remaining > config.checkpoint_delete_objects_per_beat);
+    let mut beats = 0usize;
+    let mut maintenance_lists = 0u64;
+    while engine.ckpt.as_ref().unwrap().maintenance_pending() {
+        let lists_before = namespace.borrow().list_count;
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        maintenance_lists += namespace.borrow().list_count - lists_before;
+        let after = obsolete_objects(&mut engine);
+        assert!(
+            remaining.saturating_sub(after) <= config.checkpoint_delete_objects_per_beat,
+            "one maintenance beat deleted {} objects with a configured limit of {}",
+            remaining.saturating_sub(after),
+            config.checkpoint_delete_objects_per_beat
+        );
+        remaining = after;
+        beats += 1;
+        assert!(beats < 32, "paced maintenance stopped making progress");
+    }
+    assert_eq!(remaining, 0);
+    assert!(beats > 1, "maintenance was not paced across dispatch beats");
+    assert_eq!(
+        maintenance_lists, 4,
+        "commit pruning scans twice; legacy and block garbage scan once each"
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id FROM paced_deletes ORDER BY id"
+        )),
+        ["1", "2", "3", "4"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -65259,7 +65401,7 @@ fn ambiguous_commit_batch_put_is_idempotently_adopted() {
 }
 
 #[test]
-fn published_checkpoint_cleanup_retries_after_object_store_failure() {
+fn published_checkpoint_maintenance_retries_without_fencing_reads() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
@@ -65276,31 +65418,68 @@ fn published_checkpoint_cleanup_retries_after_object_store_failure() {
 
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    engine
-        .ckpt
-        .as_mut()
-        .unwrap()
-        .publish_commit_batch(1, b"checkpoint-covered")
-        .unwrap();
-    engine.begin_post_publish_cleanup(1);
+    stage_without_publication(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE maintenance_retry (id integer PRIMARY KEY)",
+    );
+    engine.commit_wal().unwrap();
+    stage_without_publication(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO maintenance_retry VALUES (1)",
+    );
+    engine.commit_wal().unwrap();
+    let published_lsn = loop {
+        match engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap()
+        {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty storage became idle before publication")
+            }
+        }
+    };
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    assert!(engine.checkpoint_work_pending());
 
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     assert!(!engine.maybe_checkpoint());
     assert!(engine.checkpoint_work_pending());
-    let fenced = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE TABLE blocked_until_cleanup (id int)",
-    );
-    assert!(
-        String::from_utf8_lossy(&fenced).contains("58030"),
-        "a failed published cleanup must fence later writes: {}",
-        String::from_utf8_lossy(&fenced)
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM maintenance_retry"
+        )),
+        ["1"],
+        "failed remote maintenance must not fence reads after local publication cleanup"
     );
 
     namespace.borrow_mut().faults.transient_per_mille = 0;
-    assert!(engine.maybe_checkpoint());
+    for _ in 0..8 {
+        if !engine.checkpoint_work_pending() {
+            break;
+        }
+        assert!(engine.maybe_checkpoint());
+    }
     assert!(!engine.checkpoint_work_pending());
+    let writable = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO maintenance_retry VALUES (2)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&writable).contains("ERROR"),
+        "maintenance retry lost the writable state: {}",
+        String::from_utf8_lossy(&writable)
+    );
     drop(engine);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

@@ -8144,7 +8144,7 @@ impl Engine {
                             .min()
                             .unwrap_or(lsn),
                     );
-                ckpt.prune_commit_batches(retain_through)?;
+                ckpt.schedule_commit_prune(retain_through);
             }
             // A sliced checkpoint can publish a snapshot while later
             // statements have already appended WAL. Retaining the journal in

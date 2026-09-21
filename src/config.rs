@@ -253,8 +253,10 @@ pub struct Config {
     /// Content-addressed block identities retained by one checkpoint garbage
     /// collection keep-set.
     pub checkpoint_live_blocks: usize,
-    /// Obsolete objects deleted by one paced garbage collection beat.
+    /// Obsolete object identities staged by one garbage collection scan.
     pub checkpoint_garbage_batch_objects: usize,
+    /// DELETE requests issued by one paced maintenance beat.
+    pub checkpoint_delete_objects_per_beat: usize,
     /// Physical row-version entries retained while one SST pair is merged.
     pub checkpoint_merge_entries: usize,
     /// S3-compatible data-plane authority (`host:port`).
@@ -427,6 +429,7 @@ impl Config {
             checkpoint_commit_batches: 4096,
             checkpoint_live_blocks: 64 * 1024,
             checkpoint_garbage_batch_objects: 4096,
+            checkpoint_delete_objects_per_beat: 16,
             checkpoint_merge_entries: 512 * 1024,
             object_store_endpoint: "127.0.0.1:9000".to_string(),
             object_store_bucket: "pos3ql".to_string(),
@@ -906,6 +909,10 @@ impl Config {
                     config.checkpoint_garbage_batch_objects =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "checkpoint_delete_objects_per_beat" => {
+                    config.checkpoint_delete_objects_per_beat =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
                 "checkpoint_merge_entries" => {
                     config.checkpoint_merge_entries =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -1134,6 +1141,10 @@ impl Config {
                 "checkpoint_garbage_batch_objects",
                 config.checkpoint_garbage_batch_objects,
             ),
+            (
+                "checkpoint_delete_objects_per_beat",
+                config.checkpoint_delete_objects_per_beat,
+            ),
             ("checkpoint_merge_entries", config.checkpoint_merge_entries),
         ] {
             if value == 0 {
@@ -1142,6 +1153,13 @@ impl Config {
                     format!("{name} must be greater than zero"),
                 ));
             }
+        }
+        if config.checkpoint_delete_objects_per_beat > config.checkpoint_garbage_batch_objects {
+            return Err(ConfigError::at(
+                0,
+                "checkpoint_delete_objects_per_beat must not exceed checkpoint_garbage_batch_objects"
+                    .to_string(),
+            ));
         }
         if config.temporary_spill_bytes != 0
             && config.temporary_spill_bytes < crate::store::BLOCK_SIZE
@@ -1747,6 +1765,7 @@ checkpoint_manifest_bytes = 2MiB
 checkpoint_commit_batches = 7000
 checkpoint_live_blocks = 8000
 checkpoint_garbage_batch_objects = 3
+checkpoint_delete_objects_per_beat = 2
 checkpoint_merge_entries = 9000
 sql_arena_bytes = 4096
 ";
@@ -1784,6 +1803,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.checkpoint_commit_batches, 7000);
         assert_eq!(c.checkpoint_live_blocks, 8000);
         assert_eq!(c.checkpoint_garbage_batch_objects, 3);
+        assert_eq!(c.checkpoint_delete_objects_per_beat, 2);
         assert_eq!(c.checkpoint_merge_entries, 9000);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.
@@ -1818,12 +1838,21 @@ sql_arena_bytes = 4096
             "checkpoint_commit_batches",
             "checkpoint_live_blocks",
             "checkpoint_garbage_batch_objects",
+            "checkpoint_delete_objects_per_beat",
             "checkpoint_merge_entries",
         ] {
             let error = Config::parse(&format!("{name} = 0\n")).unwrap_err();
             assert_eq!(error.line, 0);
             assert_eq!(error.message, format!("{name} must be greater than zero"));
         }
+        let error = Config::parse(
+            "checkpoint_garbage_batch_objects = 2\ncheckpoint_delete_objects_per_beat = 3\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message,
+            "checkpoint_delete_objects_per_beat must not exceed checkpoint_garbage_batch_objects"
+        );
     }
 
     #[test]

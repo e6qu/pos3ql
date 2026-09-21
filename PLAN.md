@@ -190,16 +190,36 @@ window. In the clean settled run, three explicit checkpoints produced three
 row SST and value-index generations, while shutdown added one metadata-only
 manifest; the window recorded 765 object PUTs. The earlier un-settled profile
 exposed redundant generations but is not a controlled timing comparison with
-this corrected boundary. Next, bound commit and block deletion work per
-dispatch beat, then reduce the remaining per-checkpoint value-index and row
-publication traffic.
+this corrected boundary.
 The same CI run closed a transaction retry defect exposed by this scheduling
 change: a cold row that parks final WAL staging now preserves the transaction
 and its locks for retry, and a mark from any cleared transaction is no longer
 treated as live undo state merely because cleanup retained the same numeric
 transaction identity.
-Repeat on larger datasets and representative hardware before changing
-checkpoint pacing or asserting production ratios.
+
+Checkpoint commit pruning now joins legacy SST and block garbage collection in
+the paced post-publication maintenance state machine. One dispatch beat deletes
+at most `checkpoint_delete_objects_per_beat` objects from one namespace,
+counting commit batches and descriptors separately; its default is 16. The
+larger fixed garbage staging batch remains 4,096 so paced beats do not repeat a
+complete namespace scan. Explicit `CHECKPOINT` still drains all batches before
+returning.
+The [clean pacing run](benchmarks/baselines/2026-09-21-checkpoint-deletion-pacing-1000/README.md)
+limited every profiled commit and block deletion event to 16 objects. Maximum
+event spans were 54 ms for commit pruning and 52 ms for block deletion, versus
+665 ms and 340 ms when the prior run placed as many as 244 and 131 deletes in
+one event. The run made exactly four namespace scans per publication even
+though block deletion took 33 beats, matching the prior unpaced run's four
+scans per publication. Total work and foreground samples differ, and explicit
+checkpoints execute their batches contiguously, so this establishes the
+per-beat and scan boundaries rather than an end-to-end latency ratio. Actual
+PostgreSQL 18.6 remains the reference for the paired SQL workload on its
+documented local durable tier.
+Next, reduce the remaining per-checkpoint value-index and row publication
+traffic, then repeat at larger scale on representative hardware.
+
+Repeat on larger datasets and representative hardware before asserting
+production ratios.
 
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local

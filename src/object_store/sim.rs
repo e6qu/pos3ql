@@ -69,6 +69,10 @@ pub(crate) struct SimNamespace {
     next_etag: u64,
     /// Operations served so far — the clock `fail_from_op` is measured on.
     pub(crate) op_count: u64,
+    /// Successful LIST requests, exposed so pacing regressions can assert
+    /// that a staged namespace scan is retained across dispatch beats.
+    #[cfg(test)]
+    pub(crate) list_count: u64,
     pub(crate) faults: FaultPlan,
     rng: Pcg32,
     /// Keys whose bytes an unconditional PUT changed — see the module doc.
@@ -81,6 +85,8 @@ impl SimNamespace {
             objects: Vec::new(),
             next_etag: 1,
             op_count: 0,
+            #[cfg(test)]
+            list_count: 0,
             faults: FaultPlan::default(),
             rng: Pcg32::new(seed, 0x0b1e_c757), // object-store stream
             blind_overwrites: Vec::new(),
@@ -318,6 +324,10 @@ impl SimClient {
         let full_prefix = self.full_key(prefix);
         let mut bucket = self.namespace.borrow_mut();
         bucket.operation_gate()?;
+        #[cfg(test)]
+        {
+            bucket.list_count += 1;
+        }
         let mut count = 0usize;
         for object in &bucket.objects {
             if object.key.starts_with(&full_prefix) {

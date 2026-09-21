@@ -1,0 +1,72 @@
+{
+  "artifact_type": "postgresql_baseline",
+  "container_image_id": "sha256:d8a40176c29aa0c7a20a19f85ddddc47f72d8d6789a7a86a21f3713e71fb4ad6",
+  "container_mounts": [
+    {
+      "Destination": "/var/lib/postgresql",
+      "Driver": "local",
+      "Mode": "",
+      "Name": "5683dfabdb5fe7cff3ba74a407d41fb1c80fac59b11f9de552872a60be0f45ac",
+      "Propagation": "rprivate",
+      "RW": true,
+      "Source": "/var/lib/containers/storage/volumes/5683dfabdb5fe7cff3ba74a407d41fb1c80fac59b11f9de552872a60be0f45ac/_data",
+      "Type": "volume"
+    }
+  ],
+  "schema_version": 1,
+  "settings": {
+    "block_size": {
+      "source": "default",
+      "unit": null,
+      "value": "8192"
+    },
+    "checkpoint_timeout": {
+      "source": "default",
+      "unit": "s",
+      "value": "300"
+    },
+    "data_directory": {
+      "source": "override",
+      "unit": null,
+      "value": "/var/lib/postgresql/18/docker"
+    },
+    "fsync": {
+      "source": "default",
+      "unit": null,
+      "value": "on"
+    },
+    "full_page_writes": {
+      "source": "default",
+      "unit": null,
+      "value": "on"
+    },
+    "max_connections": {
+      "source": "configuration file",
+      "unit": null,
+      "value": "100"
+    },
+    "max_wal_size": {
+      "source": "configuration file",
+      "unit": "MB",
+      "value": "1024"
+    },
+    "shared_buffers": {
+      "source": "configuration file",
+      "unit": "8kB",
+      "value": "16384"
+    },
+    "synchronous_commit": {
+      "source": "default",
+      "unit": null,
+      "value": "on"
+    },
+    "wal_level": {
+      "source": "default",
+      "unit": null,
+      "value": "replica"
+    }
+  },
+  "storage_description": "Docker-managed local volume on host APFS; fsync enabled",
+  "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "version_number": 180006
+}

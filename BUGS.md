@@ -160,6 +160,13 @@ configured per-beat object limit applies separately to commit, legacy SST, and
 block namespaces. A one-object regression covers complete progress, retry,
 explicit drain, and object-cold recovery. Remaining checkpoint publication
 traffic and representative performance qualification are tracked in PLAN.md.
+The selective value-index publication audit found no externally blocked
+defect. Committed row changes now carry an allocation-free physical-column
+footprint, and durable bindings record key, predicate, and included-column
+dependencies. Unrelated updates retain published generations; row-set
+replacement and replay paths invalidate conservatively. A WAL-only recovery
+regression caught and closes the direct-replay invalidation gap, and the clean
+profile plus actual PostgreSQL 18 comparison are recorded in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -6685,13 +6685,16 @@ impl Checkpointer {
             break;
         }
         if wrote_slice
-            && (0..storage.physical_table_count()).any(|slot| self.needs_slice(storage, slot))
+            && (merge_due
+                || (0..storage.physical_table_count()).any(|slot| self.needs_slice(storage, slot)))
         {
             return Ok(CheckpointStep::Working);
         }
-        // Publish with the final slice while every captured generation is
-        // still current. Yielding here lets the next statement invalidate
-        // that slice and forces its immutable blocks to be written again.
+        // Without compaction work owed, publish with the final slice while
+        // every captured generation is still current. Yielding here lets the
+        // next statement invalidate that slice and forces its immutable
+        // blocks to be written again. An owed merge retains its alternating
+        // beat so long histories keep making bounded progress.
         let lsn = storage.lsn();
         #[cfg(feature = "checkpoint-profile")]
         let publish_started = checkpoint_profile_start();

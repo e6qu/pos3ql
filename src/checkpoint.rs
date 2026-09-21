@@ -36,23 +36,47 @@ const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | le
 const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
 
 #[cfg(feature = "checkpoint-profile")]
+pub(crate) struct CheckpointProfileStart {
+    realtime_ns: u64,
+    monotonic: std::time::Instant,
+}
+
+#[cfg(feature = "checkpoint-profile")]
+fn checkpoint_profile_start() -> CheckpointProfileStart {
+    let mut now = core::mem::MaybeUninit::<libc::timespec>::uninit();
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, now.as_mut_ptr()) };
+    assert_eq!(result, 0, "CLOCK_REALTIME is available");
+    let now = unsafe { now.assume_init() };
+    CheckpointProfileStart {
+        realtime_ns: (now.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(now.tv_nsec as u64),
+        monotonic: std::time::Instant::now(),
+    }
+}
+
+#[cfg(feature = "checkpoint-profile")]
 fn profile_checkpoint_phase(
     phase: &'static str,
     lsn: u64,
     slot: Option<usize>,
-    started: std::time::Instant,
+    started: CheckpointProfileStart,
     before: crate::store::BlockIoStats,
     after: crate::store::BlockIoStats,
     deleted: usize,
 ) {
+    let elapsed_ns = started.monotonic.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let ended_ns = started.realtime_ns.saturating_add(elapsed_ns);
     let io = after.saturating_sub(before);
     let line = stack_format!(
-        256,
-        "checkpoint_phase lsn={} phase={} slot={} elapsed_us={} block_gets={} block_puts={} deleted={}\n",
+        320,
+        "checkpoint_phase lsn={} phase={} slot={} started_ns={} ended_ns={} elapsed_us={} block_gets={} block_puts={} deleted={}\n",
         lsn,
         phase,
         slot.map_or(-1, |slot| slot as i64),
-        started.elapsed().as_micros(),
+        started.realtime_ns,
+        ended_ns,
+        elapsed_ns / 1_000,
         io.object_gets,
         io.object_puts,
         deleted
@@ -633,6 +657,30 @@ const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
 
 impl Checkpointer {
+    #[cfg(feature = "checkpoint-profile")]
+    pub(crate) fn profile_start(&self) -> (CheckpointProfileStart, crate::store::BlockIoStats) {
+        (checkpoint_profile_start(), self.blocks.borrow().io_stats())
+    }
+
+    #[cfg(feature = "checkpoint-profile")]
+    pub(crate) fn profile_phase(
+        &self,
+        phase: &'static str,
+        lsn: u64,
+        started: CheckpointProfileStart,
+        before: crate::store::BlockIoStats,
+    ) {
+        profile_checkpoint_phase(
+            phase,
+            lsn,
+            None,
+            started,
+            before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
+    }
+
     pub(crate) fn budget_bytes(config: &Config) -> usize {
         let table_capacity = crate::storage::table_slot_capacity(config);
         let manifest_capacity = config.checkpoint_manifest_bytes;
@@ -1364,7 +1412,7 @@ impl Checkpointer {
     /// the current manifest LSN. Called after a checkpoint.
     pub(crate) fn prune_commit_batches(&mut self, up_to_lsn: u64) -> Result<(), SqlError> {
         #[cfg(feature = "checkpoint-profile")]
-        let started = std::time::Instant::now();
+        let started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let before = self.blocks.borrow().io_stats();
         #[cfg(feature = "checkpoint-profile")]
@@ -6636,7 +6684,7 @@ impl Checkpointer {
         }
         let lsn = storage.lsn();
         #[cfg(feature = "checkpoint-profile")]
-        let publish_started = std::time::Instant::now();
+        let publish_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let publish_before = self.blocks.borrow().io_stats();
         let published = self.publish(storage, lsn);
@@ -10100,7 +10148,7 @@ impl Checkpointer {
         }
 
         #[cfg(feature = "checkpoint-profile")]
-        let row_started = std::time::Instant::now();
+        let row_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let row_before = self.blocks.borrow().io_stats();
         if !clean {
@@ -10266,7 +10314,7 @@ impl Checkpointer {
             );
         }
         #[cfg(feature = "checkpoint-profile")]
-        let index_started = std::time::Instant::now();
+        let index_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let index_before = self.blocks.borrow().io_stats();
         self.build_value_indexes(storage, slot)?;
@@ -10564,7 +10612,7 @@ impl Checkpointer {
     /// deletion batch remains.
     fn collect_block_garbage_batch(&mut self, storage: &Storage) -> Result<bool, SqlError> {
         #[cfg(feature = "checkpoint-profile")]
-        let keep_started = std::time::Instant::now();
+        let keep_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let keep_before = self.blocks.borrow().io_stats();
         self.roster_scratch.clear();
@@ -10675,7 +10723,7 @@ impl Checkpointer {
         let doomed = &mut self.doomed_blocks;
         let mut overflow = false;
         #[cfg(feature = "checkpoint-profile")]
-        let list_started = std::time::Instant::now();
+        let list_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let list_before = self.blocks.borrow().io_stats();
         self.client
@@ -10704,7 +10752,7 @@ impl Checkpointer {
             0,
         );
         #[cfg(feature = "checkpoint-profile")]
-        let delete_started = std::time::Instant::now();
+        let delete_started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let delete_before = self.blocks.borrow().io_stats();
         for i in 0..self.doomed_blocks.len() {
@@ -10732,7 +10780,7 @@ impl Checkpointer {
     /// deletion batch remains.
     fn collect_garbage_batch(&mut self) -> Result<bool, SqlError> {
         #[cfg(feature = "checkpoint-profile")]
-        let started = std::time::Instant::now();
+        let started = checkpoint_profile_start();
         #[cfg(feature = "checkpoint-profile")]
         let before = self.blocks.borrow().io_stats();
         // Two passes because list borrows the client: collect keys first

@@ -127,6 +127,30 @@ def main():
             f"\nFull profile window: {requests['put']} object PUT, "
             f"{requests['delete']} object DELETE, {requests['list']} LIST."
         )
+        overlap = profile.get("operation_overlap")
+        if overlap:
+            print("\n### Foreground overlap\n")
+            print(
+                "Operations are grouped when their client-observed interval intersects a "
+                "phase on the common realtime axis. One operation can intersect multiple phases.\n"
+            )
+            print("| Phase | operations | reads | writes | intersection ms | p50 ms | p95 ms | p99 ms | max ms |")
+            print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+            groups = {"no phase overlap": overlap["outside_phases"], **overlap["by_phase"]}
+            for phase, measured in groups.items():
+                print(
+                    f"| {phase} | {measured['operations']} | {measured['reads']} | "
+                    f"{measured['writes']} | "
+                    f"{number(measured.get('operation_intersection_ms'))} | "
+                    f"{number(measured['p50_ms'])} | "
+                    f"{number(measured['p95_ms'])} | {number(measured['p99_ms'])} | "
+                    f"{number(measured['maximum_ms'])} |"
+                )
+            print(
+                f"\nProfiled phases intersected "
+                f"{number(overlap['profiled_phase_intersection_ms'])} ms of "
+                f"{number(overlap['total_operation_latency_ms'])} ms summed foreground latency."
+            )
 
     if recoveries:
         print("\n## Recovery and cache-fill intervals\n")

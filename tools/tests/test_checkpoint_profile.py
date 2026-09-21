@@ -13,11 +13,11 @@ SPEC.loader.exec_module(profile)
 
 class CheckpointProfileTest(unittest.TestCase):
     def test_measured_interval_excludes_setup_and_sums_each_phase(self):
-        setup = b"checkpoint_phase lsn=1 phase=manifest slot=-1 elapsed_us=9 block_gets=0 block_puts=0 deleted=0\n"
+        setup = b"checkpoint_phase lsn=1 phase=manifest slot=-1 started_ns=1000 ended_ns=10000 elapsed_us=9 block_gets=0 block_puts=0 deleted=0\n"
         measured = (
-            b"checkpoint_phase lsn=2 phase=row_sst slot=0 elapsed_us=10 block_gets=1 block_puts=2 deleted=0\n"
-            b"checkpoint_phase lsn=2 phase=row_sst slot=1 elapsed_us=12 block_gets=3 block_puts=4 deleted=0\n"
-            b"checkpoint_phase lsn=2 phase=gc_delete slot=-1 elapsed_us=20 block_gets=0 block_puts=0 deleted=5\n"
+            b"checkpoint_phase lsn=2 phase=row_sst slot=0 started_ns=20000 ended_ns=30000 elapsed_us=10 block_gets=1 block_puts=2 deleted=0\n"
+            b"checkpoint_phase lsn=2 phase=row_sst slot=1 started_ns=30000 ended_ns=42000 elapsed_us=12 block_gets=3 block_puts=4 deleted=0\n"
+            b"checkpoint_phase lsn=2 phase=gc_delete slot=-1 started_ns=42000 ended_ns=62000 elapsed_us=20 block_gets=0 block_puts=0 deleted=5\n"
         )
         result = profile.parse(setup + measured, len(setup))
         self.assertEqual(len(result["events"]), 3)
@@ -34,6 +34,25 @@ class CheckpointProfileTest(unittest.TestCase):
             profile.parse(b"checkpoint_phase lsn=1 phase=manifest\n", 0)
         with self.assertRaisesRegex(ValueError, "no checkpoint phase lines"):
             profile.parse(b"server started\n", 0)
+
+    def test_correlates_operation_latency_with_each_overlapping_phase(self):
+        events = [
+            {"phase": "row_sst", "started_ns": 100, "ended_ns": 300},
+            {"phase": "gc_delete", "started_ns": 400, "ended_ns": 500},
+        ]
+        operations = [
+            {"worker": 0, "operation": 0, "kind": "write", "started_ns": 50, "ended_ns": 150},
+            {"worker": 1, "operation": 0, "kind": "read", "started_ns": 200, "ended_ns": 450},
+            {"worker": 0, "operation": 1, "kind": "read", "started_ns": 600, "ended_ns": 650},
+        ]
+        result = profile.correlate(events, operations)
+        self.assertEqual(result["clock"], "CLOCK_REALTIME")
+        self.assertEqual(result["by_phase"]["row_sst"]["operations"], 2)
+        self.assertEqual(result["by_phase"]["row_sst"]["p99_ms"], 0.00025)
+        self.assertEqual(result["by_phase"]["row_sst"]["operation_intersection_ms"], 0.00015)
+        self.assertEqual(result["by_phase"]["gc_delete"]["operations"], 1)
+        self.assertEqual(result["outside_phases"]["operations"], 1)
+        self.assertEqual(result["profiled_phase_intersection_ms"], 0.0002)
 
     def test_request_window_rejects_a_decreasing_counter(self):
         before = {"schema_version": 1, "requests": {

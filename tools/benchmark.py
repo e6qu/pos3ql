@@ -325,6 +325,12 @@ def workload_sql(workload, worker, operation, rows):
     raise ValueError(f"unknown workload {workload}")
 
 
+def operation_kind(workload, operation):
+    if workload == "mixed":
+        return "read" if operation % 5 else "write"
+    return "write" if workload in ("update", "insert") else "read"
+
+
 def identify(connection):
     rows = connection.query("SELECT version()")
     return rows[0][0] if rows and rows[0] else "unknown"
@@ -450,6 +456,7 @@ def subtract_access_path(after, before):
 
 
 def run(args):
+    trace_operations = getattr(args, "trace_operations", False)
     targets = args.targets or [(args.host, args.port)]
     control = PgConnection(*targets[0], args.user, args.database, args.timeout_seconds)
     try:
@@ -481,26 +488,40 @@ def run(args):
     start_barrier = threading.Barrier(args.clients + 1)
     operation_barrier = threading.Barrier(args.clients) if args.synchronized else None
     stop_maintenance = threading.Event()
+    start_maintenance = threading.Event()
     maintenance_count = [0]
     attempted = [0] * args.clients
     deadline_ns = [0]
+    operation_trace = []
 
     def worker(worker_id):
         local = []
+        local_trace = []
         operation = 0
         try:
             start_barrier.wait()
             while operation < args.operations or (
                 args.duration_seconds
-                and time.perf_counter_ns() < deadline_ns[0]
+                and time.monotonic_ns() < deadline_ns[0]
             ):
                 if operation_barrier:
                     operation_barrier.wait()
-                sql = workload_sql(args.workload, worker_id, operation, args.rows)
+                operation_index = operation
+                sql = workload_sql(args.workload, worker_id, operation_index, args.rows)
                 operation += 1
-                started = time.perf_counter_ns()
+                started = time.monotonic_ns()
+                trace_started = time.time_ns()
                 connections[worker_id].query(sql)
-                local.append(time.perf_counter_ns() - started)
+                ended = time.monotonic_ns()
+                local.append(ended - started)
+                if trace_operations:
+                    local_trace.append({
+                        "worker": worker_id,
+                        "operation": operation_index,
+                        "kind": operation_kind(args.workload, operation_index),
+                        "started_ns": trace_started,
+                        "ended_ns": trace_started + ended - started,
+                    })
         except Exception as error:  # surfaced in the result and by the exit code
             with result_lock:
                 errors.append(f"worker {worker_id}: {error}")
@@ -513,10 +534,12 @@ def run(args):
             with result_lock:
                 attempted[worker_id] = operation
                 latencies.extend(local)
+                operation_trace.extend(local_trace)
 
     def maintain():
         connection = PgConnection(*targets[0], args.user, args.database, args.timeout_seconds)
         try:
+            start_maintenance.wait()
             while not stop_maintenance.wait(args.maintenance_interval):
                 connection.query("CHECKPOINT")
                 maintenance_count[0] += 1
@@ -541,12 +564,13 @@ def run(args):
     workers = [threading.Thread(target=worker, args=(index,)) for index in range(args.clients)]
     for thread in workers:
         thread.start()
-    started = time.perf_counter_ns()
+    started = time.monotonic_ns()
     deadline_ns[0] = started + int(args.duration_seconds * 1_000_000_000)
     start_barrier.wait()
+    start_maintenance.set()
     for thread in workers:
         thread.join()
-    elapsed_seconds = (time.perf_counter_ns() - started) / 1_000_000_000
+    elapsed_seconds = (time.monotonic_ns() - started) / 1_000_000_000
     stop_maintenance.set()
     if maintenance:
         maintenance.join()
@@ -572,6 +596,7 @@ def run(args):
             errors.append(f"access-path result: {error}")
 
     ordered = sorted(latencies)
+    operation_trace.sort(key=lambda event: (event["started_ns"], event["worker"]))
     completed = len(ordered)
     object_metrics = subtract_metrics(after_metrics, before_metrics)
     object_requests = (
@@ -630,6 +655,7 @@ def run(args):
                 if object_requests is not None and completed
                 else None
             ),
+            **({"operation_trace": operation_trace} if trace_operations else {}),
         },
     }
     return result
@@ -642,6 +668,9 @@ def validate(result):
         failures.append("workload reported errors")
     if results["completed_operations"] != results["attempted_operations"]:
         failures.append("not every attempted operation completed")
+    trace = results.get("operation_trace")
+    if trace is not None and len(trace) != results["completed_operations"]:
+        failures.append("operation trace does not cover every completed operation")
     latency = results["latency_ms"]
     ordered = [latency[name] for name in ("minimum", "p50", "p95", "p99", "maximum")]
     if any(value is None for value in ordered) or ordered != sorted(ordered):
@@ -740,6 +769,10 @@ def parse_args():
     parser.add_argument("--operations", type=int, default=100)
     parser.add_argument("--duration-seconds", type=float, default=0.0,
                         help="run at least this long and at least --operations per client")
+    parser.add_argument(
+        "--trace-operations", action="store_true",
+        help="record realtime intervals with monotonic durations for correlation",
+    )
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--setup", action="store_true")
     parser.add_argument("--synchronized", action="store_true")

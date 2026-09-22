@@ -6,6 +6,12 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+Checkpoint value-index output pacing found no external blocker: the retained
+fixed-memory sort source survives bounded writer beats and retry, while exact
+table and binding identity prevents one relation's staged install from
+suppressing the same binding ordinal on another relation, and exact dirty LSNs
+reject stale work after foreground commits and `REINDEX`. A dirty binding keeps
+the sweep active even when its row slice is already clean.
 The geometric, ranked nearest-neighbor, inverted posting, signature, and
 interval index-navigation,
 checkpoint-maintenance capacity and publication handoff, concurrent-harness

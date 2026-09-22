@@ -266,10 +266,22 @@ versus the former 27.50-second dispatch. Maximum foreground latency fell from
 other event counts changed, so these shared-host results remain diagnostic
 rather than a controlled production ratio. Actual PostgreSQL 18.6 completed
 the matched local-durable workload at 3.90 ms p99 and 79.31 ms maximum latency.
-The remaining largest checkpoint event is a 3.91-second affected value-index
-publication. Apply the same dispatch bound to value-index writers, preserving
-their fixed-memory external-sort and generation-reuse behavior, then repeat the
-10,000-row profile before changing the durable row representation.
+The [paced value-index rerun](benchmarks/baselines/2026-09-22-checkpoint-value-index-pacing-10000/README.md)
+retains one fixed-memory sorted source per affected binding and streams its
+immutable output through restartable beats. Its 74 writer beats took 153.38 ms
+and wrote 28 blocks; the largest took 15.57 ms and four PUTs, with no four-PUT
+or eight-GET bound violation. A deterministic regression also invalidates an
+in-progress source after an indexed commit, retries a failed remote write, and
+verifies warm and object-cold results. The same profile makes the next boundary
+explicit: 24 value-index schedule events spent 21.26 seconds collecting and
+externally sorting entries, and the largest occupied 1.41 seconds while writing
+22 temporary run blocks. Pace value-index source collection and external run
+generation without rescanning rows or weakening fixed-memory sorting, dirty-LSN
+invalidation, content reuse, or provider neutrality, then repeat the exact
+10,000-row profile before changing the durable row representation. The run's
+row-merge counts and end-to-end latency differed substantially from its
+predecessor, so the shared-host aggregate timings are diagnostic rather than a
+controlled pacing ratio.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

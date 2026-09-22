@@ -50910,7 +50910,8 @@ fn geometric_navigation_prunes_cold_objects_across_every_builtin_spatial_class()
                         Ok(())
                     }
                 )
-                .unwrap()
+                .unwrap(),
+            "{name}"
         );
         assert_eq!(selected, 1, "{name}");
         let traffic = cold.storage.block_io_stats().saturating_sub(before);
@@ -64556,6 +64557,208 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
+fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
+    let mut config = test_config("checkpoint-value-index-pacing");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-value-index-pacing-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.table_rows = 4096;
+    config.txn_rows = 4096;
+    config.value_index_rows = 4096;
+    config.work_arena_bytes = 32 << 20;
+    config.memtable_bytes = 16 << 20;
+    config.wal_bytes = 16 << 20;
+    config.wal_buffer_bytes = 4 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 131);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE paced_value_index (id integer, code text, payload text); \
+         INSERT INTO paced_value_index \
+           SELECT value, 'k-' || value::text || '-' || repeat(md5(value::text), 8), \
+                  repeat('x', 512) \
+             FROM generate_series(1, 1024) AS source(value); \
+         CREATE INDEX paced_value_index_code ON paced_value_index (code)",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_value_index \
+            SET code = 'm-' || id::text || '-' || repeat(md5(id::text), 8)",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+
+    let before = engine.storage.block_io_stats();
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    let first_write = engine.storage.block_io_stats().saturating_sub(before);
+    assert!(
+        first_write.object_puts <= 4 && first_write.object_gets <= 8,
+        "one value-index writer beat exceeded its object-I/O bound: {first_write:?}"
+    );
+    assert!(
+        engine.ckpt.as_ref().unwrap().value_index_job_active(),
+        "the fixture must require more than one writer beat"
+    );
+
+    let interleaved = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_value_index \
+            SET code = 'latest-' || repeat(md5(id::text), 8) \
+          WHERE id = 777",
+    );
+    assert!(!message_types(&interleaved).contains(&b'E'));
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert!(
+        !engine.ckpt.as_ref().unwrap().value_index_job_active(),
+        "an indexed commit must invalidate the older retained source"
+    );
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+
+    namespace.borrow_mut().faults.transient_per_mille = 1000;
+    let before_failure = engine.storage.block_io_stats();
+    assert!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .is_err(),
+        "the retained writer must surface an object-store failure"
+    );
+    let failed_write = engine
+        .storage
+        .block_io_stats()
+        .saturating_sub(before_failure);
+    assert!(
+        failed_write.object_puts <= 4 && failed_write.object_gets <= 8,
+        "a failed writer beat exceeded its object-I/O bound: {failed_write:?}"
+    );
+    assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+    namespace.borrow_mut().faults.transient_per_mille = 0;
+
+    let mut writer_beats = 2usize;
+    let mut dispatch_beats = 0usize;
+    let published_lsn = loop {
+        dispatch_beats += 1;
+        assert!(dispatch_beats < 256, "paced checkpoint did not converge");
+        let writer_beat = engine.ckpt.as_ref().unwrap().value_index_job_active();
+        let before = engine.storage.block_io_stats();
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        let beat = engine.storage.block_io_stats().saturating_sub(before);
+        if writer_beat {
+            writer_beats += 1;
+            assert!(
+                beat.object_puts <= 4 && beat.object_gets <= 8,
+                "one value-index writer beat exceeded its object-I/O bound: {beat:?}"
+            );
+        }
+        match step {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty value index became idle before publication")
+            }
+        }
+    };
+    assert!(
+        writer_beats > 3,
+        "value-index output was not split across beats"
+    );
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM paced_value_index \
+              WHERE code = 'latest-' || repeat(md5('777'), 8)"
+        )),
+        ["777"]
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id FROM paced_value_index \
+              WHERE code = 'latest-' || repeat(md5('777'), 8); \
+             SELECT count(*) FROM paced_value_index \
+              WHERE code LIKE 'm-%'"
+        )),
+        ["777", "1023"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn analyze_and_index_refresh_coalesce_wide_pax_reads_after_cold_recovery() {
     let mut config = test_config("analyze-pax-container");
     config.object_store_on = true;
@@ -65004,12 +65207,22 @@ fn checkpoint_reslice_reuses_unchanged_staged_value_indexes() {
         )
         .unwrap()
         .created_at;
-    let staged = engine
-        .ckpt
-        .as_ref()
-        .unwrap()
-        .pending_value_index_handle(table, second_index)
-        .expect("the first slice staged the new value index");
+    let staged = (0..16)
+        .find_map(|_| {
+            let step = engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .unwrap();
+            assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
+            engine
+                .ckpt
+                .as_ref()
+                .unwrap()
+                .pending_value_index_handle(table, second_index)
+        })
+        .expect("paced value-index writes must eventually stage the new generation");
 
     let changed_again = run_with(
         &mut engine,
@@ -65640,30 +65853,41 @@ fn checkpoint_publishes_the_final_slice_without_a_dispatch_gap() {
          UPDATE final_slice SET value = 'after' WHERE id = 1",
     );
     assert!(!message_types(&updated).contains(&b'E'));
-    assert!(matches!(
-        engine
+    let first = engine.storage.find_table("public", "first_slice").unwrap();
+    let final_slot = engine.storage.find_table("public", "final_slice").unwrap();
+    let first_generation = engine.storage.table(first).generation;
+    let final_generation = engine.storage.table(final_slot).generation;
+    let mut first_sliced = false;
+    let mut beats = 0usize;
+    let published_lsn = loop {
+        let step = engine
             .ckpt
             .as_mut()
             .unwrap()
             .checkpoint_step(&mut engine.storage, &mut engine.scratch)
-            .unwrap(),
-        crate::checkpoint::CheckpointStep::Working
-    ));
-    let published_lsn = match engine
-        .ckpt
-        .as_mut()
-        .unwrap()
-        .checkpoint_step(&mut engine.storage, &mut engine.scratch)
-        .unwrap()
-    {
-        crate::checkpoint::CheckpointStep::Published { lsn } => lsn,
-        crate::checkpoint::CheckpointStep::Working => {
-            panic!("final dirty slice yielded before publication")
+            .unwrap();
+        beats += 1;
+        if engine.ckpt.as_ref().unwrap().sliced_generation(first) == first_generation {
+            first_sliced = true;
         }
-        crate::checkpoint::CheckpointStep::Idle => {
-            panic!("dirty storage became idle before publication")
+        if engine.ckpt.as_ref().unwrap().sliced_generation(final_slot) == final_generation {
+            match step {
+                crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+                crate::checkpoint::CheckpointStep::Working => {
+                    panic!("final dirty slice yielded before publication")
+                }
+                crate::checkpoint::CheckpointStep::Idle => {
+                    panic!("dirty storage became idle before publication")
+                }
+            }
         }
+        assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
+        assert!(beats < 16, "paced value-index preparation did not converge");
     };
+    assert!(
+        first_sliced,
+        "the preceding dirty table must be sliced first"
+    );
     engine.begin_post_publish_cleanup(published_lsn);
     engine.finish_post_publish_cleanup().unwrap();
     engine
@@ -65738,17 +65962,23 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
          UPDATE reslice_tail SET payload = 'after' WHERE id = 1",
     );
     assert!(!message_types(&changed).contains(&b'E'));
-    let before_first = engine.storage.block_io_stats();
-    assert!(matches!(
-        engine
+    let first_generation = engine.storage.table(table).generation;
+    let mut first_beats = 0usize;
+    let first_slice = loop {
+        first_beats += 1;
+        assert!(first_beats < 16, "initial paced slice did not converge");
+        let before = engine.storage.block_io_stats();
+        let step = engine
             .ckpt
             .as_mut()
             .unwrap()
             .checkpoint_step(&mut engine.storage, &mut engine.scratch)
-            .unwrap(),
-        crate::checkpoint::CheckpointStep::Working
-    ));
-    let first_slice = engine.storage.block_io_stats().saturating_sub(before_first);
+            .unwrap();
+        assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
+        if engine.ckpt.as_ref().unwrap().sliced_generation(table) == first_generation {
+            break engine.storage.block_io_stats().saturating_sub(before);
+        }
+    };
 
     let changed_again = run_with(
         &mut engine,
@@ -65756,39 +65986,52 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
         "UPDATE resliced_rows SET payload = 'final' WHERE id = 128",
     );
     assert!(!message_types(&changed_again).contains(&b'E'));
-    let before_reslice = engine.storage.block_io_stats();
-    assert!(matches!(
-        engine
+    let reslice_generation = engine.storage.table(table).generation;
+    let mut reslice_beats = 0usize;
+    let reslice = loop {
+        reslice_beats += 1;
+        assert!(reslice_beats < 16, "incremental reslice did not converge");
+        let before = engine.storage.block_io_stats();
+        let step = engine
             .ckpt
             .as_mut()
             .unwrap()
             .checkpoint_step(&mut engine.storage, &mut engine.scratch)
-            .unwrap(),
-        crate::checkpoint::CheckpointStep::Working
-    ));
-    let reslice = engine
-        .storage
-        .block_io_stats()
-        .saturating_sub(before_reslice);
+            .unwrap();
+        assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
+        if engine.ckpt.as_ref().unwrap().sliced_generation(table) == reslice_generation {
+            break engine.storage.block_io_stats().saturating_sub(before);
+        }
+    };
     assert!(
         reslice.object_puts < first_slice.object_puts,
         "reslice rewrote the prior slice: first={first_slice:?}, second={reslice:?}"
     );
 
-    let published_lsn = match engine
-        .ckpt
-        .as_mut()
-        .unwrap()
-        .checkpoint_step(&mut engine.storage, &mut engine.scratch)
-        .unwrap()
-    {
-        crate::checkpoint::CheckpointStep::Published { lsn } => lsn,
-        crate::checkpoint::CheckpointStep::Working => {
-            panic!("tail slice yielded before publishing the completed sweep")
+    let tail = engine.storage.find_table("public", "reslice_tail").unwrap();
+    let tail_generation = engine.storage.table(tail).generation;
+    let mut tail_beats = 0usize;
+    let published_lsn = loop {
+        tail_beats += 1;
+        assert!(tail_beats < 16, "paced tail slice did not converge");
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        if engine.ckpt.as_ref().unwrap().sliced_generation(tail) == tail_generation {
+            match step {
+                crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+                crate::checkpoint::CheckpointStep::Working => {
+                    panic!("tail slice yielded before publishing the completed sweep")
+                }
+                crate::checkpoint::CheckpointStep::Idle => {
+                    panic!("dirty sweep became idle before publication")
+                }
+            }
         }
-        crate::checkpoint::CheckpointStep::Idle => {
-            panic!("dirty sweep became idle before publication")
-        }
+        assert!(matches!(step, crate::checkpoint::CheckpointStep::Working));
     };
     engine.begin_post_publish_cleanup(published_lsn);
     engine.finish_post_publish_cleanup().unwrap();
@@ -65866,8 +66109,8 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
     let created = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE retry_rows (id integer PRIMARY KEY, value text); \
-         CREATE TABLE retry_tail (id integer PRIMARY KEY, value text); \
+        "CREATE TABLE retry_rows (id integer, value text); \
+         CREATE TABLE retry_tail (id integer, value text); \
          INSERT INTO retry_rows VALUES (1, 'deleted'); \
          INSERT INTO retry_tail VALUES (1, 'before')",
     );

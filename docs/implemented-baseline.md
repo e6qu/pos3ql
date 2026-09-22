@@ -40,6 +40,15 @@ active production roadmap is [PLAN.md](../PLAN.md).
   restartable beats before appending a new delta. Completed merges have one
   fixed startup slot per table so several filled tables can prepare for one
   manifest publish without a monolithic row rewrite.
+  Affected value-index bindings collect and externally sort into one retained
+  fixed-memory source, then write the immutable generation across restartable
+  beats bounded by entries and object transfers. Exact binding dirty LSNs
+  invalidate stale jobs and staged handles across foreground commits and
+  `REINDEX`; table identity keeps equal binding ordinals on different relations
+  independent, and a dirty binding schedules even after its row slice is clean.
+  Failed output resumes from the retained source while content-addressed writes
+  make replay idempotent. Interleaved update, injected remote failure, per-beat
+  I/O, warm lookup, and empty-cache recovery share one deterministic regression.
   Commit-batch pruning drains histories larger than one batch while retaining
   the replay boundary. The sorted live-block set gives each listed-object
   membership test logarithmic cost. Exact memory deltas, named exhaustion,

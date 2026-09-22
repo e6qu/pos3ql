@@ -227,6 +227,19 @@ shared-host runs, so the change in aggregate timing is diagnostic rather than
 a controlled production ratio. Actual PostgreSQL 18.6 completed the matched
 local-durable workload at 3.90 ms p99 and 79.31 ms maximum latency. The largest
 remaining checkpoint phase event was a 3.91-second value-index publication.
+The [paced value-index rerun](../benchmarks/baselines/2026-09-22-checkpoint-value-index-pacing-10000/README.md)
+separates source collection and sorting from immutable output writing. Its 74
+writer beats totaled 153.38 ms and 28 block PUTs; the largest took 15.57 ms and
+four PUTs, and no beat crossed its four-PUT or eight-GET boundary. The retained
+fixed-memory source restarts after an object-store failure and is discarded
+when a newer binding dirty LSN appears. The run's 24 schedule events remained
+monolithic: they took 21.26 seconds, wrote 486 external-sort blocks, and reached
+1.41 seconds and 22 PUTs in one dispatch. The run also performed more row-merge
+work than its predecessor, so its 8.09-second p99 and 13.54-second maximum do
+not isolate the effect of writer pacing. Actual PostgreSQL 18.6 completed the
+matched local-durable workload at 10.32 ms p99 and 31.49 ms maximum latency.
+Source collection and external run generation are now the measured
+value-index pacing target.
 
 ## Measured scenarios
 

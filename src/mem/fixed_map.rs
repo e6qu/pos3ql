@@ -172,6 +172,19 @@ impl<K: Hash + Eq, V> FixedMap<K, V> {
             .filter_map(|slot| slot.as_ref().map(|(k, v)| (k, v)))
     }
 
+    /// The fixed backing-slot count. A caller may retain a slot offset while
+    /// the map is unchanged and resume a bounded walk without revisiting
+    /// earlier entries.
+    pub(crate) fn backing_slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(crate) fn entry_at_slot(&self, slot: usize) -> Option<(&K, &V)> {
+        self.slots
+            .get(slot)
+            .and_then(|entry| entry.as_ref().map(|(key, value)| (key, value)))
+    }
+
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
         self.slots
             .iter_mut()

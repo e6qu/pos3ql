@@ -64613,6 +64613,35 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     ));
     assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
 
+    let mut preparation_beats = 0usize;
+    while !engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .value_index_output_job_active()
+    {
+        preparation_beats += 1;
+        assert!(
+            preparation_beats < 128,
+            "value-index preparation did not converge"
+        );
+        let before = engine.storage.block_io_stats();
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+        let beat = engine.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            beat.object_puts <= 4 && beat.object_gets <= 8,
+            "one value-index preparation beat exceeded its object-I/O bound: {beat:?}"
+        );
+    }
+
     let before = engine.storage.block_io_stats();
     assert!(matches!(
         engine
@@ -64664,6 +64693,59 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
         crate::checkpoint::CheckpointStep::Working
     ));
     assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+
+    let slot = engine
+        .storage
+        .find_table("public", "paced_value_index")
+        .unwrap();
+    let dirty_lsn = engine.storage.value_binding_dirty_lsn(slot, 0);
+    let unrelated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_value_index SET payload = 'unrelated' WHERE id = 778",
+    );
+    assert!(!message_types(&unrelated).contains(&b'E'));
+    assert_eq!(engine.storage.value_binding_dirty_lsn(slot, 0), dirty_lsn);
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert!(
+        !engine.ckpt.as_ref().unwrap().value_index_job_active(),
+        "a table change must restart a partially walked physical source"
+    );
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+
+    while !engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .value_index_schedule_io_active()
+    {
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+    }
 
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     let before_failure = engine.storage.block_io_stats();

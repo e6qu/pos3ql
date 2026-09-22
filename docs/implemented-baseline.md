@@ -7,9 +7,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   with empty RAM and disk caches.
 - Manifest and row SST formats have explicit reader and writer identities.
   Manifest v13 upgrades to v14 on the next checkpoint; direct v2 and packed PAX
-  v3 row generations coexist while new slices and merges write v3. Unknown
-  identities fail startup. The compatibility and migration contract is recorded
-  in [durable-format.md](durable-format.md).
+  v3 row generations coexist with packed v4 generations. New full slices and
+  merges write v4 PAX; deltas write v4 compressed row groups. Unknown identities
+  fail startup. The compatibility and migration contract is recorded in
+  [durable-format.md](durable-format.md).
 - A bounded S3-compatible client covering conditional writes, full and ranged
   reads, paginated listing, deletion, opaque entity tags, TLS, signing, retry
   classification, and structured errors through one endpoint-independent path.
@@ -45,6 +46,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
   restartable beats before appending a new delta. Completed merges have one
   fixed startup slot per table so several filled tables can prepare for one
   manifest publish without a monolithic row rewrite.
+  Row merge scheduling reads PAX keys and tombstones from descriptor metadata
+  without fetching column extents. Schedule and write beats have object-read
+  boundaries; one indivisible wide row may cross the write threshold. Packed
+  row deltas coalesce compressed logical groups into verified containers, so a
+  deterministic 128-row delta writes one container plus its filter, index, and
+  roster and survives empty-cache recovery.
   Affected value-index bindings collect and externally sort into one retained
   fixed-memory source, then write the immutable generation across restartable
   beats bounded by entries and object transfers. Exact binding dirty LSNs

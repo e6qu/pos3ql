@@ -12,14 +12,19 @@ they never select a guessed decoder.
 | Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v14. |
 | Checkpoint manifest | `pos3ql-manifest-v14` | yes | yes | Current format. |
 | Published row SST | `v2` | yes | no | Compatible generations remain readable and are replaced when sliced or merged. |
-| Published row SST | `v3` | yes | yes | Current packed PAX format. |
+| Published row SST | `v3` | yes | no | Compatible packed PAX generations remain readable. |
+| Published row SST | `v4` | yes | yes | Current packed format: PAX full slices and row-packed deltas. |
 
 The manifest header versions the catalog and root record grammar. Each `dsst`
 manifest reference separately names its row SST format. `v2` uses direct
 content-addressed data-block references. `v3` uses packed references to PAX
-descriptors and independently verified column extents. The in-memory handle
-retains this identity as `RowSstFormat`; index traversal cannot infer a decoder
-from block contents or collapse the identity into an unrelated flag.
+descriptors and independently verified column extents. `v4` retains that PAX
+representation for full slices and also admits compressed canonical row groups
+in verified packed extents. Small deltas use row groups so they do not pay a
+separate PAX descriptor and column-container write per group. The in-memory
+handle retains this identity as `RowSstFormat`; index traversal cannot infer an
+index-entry grammar from block contents or collapse the identity into an
+unrelated flag.
 
 Block headers also carry a typed block identity. A row SST format defines the
 allowed index-entry shape and block types together. A recognized block type in
@@ -38,10 +43,10 @@ writer can publish that identity. During the compatibility window:
 5. retries retain the exact source and destination identities.
 
 Manifest v13 follows the same rule: it is accepted at startup, while every new
-manifest is v14. Published v2 row generations can coexist with v3 generations.
-New row slices and pair merges write v3. A clean v2 generation may remain
-reachable indefinitely, so online replacement does not by itself justify
-removing its reader.
+manifest is v14. Published v2 and v3 row generations can coexist with v4
+generations. New row slices and pair merges write v4 PAX; new deltas write v4
+packed rows. A clean older generation may remain reachable indefinitely, so
+online replacement does not by itself justify removing its reader.
 
 ## Incompatible and offline changes
 

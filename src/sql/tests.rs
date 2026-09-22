@@ -66199,7 +66199,11 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
           WHERE id <= 128; \
          UPDATE reslice_tail SET payload = 'after' WHERE id = 1",
     );
-    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
     let first_generation = engine.storage.table(table).generation;
     let mut first_beats = 0usize;
     let first_slice = loop {
@@ -66241,9 +66245,13 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             break engine.storage.block_io_stats().saturating_sub(before);
         }
     };
-    assert!(
-        reslice.object_puts < first_slice.object_puts,
-        "reslice rewrote the prior slice: first={first_slice:?}, second={reslice:?}"
+    assert_eq!(
+        first_slice.object_puts, 4,
+        "the initial delta should use one packed container: {first_slice:?}"
+    );
+    assert_eq!(
+        reslice.object_puts, 4,
+        "the incremental delta should retain the prior slice and publish one packed container: {reslice:?}"
     );
 
     let tail = engine.storage.find_table("public", "reslice_tail").unwrap();
@@ -66413,6 +66421,79 @@ fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
         )),
         ["2|survives", "after"]
     );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn packed_row_delta_bounds_publication_objects_and_recovers() {
+    let mut config = test_config("checkpoint-packed-row-delta");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-checkpoint-packed-row-delta-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.table_rows = 512;
+    config.memtable_bytes = 4 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let seeded = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE packed_delta (id integer, payload text); \
+         INSERT INTO packed_delta \
+           SELECT id, repeat('a', 4096) FROM generate_series(1,128) id",
+    );
+    assert!(
+        !message_types(&seeded).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&seeded)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let changed = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "UPDATE packed_delta SET payload = repeat('b', 4096)",
+        16 << 20,
+    );
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    let before = engine.storage.block_io_stats();
+    assert!(engine.checkpoint().unwrap());
+    let delta = engine.storage.block_io_stats().saturating_sub(before);
+    assert_eq!(
+        delta.object_puts, 4,
+        "one packed row container plus filter, index, and roster: {delta:?}"
+    );
+    let warm = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM packed_delta; \
+         SELECT length(payload), payload LIKE 'b%' FROM packed_delta WHERE id = 128",
+        8 << 20,
+    );
+    assert_eq!(data_rows(&warm), ["128", "4096|t"]);
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let cold = run_with_arena_bytes(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT count(*) FROM packed_delta; \
+         SELECT length(payload), payload LIKE 'b%' FROM packed_delta WHERE id = 128",
+        8 << 20,
+    );
+    assert_eq!(data_rows(&cold), ["128", "4096|t"]);
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let _ = std::fs::remove_dir_all(&config.data_dir);

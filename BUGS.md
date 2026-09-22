@@ -213,11 +213,18 @@ an uncommitted version could move a spill-resident committed row into the
 overlay class without advancing the committed generation. Checkpoint sources
 now partition rows solely by committed home and verify the spill commit LSN.
 The durable format boundary audit found no external blocker. Manifest v13/v14
-and row SST v2/v3 compatibility are explicit typed identities; mixed row
+and row SST v2/v3/v4 compatibility are explicit typed identities; mixed row
 generations retain their identity through all reader paths, new published row
-generations use v3, and unknown formats fail at startup. Online generational
+generations use v4, and unknown formats fail at startup. Online generational
 replacement and the offline gate for retiring a reader are documented in the
-durable format contract. Row-merge performance work remains in PLAN.md.
+durable format contract.
+The row checkpoint traffic audit found no external blocker. Compaction
+scheduling now reads PAX descriptor metadata without fetching column extents,
+and write beats stop on a provider-neutral object-read boundary after finishing
+the current row. V4 row deltas compress and pack canonical groups instead of
+publishing PAX descriptor and column containers. Mixed-format reads, exact
+object counts, retry paths, and empty-cache recovery qualify the change. The
+remaining row-merge write amplification is tracked in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -207,6 +207,12 @@ from exhausting the cache during small autocommit writes. Oversized pending
 transactions still report their named memory bound; cache pressure never
 grows a pool or weakens durable publication.
 
+Published row SSTs use the v4 packed-reference format: full slices retain PAX
+column groups, while deltas pack compressed row groups to reduce object writes.
+Compaction schedules from descriptor metadata and bounds provider-neutral reads
+and writes per beat. V2 direct and v3 PAX generations remain readable during
+online replacement. [Format compatibility and migration](docs/durable-format.md).
+
 Collations, conversions, text-search objects, event triggers, tablespaces, and
 object comments likewise have independent startup capacities. Their catalog
 queries allocate from the fixed statement arena according to the actual pool,
@@ -224,7 +230,7 @@ block keep-set, and one SST-pair merge. `checkpoint_garbage_batch_objects`
 sizes one staged garbage scan without imposing a ceiling on accumulated
 obsolete objects; `checkpoint_delete_objects_per_beat` limits commit, legacy
 SST, and block DELETE requests in one maintenance beat.
-successful explicit checkpoints drain every batch. All four reservations are
+Successful explicit checkpoints drain every batch. All four reservations are
 charged before serving, and configured exhaustion names the responsible bound.
 Table, constraint, default, statistics, publication,
 replication, subscription, dependency, trigger, sequence, and information-schema

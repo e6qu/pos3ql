@@ -64634,7 +64634,11 @@ fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
         &mut budget,
         "UPDATE pax_resume SET hash_key = -1 WHERE id = 2049",
     );
-    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
     assert!(engine.checkpoint().unwrap());
     assert_eq!(
         data_rows(&run_with(
@@ -64674,13 +64678,28 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     let setup = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE paced_value_index (id integer, code text, payload text); \
-         INSERT INTO paced_value_index \
-           SELECT value, 'k-' || value::text || '-' || repeat(md5(value::text), 8), \
-                  repeat('x', 512) \
-             FROM generate_series(1, 1024) AS source(value); \
-         CREATE INDEX paced_value_index_code ON paced_value_index (code)",
+        "CREATE TABLE paced_value_index (id integer, code text, payload text)",
     );
+    for lo in [1, 1025] {
+        let loaded = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO paced_value_index \
+                 SELECT value, 'k-' || value::text || '-' || repeat(md5(value::text), 8), \
+                        repeat('x', 512) \
+                 FROM generate_series({lo}, {}) AS source(value)",
+                lo + 1023
+            ),
+        );
+        assert!(!message_types(&loaded).contains(&b'E'));
+    }
+    let indexed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX paced_value_index_code ON paced_value_index (code)",
+    );
+    assert!(!message_types(&indexed).contains(&b'E'));
     assert!(
         !message_types(&setup).contains(&b'E'),
         "{}",
@@ -64688,13 +64707,23 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     );
     assert!(engine.checkpoint().unwrap());
 
-    let changed = run_with(
-        &mut engine,
-        &mut budget,
-        "UPDATE paced_value_index \
-            SET code = 'm-' || id::text || '-' || repeat(md5(id::text), 8)",
-    );
-    assert!(!message_types(&changed).contains(&b'E'));
+    for lo in [1, 1025] {
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "UPDATE paced_value_index \
+                    SET code = 'm-' || id::text || '-' || repeat(md5(id::text), 8) \
+                  WHERE id BETWEEN {lo} AND {}",
+                lo + 1023
+            ),
+        );
+        assert!(
+            !message_types(&changed).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+    }
     assert!(matches!(
         engine
             .ckpt
@@ -64926,7 +64955,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
              SELECT count(*) FROM paced_value_index \
               WHERE code LIKE 'm-%'"
         )),
-        ["777", "1023"]
+        ["777", "2047"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

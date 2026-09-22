@@ -11107,8 +11107,9 @@ impl Checkpointer {
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index sort scratch"))?;
 
         if let Some(pending) = job.pending.take() {
-            let (key, payload) =
-                self.value_entry[..pending.key_len + pending.payload_len].split_at(pending.key_len);
+            let pending_len = pending.key_len + pending.payload_len;
+            self.value_entry[..pending_len].copy_from_slice(&self.value_source[..pending_len]);
+            let (key, payload) = self.value_entry[..pending_len].split_at(pending.key_len);
             if !Self::encode_value_sort_row(
                 storage,
                 &mut self.value_source,
@@ -11282,6 +11283,12 @@ impl Checkpointer {
             .finish(&mut *self.blocks.borrow_mut())
             .map_err(sst_to_sql)?
             .expect("non-empty value-index run");
+        if let Some(pending) = job.pending {
+            let pending_len = pending.key_len + pending.payload_len;
+            // A carry merge reuses `value_entry`; retain the deferred source
+            // row in the now-idle chunk buffer until collection resumes.
+            self.value_source[..pending_len].copy_from_slice(&self.value_entry[..pending_len]);
+        }
         job.chunk_len = 0;
         job.row_count = 0;
         Self::install_value_run(

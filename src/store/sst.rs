@@ -1010,7 +1010,12 @@ impl SstCursor {
                 self.block_ordinal += 1;
                 self.offset = resume_offset;
                 self.loaded = true;
-                if self.data_len == 0 {
+                if self.offset > self.data_len {
+                    return Err(SstError::Store(StoreError::Corrupt(
+                        super::BlockError::Truncated,
+                    )));
+                }
+                if self.offset == self.data_len {
                     continue;
                 }
             }
@@ -2654,6 +2659,44 @@ mod tests {
             Some((2, 6))
         );
         assert_eq!(&out[..6], b"second");
+    }
+
+    #[test]
+    fn detached_cursor_resumes_across_many_blocks() {
+        let (_budget, mut store) = store();
+        let rows = (1..=3072)
+            .map(|rowid| {
+                let mut row = vec![0u8; 302];
+                row[..8].copy_from_slice(&(rowid as u64).to_le_bytes());
+                for (offset, byte) in row[8..].iter_mut().enumerate() {
+                    *byte = (rowid as usize + offset) as u8;
+                }
+                (rowid as u64, row)
+            })
+            .collect::<Vec<_>>();
+        let handle = build(&mut store, &rows).unwrap();
+        let mut cursor = SstCursor::new(handle);
+        let mut index = [0; MAX_PAYLOAD];
+        let mut data = [0; MAX_PAYLOAD];
+        let mut bounce = [0; MAX_PAYLOAD];
+        let mut out = [0; MAX_PAYLOAD];
+        for (position, (rowid, expected)) in rows.iter().enumerate() {
+            let actual = cursor
+                .next_copy(&mut store, &mut index, &mut data, &mut bounce, &mut out)
+                .unwrap_or_else(|error| panic!("row {position}: {error:?}"));
+            assert_eq!(actual, Some((*rowid, expected.len())), "row {position}");
+            assert_eq!(&out[..expected.len()], expected, "row {position}");
+            cursor.detach_buffer();
+            index.fill(0);
+            data.fill(0);
+            bounce.fill(0);
+        }
+        assert_eq!(
+            cursor
+                .next_copy(&mut store, &mut index, &mut data, &mut bounce, &mut out)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

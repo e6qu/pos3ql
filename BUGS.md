@@ -198,6 +198,20 @@ rewrite. Focused coverage interleaves foreground mutation across beats, injects
 object-store failure, checks configured merge exhaustion, and verifies warm and
 object-cold results. The repeated 10,000-row profile removed the 27.50-second
 `row_sst_full` event; remaining value-index dispatch work is tracked in PLAN.md.
+The paced value-index source audit found no externally blocked defect. Source
+collection now retains its logical resident and merged-spill positions, paces
+spill-generation initialization and row walking by object GETs, and decodes
+only the active binding's physical PAX dependencies. External run generation
+uses restartable fixed-memory binary carries. Qualification found and fixed a
+deferred source row overwritten by carry-merge scratch and a detached run
+cursor that treated an exact block-end resume as a truncated entry. Multi-run,
+multi-block PAX, fault-injection, publication, and empty-cache recovery
+regressions cover the fixes. The repeated 10,000-row profile had no four-PUT or
+eight-GET schedule violation; durable row-format work is tracked in PLAN.md.
+Storage VOPR fault qualification also found and fixed a cross-beat seam where
+an uncommitted version could move a spill-resident committed row into the
+overlay class without advancing the committed generation. Checkpoint sources
+now partition rows solely by committed home and verify the spill commit LSN.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

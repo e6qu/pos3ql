@@ -986,6 +986,7 @@ impl SstCursor {
             }
             self.advance_lookahead(store, index)?;
             if !self.loaded || self.offset >= self.data_len {
+                let resume_offset = if !self.loaded { self.offset } else { 0 };
                 let id = if let Some((ordinal, id)) = self.prefetched_data
                     && ordinal == self.block_ordinal
                 {
@@ -1007,9 +1008,14 @@ impl SstCursor {
                 };
                 self.data_len = read_external_run_data_block_ref(store, id, data, bounce)?;
                 self.block_ordinal += 1;
-                self.offset = 0;
+                self.offset = resume_offset;
                 self.loaded = true;
-                if self.data_len == 0 {
+                if self.offset > self.data_len {
+                    return Err(SstError::Store(StoreError::Corrupt(
+                        super::BlockError::Truncated,
+                    )));
+                }
+                if self.offset == self.data_len {
                     continue;
                 }
             }
@@ -1032,6 +1038,15 @@ impl SstCursor {
             }
             out[..entry.total_len].copy_from_slice(entry.head);
             return Ok(Some((entry.key.rowid, entry.total_len)));
+        }
+    }
+
+    /// Releases the caller-owned data buffer while retaining the logical
+    /// byte position. The next advance reloads the same immutable block.
+    pub(crate) fn detach_buffer(&mut self) {
+        if self.loaded {
+            self.block_ordinal = self.block_ordinal.saturating_sub(1);
+            self.loaded = false;
         }
     }
 
@@ -2612,6 +2627,76 @@ mod tests {
         );
         assert_eq!(get(&mut r, &mut s, &root, 2), None);
         assert_eq!(get(&mut r, &mut s, &root, 0), None);
+    }
+
+    #[test]
+    fn detached_cursor_reloads_its_current_block_at_the_saved_offset() {
+        let (_budget, mut store) = store();
+        let handle = build(
+            &mut store,
+            &[(1, b"first".to_vec()), (2, b"second".to_vec())],
+        )
+        .unwrap();
+        let mut cursor = SstCursor::new(handle);
+        let mut index = [0; MAX_PAYLOAD];
+        let mut data = [0; MAX_PAYLOAD];
+        let mut bounce = [0; MAX_PAYLOAD];
+        let mut out = [0; MAX_PAYLOAD];
+        assert_eq!(
+            cursor
+                .next_copy(&mut store, &mut index, &mut data, &mut bounce, &mut out)
+                .unwrap(),
+            Some((1, 5))
+        );
+        cursor.detach_buffer();
+        index.fill(0);
+        data.fill(0);
+        bounce.fill(0);
+        assert_eq!(
+            cursor
+                .next_copy(&mut store, &mut index, &mut data, &mut bounce, &mut out)
+                .unwrap(),
+            Some((2, 6))
+        );
+        assert_eq!(&out[..6], b"second");
+    }
+
+    #[test]
+    fn detached_cursor_resumes_across_many_blocks() {
+        let (_budget, mut store) = store();
+        let rows = (1..=3072)
+            .map(|rowid| {
+                let mut row = vec![0u8; 302];
+                row[..8].copy_from_slice(&(rowid as u64).to_le_bytes());
+                for (offset, byte) in row[8..].iter_mut().enumerate() {
+                    *byte = (rowid as usize + offset) as u8;
+                }
+                (rowid as u64, row)
+            })
+            .collect::<Vec<_>>();
+        let handle = build(&mut store, &rows).unwrap();
+        let mut cursor = SstCursor::new(handle);
+        let mut index = [0; MAX_PAYLOAD];
+        let mut data = [0; MAX_PAYLOAD];
+        let mut bounce = [0; MAX_PAYLOAD];
+        let mut out = [0; MAX_PAYLOAD];
+        for (position, (rowid, expected)) in rows.iter().enumerate() {
+            let actual = cursor
+                .next_copy(&mut store, &mut index, &mut data, &mut bounce, &mut out)
+                .unwrap_or_else(|error| panic!("row {position}: {error:?}"));
+            assert_eq!(actual, Some((*rowid, expected.len())), "row {position}");
+            assert_eq!(&out[..expected.len()], expected, "row {position}");
+            cursor.detach_buffer();
+            index.fill(0);
+            data.fill(0);
+            bounce.fill(0);
+        }
+        assert_eq!(
+            cursor
+                .next_copy(&mut store, &mut index, &mut data, &mut bounce, &mut out)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

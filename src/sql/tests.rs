@@ -64557,6 +64557,137 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
+fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
+    let mut config = test_config("checkpoint-value-pax-resume");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-value-pax-resume-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_bytes = 32 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.table_rows = 3072;
+    config.value_index_rows = 3072;
+    config.memtable_bytes = 16 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let table = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE pax_resume(
+            id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL,
+            brin_span int4range NOT NULL, gist_span int4range NOT NULL,
+            gist_spans int4multirange NOT NULL, gist_address inet NOT NULL,
+            gist_location point NOT NULL, gin_tags integer[] NOT NULL,
+            gin_document tsvector NOT NULL, gist_document tsvector NOT NULL,
+            json_ops jsonb NOT NULL, json_path jsonb NOT NULL,
+            spgist_label text NOT NULL, spgist_span int4range NOT NULL,
+            spgist_address inet NOT NULL, spgist_location point NOT NULL,
+            payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192))",
+    );
+    assert!(!message_types(&table).contains(&b'E'));
+    for lo in (1..=2049).step_by(10) {
+        if lo == 1501 {
+            assert!(engine.checkpoint().unwrap());
+        }
+        let hi = (lo + 9).min(2049);
+        let result = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO pax_resume \
+                 SELECT i, i, i, int4range(i * 2, i * 2 + 2),
+                    int4range(i * 3, i * 3 + 3),
+                    int4multirange(int4range(i * 7, i * 7 + 2), int4range(i * 7 + 4, i * 7 + 6)),
+                    '10.0.0.0'::inet + i, point(i, i), ARRAY[i],
+                    to_tsvector('simple','token' || i::text),
+                    to_tsvector('simple','gisttoken' || i::text),
+                    jsonb_build_object('key' || i::text,'value' || i::text),
+                    jsonb_build_object('token','value' || i::text),
+                    'key-' || i::text, int4range(i * 5, i * 5 + 2),
+                    '11.0.0.0'::inet + i, point(i, -i), 0, repeat('x', 8192)
+                 FROM generate_series({lo}, {hi}) AS g(i)"
+            ),
+            64 << 20,
+        );
+        assert!(
+            !message_types(&result).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&result)
+        );
+    }
+    let index = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX pax_resume_hash ON pax_resume (hash_key)",
+    );
+    assert!(!message_types(&index).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    let slot = engine.storage.find_table("public", "pax_resume").unwrap();
+    engine.storage.evict_committed_table(slot);
+    engine.storage.evict_redundant_entries(slot);
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE pax_resume SET hash_key = -1 WHERE id = 2049",
+    );
+    assert!(
+        !message_types(&changed).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&changed)
+    );
+    let mut value_beats = 0usize;
+    let published_lsn = loop {
+        let value_beat = engine.ckpt.as_ref().unwrap().value_index_job_active();
+        let before = engine.storage.block_io_stats();
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        let beat = engine.storage.block_io_stats().saturating_sub(before);
+        if value_beat {
+            value_beats += 1;
+            assert!(
+                beat.object_puts <= 4 && beat.object_gets <= 8,
+                "one resumed PAX value-index beat exceeded its object-I/O bound: {beat:?}"
+            );
+        }
+        match step {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty PAX value index became idle before publication")
+            }
+        }
+    };
+    assert!(value_beats > 1, "the PAX source walk must span beats");
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pax_resume WHERE hash_key IN (1, -1)"
+        )),
+        ["2"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     let mut config = test_config("checkpoint-value-index-pacing");
     config.object_store_on = true;
@@ -64581,13 +64712,28 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     let setup = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TABLE paced_value_index (id integer, code text, payload text); \
-         INSERT INTO paced_value_index \
-           SELECT value, 'k-' || value::text || '-' || repeat(md5(value::text), 8), \
-                  repeat('x', 512) \
-             FROM generate_series(1, 1024) AS source(value); \
-         CREATE INDEX paced_value_index_code ON paced_value_index (code)",
+        "CREATE TABLE paced_value_index (id integer, code text, payload text)",
     );
+    for lo in [1, 1025] {
+        let loaded = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO paced_value_index \
+                 SELECT value, 'k-' || value::text || '-' || repeat(md5(value::text), 8), \
+                        repeat('x', 512) \
+                 FROM generate_series({lo}, {}) AS source(value)",
+                lo + 1023
+            ),
+        );
+        assert!(!message_types(&loaded).contains(&b'E'));
+    }
+    let indexed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX paced_value_index_code ON paced_value_index (code)",
+    );
+    assert!(!message_types(&indexed).contains(&b'E'));
     assert!(
         !message_types(&setup).contains(&b'E'),
         "{}",
@@ -64595,13 +64741,23 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     );
     assert!(engine.checkpoint().unwrap());
 
-    let changed = run_with(
-        &mut engine,
-        &mut budget,
-        "UPDATE paced_value_index \
-            SET code = 'm-' || id::text || '-' || repeat(md5(id::text), 8)",
-    );
-    assert!(!message_types(&changed).contains(&b'E'));
+    for lo in [1, 1025] {
+        let changed = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "UPDATE paced_value_index \
+                    SET code = 'm-' || id::text || '-' || repeat(md5(id::text), 8) \
+                  WHERE id BETWEEN {lo} AND {}",
+                lo + 1023
+            ),
+        );
+        assert!(
+            !message_types(&changed).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&changed)
+        );
+    }
     assert!(matches!(
         engine
             .ckpt
@@ -64612,6 +64768,35 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
         crate::checkpoint::CheckpointStep::Working
     ));
     assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+
+    let mut preparation_beats = 0usize;
+    while !engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .value_index_output_job_active()
+    {
+        preparation_beats += 1;
+        assert!(
+            preparation_beats < 128,
+            "value-index preparation did not converge"
+        );
+        let before = engine.storage.block_io_stats();
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+        let beat = engine.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            beat.object_puts <= 4 && beat.object_gets <= 8,
+            "one value-index preparation beat exceeded its object-I/O bound: {beat:?}"
+        );
+    }
 
     let before = engine.storage.block_io_stats();
     assert!(matches!(
@@ -64664,6 +64849,59 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
         crate::checkpoint::CheckpointStep::Working
     ));
     assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+
+    let slot = engine
+        .storage
+        .find_table("public", "paced_value_index")
+        .unwrap();
+    let dirty_lsn = engine.storage.value_binding_dirty_lsn(slot, 0);
+    let unrelated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_value_index SET payload = 'unrelated' WHERE id = 778",
+    );
+    assert!(!message_types(&unrelated).contains(&b'E'));
+    assert_eq!(engine.storage.value_binding_dirty_lsn(slot, 0), dirty_lsn);
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert!(
+        !engine.ckpt.as_ref().unwrap().value_index_job_active(),
+        "a table change must restart a partially walked physical source"
+    );
+    assert!(matches!(
+        engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap(),
+        crate::checkpoint::CheckpointStep::Working
+    ));
+    assert!(engine.ckpt.as_ref().unwrap().value_index_job_active());
+
+    while !engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .value_index_schedule_io_active()
+    {
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+    }
 
     namespace.borrow_mut().faults.transient_per_mille = 1000;
     let before_failure = engine.storage.block_io_stats();
@@ -64751,7 +64989,7 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
              SELECT count(*) FROM paced_value_index \
               WHERE code LIKE 'm-%'"
         )),
-        ["777", "1023"]
+        ["777", "2047"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

@@ -282,6 +282,32 @@ invalidation, content reuse, or provider neutrality, then repeat the exact
 row-merge counts and end-to-end latency differed substantially from its
 predecessor, so the shared-host aggregate timings are diagnostic rather than a
 controlled pacing ratio.
+The [paced source-and-sort rerun](benchmarks/baselines/2026-09-22-checkpoint-value-index-schedule-10000/README.md)
+completes that boundary. Source collection retains resident and merged-spill
+cursors across beats, initializes long spill-generation lists incrementally,
+reloads only displaced member buffers, and decodes only each binding's physical
+PAX dependencies. Startup-allocated binary carry state writes and merges
+provider-neutral temporary SSTs without rescanning source rows. The exact
+profile recorded 461 schedule events over 6.70 seconds; the largest took 36.42
+ms, and none exceeded eight GETs or four PUTs. The preceding profile's largest
+schedule event took 1.41 seconds with 100 GETs and 22 PUTs. Direct regressions
+also cover a deferred source row across a carry merge, cursor resumption at a
+data-block boundary, dirty-generation restart, object-store retry, publication,
+and object-cold recovery. Storage VOPR fault qualification additionally proved
+that pending versions may appear between source beats without changing the
+committed generation; checkpoint collection now keeps its resident/spill seam
+stable by classifying only the committed home and matching the spill commit
+LSN.
+
+The new profile changes the checkpoint priority. Row-merge source scheduling
+is again the largest individual dispatch and aggregate phase: 102 events took
+27.35 seconds, with a 401.72 ms and 121-GET maximum. Two row SST delta events
+reached 127.91 ms and 27 PUTs. Before changing persisted row or compaction
+bytes, define durable-format version identifiers, reader compatibility, and
+online or offline migration rules for row SSTs and their manifest references.
+Then use the resulting format boundary to reduce row-merge read amplification
+and delta publication traffic while preserving fixed memory, provider
+neutrality, retry, and empty-cache recovery, and repeat this exact profile.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

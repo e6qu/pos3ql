@@ -11873,6 +11873,46 @@ struct MemberCursor {
     done: bool,
 }
 
+/// Logical position of one checkpoint value-index source walk. Block buffers
+/// remain in the shared scan context and are reloaded on a later beat; this
+/// state contains only stable map offsets and immutable SST cursor positions.
+pub(crate) struct CheckpointValueCursor {
+    resident_slot: usize,
+    members: Box<[MemberCursor]>,
+    /// Stable owner identity for shared scan buffers across checkpoint beats.
+    spill_walk_id: u64,
+    /// Member heads opened so far; opening a long generation list is paced.
+    spill_initialized: usize,
+    resident_done: bool,
+    spill_done: bool,
+}
+
+impl CheckpointValueCursor {
+    pub(crate) fn budget_bytes(max_spill_generations: usize) -> usize {
+        max_spill_generations * core::mem::size_of::<MemberCursor>()
+    }
+
+    pub(crate) fn new(max_spill_generations: usize) -> Self {
+        Self {
+            resident_slot: 0,
+            members: vec![MemberCursor::EMPTY; max_spill_generations].into_boxed_slice(),
+            spill_walk_id: 0,
+            spill_initialized: 0,
+            resident_done: false,
+            spill_done: false,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.resident_slot = 0;
+        self.members.fill(MemberCursor::EMPTY);
+        self.spill_walk_id = 0;
+        self.spill_initialized = 0;
+        self.resident_done = false;
+        self.spill_done = false;
+    }
+}
+
 impl MemberCursor {
     const EMPTY: Self = Self {
         ordinal: 0,
@@ -11897,6 +11937,14 @@ struct SpillVersion {
     len: Option<u32>,
     member: u32,
     commit_lsn: u64,
+}
+
+#[derive(Clone, Copy)]
+enum SpillOverlayMode {
+    VisibleScan,
+    /// A checkpoint spans statements, so pending versions may appear without
+    /// changing the committed generation. Partition only by committed home.
+    CommittedCheckpoint,
 }
 
 /// The reader's owned block buffers (index, data, physical column, chain
@@ -24266,6 +24314,7 @@ impl Storage {
     /// cursor advances avoids turning every row in the block into a second
     /// SST point lookup. The context is released before `emit`, so nested
     /// execution still uses the normal bounded reader pool.
+    #[expect(clippy::too_many_arguments, reason = "merged row decoder state")]
     fn spill_merged_walk_bytes<'a>(
         &self,
         slot: usize,
@@ -24273,16 +24322,18 @@ impl Storage {
         recycle_rows: bool,
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         coalesce_packed: bool,
+        overlay_mode: SpillOverlayMode,
+        resume: Option<(&mut [MemberCursor], &mut u64, &mut usize, usize, u64)>,
         emit: &mut dyn FnMut(
             u64,
             u64,
             SpilledRowRepresentation<'a>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
-    ) -> Result<(), SqlError> {
+    ) -> Result<bool, SqlError> {
         let table = &self.tables[slot];
         let n = table.n_spill_ssts;
         if n == 0 {
-            return Ok(());
+            return Ok(true);
         }
         let Some(spill) = &self.spill else {
             return Err(sql_err!(
@@ -24290,21 +24341,49 @@ impl Storage {
                 "table has spill SSTs but no spill reader is attached"
             ));
         };
-        let walk_id = spill.next_walk_id.get();
-        spill.next_walk_id.set(walk_id.wrapping_add(1).max(1));
-        let Some(mut cursor_lease) = spill
-            .cursor_contexts
-            .iter()
-            .find_map(|candidate| candidate.try_borrow_mut().ok())
-        else {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "row-state cursor nesting exceeds the statement-list boundary"
-            ));
-        };
-        cursor_lease.fill(MemberCursor::EMPTY);
-        let cursors: &mut [MemberCursor] = &mut cursor_lease;
-        {
+        let mut cursor_lease;
+        let mut local_walk_id = 0;
+        let mut local_initialized = 0;
+        let (cursors, walk_id, initialized, max_rows, max_object_gets) =
+            if let Some((cursors, walk_id, initialized, max_rows, max_object_gets)) = resume {
+                if cursors.len() < n {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "checkpoint spill cursor has {} members for {} generations",
+                        cursors.len(),
+                        n
+                    ));
+                }
+                (cursors, walk_id, initialized, max_rows, max_object_gets)
+            } else {
+                cursor_lease = Some(
+                    spill
+                        .cursor_contexts
+                        .iter()
+                        .find_map(|candidate| candidate.try_borrow_mut().ok())
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "row-state cursor nesting exceeds the statement-list boundary"
+                            )
+                        })?,
+                );
+                (
+                    &mut ***cursor_lease.as_mut().expect("installed cursor lease"),
+                    &mut local_walk_id,
+                    &mut local_initialized,
+                    usize::MAX,
+                    u64::MAX,
+                )
+            };
+        if *walk_id == 0 {
+            *walk_id = spill.next_walk_id.get();
+            spill.next_walk_id.set((*walk_id).wrapping_add(1).max(1));
+            cursors.fill(MemberCursor::EMPTY);
+            *initialized = 0;
+        }
+        let io_before = self.block_io_stats();
+        if *initialized < n {
             let Some(mut context) = spill
                 .scan_contexts
                 .iter()
@@ -24315,13 +24394,35 @@ impl Storage {
                     "row-state block context is already in use"
                 ));
             };
-            context.owner = walk_id;
+            if context.owner != *walk_id {
+                for cursor in &mut cursors[..*initialized] {
+                    cursor.loaded = None;
+                    cursor.loaded_len = 0;
+                    cursor.loaded_type = None;
+                    cursor.pax_layout = None;
+                }
+            }
+            context.owner = *walk_id;
             context.pax_values_owner = None;
-            for (member, cursor) in cursors[..n].iter_mut().enumerate() {
-                Self::cursor_advance(spill, table, member, cursor, &mut context)?;
+            while *initialized < n {
+                Self::cursor_advance(
+                    spill,
+                    table,
+                    *initialized,
+                    &mut cursors[*initialized],
+                    &mut context,
+                )?;
+                *initialized += 1;
+                if self.block_io_stats().saturating_sub(io_before).object_gets >= max_object_gets {
+                    return Ok(false);
+                }
             }
         }
+        let mut walked = 0usize;
         loop {
+            if walked == max_rows {
+                return Ok(false);
+            }
             let mark = recycle_rows.then(|| arena.mark());
             let mut min: Option<u64> = None;
             for cursor in cursors[..n].iter() {
@@ -24329,7 +24430,8 @@ impl Storage {
                     min = Some(min.map_or(key.rowid, |rowid: u64| rowid.min(key.rowid)));
                 }
             }
-            let Some(rowid) = min else { return Ok(()) };
+            let Some(rowid) = min else { return Ok(true) };
+            walked += 1;
             let Some(mut context) = spill
                 .scan_contexts
                 .iter()
@@ -24340,24 +24442,17 @@ impl Storage {
                     "row-state block context is already in use"
                 ));
             };
-            if context.owner != walk_id {
+            if context.owner != *walk_id {
+                // Heads and logical next positions are owned cursor state.
+                // Only their claims on the shared block buffers are stale.
                 for cursor in &mut cursors[..n] {
                     cursor.loaded = None;
                     cursor.loaded_len = 0;
                     cursor.loaded_type = None;
                     cursor.pax_layout = None;
-                    if cursor.head.is_some() {
-                        cursor.raw_row = cursor.head_raw_row;
-                        cursor.head = None;
-                    }
                 }
-                context.owner = walk_id;
+                context.owner = *walk_id;
                 context.pax_values_owner = None;
-                for (member, cursor) in cursors[..n].iter_mut().enumerate() {
-                    if !cursor.done {
-                        Self::cursor_advance(spill, table, member, cursor, &mut context)?;
-                    }
-                }
             }
             let mut verdict: Option<SpillVersion> = None;
             for (member, cursor) in cursors[..n].iter().enumerate() {
@@ -24382,18 +24477,43 @@ impl Storage {
                 member,
                 commit_lsn,
             }) = verdict
-                && self.tables[slot]
-                    .rows
-                    .get(&rowid)
-                    .is_none_or(Self::redundant_spilled_row_state)
-            {
-                let cursor = &cursors[member as usize];
+                && match overlay_mode {
+                    SpillOverlayMode::VisibleScan => self.tables[slot]
+                        .rows
+                        .get(&rowid)
+                        .is_none_or(Self::redundant_spilled_row_state),
+                    SpillOverlayMode::CommittedCheckpoint => {
+                        self.tables[slot].rows.get(&rowid).is_none_or(|state| {
+                            matches!(
+                                state.committed,
+                                Some(RowHome::Spilled {
+                                    commit_lsn: current,
+                                    ..
+                                }) if current == commit_lsn
+                            )
+                        })
+                    }
+                } {
+                let cursor = &mut cursors[member as usize];
                 let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "selected spill version has no resident cursor head"
                     )
                 })?;
+                if cursor.loaded != Some(cursor.ordinal) {
+                    let expected = cursor.head;
+                    cursor.offset = cursor.head_offset;
+                    cursor.raw_row = cursor.head_raw_row;
+                    cursor.head = None;
+                    Self::cursor_advance(spill, table, member as usize, cursor, &mut context)?;
+                    if cursor.head != expected {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "reloaded spill cursor head does not match its retained version"
+                        ));
+                    }
+                }
                 let representation = if cursor.loaded_type
                     == Some(crate::store::BlockType::SstDataPaxV2)
                 {
@@ -24544,7 +24664,17 @@ impl Storage {
                                 "spilled PAX values exceed the statement arena; raise work_arena_bytes"
                             )
                         })?;
-                    rowenc::decode(encoded, &schema[..layout.columns()], values)?;
+                    rowenc::decode(encoded, &schema[..layout.columns()], values).map_err(
+                        |error| SqlError {
+                            sqlstate: error.sqlstate,
+                            message: stack_format!(
+                                192,
+                                "spilled PAX row {} failed to decode: {}",
+                                rowid,
+                                error.message.as_str()
+                            ),
+                        },
+                    )?;
                     SpilledRowRepresentation::Values(&*values)
                 } else {
                     let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
@@ -24604,7 +24734,10 @@ impl Storage {
                 unsafe { arena.rewind_to(mark) };
             }
             if emitted?.is_break() {
-                return Ok(());
+                return Ok(false);
+            }
+            if self.block_io_stats().saturating_sub(io_before).object_gets >= max_object_gets {
+                return Ok(false);
             }
         }
     }
@@ -24637,37 +24770,41 @@ impl Storage {
         let batch_mark = recycle_rows.then(|| arena.mark());
         let mut len = 0usize;
         let mut stopped = false;
-        let mut result = self.spill_merged_walk_bytes(
-            table_slot,
-            arena,
-            false,
-            decoded_columns.as_ref(),
-            decoded_columns.is_none(),
-            &mut |rowid, _commit_lsn, representation| {
-                rows[len] = SpilledRow {
-                    rowid,
-                    representation,
-                };
-                len += 1;
-                if len != rows.len() {
-                    return Ok(core::ops::ControlFlow::Continue(()));
-                }
-                match each(&rows[..len])? {
-                    core::ops::ControlFlow::Continue(()) => {
-                        if let Some(mark) = batch_mark {
-                            // SAFETY: `each` consumed this batch synchronously.
-                            unsafe { arena.rewind_to(mark) };
+        let mut result = self
+            .spill_merged_walk_bytes(
+                table_slot,
+                arena,
+                false,
+                decoded_columns.as_ref(),
+                decoded_columns.is_none(),
+                SpillOverlayMode::VisibleScan,
+                None,
+                &mut |rowid, _commit_lsn, representation| {
+                    rows[len] = SpilledRow {
+                        rowid,
+                        representation,
+                    };
+                    len += 1;
+                    if len != rows.len() {
+                        return Ok(core::ops::ControlFlow::Continue(()));
+                    }
+                    match each(&rows[..len])? {
+                        core::ops::ControlFlow::Continue(()) => {
+                            if let Some(mark) = batch_mark {
+                                // SAFETY: `each` consumed this batch synchronously.
+                                unsafe { arena.rewind_to(mark) };
+                            }
+                            len = 0;
+                            Ok(core::ops::ControlFlow::Continue(()))
                         }
-                        len = 0;
-                        Ok(core::ops::ControlFlow::Continue(()))
+                        core::ops::ControlFlow::Break(()) => {
+                            stopped = true;
+                            Ok(core::ops::ControlFlow::Break(()))
+                        }
                     }
-                    core::ops::ControlFlow::Break(()) => {
-                        stopped = true;
-                        Ok(core::ops::ControlFlow::Break(()))
-                    }
-                }
-            },
-        );
+                },
+            )
+            .map(|_| ());
         if result.is_ok() && !stopped && len != 0 {
             result = each(&rows[..len]).map(|_| ());
         }
@@ -24756,7 +24893,15 @@ impl Storage {
                 }
             }
             if cursor.loaded != Some(cursor.ordinal) {
-                let resume_raw_row = cursor.raw_row;
+                // A released scan context may have lost this block while the
+                // logical cursor retained its next byte offset. A genuine
+                // move to a later block starts at zero.
+                let resume_offset = if cursor.loaded.is_none() {
+                    cursor.offset
+                } else {
+                    0
+                };
+                let resume_raw_row = cursor.loaded.is_none().then_some(cursor.raw_row);
                 let mut blocks = spill.relation_blocks(table);
                 // Both index shapes resolve through one helper; the index
                 // buffer is scratch for the descent and the decompression
@@ -24822,12 +24967,12 @@ impl Storage {
                     })
                     .transpose()
                     .map_err(spill_read_error)?;
-                if cursor.pax_layout.is_some() && cursor.head.is_some() {
-                    cursor.raw_row = resume_raw_row;
+                if cursor.pax_layout.is_some() {
+                    cursor.raw_row = resume_raw_row.unwrap_or(0);
                 }
                 cursor.loaded_type = Some(loaded_type);
                 cursor.loaded = Some(cursor.ordinal);
-                cursor.offset = 0;
+                cursor.offset = resume_offset;
             }
             if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV2) {
                 let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
@@ -25013,54 +25158,121 @@ impl Storage {
         Ok(core::ops::ControlFlow::Continue(()))
     }
 
-    /// Supplies checkpoint index entries from the same merged payload cursor
-    /// used by scans, so spilled rows do not need a second point lookup.
-    pub(crate) fn for_each_value_binding_entry(
+    /// Resumes a checkpoint value-index source walk for at most `max_rows`
+    /// physical rowids. The cursor advances before `each` may stop the batch,
+    /// so a later beat never revisits an emitted row.
+    #[expect(clippy::too_many_arguments, reason = "checkpoint row stream boundary")]
+    pub(crate) fn for_each_value_binding_entry_batch(
         &self,
         table_slot: usize,
         binding: usize,
+        cursor: &mut CheckpointValueCursor,
         arena: &crate::mem::arena::Arena,
         output: &mut [u8],
+        max_rows: usize,
+        max_object_gets: u64,
         each: &mut dyn for<'entry> FnMut(
             CheckpointValueEntry<'entry>,
         ) -> Result<core::ops::ControlFlow<()>, SqlError>,
-    ) -> Result<(), SqlError> {
-        if self
-            .for_each_scan_overlay_row_state(table_slot, &mut |rowid, state| {
-                let Some(home) = state.committed else {
-                    return Ok(core::ops::ControlFlow::Continue(()));
+    ) -> Result<bool, SqlError> {
+        let mut walked = 0usize;
+        if !cursor.resident_done {
+            let rows = &self.tables[table_slot].rows;
+            while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
+                let slot = cursor.resident_slot;
+                cursor.resident_slot += 1;
+                let Some((&rowid, state)) = rows.entry_at_slot(slot) else {
+                    continue;
                 };
-                let Some((key_len, payload_len, hash)) =
-                    self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
+                walked += 1;
+                // Spill-resident committed rows belong to the merged walk
+                // even when a later statement adds a pending version.
+                let Some(RowHome::Heap(location)) = state.committed else {
+                    continue;
+                };
+                let home = RowHome::Heap(location);
+                let Some((key_len, payload_len, hash)) = self
+                    .encode_value_binding_entry(table_slot, binding, rowid, home, output)
+                    .map_err(|error| SqlError {
+                        sqlstate: error.sqlstate,
+                        message: stack_format!(
+                            192,
+                            "resident checkpoint value source row {}: {}",
+                            rowid,
+                            error.message.as_str()
+                        ),
+                    })?
                 else {
-                    return Ok(core::ops::ControlFlow::Continue(()));
+                    continue;
                 };
                 let (key, payload) = output[..key_len + payload_len].split_at(key_len);
-                each(CheckpointValueEntry {
+                if each(CheckpointValueEntry {
                     rowid,
                     commit_lsn: state.committed_lsn,
                     hash,
                     key,
                     payload,
-                })
-            })?
-            .is_break()
-        {
-            return Ok(());
+                })?
+                .is_break()
+                {
+                    return Ok(false);
+                }
+            }
+            if cursor.resident_slot != rows.backing_slot_count() {
+                return Ok(false);
+            }
+            cursor.resident_done = true;
         }
+        if walked == max_rows {
+            return Ok(false);
+        }
+        if cursor.spill_done {
+            return Ok(true);
+        }
+
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         let n_columns = self.tables[table_slot].def.schema(&mut schema);
-        self.spill_merged_walk_bytes(
+        let dependency_mask = self.tables[table_slot].enforcers[binding]
+            .expect("binding")
+            .dependency_mask;
+        // PAX source reads need only key, predicate, expression, and INCLUDE
+        // dependencies. Unselected values decode as NULL and are never read.
+        let decoded_columns = core::array::from_fn(|column| {
+            column < n_columns && dependency_mask & (1u64 << column) != 0
+        });
+        let decoded_count = decoded_columns[..n_columns]
+            .iter()
+            .filter(|&&selected| selected)
+            .count();
+        let done = self.spill_merged_walk_bytes(
             table_slot,
             arena,
             true,
-            None,
-            true,
+            Some(&decoded_columns),
+            decoded_count.saturating_mul(2) >= n_columns,
+            SpillOverlayMode::CommittedCheckpoint,
+            Some((
+                &mut cursor.members,
+                &mut cursor.spill_walk_id,
+                &mut cursor.spill_initialized,
+                max_rows - walked,
+                max_object_gets,
+            )),
             &mut |rowid, commit_lsn, representation| {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
-                        rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+                        rowenc::decode(bytes, &schema[..n_columns], &mut decoded).map_err(
+                            |error| SqlError {
+                                sqlstate: error.sqlstate,
+                                message: stack_format!(
+                                    192,
+                                    "spilled checkpoint value source row {}: {}",
+                                    rowid,
+                                    error.message.as_str()
+                                ),
+                            },
+                        )?;
                         &decoded[..n_columns]
                     }
                     SpilledRowRepresentation::Values(values) => values,
@@ -25079,7 +25291,9 @@ impl Storage {
                     payload,
                 })
             },
-        )
+        )?;
+        cursor.spill_done = done;
+        Ok(done)
     }
 
     fn redundant_spilled_row_state(state: &RowState) -> bool {
@@ -25291,6 +25505,8 @@ impl Storage {
             true,
             None,
             true,
+            SpillOverlayMode::VisibleScan,
+            None,
             &mut |_rowid, _commit_lsn, representation| {
                 match representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
@@ -29089,6 +29305,8 @@ impl Storage {
                 true,
                 Some(&demanded),
                 demanded_count.saturating_mul(2) >= n_columns,
+                SpillOverlayMode::VisibleScan,
+                None,
                 &mut |rowid, _commit_lsn, representation| {
                     let mark = self.index_arena.mark();
                     let mut decoded = [Datum::Null; MAX_COLUMNS];

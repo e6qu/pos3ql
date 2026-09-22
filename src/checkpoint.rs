@@ -16,13 +16,13 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
-    ColumnDefault, ColumnMeta, MAX_COLUMNS, OwnedDatum, PartitionBound, PartitionBoundValue,
-    PartitionDef, PartitionStrategy, RowHome, SerializedStoredQueryDependency, SqlName, Storage,
-    TableDef,
+    CheckpointValueCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, OwnedDatum, PartitionBound,
+    PartitionBoundValue, PartitionDef, PartitionStrategy, RowHome, SerializedStoredQueryDependency,
+    SqlName, Storage, TableDef,
 };
 use crate::store::{
-    BlockId, BlockStore, BlockType, OwnedObjectStore, SstHandle, SstKey, SstReader, SstWriter,
-    StackPlan, StoreError, TieredStore, ValueIndexHandle, ValueIndexWriter,
+    BlockId, BlockStore, BlockType, MAX_INLINE_ROW, OwnedObjectStore, SstCursor, SstHandle, SstKey,
+    SstReader, SstWriter, StackPlan, StoreError, TieredStore, ValueIndexHandle, ValueIndexWriter,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -249,8 +249,81 @@ struct ValueInstall {
 
 #[derive(Clone, Copy)]
 enum ValueIndexSource {
-    InMemory { bytes: usize, position: usize },
+    InMemory { rows: usize, position: usize },
     External { run: ExternalRun, started: bool },
+}
+
+#[derive(Clone, Copy)]
+struct BufferedValueRow {
+    offset: u32,
+    length: u32,
+    ordinal: u64,
+}
+
+const EMPTY_BUFFERED_VALUE_ROW: BufferedValueRow = BufferedValueRow {
+    offset: 0,
+    length: 0,
+    ordinal: 0,
+};
+
+#[derive(Clone, Copy)]
+struct PendingValueRow {
+    rowid: u64,
+    commit_lsn: u64,
+    hash: u64,
+    key_len: usize,
+    payload_len: usize,
+    token_skip: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ValueMergeDestination {
+    Carry(usize),
+    Finish(usize),
+}
+
+enum ValueSchedulePhase {
+    Collect,
+    WriteChunk {
+        position: usize,
+    },
+    StartMerge {
+        left: ExternalRun,
+        right: ExternalRun,
+        destination: ValueMergeDestination,
+    },
+    Merge {
+        destination: ValueMergeDestination,
+        right_cursor: SstCursor,
+        right_len: usize,
+        rows: u64,
+        output: u64,
+    },
+    Finish {
+        accumulator: Option<ExternalRun>,
+        level: usize,
+    },
+}
+
+struct ValueScheduleJob {
+    slot: usize,
+    table_created_at: u64,
+    table_generation: u64,
+    binding: usize,
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    n_columns: usize,
+    index_created_at: Option<u64>,
+    include_mask: u64,
+    navigation: Option<crate::store::NavigationSpec>,
+    dirty_lsn: u64,
+    through_lsn: u64,
+    phase: ValueSchedulePhase,
+    source_done: bool,
+    pending: Option<PendingValueRow>,
+    chunk_len: usize,
+    row_count: usize,
+    next_ordinal: u64,
+    levels: [Option<ExternalRun>; 64],
 }
 
 struct ValueIndexJob {
@@ -700,8 +773,11 @@ pub(crate) struct Checkpointer {
     /// detached into checkpoint-owned bytes; a spilled sort retains its
     /// immutable run, so the leased producer is free for foreground work.
     value_source: Box<[u8]>,
+    value_sort_rows: Box<[BufferedValueRow]>,
+    value_source_cursor: CheckpointValueCursor,
     value_sort_reader: ExternalRunReader,
     value_entry: Box<[u8]>,
+    value_schedule_job: Option<ValueScheduleJob>,
     value_job: Option<ValueIndexJob>,
     merge_job: Option<MergeJob>,
     /// Finished merges waiting for one manifest publish. One slot per table
@@ -758,6 +834,10 @@ const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
 const VALUE_INDEX_WRITE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_WRITE_BEAT_READS: u64 = 8;
 const VALUE_INDEX_WRITE_BEAT_ENTRIES: usize = 1024;
+const VALUE_INDEX_SCHEDULE_BEAT_ROWS: usize = 1024;
+const VALUE_INDEX_SCHEDULE_BEAT_BLOCKS: u64 = 4;
+const VALUE_INDEX_SCHEDULE_BEAT_READS: u64 = 8;
+const VALUE_SORT_ROWS_PER_CHUNK: usize = 8192;
 
 impl Checkpointer {
     #[cfg(feature = "checkpoint-profile")]
@@ -804,6 +884,8 @@ impl Checkpointer {
             + ValueIndexWriter::budget_bytes()
             + ExternalRunReader::budget_bytes()
             + 2 * crate::store::MAX_PAYLOAD
+            + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
+            + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table)
             + table_bookkeeping
             + (2usize.saturating_mul(table_capacity) + 1)
                 .saturating_mul(config.max_spill_generations_per_table)
@@ -1232,8 +1314,10 @@ impl Checkpointer {
             .map_err(CheckpointSetupError::Budget)?;
         budget
             .draw(
-                2 * crate::store::MAX_PAYLOAD,
-                "checkpoint value-index source and entry",
+                2 * crate::store::MAX_PAYLOAD
+                    + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
+                    + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table),
+                "checkpoint value-index scheduling",
             )
             .map_err(CheckpointSetupError::Budget)?;
         Ok(Self {
@@ -1282,8 +1366,12 @@ impl Checkpointer {
             merge_writer: SstWriter::new(),
             value_writer: ValueIndexWriter::new(),
             value_source: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            value_sort_rows: vec![EMPTY_BUFFERED_VALUE_ROW; VALUE_SORT_ROWS_PER_CHUNK]
+                .into_boxed_slice(),
+            value_source_cursor: CheckpointValueCursor::new(config.max_spill_generations_per_table),
             value_sort_reader: ExternalRunReader::new(),
             value_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            value_schedule_job: None,
             value_job: None,
             merge_job: None,
             merge_done: vec![None; table_capacity],
@@ -1312,6 +1400,23 @@ impl Checkpointer {
 
     #[cfg(test)]
     pub(crate) fn value_index_job_active(&self) -> bool {
+        self.value_schedule_job.is_some() || self.value_job.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn value_index_schedule_io_active(&self) -> bool {
+        self.value_schedule_job.as_ref().is_some_and(|job| {
+            matches!(
+                job.phase,
+                ValueSchedulePhase::WriteChunk { .. }
+                    | ValueSchedulePhase::StartMerge { .. }
+                    | ValueSchedulePhase::Merge { .. }
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn value_index_output_job_active(&self) -> bool {
         self.value_job.is_some()
     }
 
@@ -6895,8 +7000,13 @@ impl Checkpointer {
             self.sliced_this_sweep.iter_mut().for_each(|s| *s = false);
             self.pending_installs.clear();
             self.pending_value_installs.clear();
+            self.value_schedule_job = None;
             self.value_job = None;
             self.value_writer.reset();
+        }
+        if self.value_schedule_job.is_some() {
+            self.value_index_schedule_beat(storage)?;
+            return Ok(CheckpointStep::Working);
         }
         if self.value_job.is_some() {
             self.value_index_write_beat(storage)?;
@@ -10717,7 +10827,63 @@ impl Checkpointer {
         let dirty_lsn = storage
             .value_binding_dirty_lsn(slot, binding)
             .expect("selected value binding is dirty");
-        let result = self.schedule_value_index(storage, slot, binding, dirty_lsn, through_lsn);
+        self.sst_arena.reset();
+        let roster_read = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
+        self.roster_scratch.clear();
+        let result = (|| {
+            if let Some(previous) = storage.value_binding_handle(slot, binding) {
+                let known = &mut self.roster_scratch;
+                let complete = crate::store::walk_value_roster(
+                    &mut *self.blocks.borrow_mut(),
+                    previous.roster,
+                    roster_read,
+                    |id, kind| {
+                        if known.len() == known.capacity() {
+                            return false;
+                        }
+                        known.push((id, Some(kind)));
+                        true
+                    },
+                )
+                .map_err(value_index_to_sql)?;
+                if !complete {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "published value-index blocks exceed checkpoint_live_blocks ({})",
+                        self.roster_scratch.capacity()
+                    ));
+                }
+                self.roster_scratch.sort_unstable();
+                self.roster_scratch.dedup();
+            }
+            self.value_source_cursor.reset();
+            self.slice_writer.reset();
+            let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+            self.value_schedule_job = Some(ValueScheduleJob {
+                slot,
+                table_created_at: storage.table(slot).created_at,
+                table_generation: storage.table(slot).generation,
+                binding,
+                columns,
+                n_columns,
+                index_created_at: storage.value_binding_created_at(slot, binding),
+                include_mask: storage.value_binding_include_mask(slot, binding),
+                navigation: storage.value_binding_navigation(slot, binding),
+                dirty_lsn,
+                through_lsn,
+                phase: ValueSchedulePhase::Collect,
+                source_done: false,
+                pending: None,
+                chunk_len: 0,
+                row_count: 0,
+                next_ordinal: 0,
+                levels: [None; 64],
+            });
+            Ok(())
+        })();
         #[cfg(feature = "checkpoint-profile")]
         profile_checkpoint_phase(
             "value_index_schedule",
@@ -10729,23 +10895,209 @@ impl Checkpointer {
             0,
         );
         if result.is_err() {
-            self.value_writer.reset();
             self.roster_scratch.clear();
+            self.slice_writer.reset();
         }
         result?;
         Ok(true)
     }
 
-    fn schedule_value_index(
+    fn value_schedule_job_is_current(storage: &Storage, job: &ValueScheduleJob) -> bool {
+        if job.slot >= storage.physical_table_count()
+            || !storage.table(job.slot).live
+            || storage.table(job.slot).created_at != job.table_created_at
+            || storage.table(job.slot).generation != job.table_generation
+            || job.binding >= storage.value_binding_count(job.slot)
+            || !storage.value_binding_is_committed(job.slot, job.binding)
+        {
+            return false;
+        }
+        let (columns, n_columns) = storage.value_binding_columns(job.slot, job.binding);
+        job.n_columns == n_columns
+            && job.columns[..n_columns] == columns[..n_columns]
+            && job.index_created_at == storage.value_binding_created_at(job.slot, job.binding)
+            && job.include_mask == storage.value_binding_include_mask(job.slot, job.binding)
+            && job.navigation == storage.value_binding_navigation(job.slot, job.binding)
+            && storage.value_binding_dirty_lsn(job.slot, job.binding) == Some(job.dirty_lsn)
+    }
+
+    fn compare_value_sort_entries(
+        storage: &Storage,
+        job: &ValueScheduleJob,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<Ordering, SqlError> {
+        if job
+            .navigation
+            .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+        {
+            compare_posting_sort_entries(left, right)
+        } else {
+            storage.compare_value_binding_keys(
+                job.slot,
+                job.binding,
+                job.navigation,
+                value_sort_key(left)?,
+                value_sort_key(right)?,
+            )
+        }
+    }
+
+    fn push_value_sort_entry(
+        value_source: &mut [u8],
+        value_sort_rows: &mut [BufferedValueRow],
+        job: &mut ValueScheduleJob,
+        entry: &[u8],
+    ) -> Result<bool, SqlError> {
+        let total = 8usize.checked_add(entry.len()).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "value-index sort entry length overflows"
+            )
+        })?;
+        if total > MAX_INLINE_ROW {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "one value-index sort entry exceeds the external-run block capacity"
+            ));
+        }
+        if job.row_count == value_sort_rows.len() || job.chunk_len + total > value_source.len() {
+            return Ok(false);
+        }
+        let offset = job.chunk_len;
+        value_source[offset..offset + 8].copy_from_slice(&job.next_ordinal.to_le_bytes());
+        value_source[offset + 8..offset + total].copy_from_slice(entry);
+        value_sort_rows[job.row_count] = BufferedValueRow {
+            offset: offset as u32,
+            length: total as u32,
+            ordinal: job.next_ordinal,
+        };
+        job.row_count += 1;
+        job.chunk_len += total;
+        job.next_ordinal = job.next_ordinal.checked_add(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "external query row ordinal exhausted"
+            )
+        })?;
+        Ok(true)
+    }
+
+    fn sort_value_chunk(
         &mut self,
         storage: &Storage,
-        slot: usize,
-        binding: usize,
-        dirty_lsn: u64,
-        through_lsn: u64,
+        job: &ValueScheduleJob,
     ) -> Result<(), SqlError> {
+        let source = &self.value_source;
+        let mut comparison_error = None;
+        self.value_sort_rows[..job.row_count].sort_unstable_by(|left, right| {
+            if comparison_error.is_some() {
+                return Ordering::Equal;
+            }
+            let row = |entry: &BufferedValueRow| {
+                let start = entry.offset as usize + 8;
+                let end = entry.offset as usize + entry.length as usize;
+                &source[start..end]
+            };
+            match Self::compare_value_sort_entries(storage, job, row(left), row(right)) {
+                Ok(order) => order.then_with(|| left.ordinal.cmp(&right.ordinal)),
+                Err(error) => {
+                    comparison_error = Some(error);
+                    Ordering::Equal
+                }
+            }
+        });
+        if let Some(error) = comparison_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "fixed sort buffers and row view")]
+    fn encode_value_sort_row(
+        storage: &Storage,
+        value_source: &mut [u8],
+        value_sort_rows: &mut [BufferedValueRow],
+        job: &mut ValueScheduleJob,
+        row: PendingValueRow,
+        key: &[u8],
+        payload: &[u8],
+        sorted_entry: &mut [u8],
+    ) -> Result<bool, SqlError> {
+        if job
+            .navigation
+            .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+        {
+            let mut token_index = 0usize;
+            let mut complete = true;
+            let mut token_error = None;
+            storage.for_each_value_binding_posting_token(job.slot, job.binding, key, |token| {
+                if token_error.is_some() || !complete {
+                    return;
+                }
+                if token_index < row.token_skip {
+                    token_index += 1;
+                    return;
+                }
+                let posting_key = token.encode();
+                let entry_len = VALUE_SORT_ENTRY_HEADER + posting_key.len();
+                sorted_entry[..8].copy_from_slice(&token.hash().to_le_bytes());
+                sorted_entry[8..16].copy_from_slice(&row.rowid.to_le_bytes());
+                sorted_entry[16..24].copy_from_slice(&row.commit_lsn.to_le_bytes());
+                sorted_entry[24..28].copy_from_slice(&(posting_key.len() as u32).to_le_bytes());
+                sorted_entry[28..32].fill(0);
+                sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len].copy_from_slice(&posting_key);
+                match Self::push_value_sort_entry(
+                    value_source,
+                    value_sort_rows,
+                    job,
+                    &sorted_entry[..entry_len],
+                ) {
+                    Ok(true) => token_index += 1,
+                    Ok(false) => {
+                        job.pending = Some(PendingValueRow {
+                            token_skip: token_index,
+                            ..row
+                        });
+                        complete = false;
+                    }
+                    Err(error) => token_error = Some(error),
+                }
+            })?;
+            if let Some(error) = token_error {
+                return Err(error);
+            }
+            return Ok(complete);
+        }
+        let entry_len = VALUE_SORT_ENTRY_HEADER + key.len() + payload.len();
+        sorted_entry[..8].copy_from_slice(&row.hash.to_le_bytes());
+        sorted_entry[8..16].copy_from_slice(&row.rowid.to_le_bytes());
+        sorted_entry[16..24].copy_from_slice(&row.commit_lsn.to_le_bytes());
+        sorted_entry[24..28].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        sorted_entry[28..32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        sorted_entry[VALUE_SORT_ENTRY_HEADER..VALUE_SORT_ENTRY_HEADER + key.len()]
+            .copy_from_slice(key);
+        sorted_entry[VALUE_SORT_ENTRY_HEADER + key.len()..entry_len].copy_from_slice(payload);
+        if Self::push_value_sort_entry(
+            value_source,
+            value_sort_rows,
+            job,
+            &sorted_entry[..entry_len],
+        )? {
+            Ok(true)
+        } else {
+            job.pending = Some(row);
+            Ok(false)
+        }
+    }
+
+    fn value_collect_beat(
+        &mut self,
+        storage: &Storage,
+        job: &mut ValueScheduleJob,
+    ) -> Result<Option<ValueIndexSource>, SqlError> {
         self.sst_arena.reset();
-        let key = self
+        let key_output = self
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index key scratch"))?;
@@ -10753,160 +11105,494 @@ impl Checkpointer {
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index sort scratch"))?;
-        let roster_read = self
-            .sst_arena
-            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
-            .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
-        self.roster_scratch.clear();
-        if let Some(previous) = storage.value_binding_handle(slot, binding) {
-            let known = &mut self.roster_scratch;
-            let complete = crate::store::walk_value_roster(
-                &mut *self.blocks.borrow_mut(),
-                previous.roster,
-                roster_read,
-                |id, kind| {
-                    if known.len() == known.capacity() {
-                        return false;
-                    }
-                    known.push((id, Some(kind)));
-                    true
-                },
-            )
-            .map_err(value_index_to_sql)?;
-            if !complete {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "published value-index blocks exceed checkpoint_live_blocks ({})",
-                    self.roster_scratch.capacity()
-                ));
+
+        if let Some(pending) = job.pending.take() {
+            let pending_len = pending.key_len + pending.payload_len;
+            self.value_entry[..pending_len].copy_from_slice(&self.value_source[..pending_len]);
+            let (key, payload) = self.value_entry[..pending_len].split_at(pending.key_len);
+            if !Self::encode_value_sort_row(
+                storage,
+                &mut self.value_source,
+                &mut self.value_sort_rows,
+                job,
+                pending,
+                key,
+                payload,
+                sorted_entry,
+            )? {
+                self.sort_value_chunk(storage, job)?;
+                job.phase = ValueSchedulePhase::WriteChunk { position: 0 };
+                return Ok(None);
             }
-            self.roster_scratch.sort_unstable();
-            self.roster_scratch.dedup();
         }
 
-        let mut value_sorter = storage.external_sorter()?;
-        value_sorter.reset();
-        let navigation = storage.value_binding_navigation(slot, binding);
-        let mut compare = |left: &[u8], right: &[u8]| {
-            if navigation
-                .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
-            {
-                return compare_posting_sort_entries(left, right);
-            }
-            storage.compare_value_binding_keys(
-                slot,
-                binding,
-                navigation,
-                value_sort_key(left)?,
-                value_sort_key(right)?,
-            )
-        };
-        storage.for_each_value_binding_entry(
-            slot,
-            binding,
-            &self.sst_arena,
-            key,
-            &mut |entry| {
-                use core::ops::ControlFlow;
-                let key_len = entry.key.len();
-                if navigation.is_some_and(|navigation| {
-                    navigation.kind == crate::store::NavigationKind::Posting
-                }) {
-                    let mut token_error = None;
-                    storage.for_each_value_binding_posting_token(
-                        slot,
-                        binding,
+        if !job.source_done {
+            let mut stopped = false;
+            let done = storage.for_each_value_binding_entry_batch(
+                job.slot,
+                job.binding,
+                &mut self.value_source_cursor,
+                &self.sst_arena,
+                key_output,
+                VALUE_INDEX_SCHEDULE_BEAT_ROWS,
+                VALUE_INDEX_SCHEDULE_BEAT_READS,
+                &mut |entry| {
+                    let pending = PendingValueRow {
+                        rowid: entry.rowid,
+                        commit_lsn: entry.commit_lsn,
+                        hash: entry.hash,
+                        key_len: entry.key.len(),
+                        payload_len: entry.payload.len(),
+                        token_skip: 0,
+                    };
+                    if Self::encode_value_sort_row(
+                        storage,
+                        &mut self.value_source,
+                        &mut self.value_sort_rows,
+                        job,
+                        pending,
                         entry.key,
-                        |token| {
-                            if token_error.is_some() {
-                                return;
-                            }
-                            let posting_key = token.encode();
-                            let entry_len = VALUE_SORT_ENTRY_HEADER + posting_key.len();
-                            sorted_entry[..8].copy_from_slice(&token.hash().to_le_bytes());
-                            sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
-                            sorted_entry[16..24].copy_from_slice(&entry.commit_lsn.to_le_bytes());
-                            sorted_entry[24..28]
-                                .copy_from_slice(&(posting_key.len() as u32).to_le_bytes());
-                            sorted_entry[28..32].fill(0);
-                            sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
-                                .copy_from_slice(&posting_key);
-                            if let Err(error) = value_sorter.push_encoded(
-                                &mut *self.blocks.borrow_mut(),
-                                &sorted_entry[..entry_len],
-                                &mut compare,
-                            ) {
-                                token_error = Some(error);
-                            }
-                        },
-                    )?;
-                    if let Some(error) = token_error {
-                        return Err(error);
+                        entry.payload,
+                        sorted_entry,
+                    )? {
+                        return Ok(core::ops::ControlFlow::Continue(()));
                     }
-                    return Ok(ControlFlow::Continue(()));
-                }
-                let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + entry.payload.len();
-                sorted_entry[..8].copy_from_slice(&entry.hash.to_le_bytes());
-                sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
-                sorted_entry[16..24].copy_from_slice(&entry.commit_lsn.to_le_bytes());
-                sorted_entry[24..28].copy_from_slice(&(key_len as u32).to_le_bytes());
-                sorted_entry[28..32].copy_from_slice(&(entry.payload.len() as u32).to_le_bytes());
-                sorted_entry[VALUE_SORT_ENTRY_HEADER..VALUE_SORT_ENTRY_HEADER + key_len]
-                    .copy_from_slice(entry.key);
-                sorted_entry[VALUE_SORT_ENTRY_HEADER + key_len..entry_len]
-                    .copy_from_slice(entry.payload);
-                value_sorter.push_encoded(
-                    &mut *self.blocks.borrow_mut(),
-                    &sorted_entry[..entry_len],
-                    &mut compare,
-                )?;
-                Ok(ControlFlow::Continue(()))
-            },
-        )?;
+                    self.value_entry[..entry.key.len()].copy_from_slice(entry.key);
+                    self.value_entry[entry.key.len()..entry.key.len() + entry.payload.len()]
+                        .copy_from_slice(entry.payload);
+                    stopped = true;
+                    Ok(core::ops::ControlFlow::Break(()))
+                },
+            )?;
+            job.source_done = done && !stopped;
+        }
 
-        let source = if let Some(rows) = value_sorter.in_memory_rows(&mut compare)? {
-            let mut bytes = 0usize;
-            for position in 0..rows {
-                let row = value_sorter.in_memory_row(position);
-                let end = bytes + row.len();
-                self.value_source[bytes..end].copy_from_slice(row);
-                bytes = end;
-            }
-            ValueIndexSource::InMemory { bytes, position: 0 }
+        if job.pending.is_some()
+            || (!job.source_done && job.row_count == self.value_sort_rows.len())
+        {
+            self.sort_value_chunk(storage, job)?;
+            job.phase = ValueSchedulePhase::WriteChunk { position: 0 };
+            return Ok(None);
+        }
+        if !job.source_done {
+            return Ok(None);
+        }
+        if job.levels.iter().all(Option::is_none) {
+            self.sort_value_chunk(storage, job)?;
+            return Ok(Some(ValueIndexSource::InMemory {
+                rows: job.row_count,
+                position: 0,
+            }));
+        }
+        if job.row_count != 0 {
+            self.sort_value_chunk(storage, job)?;
+            job.phase = ValueSchedulePhase::WriteChunk { position: 0 };
         } else {
-            let run = value_sorter
-                .finish(&mut *self.blocks.borrow_mut(), &mut compare)?
-                .expect("spilled value-index rows produce a run");
-            ValueIndexSource::External {
+            job.phase = ValueSchedulePhase::Finish {
+                accumulator: None,
+                level: 0,
+            };
+        }
+        Ok(None)
+    }
+
+    fn install_value_run(
+        job: &mut ValueScheduleJob,
+        run: ExternalRun,
+        destination: ValueMergeDestination,
+    ) -> Result<(), SqlError> {
+        match destination {
+            ValueMergeDestination::Carry(level) => {
+                if level == job.levels.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "checkpoint value-index external run levels exhausted"
+                    ));
+                }
+                if let Some(left) = job.levels[level].take() {
+                    job.phase = ValueSchedulePhase::StartMerge {
+                        left,
+                        right: run,
+                        destination: ValueMergeDestination::Carry(level + 1),
+                    };
+                } else {
+                    job.levels[level] = Some(run);
+                    job.phase = if job.source_done && job.pending.is_none() {
+                        ValueSchedulePhase::Finish {
+                            accumulator: None,
+                            level: 0,
+                        }
+                    } else {
+                        ValueSchedulePhase::Collect
+                    };
+                }
+            }
+            ValueMergeDestination::Finish(level) => {
+                job.phase = ValueSchedulePhase::Finish {
+                    accumulator: Some(run),
+                    level,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn value_write_chunk_beat(
+        &mut self,
+        job: &mut ValueScheduleJob,
+        mut position: usize,
+        before: crate::store::BlockIoStats,
+    ) -> Result<(), SqlError> {
+        if position == 0 {
+            self.slice_writer.reset();
+        }
+        let start = position;
+        while position < job.row_count {
+            let row = self.value_sort_rows[position];
+            let begin = row.offset as usize;
+            let end = begin + row.length as usize;
+            self.slice_writer
+                .append(
+                    &mut *self.blocks.borrow_mut(),
+                    position as u64 + 1,
+                    &self.value_source[begin..end],
+                )
+                .map_err(sst_to_sql)?;
+            position += 1;
+            let io = self.blocks.borrow().io_stats().saturating_sub(before);
+            if position - start >= VALUE_INDEX_WRITE_BEAT_ENTRIES
+                || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
+            {
+                job.phase = ValueSchedulePhase::WriteChunk { position };
+                return Ok(());
+            }
+        }
+        if self
+            .blocks
+            .borrow()
+            .io_stats()
+            .saturating_sub(before)
+            .object_puts
+            != 0
+        {
+            job.phase = ValueSchedulePhase::WriteChunk { position };
+            return Ok(());
+        }
+        let rows = job.row_count as u64;
+        let handle = self
+            .slice_writer
+            .finish(&mut *self.blocks.borrow_mut())
+            .map_err(sst_to_sql)?
+            .expect("non-empty value-index run");
+        if let Some(pending) = job.pending {
+            let pending_len = pending.key_len + pending.payload_len;
+            // A carry merge reuses `value_entry`; retain the deferred source
+            // row in the now-idle chunk buffer until collection resumes.
+            self.value_source[..pending_len].copy_from_slice(&self.value_entry[..pending_len]);
+        }
+        job.chunk_len = 0;
+        job.row_count = 0;
+        Self::install_value_run(
+            job,
+            ExternalRun::from_checkpoint(handle, rows),
+            ValueMergeDestination::Carry(0),
+        )
+    }
+
+    fn start_value_merge(
+        &mut self,
+        job: &mut ValueScheduleJob,
+        left: ExternalRun,
+        right: ExternalRun,
+        destination: ValueMergeDestination,
+    ) -> Result<(), SqlError> {
+        self.value_sort_reader
+            .start(&mut *self.blocks.borrow_mut(), left)?;
+        self.sst_arena.reset();
+        let index = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge index scratch"))?;
+        let data = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge data scratch"))?;
+        let bounce = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge bounce scratch"))?;
+        let mut right_cursor = right.cursor();
+        let right_len = right_cursor
+            .next_copy(
+                &mut *self.blocks.borrow_mut(),
+                index,
+                data,
+                bounce,
+                &mut self.value_entry,
+            )
+            .map_err(sst_to_sql)?
+            .map_or(0, |(_, length)| length);
+        right_cursor.detach_buffer();
+        self.slice_writer.reset();
+        job.phase = ValueSchedulePhase::Merge {
+            destination,
+            right_cursor,
+            right_len,
+            rows: left.rows().checked_add(right.rows()).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "external query row count exhausted"
+                )
+            })?,
+            output: 1,
+        };
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "retained merge cursor state")]
+    fn value_merge_beat(
+        &mut self,
+        storage: &Storage,
+        job: &mut ValueScheduleJob,
+        destination: ValueMergeDestination,
+        mut right_cursor: SstCursor,
+        mut right_len: usize,
+        rows: u64,
+        mut output: u64,
+        before: crate::store::BlockIoStats,
+    ) -> Result<(), SqlError> {
+        self.sst_arena.reset();
+        let index = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge index scratch"))?;
+        let data = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge data scratch"))?;
+        let bounce = self
+            .sst_arena
+            .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
+            .map_err(|_| sql_err!(SQLSTATE_IO, "value-index merge bounce scratch"))?;
+        let mut processed = 0usize;
+        loop {
+            let left = self.value_sort_reader.prefixed_row();
+            let right = (right_len != 0).then_some(&self.value_entry[..right_len]);
+            let choose_left = match (left, right) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(left), Some(right)) => {
+                    let order =
+                        Self::compare_value_sort_entries(storage, job, &left[8..], &right[8..])?
+                            .then_with(|| {
+                                u64::from_le_bytes(left[..8].try_into().unwrap())
+                                    .cmp(&u64::from_le_bytes(right[..8].try_into().unwrap()))
+                            });
+                    !order.is_gt()
+                }
+                (None, None) => break,
+            };
+            if choose_left {
+                let row = self
+                    .value_sort_reader
+                    .prefixed_row()
+                    .expect("chosen left row");
+                self.slice_writer
+                    .append(&mut *self.blocks.borrow_mut(), output, row)
+                    .map_err(sst_to_sql)?;
+                self.value_sort_reader
+                    .advance(&mut *self.blocks.borrow_mut())?;
+            } else {
+                self.slice_writer
+                    .append(
+                        &mut *self.blocks.borrow_mut(),
+                        output,
+                        &self.value_entry[..right_len],
+                    )
+                    .map_err(sst_to_sql)?;
+                right_len = right_cursor
+                    .next_copy(
+                        &mut *self.blocks.borrow_mut(),
+                        index,
+                        data,
+                        bounce,
+                        &mut self.value_entry,
+                    )
+                    .map_err(sst_to_sql)?
+                    .map_or(0, |(_, length)| length);
+            }
+            processed += 1;
+            output += 1;
+            let io = self.blocks.borrow().io_stats().saturating_sub(before);
+            if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
+                || io.object_puts >= VALUE_INDEX_SCHEDULE_BEAT_BLOCKS
+                || io.object_gets >= VALUE_INDEX_SCHEDULE_BEAT_READS
+            {
+                right_cursor.detach_buffer();
+                job.phase = ValueSchedulePhase::Merge {
+                    destination,
+                    right_cursor,
+                    right_len,
+                    rows,
+                    output,
+                };
+                return Ok(());
+            }
+        }
+        if self.blocks.borrow().io_stats().saturating_sub(before) != Default::default() {
+            right_cursor.detach_buffer();
+            job.phase = ValueSchedulePhase::Merge {
+                destination,
+                right_cursor,
+                right_len,
+                rows,
+                output,
+            };
+            return Ok(());
+        }
+        let handle = self
+            .slice_writer
+            .finish(&mut *self.blocks.borrow_mut())
+            .map_err(sst_to_sql)?
+            .expect("merged value-index run is non-empty");
+        Self::install_value_run(job, ExternalRun::from_checkpoint(handle, rows), destination)
+    }
+
+    fn value_finish_beat(
+        &mut self,
+        job: &mut ValueScheduleJob,
+        mut accumulator: Option<ExternalRun>,
+        mut level: usize,
+    ) -> Option<ValueIndexSource> {
+        while level < job.levels.len() {
+            let Some(run) = job.levels[level].take() else {
+                level += 1;
+                continue;
+            };
+            if let Some(left) = accumulator {
+                job.phase = ValueSchedulePhase::StartMerge {
+                    left,
+                    right: run,
+                    destination: ValueMergeDestination::Finish(level + 1),
+                };
+                return None;
+            }
+            accumulator = Some(run);
+            level += 1;
+        }
+        Some(match accumulator {
+            Some(run) => ValueIndexSource::External {
                 run,
                 started: false,
-            }
-        };
-        let include_mask = storage.value_binding_include_mask(slot, binding);
-        if let Some(spec) = navigation {
+            },
+            None => ValueIndexSource::InMemory {
+                rows: 0,
+                position: 0,
+            },
+        })
+    }
+
+    fn finish_value_schedule(&mut self, job: ValueScheduleJob, source: ValueIndexSource) {
+        if let Some(spec) = job.navigation {
             self.value_writer.reset_navigation(
                 spec.position,
                 spec.kind,
-                include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
+                job.include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
             );
         } else {
             self.value_writer.reset();
         }
-        let (columns, n_columns) = storage.value_binding_columns(slot, binding);
         self.value_job = Some(ValueIndexJob {
-            slot,
-            table_created_at: storage.table(slot).created_at,
-            binding,
-            columns,
-            n_columns,
-            index_created_at: storage.value_binding_created_at(slot, binding),
-            include_mask,
-            navigation,
-            dirty_lsn,
-            through_lsn,
+            slot: job.slot,
+            table_created_at: job.table_created_at,
+            binding: job.binding,
+            columns: job.columns,
+            n_columns: job.n_columns,
+            index_created_at: job.index_created_at,
+            include_mask: job.include_mask,
+            navigation: job.navigation,
+            dirty_lsn: job.dirty_lsn,
+            through_lsn: job.through_lsn,
             source,
             previous_posting: None,
         });
+    }
+
+    fn value_index_schedule_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        let mut job = self
+            .value_schedule_job
+            .take()
+            .expect("checked by checkpoint scheduler");
+        if !Self::value_schedule_job_is_current(storage, &job) {
+            self.slice_writer.reset();
+            self.roster_scratch.clear();
+            return Ok(());
+        }
+        #[cfg(feature = "checkpoint-profile")]
+        let started = checkpoint_profile_start();
+        let before = self.blocks.borrow().io_stats();
+        let phase = core::mem::replace(&mut job.phase, ValueSchedulePhase::Collect);
+        let result = match phase {
+            ValueSchedulePhase::Collect => self.value_collect_beat(storage, &mut job),
+            ValueSchedulePhase::WriteChunk { position } => self
+                .value_write_chunk_beat(&mut job, position, before)
+                .map(|()| None),
+            ValueSchedulePhase::StartMerge {
+                left,
+                right,
+                destination,
+            } => self
+                .start_value_merge(&mut job, left, right, destination)
+                .map(|()| None),
+            ValueSchedulePhase::Merge {
+                destination,
+                right_cursor,
+                right_len,
+                rows,
+                output,
+            } => self
+                .value_merge_beat(
+                    storage,
+                    &mut job,
+                    destination,
+                    right_cursor,
+                    right_len,
+                    rows,
+                    output,
+                    before,
+                )
+                .map(|()| None),
+            ValueSchedulePhase::Finish { accumulator, level } => {
+                Ok(self.value_finish_beat(&mut job, accumulator, level))
+            }
+        };
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "value_index_schedule",
+            job.through_lsn,
+            Some(job.slot),
+            started,
+            before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
+        match result {
+            Ok(Some(source)) => self.finish_value_schedule(job, source),
+            Ok(None) => self.value_schedule_job = Some(job),
+            Err(error) => {
+                self.slice_writer.reset();
+                self.value_source_cursor.reset();
+                job.phase = ValueSchedulePhase::Collect;
+                job.source_done = false;
+                job.pending = None;
+                job.chunk_len = 0;
+                job.row_count = 0;
+                job.next_ordinal = 0;
+                job.levels.fill(None);
+                self.value_schedule_job = Some(job);
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -11020,10 +11706,12 @@ impl Checkpointer {
         let mut processed = 0usize;
         loop {
             let entry_len = match &job.source {
-                ValueIndexSource::InMemory { bytes, position } if position < bytes => {
-                    let entry_len = value_sort_entry_len(&self.value_source[*position..*bytes])?;
-                    self.value_entry[..entry_len]
-                        .copy_from_slice(&self.value_source[*position..*position + entry_len]);
+                ValueIndexSource::InMemory { rows, position } if position < rows => {
+                    let row = self.value_sort_rows[*position];
+                    let start = row.offset as usize + 8;
+                    let end = row.offset as usize + row.length as usize;
+                    let entry_len = end - start;
+                    self.value_entry[..entry_len].copy_from_slice(&self.value_source[start..end]);
                     entry_len
                 }
                 ValueIndexSource::External { .. } => match self.value_sort_reader.row() {
@@ -11142,7 +11830,7 @@ impl Checkpointer {
             }
 
             match &mut job.source {
-                ValueIndexSource::InMemory { position, .. } => *position += entry_len,
+                ValueIndexSource::InMemory { position, .. } => *position += 1,
                 ValueIndexSource::External { .. } => self
                     .value_sort_reader
                     .advance(&mut *self.blocks.borrow_mut())?,

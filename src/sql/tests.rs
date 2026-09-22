@@ -64639,7 +64639,41 @@ fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
         "{}",
         String::from_utf8_lossy(&changed)
     );
-    assert!(engine.checkpoint().unwrap());
+    let mut value_beats = 0usize;
+    let published_lsn = loop {
+        let value_beat = engine.ckpt.as_ref().unwrap().value_index_job_active();
+        let before = engine.storage.block_io_stats();
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        let beat = engine.storage.block_io_stats().saturating_sub(before);
+        if value_beat {
+            value_beats += 1;
+            assert!(
+                beat.object_puts <= 4 && beat.object_gets <= 8,
+                "one resumed PAX value-index beat exceeded its object-I/O bound: {beat:?}"
+            );
+        }
+        match step {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty PAX value index became idle before publication")
+            }
+        }
+    };
+    assert!(value_beats > 1, "the PAX source walk must span beats");
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

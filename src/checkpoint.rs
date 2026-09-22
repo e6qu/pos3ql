@@ -11135,6 +11135,7 @@ impl Checkpointer {
                 &self.sst_arena,
                 key_output,
                 VALUE_INDEX_SCHEDULE_BEAT_ROWS,
+                VALUE_INDEX_SCHEDULE_BEAT_READS,
                 &mut |entry| {
                     let pending = PendingValueRow {
                         rowid: entry.rowid,

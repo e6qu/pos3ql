@@ -24831,7 +24831,7 @@ impl Storage {
                 } else {
                     0
                 };
-                let resume_raw_row = cursor.raw_row;
+                let resume_raw_row = cursor.loaded.is_none().then_some(cursor.raw_row);
                 let mut blocks = spill.relation_blocks(table);
                 // Both index shapes resolve through one helper; the index
                 // buffer is scratch for the descent and the decompression
@@ -24897,8 +24897,8 @@ impl Storage {
                     })
                     .transpose()
                     .map_err(spill_read_error)?;
-                if cursor.pax_layout.is_some() && cursor.head.is_some() {
-                    cursor.raw_row = resume_raw_row;
+                if cursor.pax_layout.is_some() {
+                    cursor.raw_row = resume_raw_row.unwrap_or(0);
                 }
                 cursor.loaded_type = Some(loaded_type);
                 cursor.loaded = Some(cursor.ordinal);

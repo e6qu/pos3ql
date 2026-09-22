@@ -28401,14 +28401,13 @@ impl Storage {
             .durable_dirty
     }
 
-    pub(crate) fn value_binding_needs_publish_after(
+    pub(crate) fn value_binding_dirty_lsn(
         &self,
         table_index: usize,
         binding: usize,
-        lsn: u64,
-    ) -> bool {
+    ) -> Option<u64> {
         let enforcer = self.tables[table_index].enforcers[binding].expect("binding");
-        enforcer.durable_dirty && enforcer.durable_dirty_lsn > lsn
+        enforcer.durable_dirty.then_some(enforcer.durable_dirty_lsn)
     }
 
     /// Invalidates every durable value generation after a committed row-set

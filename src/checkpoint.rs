@@ -11,6 +11,7 @@ use crate::object_store::{
     ByteRange, Client as ObjectStore, EntityTag, Error as ObjectError, Precondition,
 };
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::external::{ExternalRun, ExternalRunReader};
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
@@ -124,7 +125,7 @@ const SQLSTATE_IO: &str = "58030";
 /// serialization_failure — manifest CAS lost to another writer.
 const SQLSTATE_CAS: &str = "40001";
 
-fn value_sort_key(entry: &[u8]) -> Result<&[u8], SqlError> {
+fn value_sort_entry_len(entry: &[u8]) -> Result<usize, SqlError> {
     if entry.len() < VALUE_SORT_ENTRY_HEADER {
         return Err(sql_err!(
             SQLSTATE_IO,
@@ -136,8 +137,19 @@ fn value_sort_key(entry: &[u8]) -> Result<&[u8], SqlError> {
     VALUE_SORT_ENTRY_HEADER
         .checked_add(key_len)
         .and_then(|end| end.checked_add(payload_len))
-        .filter(|end| *end == entry.len())
-        .ok_or_else(|| sql_err!(SQLSTATE_IO, "persistent value-index sort row is malformed"))?;
+        .filter(|end| *end <= entry.len())
+        .ok_or_else(|| sql_err!(SQLSTATE_IO, "persistent value-index sort row is malformed"))
+}
+
+fn value_sort_key(entry: &[u8]) -> Result<&[u8], SqlError> {
+    let entry_len = value_sort_entry_len(entry)?;
+    if entry_len != entry.len() {
+        return Err(sql_err!(
+            SQLSTATE_IO,
+            "persistent value-index sort row has trailing bytes"
+        ));
+    }
+    let key_len = u32::from_le_bytes(entry[24..28].try_into().unwrap()) as usize;
     Ok(&entry[VALUE_SORT_ENTRY_HEADER..VALUE_SORT_ENTRY_HEADER + key_len])
 }
 
@@ -226,11 +238,38 @@ impl SliceLayout {
 #[derive(Clone, Copy)]
 struct ValueInstall {
     slot: usize,
+    table_created_at: u64,
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_columns: usize,
     index_created_at: Option<u64>,
     include_mask: u64,
+    dirty_lsn: u64,
     handle: Option<ValueIndexHandle>,
+}
+
+#[derive(Clone, Copy)]
+enum ValueIndexSource {
+    InMemory { bytes: usize, position: usize },
+    External { run: ExternalRun, started: bool },
+}
+
+struct ValueIndexJob {
+    slot: usize,
+    table_created_at: u64,
+    binding: usize,
+    columns: [u16; crate::storage::MAX_INDEX_COLS],
+    n_columns: usize,
+    index_created_at: Option<u64>,
+    include_mask: u64,
+    navigation: Option<crate::store::NavigationSpec>,
+    dirty_lsn: u64,
+    through_lsn: u64,
+    source: ValueIndexSource,
+    previous_posting: Option<(
+        [u8; crate::sql::index_signature::PostingToken::KEY_BYTES],
+        u64,
+        u64,
+    )>,
 }
 
 type LoadedValueIndex = (
@@ -624,7 +663,6 @@ pub(crate) struct Checkpointer {
     /// One table's next slice, committed into `prev_scratch` only after every
     /// fallible row and value-index write succeeds.
     slice_scratch: SlotList,
-    slice_value_installs: Vec<ValueInstall>,
     /// Pre-reserved scratch for cold commit replay and object deletion batches.
     commit_scratch: Vec<StackStr<64>>,
     garbage_scratch: Vec<StackStr<64>>,
@@ -658,6 +696,13 @@ pub(crate) struct Checkpointer {
     slice_writer: SstWriter,
     merge_writer: SstWriter,
     value_writer: ValueIndexWriter,
+    /// One value-index rebuild spans dispatch beats. An in-memory sort is
+    /// detached into checkpoint-owned bytes; a spilled sort retains its
+    /// immutable run, so the leased producer is free for foreground work.
+    value_source: Box<[u8]>,
+    value_sort_reader: ExternalRunReader,
+    value_entry: Box<[u8]>,
+    value_job: Option<ValueIndexJob>,
     merge_job: Option<MergeJob>,
     /// Finished merges waiting for one manifest publish. One slot per table
     /// lets every dirty filled roster free a generation before the sweep;
@@ -710,6 +755,9 @@ const MERGE_TRIGGER: usize = 4;
 const MERGE_SCHEDULE_BEAT_BLOCKS: usize = 8;
 const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
+const VALUE_INDEX_WRITE_BEAT_BLOCKS: u64 = 4;
+const VALUE_INDEX_WRITE_BEAT_READS: u64 = 8;
+const VALUE_INDEX_WRITE_BEAT_ENTRIES: usize = 1024;
 
 impl Checkpointer {
     #[cfg(feature = "checkpoint-profile")]
@@ -754,11 +802,13 @@ impl Checkpointer {
         (1 + config.object_store_get_slots) * ObjectStore::budget_bytes(config)
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
+            + ExternalRunReader::budget_bytes()
+            + 2 * crate::store::MAX_PAYLOAD
             + table_bookkeeping
             + (2usize.saturating_mul(table_capacity) + 1)
                 .saturating_mul(config.max_spill_generations_per_table)
                 .saturating_mul(core::mem::size_of::<Option<PrevSst>>())
-            + (table_capacity + 1).saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
+            + table_capacity.saturating_mul(crate::storage::MAX_VALUE_ENFORCERS)
                 * core::mem::size_of::<ValueInstall>()
             + config.checkpoint_live_blocks * core::mem::size_of::<(BlockId, Option<BlockType>)>()
             + config.checkpoint_garbage_batch_objects
@@ -1174,6 +1224,18 @@ impl Checkpointer {
         let prev_scratch = (0..table_capacity)
             .map(|_| SlotList::new(config.max_spill_generations_per_table))
             .collect::<Vec<_>>();
+        budget
+            .draw(
+                ExternalRunReader::budget_bytes(),
+                "checkpoint value-index run reader",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
+        budget
+            .draw(
+                2 * crate::store::MAX_PAYLOAD,
+                "checkpoint value-index source and entry",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
@@ -1198,7 +1260,6 @@ impl Checkpointer {
             prev_ssts,
             prev_scratch,
             slice_scratch: SlotList::new(config.max_spill_generations_per_table),
-            slice_value_installs: Vec::with_capacity(crate::storage::MAX_VALUE_ENFORCERS),
             commit_scratch: Vec::with_capacity(config.checkpoint_commit_batches),
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             delete_objects_per_beat: config.checkpoint_delete_objects_per_beat,
@@ -1220,6 +1281,10 @@ impl Checkpointer {
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
             value_writer: ValueIndexWriter::new(),
+            value_source: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            value_sort_reader: ExternalRunReader::new(),
+            value_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            value_job: None,
             merge_job: None,
             merge_done: vec![None; table_capacity],
             merge_turn: false,
@@ -1238,6 +1303,16 @@ impl Checkpointer {
     #[cfg(test)]
     pub(crate) fn published_spill_generation_count(&self, slot: usize) -> usize {
         self.prev_ssts.get(slot).map_or(0, |list| list.n)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sliced_generation(&self, slot: usize) -> u64 {
+        self.sliced_generation.get(slot).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn value_index_job_active(&self) -> bool {
+        self.value_job.is_some()
     }
 
     #[cfg(test)]
@@ -6794,10 +6869,12 @@ impl Checkpointer {
         // long merge cannot starve publishes. A finished merge makes a
         // sweep due even at an unchanged lsn: its install needs a publish.
         let merge_due = self.merge_job.is_some() || self.merge_candidate(storage).is_some();
+        let value_index_due = self.value_index_schedule_pending(storage);
         let sweep_due = self.sweeping
             || storage.lsn() != self.manifest_lsn
             || self.manifest_etag.is_none()
             || self.merge_done.iter().any(Option::is_some)
+            || value_index_due
             || storage.statistics_dirty();
         if merge_due && (self.merge_turn || !sweep_due) {
             self.merge_turn = false;
@@ -6818,9 +6895,24 @@ impl Checkpointer {
             self.sliced_this_sweep.iter_mut().for_each(|s| *s = false);
             self.pending_installs.clear();
             self.pending_value_installs.clear();
+            self.value_job = None;
+            self.value_writer.reset();
+        }
+        if self.value_job.is_some() {
+            self.value_index_write_beat(storage)?;
+            return Ok(CheckpointStep::Working);
         }
         let mut wrote_slice = false;
         for slot in 0..storage.physical_table_count() {
+            let table = storage.table(slot);
+            if !table.live
+                || table.def.persistence == crate::storage::RelationPersistence::Temporary
+            {
+                continue;
+            }
+            if self.start_value_index_job(storage, slot)? {
+                return Ok(CheckpointStep::Working);
+            }
             if !self.needs_slice(storage, slot) {
                 continue;
             }
@@ -6835,7 +6927,8 @@ impl Checkpointer {
         }
         if wrote_slice
             && (merge_due
-                || (0..storage.physical_table_count()).any(|slot| self.needs_slice(storage, slot)))
+                || (0..storage.physical_table_count()).any(|slot| self.needs_slice(storage, slot))
+                || self.value_index_schedule_pending(storage))
         {
             return Ok(CheckpointStep::Working);
         }
@@ -7882,6 +7975,7 @@ impl Checkpointer {
                     .iter()
                     .find(|install| {
                         install.slot == slot
+                            && install.table_created_at == storage.table(slot).created_at
                             && install.n_columns == n_columns
                             && install.columns[..n_columns] == columns[..n_columns]
                             && install.index_created_at == index_created_at
@@ -10295,46 +10389,6 @@ impl Checkpointer {
         } else {
             self.slice_scratch.copy_from(&self.prev_ssts[slot]);
         }
-        self.slice_value_installs.clear();
-        if let Some(floor) = changed_after_lsn {
-            for install in self
-                .pending_value_installs
-                .iter()
-                .filter(|install| install.slot == slot)
-            {
-                let unchanged = (0..storage.value_binding_count(slot)).any(|binding| {
-                    let (columns, n_columns) = storage.value_binding_columns(slot, binding);
-                    storage.value_binding_is_committed(slot, binding)
-                        && !storage.value_binding_needs_publish_after(slot, binding, floor)
-                        && install.n_columns == n_columns
-                        && install.columns[..n_columns] == columns[..n_columns]
-                        && install.index_created_at
-                            == storage.value_binding_created_at(slot, binding)
-                        && install.include_mask == storage.value_binding_include_mask(slot, binding)
-                });
-                if unchanged {
-                    self.slice_value_installs.push(*install);
-                }
-            }
-        }
-        // Stage every fallible write before changing the retained slice. A
-        // failed fallback from a full unpublished list must keep that list
-        // and its LSN boundary intact for the retry.
-        #[cfg(feature = "checkpoint-profile")]
-        let index_started = checkpoint_profile_start();
-        #[cfg(feature = "checkpoint-profile")]
-        let index_before = self.blocks.borrow().io_stats();
-        self.build_value_indexes(storage, slot, changed_after_lsn)?;
-        #[cfg(feature = "checkpoint-profile")]
-        profile_checkpoint_phase(
-            "value_indexes",
-            storage.lsn(),
-            Some(slot),
-            index_started,
-            index_before,
-            self.blocks.borrow().io_stats(),
-            0,
-        );
         // A completed paced merge is part of this publish's base before a
         // dirty table decides whether its new versions fit as a delta. A
         // retained slice already incorporated this merge.
@@ -10580,38 +10634,116 @@ impl Checkpointer {
             self.pending_installs.push((slot, install));
         }
         self.prev_scratch[slot].copy_from(&self.slice_scratch);
-        self.pending_value_installs
-            .retain(|install| install.slot != slot);
-        self.pending_value_installs
-            .extend_from_slice(&self.slice_value_installs);
         Ok(())
     }
 
-    /// Rebuilds each changed constrained or named tuple as a compact key-only
-    /// generation. A binding whose dependent physical columns did not change
-    /// retains its prior immutable handle; changed bindings still receive a
-    /// full logical rebuild so stale keys disappear atomically with the row
-    /// generation through the same manifest CAS.
-    fn build_value_indexes(
+    fn value_install_matches_binding(
+        storage: &Storage,
+        install: &ValueInstall,
+        slot: usize,
+        binding: usize,
+    ) -> bool {
+        if install.slot != slot
+            || slot >= storage.physical_table_count()
+            || !storage.table(slot).live
+            || storage.table(slot).created_at != install.table_created_at
+            || binding >= storage.value_binding_count(slot)
+            || !storage.value_binding_is_committed(slot, binding)
+        {
+            return false;
+        }
+        let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+        install.n_columns == n_columns
+            && install.columns[..n_columns] == columns[..n_columns]
+            && install.index_created_at == storage.value_binding_created_at(slot, binding)
+            && install.include_mask == storage.value_binding_include_mask(slot, binding)
+    }
+
+    fn value_install_is_current(storage: &Storage, install: &ValueInstall) -> bool {
+        if install.slot >= storage.physical_table_count() {
+            return false;
+        }
+        (0..storage.value_binding_count(install.slot)).any(|binding| {
+            Self::value_install_matches_binding(storage, install, install.slot, binding)
+                && storage.value_binding_dirty_lsn(install.slot, binding) == Some(install.dirty_lsn)
+        })
+    }
+
+    fn value_index_schedule_pending(&self, storage: &Storage) -> bool {
+        (0..storage.physical_table_count()).any(|slot| {
+            let table = storage.table(slot);
+            table.live
+                && table.def.persistence != crate::storage::RelationPersistence::Temporary
+                && (0..storage.value_binding_count(slot)).any(|binding| {
+                    storage.value_binding_is_committed(slot, binding)
+                        && storage.value_binding_needs_publish(slot, binding)
+                        && !self.pending_value_installs.iter().any(|install| {
+                            Self::value_install_matches_binding(storage, install, slot, binding)
+                                && storage.value_binding_dirty_lsn(slot, binding)
+                                    == Some(install.dirty_lsn)
+                        })
+                })
+        })
+    }
+
+    /// Starts one affected binding. Entry collection and external sorting are
+    /// one schedule beat; the immutable writer consumes the retained result
+    /// through bounded later beats.
+    fn start_value_index_job(&mut self, storage: &Storage, slot: usize) -> Result<bool, SqlError> {
+        self.pending_value_installs
+            .retain(|install| Self::value_install_is_current(storage, install));
+        let binding = (0..storage.value_binding_count(slot)).find(|&binding| {
+            storage.value_binding_is_committed(slot, binding)
+                && storage.value_binding_needs_publish(slot, binding)
+                && !self.pending_value_installs.iter().any(|install| {
+                    Self::value_install_matches_binding(storage, install, slot, binding)
+                })
+        });
+        let Some(binding) = binding else {
+            return Ok(false);
+        };
+        if self.pending_value_installs.len() == self.pending_value_installs.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "checkpoint value-index install roster is full"
+            ));
+        }
+
+        #[cfg(feature = "checkpoint-profile")]
+        let started = checkpoint_profile_start();
+        #[cfg(feature = "checkpoint-profile")]
+        let before = self.blocks.borrow().io_stats();
+        let through_lsn = storage.lsn();
+        let dirty_lsn = storage
+            .value_binding_dirty_lsn(slot, binding)
+            .expect("selected value binding is dirty");
+        let result = self.schedule_value_index(storage, slot, binding, dirty_lsn, through_lsn);
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "value_index_schedule",
+            through_lsn,
+            Some(slot),
+            started,
+            before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
+        if result.is_err() {
+            self.value_writer.reset();
+            self.roster_scratch.clear();
+        }
+        result?;
+        Ok(true)
+    }
+
+    fn schedule_value_index(
         &mut self,
         storage: &Storage,
         slot: usize,
-        changed_after_lsn: Option<u64>,
+        binding: usize,
+        dirty_lsn: u64,
+        through_lsn: u64,
     ) -> Result<(), SqlError> {
-        let needs_publish = |binding| {
-            changed_after_lsn.map_or_else(
-                || storage.value_binding_needs_publish(slot, binding),
-                |floor| storage.value_binding_needs_publish_after(slot, binding, floor),
-            )
-        };
-        if !(0..storage.value_binding_count(slot)).any(needs_publish) {
-            return Ok(());
-        }
-        // Checkpoints run between statements, so they can lease the same
-        // startup-bounded external-run contexts as query materializers rather
-        // than reserving another multi-megabyte merge fan-in.
-        let mut value_sorter = storage.external_sorter()?;
-        let mut value_sort_reader = storage.external_run_reader()?;
         self.sst_arena.reset();
         let key = self
             .sst_arena
@@ -10625,155 +10757,326 @@ impl Checkpointer {
             .sst_arena
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
-        let published_lsn = storage.lsn();
-        for binding in 0..storage.value_binding_count(slot) {
-            if !storage.value_binding_is_committed(slot, binding) || !needs_publish(binding) {
-                continue;
+        self.roster_scratch.clear();
+        if let Some(previous) = storage.value_binding_handle(slot, binding) {
+            let known = &mut self.roster_scratch;
+            let complete = crate::store::walk_value_roster(
+                &mut *self.blocks.borrow_mut(),
+                previous.roster,
+                roster_read,
+                |id, kind| {
+                    if known.len() == known.capacity() {
+                        return false;
+                    }
+                    known.push((id, Some(kind)));
+                    true
+                },
+            )
+            .map_err(value_index_to_sql)?;
+            if !complete {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "published value-index blocks exceed checkpoint_live_blocks ({})",
+                    self.roster_scratch.capacity()
+                ));
             }
-            self.roster_scratch.clear();
-            if let Some(previous) = storage.value_binding_handle(slot, binding) {
-                let known = &mut self.roster_scratch;
-                let complete = crate::store::walk_value_roster(
-                    &mut *self.blocks.borrow_mut(),
-                    previous.roster,
-                    roster_read,
-                    |id, kind| {
-                        if known.len() == known.capacity() {
-                            return false;
-                        }
-                        known.push((id, Some(kind)));
-                        true
-                    },
-                )
-                .map_err(value_index_to_sql)?;
-                if !complete {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "published value-index blocks exceed checkpoint_live_blocks ({})",
-                        self.roster_scratch.capacity()
-                    ));
-                }
-                self.roster_scratch.sort_unstable();
-                self.roster_scratch.dedup();
+            self.roster_scratch.sort_unstable();
+            self.roster_scratch.dedup();
+        }
+
+        let mut value_sorter = storage.external_sorter()?;
+        value_sorter.reset();
+        let navigation = storage.value_binding_navigation(slot, binding);
+        let mut compare = |left: &[u8], right: &[u8]| {
+            if navigation
+                .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+            {
+                return compare_posting_sort_entries(left, right);
             }
-            value_sorter.reset();
-            let navigation = storage.value_binding_navigation(slot, binding);
-            let mut compare = |left: &[u8], right: &[u8]| {
+            storage.compare_value_binding_keys(
+                slot,
+                binding,
+                navigation,
+                value_sort_key(left)?,
+                value_sort_key(right)?,
+            )
+        };
+        storage.for_each_value_binding_entry(
+            slot,
+            binding,
+            &self.sst_arena,
+            key,
+            &mut |entry| {
+                use core::ops::ControlFlow;
+                let key_len = entry.key.len();
                 if navigation.is_some_and(|navigation| {
                     navigation.kind == crate::store::NavigationKind::Posting
                 }) {
-                    return compare_posting_sort_entries(left, right);
-                }
-                storage.compare_value_binding_keys(
-                    slot,
-                    binding,
-                    navigation,
-                    value_sort_key(left)?,
-                    value_sort_key(right)?,
-                )
-            };
-            let include_mask = storage.value_binding_include_mask(slot, binding);
-            if let Some(spec) = navigation {
-                self.value_writer.reset_navigation(
-                    spec.position,
-                    spec.kind,
-                    include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
-                );
-            } else {
-                self.value_writer.reset();
-            }
-            storage.for_each_value_binding_entry(
-                slot,
-                binding,
-                &self.sst_arena,
-                key,
-                &mut |entry| {
-                    use core::ops::ControlFlow;
-                    let key_len = entry.key.len();
-                    if navigation.is_some_and(|navigation| {
-                        navigation.kind == crate::store::NavigationKind::Posting
-                    }) {
-                        let mut token_error = None;
-                        storage.for_each_value_binding_posting_token(
-                            slot,
-                            binding,
-                            entry.key,
-                            |token| {
-                                if token_error.is_some() {
-                                    return;
-                                }
-                                let posting_key = token.encode();
-                                let entry_len = VALUE_SORT_ENTRY_HEADER + posting_key.len();
-                                sorted_entry[..8].copy_from_slice(&token.hash().to_le_bytes());
-                                sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
-                                sorted_entry[16..24]
-                                    .copy_from_slice(&entry.commit_lsn.to_le_bytes());
-                                sorted_entry[24..28]
-                                    .copy_from_slice(&(posting_key.len() as u32).to_le_bytes());
-                                sorted_entry[28..32].fill(0);
-                                sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
-                                    .copy_from_slice(&posting_key);
-                                if let Err(error) = value_sorter.push_encoded(
-                                    &mut *self.blocks.borrow_mut(),
-                                    &sorted_entry[..entry_len],
-                                    &mut compare,
-                                ) {
-                                    token_error = Some(error);
-                                }
-                            },
-                        )?;
-                        if let Some(error) = token_error {
-                            return Err(error);
-                        }
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + entry.payload.len();
-                    sorted_entry[..8].copy_from_slice(&entry.hash.to_le_bytes());
-                    sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
-                    sorted_entry[16..24].copy_from_slice(&entry.commit_lsn.to_le_bytes());
-                    sorted_entry[24..28].copy_from_slice(&(key_len as u32).to_le_bytes());
-                    sorted_entry[28..32]
-                        .copy_from_slice(&(entry.payload.len() as u32).to_le_bytes());
-                    sorted_entry[VALUE_SORT_ENTRY_HEADER..VALUE_SORT_ENTRY_HEADER + key_len]
-                        .copy_from_slice(entry.key);
-                    sorted_entry[VALUE_SORT_ENTRY_HEADER + key_len..entry_len]
-                        .copy_from_slice(entry.payload);
-                    value_sorter.push_encoded(
-                        &mut *self.blocks.borrow_mut(),
-                        &sorted_entry[..entry_len],
-                        &mut compare,
+                    let mut token_error = None;
+                    storage.for_each_value_binding_posting_token(
+                        slot,
+                        binding,
+                        entry.key,
+                        |token| {
+                            if token_error.is_some() {
+                                return;
+                            }
+                            let posting_key = token.encode();
+                            let entry_len = VALUE_SORT_ENTRY_HEADER + posting_key.len();
+                            sorted_entry[..8].copy_from_slice(&token.hash().to_le_bytes());
+                            sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
+                            sorted_entry[16..24].copy_from_slice(&entry.commit_lsn.to_le_bytes());
+                            sorted_entry[24..28]
+                                .copy_from_slice(&(posting_key.len() as u32).to_le_bytes());
+                            sorted_entry[28..32].fill(0);
+                            sorted_entry[VALUE_SORT_ENTRY_HEADER..entry_len]
+                                .copy_from_slice(&posting_key);
+                            if let Err(error) = value_sorter.push_encoded(
+                                &mut *self.blocks.borrow_mut(),
+                                &sorted_entry[..entry_len],
+                                &mut compare,
+                            ) {
+                                token_error = Some(error);
+                            }
+                        },
                     )?;
-                    Ok(ControlFlow::Continue(()))
-                },
-            )?;
-            let mut previous_posting = None;
-            let mut append_sorted = |entry: &[u8]| -> Result<(), SqlError> {
-                let key = value_sort_key(entry)?;
-                let payload = value_sort_payload(entry)?;
-                let hash = u64::from_le_bytes(entry[..8].try_into().unwrap());
-                let rowid = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-                let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
-                let posting_token = if navigation.is_some_and(|navigation| {
-                    navigation.kind == crate::store::NavigationKind::Posting
-                }) {
-                    Some(
-                        crate::sql::index_signature::PostingToken::decode(key).ok_or_else(
-                            || sql_err!(SQLSTATE_IO, "persistent GIN posting key is corrupt"),
-                        )?,
-                    )
-                } else {
-                    None
-                };
-                if let Some(token) = posting_token {
-                    let identity = (token.encode(), rowid, commit_lsn);
-                    if previous_posting == Some(identity) {
-                        return Ok(());
+                    if let Some(error) = token_error {
+                        return Err(error);
                     }
-                    previous_posting = Some(identity);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let entry_len = VALUE_SORT_ENTRY_HEADER + key_len + entry.payload.len();
+                sorted_entry[..8].copy_from_slice(&entry.hash.to_le_bytes());
+                sorted_entry[8..16].copy_from_slice(&entry.rowid.to_le_bytes());
+                sorted_entry[16..24].copy_from_slice(&entry.commit_lsn.to_le_bytes());
+                sorted_entry[24..28].copy_from_slice(&(key_len as u32).to_le_bytes());
+                sorted_entry[28..32].copy_from_slice(&(entry.payload.len() as u32).to_le_bytes());
+                sorted_entry[VALUE_SORT_ENTRY_HEADER..VALUE_SORT_ENTRY_HEADER + key_len]
+                    .copy_from_slice(entry.key);
+                sorted_entry[VALUE_SORT_ENTRY_HEADER + key_len..entry_len]
+                    .copy_from_slice(entry.payload);
+                value_sorter.push_encoded(
+                    &mut *self.blocks.borrow_mut(),
+                    &sorted_entry[..entry_len],
+                    &mut compare,
+                )?;
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+
+        let source = if let Some(rows) = value_sorter.in_memory_rows(&mut compare)? {
+            let mut bytes = 0usize;
+            for position in 0..rows {
+                let row = value_sorter.in_memory_row(position);
+                let end = bytes + row.len();
+                self.value_source[bytes..end].copy_from_slice(row);
+                bytes = end;
+            }
+            ValueIndexSource::InMemory { bytes, position: 0 }
+        } else {
+            let run = value_sorter
+                .finish(&mut *self.blocks.borrow_mut(), &mut compare)?
+                .expect("spilled value-index rows produce a run");
+            ValueIndexSource::External {
+                run,
+                started: false,
+            }
+        };
+        let include_mask = storage.value_binding_include_mask(slot, binding);
+        if let Some(spec) = navigation {
+            self.value_writer.reset_navigation(
+                spec.position,
+                spec.kind,
+                include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
+            );
+        } else {
+            self.value_writer.reset();
+        }
+        let (columns, n_columns) = storage.value_binding_columns(slot, binding);
+        self.value_job = Some(ValueIndexJob {
+            slot,
+            table_created_at: storage.table(slot).created_at,
+            binding,
+            columns,
+            n_columns,
+            index_created_at: storage.value_binding_created_at(slot, binding),
+            include_mask,
+            navigation,
+            dirty_lsn,
+            through_lsn,
+            source,
+            previous_posting: None,
+        });
+        Ok(())
+    }
+
+    fn value_job_is_current(storage: &Storage, job: &ValueIndexJob) -> bool {
+        if job.slot >= storage.physical_table_count()
+            || !storage.table(job.slot).live
+            || storage.table(job.slot).created_at != job.table_created_at
+            || job.binding >= storage.value_binding_count(job.slot)
+            || !storage.value_binding_is_committed(job.slot, job.binding)
+        {
+            return false;
+        }
+        let (columns, n_columns) = storage.value_binding_columns(job.slot, job.binding);
+        job.n_columns == n_columns
+            && job.columns[..n_columns] == columns[..n_columns]
+            && job.index_created_at == storage.value_binding_created_at(job.slot, job.binding)
+            && job.include_mask == storage.value_binding_include_mask(job.slot, job.binding)
+            && job.navigation == storage.value_binding_navigation(job.slot, job.binding)
+            && storage.value_binding_dirty_lsn(job.slot, job.binding) == Some(job.dirty_lsn)
+    }
+
+    fn reset_value_index_output(&mut self, job: &mut ValueIndexJob) {
+        if let Some(spec) = job.navigation {
+            self.value_writer.reset_navigation(
+                spec.position,
+                spec.kind,
+                job.include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
+            );
+        } else {
+            self.value_writer.reset();
+        }
+        job.previous_posting = None;
+        match &mut job.source {
+            ValueIndexSource::InMemory { position, .. } => *position = 0,
+            ValueIndexSource::External { started, .. } => *started = false,
+        }
+    }
+
+    /// Streams a sorted value-index generation through a bounded number of
+    /// entries and block transfers. A failed beat restarts from the retained
+    /// sorted source; content-addressed writes make the replay idempotent.
+    fn value_index_write_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        let mut job = self.value_job.take().expect("checked by caller");
+        if !Self::value_job_is_current(storage, &job) {
+            self.value_writer.reset();
+            self.roster_scratch.clear();
+            return Ok(());
+        }
+        #[cfg(feature = "checkpoint-profile")]
+        let started = checkpoint_profile_start();
+        let before = self.blocks.borrow().io_stats();
+        let result = self.write_value_index_entries(storage, &mut job, before);
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            "value_index_write",
+            job.through_lsn,
+            Some(job.slot),
+            started,
+            before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
+        match result {
+            Ok(Some(handle)) => {
+                if self.pending_value_installs.len() == self.pending_value_installs.capacity() {
+                    self.reset_value_index_output(&mut job);
+                    self.value_job = Some(job);
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "checkpoint value-index install roster is full"
+                    ));
+                }
+                self.pending_value_installs.push(ValueInstall {
+                    slot: job.slot,
+                    table_created_at: job.table_created_at,
+                    columns: job.columns,
+                    n_columns: job.n_columns,
+                    index_created_at: job.index_created_at,
+                    include_mask: job.include_mask,
+                    dirty_lsn: job.dirty_lsn,
+                    handle,
+                });
+                self.roster_scratch.clear();
+                Ok(())
+            }
+            Ok(None) => {
+                self.value_job = Some(job);
+                Ok(())
+            }
+            Err(error) => {
+                self.reset_value_index_output(&mut job);
+                self.value_job = Some(job);
+                Err(error)
+            }
+        }
+    }
+
+    fn write_value_index_entries(
+        &mut self,
+        storage: &Storage,
+        job: &mut ValueIndexJob,
+        before: crate::store::BlockIoStats,
+    ) -> Result<Option<Option<ValueIndexHandle>>, SqlError> {
+        if let ValueIndexSource::External { run, started } = &mut job.source
+            && !*started
+        {
+            self.value_sort_reader
+                .start(&mut *self.blocks.borrow_mut(), *run)?;
+            *started = true;
+        }
+        let mut processed = 0usize;
+        loop {
+            let entry_len = match &job.source {
+                ValueIndexSource::InMemory { bytes, position } if position < bytes => {
+                    let entry_len = value_sort_entry_len(&self.value_source[*position..*bytes])?;
+                    self.value_entry[..entry_len]
+                        .copy_from_slice(&self.value_source[*position..*position + entry_len]);
+                    entry_len
+                }
+                ValueIndexSource::External { .. } => match self.value_sort_reader.row() {
+                    Some(entry) => {
+                        self.value_entry[..entry.len()].copy_from_slice(entry);
+                        entry.len()
+                    }
+                    None => 0,
+                },
+                ValueIndexSource::InMemory { .. } => 0,
+            };
+            if entry_len == 0 {
+                let handle = {
+                    let mut blocks = self.blocks.borrow_mut();
+                    let mut published = PublishedValueBlockStore {
+                        inner: &mut *blocks,
+                        known_blocks: &self.roster_scratch,
+                    };
+                    self.value_writer
+                        .finish(&mut published, job.through_lsn)
+                        .map_err(value_index_to_sql)?
+                };
+                return Ok(Some(handle));
+            }
+
+            let entry = &self.value_entry[..entry_len];
+            let key = value_sort_key(entry)?;
+            let payload = value_sort_payload(entry)?;
+            let hash = u64::from_le_bytes(entry[..8].try_into().unwrap());
+            let rowid = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+            let commit_lsn = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+            let posting_token = if job
+                .navigation
+                .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
+            {
+                Some(
+                    crate::sql::index_signature::PostingToken::decode(key).ok_or_else(|| {
+                        sql_err!(SQLSTATE_IO, "persistent GIN posting key is corrupt")
+                    })?,
+                )
+            } else {
+                None
+            };
+            let duplicate = posting_token.is_some_and(|token| {
+                job.previous_posting == Some((token.encode(), rowid, commit_lsn))
+            });
+            if !duplicate {
+                if let Some(token) = posting_token {
+                    job.previous_posting = Some((token.encode(), rowid, commit_lsn));
                 }
                 let mut comparison_error = None;
                 let mut compare_keys = |left: &[u8], right: &[u8]| match storage
-                    .compare_value_binding_keys(slot, binding, navigation, left, right)
+                    .compare_value_binding_keys(job.slot, job.binding, job.navigation, left, right)
                 {
                     Ok(ordering) => ordering,
                     Err(error) => {
@@ -10781,10 +11084,16 @@ impl Checkpointer {
                         core::cmp::Ordering::Equal
                     }
                 };
-                let include_mask = storage.value_binding_include_mask(slot, binding);
-                let summary = if let Some(spec) = navigation {
+                let summary = if let Some(spec) = job.navigation {
                     Some(posting_token.map_or_else(
-                        || storage.value_binding_navigation_summary(slot, binding, spec, key),
+                        || {
+                            storage.value_binding_navigation_summary(
+                                job.slot,
+                                job.binding,
+                                spec,
+                                key,
+                            )
+                        },
                         |token| Ok(token.summary()),
                     )?)
                 } else {
@@ -10796,18 +11105,18 @@ impl Checkpointer {
                         inner: &mut *blocks,
                         known_blocks: &self.roster_scratch,
                     };
-                    if let Some(spec) = navigation {
+                    if let Some(spec) = job.navigation {
                         self.value_writer.append_navigation(
                             &mut published,
                             (hash, rowid, commit_lsn),
                             key,
-                            (include_mask != 0
+                            (job.include_mask != 0
                                 && spec.kind != crate::store::NavigationKind::Posting)
                                 .then_some(payload),
                             summary.expect("navigation summary was computed"),
                             &mut compare_keys,
                         )
-                    } else if include_mask == 0 {
+                    } else if job.include_mask == 0 {
                         self.value_writer.append(
                             &mut published,
                             hash,
@@ -10830,44 +11139,23 @@ impl Checkpointer {
                 if let Some(error) = comparison_error {
                     return Err(error);
                 }
-                Ok(())
-            };
-            if let Some(count) = value_sorter.in_memory_rows(&mut compare)? {
-                for position in 0..count {
-                    append_sorted(value_sorter.in_memory_row(position))?;
-                }
-            } else {
-                let run = value_sorter
-                    .finish(&mut *self.blocks.borrow_mut(), &mut compare)?
-                    .expect("spilled rows produce a run");
-                value_sort_reader.start(&mut *self.blocks.borrow_mut(), run)?;
-                while let Some(entry) = value_sort_reader.row() {
-                    append_sorted(entry)?;
-                    value_sort_reader.advance(&mut *self.blocks.borrow_mut())?;
-                }
             }
-            let handle = {
-                let mut blocks = self.blocks.borrow_mut();
-                let mut published = PublishedValueBlockStore {
-                    inner: &mut *blocks,
-                    known_blocks: &self.roster_scratch,
-                };
-                self.value_writer
-                    .finish(&mut published, published_lsn)
-                    .map_err(value_index_to_sql)?
-            };
-            let (columns, n_columns) = storage.value_binding_columns(slot, binding);
-            let include_mask = storage.value_binding_include_mask(slot, binding);
-            self.slice_value_installs.push(ValueInstall {
-                slot,
-                columns,
-                n_columns,
-                index_created_at: storage.value_binding_created_at(slot, binding),
-                include_mask,
-                handle,
-            });
+
+            match &mut job.source {
+                ValueIndexSource::InMemory { position, .. } => *position += entry_len,
+                ValueIndexSource::External { .. } => self
+                    .value_sort_reader
+                    .advance(&mut *self.blocks.borrow_mut())?,
+            }
+            processed += 1;
+            let io = self.blocks.borrow().io_stats().saturating_sub(before);
+            if processed >= VALUE_INDEX_WRITE_BEAT_ENTRIES
+                || io.object_puts >= VALUE_INDEX_WRITE_BEAT_BLOCKS
+                || io.object_gets >= VALUE_INDEX_WRITE_BEAT_READS
+            {
+                return Ok(None);
+            }
         }
-        Ok(())
     }
 
     /// Mark-and-sweep over `blocks/`: the keep-set is every identity on the

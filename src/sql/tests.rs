@@ -16028,7 +16028,8 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut budget =
+        Budget::new((1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -16063,7 +16064,8 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted_budget =
+        Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -16993,7 +16995,7 @@ fn object_resident_set_records_keep_their_structural_fields() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -64310,7 +64312,8 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.value_index_rows = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut budget =
+        Budget::new((1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut writer = TxnState::new(&mut budget, 256).unwrap();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();
@@ -64423,7 +64426,8 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted_budget =
+        Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let restarted_slot = restarted
         .storage
@@ -68123,7 +68127,7 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -71942,7 +71946,7 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,

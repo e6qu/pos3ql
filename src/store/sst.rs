@@ -1094,8 +1094,7 @@ impl SstVersionCursor {
         raw: &mut [u8],
         decoded: &mut [u8],
         column: &mut [u8],
-        range: &mut [u8],
-        out: &mut [u8],
+        assembly: &mut [u8],
     ) -> Result<Option<SstProbe>, SstError> {
         loop {
             if self.offset >= self.data_len {
@@ -1114,7 +1113,7 @@ impl SstVersionCursor {
                     (
                         RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4,
                         BlockType::SstDataPaxV2,
-                    ) => decode_pax_v2(store, &raw[..raw_len], decoded, column, range)?,
+                    ) => decode_pax_v2(store, &raw[..raw_len], decoded, column, assembly)?,
                     (
                         RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
                         BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
@@ -1156,12 +1155,12 @@ impl SstVersionCursor {
                 }));
             }
             if entry.is_chained() {
-                assemble_chain(store, &entry, out)?;
+                assemble_chain(store, &entry, assembly)?;
             } else {
-                if out.len() < entry.total_len {
+                if assembly.len() < entry.total_len {
                     return Err(SstError::Store(StoreError::BufferTooSmall));
                 }
-                out[..entry.total_len].copy_from_slice(entry.head);
+                assembly[..entry.total_len].copy_from_slice(entry.head);
             }
             return Ok(Some(SstProbe {
                 key: entry.key,
@@ -3209,7 +3208,6 @@ mod tests {
         let mut raw = vec![0; MAX_PAYLOAD];
         let mut decoded = vec![0; MAX_PAYLOAD];
         let mut column = vec![0; MAX_PAYLOAD];
-        let mut range = vec![0; MAX_ASSEMBLED];
         let mut out = vec![0; MAX_ASSEMBLED];
 
         let first = cursor
@@ -3220,7 +3218,6 @@ mod tests {
                 &mut raw,
                 &mut decoded,
                 &mut column,
-                &mut range,
                 &mut out,
             )
             .unwrap()
@@ -3238,7 +3235,6 @@ mod tests {
                     &mut raw,
                     &mut decoded,
                     &mut column,
-                    &mut range,
                     &mut out,
                 )
                 .unwrap()

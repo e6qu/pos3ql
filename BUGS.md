@@ -225,6 +225,14 @@ the current row. V4 row deltas compress and pack canonical groups instead of
 publishing PAX descriptor and column containers. Mixed-format reads, exact
 object counts, retry paths, and empty-cache recovery qualify the change. The
 remaining row-merge write amplification is tracked in PLAN.md.
+The row-merge read audit found no external blocker. Merge writers retain
+decoded source groups in startup-accounted memory and use sparse-key seeks when
+the schedule skips source blocks. Full-row PAX decoding reads a shared packed
+container once and still verifies every logical frame; selective query readers
+continue to fetch only demanded columns. A cache-disabled wide-row regression
+bounds provider reads across paced beats, retry, and empty-cache recovery, and
+the clean profile records the removed read amplification. Remaining immutable
+output reuse is tracked in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -806,7 +806,6 @@ pub(crate) struct Checkpointer {
     merge_source_index: Box<[u8]>,
     merge_source_raw: Box<[u8]>,
     merge_source_column: Box<[u8]>,
-    merge_source_range: Box<[u8]>,
     merge_row: Box<[u8]>,
     value_writer: ValueIndexWriter,
     /// One value-index rebuild spans dispatch beats. An in-memory sort is
@@ -873,7 +872,7 @@ const MERGE_SCHEDULE_BEAT_BLOCKS: usize = 8;
 const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_WRITE_BEAT_READS: u64 = 8;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
-const MERGE_SOURCE_SCRATCH_BYTES: usize = 5 * crate::store::MAX_PAYLOAD + 2 * MAX_ASSEMBLED;
+pub(crate) const MERGE_SOURCE_SCRATCH_BYTES: usize = 5 * crate::store::MAX_PAYLOAD + MAX_ASSEMBLED;
 const VALUE_INDEX_WRITE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_WRITE_BEAT_READS: u64 = 8;
 const VALUE_INDEX_WRITE_BEAT_ENTRIES: usize = 1024;
@@ -1281,7 +1280,6 @@ impl Checkpointer {
                     &mut self.merge_source_raw,
                     decoded,
                     &mut self.merge_source_column,
-                    &mut self.merge_source_range,
                     &mut self.merge_row,
                 )
                 .map_err(sst_to_sql)?
@@ -1435,7 +1433,6 @@ impl Checkpointer {
             merge_source_index: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_raw: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             merge_source_column: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
-            merge_source_range: vec![0; MAX_ASSEMBLED].into_boxed_slice(),
             merge_row: vec![0; MAX_ASSEMBLED].into_boxed_slice(),
             value_writer: ValueIndexWriter::new(),
             value_source: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),

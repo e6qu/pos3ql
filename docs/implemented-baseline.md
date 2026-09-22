@@ -5,6 +5,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
 
 - Object-native commit publication, checkpoints, crash recovery, and recovery
   with empty RAM and disk caches.
+- Manifest and row SST formats have explicit reader and writer identities.
+  Manifest v13 upgrades to v14 on the next checkpoint; direct v2 and packed PAX
+  v3 row generations coexist while new slices and merges write v3. Unknown
+  identities fail startup. The compatibility and migration contract is recorded
+  in [durable-format.md](durable-format.md).
 - A bounded S3-compatible client covering conditional writes, full and ranged
   reads, paginated listing, deletion, opaque entity tags, TLS, signing, retry
   classification, and structured errors through one endpoint-independent path.

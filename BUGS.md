@@ -212,6 +212,12 @@ Storage VOPR fault qualification also found and fixed a cross-beat seam where
 an uncommitted version could move a spill-resident committed row into the
 overlay class without advancing the committed generation. Checkpoint sources
 now partition rows solely by committed home and verify the spill commit LSN.
+The durable format boundary audit found no external blocker. Manifest v13/v14
+and row SST v2/v3 compatibility are explicit typed identities; mixed row
+generations retain their identity through all reader paths, new published row
+generations use v3, and unknown formats fail at startup. Online generational
+replacement and the offline gate for retiring a reader are documented in the
+durable format contract. Row-merge performance work remains in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

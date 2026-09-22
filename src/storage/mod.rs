@@ -24880,7 +24880,7 @@ impl Storage {
                     &mut *blocks,
                     &leaf,
                     &mut context.index_buf,
-                    handle.packed,
+                    handle.uses_packed_references(),
                 )
                 .map_err(spill_read_error)?
                 {

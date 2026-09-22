@@ -27,9 +27,39 @@ use crate::storage::rowenc::{self, MAX_COLUMNS};
 use super::bloom::{self, FILTER_BYTES};
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
+/// Durable row SST layouts accepted by this reader. The identity stays on the
+/// handle so every index descent uses the layout named by the manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowSstFormat {
+    /// Direct data blocks named by v2 sparse-index entries.
+    DirectV2,
+    /// PAX extents named through packed v3 sparse-index entries.
+    PackedPaxV3,
+}
+
+impl RowSstFormat {
+    pub(crate) const fn manifest_id(self) -> &'static str {
+        match self {
+            Self::DirectV2 => "v2",
+            Self::PackedPaxV3 => "v3",
+        }
+    }
+
+    pub(crate) const fn from_manifest_id(id: &str) -> Option<Self> {
+        match id.as_bytes() {
+            b"v2" => Some(Self::DirectV2),
+            b"v3" => Some(Self::PackedPaxV3),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn uses_packed_references(self) -> bool {
+        matches!(self, Self::PackedPaxV3)
+    }
+}
+
 /// What a finished SST is named by: the index block a reader searches, and the
-/// filter block it checks first to skip an SST that cannot hold a key. The
-/// filter is `None` only for an SST with no rows, which has neither.
+/// filter block it checks first to skip an SST that cannot hold a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SstHandle {
     pub(crate) index: BlockId,
@@ -38,9 +68,13 @@ pub(crate) struct SstHandle {
     /// chain, filter, index), so garbage collection can enumerate an SST by
     /// reading one block instead of all of them.
     pub(crate) roster: BlockId,
-    /// Data entries name verified extents in immutable packed containers.
-    /// False retains the direct content-addressed data-block format.
-    pub(crate) packed: bool,
+    pub(crate) format: RowSstFormat,
+}
+
+impl SstHandle {
+    pub(crate) const fn uses_packed_references(self) -> bool {
+        self.format.uses_packed_references()
+    }
 }
 
 /// One physical data-block location. A packed reference names both the
@@ -914,7 +948,11 @@ impl SstWriter {
             index,
             filter,
             roster,
-            packed: self.pax_enabled,
+            format: if self.pax_enabled {
+                RowSstFormat::PackedPaxV3
+            } else {
+                RowSstFormat::DirectV2
+            },
         }))
     }
 }
@@ -1080,8 +1118,12 @@ impl SstCursor {
         let Some((ordinal, leaf)) = self.prefetched_leaf else {
             return Ok(());
         };
-        let Some(reference) =
-            take_prefetched_index_first_data(store, &leaf, index, self.handle.packed)?
+        let Some(reference) = take_prefetched_index_first_data(
+            store,
+            &leaf,
+            index,
+            self.handle.uses_packed_references(),
+        )?
         else {
             return Ok(());
         };
@@ -1836,10 +1878,15 @@ impl<'a> SstReader<'a> {
         }
         let target = SstKey::at(rowid, snapshot);
         let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(self.index_scratch, count, target, handle.packed) else {
+        let Some(entry) = block_containing(
+            self.index_scratch,
+            count,
+            target,
+            handle.uses_packed_references(),
+        ) else {
             return Ok(None);
         };
-        let block_ref = block_ref_at(self.index_scratch, entry, handle.packed);
+        let block_ref = block_ref_at(self.index_scratch, entry, handle.uses_packed_references());
 
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
@@ -1905,10 +1952,15 @@ impl<'a> SstReader<'a> {
         }
         let target = SstKey::at(rowid, snapshot);
         let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(self.index_scratch, count, target, handle.packed) else {
+        let Some(entry) = block_containing(
+            self.index_scratch,
+            count,
+            target,
+            handle.uses_packed_references(),
+        ) else {
             return Ok(None);
         };
-        let block_ref = block_ref_at(self.index_scratch, entry, handle.packed);
+        let block_ref = block_ref_at(self.index_scratch, entry, handle.uses_packed_references());
         let data_len = self.load_data_block(store, block_ref)?;
         for entry in (DataBlock {
             bytes: &self.decoded_scratch[..data_len],
@@ -1958,18 +2010,28 @@ impl<'a> SstReader<'a> {
             // The block `lo` falls in, or — when `lo` precedes every key — the
             // first block, since the range may still cover it from the left.
             let start = if leaf_ordinal == start_leaf {
-                block_containing(self.index_scratch, count, start_key, handle.packed).unwrap_or(0)
+                block_containing(
+                    self.index_scratch,
+                    count,
+                    start_key,
+                    handle.uses_packed_references(),
+                )
+                .unwrap_or(0)
             } else {
                 0
             };
             for entry_index in start..count {
-                let block_ref = block_ref_at(self.index_scratch, entry_index, handle.packed);
+                let block_ref = block_ref_at(
+                    self.index_scratch,
+                    entry_index,
+                    handle.uses_packed_references(),
+                );
                 prefetch_data_window(
                     store,
                     self.index_scratch,
                     entry_index + 1,
                     count,
-                    handle.packed,
+                    handle.uses_packed_references(),
                 )?;
                 let data_len = self.load_data_block(store, block_ref)?;
                 let mut ran_past = false;
@@ -2030,19 +2092,29 @@ impl<'a> SstReader<'a> {
                 return Ok(None); // the SST is exhausted
             };
             let start = if leaf_ordinal == start_leaf {
-                block_containing(self.index_scratch, count, lo, handle.packed).unwrap_or(0)
+                block_containing(
+                    self.index_scratch,
+                    count,
+                    lo,
+                    handle.uses_packed_references(),
+                )
+                .unwrap_or(0)
             } else {
                 0
             };
             let end = (start + budget).min(count);
             for entry_index in start..end {
-                let block_ref = block_ref_at(self.index_scratch, entry_index, handle.packed);
+                let block_ref = block_ref_at(
+                    self.index_scratch,
+                    entry_index,
+                    handle.uses_packed_references(),
+                );
                 prefetch_data_window(
                     store,
                     self.index_scratch,
                     entry_index + 1,
                     end,
-                    handle.packed,
+                    handle.uses_packed_references(),
                 )?;
                 let data_len = self.load_data_block(store, block_ref)?;
                 for entry in (DataBlock {
@@ -2216,9 +2288,17 @@ pub(crate) fn locate_data_block_with_next(
         if ordinal >= count {
             return Ok(None);
         }
-        let next = (ordinal + 1 < count)
-            .then(|| DataBlockLookahead::Data(block_ref_at(buf, ordinal + 1, handle.packed)));
-        return Ok(Some((block_ref_at(buf, ordinal, handle.packed), next)));
+        let next = (ordinal + 1 < count).then(|| {
+            DataBlockLookahead::Data(block_ref_at(
+                buf,
+                ordinal + 1,
+                handle.uses_packed_references(),
+            ))
+        });
+        return Ok(Some((
+            block_ref_at(buf, ordinal, handle.uses_packed_references()),
+            next,
+        )));
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
     let entry_size = VERSIONED_ROOT_ENTRY;
@@ -2242,12 +2322,15 @@ pub(crate) fn locate_data_block_with_next(
                 Some(DataBlockLookahead::Data(block_ref_at(
                     buf,
                     remaining + 1,
-                    handle.packed,
+                    handle.uses_packed_references(),
                 )))
             } else {
                 next_leaf.map(DataBlockLookahead::Leaf)
             };
-            return Ok(Some((block_ref_at(buf, remaining, handle.packed), next)));
+            return Ok(Some((
+                block_ref_at(buf, remaining, handle.uses_packed_references()),
+                next,
+            )));
         }
         remaining -= count;
     }
@@ -2630,6 +2713,35 @@ mod tests {
     }
 
     #[test]
+    fn supported_row_sst_formats_coexist_in_one_reader() {
+        let (_budget, mut store) = store();
+        let arena = arena();
+        let direct_row = b"direct-v2".to_vec();
+        let direct = build(&mut store, &[(1, direct_row.clone())]).unwrap();
+
+        let values = [Datum::Int4(9), Datum::Text("packed-v3")];
+        let mut packed_row = vec![0; rowenc::encoded_len(&values)];
+        rowenc::encode(&values, &mut packed_row);
+        let mut writer = SstWriter::new();
+        writer
+            .set_pax_schema(&[ColType::Int4, ColType::Text])
+            .unwrap();
+        writer
+            .append_version(&mut store, SstKey::at(2, 1), &packed_row)
+            .unwrap();
+        let packed = writer.finish(&mut store).unwrap().unwrap();
+
+        assert_eq!(direct.format, RowSstFormat::DirectV2);
+        assert_eq!(direct.format.manifest_id(), "v2");
+        assert_eq!(packed.format, RowSstFormat::PackedPaxV3);
+        assert_eq!(packed.format.manifest_id(), "v3");
+
+        let mut reader = SstReader::new(&arena).unwrap();
+        assert_eq!(get(&mut reader, &mut store, &direct, 1), Some(direct_row));
+        assert_eq!(get(&mut reader, &mut store, &packed, 2), Some(packed_row));
+    }
+
+    #[test]
     fn detached_cursor_reloads_its_current_block_at_the_saved_offset() {
         let (_budget, mut store) = store();
         let handle = build(
@@ -2875,7 +2987,7 @@ mod tests {
                 .unwrap();
         }
         let handle = writer.finish(&mut store).unwrap().unwrap();
-        assert!(handle.packed);
+        assert!(handle.uses_packed_references());
 
         let mut index = [0; MAX_PAYLOAD];
         let first = locate_data_block_ref(&mut store, &handle, &mut index, 0)

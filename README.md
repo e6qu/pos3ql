@@ -458,6 +458,7 @@ psql -h 127.0.0.1 -p 5433 -U you
 - [BUGS.md](BUGS.md) — unresolved, genuinely blocked bugs only
 - [docs/terminology.md](docs/terminology.md) — naming and glossary
 - [docs/object-storage.md](docs/object-storage.md) — direct S3-compatible durability boundary
+- [docs/durable-format.md](docs/durable-format.md) — manifest and row SST compatibility and migration rules
 - [docs/postgresql-18-compatibility.md](docs/postgresql-18-compatibility.md) — implemented PostgreSQL 18 and explicit non-goals
 - [docs/performance.md](docs/performance.md) — current single-process and replica scaling boundary
 - [docs/logical-replication.md](docs/logical-replication.md) — PostgreSQL 18 protocol, SQL, monitoring, and architecture boundary

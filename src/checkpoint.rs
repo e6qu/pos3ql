@@ -21,8 +21,9 @@ use crate::storage::{
     SqlName, Storage, TableDef,
 };
 use crate::store::{
-    BlockId, BlockStore, BlockType, MAX_INLINE_ROW, OwnedObjectStore, SstCursor, SstHandle, SstKey,
-    SstReader, SstWriter, StackPlan, StoreError, TieredStore, ValueIndexHandle, ValueIndexWriter,
+    BlockId, BlockStore, BlockType, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat, SstCursor,
+    SstHandle, SstKey, SstReader, SstWriter, StackPlan, StoreError, TieredStore, ValueIndexHandle,
+    ValueIndexWriter,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -30,11 +31,40 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v14";
-const LEGACY_MANIFEST_HEADER: &str = "pos3ql-manifest-v13";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
+
+/// Manifest readers are deliberately explicit. A supported legacy manifest is
+/// rewritten as the current format by the next successful checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestFormat {
+    V13,
+    V14,
+}
+
+impl ManifestFormat {
+    const CURRENT: Self = Self::V14;
+
+    const fn header(self) -> &'static str {
+        match self {
+            Self::V13 => "pos3ql-manifest-v13",
+            Self::V14 => "pos3ql-manifest-v14",
+        }
+    }
+
+    fn parse(header: Option<&str>) -> Result<Self, CheckpointSetupError> {
+        match header {
+            Some("pos3ql-manifest-v13") => Ok(Self::V13),
+            Some("pos3ql-manifest-v14") => Ok(Self::V14),
+            _ => Err(CheckpointSetupError::Corrupt("bad manifest header")),
+        }
+    }
+
+    const fn has_value_index_identity(self) -> bool {
+        matches!(self, Self::V14)
+    }
+}
 
 #[cfg(feature = "checkpoint-profile")]
 pub(crate) struct CheckpointProfileStart {
@@ -1867,11 +1897,7 @@ impl Checkpointer {
         text: &str,
     ) -> Result<u64, CheckpointSetupError> {
         let mut lines = text.lines();
-        let header = lines.next();
-        let manifest_v14 = header == Some(MANIFEST_HEADER);
-        if !manifest_v14 && header != Some(LEGACY_MANIFEST_HEADER) {
-            return Err(CheckpointSetupError::Corrupt("bad manifest header"));
-        }
+        let manifest_format = ManifestFormat::parse(lines.next())?;
         let mut lsn = 0u64;
         let mut next_rowid = 1u64;
         let mut latest_transaction_id = None;
@@ -3535,7 +3561,7 @@ impl Checkpointer {
                         *column = parse_field(words.next(), "vix column")?;
                     }
                     let include_mask = parse_field(words.next(), "vix include mask")?;
-                    let index_created_at = if manifest_v14 {
+                    let index_created_at = if manifest_format.has_value_index_identity() {
                         match words
                             .next()
                             .ok_or(CheckpointSetupError::Corrupt("vix index identity"))?
@@ -7136,7 +7162,7 @@ impl Checkpointer {
         // Delta bookkeeping collects the new per-slot references into
         // pre-reserved scratch so this post-freeze path never allocates.
         self.manifest_buf.clear();
-        write_manifest(&mut self.manifest_buf, MANIFEST_HEADER)?;
+        write_manifest(&mut self.manifest_buf, ManifestFormat::CURRENT.header())?;
         write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
         write_manifest(
             &mut self.manifest_buf,
@@ -8064,7 +8090,7 @@ impl Checkpointer {
                         core::str::from_utf8(&ih).expect("hex"),
                         core::str::from_utf8(&fh).expect("hex"),
                         core::str::from_utf8(&rh).expect("hex"),
-                        if h.packed { "v3" } else { "v2" },
+                        h.format.manifest_id(),
                     ),
                 )?;
             }
@@ -12203,11 +12229,10 @@ fn parse_dsst_handle<'a>(
     if filter == "-" || roster == "-" {
         return Err(CheckpointSetupError::Corrupt("incomplete dsst handle"));
     }
-    let packed = match words.next() {
-        Some("v2") => false,
-        Some("v3") => true,
-        Some(_) | None => return Err(CheckpointSetupError::Corrupt("unknown dsst format")),
-    };
+    let format = words
+        .next()
+        .and_then(RowSstFormat::from_manifest_id)
+        .ok_or(CheckpointSetupError::Corrupt("unknown dsst format"))?;
     if words.next().is_some() {
         return Err(CheckpointSetupError::Corrupt("malformed dsst handle"));
     }
@@ -12215,7 +12240,7 @@ fn parse_dsst_handle<'a>(
         index: parse_block_id(index)?,
         filter: parse_block_id(filter)?,
         roster: parse_block_id(roster)?,
-        packed,
+        format,
     }))
 }
 
@@ -14591,21 +14616,38 @@ mod stored_dependency_tests {
     }
 
     #[test]
-    fn dsst_manifest_accepts_only_current_complete_formats() {
+    fn manifest_reader_accepts_only_declared_versions() {
+        assert_eq!(
+            ManifestFormat::parse(Some("pos3ql-manifest-v13")).unwrap(),
+            ManifestFormat::V13
+        );
+        assert_eq!(
+            ManifestFormat::parse(Some("pos3ql-manifest-v14")).unwrap(),
+            ManifestFormat::CURRENT
+        );
+        assert!(ManifestFormat::parse(Some("pos3ql-manifest-v12")).is_err());
+        assert!(ManifestFormat::parse(Some("pos3ql-manifest-v15")).is_err());
+        assert!(ManifestFormat::parse(None).is_err());
+    }
+
+    #[test]
+    fn dsst_manifest_retains_supported_format_identity() {
         let id = "00".repeat(32);
         let mut direct = "v2".split(' ');
-        assert!(
-            !parse_dsst_handle(&id, &id, &id, &mut direct)
+        assert_eq!(
+            parse_dsst_handle(&id, &id, &id, &mut direct)
                 .unwrap()
                 .unwrap()
-                .packed
+                .format,
+            RowSstFormat::DirectV2
         );
         let mut packed = "v3".split(' ');
-        assert!(
+        assert_eq!(
             parse_dsst_handle(&id, &id, &id, &mut packed)
                 .unwrap()
                 .unwrap()
-                .packed
+                .format,
+            RowSstFormat::PackedPaxV3
         );
         let mut obsolete = "v1".split(' ');
         assert!(parse_dsst_handle(&id, &id, &id, &mut obsolete).is_err());

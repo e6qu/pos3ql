@@ -302,12 +302,15 @@ LSN.
 The new profile changes the checkpoint priority. Row-merge source scheduling
 is again the largest individual dispatch and aggregate phase: 102 events took
 27.35 seconds, with a 401.72 ms and 121-GET maximum. Two row SST delta events
-reached 127.91 ms and 27 PUTs. Before changing persisted row or compaction
-bytes, define durable-format version identifiers, reader compatibility, and
-online or offline migration rules for row SSTs and their manifest references.
-Then use the resulting format boundary to reduce row-merge read amplification
-and delta publication traffic while preserving fixed memory, provider
-neutrality, retry, and empty-cache recovery, and repeat this exact profile.
+reached 127.91 ms and 27 PUTs. The [durable format contract](docs/durable-format.md)
+now defines typed manifest and row SST identities, the v13-to-v14 manifest
+upgrade, v2/v3 mixed-generation reads, online generational replacement, and
+the offline gate required before a reader can be removed. The row SST handle
+retains its exact format through every index descent, and unknown formats fail
+at the manifest parse boundary. Use this boundary to reduce row-merge read
+amplification and delta publication traffic while preserving fixed memory,
+provider neutrality, retry, and empty-cache recovery, then repeat this exact
+profile.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

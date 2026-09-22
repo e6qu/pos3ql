@@ -24608,7 +24608,17 @@ impl Storage {
                                 "spilled PAX values exceed the statement arena; raise work_arena_bytes"
                             )
                         })?;
-                    rowenc::decode(encoded, &schema[..layout.columns()], values)?;
+                    rowenc::decode(encoded, &schema[..layout.columns()], values).map_err(
+                        |error| SqlError {
+                            sqlstate: error.sqlstate,
+                            message: stack_format!(
+                                192,
+                                "spilled PAX row {} failed to decode: {}",
+                                rowid,
+                                error.message.as_str()
+                            ),
+                        },
+                    )?;
                     SpilledRowRepresentation::Values(&*values)
                 } else {
                     let output = arena.alloc_slice_with(len as usize, |_| 0u8).map_err(|_| {
@@ -25120,8 +25130,17 @@ impl Storage {
                 let Some(home) = state.committed else {
                     continue;
                 };
-                let Some((key_len, payload_len, hash)) =
-                    self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
+                let Some((key_len, payload_len, hash)) = self
+                    .encode_value_binding_entry(table_slot, binding, rowid, home, output)
+                    .map_err(|error| SqlError {
+                        sqlstate: error.sqlstate,
+                        message: stack_format!(
+                            192,
+                            "resident checkpoint value source row {}: {}",
+                            rowid,
+                            error.message.as_str()
+                        ),
+                    })?
                 else {
                     continue;
                 };
@@ -25167,7 +25186,17 @@ impl Storage {
                 let mut decoded = [Datum::Null; MAX_COLUMNS];
                 let values = match representation {
                     SpilledRowRepresentation::Encoded(bytes) => {
-                        rowenc::decode(bytes, &schema[..n_columns], &mut decoded)?;
+                        rowenc::decode(bytes, &schema[..n_columns], &mut decoded).map_err(
+                            |error| SqlError {
+                                sqlstate: error.sqlstate,
+                                message: stack_format!(
+                                    192,
+                                    "spilled checkpoint value source row {}: {}",
+                                    rowid,
+                                    error.message.as_str()
+                                ),
+                            },
+                        )?;
                         &decoded[..n_columns]
                     }
                     SpilledRowRepresentation::Values(values) => values,

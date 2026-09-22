@@ -64557,6 +64557,99 @@ fn checkpoint_value_indexes_stream_wide_spilled_rows_across_recovery() {
 }
 
 #[test]
+fn checkpoint_value_source_resumes_inside_a_spilled_pax_block() {
+    let mut config = test_config("checkpoint-value-pax-resume");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("sql-value-pax-resume-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_bytes = 32 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.table_rows = 3072;
+    config.value_index_rows = 3072;
+    config.memtable_bytes = 16 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let table = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE pax_resume(
+            id integer PRIMARY KEY, hash_key integer NOT NULL, brin_key integer NOT NULL,
+            brin_span int4range NOT NULL, gist_span int4range NOT NULL,
+            gist_spans int4multirange NOT NULL, gist_address inet NOT NULL,
+            gist_location point NOT NULL, gin_tags integer[] NOT NULL,
+            gin_document tsvector NOT NULL, gist_document tsvector NOT NULL,
+            json_ops jsonb NOT NULL, json_path jsonb NOT NULL,
+            spgist_label text NOT NULL, spgist_span int4range NOT NULL,
+            spgist_address inet NOT NULL, spgist_location point NOT NULL,
+            payload bigint NOT NULL, padding text NOT NULL DEFAULT repeat('x', 8192))",
+    );
+    assert!(!message_types(&table).contains(&b'E'));
+    for lo in (1..=2049).step_by(10) {
+        if lo == 1501 {
+            assert!(engine.checkpoint().unwrap());
+        }
+        let hi = (lo + 9).min(2049);
+        let result = run_with_arena_bytes(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO pax_resume \
+                 SELECT i, i, i, int4range(i * 2, i * 2 + 2),
+                    int4range(i * 3, i * 3 + 3),
+                    int4multirange(int4range(i * 7, i * 7 + 2), int4range(i * 7 + 4, i * 7 + 6)),
+                    '10.0.0.0'::inet + i, point(i, i), ARRAY[i],
+                    to_tsvector('simple','token' || i::text),
+                    to_tsvector('simple','gisttoken' || i::text),
+                    jsonb_build_object('key' || i::text,'value' || i::text),
+                    jsonb_build_object('token','value' || i::text),
+                    'key-' || i::text, int4range(i * 5, i * 5 + 2),
+                    '11.0.0.0'::inet + i, point(i, -i), 0, repeat('x', 8192)
+                 FROM generate_series({lo}, {hi}) AS g(i)"
+            ),
+            64 << 20,
+        );
+        assert!(
+            !message_types(&result).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&result)
+        );
+    }
+    let index = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX pax_resume_hash ON pax_resume (hash_key)",
+    );
+    assert!(!message_types(&index).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    let slot = engine.storage.find_table("public", "pax_resume").unwrap();
+    engine.storage.evict_committed_table(slot);
+    engine.storage.evict_redundant_entries(slot);
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE pax_resume SET hash_key = -1 WHERE id = 2049",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pax_resume WHERE hash_key IN (1, -1)"
+        )),
+        ["2"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
     let mut config = test_config("checkpoint-value-index-pacing");
     config.object_store_on = true;

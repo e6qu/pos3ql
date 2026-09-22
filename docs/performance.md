@@ -238,8 +238,23 @@ monolithic: they took 21.26 seconds, wrote 486 external-sort blocks, and reached
 work than its predecessor, so its 8.09-second p99 and 13.54-second maximum do
 not isolate the effect of writer pacing. Actual PostgreSQL 18.6 completed the
 matched local-durable workload at 10.32 ms p99 and 31.49 ms maximum latency.
-Source collection and external run generation are now the measured
-value-index pacing target.
+The [paced source-and-sort rerun](../benchmarks/baselines/2026-09-22-checkpoint-value-index-schedule-10000/README.md)
+then split source collection and fixed-memory external sorting across 461
+beats. Its largest event made eight GETs, four PUTs, and took 36.42 ms, versus
+100 GETs, 22 PUTs, and 1.41 seconds before pacing. The subsequent packed-v4
+row format reduced each small row delta from 27 objects to four and bounded
+row-merge scheduling at eight descriptor GETs per beat.
+The [retained row-merge cursor profile](../benchmarks/baselines/2026-09-22-checkpoint-row-merge-containers-10000/README.md)
+removed write-phase source rereads: `row_merge_write` fell from 5,782 to zero
+GETs and from 21.31 to 7.08 seconds of summed phase time. The latest
+[immutable-group reuse profile](../benchmarks/baselines/2026-09-22-checkpoint-row-merge-reuse-10000/README.md)
+keeps complete pruned PAX groups by verified reference and names every shared
+container in the new garbage roster. Across a similar 234 write beats, PUTs
+fell from 922 to 90 and summed time to 1.07 seconds; 212 beats wrote no object.
+Changed or pruned groups still use the ordinary writer. Cache-disabled
+recovery tests read reused payloads after garbage collection. The remaining
+measured checkpoint construction cost is value-index source and external-run
+work, which made 910 GETs and 162 PUTs in the latest run.
 
 ## Measured scenarios
 

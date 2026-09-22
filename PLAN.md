@@ -326,13 +326,26 @@ cache-disabled regression exercises the provider path through warm and cold
 recovery with 19 total GETs and at most six in one beat. Fixed startup memory,
 snapshot pruning, retry, and v2/v3/v4 format identity remain explicit.
 
-Row merge output is the next checkpoint boundary. The clean profile wrote 922
-objects, compared with 906 in the preceding timing-dependent workload. Reuse
-unchanged PAX groups or their immutable references when constructing a merged
-generation, while preserving tombstone and snapshot pruning, mixed-format
-reads, retry idempotence, garbage reachability, fixed memory, and bounded beat
-traffic. Then compare its cost with `value_index_schedule`, which made 1,669
-GETs over 481 events in the same run.
+The [immutable-group reuse profile](benchmarks/baselines/2026-09-22-checkpoint-row-merge-reuse-10000/README.md)
+closes the row-merge output boundary. A complete PAX group whose physical
+versions all survive schedule pruning now enters the merged generation by its
+verified immutable reference. The new roster names the descriptor and every
+column container, while changed, snapshot-pruned, duplicate, and removable
+tombstone groups use the ordinary writer. Canonical checksums, mixed v2/v3/v4
+reads, fixed memory, retry idempotence, paced traffic, and empty-cache recovery
+remain covered. Across 234 write beats, PUTs fell from 922 to 90, 212 beats
+wrote no object, and summed phase time fell from 7.08 to 1.07 seconds. The
+largest event fell from 334.94 to 39.24 ms. The run completed the same
+configured workload and actual PostgreSQL 18 comparison, though its duration
+floor admitted more foreground operations, so aggregate timing is exploratory.
+
+`value_index_schedule` is now the largest checkpoint construction boundary. It
+made 910 GETs and 162 PUTs over 398 events in the reuse profile. Reduce its
+physical source and external-run work while retaining the startup-sized binary
+carry, exact key ordering, selective PAX dependency reads, retry restart,
+four-PUT and eight-GET beat limits, and publication identity. Compare the
+result with actual PostgreSQL 18 under the same SQL workload while continuing
+to report its local durable tier separately from pos3ql object traffic.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

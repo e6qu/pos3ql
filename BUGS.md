@@ -233,6 +233,14 @@ continue to fetch only demanded columns. A cache-disabled wide-row regression
 bounds provider reads across paced beats, retry, and empty-cache recovery, and
 the clean profile records the removed read amplification. Remaining immutable
 output reuse is tracked in PLAN.md.
+The row-merge output audit found no external blocker. Complete PAX groups that
+survive merge pruning retain their immutable descriptor and column-container
+references, and the merged roster keeps every shared physical dependency live.
+Groups affected by duplicate selection, snapshot pruning, or removable
+tombstones rebuild normally. A cache-disabled regression combines both paths,
+runs garbage collection, and reads reused payloads after empty-cache recovery.
+The clean profile records the reduced PUT traffic; remaining value-index
+schedule work is tracked in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

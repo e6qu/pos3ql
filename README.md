@@ -212,8 +212,10 @@ column groups, while deltas pack compressed row groups to reduce object writes.
 Compaction schedules from descriptor metadata and bounds provider-neutral reads
 and writes per beat. Merge writers retain fixed-memory source cursors, seek
 across pruned blocks, and fetch each shared packed container once during
-full-row materialization; selective readers preserve column pruning. V2 direct
-and v3 PAX generations remain readable during online replacement.
+full-row materialization. Complete unchanged PAX groups keep their immutable
+references and physical garbage-roster dependencies; changed or pruned groups
+are rebuilt. Selective readers preserve column pruning. V2 direct and v3 PAX
+generations remain readable during online replacement.
 [Format compatibility and migration](docs/durable-format.md).
 
 Collations, conversions, text-search objects, event triggers, tablespaces, and

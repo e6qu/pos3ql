@@ -52,6 +52,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   row deltas coalesce compressed logical groups into verified containers, so a
   deterministic 128-row delta writes one container plus its filter, index, and
   roster and survives empty-cache recovery.
+  Merge writers retain each source cursor and decoded physical group across
+  beats in fixed startup-accounted scratch. Sparse-key seeks skip pruned source
+  blocks without a linear scan. Full-row PAX materialization fetches a shared
+  packed container once and verifies its logical column frames locally;
+  selective query paths continue to fetch only demanded columns.
   Affected value-index bindings collect and externally sort into one retained
   fixed-memory source, then write the immutable generation across restartable
   beats bounded by entries and object transfers. Exact binding dirty LSNs

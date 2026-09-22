@@ -16028,7 +16028,8 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut budget =
+        Budget::new((1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -16063,7 +16064,8 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted_budget =
+        Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -16993,7 +16995,7 @@ fn object_resident_set_records_keep_their_structural_fields() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -64310,7 +64312,8 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.value_index_rows = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut budget =
+        Budget::new((1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut writer = TxnState::new(&mut budget, 256).unwrap();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();
@@ -64423,7 +64426,8 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget = Budget::new(1 << 28);
+    let mut restarted_budget =
+        Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let restarted_slot = restarted
         .storage
@@ -66673,6 +66677,126 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
 }
 
 #[test]
+fn row_merge_retains_wide_pax_source_groups_across_beats() {
+    let mut config = test_config("checkpoint-retained-pax-merge");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-retained-pax-merge-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.max_spill_generations_per_table = 2;
+    config.table_rows = 512;
+    config.memtable_bytes = 4 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE retained_pax_merge (\
+             id integer PRIMARY KEY, \
+             c01 integer, c02 integer, c03 integer, c04 integer, \
+             c05 integer, c06 integer, c07 integer, c08 integer, \
+             c09 integer, c10 integer, c11 integer, c12 integer); \
+         INSERT INTO retained_pax_merge \
+           SELECT id, id, id, id, id, id, id, id, id, id, id, id, id \
+             FROM generate_series(1,256) id",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let second = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE retained_pax_merge SET c01 = -1 WHERE id = 1",
+    );
+    assert!(!message_types(&second).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+
+    let third = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE retained_pax_merge SET c02 = -2 WHERE id = 2",
+    );
+    assert!(!message_types(&third).contains(&b'E'));
+    let before_merge = engine.storage.block_io_stats();
+    let mut beats = 0usize;
+    let mut max_beat_gets = 0u64;
+    let published_lsn = loop {
+        let before_beat = engine.storage.block_io_stats();
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        let beat = engine.storage.block_io_stats().saturating_sub(before_beat);
+        max_beat_gets = max_beat_gets.max(beat.object_gets);
+        assert!(
+            beat.object_gets <= 17,
+            "one merge beat read too much: {beat:?}"
+        );
+        beats += 1;
+        match step {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty full roster became idle before publication")
+            }
+        }
+        assert!(beats < 64, "retained PAX merge did not converge");
+    };
+    let merge = engine.storage.block_io_stats().saturating_sub(before_merge);
+    assert!(
+        merge.object_gets <= 20,
+        "the PAX source group was reread across merge beats: {merge:?}"
+    );
+    assert!(max_beat_gets <= 8, "one merge beat read too much");
+    assert!(beats > 2, "the wide merge must cross dispatch beats");
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*), min(c01), min(c02) FROM retained_pax_merge"
+        )),
+        ["256|-1|-2"]
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*), min(c01), min(c02) FROM retained_pax_merge"
+        )),
+        ["256|-1|-2"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
 fn checkpoint_live_block_capacity_exhausts_loudly() {
     let mut config = test_config("checkpoint-live-block-capacity");
     config.object_store_on = true;
@@ -68003,7 +68127,7 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -71822,7 +71946,7 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,

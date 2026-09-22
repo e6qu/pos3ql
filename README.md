@@ -210,8 +210,11 @@ grows a pool or weakens durable publication.
 Published row SSTs use the v4 packed-reference format: full slices retain PAX
 column groups, while deltas pack compressed row groups to reduce object writes.
 Compaction schedules from descriptor metadata and bounds provider-neutral reads
-and writes per beat. V2 direct and v3 PAX generations remain readable during
-online replacement. [Format compatibility and migration](docs/durable-format.md).
+and writes per beat. Merge writers retain fixed-memory source cursors, seek
+across pruned blocks, and fetch each shared packed container once during
+full-row materialization; selective readers preserve column pruning. V2 direct
+and v3 PAX generations remain readable during online replacement.
+[Format compatibility and migration](docs/durable-format.md).
 
 Collations, conversions, text-search objects, event triggers, tablespaces, and
 object comments likewise have independent startup capacities. Their catalog

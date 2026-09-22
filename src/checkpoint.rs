@@ -21,9 +21,9 @@ use crate::storage::{
     SqlName, Storage, TableDef,
 };
 use crate::store::{
-    BlockId, BlockStore, BlockType, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat, SstCursor,
-    SstHandle, SstKey, SstReader, SstWriter, StackPlan, StoreError, TieredStore, ValueIndexHandle,
-    ValueIndexWriter,
+    BlockId, BlockStore, BlockType, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat,
+    SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan, StoreError,
+    TieredStore, ValueIndexHandle, ValueIndexWriter,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -798,6 +798,15 @@ pub(crate) struct Checkpointer {
     /// state instead of borrowing an arena.
     slice_writer: SstWriter,
     merge_writer: SstWriter,
+    /// The two merge inputs retain their physical position and decoded data
+    /// block across beats. Transient index/PAX decode buffers are shared
+    /// because only one source advances at a time.
+    merge_source_cursors: [Option<SstVersionCursor>; 2],
+    merge_source_decoded: Box<[u8]>,
+    merge_source_index: Box<[u8]>,
+    merge_source_raw: Box<[u8]>,
+    merge_source_column: Box<[u8]>,
+    merge_row: Box<[u8]>,
     value_writer: ValueIndexWriter,
     /// One value-index rebuild spans dispatch beats. An in-memory sort is
     /// detached into checkpoint-owned bytes; a spilled sort retains its
@@ -863,6 +872,7 @@ const MERGE_SCHEDULE_BEAT_BLOCKS: usize = 8;
 const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
 const MERGE_WRITE_BEAT_READS: u64 = 8;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
+pub(crate) const MERGE_SOURCE_SCRATCH_BYTES: usize = 5 * crate::store::MAX_PAYLOAD + MAX_ASSEMBLED;
 const VALUE_INDEX_WRITE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_WRITE_BEAT_READS: u64 = 8;
 const VALUE_INDEX_WRITE_BEAT_ENTRIES: usize = 1024;
@@ -931,6 +941,7 @@ impl Checkpointer {
             + manifest_capacity
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
+            + MERGE_SOURCE_SCRATCH_BYTES
             + config.checkpoint_merge_entries * core::mem::size_of::<(SstKey, u8)>()
     }
 
@@ -957,6 +968,10 @@ impl Checkpointer {
                 self.merge_writer
                     .set_packed_fillfactor(storage.table(job.slot).def.storage_options.fillfactor)
                     .map_err(sst_to_sql)?;
+                self.merge_source_cursors = [
+                    Some(SstVersionCursor::new(job.old0.handle)),
+                    Some(SstVersionCursor::new(job.old1.handle)),
+                ];
                 self.merge_job = Some(job);
             }
             return Ok(());
@@ -1198,20 +1213,14 @@ impl Checkpointer {
 
     /// A write beat: stream scheduled entries into the merged SST until a
     /// few output blocks have been emitted (or a cheap-entry cap trips on a
-    /// tombstone-heavy stretch), then suspend. Point reads ride the block
-    /// cache, so a rowid-ordered walk touches each source block about once
-    /// across the beats.
+    /// tombstone-heavy stretch), then suspend. Each source cursor and decoded
+    /// group survives the suspension, so a rowid-ordered walk materializes an
+    /// immutable source group once even when output pacing splits its rows.
     fn merge_write_beat(
         &mut self,
         job: &mut MergeJob,
         cursor: usize,
     ) -> Result<MergeBeatOutcome, SqlError> {
-        self.sst_arena.reset();
-        let mut reader = SstReader::new(&self.sst_arena).map_err(sst_to_sql)?;
-        let row_buf = self
-            .sst_arena
-            .alloc_slice_with(crate::store::MAX_ASSEMBLED, |_| 0u8)
-            .map_err(|_| sql_err!(SQLSTATE_IO, "merge scratch exceeds the checkpoint arena"))?;
         let blocks = &self.blocks;
         let writer = &mut self.merge_writer;
         let scratch = &self.merge_scratch;
@@ -1255,14 +1264,23 @@ impl Checkpointer {
                 }
                 continue;
             }
-            let member = if kind & 1 == 0 { &job.old0 } else { &job.old1 };
-            let len = reader
-                .get_at(
+            let rank = usize::from(kind & 1);
+            let decoded = if rank == 0 {
+                &mut self.merge_source_decoded[..crate::store::MAX_PAYLOAD]
+            } else {
+                &mut self.merge_source_decoded[crate::store::MAX_PAYLOAD..]
+            };
+            let len = self.merge_source_cursors[rank]
+                .as_mut()
+                .expect("merge source cursor initialized with the job")
+                .copy_exact(
                     &mut *blocks.borrow_mut(),
-                    &member.handle,
-                    rowid,
-                    key.commit_lsn,
-                    row_buf,
+                    key,
+                    &mut self.merge_source_index,
+                    &mut self.merge_source_raw,
+                    decoded,
+                    &mut self.merge_source_column,
+                    &mut self.merge_row,
                 )
                 .map_err(sst_to_sql)?
                 .filter(|probe| probe.key == key && probe.len.is_some())
@@ -1279,9 +1297,9 @@ impl Checkpointer {
             header[8..16].copy_from_slice(&key.commit_lsn.to_le_bytes());
             header[16..20].copy_from_slice(&(len as u32).to_le_bytes());
             job.crc.update(&header);
-            job.crc.update(&row_buf[..len]);
+            job.crc.update(&self.merge_row[..len]);
             writer
-                .append_version(&mut *blocks.borrow_mut(), key, &row_buf[..len])
+                .append_version(&mut *blocks.borrow_mut(), key, &self.merge_row[..len])
                 .map_err(sst_to_sql)?;
             job.count += 1;
         }
@@ -1360,6 +1378,12 @@ impl Checkpointer {
                 "checkpoint value-index scheduling",
             )
             .map_err(CheckpointSetupError::Budget)?;
+        budget
+            .draw(
+                MERGE_SOURCE_SCRATCH_BYTES,
+                "checkpoint row-merge source cursors",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
         Ok(Self {
             client: ObjectStore::new(config, budget)
                 .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?,
@@ -1404,6 +1428,12 @@ impl Checkpointer {
             sliced_this_sweep: vec![false; table_capacity],
             slice_writer: SstWriter::new(),
             merge_writer: SstWriter::new(),
+            merge_source_cursors: [None, None],
+            merge_source_decoded: vec![0; 2 * crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            merge_source_index: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            merge_source_raw: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            merge_source_column: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
+            merge_row: vec![0; MAX_ASSEMBLED].into_boxed_slice(),
             value_writer: ValueIndexWriter::new(),
             value_source: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             value_sort_rows: vec![EMPTY_BUFFERED_VALUE_ROW; VALUE_SORT_ROWS_PER_CHUNK]

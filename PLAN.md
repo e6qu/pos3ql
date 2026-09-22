@@ -310,12 +310,29 @@ The [clean repeated 10,000-row profile](benchmarks/baselines/2026-09-22-checkpoi
 reduced the schedule maximum from 121 GETs and 401.72 ms to eight GETs and
 23.91 ms. Its two deltas each wrote four blocks, down from 27, and their maximum
 fell from 127.91 to 25.62 ms. Event counts and shared-host timing differ, so the
-request bounds are the controlled result. Row merge writing is now the largest
-remaining checkpoint phase: it made 5,782 GETs across 440 beats while
-materializing PAX rows after the metadata-only schedule. Retain source row
-cursors and decoded groups across write beats to remove repeated point-read
-setup while preserving snapshot pruning, retry, fixed memory, format identity,
-and the per-beat request boundary.
+request bounds are the controlled result.
+
+The following [row-merge profile](benchmarks/baselines/2026-09-22-checkpoint-row-merge-containers-10000/README.md)
+changed the diagnosis of the remaining read amplification. Retaining decoded
+source groups across write beats removed repeated setup, but a cursor-only run
+showed that full PAX row reconstruction still issued a ranged GET for every
+column. Full-row decoding now fetches each shared packed container once while
+selective readers retain column pruning. Source cursors use sparse-key seeks
+when the merge schedule skips blocks, so their retained state cannot turn a
+pruned range into a linear scan. The clean profile reduced `row_merge_write`
+from 5,782 to zero GETs, 440 to 228 beats, and 21.31 to 7.08 seconds of summed
+phase time; the largest event fell from 1.21 seconds to 334.94 ms. A separate
+cache-disabled regression exercises the provider path through warm and cold
+recovery with 19 total GETs and at most six in one beat. Fixed startup memory,
+snapshot pruning, retry, and v2/v3/v4 format identity remain explicit.
+
+Row merge output is the next checkpoint boundary. The clean profile wrote 922
+objects, compared with 906 in the preceding timing-dependent workload. Reuse
+unchanged PAX groups or their immutable references when constructing a merged
+generation, while preserving tombstone and snapshot pruning, mixed-format
+reads, retry idempotence, garbage reachability, fixed memory, and bounded beat
+traffic. Then compare its cost with `value_index_schedule`, which made 1,669
+GETs over 481 events in the same run.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

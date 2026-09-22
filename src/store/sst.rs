@@ -1056,6 +1056,120 @@ pub(crate) struct SstCursor {
     done: bool,
 }
 
+/// Suspendable physical-version cursor for row compaction.
+///
+/// The caller owns one decoded buffer per source and keeps it across dispatch
+/// beats. Advancing to another scheduled key then reuses the current PAX group
+/// or canonical row block instead of repeating a point lookup and decoding the
+/// same immutable group.
+#[derive(Clone, Copy)]
+pub(crate) struct SstVersionCursor {
+    handle: SstHandle,
+    offset: usize,
+    data_len: usize,
+    loaded_ref: Option<DataBlockRef>,
+}
+
+impl SstVersionCursor {
+    pub(crate) fn new(handle: SstHandle) -> Self {
+        Self {
+            handle,
+            offset: 0,
+            data_len: 0,
+            loaded_ref: None,
+        }
+    }
+
+    /// Copies the exact scheduled version into `out` while walking forward.
+    /// `decoded` must remain unchanged between calls for this cursor.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "caller-owned fixed scratch makes cursor suspension allocation-free"
+    )]
+    pub(crate) fn copy_exact(
+        &mut self,
+        store: &mut dyn BlockStore,
+        target: SstKey,
+        index: &mut [u8],
+        raw: &mut [u8],
+        decoded: &mut [u8],
+        column: &mut [u8],
+        assembly: &mut [u8],
+    ) -> Result<Option<SstProbe>, SstError> {
+        loop {
+            if self.offset >= self.data_len {
+                let Some(reference) = data_block_ref_for_key(store, &self.handle, index, target)?
+                else {
+                    return Ok(None);
+                };
+                // The sparse index mapped `target` to the block already
+                // exhausted without finding it. Reloading would loop; the
+                // schedule and source no longer agree.
+                if self.loaded_ref == Some(reference) {
+                    return Ok(None);
+                }
+                let (raw_len, block_type) = read_data_block_raw_ref(store, reference, raw, column)?;
+                self.data_len = match (self.handle.format, block_type) {
+                    (
+                        RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4,
+                        BlockType::SstDataPaxV2,
+                    ) => decode_pax_v2(store, &raw[..raw_len], decoded, column, assembly)?,
+                    (
+                        RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
+                        BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
+                    ) => decode_data_block(&raw[..raw_len], block_type, decoded)?,
+                    _ => {
+                        return Err(SstError::Store(StoreError::Corrupt(
+                            super::BlockError::UnknownType,
+                        )));
+                    }
+                };
+                self.offset = 0;
+                self.loaded_ref = Some(reference);
+                if self.data_len == 0 {
+                    return Err(SstError::Store(StoreError::Corrupt(
+                        super::BlockError::Truncated,
+                    )));
+                }
+            }
+
+            let remaining = &decoded[self.offset..self.data_len];
+            let before = remaining.len();
+            let mut entries = DataBlock { bytes: remaining };
+            let Some(entry) = entries.next() else {
+                return Err(SstError::Store(StoreError::Corrupt(
+                    super::BlockError::Truncated,
+                )));
+            };
+            self.offset += before - entries.bytes.len();
+            if entry.key < target {
+                continue;
+            }
+            if entry.key > target {
+                return Ok(None);
+            }
+            if entry.tombstone {
+                return Ok(Some(SstProbe {
+                    key: entry.key,
+                    len: None,
+                }));
+            }
+            if entry.is_chained() {
+                assemble_chain(store, &entry, assembly)?;
+            } else {
+                if assembly.len() < entry.total_len {
+                    return Err(SstError::Store(StoreError::BufferTooSmall));
+                }
+                assembly[..entry.total_len].copy_from_slice(entry.head);
+            }
+            return Ok(Some(SstProbe {
+                key: entry.key,
+                len: Some(entry.total_len as u32),
+            }));
+        }
+    }
+}
+
 impl SstCursor {
     pub(crate) fn new(handle: SstHandle) -> Self {
         Self {
@@ -1087,7 +1201,13 @@ impl SstCursor {
             if self.done {
                 return Ok(None);
             }
-            self.advance_lookahead(store, index)?;
+            advance_cursor_lookahead(
+                store,
+                index,
+                self.handle.uses_packed_references(),
+                &mut self.prefetched_leaf,
+                &mut self.prefetched_data,
+            )?;
             if !self.loaded || self.offset >= self.data_len {
                 let resume_offset = if !self.loaded { self.offset } else { 0 };
                 let id = if let Some((ordinal, id)) = self.prefetched_data
@@ -1106,7 +1226,13 @@ impl SstCursor {
                         self.done = true;
                         return Ok(None);
                     };
-                    self.schedule_lookahead(store, self.block_ordinal + 1, next)?;
+                    schedule_cursor_lookahead(
+                        store,
+                        self.block_ordinal + 1,
+                        next,
+                        &mut self.prefetched_leaf,
+                        &mut self.prefetched_data,
+                    )?;
                     id
                 };
                 self.data_len = read_external_run_data_block_ref(store, id, data, bounce)?;
@@ -1152,59 +1278,56 @@ impl SstCursor {
             self.loaded = false;
         }
     }
-
-    fn schedule_lookahead(
-        &mut self,
-        store: &mut dyn BlockStore,
-        ordinal: usize,
-        next: Option<DataBlockLookahead>,
-    ) -> Result<(), SstError> {
-        match next {
-            Some(DataBlockLookahead::Data(reference)) => {
-                if let DataBlockRef::Direct(id) = reference {
-                    prefetch_data_block(store, Some(id))?;
-                    self.prefetched_data = Some((ordinal, reference));
-                }
-            }
-            Some(DataBlockLookahead::Leaf(id)) => {
-                prefetch_index_block(store, id)?;
-                self.prefetched_leaf = Some((ordinal, id));
-            }
-            None => {}
-        }
-        Ok(())
-    }
-
-    fn advance_lookahead(
-        &mut self,
-        store: &mut dyn BlockStore,
-        index: &mut [u8],
-    ) -> Result<(), SstError> {
-        let Some((ordinal, leaf)) = self.prefetched_leaf else {
-            return Ok(());
-        };
-        let Some(reference) = take_prefetched_index_first_data(
-            store,
-            &leaf,
-            index,
-            self.handle.uses_packed_references(),
-        )?
-        else {
-            return Ok(());
-        };
-        self.prefetched_leaf = None;
-        if let DataBlockRef::Direct(id) = reference {
-            prefetch_data_block(store, Some(id))?;
-            self.prefetched_data = Some((ordinal, reference));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum DataBlockLookahead {
     Data(DataBlockRef),
     Leaf(BlockId),
+}
+
+fn schedule_cursor_lookahead(
+    store: &mut dyn BlockStore,
+    ordinal: usize,
+    next: Option<DataBlockLookahead>,
+    prefetched_leaf: &mut Option<(usize, BlockId)>,
+    prefetched_data: &mut Option<(usize, DataBlockRef)>,
+) -> Result<(), SstError> {
+    match next {
+        Some(DataBlockLookahead::Data(reference)) => {
+            if let DataBlockRef::Direct(id) = reference {
+                prefetch_data_block(store, Some(id))?;
+            }
+            *prefetched_data = Some((ordinal, reference));
+        }
+        Some(DataBlockLookahead::Leaf(id)) => {
+            prefetch_index_block(store, id)?;
+            *prefetched_leaf = Some((ordinal, id));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn advance_cursor_lookahead(
+    store: &mut dyn BlockStore,
+    index: &mut [u8],
+    packed: bool,
+    prefetched_leaf: &mut Option<(usize, BlockId)>,
+    prefetched_data: &mut Option<(usize, DataBlockRef)>,
+) -> Result<(), SstError> {
+    let Some((ordinal, leaf)) = *prefetched_leaf else {
+        return Ok(());
+    };
+    let Some(reference) = take_prefetched_index_first_data(store, &leaf, index, packed)? else {
+        return Ok(());
+    };
+    *prefetched_leaf = None;
+    if let DataBlockRef::Direct(id) = reference {
+        prefetch_data_block(store, Some(id))?;
+    }
+    *prefetched_data = Some((ordinal, reference));
+    Ok(())
 }
 
 /// One SST's best version for a snapshot. `len == None` is a deletion marker.
@@ -1522,10 +1645,38 @@ fn decode_pax_v2(
     let layout = pax_layout(input)?;
     let mut extents = [None; MAX_COLUMNS];
     let mut extent_len = 0usize;
+    let mut loaded_container: Option<(BlockId, usize)> = None;
     for (column, extent) in extents.iter_mut().enumerate().take(layout.columns()) {
         let reference = layout.column_ref(input, column)?;
-        let (column_len, block_type) =
-            read_data_block_raw_ref(store, reference, column_scratch, output)?;
+        let (column_len, block_type) = match reference {
+            DataBlockRef::Packed {
+                container,
+                offset,
+                length,
+                id,
+            } => {
+                let container_len = if let Some((loaded, length)) = loaded_container
+                    && loaded == container
+                {
+                    length
+                } else {
+                    let (length, block_type) = store.get(&container, column_scratch)?;
+                    if block_type != BlockType::SstPackedContainerV1 {
+                        return Err(corrupt());
+                    }
+                    loaded_container = Some((container, length));
+                    length
+                };
+                super::decode_packed_extent(
+                    &column_scratch[..container_len],
+                    offset as usize,
+                    length as usize,
+                    &id,
+                    output,
+                )?
+            }
+            DataBlockRef::Direct(id) => read_data_block_raw(store, &id, output)?,
+        };
         if block_type != BlockType::SstDataPaxColumnV1 || column_len < 8 {
             return Err(corrupt());
         }
@@ -1533,7 +1684,7 @@ fn decode_pax_v2(
         if end > range_scratch.len() {
             return Err(SstError::RowTooLarge);
         }
-        range_scratch[extent_len..end].copy_from_slice(&column_scratch[..column_len]);
+        range_scratch[extent_len..end].copy_from_slice(&output[..column_len]);
         *extent = Some((extent_len, end));
         extent_len = end;
     }
@@ -2402,6 +2553,34 @@ pub(crate) fn locate_data_block_ref(
     Ok(locate_data_block_with_next(store, handle, buf, ordinal)?.map(|(reference, _)| reference))
 }
 
+/// Resolves the one data block whose key range can contain `key`.
+/// Compaction cursors use this when the next retained version skips whole
+/// source blocks, preserving the per-beat read bound without a Bloom lookup.
+fn data_block_ref_for_key(
+    store: &mut dyn BlockStore,
+    handle: &SstHandle,
+    buf: &mut [u8],
+    key: SstKey,
+) -> Result<Option<DataBlockRef>, SstError> {
+    load_index(store, &handle.index, buf)?;
+    let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let count = if head == INDEX_ROOT_MAGIC {
+        let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let leaf = root_leaf_containing(buf, leaves, key).unwrap_or(0);
+        let at = 8 + leaf * VERSIONED_ROOT_ENTRY;
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&buf[at + 16 + 4..at + VERSIONED_ROOT_ENTRY]);
+        load_index(store, &BlockId(id), buf)?;
+        u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize
+    } else {
+        head as usize
+    };
+    Ok(
+        block_containing(buf, count, key, handle.uses_packed_references())
+            .map(|entry| block_ref_at(buf, entry, handle.uses_packed_references())),
+    )
+}
+
 /// Resolves one data-block ordinal and, when it shares an index leaf with a
 /// successor, returns that successor for scan lookahead. The index scratch is
 /// otherwise identical to [`locate_data_block`]'s and remains caller-owned.
@@ -3002,6 +3181,71 @@ mod tests {
             store.reads() - before <= 10,
             "schedule scan fetched PAX column extents: {} reads",
             store.reads() - before
+        );
+    }
+
+    #[test]
+    fn version_cursor_retains_its_decoded_pax_group_across_beats() {
+        let (_budget, mut store) = store();
+        let schema = [ColType::Int4; 12];
+        let values = [Datum::Int4(7); 12];
+        let mut row = vec![0; rowenc::encoded_len(&values)];
+        rowenc::encode(&values, &mut row);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&schema).unwrap();
+        for rowid in 1..=256 {
+            writer
+                .append_version(&mut store, SstKey::at(rowid, 9), &row)
+                .unwrap();
+        }
+        let current = writer.finish(&mut store).unwrap().unwrap();
+        let legacy = SstHandle {
+            format: RowSstFormat::PackedPaxV3,
+            ..current
+        };
+        let mut cursor = SstVersionCursor::new(legacy);
+        let mut index = vec![0; MAX_PAYLOAD];
+        let mut raw = vec![0; MAX_PAYLOAD];
+        let mut decoded = vec![0; MAX_PAYLOAD];
+        let mut column = vec![0; MAX_PAYLOAD];
+        let mut out = vec![0; MAX_ASSEMBLED];
+
+        let first = cursor
+            .copy_exact(
+                &mut store,
+                SstKey::at(1, 9),
+                &mut index,
+                &mut raw,
+                &mut decoded,
+                &mut column,
+                &mut out,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len, Some(row.len() as u32));
+        assert_eq!(&out[..row.len()], row);
+        let after_first = store.reads();
+
+        for rowid in [2, 128, 256] {
+            let found = cursor
+                .copy_exact(
+                    &mut store,
+                    SstKey::at(rowid, 9),
+                    &mut index,
+                    &mut raw,
+                    &mut decoded,
+                    &mut column,
+                    &mut out,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.len, Some(row.len() as u32));
+            assert_eq!(&out[..row.len()], row);
+        }
+        assert_eq!(
+            store.reads(),
+            after_first,
+            "later beats must consume the retained decoded group without object reads"
         );
     }
 

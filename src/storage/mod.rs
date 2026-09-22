@@ -11939,6 +11939,14 @@ struct SpillVersion {
     commit_lsn: u64,
 }
 
+#[derive(Clone, Copy)]
+enum SpillOverlayMode {
+    VisibleScan,
+    /// A checkpoint spans statements, so pending versions may appear without
+    /// changing the committed generation. Partition only by committed home.
+    CommittedCheckpoint,
+}
+
 /// The reader's owned block buffers (index, data, physical column, chain
 /// assembly, and packed-range staging).
 struct SpillScratch {
@@ -24314,6 +24322,7 @@ impl Storage {
         recycle_rows: bool,
         decoded_columns: Option<&[bool; MAX_COLUMNS]>,
         coalesce_packed: bool,
+        overlay_mode: SpillOverlayMode,
         resume: Option<(&mut [MemberCursor], &mut u64, &mut usize, usize, u64)>,
         emit: &mut dyn FnMut(
             u64,
@@ -24468,11 +24477,23 @@ impl Storage {
                 member,
                 commit_lsn,
             }) = verdict
-                && self.tables[slot]
-                    .rows
-                    .get(&rowid)
-                    .is_none_or(Self::redundant_spilled_row_state)
-            {
+                && match overlay_mode {
+                    SpillOverlayMode::VisibleScan => self.tables[slot]
+                        .rows
+                        .get(&rowid)
+                        .is_none_or(Self::redundant_spilled_row_state),
+                    SpillOverlayMode::CommittedCheckpoint => {
+                        self.tables[slot].rows.get(&rowid).is_none_or(|state| {
+                            matches!(
+                                state.committed,
+                                Some(RowHome::Spilled {
+                                    commit_lsn: current,
+                                    ..
+                                }) if current == commit_lsn
+                            )
+                        })
+                    }
+                } {
                 let cursor = &mut cursors[member as usize];
                 let (key, tombstone, _copied) = cursor.head.ok_or_else(|| {
                     sql_err!(
@@ -24756,6 +24777,7 @@ impl Storage {
                 false,
                 decoded_columns.as_ref(),
                 decoded_columns.is_none(),
+                SpillOverlayMode::VisibleScan,
                 None,
                 &mut |rowid, _commit_lsn, representation| {
                     rows[len] = SpilledRow {
@@ -25163,12 +25185,12 @@ impl Storage {
                     continue;
                 };
                 walked += 1;
-                if Self::redundant_spilled_row_state(state) {
-                    continue;
-                }
-                let Some(home) = state.committed else {
+                // Spill-resident committed rows belong to the merged walk
+                // even when a later statement adds a pending version.
+                let Some(RowHome::Heap(location)) = state.committed else {
                     continue;
                 };
+                let home = RowHome::Heap(location);
                 let Some((key_len, payload_len, hash)) = self
                     .encode_value_binding_entry(table_slot, binding, rowid, home, output)
                     .map_err(|error| SqlError {
@@ -25228,6 +25250,7 @@ impl Storage {
             true,
             Some(&decoded_columns),
             decoded_count.saturating_mul(2) >= n_columns,
+            SpillOverlayMode::CommittedCheckpoint,
             Some((
                 &mut cursor.members,
                 &mut cursor.spill_walk_id,
@@ -25482,6 +25505,7 @@ impl Storage {
             true,
             None,
             true,
+            SpillOverlayMode::VisibleScan,
             None,
             &mut |_rowid, _commit_lsn, representation| {
                 match representation {
@@ -29281,6 +29305,7 @@ impl Storage {
                 true,
                 Some(&demanded),
                 demanded_count.saturating_mul(2) >= n_columns,
+                SpillOverlayMode::VisibleScan,
                 None,
                 &mut |rowid, _commit_lsn, representation| {
                     let mark = self.index_arena.mark();

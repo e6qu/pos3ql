@@ -293,7 +293,11 @@ ms, and none exceeded eight GETs or four PUTs. The preceding profile's largest
 schedule event took 1.41 seconds with 100 GETs and 22 PUTs. Direct regressions
 also cover a deferred source row across a carry merge, cursor resumption at a
 data-block boundary, dirty-generation restart, object-store retry, publication,
-and object-cold recovery.
+and object-cold recovery. Storage VOPR fault qualification additionally proved
+that pending versions may appear between source beats without changing the
+committed generation; checkpoint collection now keeps its resident/spill seam
+stable by classifying only the committed home and matching the spill commit
+LSN.
 
 The new profile changes the checkpoint priority. Row-merge source scheduling
 is again the largest individual dispatch and aggregate phase: 102 events took

@@ -208,6 +208,10 @@ cursor that treated an exact block-end resume as a truncated entry. Multi-run,
 multi-block PAX, fault-injection, publication, and empty-cache recovery
 regressions cover the fixes. The repeated 10,000-row profile had no four-PUT or
 eight-GET schedule violation; durable row-format work is tracked in PLAN.md.
+Storage VOPR fault qualification also found and fixed a cross-beat seam where
+an uncommitted version could move a spill-resident committed row into the
+overlay class without advancing the committed generation. Checkpoint sources
+now partition rows solely by committed home and verify the spill commit LSN.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

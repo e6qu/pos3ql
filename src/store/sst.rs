@@ -1030,6 +1030,7 @@ pub(crate) struct SstReader<'a> {
     decoded_scratch: &'a mut [u8],
     column_scratch: &'a mut [u8],
     loaded_ref: Option<DataBlockRef>,
+    loaded_format: Option<RowSstFormat>,
     decoded_len: usize,
     /// Scratch a range scan assembles a chained row into (a point lookup
     /// assembles straight into the caller's buffer instead).
@@ -1814,9 +1815,14 @@ impl<'a> SstReader<'a> {
     /// Restores a canonical block held by the caller-owned scratch. The
     /// caller retains that scratch for its entire lifetime, so its decoded
     /// bytes remain valid exactly while this identity does.
-    pub(crate) fn restore_cached_data_block(&mut self, cached: Option<(DataBlockRef, usize)>) {
+    pub(crate) fn restore_cached_data_block(
+        &mut self,
+        format: RowSstFormat,
+        cached: Option<(DataBlockRef, usize)>,
+    ) {
         if let Some((reference, len)) = cached {
             self.loaded_ref = Some(reference);
+            self.loaded_format = Some(format);
             self.decoded_len = len;
         }
     }
@@ -1848,6 +1854,7 @@ impl<'a> SstReader<'a> {
             decoded_scratch,
             column_scratch,
             loaded_ref: None,
+            loaded_format: None,
             decoded_len: 0,
             assembly,
         })
@@ -1870,6 +1877,7 @@ impl<'a> SstReader<'a> {
             decoded_scratch: decoded,
             column_scratch: column,
             loaded_ref: None,
+            loaded_format: None,
             decoded_len: 0,
             assembly,
         }
@@ -1878,29 +1886,40 @@ impl<'a> SstReader<'a> {
     fn load_data_block(
         &mut self,
         store: &mut dyn BlockStore,
+        format: RowSstFormat,
         reference: DataBlockRef,
     ) -> Result<usize, SstError> {
-        if self.loaded_ref == Some(reference) {
+        if self.loaded_ref == Some(reference) && self.loaded_format == Some(format) {
             return Ok(self.decoded_len);
         }
         let (raw_len, block_type) =
             read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
-        let decoded_len = if block_type == BlockType::SstDataPaxV2 {
-            decode_pax_v2(
-                store,
-                &self.data_scratch[..raw_len],
-                self.decoded_scratch,
-                self.column_scratch,
-                self.assembly,
-            )?
-        } else {
-            decode_data_block(
+        let decoded_len = match (format, block_type) {
+            (RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4, BlockType::SstDataPaxV2) => {
+                decode_pax_v2(
+                    store,
+                    &self.data_scratch[..raw_len],
+                    self.decoded_scratch,
+                    self.column_scratch,
+                    self.assembly,
+                )?
+            }
+            (
+                RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
+                BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
+            ) => decode_data_block(
                 &self.data_scratch[..raw_len],
                 block_type,
                 self.decoded_scratch,
-            )?
+            )?,
+            _ => {
+                return Err(SstError::Store(StoreError::Corrupt(
+                    super::BlockError::UnknownType,
+                )));
+            }
         };
         self.loaded_ref = Some(reference);
+        self.loaded_format = Some(format);
         self.decoded_len = decoded_len;
         Ok(decoded_len)
     }
@@ -1955,7 +1974,7 @@ impl<'a> SstReader<'a> {
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
         // indexing every row.
-        let data_len = self.load_data_block(store, block_ref)?;
+        let data_len = self.load_data_block(store, handle.format, block_ref)?;
         for entry in (DataBlock {
             bytes: &self.decoded_scratch[..data_len],
         }) {
@@ -2025,7 +2044,7 @@ impl<'a> SstReader<'a> {
             return Ok(None);
         };
         let block_ref = block_ref_at(self.index_scratch, entry, handle.uses_packed_references());
-        let data_len = self.load_data_block(store, block_ref)?;
+        let data_len = self.load_data_block(store, handle.format, block_ref)?;
         for entry in (DataBlock {
             bytes: &self.decoded_scratch[..data_len],
         }) {
@@ -2097,7 +2116,7 @@ impl<'a> SstReader<'a> {
                     count,
                     handle.uses_packed_references(),
                 )?;
-                let data_len = self.load_data_block(store, block_ref)?;
+                let data_len = self.load_data_block(store, handle.format, block_ref)?;
                 let mut ran_past = false;
                 // A chained entry owns its whole block, so at most one assembly
                 // happens per block and the borrow of `data_scratch` has ended by
@@ -2869,6 +2888,17 @@ mod tests {
         );
         assert_eq!(get(&mut reader, &mut store, &packed, 2), Some(packed_row));
         assert_eq!(get(&mut reader, &mut store, &delta, 3), Some(delta_row));
+        let mislabeled_delta = SstHandle {
+            format: RowSstFormat::PackedPaxV3,
+            ..delta
+        };
+        let mut out = [0u8; MAX_PAYLOAD];
+        assert_eq!(
+            reader
+                .get(&mut store, &mislabeled_delta, 3, &mut out)
+                .unwrap_err(),
+            SstError::Store(StoreError::Corrupt(crate::store::BlockError::UnknownType))
+        );
     }
 
     #[test]

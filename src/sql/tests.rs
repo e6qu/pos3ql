@@ -66245,9 +66245,13 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             break engine.storage.block_io_stats().saturating_sub(before);
         }
     };
-    assert!(
-        reslice.object_puts < first_slice.object_puts,
-        "reslice rewrote the prior slice: first={first_slice:?}, second={reslice:?}"
+    assert_eq!(
+        first_slice.object_puts, 4,
+        "the initial delta should use one packed container: {first_slice:?}"
+    );
+    assert_eq!(
+        reslice.object_puts, 4,
+        "the incremental delta should retain the prior slice and publish one packed container: {reslice:?}"
     );
 
     let tail = engine.storage.find_table("public", "reslice_tail").unwrap();

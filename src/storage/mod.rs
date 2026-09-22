@@ -25808,11 +25808,12 @@ impl Storage {
                     column_buf,
                     assembly_buf,
                 );
-                reader.restore_cached_data_block((*decoded_data_ref).and_then(
-                    |(cached_handle, reference, cached_len)| {
+                reader.restore_cached_data_block(
+                    handle.format,
+                    (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
                         (cached_handle == handle).then_some((reference, cached_len))
-                    },
-                ));
+                    }),
+                );
                 let got = reader
                     .get_at(&mut *blocks, &handle, rowid, commit_lsn, out)
                     .map_err(spill_read_error)?;
@@ -25903,11 +25904,12 @@ impl Storage {
                         column_buf,
                         bounce_buf,
                     );
-                    reader.restore_cached_data_block((*decoded_data_ref).and_then(
-                        |(cached_handle, reference, cached_len)| {
+                    reader.restore_cached_data_block(
+                        handle.format,
+                        (*decoded_data_ref).and_then(|(cached_handle, reference, cached_len)| {
                             (cached_handle == handle).then_some((reference, cached_len))
-                        },
-                    ));
+                        }),
+                    );
                     let got = reader
                         .get_at(&mut *blocks, &handle, rowid, commit_lsn, row_buf)
                         .map_err(spill_read_error)?;

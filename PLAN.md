@@ -299,18 +299,23 @@ committed generation; checkpoint collection now keeps its resident/spill seam
 stable by classifying only the committed home and matching the spill commit
 LSN.
 
-The new profile changes the checkpoint priority. Row-merge source scheduling
-is again the largest individual dispatch and aggregate phase: 102 events took
-27.35 seconds, with a 401.72 ms and 121-GET maximum. Two row SST delta events
-reached 127.91 ms and 27 PUTs. The [durable format contract](docs/durable-format.md)
-now defines typed manifest and row SST identities, the v13-to-v14 manifest
-upgrade, v2/v3 mixed-generation reads, online generational replacement, and
-the offline gate required before a reader can be removed. The row SST handle
-retains its exact format through every index descent, and unknown formats fail
-at the manifest parse boundary. Use this boundary to reduce row-merge read
-amplification and delta publication traffic while preserving fixed memory,
-provider neutrality, retry, and empty-cache recovery, then repeat this exact
-profile.
+The durable format contract now covers manifest v13-to-v14 upgrade and
+v2/v3/v4 mixed row generations. New v4 full slices retain PAX, while v4 deltas
+pack compressed canonical row groups into verified containers. Row merge
+scheduling reads keys and tombstones from PAX descriptors without fetching
+column extents, and both schedule and write beats have provider-neutral object
+read boundaries. A deterministic 128-row delta writes four objects and survives
+empty-cache recovery.
+The [clean repeated 10,000-row profile](benchmarks/baselines/2026-09-22-checkpoint-row-format-10000/README.md)
+reduced the schedule maximum from 121 GETs and 401.72 ms to eight GETs and
+23.91 ms. Its two deltas each wrote four blocks, down from 27, and their maximum
+fell from 127.91 to 25.62 ms. Event counts and shared-host timing differ, so the
+request bounds are the controlled result. Row merge writing is now the largest
+remaining checkpoint phase: it made 5,782 GETs across 440 beats while
+materializing PAX rows after the metadata-only schedule. Retain source row
+cursors and decoded groups across write beats to remove repeated point-read
+setup while preserving snapshot pruning, retry, fixed memory, format identity,
+and the per-beat request boundary.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

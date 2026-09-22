@@ -84,7 +84,7 @@ pub(crate) use object::OwnedObjectStore;
 pub(crate) use sst::copy_pax_v2_row_from_extents;
 pub(crate) use sst::{
     DataBlockLookahead, DataBlockRef, PaxLayout, RowSstFormat, SstCursor, SstHandle, SstKey,
-    SstReader,
+    SstReader, SstVersionCursor,
 };
 pub(crate) use sst::{MAX_ASSEMBLED, MAX_INLINE_ROW, SstError, SstWriter};
 pub(crate) use sst::{

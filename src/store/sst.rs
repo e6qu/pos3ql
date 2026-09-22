@@ -35,6 +35,9 @@ pub(crate) enum RowSstFormat {
     DirectV2,
     /// PAX extents named through packed v3 sparse-index entries.
     PackedPaxV3,
+    /// Packed v4 sparse-index entries naming either row blocks or PAX
+    /// descriptors. Small deltas use row blocks; full slices use PAX.
+    PackedV4,
 }
 
 impl RowSstFormat {
@@ -42,6 +45,7 @@ impl RowSstFormat {
         match self {
             Self::DirectV2 => "v2",
             Self::PackedPaxV3 => "v3",
+            Self::PackedV4 => "v4",
         }
     }
 
@@ -49,12 +53,13 @@ impl RowSstFormat {
         match id.as_bytes() {
             b"v2" => Some(Self::DirectV2),
             b"v3" => Some(Self::PackedPaxV3),
+            b"v4" => Some(Self::PackedV4),
             _ => None,
         }
     }
 
     pub(crate) const fn uses_packed_references(self) -> bool {
-        matches!(self, Self::PackedPaxV3)
+        matches!(self, Self::PackedPaxV3 | Self::PackedV4)
     }
 }
 
@@ -185,7 +190,7 @@ const PAX_V2_ROW_HEADER: usize = PAX_ROW_HEADER + 4;
 const PACKED_DATA_REF_BYTES: usize = 32 + 4 + 4 + 32;
 /// PAX data groups are deliberately smaller than their enclosing container so
 /// one ranged object can carry several independently cacheable groups.
-const PACKED_PAX_TARGET: usize = MAX_PAYLOAD / 2;
+const PACKED_GROUP_TARGET: usize = MAX_PAYLOAD / 2;
 
 const VERSIONED_INDEX_ENTRY: usize = 16 + 32;
 const PACKED_VERSIONED_INDEX_ENTRY: usize = 16 + 32 + 4 + 4 + 32;
@@ -211,7 +216,7 @@ pub(crate) enum SstError {
     /// Rows were not handed to the writer in ascending key order.
     KeyOutOfOrder,
     /// A PAX group could not represent a row supplied by its table writer.
-    PaxEncoding,
+    Encoding,
     /// The block store failed.
     Store(StoreError),
 }
@@ -256,13 +261,14 @@ pub(crate) struct SstWriter {
     /// LZ4 staging for data-block flushes: the smaller of raw/compressed is
     /// what gets stored.
     compress_buf: Box<[u8]>,
-    /// Columnar payload assembled from `pending` before compression.
-    pax_buf: Box<[u8]>,
+    /// Encoding scratch for PAX payloads and packed-row compression.
+    encoding_buf: Box<[u8]>,
     pax_schema: [ColType; MAX_COLUMNS],
     pax_refs: [DataBlockRef; MAX_COLUMNS],
     pax_columns: usize,
     pax_enabled: bool,
-    pax_fillfactor: u8,
+    packed_rows: bool,
+    packed_fillfactor: u8,
     /// Framed logical PAX blocks waiting to become one immutable container.
     packed: Box<[u8]>,
     packed_len: usize,
@@ -312,12 +318,13 @@ impl SstWriter {
             roster: vec![BlockId([0u8; 32]); MAX_ROSTER].into_boxed_slice(),
             roster_len: 0,
             compress_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
-            pax_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
+            encoding_buf: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             pax_schema: [ColType::Bool; MAX_COLUMNS],
             pax_refs: [DataBlockRef::Direct(BlockId([0u8; 32])); MAX_COLUMNS],
             pax_columns: 0,
             pax_enabled: false,
-            pax_fillfactor: 100,
+            packed_rows: false,
+            packed_fillfactor: 100,
             packed: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             packed_len: 0,
             packed_index_start: 0,
@@ -353,7 +360,8 @@ impl SstWriter {
         self.pax_refs.fill(DataBlockRef::Direct(BlockId([0u8; 32])));
         self.pax_columns = 0;
         self.pax_enabled = false;
-        self.pax_fillfactor = 100;
+        self.packed_rows = false;
+        self.packed_fillfactor = 100;
     }
 
     /// Selects the table row layout for the next SST.  Callers must choose it
@@ -364,7 +372,7 @@ impl SstWriter {
             || self.leaves_len != 0
             || schema.len() > MAX_COLUMNS
         {
-            return Err(SstError::PaxEncoding);
+            return Err(SstError::Encoding);
         }
         self.pax_schema[..schema.len()].copy_from_slice(schema);
         self.pax_columns = schema.len();
@@ -372,13 +380,28 @@ impl SstWriter {
         Ok(())
     }
 
-    /// Chooses the durable PAX data-block occupancy for the next relation SST.
-    pub(crate) fn set_pax_fillfactor(&mut self, fillfactor: Option<u8>) -> Result<(), SstError> {
+    /// Selects packed row blocks for a small immutable delta. The v4 index
+    /// keeps the same verified range references as PAX while avoiding one
+    /// column object per table column.
+    pub(crate) fn set_packed_rows(&mut self) -> Result<(), SstError> {
+        if self.pending_len != 0 || self.index_len != 0 || self.leaves_len != 0 {
+            return Err(SstError::Encoding);
+        }
+        self.packed_rows = true;
+        Ok(())
+    }
+
+    fn packed_references(&self) -> bool {
+        self.pax_enabled || self.packed_rows
+    }
+
+    /// Chooses durable packed-group occupancy for the next relation SST.
+    pub(crate) fn set_packed_fillfactor(&mut self, fillfactor: Option<u8>) -> Result<(), SstError> {
         let fillfactor = fillfactor.unwrap_or(100);
         if self.pending_len != 0 || !(10..=100).contains(&fillfactor) {
-            return Err(SstError::PaxEncoding);
+            return Err(SstError::Encoding);
         }
-        self.pax_fillfactor = fillfactor;
+        self.packed_fillfactor = fillfactor;
         Ok(())
     }
 
@@ -414,14 +437,14 @@ impl SstWriter {
         }
         let entry = VERSIONED_ENTRY_HEADER + row.len();
         if self.pax_enabled && entry > MAX_PAYLOAD {
-            return Err(SstError::PaxEncoding);
+            return Err(SstError::Encoding);
         }
         if entry > MAX_PAYLOAD {
             return self.append_chained(store, key, row);
         }
-        let limit = if self.pax_enabled {
-            PACKED_PAX_TARGET
-                .saturating_mul(usize::from(self.pax_fillfactor))
+        let limit = if self.packed_references() {
+            PACKED_GROUP_TARGET
+                .saturating_mul(usize::from(self.packed_fillfactor))
                 .saturating_div(100)
                 .saturating_sub(128)
         } else {
@@ -516,9 +539,9 @@ impl SstWriter {
         {
             return Err(SstError::KeyOutOfOrder);
         }
-        let limit = if self.pax_enabled {
-            PACKED_PAX_TARGET
-                .saturating_mul(usize::from(self.pax_fillfactor))
+        let limit = if self.packed_references() {
+            PACKED_GROUP_TARGET
+                .saturating_mul(usize::from(self.packed_fillfactor))
                 .saturating_div(100)
                 .saturating_sub(128)
         } else {
@@ -571,17 +594,21 @@ impl SstWriter {
         // Store whichever of raw/LZ4 is smaller: on object storage the bytes
         // are latency, bandwidth and money, and an incompressible block
         // costs nothing but this attempt.
-        let (raw, block_type) = if !self.pax_enabled {
-            (&self.pending[..self.pending_len], BlockType::SstDataV2)
-        } else {
-            let length = self.encode_pax_v2(store)?;
-            (&self.pax_buf[..length], BlockType::SstDataPaxV2)
-        };
         let reference = if self.pax_enabled {
-            let (id, framed_len) = super::encode(raw, block_type, 0, &mut self.compress_buf)
-                .map_err(|_| SstError::PaxEncoding)?;
+            let length = self.encode_pax_v2(store)?;
+            let (id, framed_len) = super::encode(
+                &self.encoding_buf[..length],
+                BlockType::SstDataPaxV2,
+                0,
+                &mut self.compress_buf,
+            )
+            .map_err(|_| SstError::Encoding)?;
             if framed_len > self.packed.len() {
-                DataBlockRef::direct(store.put(raw, block_type, 0)?)
+                DataBlockRef::direct(store.put(
+                    &self.encoding_buf[..length],
+                    BlockType::SstDataPaxV2,
+                    0,
+                )?)
             } else {
                 if self.packed_len + framed_len > self.packed.len() {
                     self.flush_packed(store)?;
@@ -592,19 +619,46 @@ impl SstWriter {
                 self.packed_len += framed_len;
                 DataBlockRef::Packed {
                     container: BlockId([0; 32]),
-                    offset: u32::try_from(offset).map_err(|_| SstError::PaxEncoding)?,
-                    length: u32::try_from(framed_len).map_err(|_| SstError::PaxEncoding)?,
+                    offset: u32::try_from(offset).map_err(|_| SstError::Encoding)?,
+                    length: u32::try_from(framed_len).map_err(|_| SstError::Encoding)?,
+                    id,
+                }
+            }
+        } else if self.packed_rows {
+            let raw = &self.pending[..self.pending_len];
+            let (payload, packed_type) =
+                match super::lz4::compress(raw, &mut self.encoding_buf[..self.pending_len]) {
+                    Some(n) if n < raw.len() => (&self.encoding_buf[..n], BlockType::SstDataV2Lz4),
+                    _ => (raw, BlockType::SstDataV2),
+                };
+            let (id, framed_len) = super::encode(payload, packed_type, 0, &mut self.compress_buf)
+                .map_err(|_| SstError::Encoding)?;
+            if framed_len > self.packed.len() {
+                DataBlockRef::direct(store.put(payload, packed_type, 0)?)
+            } else {
+                if self.packed_len + framed_len > self.packed.len() {
+                    self.flush_packed(store)?;
+                }
+                let offset = self.packed_len;
+                self.packed[offset..offset + framed_len]
+                    .copy_from_slice(&self.compress_buf[..framed_len]);
+                self.packed_len += framed_len;
+                DataBlockRef::Packed {
+                    container: BlockId([0; 32]),
+                    offset: u32::try_from(offset).map_err(|_| SstError::Encoding)?,
+                    length: u32::try_from(framed_len).map_err(|_| SstError::Encoding)?,
                     id,
                 }
             }
         } else {
+            let raw = &self.pending[..self.pending_len];
             match super::lz4::compress(raw, &mut self.compress_buf[..raw.len()]) {
                 Some(n) if n < raw.len() => DataBlockRef::direct(store.put(
                     &self.compress_buf[..n],
                     BlockType::SstDataV2Lz4,
                     0,
                 )?),
-                _ => DataBlockRef::direct(store.put(raw, block_type, 0)?),
+                _ => DataBlockRef::direct(store.put(raw, BlockType::SstDataV2, 0)?),
             }
         };
         if let DataBlockRef::Direct(id) = reference {
@@ -654,7 +708,7 @@ impl SstWriter {
         };
         for entry in entries {
             if entry.is_chained() || rows == u16::MAX as usize {
-                return Err(SstError::PaxEncoding);
+                return Err(SstError::Encoding);
             }
             rows += 1;
             if entry.tombstone {
@@ -668,12 +722,12 @@ impl SstWriter {
                 &mut payloads,
                 &mut nulls,
             )
-            .map_err(|_| SstError::PaxEncoding)?;
+            .map_err(|_| SstError::Encoding)?;
             for column in 0..self.pax_columns {
                 if !nulls[column] {
                     payload_bytes[column] = payload_bytes[column]
                         .checked_add(payloads[column].len())
-                        .ok_or(SstError::PaxEncoding)?;
+                        .ok_or(SstError::Encoding)?;
                 }
             }
         }
@@ -681,11 +735,11 @@ impl SstWriter {
         for column in 0..self.pax_columns {
             let column_len = 8usize
                 .checked_add(payload_bytes[column])
-                .ok_or(SstError::PaxEncoding)?;
+                .ok_or(SstError::Encoding)?;
             if column_len > MAX_PAYLOAD {
-                return Err(SstError::PaxEncoding);
+                return Err(SstError::Encoding);
             }
-            let output = &mut self.pax_buf[..column_len];
+            let output = &mut self.encoding_buf[..column_len];
             output[..4].copy_from_slice(&PAX_COLUMN_MAGIC.to_le_bytes());
             output[4..6].copy_from_slice(&(rows as u16).to_le_bytes());
             output[6] = self.pax_schema[column].code();
@@ -705,25 +759,25 @@ impl SstWriter {
                     &mut payloads,
                     &mut nulls,
                 )
-                .map_err(|_| SstError::PaxEncoding)?;
+                .map_err(|_| SstError::Encoding)?;
                 if !nulls[column] {
                     let end = at
                         .checked_add(payloads[column].len())
-                        .ok_or(SstError::PaxEncoding)?;
+                        .ok_or(SstError::Encoding)?;
                     output[at..end].copy_from_slice(payloads[column]);
                     at = end;
                 }
             }
             if at != column_len {
-                return Err(SstError::PaxEncoding);
+                return Err(SstError::Encoding);
             }
             let (id, framed_len) = super::encode(
-                &self.pax_buf[..column_len],
+                &self.encoding_buf[..column_len],
                 BlockType::SstDataPaxColumnV1,
                 0,
                 &mut self.compress_buf,
             )
-            .map_err(|_| SstError::PaxEncoding)?;
+            .map_err(|_| SstError::Encoding)?;
             if self.packed_len + framed_len > self.packed.len() {
                 self.flush_pax_columns(store)?;
             }
@@ -733,8 +787,8 @@ impl SstWriter {
             self.packed_len += framed_len;
             self.pax_refs[column] = DataBlockRef::Packed {
                 container: BlockId([0; 32]),
-                offset: u32::try_from(offset).map_err(|_| SstError::PaxEncoding)?,
-                length: u32::try_from(framed_len).map_err(|_| SstError::PaxEncoding)?,
+                offset: u32::try_from(offset).map_err(|_| SstError::Encoding)?,
+                length: u32::try_from(framed_len).map_err(|_| SstError::Encoding)?,
                 id,
             };
         }
@@ -742,31 +796,31 @@ impl SstWriter {
 
         let row_base = 8usize
             .checked_add(self.pax_columns)
-            .ok_or(SstError::PaxEncoding)?;
+            .ok_or(SstError::Encoding)?;
         let bitmap_base = row_base
             .checked_add(
                 rows.checked_mul(PAX_V2_ROW_HEADER)
-                    .ok_or(SstError::PaxEncoding)?,
+                    .ok_or(SstError::Encoding)?,
             )
-            .ok_or(SstError::PaxEncoding)?;
+            .ok_or(SstError::Encoding)?;
         let refs_base = bitmap_base
             .checked_add(
                 self.pax_columns
                     .checked_mul(bitmap_bytes)
-                    .ok_or(SstError::PaxEncoding)?,
+                    .ok_or(SstError::Encoding)?,
             )
-            .ok_or(SstError::PaxEncoding)?;
+            .ok_or(SstError::Encoding)?;
         let total = refs_base
             .checked_add(
                 self.pax_columns
                     .checked_mul(PACKED_DATA_REF_BYTES)
-                    .ok_or(SstError::PaxEncoding)?,
+                    .ok_or(SstError::Encoding)?,
             )
-            .ok_or(SstError::PaxEncoding)?;
+            .ok_or(SstError::Encoding)?;
         if total > MAX_PAYLOAD {
-            return Err(SstError::PaxEncoding);
+            return Err(SstError::Encoding);
         }
-        let output = &mut self.pax_buf[..total];
+        let output = &mut self.encoding_buf[..total];
         output[..4].copy_from_slice(&PAX_V2_MAGIC.to_le_bytes());
         output[4..6].copy_from_slice(&(rows as u16).to_le_bytes());
         output[6..8].copy_from_slice(&(self.pax_columns as u16).to_le_bytes());
@@ -797,7 +851,7 @@ impl SstWriter {
                 &mut payloads,
                 &mut nulls,
             )
-            .map_err(|_| SstError::PaxEncoding)?;
+            .map_err(|_| SstError::Encoding)?;
             for column in 0..self.pax_columns {
                 if nulls[column] {
                     output[bitmap_base + column * bitmap_bytes + row / 8] |= 1 << (row % 8);
@@ -849,7 +903,8 @@ impl SstWriter {
         if self.leaves_len == MAX_LEAVES {
             return Err(SstError::TooManyBlocks);
         }
-        let entry_size = if self.pax_enabled {
+        let packed_references = self.packed_references();
+        let entry_size = if packed_references {
             PACKED_VERSIONED_INDEX_ENTRY
         } else {
             VERSIONED_INDEX_ENTRY
@@ -860,7 +915,11 @@ impl SstWriter {
         for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
             let at = 4 + i * entry_size;
             write_key(*first, &mut buffer[at..at + 16]);
-            write_data_ref(*id, &mut buffer[at + 16..at + entry_size], self.pax_enabled);
+            write_data_ref(
+                *id,
+                &mut buffer[at + 16..at + entry_size],
+                packed_references,
+            );
         }
         let id = store.put(&self.compress_buf[..bytes], BlockType::SstIndexV2, 0)?;
         self.record(id)?;
@@ -895,9 +954,10 @@ impl SstWriter {
         // The index. One leaf's worth of entries makes the classic single
         // block; more make leaves under a root, so SST size is no longer
         // bounded by one index block.
+        let packed_references = self.packed_references();
         let index = if self.leaves_len == 0 {
             let bytes = 4 + self.index_len
-                * if self.pax_enabled {
+                * if packed_references {
                     PACKED_VERSIONED_INDEX_ENTRY
                 } else {
                     VERSIONED_INDEX_ENTRY
@@ -905,14 +965,18 @@ impl SstWriter {
             let buffer = &mut *self.pending; // reuse the data scratch; it is done with
             buffer[0..4].copy_from_slice(&(self.index_len as u32).to_le_bytes());
             for (i, (first, id)) in self.index[..self.index_len].iter().enumerate() {
-                let entry_size = if self.pax_enabled {
+                let entry_size = if packed_references {
                     PACKED_VERSIONED_INDEX_ENTRY
                 } else {
                     VERSIONED_INDEX_ENTRY
                 };
                 let at = 4 + i * entry_size;
                 write_key(*first, &mut buffer[at..at + 16]);
-                write_data_ref(*id, &mut buffer[at + 16..at + entry_size], self.pax_enabled);
+                write_data_ref(
+                    *id,
+                    &mut buffer[at + 16..at + entry_size],
+                    packed_references,
+                );
             }
             store.put(&buffer[..bytes], BlockType::SstIndexV2, 0)?
         } else {
@@ -948,8 +1012,8 @@ impl SstWriter {
             index,
             filter,
             roster,
-            format: if self.pax_enabled {
-                RowSstFormat::PackedPaxV3
+            format: if self.packed_references() {
+                RowSstFormat::PackedV4
             } else {
                 RowSstFormat::DirectV2
             },
@@ -2074,7 +2138,9 @@ impl<'a> SstReader<'a> {
     }
 
     /// Bounded physical-version scan used by compaction. Unlike `scan`, it
-    /// does not collapse versions of one row.
+    /// does not collapse versions of one row. PAX groups expose keys,
+    /// tombstones, and row lengths in their descriptor, so compaction's
+    /// scheduling pass never reads column extents it cannot use.
     pub(crate) fn scan_versions_bounded(
         &mut self,
         store: &mut dyn BlockStore,
@@ -2116,14 +2182,10 @@ impl<'a> SstReader<'a> {
                     end,
                     handle.uses_packed_references(),
                 )?;
-                let data_len = self.load_data_block(store, block_ref)?;
-                for entry in (DataBlock {
-                    bytes: &self.decoded_scratch[..data_len],
-                }) {
-                    if entry.key >= lo {
-                        emit(entry.key, entry.tombstone);
-                    }
-                    last_key = Some(last_key.map_or(entry.key, |key| key.max(entry.key)));
+                let block_last =
+                    self.scan_version_metadata_block(store, handle, block_ref, lo, emit)?;
+                if let Some(key) = block_last {
+                    last_key = Some(last_key.map_or(key, |last| last.max(key)));
                 }
             }
             budget -= end - start;
@@ -2141,6 +2203,55 @@ impl<'a> SstReader<'a> {
             }
         }
         Ok(last_key.and_then(SstKey::successor))
+    }
+
+    fn scan_version_metadata_block(
+        &mut self,
+        store: &mut dyn BlockStore,
+        handle: &SstHandle,
+        reference: DataBlockRef,
+        lo: SstKey,
+        emit: &mut dyn FnMut(SstKey, bool),
+    ) -> Result<Option<SstKey>, SstError> {
+        let (raw_len, block_type) =
+            read_data_block_raw_ref(store, reference, self.data_scratch, self.assembly)?;
+        match (handle.format, block_type) {
+            (RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4, BlockType::SstDataPaxV2) => {
+                let layout = pax_layout(&self.data_scratch[..raw_len])?;
+                let mut last = None;
+                for row in 0..layout.rows() {
+                    let (key, tombstone) = layout.row_key(&self.data_scratch[..raw_len], row)?;
+                    if key >= lo {
+                        emit(key, tombstone);
+                    }
+                    last = Some(key);
+                }
+                Ok(last)
+            }
+            (
+                RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
+                BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
+            ) => {
+                let data_len = decode_data_block(
+                    &self.data_scratch[..raw_len],
+                    block_type,
+                    self.decoded_scratch,
+                )?;
+                let mut last = None;
+                for entry in (DataBlock {
+                    bytes: &self.decoded_scratch[..data_len],
+                }) {
+                    if entry.key >= lo {
+                        emit(entry.key, entry.tombstone);
+                    }
+                    last = Some(entry.key);
+                }
+                Ok(last)
+            }
+            _ => Err(SstError::Store(StoreError::Corrupt(
+                super::BlockError::UnknownType,
+            ))),
+        }
     }
 
     /// Loads leaf `ordinal` of the index into the index scratch and returns
@@ -2730,15 +2841,138 @@ mod tests {
             .append_version(&mut store, SstKey::at(2, 1), &packed_row)
             .unwrap();
         let packed = writer.finish(&mut store).unwrap().unwrap();
+        let legacy_pax = SstHandle {
+            format: RowSstFormat::PackedPaxV3,
+            ..packed
+        };
+
+        let delta_row = b"packed-row-v4".to_vec();
+        let mut delta_writer = SstWriter::new();
+        delta_writer.set_packed_rows().unwrap();
+        delta_writer
+            .append_version(&mut store, SstKey::at(3, 1), &delta_row)
+            .unwrap();
+        let delta = delta_writer.finish(&mut store).unwrap().unwrap();
 
         assert_eq!(direct.format, RowSstFormat::DirectV2);
         assert_eq!(direct.format.manifest_id(), "v2");
-        assert_eq!(packed.format, RowSstFormat::PackedPaxV3);
-        assert_eq!(packed.format.manifest_id(), "v3");
+        assert_eq!(legacy_pax.format.manifest_id(), "v3");
+        assert_eq!(packed.format, RowSstFormat::PackedV4);
+        assert_eq!(packed.format.manifest_id(), "v4");
+        assert_eq!(delta.format, RowSstFormat::PackedV4);
 
         let mut reader = SstReader::new(&arena).unwrap();
         assert_eq!(get(&mut reader, &mut store, &direct, 1), Some(direct_row));
+        assert_eq!(
+            get(&mut reader, &mut store, &legacy_pax, 2),
+            Some(packed_row.clone())
+        );
         assert_eq!(get(&mut reader, &mut store, &packed, 2), Some(packed_row));
+        assert_eq!(get(&mut reader, &mut store, &delta, 3), Some(delta_row));
+    }
+
+    #[test]
+    fn packed_row_delta_uses_one_data_container() {
+        let (_budget, mut store) = store();
+        let mut writer = SstWriter::new();
+        writer.set_packed_rows().unwrap();
+        for rowid in 1..=64 {
+            writer
+                .append_version(&mut store, SstKey::at(rowid, 7), &[b'x'; 256])
+                .unwrap();
+        }
+        let handle = writer.finish(&mut store).unwrap().unwrap();
+        assert_eq!(handle.format, RowSstFormat::PackedV4);
+        assert_eq!(
+            store.len(),
+            4,
+            "one packed row container plus filter, index, and roster"
+        );
+        let scratch = arena();
+        let mut reader = SstReader::new(&scratch).unwrap();
+        assert_eq!(
+            get(&mut reader, &mut store, &handle, 64),
+            Some(vec![b'x'; 256])
+        );
+    }
+
+    #[test]
+    fn packed_row_delta_uses_fewer_objects_than_pax_for_many_small_groups() {
+        let value = "w".repeat(4_096);
+        let values = [Datum::Text(value.as_str())];
+        let mut row = vec![0; rowenc::encoded_len(&values)];
+        rowenc::encode(&values, &mut row);
+
+        let (_pax_budget, mut pax_store) = store();
+        let mut pax = SstWriter::new();
+        pax.set_pax_schema(&[ColType::Text]).unwrap();
+        for rowid in 1..=512 {
+            pax.append_version(&mut pax_store, SstKey::at(rowid, 11), &row)
+                .unwrap();
+        }
+        let pax_handle = pax.finish(&mut pax_store).unwrap().unwrap();
+
+        let (_row_budget, mut row_store) = store();
+        let mut packed = SstWriter::new();
+        packed.set_packed_rows().unwrap();
+        for rowid in 1..=512 {
+            packed
+                .append_version(&mut row_store, SstKey::at(rowid, 11), &row)
+                .unwrap();
+        }
+        let packed_handle = packed.finish(&mut row_store).unwrap().unwrap();
+
+        assert_eq!(pax_handle.format, RowSstFormat::PackedV4);
+        assert_eq!(packed_handle.format, RowSstFormat::PackedV4);
+        assert!(
+            row_store.len() * 2 < pax_store.len(),
+            "packed rows did not reduce delta objects: row={} pax={}",
+            row_store.len(),
+            pax_store.len()
+        );
+        let scratch = arena();
+        let mut reader = SstReader::new(&scratch).unwrap();
+        assert_eq!(
+            get(&mut reader, &mut row_store, &packed_handle, 512),
+            Some(row)
+        );
+    }
+
+    #[test]
+    fn version_schedule_reads_pax_descriptors_without_column_extents() {
+        let (_budget, mut store) = store();
+        let schema = [ColType::Int4; 12];
+        let values = [Datum::Int4(7); 12];
+        let mut row = vec![0; rowenc::encoded_len(&values)];
+        rowenc::encode(&values, &mut row);
+        let mut writer = SstWriter::new();
+        writer.set_pax_schema(&schema).unwrap();
+        for rowid in 1..=6_000 {
+            writer
+                .append_version(&mut store, SstKey::at(rowid, 9), &row)
+                .unwrap();
+        }
+        let current = writer.finish(&mut store).unwrap().unwrap();
+        let legacy = SstHandle {
+            format: RowSstFormat::PackedPaxV3,
+            ..current
+        };
+        let before = store.reads();
+        let scratch = arena();
+        let mut reader = SstReader::new(&scratch).unwrap();
+        let mut seen = 0usize;
+        assert_eq!(
+            reader
+                .scan_versions_bounded(&mut store, &legacy, SstKey::MIN, 8, &mut |_, _| seen += 1,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(seen, 6_000);
+        assert!(
+            store.reads() - before <= 10,
+            "schedule scan fetched PAX column extents: {} reads",
+            store.reads() - before
+        );
     }
 
     #[test]
@@ -2882,7 +3116,7 @@ mod tests {
             rowenc::encode(&row, &mut encoded);
             let mut writer = SstWriter::new();
             writer.set_pax_schema(&[ColType::Text]).unwrap();
-            writer.set_pax_fillfactor(Some(fillfactor)).unwrap();
+            writer.set_packed_fillfactor(Some(fillfactor)).unwrap();
             for rowid in 1..=128 {
                 writer
                     .append_version(&mut store, SstKey::at(rowid, 1), &encoded)

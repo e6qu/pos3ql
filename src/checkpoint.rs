@@ -630,7 +630,7 @@ impl TemporarySpiller {
             .set_pax_schema(&schema[..columns])
             .map_err(temporary_sst_to_sql)?;
         self.writer
-            .set_pax_fillfactor(storage.table(slot).def.storage_options.fillfactor)
+            .set_packed_fillfactor(storage.table(slot).def.storage_options.fillfactor)
             .map_err(temporary_sst_to_sql)?;
         let writer = &mut self.writer;
         let blocks = &self.blocks;
@@ -855,11 +855,13 @@ const MERGE_TRIGGER: usize = 4;
 
 /// How far one merge beat may go — the pause a beat inserts between
 /// statements is a handful of block transfers, never a whole pair. Data
-/// blocks *read* per schedule beat, data blocks *written* per write beat,
-/// and a cheap-entry cap so a tombstone-heavy stretch (which emits no
-/// blocks) still bounds its walking and checksum work.
+/// blocks *read* per schedule beat, object reads and data blocks *written*
+/// per write beat, and a cheap-entry cap so a tombstone-heavy stretch (which
+/// emits no blocks) still bounds its walking and checksum work. One row can
+/// cross the read budget because its PAX columns are one indivisible image.
 const MERGE_SCHEDULE_BEAT_BLOCKS: usize = 8;
 const MERGE_WRITE_BEAT_BLOCKS: usize = 4;
+const MERGE_WRITE_BEAT_READS: u64 = 8;
 const MERGE_BEAT_ENTRIES: usize = 64 * 1024;
 const VALUE_INDEX_WRITE_BEAT_BLOCKS: u64 = 4;
 const VALUE_INDEX_WRITE_BEAT_READS: u64 = 8;
@@ -953,7 +955,7 @@ impl Checkpointer {
                     .set_pax_schema(&schema[..columns])
                     .map_err(sst_to_sql)?;
                 self.merge_writer
-                    .set_pax_fillfactor(storage.table(job.slot).def.storage_options.fillfactor)
+                    .set_packed_fillfactor(storage.table(job.slot).def.storage_options.fillfactor)
                     .map_err(sst_to_sql)?;
                 self.merge_job = Some(job);
             }
@@ -1214,11 +1216,19 @@ impl Checkpointer {
         let writer = &mut self.merge_writer;
         let scratch = &self.merge_scratch;
         let start_blocks = writer.roster_so_far().len();
+        let start_reads = blocks.borrow().io_stats().object_gets;
         let mut cursor = cursor;
         let mut processed = 0usize;
         while cursor < job.schedule_len {
             if processed >= MERGE_BEAT_ENTRIES
                 || writer.roster_so_far().len() - start_blocks >= MERGE_WRITE_BEAT_BLOCKS
+                || (processed > 0
+                    && blocks
+                        .borrow()
+                        .io_stats()
+                        .object_gets
+                        .saturating_sub(start_reads)
+                        >= MERGE_WRITE_BEAT_READS)
             {
                 job.phase = MergePhase::Write { cursor };
                 return Ok(MergeBeatOutcome::Continue);
@@ -10629,11 +10639,15 @@ impl Checkpointer {
             self.slice_writer.reset();
             let mut schema = [ColType::Bool; MAX_COLUMNS];
             let columns = storage.table(slot).def.schema(&mut schema);
+            if delta {
+                self.slice_writer.set_packed_rows().map_err(sst_to_sql)?;
+            } else {
+                self.slice_writer
+                    .set_pax_schema(&schema[..columns])
+                    .map_err(sst_to_sql)?;
+            }
             self.slice_writer
-                .set_pax_schema(&schema[..columns])
-                .map_err(sst_to_sql)?;
-            self.slice_writer
-                .set_pax_fillfactor(storage.table(slot).def.storage_options.fillfactor)
+                .set_packed_fillfactor(storage.table(slot).def.storage_options.fillfactor)
                 .map_err(sst_to_sql)?;
             let writer = &mut self.slice_writer;
             let blocks = &self.blocks;
@@ -14648,6 +14662,14 @@ mod stored_dependency_tests {
                 .unwrap()
                 .format,
             RowSstFormat::PackedPaxV3
+        );
+        let mut current = "v4".split(' ');
+        assert_eq!(
+            parse_dsst_handle(&id, &id, &id, &mut current)
+                .unwrap()
+                .unwrap()
+                .format,
+            RowSstFormat::PackedV4
         );
         let mut obsolete = "v1".split(' ');
         assert!(parse_dsst_handle(&id, &id, &id, &mut obsolete).is_err());

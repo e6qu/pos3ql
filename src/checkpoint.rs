@@ -340,8 +340,8 @@ struct MergeJob {
 
 /// A finished merge awaiting the next publish, which composes it into the
 /// slot's list — or discards it if a collapse superseded the pair.
+#[derive(Clone, Copy)]
 struct CompletedMerge {
-    slot: usize,
     at: usize,
     old0: PrevSst,
     old1: PrevSst,
@@ -659,7 +659,11 @@ pub(crate) struct Checkpointer {
     merge_writer: SstWriter,
     value_writer: ValueIndexWriter,
     merge_job: Option<MergeJob>,
-    merge_done: Option<CompletedMerge>,
+    /// Finished merges waiting for one manifest publish. One slot per table
+    /// lets every dirty filled roster free a generation before the sweep;
+    /// otherwise an unrelated completed merge could force the next table
+    /// back through a full rewrite.
+    merge_done: Vec<Option<CompletedMerge>>,
     /// Fairness toggle: merge beats and sweep beats alternate when both
     /// want the engine, so neither starves the other.
     merge_turn: bool,
@@ -740,6 +744,7 @@ impl Checkpointer {
                 + 2 * core::mem::size_of::<u64>()
                 + core::mem::size_of::<SliceLayout>()
                 + core::mem::size_of::<bool>()
+                + core::mem::size_of::<Option<CompletedMerge>>()
                 + core::mem::size_of::<Option<(BlockId, BlockId)>>())
             + table_capacity
                 .saturating_mul(config.max_spill_generations_per_table)
@@ -773,7 +778,7 @@ impl Checkpointer {
     ///
     /// A job survives publishes (its pair's list positions are stable under
     /// delta appends, which only extend the tail) and is dropped when a
-    /// collapse or full rewrite supersedes the pair — its blocks sweep as
+    /// relation replacement supersedes the pair — its blocks sweep as
     /// orphans. A crash loses only the job's progress, never data.
     fn merge_beat(&mut self, storage: &Storage) -> Result<(), SqlError> {
         let Some(mut job) = self.merge_job.take() else {
@@ -793,7 +798,7 @@ impl Checkpointer {
             return Ok(());
         };
         // The published list must still hold the pair where the job left
-        // it; a collapse or full rewrite replaced it, and with it the merge.
+        // it; a relation replacement also replaces the merge.
         let valid = self
             .prev_ssts
             .get(job.slot)
@@ -801,18 +806,36 @@ impl Checkpointer {
         if !valid {
             return Ok(());
         }
+        #[cfg(feature = "checkpoint-profile")]
+        let (phase, started, before) = (
+            match &job.phase {
+                MergePhase::Schedule { .. } => "row_merge_schedule",
+                MergePhase::Write { .. } => "row_merge_write",
+            },
+            checkpoint_profile_start(),
+            self.blocks.borrow().io_stats(),
+        );
         let outcome = match job.phase {
             MergePhase::Schedule { rank, resume_lo } => {
                 self.merge_schedule_beat(&mut job, rank, resume_lo)?
             }
             MergePhase::Write { cursor } => self.merge_write_beat(&mut job, cursor)?,
         };
+        #[cfg(feature = "checkpoint-profile")]
+        profile_checkpoint_phase(
+            phase,
+            storage.lsn(),
+            Some(job.slot),
+            started,
+            before,
+            self.blocks.borrow().io_stats(),
+            0,
+        );
         match outcome {
             MergeBeatOutcome::Continue => self.merge_job = Some(job),
             MergeBeatOutcome::Cancel => {}
             MergeBeatOutcome::Finished(merged) => {
-                self.merge_done = Some(CompletedMerge {
-                    slot: job.slot,
+                self.merge_done[job.slot] = Some(CompletedMerge {
                     at: job.at,
                     old0: job.old0,
                     old1: job.old1,
@@ -826,27 +849,28 @@ impl Checkpointer {
     /// The next pair worth merging: the first live table whose published
     /// list is at the trigger, taking its cheapest adjacent pair — least
     /// write amplification now, big settled members left to accrete —
-    /// skipping pairs the id scratch cannot hold (the filled-list full
-    /// rewrite stays the safety net) and pairs whose scans previously
-    /// overflowed it.
+    /// skipping pairs the id scratch cannot hold and pairs whose scans
+    /// previously overflowed it. A dirty filled list is always considered,
+    /// even below the ordinary merge trigger: publication needs one free slot
+    /// and must not fall back to an unbounded full-table rewrite.
     fn merge_candidate(&self, storage: &Storage) -> Option<MergeJob> {
-        if self.merge_job.is_some() || self.merge_done.is_some() {
+        if self.merge_job.is_some() {
             return None;
         }
-        // A dirty full list cannot append its next delta while a snapshot is
-        // pinned. Free one of those lists before servicing ordinary merge
-        // candidates, or a smaller unrelated table can starve the publication.
-        let must_free_full_list = storage.has_active_snapshots()
-            && (0..storage.physical_table_count()).any(|slot| {
-                storage.table(slot).live
-                    && storage.table(slot).def.persistence
-                        != crate::storage::RelationPersistence::Temporary
-                    && storage.table(slot).dirty
-                    && self
-                        .prev_ssts
-                        .get(slot)
-                        .is_some_and(|list| list.n == list.capacity())
-            });
+        // A dirty full list cannot append its next delta. Free one of those
+        // lists before servicing ordinary merge candidates, or a smaller
+        // unrelated table can starve the publication.
+        let must_free_full_list = (0..storage.physical_table_count()).any(|slot| {
+            storage.table(slot).live
+                && storage.table(slot).def.persistence
+                    != crate::storage::RelationPersistence::Temporary
+                && storage.table(slot).dirty
+                && self.merge_done[slot].is_none()
+                && self
+                    .prev_ssts
+                    .get(slot)
+                    .is_some_and(|list| list.n == list.capacity())
+        });
         for slot in 0..storage.physical_table_count() {
             if !storage.table(slot).live
                 || storage.table(slot).def.persistence
@@ -860,7 +884,10 @@ impl Checkpointer {
             if must_free_full_list && (!storage.table(slot).dirty || list.n != list.capacity()) {
                 continue;
             }
-            if list.n < MERGE_TRIGGER {
+            if self.merge_done[slot].is_some() {
+                continue;
+            }
+            if list.n < MERGE_TRIGGER && !must_free_full_list {
                 continue;
             }
             let at = (0..list.n - 1)
@@ -901,7 +928,7 @@ impl Checkpointer {
     /// merge awaiting its publish, or a published list at the trigger.
     pub(crate) fn merge_work_pending(&self, storage: &Storage) -> bool {
         self.merge_job.is_some()
-            || self.merge_done.is_some()
+            || self.merge_done.iter().any(Option::is_some)
             || self.merge_candidate(storage).is_some()
     }
 
@@ -1194,7 +1221,7 @@ impl Checkpointer {
             merge_writer: SstWriter::new(),
             value_writer: ValueIndexWriter::new(),
             merge_job: None,
-            merge_done: None,
+            merge_done: vec![None; table_capacity],
             merge_turn: false,
             merge_overflow: vec![None; table_capacity],
             writer_id: crate::object_store::writer_id(config),
@@ -6740,21 +6767,22 @@ impl Checkpointer {
             return Ok(CheckpointStep::Working);
         }
         self.reconcile_published_spill_lists(storage);
-        let pinned_full_list = storage.has_active_snapshots()
-            && self.merge_done.is_none()
-            && (0..storage.physical_table_count()).any(|slot| {
-                storage.table(slot).live
-                    && storage.table(slot).dirty
-                    && self
-                        .prev_ssts
-                        .get(slot)
-                        .is_some_and(|list| list.n == list.capacity())
-            });
-        if pinned_full_list {
+        let dirty_full_list = (0..storage.physical_table_count()).any(|slot| {
+            storage.table(slot).live
+                && storage.table(slot).def.persistence
+                    != crate::storage::RelationPersistence::Temporary
+                && storage.table(slot).dirty
+                && self.merge_done[slot].is_none()
+                && self
+                    .prev_ssts
+                    .get(slot)
+                    .is_some_and(|list| list.n == list.capacity())
+        });
+        if dirty_full_list {
             if self.merge_job.is_none() && self.merge_candidate(storage).is_none() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "historical snapshot pins a full SST generation list whose merge exceeds checkpoint_merge_entries ({})",
+                    "dirty full SST generation list requires a merge exceeding checkpoint_merge_entries ({})",
                     self.merge_scratch.capacity()
                 ));
             }
@@ -6765,12 +6793,11 @@ impl Checkpointer {
         // want the engine, so a hot sweep cannot starve compaction and a
         // long merge cannot starve publishes. A finished merge makes a
         // sweep due even at an unchanged lsn: its install needs a publish.
-        let merge_due = self.merge_job.is_some()
-            || (self.merge_done.is_none() && self.merge_candidate(storage).is_some());
+        let merge_due = self.merge_job.is_some() || self.merge_candidate(storage).is_some();
         let sweep_due = self.sweeping
             || storage.lsn() != self.manifest_lsn
             || self.manifest_etag.is_none()
-            || self.merge_done.is_some()
+            || self.merge_done.iter().any(Option::is_some)
             || storage.statistics_dirty();
         if merge_due && (self.merge_turn || !sweep_due) {
             self.merge_turn = false;
@@ -6883,13 +6910,7 @@ impl Checkpointer {
             if self.merge_job.as_ref().is_some_and(|job| job.slot == slot) {
                 self.merge_job = None;
             }
-            if self
-                .merge_done
-                .as_ref()
-                .is_some_and(|done| done.slot == slot)
-            {
-                self.merge_done = None;
-            }
+            self.merge_done[slot] = None;
             self.merge_overflow[slot] = None;
         }
     }
@@ -7808,10 +7829,9 @@ impl Checkpointer {
             // merged blocks simply sweep as orphans. Recomputed from the
             // carried base on every attempt, so a publish retried after a
             // mid-CAS failure applies it exactly once.
-            let completed = self.merge_done.as_ref().and_then(|done| {
-                (done.slot == slot
-                    && pair_at(&self.prev_scratch[slot], done.at)
-                        == Some((done.old0.handle, done.old1.handle)))
+            let completed = self.merge_done[slot].as_ref().and_then(|done| {
+                (pair_at(&self.prev_scratch[slot], done.at)
+                    == Some((done.old0.handle, done.old1.handle)))
                 .then_some((done.at, done.merged))
             });
             if let Some((at, merged)) = completed {
@@ -10229,10 +10249,10 @@ impl Checkpointer {
             )?;
         }
         self.pending_value_installs.clear();
-        // The completed merge is consumed with the installs — whether it
-        // composed in or a collapse had superseded it, this publish settled
-        // its fate either way.
-        self.merge_done = None;
+        // Completed merges are consumed with the installs — whether each one
+        // composed in or a collapse superseded it, this publish settled its
+        // fate either way.
+        self.merge_done.fill(None);
         // The sweep is complete the instant the installs land: everything
         // after the CAS is cleanup of the superseded generation. Marking it
         // here (not in the caller) is load-bearing — a failure below must
@@ -10252,12 +10272,13 @@ impl Checkpointer {
     }
 
     /// One beat's work for one table: computes its new SST list — carrying,
-    /// delta-flushing, fully rewriting, and paying at most one paced merge —
+    /// delta-flushing, rebuilding when no durable base remains, and applying
+    /// at most one completed paced merge —
     /// records it for the publish, and queues the storage installs that
     /// apply only after the manifest CAS lands. A compatible re-slice keeps
     /// the earlier immutable delta and appends only versions committed after
-    /// its captured LSN. Layout changes or a full generation roster fall back
-    /// to rebuilding from the published base.
+    /// its captured LSN. Relation replacements rebuild without a reusable
+    /// published base; filled generation rosters are merged before this beat.
     fn build_table_list(
         &mut self,
         storage: &mut Storage,
@@ -10318,10 +10339,9 @@ impl Checkpointer {
         // dirty table decides whether its new versions fit as a delta. A
         // retained slice already incorporated this merge.
         let completed = (!reuse_slice).then(|| {
-            self.merge_done.as_ref().and_then(|done| {
-                (done.slot == slot
-                    && pair_at(&self.slice_scratch, done.at)
-                        == Some((done.old0.handle, done.old1.handle)))
+            self.merge_done[slot].as_ref().and_then(|done| {
+                (pair_at(&self.slice_scratch, done.at)
+                    == Some((done.old0.handle, done.old1.handle)))
                 .then_some((done.at, done.merged))
             })
         });

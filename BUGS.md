@@ -170,14 +170,13 @@ profile plus actual PostgreSQL 18 comparison are recorded in PLAN.md.
 The checkpoint row-reslice audit found no externally blocked defect. Compatible
 stale slices now remain in the pending manifest and later slices include only
 newer committed versions. Startup-bounded generation LSNs preserve warm reads
-and guide later eviction, while physical-layout changes and full rosters take
-the rebuild path. Value-index work completes before the retained row slice is
-advanced so an I/O retry cannot duplicate an interval. Full-roster fallback
-now stages its replacement row list and value-index installs before discarding
-the retained slice, so a failed object write retries with the same tombstone
-and LSN boundary. A focused fault-injection regression, the storage VOPR
-corpus, checkpoint suite, clean profile, and object-cold recovery qualify the
-change; larger representative measurement remains in PLAN.md.
+and guide later eviction, while relation replacements rebuild without a
+reusable published base. Value-index work completes before the retained row
+slice is advanced so an I/O retry cannot duplicate an interval. Row lists and
+value-index installs are staged before discarding the retained slice, so a
+failed object write retries with the same tombstone and LSN boundary. A focused
+fault-injection regression, the storage VOPR corpus, checkpoint suite, clean
+profile, and object-cold recovery qualify the change.
 The 10,000-row checkpoint-scale audit found no externally blocked defect.
 Checkpoint reslices now retain unchanged staged value-index generations, and
 cold `ANALYZE`, `CREATE INDEX` validation, and value-cache population stream
@@ -185,6 +184,14 @@ the merged PAX cursor without per-row or per-column-range amplification. Full
 container reads remain limited to dense column demand, so selective query and
 startup cache paths preserve column pruning. The completed profile identifies
 the full-roster row rewrite as the next bounded-dispatch target in PLAN.md.
+The bounded full-roster audit found no externally blocked defect. Dirty filled
+generation lists now free a slot through restartable pair-merge beats before
+row publication. Completed merges use fixed startup storage per table, so
+several filled tables can join one manifest publish without an unbounded
+rewrite. Focused coverage interleaves foreground mutation across beats, injects
+object-store failure, checks configured merge exhaustion, and verifies warm and
+object-cold results. The repeated 10,000-row profile removed the 27.50-second
+`row_sst_full` event; remaining value-index dispatch work is tracked in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

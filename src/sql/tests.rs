@@ -65851,7 +65851,7 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
 }
 
 #[test]
-fn failed_full_roster_reslice_keeps_the_prior_slice_for_retry() {
+fn failed_full_roster_merge_keeps_the_prior_slice_for_retry() {
     let mut config = test_config("checkpoint-reslice-retry");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -65905,7 +65905,7 @@ fn failed_full_roster_reslice_keeps_the_prior_slice_for_retry() {
             .unwrap()
             .checkpoint_step(&mut engine.storage, &mut engine.scratch)
             .is_err(),
-        "the full-roster fallback must reach a fallible object-store write"
+        "the full-roster merge must reach a fallible object-store write"
     );
     namespace.borrow_mut().faults.transient_per_mille = 0;
 
@@ -65931,6 +65931,179 @@ fn failed_full_roster_reslice_keeps_the_prior_slice_for_retry() {
              SELECT value FROM retry_tail WHERE id = 1"
         )),
         ["2|survives", "after"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
+    let mut config = test_config("checkpoint-full-roster-pacing");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket =
+        format!("sql-checkpoint-full-roster-pacing-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.max_spill_generations_per_table = 2;
+    config.table_rows = 512;
+    config.value_index_rows = 512;
+    config.memtable_bytes = 4 << 20;
+    config.wal_bytes = 8 << 20;
+    config.wal_buffer_bytes = 2 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE paced_full_roster (id integer PRIMARY KEY, value text); \
+         CREATE TABLE paced_full_roster_peer (id integer PRIMARY KEY, value text); \
+         INSERT INTO paced_full_roster \
+           SELECT id, repeat('a', 1024) FROM generate_series(1,256) id; \
+         INSERT INTO paced_full_roster_peer \
+           SELECT id, repeat('a', 1024) FROM generate_series(1,256) id",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+
+    let table = engine
+        .storage
+        .find_table("public", "paced_full_roster")
+        .unwrap();
+    let peer = engine
+        .storage
+        .find_table("public", "paced_full_roster_peer")
+        .unwrap();
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_full_roster SET value = repeat('b', 1024); \
+         UPDATE paced_full_roster_peer SET value = repeat('b', 1024)",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(table),
+        2
+    );
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(peer),
+        2
+    );
+
+    let changed_again = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_full_roster SET value = repeat('c', 1024) WHERE id = 128; \
+         UPDATE paced_full_roster_peer SET value = repeat('d', 1024) WHERE id = 129",
+    );
+    assert!(!message_types(&changed_again).contains(&b'E'));
+    let mut beats = 0usize;
+    let published_lsn = loop {
+        let before = engine.storage.block_io_stats();
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        let beat = engine.storage.block_io_stats().saturating_sub(before);
+        assert!(
+            beat.object_gets <= 64,
+            "one checkpoint beat read too much: {beat:?}"
+        );
+        assert!(
+            beat.object_puts <= 16,
+            "one checkpoint beat wrote too much: {beat:?}"
+        );
+        beats += 1;
+        if beats == 2 {
+            let interleaved = run_with(
+                &mut engine,
+                &mut budget,
+                "UPDATE paced_full_roster SET value = repeat('e', 1024) WHERE id = 130",
+            );
+            assert!(!message_types(&interleaved).contains(&b'E'));
+        }
+        match step {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("dirty full roster became idle before publication")
+            }
+        }
+        assert!(beats < 128, "full-roster merges did not converge");
+    };
+    assert!(
+        beats > 3,
+        "full roster was not paced across checkpoint beats"
+    );
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(table),
+        2,
+        "the merged pair must leave room for the new delta"
+    );
+    assert_eq!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .published_spill_generation_count(peer),
+        2,
+        "every filled roster must merge before the shared publish"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT length(value), count(*) FROM paced_full_roster GROUP BY length(value); \
+             SELECT value = repeat('c', 1024) FROM paced_full_roster WHERE id = 128; \
+             SELECT value = repeat('e', 1024) FROM paced_full_roster WHERE id = 130; \
+             SELECT value = repeat('d', 1024) FROM paced_full_roster_peer WHERE id = 129",
+        )),
+        ["1024|256", "t", "t", "t"]
+    );
+
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*), count(*) FILTER (WHERE value IN (repeat('c', 1024), repeat('e', 1024))) \
+               FROM paced_full_roster; \
+             SELECT count(*), count(*) FILTER (WHERE value = repeat('d', 1024)) \
+               FROM paced_full_roster_peer",
+        )),
+        ["256|2", "256|1"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

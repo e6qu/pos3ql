@@ -230,12 +230,11 @@ completed the matched SQL and checkpoint workload on its recorded local
 durable tier. These shared-host measurements are exploratory and do not equate
 PostgreSQL storage with pos3ql object traffic.
 Checkpoint row reslicing now retains a compatible earlier slice and appends
-only versions committed after its captured LSN. Physical-layout changes and a
-full generation roster rebuild from the published base. Fixed startup metadata
+only versions committed after its captured LSN. Relation replacements rebuild
+without a reusable published base. Fixed startup metadata
 preserves warm reads after publication and maps rows to their containing SST
-when later memory pressure evicts them. Full-roster fallback also stages its
-replacement row list and value-index installs in fixed startup scratch, so an
-object-store failure retains the earlier slice and its LSN boundary for retry.
+when later memory pressure evicts them. Filled generation rosters retain their
+slice and LSN boundary through an object-store failure.
 A deterministic regression reduced a one-row reslice from the first slice's 13
 block PUTs to 5; focused fault injection and the storage VOPR corpus qualify
 retry, deferred eviction, and object-cold recovery. The
@@ -253,11 +252,24 @@ seconds and wrote 1,017 blocks, while 13 row deltas took 0.92 seconds and wrote
 197. Most value-index events read no durable blocks, confirming that unchanged
 staged bindings were retained. One full-roster row rewrite remained the largest
 individual event at 27.50 seconds, 6,600 block reads, and 1,337 writes; it drove
-the 30.27-second maximum foreground latency. Next, make that fallback a bounded,
-restartable sequence of checkpoint beats and repeat this exact profile before
-changing the durable row representation. Then apply the same dispatch bound to
-the remaining affected value-index writers if their roughly 2.7-second events
-still control foreground tails.
+the 30.27-second maximum foreground latency.
+The [bounded full-roster rerun](benchmarks/baselines/2026-09-21-checkpoint-full-roster-bounded-10000/README.md)
+replaces that rewrite with restartable pair-merge beats. One fixed completed
+merge slot per table lets several filled rosters prepare for one manifest
+publish. A deterministic two-table regression interleaves a foreground update,
+bounds each dispatch, injects an object-store failure, and verifies warm and
+object-cold results. The exact profile contained no `row_sst_full` event: 64
+schedule beats read 4,712 blocks over 16.10 seconds, and 207 write beats wrote
+844 blocks over 4.24 seconds. Their largest events were 447.94 ms and 61.66 ms,
+versus the former 27.50-second dispatch. Maximum foreground latency fell from
+30.27 to 6.24 seconds, while p99 fell from 5.60 to 4.03 seconds. The workload's
+other event counts changed, so these shared-host results remain diagnostic
+rather than a controlled production ratio. Actual PostgreSQL 18.6 completed
+the matched local-durable workload at 3.90 ms p99 and 79.31 ms maximum latency.
+The remaining largest checkpoint event is a 3.91-second affected value-index
+publication. Apply the same dispatch bound to value-index writers, preserving
+their fixed-memory external-sort and generation-reuse behavior, then repeat the
+10,000-row profile before changing the durable row representation.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

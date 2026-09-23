@@ -10673,7 +10673,7 @@ impl Checkpointer {
         let reuse_slice = self.sliced_this_sweep[slot]
             && self.sliced_layout[slot] == layout
             && self.prev_scratch[slot].n < self.prev_scratch[slot].capacity();
-        let changed_after_lsn = reuse_slice.then_some(self.sliced_lsn[slot]);
+        let slice_after_lsn = reuse_slice.then_some(self.sliced_lsn[slot]);
         if reuse_slice {
             self.slice_scratch.copy_from(&self.prev_scratch[slot]);
         } else {
@@ -10701,15 +10701,19 @@ impl Checkpointer {
         }
         // A clean table carries its whole SST list forward untouched.
         let clean = !storage.table(slot).dirty && self.slice_scratch.n > 0;
-        // A dirty table with spilled SSTs and room flushes a *delta*:
-        // its heap-resident committed rows plus deletion markers retained in
-        // the row overlay since the last checkpoint. Otherwise it rewrites
-        // fully. The overlay is already startup-sized by `table_rows`, so
-        // there is no second compiled tombstone limit.
+        // A dirty table with spilled SSTs and room flushes a *delta* from the
+        // committed row identities retained in the overlay since the last
+        // checkpoint. Otherwise it rewrites fully. The overlay is already
+        // startup-sized by `table_rows`, so there is no second row-id limit.
         let delta = !clean
             && storage.table(slot).dirty
             && self.slice_scratch.n > 0
             && self.slice_scratch.n < self.slice_scratch.capacity();
+        let changed_row_after_lsn = delta.then_some(if reuse_slice {
+            self.sliced_lsn[slot]
+        } else {
+            self.manifest_lsn
+        });
         if storage.has_active_snapshots()
             && !clean
             && storage.table(slot).n_spill_ssts > 0
@@ -10739,20 +10743,7 @@ impl Checkpointer {
                 if !has_version {
                     return Ok(ControlFlow::Continue(()));
                 }
-                let after_slice = |lsn: u64| changed_after_lsn.is_none_or(|floor| lsn > floor);
-                let resident = ((matches!(state.committed, Some(RowHome::Heap(_)))
-                    || (state.committed.is_none() && state.committed_lsn != 0))
-                    && after_slice(state.committed_lsn))
-                    || (0..state.history.len()).any(|index| {
-                        storage
-                            .row_history_get(state, index)
-                            .is_some_and(|version| {
-                                after_slice(version.lsn)
-                                    && (version.home.is_none()
-                                        || matches!(version.home, Some(RowHome::Heap(_))))
-                            })
-                    });
-                if delta && !resident {
+                if changed_row_after_lsn.is_some_and(|floor| state.checkpoint_change_lsn <= floor) {
                     return Ok(ControlFlow::Continue(()));
                 }
                 let marker = state
@@ -10771,11 +10762,15 @@ impl Checkpointer {
                 })?;
                 Ok(ControlFlow::Continue(()))
             };
-            // A row changed after the prior slice can already have spilled
-            // before this checkpoint begins. Walk the complete logical row
-            // set, then let `resident` select the heap image or spilled
-            // tombstone/version that belongs in this delta.
-            storage.for_each_row_state(slot, &mut collect)?;
+            // Unpublished row identities remain in the fixed-capacity overlay
+            // even when their bytes spill. Delta discovery therefore avoids a
+            // complete walk of the immutable table; full rewrites still need
+            // that complete logical stream.
+            if delta {
+                let _ = storage.for_each_resident_row_state(slot, &mut collect)?;
+            } else {
+                storage.for_each_row_state(slot, &mut collect)?;
+            }
             sort_scratch
                 .as_mut_slice()
                 .sort_unstable_by_key(|(rowid, _)| *rowid);
@@ -10807,11 +10802,19 @@ impl Checkpointer {
                     continue;
                 };
                 let mut append_version = |commit_lsn: u64,
-                                          home: Option<RowHome>|
+                                          home: Option<RowHome>,
+                                          current: bool|
                  -> Result<(), SqlError> {
-                    if delta
-                        && (changed_after_lsn.is_some_and(|floor| commit_lsn <= floor)
-                            || home.is_some_and(|location| !matches!(location, RowHome::Heap(_))))
+                    // Ordinary deltas repeat resident Heap and tombstone
+                    // history so pair-merge pruning can retain a pinned
+                    // snapshot. Spilled history is already in the base.
+                    // A reslice appends only work newer than its prior
+                    // immutable slice.
+                    if slice_after_lsn.is_some_and(|floor| commit_lsn <= floor)
+                        || (!current
+                            && home.is_some_and(|location| {
+                                matches!(location, RowHome::Spilled { .. })
+                            }))
                     {
                         return Ok(());
                     }
@@ -10844,11 +10847,11 @@ impl Checkpointer {
                     Ok(())
                 };
                 if state.committed.is_some() || state.committed_lsn != 0 {
-                    append_version(state.committed_lsn, state.committed)?;
+                    append_version(state.committed_lsn, state.committed, true)?;
                 }
                 for index in 0..state.history.len() {
                     if let Some(version) = storage.row_history_get(state, index) {
-                        append_version(version.lsn, version.home)?;
+                        append_version(version.lsn, version.home, false)?;
                     }
                 }
             }

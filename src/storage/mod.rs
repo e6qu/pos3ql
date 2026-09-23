@@ -2109,6 +2109,10 @@ pub struct RowState {
     /// absent but the entry shadows an older SST row. Zero means no committed
     /// image has been installed.
     pub committed_lsn: u64,
+    /// Latest committed row change not yet captured by a published row SST.
+    /// Keeping this identity in the bounded overlay lets delta checkpoints
+    /// avoid a complete immutable-table walk even if the row bytes spill.
+    pub(crate) checkpoint_change_lsn: u64,
     /// Older committed images retained while a repeatable-read snapshot can
     /// still see them. Their bytes remain in the heap or in immutable SST
     /// generations; WAL/SST objects, not this metadata, are the durable copy.
@@ -2470,6 +2474,7 @@ impl RowState {
         Self {
             committed: Some(RowHome::Heap(loc)),
             committed_lsn: commit_lsn,
+            checkpoint_change_lsn: commit_lsn,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         }
@@ -25126,6 +25131,7 @@ impl Storage {
                         commit_lsn,
                     }),
                     committed_lsn: commit_lsn,
+                    checkpoint_change_lsn: 0,
                     history: CommittedHistory::empty(),
                     pending: PendingVersions::empty(),
                 },
@@ -25381,6 +25387,7 @@ impl Storage {
 
     fn redundant_spilled_row_state(state: &RowState) -> bool {
         matches!(state.committed, Some(RowHome::Spilled { .. }))
+            && state.checkpoint_change_lsn == 0
             && state.history.is_empty()
             && state.pending.is_none()
     }
@@ -25400,6 +25407,7 @@ impl Storage {
                         commit_lsn: version.commit_lsn,
                     }),
                     committed_lsn: version.commit_lsn,
+                    checkpoint_change_lsn: 0,
                     history: CommittedHistory::empty(),
                     pending: PendingVersions::empty(),
                 })
@@ -26083,7 +26091,11 @@ impl Storage {
 
     pub(crate) fn clear_table_dirty_through(&mut self, slot: usize, generation: u64) {
         if self.tables[slot].generation == generation {
-            self.tables[slot].dirty = false;
+            let table = &mut self.tables[slot];
+            table.dirty = false;
+            for (_, state) in table.rows.iter_mut() {
+                state.checkpoint_change_lsn = 0;
+            }
         }
     }
 
@@ -26620,6 +26632,9 @@ impl Storage {
         for (slot, t) in self.tables.iter_mut().enumerate() {
             if generations.get(slot).copied() == Some(t.generation) {
                 t.dirty = false;
+                for (_, state) in t.rows.iter_mut() {
+                    state.checkpoint_change_lsn = 0;
+                }
             }
             t.statistics_dirty = false;
             t.statistics_wal_dirty = false;
@@ -26932,6 +26947,7 @@ impl Storage {
                 RowState {
                     committed,
                     committed_lsn,
+                    checkpoint_change_lsn: 0,
                     history: CommittedHistory::empty(),
                     pending,
                 },
@@ -27150,37 +27166,53 @@ impl Storage {
         }
     }
 
-    /// Promotes a row's pending change to committed. The WAL record must
-    /// already be durable.
     /// Removes a committed row outright (journal replay of a DELETE), retaining
     /// the shadowing marker a later delta checkpoint emits as a tombstone.
-    pub fn remove_committed(&mut self, table_index: usize, rowid: u64, commit_lsn: u64) {
+    pub fn remove_committed(
+        &mut self,
+        table_index: usize,
+        rowid: u64,
+        commit_lsn: u64,
+    ) -> Result<(), SqlError> {
         if self.tables[table_index].n_spill_ssts == 0 {
             if self.remove_row_state(table_index, rowid).is_some() {
                 self.mark_value_bindings_changed_at(table_index, commit_lsn);
                 self.tables[table_index].mark_dirty();
             }
-            return;
+            return Ok(());
         }
         // The spill list may hold this row, so the delete must both
         // tombstone (for the next flush) and leave a shadowing marker (for
         // reads until then) — same discipline as a committed DELETE.
         self.remove_row_state(table_index, rowid);
         let table = &mut self.tables[table_index];
-        let _ = table.rows.insert(
-            rowid,
-            RowState {
-                committed: None,
-                committed_lsn: commit_lsn,
-                history: CommittedHistory::empty(),
-                pending: PendingVersions::empty(),
-            },
-        );
+        table
+            .rows
+            .insert(
+                rowid,
+                RowState {
+                    committed: None,
+                    committed_lsn: commit_lsn,
+                    checkpoint_change_lsn: commit_lsn,
+                    history: CommittedHistory::empty(),
+                    pending: PendingVersions::empty(),
+                },
+            )
+            .map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "journal replay overflows {}",
+                    error.what
+                )
+            })?;
         self.mark_value_bindings_changed_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
+        Ok(())
     }
 
+    /// Promotes a row's pending change to committed. The WAL record must
+    /// already be durable.
     pub fn commit_row(&mut self, table_index: usize, rowid: u64, txid: u32, commit_lsn: u64) {
         // Read the transition without holding a mutable borrow.
         let (old_committed, old_lsn, pending) = {
@@ -27244,6 +27276,7 @@ impl Storage {
             }
             state.committed = new_loc.map(RowHome::Heap);
             state.committed_lsn = commit_lsn;
+            state.checkpoint_change_lsn = commit_lsn;
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
@@ -27305,6 +27338,7 @@ impl Storage {
             prune_committed_history(committed_versions, committed_free, &mut state.history, None);
             state.committed = new_loc.map(RowHome::Heap);
             state.committed_lsn = commit_lsn;
+            state.checkpoint_change_lsn = commit_lsn;
             clear_pending_versions(pending_versions, pending_free, &mut state.pending);
         }
         let table = &mut self.tables[table_index];
@@ -45078,6 +45112,24 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_spilled_row_state_is_not_redundant() {
+        let mut state = RowState {
+            committed: Some(RowHome::Spilled {
+                len: 4,
+                sst: 0,
+                commit_lsn: 42,
+            }),
+            committed_lsn: 42,
+            checkpoint_change_lsn: 42,
+            history: CommittedHistory::empty(),
+            pending: PendingVersions::empty(),
+        };
+        assert!(!Storage::redundant_spilled_row_state(&state));
+        state.checkpoint_change_lsn = 0;
+        assert!(Storage::redundant_spilled_row_state(&state));
+    }
+
+    #[test]
     fn comment_class_codec_rejects_unknown_values() {
         for class in [
             CommentClass::Relation,
@@ -45443,12 +45495,32 @@ mod tests {
             ))
             .unwrap();
         let captured = storage.table(slot).generation;
+        let _ = storage.tables[slot].rows.insert(
+            1,
+            RowState::committed_only_at(RowLoc { offset: 0, len: 4 }, 42),
+        );
         storage.table_mut(slot).mark_dirty();
         storage.clear_dirty_through(&[captured]);
         assert!(storage.table(slot).dirty);
+        assert_eq!(
+            storage.tables[slot]
+                .rows
+                .get(&1)
+                .unwrap()
+                .checkpoint_change_lsn,
+            42
+        );
         let current = storage.table(slot).generation;
         storage.clear_dirty_through(&[current]);
         assert!(!storage.table(slot).dirty);
+        assert_eq!(
+            storage.tables[slot]
+                .rows
+                .get(&1)
+                .unwrap()
+                .checkpoint_change_lsn,
+            0
+        );
     }
 
     #[test]
@@ -45561,6 +45633,7 @@ mod tests {
         let mut state = RowState {
             committed: None,
             committed_lsn: 0,
+            checkpoint_change_lsn: 0,
             history: CommittedHistory::empty(),
             pending: PendingVersions::empty(),
         };

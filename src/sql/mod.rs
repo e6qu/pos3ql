@@ -19526,7 +19526,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),
                 });
             };
-            storage.remove_committed(index, rowid, lsn);
+            storage.remove_committed(index, rowid, lsn)?;
         }
         WalOp::CreateView {
             schema,

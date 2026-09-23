@@ -66385,6 +66385,8 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
     config.object_store_bucket =
         format!("sql-checkpoint-incremental-reslice-{}", std::process::id());
     config.object_store_response_bytes = 1 << 20;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
     config.table_rows = 512;
     config.value_index_rows = 512;
     config.memtable_bytes = 8 << 20;
@@ -66414,6 +66416,8 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
         .find_table("public", "resliced_rows")
         .unwrap();
     engine.storage.evict_committed_table(table);
+    engine.storage.evict_redundant_entries(table);
+    assert!(engine.storage.spill_rows_are_unshadowed(table));
 
     let changed = run_with(
         &mut engine,
@@ -66469,6 +66473,14 @@ fn checkpoint_reslice_appends_only_commits_after_the_prior_slice() {
             break engine.storage.block_io_stats().saturating_sub(before);
         }
     };
+    assert_eq!(
+        first_slice.object_gets, 0,
+        "delta discovery must not scan the object-cold immutable table: {first_slice:?}"
+    );
+    assert_eq!(
+        reslice.object_gets, 0,
+        "incremental reslice discovery must retain exact changed identities: {reslice:?}"
+    );
     assert_eq!(
         first_slice.object_puts, 4,
         "the initial delta should use one packed container: {first_slice:?}"

@@ -49,12 +49,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-S3_PORT=$(claim_test_port "${POS3QL_BENCH_S3_PORT:-}" 19500 19599)
-POS3QL_PORT=$(claim_test_port "${POS3QL_BENCH_PORT:-}" 19600 19699)
+POS3QL_PORT=
 OBJECT_STORE=${POS3QL_BENCH_OBJECT_STORE:-fixture}
 case "$OBJECT_STORE" in
-  fixture|minio|seaweedfs) ;;
-  *) echo "POS3QL_BENCH_OBJECT_STORE must be fixture, minio, or seaweedfs" >&2; exit 2 ;;
+  fixture|minio|seaweedfs|external) ;;
+  *) echo "POS3QL_BENCH_OBJECT_STORE must be fixture, minio, seaweedfs, or external" >&2; exit 2 ;;
 esac
 if [ "$OBJECT_STORE" = fixture ]; then
   LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-2}
@@ -63,22 +62,32 @@ else
   LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-0}
   OBJECT_LATENCY_INJECTED=0
   if [ "$LATENCY_MS" != 0 ]; then
-    echo "POS3QL_BENCH_OBJECT_LATENCY_MS must be 0 for MinIO and SeaweedFS" >&2
+    echo "POS3QL_BENCH_OBJECT_LATENCY_MS must be 0 for MinIO, SeaweedFS, and external services" >&2
     exit 2
   fi
 fi
 METRICS=
-OBJECT_STORE_ENDPOINT="127.0.0.1:$S3_PORT"
+S3_PORT=
+OBJECT_STORE_ENDPOINT=
 OBJECT_STORE_BUCKET=performance
 OBJECT_STORE_REGION=benchmark
 OBJECT_STORE_ACCESS_KEY=benchmark
 OBJECT_STORE_SECRET_KEY=benchmark-secret
+OBJECT_STORE_SESSION_TOKEN=
+OBJECT_STORE_ADDRESSING=path
+OBJECT_STORE_TLS=off
+OBJECT_STORE_TLS_CA_FILE=
+OBJECT_STORE_PREFIX_ROOT=
 OBJECT_STORE_IMPLEMENTATION=
 OBJECT_STORE_BACKING=
 OBJECT_STORE_IMAGE=
 OBJECT_STORE_IMAGE_ID=
 OBJECT_STORE_INDEPENDENT_IMPLEMENTATION=0
+OBJECT_STORE_INDEPENDENTLY_OPERATED=0
 OBJECT_STORE_REQUEST_METRICS=0
+BENCHMARK_HARDWARE_DESCRIPTION="automatic host inventory only"
+BENCHMARK_NETWORK_DESCRIPTION="object store on the benchmark host"
+CACHE_STORAGE_DESCRIPTION="temporary local directory; host backing unspecified"
 DISK_CACHE_MIB=${POS3QL_BENCH_DISK_CACHE_MIB:-128}
 BENCH_TIMEOUT_SECONDS=${POS3QL_BENCH_TIMEOUT_SECONDS:-30}
 CHECKPOINT_PROFILE=${POS3QL_BENCH_CHECKPOINT_PROFILE:-0}
@@ -102,7 +111,43 @@ if [[ "$CHECKPOINT_PROFILE" = 1 && "$MODE" != checkpoint ]]; then
 fi
 export POS3QL_BENCH_TIMEOUT_SECONDS=$BENCH_TIMEOUT_SECONDS
 
-if [ "$OBJECT_STORE" = fixture ]; then
+if [ "$OBJECT_STORE" = external ]; then
+  OBJECT_STORE_ENDPOINT=${POS3QL_BENCH_OBJECT_STORE_ENDPOINT:?POS3QL_BENCH_OBJECT_STORE_ENDPOINT must be host:port for an external object store}
+  OBJECT_STORE_BUCKET=${POS3QL_BENCH_OBJECT_STORE_BUCKET:?POS3QL_BENCH_OBJECT_STORE_BUCKET is required for an external object store}
+  OBJECT_STORE_REGION=${POS3QL_BENCH_OBJECT_STORE_REGION:?POS3QL_BENCH_OBJECT_STORE_REGION is required for an external object store}
+  OBJECT_STORE_ACCESS_KEY=${POS3QL_BENCH_OBJECT_STORE_ACCESS_KEY:?POS3QL_BENCH_OBJECT_STORE_ACCESS_KEY is required for an external object store}
+  OBJECT_STORE_SECRET_KEY=${POS3QL_BENCH_OBJECT_STORE_SECRET_KEY:?POS3QL_BENCH_OBJECT_STORE_SECRET_KEY is required for an external object store}
+  OBJECT_STORE_SESSION_TOKEN=${POS3QL_BENCH_OBJECT_STORE_SESSION_TOKEN:-}
+  OBJECT_STORE_ADDRESSING=${POS3QL_BENCH_OBJECT_STORE_ADDRESSING:-path}
+  OBJECT_STORE_TLS=${POS3QL_BENCH_OBJECT_STORE_TLS:-on}
+  OBJECT_STORE_TLS_CA_FILE=${POS3QL_BENCH_OBJECT_STORE_TLS_CA_FILE:-}
+  OBJECT_STORE_PREFIX_ROOT=${POS3QL_BENCH_OBJECT_STORE_PREFIX:-performance-$(date -u +%Y%m%dT%H%M%SZ)-$$}
+  OBJECT_STORE_IMPLEMENTATION=${POS3QL_BENCH_OBJECT_STORE_IMPLEMENTATION:?POS3QL_BENCH_OBJECT_STORE_IMPLEMENTATION must identify the external service and available version}
+  OBJECT_STORE_BACKING=${POS3QL_BENCH_OBJECT_STORE_BACKING:?POS3QL_BENCH_OBJECT_STORE_BACKING must describe the external durable tier}
+  BENCHMARK_HARDWARE_DESCRIPTION=${POS3QL_BENCH_HARDWARE_DESCRIPTION:?POS3QL_BENCH_HARDWARE_DESCRIPTION must identify the pinned benchmark host}
+  BENCHMARK_NETWORK_DESCRIPTION=${POS3QL_BENCH_NETWORK_DESCRIPTION:?POS3QL_BENCH_NETWORK_DESCRIPTION must describe the path to the external object store}
+  CACHE_STORAGE_DESCRIPTION=${POS3QL_BENCH_CACHE_STORAGE:?POS3QL_BENCH_CACHE_STORAGE must describe the local cache storage}
+  if [ "$MODE" != smoke ]; then
+    : "${POS3QL_BENCH_POSTGRES_STORAGE:?POS3QL_BENCH_POSTGRES_STORAGE must describe the host-available PostgreSQL storage}"
+    : "${POS3QL_BENCH_MATCHED_POSTGRES_STORAGE:?POS3QL_BENCH_MATCHED_POSTGRES_STORAGE must describe the resource-matched PostgreSQL storage}"
+  fi
+  if [ "${POS3QL_BENCH_OBJECT_STORE_INDEPENDENTLY_OPERATED:-}" != 1 ]; then
+    echo "external object-store runs require POS3QL_BENCH_OBJECT_STORE_INDEPENDENTLY_OPERATED=1" >&2
+    exit 2
+  fi
+  if [ "$OBJECT_STORE_TLS" != on ]; then
+    echo "external object-store runs require POS3QL_BENCH_OBJECT_STORE_TLS=on" >&2
+    exit 2
+  fi
+  case "$OBJECT_STORE_ADDRESSING" in
+    path|virtual_hosted) ;;
+    *) echo "POS3QL_BENCH_OBJECT_STORE_ADDRESSING must be path or virtual_hosted" >&2; exit 2 ;;
+  esac
+  OBJECT_STORE_INDEPENDENT_IMPLEMENTATION=1
+  OBJECT_STORE_INDEPENDENTLY_OPERATED=1
+elif [ "$OBJECT_STORE" = fixture ]; then
+  S3_PORT=$(claim_test_port "${POS3QL_BENCH_S3_PORT:-}" 19500 19599)
+  OBJECT_STORE_ENDPOINT="127.0.0.1:$S3_PORT"
   METRICS="$WORK/object-store-metrics.json"
   OBJECT_STORE_REQUEST_METRICS=1
   OBJECT_STORE_IMPLEMENTATION=tests/external/s3_test_server.py
@@ -114,6 +159,8 @@ if [ "$OBJECT_STORE" = fixture ]; then
     --metrics-file "$METRICS" --latency-ms "$LATENCY_MS" &
   S3_PID=$!
 else
+  S3_PORT=$(claim_test_port "${POS3QL_BENCH_S3_PORT:-}" 19500 19599)
+  OBJECT_STORE_ENDPOINT="127.0.0.1:$S3_PORT"
   command -v docker >/dev/null 2>&1 || {
     echo "Docker is required for the $OBJECT_STORE benchmark backend" >&2
     exit 1
@@ -140,24 +187,26 @@ else
   fi
 fi
 
-for attempt in $(seq 1 100); do
-  if [ -n "$S3_PID" ] && ! server_alive "$S3_PID"; then
-    echo "object-store fixture exited at startup" >&2
-    exit 1
-  fi
-  if [ -n "$OBJECT_STORE_CONTAINER" ] &&
-     [ "$(docker inspect --format '{{.State.Running}}' "$OBJECT_STORE_CONTAINER")" != true ]; then
-    docker logs "$OBJECT_STORE_CONTAINER" >&2
-    exit 1
-  fi
-  if nc -z 127.0.0.1 "$S3_PORT" >/dev/null 2>&1; then break; fi
-  if [ "$attempt" = 100 ]; then
-    [ -z "$OBJECT_STORE_CONTAINER" ] || docker logs "$OBJECT_STORE_CONTAINER" >&2
-    echo "$OBJECT_STORE object store did not start" >&2
-    exit 1
-  fi
-  sleep 0.05
-done
+if [ "$OBJECT_STORE" != external ]; then
+  for attempt in $(seq 1 100); do
+    if [ -n "$S3_PID" ] && ! server_alive "$S3_PID"; then
+      echo "object-store fixture exited at startup" >&2
+      exit 1
+    fi
+    if [ -n "$OBJECT_STORE_CONTAINER" ] &&
+       [ "$(docker inspect --format '{{.State.Running}}' "$OBJECT_STORE_CONTAINER")" != true ]; then
+      docker logs "$OBJECT_STORE_CONTAINER" >&2
+      exit 1
+    fi
+    if nc -z 127.0.0.1 "$S3_PORT" >/dev/null 2>&1; then break; fi
+    if [ "$attempt" = 100 ]; then
+      [ -z "$OBJECT_STORE_CONTAINER" ] || docker logs "$OBJECT_STORE_CONTAINER" >&2
+      echo "$OBJECT_STORE object store did not start" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+fi
 if [ -n "$OBJECT_STORE_CONTAINER" ]; then
   for attempt in $(seq 1 100); do
     if curl --silent --output /dev/null "http://$OBJECT_STORE_ENDPOINT/"; then break; fi
@@ -185,6 +234,8 @@ if [ -n "$OBJECT_STORE_CONTAINER" ]; then
   printf '%s\n' "$OBJECT_STORE_IMAGE_ID" >"$OUTPUT/object-store-image-id.txt"
 fi
 
+POS3QL_PORT=$(claim_test_port "${POS3QL_BENCH_PORT:-}" 19600 19699)
+
 if [ "$CHECKPOINT_PROFILE" = 1 ]; then
   cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" \
     --features checkpoint-profile
@@ -197,6 +248,10 @@ write_config() {
   data=$2
   prefix=$3
   port=$4
+  object_prefix=$prefix
+  if [ -n "$OBJECT_STORE_PREFIX_ROOT" ]; then
+    object_prefix="${OBJECT_STORE_PREFIX_ROOT%/}/$prefix"
+  fi
   cat >"$config" <<EOF
 listen_addr = 127.0.0.1:$port
 data_dir = $data
@@ -236,10 +291,14 @@ subscription_arena_bytes = 512 KiB
 object_store = on
 object_store_endpoint = $OBJECT_STORE_ENDPOINT
 object_store_bucket = $OBJECT_STORE_BUCKET
-object_store_prefix = $prefix
+object_store_prefix = $object_prefix
 object_store_region = $OBJECT_STORE_REGION
 object_store_access_key = $OBJECT_STORE_ACCESS_KEY
 object_store_secret_key = $OBJECT_STORE_SECRET_KEY
+object_store_session_token = $OBJECT_STORE_SESSION_TOKEN
+object_store_addressing = $OBJECT_STORE_ADDRESSING
+object_store_tls = $OBJECT_STORE_TLS
+object_store_tls_ca_file = $OBJECT_STORE_TLS_CA_FILE
 object_store_response_bytes = 512 KiB
 object_store_get_slots = 4
 wal_upload = on
@@ -357,7 +416,7 @@ start_postgresql_baseline() {
       ;;
     resource-matched)
       POSTGRES_PORT=
-      postgres_storage="Docker-managed local volume; host backing unspecified; container limits recorded"
+      postgres_storage=${POS3QL_BENCH_MATCHED_POSTGRES_STORAGE:-Docker-managed local volume; host backing unspecified; container limits recorded}
       server_output="$OUTPUT/postgresql-matched-server.json"
       image_output="$OUTPUT/postgresql-matched-image-id.txt"
       ;;
@@ -523,7 +582,18 @@ python3 "$ROOT/tools/benchmark-environment.py" \
   --object-store-image "$OBJECT_STORE_IMAGE" \
   --object-store-image-id "$OBJECT_STORE_IMAGE_ID" \
   --object-store-independent-implementation "$OBJECT_STORE_INDEPENDENT_IMPLEMENTATION" \
+  --object-store-independently-operated "$OBJECT_STORE_INDEPENDENTLY_OPERATED" \
   --object-store-request-metrics "$OBJECT_STORE_REQUEST_METRICS" \
+  --object-store-endpoint "$OBJECT_STORE_ENDPOINT" \
+  --object-store-bucket "$OBJECT_STORE_BUCKET" \
+  --object-store-prefix "$OBJECT_STORE_PREFIX_ROOT" \
+  --object-store-region "$OBJECT_STORE_REGION" \
+  --object-store-addressing "$OBJECT_STORE_ADDRESSING" \
+  --object-store-tls "$([ "$OBJECT_STORE_TLS" = on ] && echo 1 || echo 0)" \
+  --object-store-tls-ca-file "$OBJECT_STORE_TLS_CA_FILE" \
+  --hardware-description "$BENCHMARK_HARDWARE_DESCRIPTION" \
+  --network-description "$BENCHMARK_NETWORK_DESCRIPTION" \
+  --cache-storage-description "$CACHE_STORAGE_DESCRIPTION" \
   --disk-cache-mib "$DISK_CACHE_MIB" --timeout-seconds "$BENCH_TIMEOUT_SECONDS" \
   --checkpoint-profile "$CHECKPOINT_PROFILE" \
   --checkpoint-duration-seconds "$CHECKPOINT_DURATION"

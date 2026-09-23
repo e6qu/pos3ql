@@ -458,6 +458,17 @@ prevent a controlled production ratio. The resource constraint and provenance
 are now explicit; the representative independently operated run remains
 outstanding.
 
+The benchmark harness now has a strict `external` object-store profile for
+that remaining run. It requires TLS and an explicit assertion that the service
+is independently operated, uses a fresh recorded object prefix, supports
+temporary session credentials and path or virtual-hosted addressing, and keeps
+all credentials out of retained artifacts. Retained evidence records the
+service identity, endpoint, bucket, region, backing storage, network path,
+pinned host, cache storage, and both PostgreSQL storage descriptions. Derived
+reports distinguish this topology from exploratory same-host services. The
+long-running measurement and publication below still require representative
+infrastructure and remain outstanding.
+
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local
 storage medium and durability settings and pos3ql's object store, network,

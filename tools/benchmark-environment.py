@@ -52,7 +52,22 @@ def main():
     parser.add_argument(
         "--object-store-independent-implementation", type=int, choices=(0, 1), required=True
     )
+    parser.add_argument(
+        "--object-store-independently-operated", type=int, choices=(0, 1), required=True
+    )
     parser.add_argument("--object-store-request-metrics", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--object-store-endpoint", required=True)
+    parser.add_argument("--object-store-bucket", required=True)
+    parser.add_argument("--object-store-prefix", required=True)
+    parser.add_argument("--object-store-region", required=True)
+    parser.add_argument(
+        "--object-store-addressing", choices=("path", "virtual_hosted"), required=True
+    )
+    parser.add_argument("--object-store-tls", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--object-store-tls-ca-file", default="")
+    parser.add_argument("--hardware-description", required=True)
+    parser.add_argument("--network-description", required=True)
+    parser.add_argument("--cache-storage-description", required=True)
     parser.add_argument("--disk-cache-mib", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument("--checkpoint-profile", type=int, choices=(0, 1), default=0)
@@ -64,7 +79,18 @@ def main():
         parser.error("object latency must be nonnegative and finite")
     if args.mode == "checkpoint" and args.checkpoint_duration_seconds == 0:
         parser.error("checkpoint mode requires a positive duration")
+    if args.object_store_independently_operated:
+        if not args.object_store_independent_implementation:
+            parser.error("an independently operated object store must be an independent implementation")
+        if not args.object_store_tls:
+            parser.error("an independently operated object store must use TLS")
+        if not args.object_store_prefix:
+            parser.error("an independently operated object store requires an isolated prefix")
     binary_bytes = args.binary.read_bytes()
+    tls_ca_sha256 = None
+    if args.object_store_tls_ca_file:
+        tls_ca_bytes = pathlib.Path(args.object_store_tls_ca_file).read_bytes()
+        tls_ca_sha256 = hashlib.sha256(tls_ca_bytes).hexdigest()
     status = command("git", "status", "--porcelain")
     result = {
         "schema_version": 1,
@@ -78,6 +104,7 @@ def main():
         "processor": platform.processor() or None,
         "logical_cpu_count": available_cpu_count(),
         "physical_memory_bytes": physical_memory(),
+        "hardware_description": args.hardware_description,
         "python_version": sys.version.splitlines()[0],
         "rustc_version": command("rustc", "--version"),
         "docker_version": command("docker", "version", "--format", "{{.Server.Version}}"),
@@ -95,6 +122,7 @@ def main():
             "checkpoint_profile_enabled": bool(args.checkpoint_profile),
             "checkpoint_duration_seconds": args.checkpoint_duration_seconds,
             "checkpoint_settled_before_interference": args.mode == "checkpoint",
+            "cache_storage_description": args.cache_storage_description,
         },
         "pos3ql_object_store": {
             "implementation": args.object_store_implementation,
@@ -102,8 +130,16 @@ def main():
             "container_image": args.object_store_image or None,
             "container_image_id": args.object_store_image_id or None,
             "independent_implementation": bool(args.object_store_independent_implementation),
-            "independently_operated": False,
+            "independently_operated": bool(args.object_store_independently_operated),
             "request_metrics_available": bool(args.object_store_request_metrics),
+            "endpoint": args.object_store_endpoint,
+            "bucket": args.object_store_bucket,
+            "prefix": args.object_store_prefix or None,
+            "region": args.object_store_region,
+            "addressing": args.object_store_addressing,
+            "tls": bool(args.object_store_tls),
+            "tls_ca_sha256": tls_ca_sha256,
+            "network_description": args.network_description,
         },
     }
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

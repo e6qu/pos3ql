@@ -91,6 +91,45 @@ also records Docker's resolved image ID. These local containers are independent
 S3-compatible implementations on the benchmark host, not independently
 operated object-storage services.
 
+Use the `external` profile for the representative run against an existing,
+independently operated S3-compatible service. It requires TLS, an existing
+bucket, explicit service and infrastructure descriptions, and credentials with
+read, write, list, and delete access. The endpoint is a `host:port` authority,
+not a URL. Path addressing is the default; set
+`POS3QL_BENCH_OBJECT_STORE_ADDRESSING=virtual_hosted` when the service requires
+virtual-hosted buckets. Temporary credentials can include
+`POS3QL_BENCH_OBJECT_STORE_SESSION_TOKEN`, and a private trust root can be set
+with `POS3QL_BENCH_OBJECT_STORE_TLS_CA_FILE`.
+
+```sh
+POS3QL_BENCH_OBJECT_STORE=external \
+POS3QL_BENCH_OBJECT_STORE_ENDPOINT=objects.example:443 \
+POS3QL_BENCH_OBJECT_STORE_BUCKET=pos3ql-benchmarks \
+POS3QL_BENCH_OBJECT_STORE_REGION=region-1 \
+POS3QL_BENCH_OBJECT_STORE_ACCESS_KEY="$ACCESS_KEY" \
+POS3QL_BENCH_OBJECT_STORE_SECRET_KEY="$SECRET_KEY" \
+POS3QL_BENCH_OBJECT_STORE_IMPLEMENTATION='service identity and available version' \
+POS3QL_BENCH_OBJECT_STORE_BACKING='provider and durability description' \
+POS3QL_BENCH_OBJECT_STORE_INDEPENDENTLY_OPERATED=1 \
+POS3QL_BENCH_HARDWARE_DESCRIPTION='pinned host type and processor' \
+POS3QL_BENCH_NETWORK_DESCRIPTION='location and path to object storage' \
+POS3QL_BENCH_CACHE_STORAGE='local cache medium and filesystem' \
+POS3QL_BENCH_POSTGRES_STORAGE='host-available PostgreSQL local medium' \
+POS3QL_BENCH_MATCHED_POSTGRES_STORAGE='resource-matched PostgreSQL local medium' \
+tools/run-performance.sh full ./performance-results/representative
+```
+
+The harness generates a unique object prefix for each external run and records
+it with the endpoint, bucket, region, addressing mode, TLS state, network,
+hardware, and cache descriptions. Set
+`POS3QL_BENCH_OBJECT_STORE_PREFIX` only when a caller-managed unique namespace
+is needed. External objects remain in that prefix after the run so cold
+recovery evidence is reproducible; remove them after retaining the artifacts.
+Access keys, secret keys, session tokens, and custom trust-root contents are
+never written to benchmark artifacts; a custom trust root is identified only
+by its SHA-256 digest. Provider request counters remain
+unavailable unless the provider supplies separate evidence.
+
 For an existing host-available PostgreSQL instance, set
 `POS3QL_BENCH_POSTGRES_STORAGE` to describe its storage medium. The full run
 requires PostgreSQL 18 with `fsync`, `full_page_writes`, and

@@ -282,6 +282,13 @@ Exact captured identities and rollback cleanup close both classes; seeds
 caught an unsafe row-SST delta shortcut: a changed row can spill before the
 checkpoint, so scanning only the resident map lost that row after cold
 recovery. Row-SST delta discovery retains the complete logical scan.
+The external benchmark harness audit found no product defect. The new profile
+rejects plaintext or ambiguously operated services, isolates every run under a
+recorded object prefix, records the hardware, network, cache, and PostgreSQL
+storage conditions needed to interpret a representative comparison, and keeps
+credentials out of artifacts. Unit coverage validates the provenance contract
+and report wording. The representative long-running run remains an explicit
+PLAN.md infrastructure task rather than a software bug.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

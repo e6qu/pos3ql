@@ -83,6 +83,11 @@ DISK_CACHE_MIB=${POS3QL_BENCH_DISK_CACHE_MIB:-128}
 BENCH_TIMEOUT_SECONDS=${POS3QL_BENCH_TIMEOUT_SECONDS:-30}
 CHECKPOINT_PROFILE=${POS3QL_BENCH_CHECKPOINT_PROFILE:-0}
 CHECKPOINT_DURATION=${POS3QL_BENCH_CHECKPOINT_SECONDS:-4}
+MATCHED_POSTGRES_CPUS=$(python3 -c 'import os; print(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count())')
+if ! [[ "$MATCHED_POSTGRES_CPUS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "could not determine the CPUs available to pos3ql" >&2
+  exit 1
+fi
 if ! [[ "$DISK_CACHE_MIB" =~ ^(0|[1-9][0-9]*)$ && "$BENCH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "POS3QL_BENCH_DISK_CACHE_MIB must be nonnegative and POS3QL_BENCH_TIMEOUT_SECONDS positive decimal integers" >&2
   exit 2
@@ -342,13 +347,39 @@ bench_pos3ql() {
 }
 
 start_postgresql_baseline() {
-  POSTGRES_PORT=${POS3QL_BENCH_POSTGRES_PORT:-}
-  if [ -z "${POS3QL_BENCH_POSTGRES_PORT:-}" ]; then
+  profile=$1
+  case "$profile" in
+    host-available)
+      POSTGRES_PORT=${POS3QL_BENCH_POSTGRES_PORT:-}
+      postgres_storage=${POS3QL_BENCH_POSTGRES_STORAGE:-Docker-managed local volume; host backing unspecified}
+      server_output="$OUTPUT/postgresql-server.json"
+      image_output="$OUTPUT/postgresql-image-id.txt"
+      ;;
+    resource-matched)
+      POSTGRES_PORT=
+      postgres_storage="Docker-managed local volume; host backing unspecified; container limits recorded"
+      server_output="$OUTPUT/postgresql-matched-server.json"
+      image_output="$OUTPUT/postgresql-matched-image-id.txt"
+      ;;
+    *) echo "unknown PostgreSQL resource profile: $profile" >&2; exit 2 ;;
+  esac
+  if [ -z "$POSTGRES_PORT" ]; then
+    command -v docker >/dev/null 2>&1 || {
+      echo "Docker is required for PostgreSQL benchmark baselines" >&2
+      exit 1
+    }
     POSTGRES_PORT=$(claim_test_port "" 19700 19799)
     POSTGRES_IMAGE=${POS3QL_BENCH_POSTGRES_IMAGE:-postgres:18}
-    POSTGRES_CONTAINER="pos3ql-performance-$$"
-    docker run -d --name "$POSTGRES_CONTAINER" -p "$POSTGRES_PORT:5432" \
-      -e POSTGRES_HOST_AUTH_METHOD=trust "$POSTGRES_IMAGE" >/dev/null
+    POSTGRES_CONTAINER="pos3ql-performance-${profile}-$$"
+    if [ "$profile" = resource-matched ]; then
+      docker run -d --name "$POSTGRES_CONTAINER" -p "$POSTGRES_PORT:5432" \
+        --cpus "$MATCHED_POSTGRES_CPUS" --memory "$MEMORY_PLAN_BYTES" \
+        --memory-swap "$MEMORY_PLAN_BYTES" \
+        -e POSTGRES_HOST_AUTH_METHOD=trust "$POSTGRES_IMAGE" >/dev/null
+    else
+      docker run -d --name "$POSTGRES_CONTAINER" -p "$POSTGRES_PORT:5432" \
+        -e POSTGRES_HOST_AUTH_METHOD=trust "$POSTGRES_IMAGE" >/dev/null
+    fi
     for attempt in $(seq 1 200); do
       if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres >/dev/null 2>&1; then break; fi
       if [ "$attempt" = 200 ]; then docker logs "$POSTGRES_CONTAINER" >&2; exit 1; fi
@@ -356,21 +387,91 @@ start_postgresql_baseline() {
     done
     python3 "$ROOT/tools/pg-query.py" --port "$POSTGRES_PORT" --expect 1 \
       --timeout 30 "SELECT 1" >/dev/null
-    docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" >"$OUTPUT/postgresql-image-id.txt"
-    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:-Docker-managed local volume; host backing unspecified}
+    docker inspect --format '{{.Image}}' "$POSTGRES_CONTAINER" >"$image_output"
   else
-    POSTGRES_STORAGE=${POS3QL_BENCH_POSTGRES_STORAGE:?POS3QL_BENCH_POSTGRES_STORAGE must describe the external PostgreSQL storage}
+    postgres_storage=${POS3QL_BENCH_POSTGRES_STORAGE:?POS3QL_BENCH_POSTGRES_STORAGE must describe the external PostgreSQL storage}
   fi
   if [ -n "$POSTGRES_CONTAINER" ]; then
-    python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
-      --storage-description "$POSTGRES_STORAGE" \
-      --output "$OUTPUT/postgresql-server.json" \
-      --docker-container "$POSTGRES_CONTAINER"
+    if [ "$profile" = resource-matched ]; then
+      python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
+        --storage-description "$postgres_storage" --resource-profile "$profile" \
+        --expected-cpus "$MATCHED_POSTGRES_CPUS" \
+        --expected-memory-bytes "$MEMORY_PLAN_BYTES" \
+        --output "$server_output" --docker-container "$POSTGRES_CONTAINER"
+    else
+      python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
+        --storage-description "$postgres_storage" --resource-profile "$profile" \
+        --output "$server_output" --docker-container "$POSTGRES_CONTAINER"
+    fi
   else
     python3 "$ROOT/tools/benchmark-postgresql.py" --port "$POSTGRES_PORT" \
-      --storage-description "$POSTGRES_STORAGE" \
-      --output "$OUTPUT/postgresql-server.json"
+      --storage-description "$postgres_storage" --resource-profile external \
+      --output "$server_output"
   fi
+}
+
+stop_postgresql_baseline() {
+  if [ -n "$POSTGRES_CONTAINER" ]; then
+    docker rm -f "$POSTGRES_CONTAINER" >/dev/null
+    POSTGRES_CONTAINER=
+  fi
+  POSTGRES_PORT=
+}
+
+run_checkpoint_postgresql_suite() {
+  prefix=$1
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-point-concurrency-1" --workload point-read --clients 1 \
+    --operations "$OPERATIONS" --rows "$ROWS" --setup --check \
+    --output "$OUTPUT/$prefix-point-concurrency-1.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-mixed-baseline" --workload mixed --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" --check \
+    --output "$OUTPUT/$prefix-mixed-baseline.json" >/dev/null
+  python3 "$ROOT/tools/pg-query.py" --port "$POSTGRES_PORT" \
+    --timeout "$BENCH_TIMEOUT_SECONDS" "CHECKPOINT" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-mixed-checkpoint-interference" --workload mixed --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
+    --maintenance-interval 0.001 --maintenance-limit 3 \
+    --require-maintenance-operations 3 --check \
+    --output "$OUTPUT/$prefix-mixed-checkpoint-interference.json" >/dev/null
+}
+
+run_full_postgresql_suite() {
+  prefix=$1
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-point-concurrency-1" --workload point-read --clients 1 \
+    --operations "$OPERATIONS" --rows "$ROWS" --setup --check \
+    --output "$OUTPUT/$prefix-point-concurrency-1.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-point" --workload point-read --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-point.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-tail-range" --workload tail-range --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-tail-range.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-ordered-limit" --workload ordered-limit --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-ordered-limit.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-join-probe" --workload join-probe --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-join-probe.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-insert" --workload insert --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-insert.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-scan" --workload scan --clients 1 \
+    --operations "$((OPERATIONS / 20 + 1))" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-scan.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-mixed" --workload mixed --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-mixed.json" >/dev/null
 }
 
 if [ "$MODE" = smoke ]; then
@@ -450,23 +551,12 @@ if [ "$MODE" = checkpoint ]; then
     sleep 0.1
     if [ -n "$METRICS" ]; then cp "$METRICS" "$WORK/checkpoint-profile-after.json"; fi
   fi
-  start_postgresql_baseline
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
-    --operations "$OPERATIONS" --rows "$ROWS" --setup --check \
-    --output "$OUTPUT/postgresql18-point-concurrency-1.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-mixed-baseline --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" --check \
-    --output "$OUTPUT/postgresql18-mixed-baseline.json" >/dev/null
-  python3 "$ROOT/tools/pg-query.py" --port "$POSTGRES_PORT" \
-    --timeout "$BENCH_TIMEOUT_SECONDS" "CHECKPOINT" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
-    --maintenance-interval 0.001 --maintenance-limit 3 \
-    --require-maintenance-operations 3 --check \
-    --output "$OUTPUT/postgresql18-mixed-checkpoint-interference.json" >/dev/null
+  start_postgresql_baseline host-available
+  run_checkpoint_postgresql_suite postgresql18
+  stop_postgresql_baseline
+  start_postgresql_baseline resource-matched
+  run_checkpoint_postgresql_suite postgresql18-matched
+  stop_postgresql_baseline
   cp "$WORK/pos3ql-primary.log" "$OUTPUT/pos3ql-startup.log"
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
     if [ -n "$METRICS" ]; then
@@ -629,39 +719,12 @@ if [ "$MODE" = full ]; then
       --output "$OUTPUT/logical-replicas-$replica.json" >/dev/null
   done
 
-  start_postgresql_baseline
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-point-concurrency-1 --workload point-read --clients 1 \
-    --operations "$OPERATIONS" --rows "$ROWS" --setup --check \
-    --output "$OUTPUT/postgresql18-point-concurrency-1.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-point --workload point-read --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --check \
-    --output "$OUTPUT/postgresql18-point.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-tail-range --workload tail-range --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --check \
-    --output "$OUTPUT/postgresql18-tail-range.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-ordered-limit --workload ordered-limit --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --check \
-    --output "$OUTPUT/postgresql18-ordered-limit.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-join-probe --workload join-probe --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --check \
-    --output "$OUTPUT/postgresql18-join-probe.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-insert --workload insert --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --check \
-    --output "$OUTPUT/postgresql18-insert.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-scan --workload scan --clients 1 \
-    --operations "$((OPERATIONS / 20 + 1))" --rows "$ROWS" --check \
-    --output "$OUTPUT/postgresql18-scan.json" >/dev/null
-  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
-    --label postgresql18-mixed --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --check \
-    --output "$OUTPUT/postgresql18-mixed.json" >/dev/null
+  start_postgresql_baseline host-available
+  run_full_postgresql_suite postgresql18
+  stop_postgresql_baseline
+  start_postgresql_baseline resource-matched
+  run_full_postgresql_suite postgresql18-matched
+  stop_postgresql_baseline
 fi
 
 cp "$WORK/pos3ql-primary.log" "$OUTPUT/pos3ql-startup.log"

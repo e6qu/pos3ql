@@ -16,6 +16,33 @@ def ratio(numerator, denominator):
     return numerator / denominator
 
 
+def print_postgresql(path, label):
+    postgresql = json.loads(path.read_text(encoding="utf-8"))
+    if postgresql.get("resource_profile") == "external":
+        label = "PostgreSQL external baseline"
+    settings = postgresql["settings"]
+    image = postgresql["container_image_id"]
+    image_text = f"; image `{image[:20]}…`" if image else ""
+    limits = postgresql.get("resource_limits")
+    if limits and limits["memory_bytes"]:
+        resource_text = (
+            f"; CPU quota={number(limits['cpu_quota'])}; "
+            f"memory limit={number(limits['memory_bytes'] / 1048576)} MiB; "
+            f"swap limit={number(limits['memory_swap_bytes'] / 1048576)} MiB"
+        )
+    elif postgresql.get("resource_profile") == "external":
+        resource_text = "; external resource limits not verified"
+    else:
+        resource_text = "; no container CPU or memory limit"
+    print(
+        f"{label}: version `{postgresql['version_number']}`{image_text}; "
+        f"storage: {postgresql['storage_description']}{resource_text}; "
+        f"fsync={settings['fsync']['value']}, "
+        f"full_page_writes={settings['full_page_writes']['value']}, "
+        f"synchronous_commit={settings['synchronous_commit']['value']}.\n"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=pathlib.Path)
@@ -91,17 +118,10 @@ def main():
                 )
     postgresql_path = args.directory / "postgresql-server.json"
     if postgresql_path.exists():
-        postgresql = json.loads(postgresql_path.read_text(encoding="utf-8"))
-        settings = postgresql["settings"]
-        image = postgresql["container_image_id"]
-        image_text = f"; image `{image[:20]}…`" if image else ""
-        print(
-            f"PostgreSQL baseline: version `{postgresql['version_number']}`{image_text}; "
-            f"storage: {postgresql['storage_description']}; "
-            f"fsync={settings['fsync']['value']}, "
-            f"full_page_writes={settings['full_page_writes']['value']}, "
-            f"synchronous_commit={settings['synchronous_commit']['value']}.\n"
-        )
+        print_postgresql(postgresql_path, "PostgreSQL host-available baseline")
+    matched_postgresql_path = args.directory / "postgresql-matched-server.json"
+    if matched_postgresql_path.exists():
+        print_postgresql(matched_postgresql_path, "PostgreSQL resource-matched baseline")
     print("| Scenario | ops/s | p50 ms | p95 ms | p99 ms | max ms | max RSS MiB | index scans | seq scans | object req/op | errors |")
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for label, value in results.items():
@@ -221,6 +241,10 @@ def main():
         ))
     pg_baseline = results.get("postgresql18-mixed-baseline")
     pg_interference = results.get("postgresql18-mixed-checkpoint-interference")
+    pg_matched_baseline = results.get("postgresql18-matched-mixed-baseline")
+    pg_matched_interference = results.get(
+        "postgresql18-matched-mixed-checkpoint-interference"
+    )
     postgres = results.get("postgresql18-point")
     if postgres and warm:
         comparisons.append((
@@ -276,6 +300,14 @@ def main():
             f"PostgreSQL 18 {pg_interference['results']['maintenance_operations']}. "
             "This short shared-host run compares SQL workloads on distinct persistence tiers; "
             "the p99 samples above do not establish production ratios."
+        )
+    if pg_matched_baseline and pg_matched_interference and interference:
+        print(
+            "- Resource-matched checkpoint commands completed: "
+            f"pos3ql {interference['results']['maintenance_operations']}, "
+            "PostgreSQL 18 "
+            f"{pg_matched_interference['results']['maintenance_operations']}. "
+            "The PostgreSQL container CPU and memory limits are recorded above."
         )
 
     scaling = sorted(

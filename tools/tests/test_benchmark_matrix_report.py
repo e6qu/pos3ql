@@ -15,6 +15,7 @@ def measured(throughput, p99, requests=None):
         "throughput_ops_per_second": throughput,
         "latency_ms": {"p99": p99, "maximum": p99 * 2},
         "object_store": requests,
+        "fixed_memory_plan_bytes": 1048576,
         "errors": [],
     }
 
@@ -29,6 +30,7 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             "artifact_type": "environment",
             "git_commit": "commit",
             "pos3ql_binary_sha256": binary,
+            "logical_cpu_count": 2,
             "suite": {
                 "mode": "checkpoint",
                 "rows": 100,
@@ -61,6 +63,9 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             "postgresql18-point-concurrency-1": measured(200, 1),
             "postgresql18-mixed-baseline": measured(180, 1.5),
             "postgresql18-mixed-checkpoint-interference": measured(160, 2),
+            "postgresql18-matched-point-concurrency-1": measured(190, 1.1),
+            "postgresql18-matched-mixed-baseline": measured(170, 1.7),
+            "postgresql18-matched-mixed-checkpoint-interference": measured(150, 2.2),
         }
         for label, result in labels.items():
             artifact = {
@@ -70,6 +75,27 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
                 "results": result,
             }
             (directory / f"{label}.json").write_text(json.dumps(artifact))
+        for filename, profile, limits in (
+            (
+                "postgresql-server.json",
+                "host-available",
+                {"cpu_quota": 0, "memory_bytes": 0, "memory_swap_bytes": 0},
+            ),
+            (
+                "postgresql-matched-server.json",
+                "resource-matched",
+                {"cpu_quota": 2, "memory_bytes": 1048576, "memory_swap_bytes": 1048576},
+            ),
+        ):
+            (directory / filename).write_text(
+                json.dumps(
+                    {
+                        "container_image_id": "sha256:postgresql",
+                        "resource_profile": profile,
+                        "resource_limits": limits,
+                    }
+                )
+            )
 
     def test_reports_paired_backends_and_unavailable_provider_metrics(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -83,11 +109,22 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
                 capture_output=True,
             )
             self.assertIn("| fixture | pos3ql | mixed baseline", completed.stdout)
-            self.assertIn("| minio | PostgreSQL 18 | mixed with checkpoints", completed.stdout)
+            self.assertIn(
+                "| minio | PostgreSQL 18 host available | mixed with checkpoints",
+                completed.stdout,
+            )
+            self.assertIn(
+                "| minio | PostgreSQL 18 resource matched | mixed with checkpoints",
+                completed.stdout,
+            )
             self.assertIn("| seaweedfs | pos3ql | point", completed.stdout)
             self.assertIn("| fixture | fixture | test storage | 2.00 ms | yes |", completed.stdout)
             self.assertIn("| minio | minio | test storage | none | no |", completed.stdout)
             self.assertIn("| 1.000 | 0 |", completed.stdout)
+            self.assertIn(
+                "| fixture | 2 | 1.00 | 2.00 | 1.00 | 1.00 |",
+                completed.stdout,
+            )
 
     def test_rejects_a_different_binary(self):
         with tempfile.TemporaryDirectory() as temporary:

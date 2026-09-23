@@ -419,7 +419,10 @@ equivalent.
 
 The benchmark harness now runs the same pos3ql workload against its
 instrumented fixture, pinned MinIO, and pinned SeaweedFS, pairing every backend
-run with a contemporaneous vanilla PostgreSQL 18 baseline. Environment
+run with contemporaneous host-available and resource-matched vanilla
+PostgreSQL 18 controls. The matched container receives the CPU count available
+to pos3ql and pos3ql's exact fixed startup memory plan, with swap borrowing
+disabled; the report rejects missing or unequal limits. Environment
 artifacts identify the implementation, immutable container reference, backing
 storage, artificial latency, and request-metric availability. A combined
 report rejects mismatched commits, binaries, and workload shapes. Exact

@@ -43,8 +43,10 @@ The smoke suite needs Rust, Python 3, and `nc`:
 tools/run-performance.sh smoke /tmp/pos3ql-performance-smoke
 ```
 
-The full suite additionally needs Docker unless
-`POS3QL_BENCH_POSTGRES_PORT` names an existing PostgreSQL 18 instance:
+The full and checkpoint suites need Docker for their resource-matched
+PostgreSQL 18 control. `POS3QL_BENCH_POSTGRES_PORT` can name an existing
+PostgreSQL 18 instance for the host-available control, but the matched control
+still runs in Docker:
 
 ```sh
 tools/run-performance.sh full ./performance-results/local
@@ -73,7 +75,7 @@ POS3QL_BENCH_OBJECT_STORE=seaweedfs \
 ```
 
 Run the fixture, MinIO, and SeaweedFS consecutively, each paired with its own
-same-host vanilla PostgreSQL 18 baseline, with:
+host-available and resource-matched vanilla PostgreSQL 18 controls, with:
 
 ```sh
 tools/run-performance-matrix.sh checkpoint ./performance-results/object-matrix
@@ -89,7 +91,7 @@ also records Docker's resolved image ID. These local containers are independent
 S3-compatible implementations on the benchmark host, not independently
 operated object-storage services.
 
-For an existing PostgreSQL instance, set
+For an existing host-available PostgreSQL instance, set
 `POS3QL_BENCH_POSTGRES_STORAGE` to describe its storage medium. The full run
 requires PostgreSQL 18 with `fsync`, `full_page_writes`, and
 `synchronous_commit` enabled. It records `version()`, durability and resource
@@ -111,16 +113,25 @@ The output directory contains an environment manifest with the commit, binary
 hash, toolchain, machine, resources, and workload sizing; one raw JSON file
 per workload; separate
 recovery JSON intervals for initial/warm-disk/empty-local-cache starts, one
-freshness interval per logical replica, Docker's resolved PostgreSQL image ID
-when Docker is used, `postgresql-server.json` with PostgreSQL's settings and
-storage description,
+freshness interval per logical replica, Docker's resolved PostgreSQL image IDs
+when Docker is used, `postgresql-server.json` and
+`postgresql-matched-server.json` with PostgreSQL's settings, storage
+description, and container limits,
 the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
 
-The baseline runs actual, unmodified PostgreSQL 18 with its ordinary local
-storage and durability settings. Both systems receive the same SQL workload,
-concurrency, row count, and stopping rule; duration-bound runs can complete
-different operation counts. pos3ql instead publishes durable state to object
-storage. A representative comparison must record PostgreSQL's
+Both controls run the stock PostgreSQL 18 image with its ordinary local
+storage and database settings. The host-available control has no container CPU
+or memory limit. The resource-matched control limits Docker to the CPUs
+available to the pos3ql process and to pos3ql's exact fixed startup memory
+plan; its memory and memory-plus-swap limits are equal so it cannot borrow swap.
+The report validates those values from Docker metadata. Resource matching
+equalizes availability, while each engine remains free to consume less than
+its limit.
+
+Both systems receive the same SQL workload, concurrency, row count, and
+stopping rule; duration-bound runs can complete different operation counts.
+pos3ql instead publishes durable state to object storage. A representative
+comparison must record PostgreSQL's
 storage medium and settings alongside pos3ql's object store, network, and cache
 conditions. End-to-end latency and throughput can be compared directly for the
 stated setups; storage request, cache-tier, and recovery measurements describe

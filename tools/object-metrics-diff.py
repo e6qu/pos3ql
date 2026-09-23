@@ -10,16 +10,22 @@ from benchmark import subtract_metrics
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--before", type=pathlib.Path, required=True)
-    parser.add_argument("--after", type=pathlib.Path, required=True)
+    parser.add_argument("--before", type=pathlib.Path)
+    parser.add_argument("--after", type=pathlib.Path)
     parser.add_argument("--label", required=True)
     parser.add_argument("--elapsed-seconds", type=float, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--require-read", action="store_true")
     args = parser.parse_args()
-    before = json.loads(args.before.read_text(encoding="utf-8"))
-    after = json.loads(args.after.read_text(encoding="utf-8"))
-    metrics = subtract_metrics(after, before)
+    if (args.before is None) != (args.after is None):
+        parser.error("--before and --after must be provided together")
+    if args.require_read and args.before is None:
+        parser.error("--require-read requires object-store metrics")
+    metrics = None
+    if args.before is not None:
+        before = json.loads(args.before.read_text(encoding="utf-8"))
+        after = json.loads(args.after.read_text(encoding="utf-8"))
+        metrics = subtract_metrics(after, before)
     if args.require_read and metrics["requests"]["get"] + metrics["requests"]["range_get"] == 0:
         raise SystemExit("recovery observed no shared-object-store reads")
     result = {

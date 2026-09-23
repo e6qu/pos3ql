@@ -61,6 +61,7 @@ jobs:
           tools/tests/test_check_dups.py
           tools/tests/test_postgres_regress_diff.py
           tools/tests/test_benchmark.py
+          tools/tests/test_benchmark_matrix_report.py
           tools/tests/test_test_ports.py
 
       - name: Duplicate-code guard

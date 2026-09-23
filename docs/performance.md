@@ -50,9 +50,10 @@ The full suite additionally needs Docker unless
 tools/run-performance.sh full ./performance-results/local
 ```
 
-To repeat only setup and mixed checkpoint pressure without starting PostgreSQL
-or replicas, use `checkpoint` mode. It retains the same raw workload schema and
-requires `POS3QL_BENCH_REPLICAS=0`:
+To repeat only setup and mixed checkpoint pressure without replicas, use
+`checkpoint` mode. It runs the same workload against vanilla PostgreSQL 18,
+retains the same raw workload schema, and requires
+`POS3QL_BENCH_REPLICAS=0`:
 
 ```sh
 POS3QL_BENCH_ROWS=1000 POS3QL_BENCH_TABLE_CAPACITY=2048 \
@@ -60,6 +61,33 @@ POS3QL_BENCH_OPERATIONS=50 POS3QL_BENCH_CLIENTS=4 \
 POS3QL_BENCH_DISK_CACHE_MIB=1024 POS3QL_BENCH_TIMEOUT_SECONDS=120 \
 tools/run-performance.sh checkpoint ./performance-results/checkpoint
 ```
+
+The default pos3ql durable tier is the instrumented fixture. Select a pinned
+local MinIO or SeaweedFS container with `POS3QL_BENCH_OBJECT_STORE`:
+
+```sh
+POS3QL_BENCH_OBJECT_STORE=minio \
+  tools/run-performance.sh checkpoint ./performance-results/minio
+POS3QL_BENCH_OBJECT_STORE=seaweedfs \
+  tools/run-performance.sh checkpoint ./performance-results/seaweedfs
+```
+
+Run the fixture, MinIO, and SeaweedFS consecutively, each paired with its own
+same-host vanilla PostgreSQL 18 baseline, with:
+
+```sh
+tools/run-performance-matrix.sh checkpoint ./performance-results/object-matrix
+```
+
+The combined report rejects different commits, binaries, or workload shapes
+across the three runs. The fixture retains exact request and byte counters and
+defaults to 2 ms injected request latency. MinIO and SeaweedFS run without
+artificial latency and report request metrics as unavailable rather than
+substituting an estimate. Their immutable image references can be overridden
+with `POS3QL_BENCH_MINIO_IMAGE` and `POS3QL_BENCH_SEAWEEDFS_IMAGE`; each run
+also records Docker's resolved image ID. These local containers are independent
+S3-compatible implementations on the benchmark host, not independently
+operated object-storage services.
 
 For an existing PostgreSQL instance, set
 `POS3QL_BENCH_POSTGRES_STORAGE` to describe its storage medium. The full run
@@ -69,7 +97,7 @@ settings, and, for Docker, the resolved image ID and mounts rather than
 treating a mutable image tag as provenance. Its defaults
 can be overridden with `POS3QL_BENCH_ROWS`,
 `POS3QL_BENCH_TABLE_CAPACITY`, `POS3QL_BENCH_OPERATIONS`,
-`POS3QL_BENCH_CLIENTS`, `POS3QL_BENCH_REPLICAS`, and
+`POS3QL_BENCH_CLIENTS`, `POS3QL_BENCH_REPLICAS`, and, for the fixture only,
 `POS3QL_BENCH_OBJECT_LATENCY_MS`. `POS3QL_BENCH_DISK_CACHE_MIB` sizes the
 fixed local disk block cache (default 128 MiB), and
 `POS3QL_BENCH_TIMEOUT_SECONDS` sets the per-query socket timeout (default 30
@@ -90,16 +118,26 @@ the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
 
 The baseline runs actual, unmodified PostgreSQL 18 with its ordinary local
 storage and durability settings. Both systems receive the same SQL workload,
-concurrency, row count, and operation count. pos3ql instead publishes durable
-state to object storage. A representative comparison must record PostgreSQL's
+concurrency, row count, and stopping rule; duration-bound runs can complete
+different operation counts. pos3ql instead publishes durable state to object
+storage. A representative comparison must record PostgreSQL's
 storage medium and settings alongside pos3ql's object store, network, and cache
 conditions. End-to-end latency and throughput can be compared directly for the
 stated setups; storage request, cache-tier, and recovery measurements describe
 each system's different persistence design and must be reported separately.
-The bundled suite uses an instrumented object-store fixture backed by local
-temporary storage. Its PostgreSQL comparison is an exploratory baseline; the
-representative qualification in [PLAN.md](../PLAN.md) also requires pinned
-hardware and an independently operated compatible object store.
+The bundled suite defaults to an instrumented object-store fixture backed by
+local temporary storage. The object-store matrix adds pinned local MinIO and
+SeaweedFS implementations. Their PostgreSQL comparisons are exploratory
+baselines; the representative qualification in [PLAN.md](../PLAN.md) also
+requires pinned hardware and an independently operated compatible object
+store.
+
+The first [10,000-row object-store matrix](../benchmarks/baselines/2026-09-23-object-store-matrix-10000/README.md)
+preserves raw fixture, MinIO, SeaweedFS, and paired vanilla PostgreSQL 18.6
+results. All workloads completed without error. Different duration-bound
+foreground counts, row-generation shapes, and sequential PostgreSQL samples
+make it implementation coverage and exploratory evidence rather than a
+provider ranking.
 
 The complete [256-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
 and [1,000-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs-1000/README.md)

@@ -38,6 +38,15 @@ def main():
     parser.add_argument("--clients", type=int, required=True)
     parser.add_argument("--replicas", type=int, required=True)
     parser.add_argument("--object-latency-ms", type=float, required=True)
+    parser.add_argument("--object-latency-injected", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--object-store-implementation", required=True)
+    parser.add_argument("--object-store-backing", required=True)
+    parser.add_argument("--object-store-image", default="")
+    parser.add_argument("--object-store-image-id", default="")
+    parser.add_argument(
+        "--object-store-independent-implementation", type=int, choices=(0, 1), required=True
+    )
+    parser.add_argument("--object-store-request-metrics", type=int, choices=(0, 1), required=True)
     parser.add_argument("--disk-cache-mib", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument("--checkpoint-profile", type=int, choices=(0, 1), default=0)
@@ -45,6 +54,8 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.checkpoint_duration_seconds) or args.checkpoint_duration_seconds < 0:
         parser.error("checkpoint duration must be nonnegative and finite")
+    if not math.isfinite(args.object_latency_ms) or args.object_latency_ms < 0:
+        parser.error("object latency must be nonnegative and finite")
     if args.mode == "checkpoint" and args.checkpoint_duration_seconds == 0:
         parser.error("checkpoint mode requires a positive duration")
     binary_bytes = args.binary.read_bytes()
@@ -72,6 +83,7 @@ def main():
             "clients": args.clients,
             "logical_replicas": args.replicas,
             "object_latency_ms": args.object_latency_ms,
+            "object_latency_injected": bool(args.object_latency_injected),
             "disk_cache_mib": args.disk_cache_mib,
             "timeout_seconds": args.timeout_seconds,
             "checkpoint_profile_enabled": bool(args.checkpoint_profile),
@@ -79,9 +91,13 @@ def main():
             "checkpoint_settled_before_interference": args.mode == "checkpoint",
         },
         "pos3ql_object_store": {
-            "implementation": "tests/external/s3_test_server.py",
-            "backing": "temporary local filesystem",
+            "implementation": args.object_store_implementation,
+            "backing": args.object_store_backing,
+            "container_image": args.object_store_image or None,
+            "container_image_id": args.object_store_image_id or None,
+            "independent_implementation": bool(args.object_store_independent_implementation),
             "independently_operated": False,
+            "request_metrics_available": bool(args.object_store_request_metrics),
         },
     }
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

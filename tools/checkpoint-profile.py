@@ -140,18 +140,22 @@ def main():
     parser.add_argument("log", type=pathlib.Path)
     parser.add_argument("output", type=pathlib.Path)
     parser.add_argument("--after-byte-offset", type=int, default=0)
-    parser.add_argument("--metrics-before", type=pathlib.Path, required=True)
-    parser.add_argument("--metrics-after", type=pathlib.Path, required=True)
+    parser.add_argument("--metrics-before", type=pathlib.Path)
+    parser.add_argument("--metrics-after", type=pathlib.Path)
     parser.add_argument("--operation-trace", type=pathlib.Path, required=True)
     args = parser.parse_args()
+    if (args.metrics_before is None) != (args.metrics_after is None):
+        parser.error("--metrics-before and --metrics-after must be provided together")
     source = args.log.read_bytes()
     if args.after_byte_offset < 0 or args.after_byte_offset > len(source):
         parser.error("profile offset is outside the log")
     result = parse(source, args.after_byte_offset)
-    result["object_requests"] = request_delta(
-        json.loads(args.metrics_before.read_text()),
-        json.loads(args.metrics_after.read_text()),
-    )
+    result["object_requests"] = None
+    if args.metrics_before is not None:
+        result["object_requests"] = request_delta(
+            json.loads(args.metrics_before.read_text()),
+            json.loads(args.metrics_after.read_text()),
+        )
     benchmark = json.loads(args.operation_trace.read_text())
     operations = benchmark.get("results", {}).get("operation_trace")
     if operations is None:
@@ -161,10 +165,11 @@ def main():
     result["operation_overlap"] = correlate(result["events"], operations)
     profiled_deletes = sum(phase["deleted"] for phase in result["totals"].values())
     profiled_puts = sum(phase["block_puts"] for phase in result["totals"].values())
-    if profiled_deletes > result["object_requests"]["delete"]:
-        raise ValueError("phase deletes exceed measured object DELETE requests")
-    if profiled_puts > result["object_requests"]["put"]:
-        raise ValueError("phase block PUTs exceed measured object PUT requests")
+    if result["object_requests"] is not None:
+        if profiled_deletes > result["object_requests"]["delete"]:
+            raise ValueError("phase deletes exceed measured object DELETE requests")
+        if profiled_puts > result["object_requests"]["put"]:
+            raise ValueError("phase block PUTs exceed measured object PUT requests")
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 

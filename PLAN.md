@@ -417,6 +417,30 @@ PostgreSQL 18.6 completed the matched SQL and checkpoint workload on its
 recorded durable local tier; its persistence path has no pos3ql object-request
 equivalent.
 
+The benchmark harness now runs the same pos3ql workload against its
+instrumented fixture, pinned MinIO, and pinned SeaweedFS, pairing every backend
+run with a contemporaneous vanilla PostgreSQL 18 baseline. Environment
+artifacts identify the implementation, immutable container reference, backing
+storage, artificial latency, and request-metric availability. A combined
+report rejects mismatched commits, binaries, and workload shapes. Exact
+provider request attribution remains available from the fixture; MinIO and
+SeaweedFS timings report those counters as unavailable. Local containers expand
+implementation coverage but do not satisfy the remaining independently
+operated object-store qualification.
+
+The [clean 10,000-row matrix](benchmarks/baselines/2026-09-23-object-store-matrix-10000/README.md)
+completed every fixture, MinIO, SeaweedFS, and vanilla PostgreSQL 18.6 workload
+without error. pos3ql mixed-baseline throughput was 206.83, 157.15, and 154.35
+operations per second with p99 latency of 76.77, 103.34, and 114.11 ms;
+checkpoint-overlap throughput was 100.14, 75.21, and 46.94 operations per
+second with p99 latency of 758.77, 1,948.90, and 2,087.74 ms. The paired
+PostgreSQL checkpoint runs recorded 2,145.72, 2,935.24, and 1,629.75 operations
+per second with 10.96, 6.82, and 14.94 ms p99. The sequential PostgreSQL
+variation, differing completed foreground counts, and row-merge output of 58,
+497, and 494 block PUTs show that this shared-host duration-floor sample cannot
+rank providers. It establishes executable coverage and exposes the checkpoint
+cost on each stated local setup; the representative run remains outstanding.
+
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local
 storage medium and durability settings and pos3ql's object store, network,

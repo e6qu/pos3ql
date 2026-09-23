@@ -25162,11 +25162,11 @@ impl Storage {
         Ok(core::ops::ControlFlow::Continue(()))
     }
 
-    /// Resumes the resident rows changed after one published value-index base.
-    /// Durable cleanup moves heap rows to spilled storage only after the same
-    /// checkpoint installs its value-index generation, so every later change
-    /// is still present in the overlay. The base merge suppresses the older
-    /// entries for those rowids.
+    /// Resumes resident rows changed after one published value-index base and
+    /// records the exact row identities represented by the delta. Heap rows
+    /// contribute replacement entries and tombstones only suppress the base.
+    /// A spilled row was captured by a successful row checkpoint; its base
+    /// entry remains current when this binding stayed clean.
     #[expect(clippy::too_many_arguments, reason = "checkpoint row stream boundary")]
     pub(crate) fn for_each_value_binding_delta_entry_batch(
         &self,
@@ -25174,6 +25174,7 @@ impl Storage {
         binding: usize,
         after_lsn: u64,
         cursor: &mut CheckpointValueCursor,
+        changed_rowids: &mut Vec<u64>,
         output: &mut [u8],
         max_rows: usize,
         each: &mut dyn for<'entry> FnMut(
@@ -25192,18 +25193,33 @@ impl Storage {
                 continue;
             }
             walked += 1;
-            let Some(home @ RowHome::Heap(_)) = state.committed else {
-                // Deletions contribute no new entry. A committed change newer
-                // than the published base remains in the heap until the next
-                // checkpoint publishes both row and value generations.
-                if state.committed.is_some() {
-                    return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "incremental value-index row is not resident"
-                    ));
+            let home = match state.committed {
+                Some(home @ RowHome::Heap(_)) => home,
+                None => {
+                    if changed_rowids.len() == changed_rowids.capacity() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "checkpoint value-index changed-row set exceeds table_rows ({})",
+                            changed_rowids.capacity()
+                        ));
+                    }
+                    changed_rowids.push(rowid);
+                    continue;
                 }
-                continue;
+                // A spilled image was already captured by a successful row
+                // checkpoint. If this binding stayed clean, its base entry
+                // remains current; a binding-changing row cannot spill until
+                // the matching value generation publishes.
+                Some(RowHome::Spilled { .. }) => continue,
             };
+            if changed_rowids.len() == changed_rowids.capacity() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "checkpoint value-index changed-row set exceeds table_rows ({})",
+                    changed_rowids.capacity()
+                ));
+            }
+            changed_rowids.push(rowid);
             let Some((key_len, payload_len, hash)) =
                 self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
             else {
@@ -25223,18 +25239,6 @@ impl Storage {
             }
         }
         Ok(cursor.resident_slot == rows.backing_slot_count())
-    }
-
-    pub(crate) fn value_binding_row_changed_after(
-        &self,
-        table_slot: usize,
-        rowid: u64,
-        after_lsn: u64,
-    ) -> bool {
-        self.tables[table_slot]
-            .rows
-            .get(&rowid)
-            .is_some_and(|state| state.committed_lsn > after_lsn)
     }
 
     /// Resumes a complete checkpoint value-index source walk for at most
@@ -27130,7 +27134,10 @@ impl Storage {
                     .get_mut(&rowid)
                     .expect("row state was just observed");
                 pop_pending_version(versions, free, &mut state.pending);
-                if state.committed.is_none() && state.history.is_empty() && state.pending.is_none()
+                if (state.committed.is_none()
+                    && state.history.is_empty()
+                    && state.pending.is_none())
+                    || Self::redundant_spilled_row_state(state)
                 {
                     tables[table_index].rows.remove(&rowid);
                 }

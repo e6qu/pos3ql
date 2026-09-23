@@ -64985,6 +64985,60 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
         ["777"]
     );
 
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_value_index SET code = 'second' WHERE id = 1",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+    let mut preparation_beats = 0usize;
+    while !engine
+        .ckpt
+        .as_ref()
+        .unwrap()
+        .value_index_output_job_active()
+    {
+        preparation_beats += 1;
+        assert!(
+            preparation_beats < 128,
+            "incremental value-index preparation did not converge"
+        );
+        assert!(matches!(
+            engine
+                .ckpt
+                .as_mut()
+                .unwrap()
+                .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+                .unwrap(),
+            crate::checkpoint::CheckpointStep::Working
+        ));
+    }
+    let unrelated = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE paced_value_index SET payload = 'late-unrelated' WHERE id = 778",
+    );
+    assert!(!message_types(&unrelated).contains(&b'E'));
+    assert!(
+        engine
+            .ckpt
+            .as_ref()
+            .unwrap()
+            .value_index_output_job_active(),
+        "a non-indexed commit must retain the captured value-index job"
+    );
+    assert!(engine.checkpoint().unwrap());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, payload FROM paced_value_index
+              WHERE code = 'm-' || id::text || '-' || repeat(md5(id::text), 8)
+                AND id = 778"
+        )),
+        ["778|late-unrelated"]
+    );
+
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut recovered_budget = Budget::new(1 << 30);
@@ -64996,9 +65050,25 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
             "SELECT id FROM paced_value_index \
               WHERE code = 'latest-' || repeat(md5('777'), 8); \
              SELECT count(*) FROM paced_value_index \
-              WHERE code LIKE 'm-%'"
+              WHERE code LIKE 'm-%'; \
+             SELECT id, payload FROM paced_value_index \
+              WHERE code = 'm-' || id::text || '-' || repeat(md5(id::text), 8) \
+                AND id = 778"
         )),
-        ["777", "2047"]
+        ["777", "2046", "778|late-unrelated"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "BEGIN; \
+             UPDATE paced_value_index SET payload = 'rolled-back' WHERE id = 778; \
+             ROLLBACK; \
+             SELECT id, payload FROM paced_value_index \
+              WHERE code = 'm-' || id::text || '-' || repeat(md5(id::text), 8) \
+                AND id = 778"
+        )),
+        ["778|late-unrelated"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

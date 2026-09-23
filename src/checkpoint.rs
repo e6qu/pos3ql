@@ -820,6 +820,7 @@ pub(crate) struct Checkpointer {
     value_sort_rows: Box<[BufferedValueRow]>,
     value_source_cursor: CheckpointValueCursor,
     value_sort_reader: ExternalRunReader,
+    value_changed_rowids: Vec<u64>,
     value_base_stream: ValueIndexStream,
     value_base_entry: Box<[u8]>,
     value_entry: Box<[u8]>,
@@ -937,6 +938,7 @@ impl Checkpointer {
             + 2 * crate::store::MAX_PAYLOAD
             + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
             + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table)
+            + config.table_rows * core::mem::size_of::<u64>()
             + table_bookkeeping
             + (2usize.saturating_mul(table_capacity) + 1)
                 .saturating_mul(config.max_spill_generations_per_table)
@@ -1481,7 +1483,8 @@ impl Checkpointer {
             .draw(
                 2 * crate::store::MAX_PAYLOAD
                     + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
-                    + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table),
+                    + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table)
+                    + config.table_rows * core::mem::size_of::<u64>(),
                 "checkpoint value-index scheduling",
             )
             .map_err(CheckpointSetupError::Budget)?;
@@ -1547,6 +1550,7 @@ impl Checkpointer {
                 .into_boxed_slice(),
             value_source_cursor: CheckpointValueCursor::new(config.max_spill_generations_per_table),
             value_sort_reader: ExternalRunReader::new(),
+            value_changed_rowids: Vec::with_capacity(config.table_rows),
             value_base_stream: ValueIndexStream::new(config.checkpoint_live_blocks),
             value_base_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             value_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
@@ -7177,6 +7181,7 @@ impl Checkpointer {
             self.pending_value_installs.clear();
             self.value_schedule_job = None;
             self.value_job = None;
+            self.value_changed_rowids.clear();
             self.value_writer.reset();
         }
         if self.value_schedule_job.is_some() {
@@ -11020,6 +11025,7 @@ impl Checkpointer {
             .alloc_slice_with(crate::store::MAX_PAYLOAD, |_| 0u8)
             .map_err(|_| sql_err!(SQLSTATE_IO, "persistent value-index roster scratch"))?;
         self.roster_scratch.clear();
+        self.value_changed_rowids.clear();
         let result = (|| {
             if let Some(previous) = storage.value_binding_handle(slot, binding) {
                 let known = &mut self.roster_scratch;
@@ -11362,6 +11368,7 @@ impl Checkpointer {
                     binding,
                     base.published_lsn,
                     &mut self.value_source_cursor,
+                    &mut self.value_changed_rowids,
                     key_output,
                     VALUE_INDEX_SCHEDULE_BEAT_ROWS,
                     &mut each,
@@ -11707,6 +11714,8 @@ impl Checkpointer {
     }
 
     fn finish_value_schedule(&mut self, job: ValueScheduleJob, source: ValueIndexSource) {
+        self.value_changed_rowids.sort_unstable();
+        self.value_changed_rowids.dedup();
         if let Some(spec) = job.navigation {
             self.value_writer.reset_navigation(
                 spec.position,
@@ -11746,6 +11755,7 @@ impl Checkpointer {
         if !Self::value_schedule_job_is_current(storage, &job) {
             self.slice_writer.reset();
             self.roster_scratch.clear();
+            self.value_changed_rowids.clear();
             return Ok(());
         }
         #[cfg(feature = "checkpoint-profile")]
@@ -11802,6 +11812,7 @@ impl Checkpointer {
             Err(error) => {
                 self.slice_writer.reset();
                 self.value_source_cursor.reset();
+                self.value_changed_rowids.clear();
                 job.phase = ValueSchedulePhase::Collect;
                 job.source_done = false;
                 job.pending = None;
@@ -11864,6 +11875,7 @@ impl Checkpointer {
         if !Self::value_job_is_current(storage, &job) {
             self.value_writer.reset();
             self.roster_scratch.clear();
+            self.value_changed_rowids.clear();
             return Ok(());
         }
         #[cfg(feature = "checkpoint-profile")]
@@ -11901,6 +11913,7 @@ impl Checkpointer {
                     handle,
                 });
                 self.roster_scratch.clear();
+                self.value_changed_rowids.clear();
                 Ok(())
             }
             Ok(None) => {
@@ -11969,9 +11982,7 @@ impl Checkpointer {
                     ValueIndexStreamStep::Entry(length) => {
                         let rowid =
                             u64::from_le_bytes(self.value_base_entry[8..16].try_into().unwrap());
-                        let published_lsn =
-                            job.base.expect("base stream has a handle").published_lsn;
-                        if storage.value_binding_row_changed_after(job.slot, rowid, published_lsn) {
+                        if self.value_changed_rowids.binary_search(&rowid).is_ok() {
                             continue;
                         }
                         job.base_len = length;
@@ -14824,6 +14835,13 @@ mod stored_dependency_tests {
             Checkpointer::budget_bytes(&live_blocks) - base_bytes,
             core::mem::size_of::<(BlockId, Option<BlockType>)>()
                 + core::mem::size_of::<(BlockId, bool)>()
+        );
+
+        let mut table_rows = base.clone();
+        table_rows.table_rows += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&table_rows) - base_bytes,
+            core::mem::size_of::<u64>()
         );
 
         let mut garbage = base.clone();

@@ -349,12 +349,14 @@ publication identity.
 The [incremental value-index profile](benchmarks/baselines/2026-09-23-checkpoint-value-index-delta-10000/README.md)
 completes that boundary. Ordinary committed changes now sort only resident rows
 newer than the published index LSN, then merge them with a restartable ordered
-stream of the immutable generation. Old entries for changed row identities are
-suppressed, so key moves, predicate exits, deletes, covering payload changes,
-and posting changes produce an exact replacement rather than an accumulating
-overlay. Relation rewrites, catalog changes, and `REINDEX` retain the complete
-source walk. Fixed startup buffers cover both ordinary roster chains and
-navigation trees, and retries restart both inputs.
+stream of the immutable generation. A startup-bounded set captures the exact
+row identities represented by that delta and remains stable through output and
+retry. Suppressing those rows from the base makes key moves, predicate exits,
+deletes, covering payload changes, and posting changes exact replacements
+rather than an accumulating overlay. Object-resident rows whose binding stayed
+clean retain their published entry. Relation rewrites, catalog changes, and
+`REINDEX` retain the complete source walk. Fixed startup buffers cover both
+ordinary roster chains and navigation trees, and retries restart both inputs.
 
 Across a similar two-generation value-index workload, schedule plus write work
 fell from 460 events, 910 GETs, 204 PUTs, and 4.05 seconds to 76 events, zero
@@ -377,6 +379,14 @@ without making pre-checkpoint residence an invariant. Row merge made 41 GETs
 over 40 schedule beats and 86 PUTs over 234 write beats; their totals were 0.12
 and 1.01 seconds, with largest events of 23.73 and 22.66 ms. Commit pruning
 remains a separate 1.20-second post-publication cost.
+
+The complete storage VOPR range then exposed two interleavings hidden by the
+profile: consulting a live committed LSN during output could suppress an
+unchanged base entry after a later non-indexed commit, and rollback could leave
+a redundant spilled overlay state that shadowed an immutable index candidate.
+The captured row-identity set now supplies the stable merge boundary, while
+rollback removes the redundant overlay state. Deterministic seeds 460259
+through 460274 cover outage, cold-start, warm-restart, and rollback variants.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

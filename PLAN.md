@@ -339,13 +339,44 @@ largest event fell from 334.94 to 39.24 ms. The run completed the same
 configured workload and actual PostgreSQL 18 comparison, though its duration
 floor admitted more foreground operations, so aggregate timing is exploratory.
 
-`value_index_schedule` is now the largest checkpoint construction boundary. It
-made 910 GETs and 162 PUTs over 398 events in the reuse profile. Reduce its
-physical source and external-run work while retaining the startup-sized binary
-carry, exact key ordering, selective PAX dependency reads, retry restart,
-four-PUT and eight-GET beat limits, and publication identity. Compare the
-result with actual PostgreSQL 18 under the same SQL workload while continuing
-to report its local durable tier separately from pos3ql object traffic.
+The immutable-group reuse profile left `value_index_schedule` as the largest
+checkpoint construction boundary: 398 events made 910 GETs and 162 PUTs. The
+next change therefore targeted its physical source and external-run work while
+retaining the startup-sized binary carry, exact key ordering, selective PAX
+dependency reads, retry restart, four-PUT and eight-GET beat limits, and
+publication identity.
+
+The [incremental value-index profile](benchmarks/baselines/2026-09-23-checkpoint-value-index-delta-10000/README.md)
+completes that boundary. Ordinary committed changes now sort only resident rows
+newer than the published index LSN, then merge them with a restartable ordered
+stream of the immutable generation. Old entries for changed row identities are
+suppressed, so key moves, predicate exits, deletes, covering payload changes,
+and posting changes produce an exact replacement rather than an accumulating
+overlay. Relation rewrites, catalog changes, and `REINDEX` retain the complete
+source walk. Fixed startup buffers cover both ordinary roster chains and
+navigation trees, and retries restart both inputs.
+
+Across a similar two-generation value-index workload, schedule plus write work
+fell from 460 events, 910 GETs, 204 PUTs, and 4.05 seconds to 76 events, zero
+object GETs, 66 PUTs, and 0.38 seconds. Schedule alone became 12 CPU-only events
+totaling 2.37 ms. Every value-index beat stayed within four PUTs and eight GETs.
+The run completed 1,485 foreground operations versus 825 in the preceding
+duration-floor run, so aggregate traffic and latency are diagnostic rather than
+a controlled ratio. Actual PostgreSQL 18.6 completed the matched SQL and
+checkpoint workload on its recorded local
+durable tier at 3,043 operations per second and 7.07 ms p99; its persistence
+path has no pos3ql object-request equivalent.
+
+Every paced value-index and row-merge event stayed within its object-I/O beat
+limits. Correctness validation rejected a resident-only row-SST delta shortcut
+because a changed row may spill before checkpoint. The restored complete
+logical scan made 228 GETs over two delta events, with one 719.40 ms event. This
+is now the next measured construction target: track changed spilled row
+identities explicitly so delta discovery avoids a table-wide provider scan
+without making pre-checkpoint residence an invariant. Row merge made 41 GETs
+over 40 schedule beats and 86 PUTs over 234 write beats; their totals were 0.12
+and 1.01 seconds, with largest events of 23.73 and 22.66 ms. Commit pruning
+remains a separate 1.20-second post-publication cost.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

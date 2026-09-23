@@ -246,15 +246,29 @@ row format reduced each small row delta from 27 objects to four and bounded
 row-merge scheduling at eight descriptor GETs per beat.
 The [retained row-merge cursor profile](../benchmarks/baselines/2026-09-22-checkpoint-row-merge-containers-10000/README.md)
 removed write-phase source rereads: `row_merge_write` fell from 5,782 to zero
-GETs and from 21.31 to 7.08 seconds of summed phase time. The latest
+GETs and from 21.31 to 7.08 seconds of summed phase time. The subsequent
 [immutable-group reuse profile](../benchmarks/baselines/2026-09-22-checkpoint-row-merge-reuse-10000/README.md)
 keeps complete pruned PAX groups by verified reference and names every shared
 container in the new garbage roster. Across a similar 234 write beats, PUTs
 fell from 922 to 90 and summed time to 1.07 seconds; 212 beats wrote no object.
 Changed or pruned groups still use the ordinary writer. Cache-disabled
-recovery tests read reused payloads after garbage collection. The remaining
-measured checkpoint construction cost is value-index source and external-run
-work, which made 910 GETs and 162 PUTs in the latest run.
+recovery tests read reused payloads after garbage collection. That profile left
+value-index source and external-run work at 910 GETs and 162 PUTs.
+The following [incremental value-index profile](../benchmarks/baselines/2026-09-23-checkpoint-value-index-delta-10000/README.md)
+sorts only resident rows newer than each published value-index LSN and merges
+that delta with a paced ordered stream of the immutable base. Changed row
+identities suppress their old entries, while relation rewrites, catalog changes,
+and `REINDEX` still take the complete rebuild path. Combined schedule and write
+work fell from 910 GETs, 204 PUTs, and 4.05 seconds to zero object GETs, 66 PUTs,
+and 0.38 seconds. The schedule was 12 CPU-only events totaling 2.37 ms.
+Per-beat limits, fixed memory, retry, garbage collection, and object-cold
+recovery remain directly covered. Correctness validation rejected a
+resident-only row-SST delta scan because a changed row may spill before
+checkpoint; its restored complete scan made 228 GETs and identifies the next
+optimization boundary. The current run completed substantially more foreground
+operations than its predecessor, so total traffic and latency are not a
+controlled ratio. Actual PostgreSQL 18.6 remains a separate local-durable
+reference with no corresponding object-request metric.
 
 ## Measured scenarios
 

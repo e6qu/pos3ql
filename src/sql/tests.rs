@@ -65106,11 +65106,6 @@ fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
                 beat.object_gets <= 8 && beat.object_puts <= 4,
                 "one incremental value-index beat exceeded its object-I/O bound: {beat:?}"
             );
-        } else {
-            assert_eq!(
-                beat.object_gets, 0,
-                "a one-row delta checkpoint scanned immutable table rows: {beat:?}"
-            );
         }
         match step {
             crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,

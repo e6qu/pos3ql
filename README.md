@@ -218,6 +218,13 @@ are rebuilt. Selective readers preserve column pruning. V2 direct and v3 PAX
 generations remain readable during online replacement.
 [Format compatibility and migration](docs/durable-format.md).
 
+Checkpoint value indexes merge rows changed after the published index LSN with
+an ordered stream of that immutable generation. Changed row identities suppress
+their old entries, while unchanged data and navigation blocks retain their
+content identities. Catalog maintenance and relation rewrites request a full
+rebuild explicitly. Both base streaming and delta sorting use startup-accounted
+memory and provider-neutral per-beat object-I/O limits.
+
 Collations, conversions, text-search objects, event triggers, tablespaces, and
 object comments likewise have independent startup capacities. Their catalog
 queries allocate from the fixed statement arena according to the actual pool,

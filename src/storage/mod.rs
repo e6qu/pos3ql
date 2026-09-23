@@ -25163,7 +25163,10 @@ impl Storage {
     }
 
     /// Resumes the resident rows changed after one published value-index base.
-    /// The base merge suppresses the older entries for the same rowids.
+    /// Durable cleanup moves heap rows to spilled storage only after the same
+    /// checkpoint installs its value-index generation, so every later change
+    /// is still present in the overlay. The base merge suppresses the older
+    /// entries for those rowids.
     #[expect(clippy::too_many_arguments, reason = "checkpoint row stream boundary")]
     pub(crate) fn for_each_value_binding_delta_entry_batch(
         &self,
@@ -25190,10 +25193,9 @@ impl Storage {
             }
             walked += 1;
             let Some(home @ RowHome::Heap(_)) = state.committed else {
-                // Deletions contribute no new entry. A changed committed row
-                // remains in the heap until the checkpoint publishes; any
-                // other home would make the incremental-source invariant
-                // false and must be rebuilt through the complete walk.
+                // Deletions contribute no new entry. A committed change newer
+                // than the published base remains in the heap until the next
+                // checkpoint publishes both row and value generations.
                 if state.committed.is_some() {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,

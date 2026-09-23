@@ -289,6 +289,13 @@ storage conditions needed to interpret a representative comparison, and keeps
 credentials out of artifacts. Unit coverage validates the provenance contract
 and report wording. The representative long-running run remains an explicit
 PLAN.md infrastructure task rather than a software bug.
+The large-catalog benchmark audit found no product defect. The suite now builds
+a bounded, configurable relation catalog, verifies its complete `pg_class`
+shape, and measures exact name and OID lookup before and after empty-local-cache
+recovery. PostgreSQL controls receive the same setup and warm workload. The
+128-relation smoke and reduced full PostgreSQL-control qualification completed
+without errors; representative timing remains part of the external run tracked
+in PLAN.md.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -201,7 +201,7 @@ def ipv4_offset(first_octet, offset):
     return ".".join(str((value >> shift) & 0xFF) for shift in (24, 16, 8, 0))
 
 
-def workload_sql(workload, worker, operation, rows):
+def workload_sql(workload, worker, operation, rows, catalog_relations=0):
     key = (worker + operation * 17) % rows + 1
     if workload == "point-read" or (workload == "mixed" and operation % 5):
         return f"SELECT payload FROM benchmark_kv WHERE hash_key = {key}"
@@ -307,6 +307,12 @@ def workload_sql(workload, worker, operation, rows):
             f"FROM generate_series({lower}, {upper}) AS probe(id) "
             "JOIN benchmark_kv AS kv ON kv.id = probe.id"
         )
+    if workload == "catalog-lookup":
+        relation = (worker + operation * 17) % catalog_relations
+        return (
+            "SELECT relname FROM pg_class "
+            f"WHERE oid = 'benchmark_catalog.relation_{relation:06d}'::regclass"
+        )
     if workload == "insert":
         inserted_key = rows + worker * 1_000_000 + operation + 1
         return (
@@ -336,9 +342,10 @@ def identify(connection):
     return rows[0][0] if rows and rows[0] else "unknown"
 
 
-def setup_database(connection, rows):
+def setup_database(connection, rows, catalog_relations):
     # Setup is untimed and may build many indexes over a large fixture.
     connection.socket.settimeout(max(300, connection.timeout_seconds))
+    connection.query("DROP SCHEMA IF EXISTS benchmark_catalog CASCADE")
     connection.query("DROP TABLE IF EXISTS benchmark_kv")
     # A realistic row body makes even the small CI dataset span immutable
     # table blocks, so a selective cold index probe competes against an actual
@@ -429,6 +436,22 @@ def setup_database(connection, rows):
         "CREATE INDEX benchmark_covering "
         "ON benchmark_kv (id DESC) INCLUDE (payload)"
     )
+    if catalog_relations:
+        connection.query("CREATE SCHEMA benchmark_catalog")
+        for relation in range(catalog_relations):
+            connection.query(
+                f"CREATE VIEW benchmark_catalog.relation_{relation:06d} "
+                f"AS SELECT {relation}::integer AS id"
+            )
+        catalog_count = connection.query(
+            "SELECT count(*) FROM pg_class AS class "
+            "JOIN pg_namespace AS namespace ON namespace.oid = class.relnamespace "
+            "WHERE namespace.nspname = 'benchmark_catalog'"
+        )
+        if catalog_count != [[str(catalog_relations)]]:
+            raise RuntimeError(
+                f"catalog setup created {catalog_count!r}, expected {catalog_relations} relations"
+            )
     connection.query("ANALYZE benchmark_kv")
     connection.query("CHECKPOINT")
     connection.socket.settimeout(connection.timeout_seconds)
@@ -457,12 +480,13 @@ def subtract_access_path(after, before):
 
 def run(args):
     trace_operations = getattr(args, "trace_operations", False)
+    catalog_relations = getattr(args, "catalog_relations", 0)
     targets = args.targets or [(args.host, args.port)]
     control = PgConnection(*targets[0], args.user, args.database, args.timeout_seconds)
     try:
         identity = identify(control)
         if args.setup:
-            setup_database(control, args.rows)
+            setup_database(control, args.rows, catalog_relations)
     finally:
         control.close()
 
@@ -507,7 +531,13 @@ def run(args):
                 if operation_barrier:
                     operation_barrier.wait()
                 operation_index = operation
-                sql = workload_sql(args.workload, worker_id, operation_index, args.rows)
+                sql = workload_sql(
+                    args.workload,
+                    worker_id,
+                    operation_index,
+                    args.rows,
+                    catalog_relations,
+                )
                 operation += 1
                 started = time.monotonic_ns()
                 trace_started = time.time_ns()
@@ -613,6 +643,7 @@ def run(args):
             "operations_per_client": args.operations,
             "minimum_duration_seconds": args.duration_seconds,
             "rows": args.rows,
+            "catalog_relations": catalog_relations,
             "synchronized": args.synchronized,
             "require_index": args.require_index,
             "maintenance_interval_seconds": args.maintenance_interval,
@@ -758,6 +789,7 @@ def parse_args():
             "tail-range",
             "ordered-limit",
             "join-probe",
+            "catalog-lookup",
             "update",
             "mixed",
             "scan",
@@ -774,6 +806,11 @@ def parse_args():
         help="record realtime intervals with monotonic durations for correlation",
     )
     parser.add_argument("--rows", type=int, default=1000)
+    parser.add_argument(
+        "--catalog-relations",
+        type=int,
+        default=int(os.environ.get("POS3QL_BENCH_CATALOG_RELATIONS", "0")),
+    )
     parser.add_argument("--setup", action="store_true")
     parser.add_argument("--synchronized", action="store_true")
     parser.add_argument(
@@ -801,6 +838,10 @@ def parse_args():
             parser.error(f"invalid target {target!r}; expected host:port")
     if args.clients < 1 or args.operations < 1 or args.rows < 1:
         parser.error("clients, operations, and rows must be positive")
+    if args.catalog_relations < 0:
+        parser.error("catalog relations must be nonnegative")
+    if args.workload == "catalog-lookup" and args.catalog_relations == 0:
+        parser.error("catalog-lookup requires at least one catalog relation")
     if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
         parser.error("timeout seconds must be positive and finite")
     if not math.isfinite(args.duration_seconds) or args.duration_seconds < 0:

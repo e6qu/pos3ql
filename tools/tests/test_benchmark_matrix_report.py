@@ -21,7 +21,7 @@ def measured(throughput, p99, requests=None):
 
 
 class BenchmarkMatrixReportTest(unittest.TestCase):
-    def write_run(self, root, backend, binary="binary-sha"):
+    def write_run(self, root, backend, binary="binary-sha", mode="checkpoint"):
         directory = root / backend
         directory.mkdir()
         request_metrics = backend == "fixture"
@@ -32,11 +32,12 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             "pos3ql_binary_sha256": binary,
             "logical_cpu_count": 2,
             "suite": {
-                "mode": "checkpoint",
+                "mode": mode,
                 "rows": 100,
                 "table_capacity": 200,
                 "operations_per_client": 10,
                 "clients": 2,
+                "catalog_relations": 128 if mode == "full" else 0,
                 "logical_replicas": 0,
                 "disk_cache_mib": 16,
                 "timeout_seconds": 30,
@@ -56,17 +57,47 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             metrics = {
                 "requests": {"delete": 1, "get": 2, "list": 3, "put": 4, "range_get": 0}
             }
-        labels = {
-            "point-concurrency-1": measured(100, 2, metrics),
-            "mixed-baseline": measured(80, 3, metrics),
-            "mixed-checkpoint-interference": measured(60, 4, metrics),
-            "postgresql18-point-concurrency-1": measured(200, 1),
-            "postgresql18-mixed-baseline": measured(180, 1.5),
-            "postgresql18-mixed-checkpoint-interference": measured(160, 2),
-            "postgresql18-matched-point-concurrency-1": measured(190, 1.1),
-            "postgresql18-matched-mixed-baseline": measured(170, 1.7),
-            "postgresql18-matched-mixed-checkpoint-interference": measured(150, 2.2),
-        }
+        if mode == "checkpoint":
+            labels = {
+                "point-concurrency-1": measured(100, 2, metrics),
+                "mixed-baseline": measured(80, 3, metrics),
+                "mixed-checkpoint-interference": measured(60, 4, metrics),
+                "postgresql18-point-concurrency-1": measured(200, 1),
+                "postgresql18-mixed-baseline": measured(180, 1.5),
+                "postgresql18-mixed-checkpoint-interference": measured(160, 2),
+                "postgresql18-matched-point-concurrency-1": measured(190, 1.1),
+                "postgresql18-matched-mixed-baseline": measured(170, 1.7),
+                "postgresql18-matched-mixed-checkpoint-interference": measured(150, 2.2),
+            }
+        else:
+            labels = {}
+            for index, (_, pos3ql, postgres, matched) in enumerate(
+                (
+                    (
+                        "point",
+                        "warm-memory-point",
+                        "postgresql18-point",
+                        "postgresql18-matched-point",
+                    ),
+                    (
+                        "catalog",
+                        "warm-memory-catalog-lookup",
+                        "postgresql18-catalog-lookup",
+                        "postgresql18-matched-catalog-lookup",
+                    ),
+                    (
+                        "insert",
+                        "concurrent-insert",
+                        "postgresql18-insert",
+                        "postgresql18-matched-insert",
+                    ),
+                    ("scan", "analytical-scan", "postgresql18-scan", "postgresql18-matched-scan"),
+                    ("mixed", "mixed-baseline", "postgresql18-mixed", "postgresql18-matched-mixed"),
+                )
+            ):
+                labels[pos3ql] = measured(100 - index, 2 + index, metrics)
+                labels[postgres] = measured(200 - index, 1 + index)
+                labels[matched] = measured(190 - index, 1.1 + index)
         for label, result in labels.items():
             artifact = {
                 "schema_version": 1,
@@ -140,6 +171,47 @@ class BenchmarkMatrixReportTest(unittest.TestCase):
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("minio used a different pos3ql binary", completed.stderr)
+
+    def test_rejects_a_different_catalog_size(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for backend in ("fixture", "minio", "seaweedfs"):
+                self.write_run(root, backend)
+            environment_path = root / "minio" / "environment.json"
+            environment = json.loads(environment_path.read_text())
+            environment["suite"]["catalog_relations"] = 1
+            environment_path.write_text(json.dumps(environment))
+            completed = subprocess.run(
+                ["python3", str(SCRIPT), str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("minio used a different suite catalog_relations", completed.stderr)
+
+    def test_full_matrix_includes_catalog_lookup_for_both_postgresql_controls(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for backend in ("fixture", "minio", "seaweedfs"):
+                self.write_run(root, backend, mode="full")
+            completed = subprocess.run(
+                ["python3", str(SCRIPT), str(root)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertIn("| fixture | pos3ql | catalog lookup", completed.stdout)
+        self.assertIn(
+            "| minio | PostgreSQL 18 host available | catalog lookup",
+            completed.stdout,
+        )
+        self.assertIn(
+            "| seaweedfs | PostgreSQL 18 resource matched | catalog lookup",
+            completed.stdout,
+        )
 
 
 if __name__ == "__main__":

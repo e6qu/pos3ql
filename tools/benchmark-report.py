@@ -81,11 +81,17 @@ def main():
             if suite.get("object_latency_injected", True)
             else "no artificial object latency"
         )
+        catalogs = (
+            f", {suite['catalog_relations']} catalog relations"
+            if suite.get("catalog_relations")
+            else ""
+        )
         print(
             f"Run identity: `{environment['git_commit']}`; "
             f"binary `{environment['pos3ql_binary_sha256'][:16]}…`; "
             f"{environment['machine']}, {environment['logical_cpu_count']} logical CPUs; "
-            f"{suite['rows']} rows, {suite['clients']} clients, {cache}{timeout}{latency}.\n"
+            f"{suite['rows']} rows, {suite['clients']} clients{catalogs}, "
+            f"{cache}{timeout}{latency}.\n"
         )
         hardware = environment.get("hardware_description")
         cache_storage = suite.get("cache_storage_description")
@@ -301,6 +307,26 @@ def main():
                 pg_one["results"]["throughput_ops_per_second"],
             ),
         ))
+    catalog = results.get("warm-memory-catalog-lookup")
+    for postgres_label, description in (
+        (
+            "postgresql18-catalog-lookup",
+            "pos3ql / PostgreSQL 18 catalog lookup throughput",
+        ),
+        (
+            "postgresql18-matched-catalog-lookup",
+            "pos3ql / resource-matched PostgreSQL 18 catalog lookup throughput",
+        ),
+    ):
+        postgres_catalog = results.get(postgres_label)
+        if catalog and postgres_catalog:
+            comparisons.append((
+                description,
+                ratio(
+                    catalog["results"]["throughput_ops_per_second"],
+                    postgres_catalog["results"]["throughput_ops_per_second"],
+                ),
+            ))
     for pos3ql_label, postgres_label, description in (
         ("concurrent-insert", "postgresql18-insert", "pos3ql / PostgreSQL 18 insert throughput"),
         ("analytical-scan", "postgresql18-scan", "pos3ql / PostgreSQL 18 scan throughput"),

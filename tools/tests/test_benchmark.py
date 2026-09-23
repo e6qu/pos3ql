@@ -173,6 +173,13 @@ class BenchmarkTest(unittest.TestCase):
             "JOIN benchmark_kv AS kv ON kv.id = probe.id",
         )
 
+    def test_catalog_lookup_resolves_one_relation_from_the_configured_catalog(self):
+        self.assertEqual(
+            benchmark.workload_sql("catalog-lookup", 7, 19, 1000, 128),
+            "SELECT relname FROM pg_class WHERE oid = "
+            "'benchmark_catalog.relation_000074'::regclass",
+        )
+
     def test_spatial_workloads_probe_existing_gist_and_spgist_generations(self):
         self.assertEqual(
             benchmark.workload_sql("gist-spatial", 7, 19, 1000),

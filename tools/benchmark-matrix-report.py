@@ -30,6 +30,12 @@ CHECKPOINT_PAIRS = (
 )
 FULL_PAIRS = (
     ("point", "warm-memory-point", "postgresql18-point", "postgresql18-matched-point"),
+    (
+        "catalog lookup",
+        "warm-memory-catalog-lookup",
+        "postgresql18-catalog-lookup",
+        "postgresql18-matched-catalog-lookup",
+    ),
     ("insert", "concurrent-insert", "postgresql18-insert", "postgresql18-matched-insert"),
     ("scan", "analytical-scan", "postgresql18-scan", "postgresql18-matched-scan"),
     ("mixed", "mixed-baseline", "postgresql18-mixed", "postgresql18-matched-mixed"),
@@ -40,6 +46,7 @@ SUITE_IDENTITY_FIELDS = (
     "table_capacity",
     "operations_per_client",
     "clients",
+    "catalog_relations",
     "logical_replicas",
     "disk_cache_mib",
     "timeout_seconds",

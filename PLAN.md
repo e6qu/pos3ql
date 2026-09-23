@@ -469,6 +469,15 @@ reports distinguish this topology from exploratory same-host services. The
 long-running measurement and publication below still require representative
 infrastructure and remain outstanding.
 
+The full performance suite now covers the previously listed large-catalog
+shape with 128 configurable ordinary views in an isolated schema. It measures
+exact relation-name resolution and `pg_class` lookup in warm memory and after
+empty-local-cache recovery; both vanilla PostgreSQL controls run the same
+catalog setup and warm workload. Smoke mode exercises 16 relations, raw
+artifacts record the selected count, and matrix identity checks reject unequal
+catalog sizes. The focused checkpoint suite keeps this count at zero so the
+new setup does not alter its publication profile.
+
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local
 storage medium and durability settings and pos3ql's object store, network,

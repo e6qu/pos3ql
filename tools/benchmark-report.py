@@ -49,18 +49,33 @@ def main():
             f"{suite['timeout_seconds']} s query timeout, "
             if "timeout_seconds" in suite else ""
         )
+        latency = (
+            f"{suite['object_latency_ms']} ms injected object latency"
+            if suite.get("object_latency_injected", True)
+            else "no artificial object latency"
+        )
         print(
             f"Run identity: `{environment['git_commit']}`; "
             f"binary `{environment['pos3ql_binary_sha256'][:16]}…`; "
             f"{environment['machine']}, {environment['logical_cpu_count']} logical CPUs; "
-            f"{suite['rows']} rows, {suite['clients']} clients, {cache}{timeout}"
-            f"{suite['object_latency_ms']} ms injected object latency.\n"
+            f"{suite['rows']} rows, {suite['clients']} clients, {cache}{timeout}{latency}.\n"
         )
         object_store = environment.get("pos3ql_object_store")
-        if object_store and not object_store["independently_operated"]:
+        if object_store:
+            image = object_store.get("container_image")
+            image_text = f"; image `{image}`" if image else ""
+            image_id = object_store.get("container_image_id")
+            image_id_text = f"; resolved `{image_id[:20]}…`" if image_id else ""
+            metrics = (
+                "exact request metrics available"
+                if object_store.get("request_metrics_available", True)
+                else "provider request metrics unavailable"
+            )
             print(
-                "pos3ql uses an instrumented object-store fixture backed by "
-                "local temporary storage. Timing from this run is exploratory.\n"
+                f"pos3ql object store: {object_store['implementation']}{image_text}"
+                f"{image_id_text}; "
+                f"backing: {object_store['backing']}; {metrics}. "
+                "This local-host timing is exploratory.\n"
             )
         duration = suite.get("checkpoint_duration_seconds", 0)
         if suite_mode == "checkpoint" and duration:
@@ -128,10 +143,13 @@ def main():
                 f"{totals['block_gets']} | {totals['block_puts']} | {totals['deleted']} |"
             )
         requests = profile["object_requests"]
-        print(
-            f"\nFull profile window: {requests['put']} object PUT, "
-            f"{requests['delete']} object DELETE, {requests['list']} LIST."
-        )
+        if requests is None:
+            print("\nProvider request totals are unavailable for this profile window.")
+        else:
+            print(
+                f"\nFull profile window: {requests['put']} object PUT, "
+                f"{requests['delete']} object DELETE, {requests['list']} LIST."
+            )
         overlap = profile.get("operation_overlap")
         if overlap:
             print("\n### Foreground overlap\n")
@@ -163,6 +181,12 @@ def main():
         print("|---|---:|---:|---:|---:|---:|")
         for label, value in recoveries.items():
             objects = value["object_store"]
+            if objects is None:
+                print(
+                    f"| {label} | {number(value['elapsed_seconds'], 3)} | "
+                    "— | — | — | — |"
+                )
+                continue
             requests = objects["requests"]
             print(
                 f"| {label} | {number(value['elapsed_seconds'], 3)} | "

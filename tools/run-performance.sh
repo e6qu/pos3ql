@@ -17,6 +17,7 @@ mkdir -p "$OUTPUT"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pos3ql-performance.XXXXXX")
 SERVER_PID=
 S3_PID=
+OBJECT_STORE_CONTAINER=
 POSTGRES_CONTAINER=
 REPLICA_PIDS=
 
@@ -28,6 +29,9 @@ cleanup() {
   if [ -n "$S3_PID" ] && server_alive "$S3_PID"; then
     kill "$S3_PID" 2>/dev/null || true
     wait "$S3_PID" 2>/dev/null || true
+  fi
+  if [ -n "$OBJECT_STORE_CONTAINER" ]; then
+    docker rm -f "$OBJECT_STORE_CONTAINER" >/dev/null 2>&1 || true
   fi
   for replica_pid in $REPLICA_PIDS; do
     if server_alive "$replica_pid"; then
@@ -47,8 +51,34 @@ trap cleanup EXIT INT TERM
 
 S3_PORT=$(claim_test_port "${POS3QL_BENCH_S3_PORT:-}" 19500 19599)
 POS3QL_PORT=$(claim_test_port "${POS3QL_BENCH_PORT:-}" 19600 19699)
-METRICS="$WORK/object-store-metrics.json"
-LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-2}
+OBJECT_STORE=${POS3QL_BENCH_OBJECT_STORE:-fixture}
+case "$OBJECT_STORE" in
+  fixture|minio|seaweedfs) ;;
+  *) echo "POS3QL_BENCH_OBJECT_STORE must be fixture, minio, or seaweedfs" >&2; exit 2 ;;
+esac
+if [ "$OBJECT_STORE" = fixture ]; then
+  LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-2}
+  OBJECT_LATENCY_INJECTED=1
+else
+  LATENCY_MS=${POS3QL_BENCH_OBJECT_LATENCY_MS:-0}
+  OBJECT_LATENCY_INJECTED=0
+  if [ "$LATENCY_MS" != 0 ]; then
+    echo "POS3QL_BENCH_OBJECT_LATENCY_MS must be 0 for MinIO and SeaweedFS" >&2
+    exit 2
+  fi
+fi
+METRICS=
+OBJECT_STORE_ENDPOINT="127.0.0.1:$S3_PORT"
+OBJECT_STORE_BUCKET=performance
+OBJECT_STORE_REGION=benchmark
+OBJECT_STORE_ACCESS_KEY=benchmark
+OBJECT_STORE_SECRET_KEY=benchmark-secret
+OBJECT_STORE_IMPLEMENTATION=
+OBJECT_STORE_BACKING=
+OBJECT_STORE_IMAGE=
+OBJECT_STORE_IMAGE_ID=
+OBJECT_STORE_INDEPENDENT_IMPLEMENTATION=0
+OBJECT_STORE_REQUEST_METRICS=0
 DISK_CACHE_MIB=${POS3QL_BENCH_DISK_CACHE_MIB:-128}
 BENCH_TIMEOUT_SECONDS=${POS3QL_BENCH_TIMEOUT_SECONDS:-30}
 CHECKPOINT_PROFILE=${POS3QL_BENCH_CHECKPOINT_PROFILE:-0}
@@ -66,31 +96,96 @@ if [[ "$CHECKPOINT_PROFILE" = 1 && "$MODE" != checkpoint ]]; then
   exit 2
 fi
 export POS3QL_BENCH_TIMEOUT_SECONDS=$BENCH_TIMEOUT_SECONDS
-python3 "$ROOT/tests/external/s3_test_server.py" \
-  --root "$WORK/objects" --port "$S3_PORT" --bucket performance \
-  --region benchmark --access-key benchmark --secret-key benchmark-secret \
-  --metrics-file "$METRICS" --latency-ms "$LATENCY_MS" &
-S3_PID=$!
 
-for attempt in $(seq 1 100); do
-  if ! server_alive "$S3_PID"; then echo "object-store fixture exited at startup" >&2; exit 1; fi
-  if nc -z 127.0.0.1 "$S3_PORT" >/dev/null 2>&1; then break; fi
-  if [ "$attempt" = 100 ]; then echo "object-store fixture did not start" >&2; exit 1; fi
-  sleep 0.05
-done
-for attempt in $(seq 1 100); do
-  if [ -s "$METRICS" ]; then break; fi
-  if [ "$attempt" = 100 ]; then echo "object-store metrics did not start" >&2; exit 1; fi
-  sleep 0.05
-done
-
-BUILD_FEATURES=()
-TRACE_FEATURES=()
-if [ "$CHECKPOINT_PROFILE" = 1 ]; then
-  BUILD_FEATURES=(--features checkpoint-profile)
-  TRACE_FEATURES=(--trace-operations)
+if [ "$OBJECT_STORE" = fixture ]; then
+  METRICS="$WORK/object-store-metrics.json"
+  OBJECT_STORE_REQUEST_METRICS=1
+  OBJECT_STORE_IMPLEMENTATION=tests/external/s3_test_server.py
+  OBJECT_STORE_BACKING="temporary local filesystem"
+  python3 "$ROOT/tests/external/s3_test_server.py" \
+    --root "$WORK/objects" --port "$S3_PORT" --bucket "$OBJECT_STORE_BUCKET" \
+    --region "$OBJECT_STORE_REGION" --access-key "$OBJECT_STORE_ACCESS_KEY" \
+    --secret-key "$OBJECT_STORE_SECRET_KEY" \
+    --metrics-file "$METRICS" --latency-ms "$LATENCY_MS" &
+  S3_PID=$!
+else
+  command -v docker >/dev/null 2>&1 || {
+    echo "Docker is required for the $OBJECT_STORE benchmark backend" >&2
+    exit 1
+  }
+  OBJECT_STORE_CONTAINER="pos3ql-performance-$OBJECT_STORE-$$"
+  OBJECT_STORE_REGION=us-east-1
+  OBJECT_STORE_INDEPENDENT_IMPLEMENTATION=1
+  OBJECT_STORE_BACKING="ephemeral Docker container storage on the benchmark host"
+  if [ "$OBJECT_STORE" = minio ]; then
+    OBJECT_STORE_IMPLEMENTATION=MinIO
+    OBJECT_STORE_IMAGE=${POS3QL_BENCH_MINIO_IMAGE:-quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e}
+    docker run -d --name "$OBJECT_STORE_CONTAINER" -p "$S3_PORT:9000" \
+      -e MINIO_ROOT_USER="$OBJECT_STORE_ACCESS_KEY" \
+      -e MINIO_ROOT_PASSWORD="$OBJECT_STORE_SECRET_KEY" \
+      "$OBJECT_STORE_IMAGE" server /data >/dev/null
+  else
+    OBJECT_STORE_IMPLEMENTATION=SeaweedFS
+    OBJECT_STORE_IMAGE=${POS3QL_BENCH_SEAWEEDFS_IMAGE:-chrislusf/seaweedfs@sha256:08d516132314207d10c8e37cbffc1f32b147d870169688734cc61c6231625b62}
+    docker run -d --name "$OBJECT_STORE_CONTAINER" -p "$S3_PORT:8333" \
+      -e AWS_ACCESS_KEY_ID="$OBJECT_STORE_ACCESS_KEY" \
+      -e AWS_SECRET_ACCESS_KEY="$OBJECT_STORE_SECRET_KEY" \
+      -e S3_BUCKET="$OBJECT_STORE_BUCKET" \
+      "$OBJECT_STORE_IMAGE" mini -dir=/data >/dev/null
+  fi
 fi
-cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" "${BUILD_FEATURES[@]}"
+
+for attempt in $(seq 1 100); do
+  if [ -n "$S3_PID" ] && ! server_alive "$S3_PID"; then
+    echo "object-store fixture exited at startup" >&2
+    exit 1
+  fi
+  if [ -n "$OBJECT_STORE_CONTAINER" ] &&
+     [ "$(docker inspect --format '{{.State.Running}}' "$OBJECT_STORE_CONTAINER")" != true ]; then
+    docker logs "$OBJECT_STORE_CONTAINER" >&2
+    exit 1
+  fi
+  if nc -z 127.0.0.1 "$S3_PORT" >/dev/null 2>&1; then break; fi
+  if [ "$attempt" = 100 ]; then
+    [ -z "$OBJECT_STORE_CONTAINER" ] || docker logs "$OBJECT_STORE_CONTAINER" >&2
+    echo "$OBJECT_STORE object store did not start" >&2
+    exit 1
+  fi
+  sleep 0.05
+done
+if [ -n "$OBJECT_STORE_CONTAINER" ]; then
+  for attempt in $(seq 1 100); do
+    if curl --silent --output /dev/null "http://$OBJECT_STORE_ENDPOINT/"; then break; fi
+    if [ "$attempt" = 100 ]; then
+      docker logs "$OBJECT_STORE_CONTAINER" >&2
+      echo "$OBJECT_STORE S3 API did not become ready" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+fi
+if [ -n "$METRICS" ]; then
+  for attempt in $(seq 1 100); do
+    if [ -s "$METRICS" ]; then break; fi
+    if [ "$attempt" = 100 ]; then echo "object-store metrics did not start" >&2; exit 1; fi
+    sleep 0.05
+  done
+elif [ "$OBJECT_STORE" = minio ]; then
+  docker exec "$OBJECT_STORE_CONTAINER" mc alias set local \
+    http://127.0.0.1:9000 "$OBJECT_STORE_ACCESS_KEY" "$OBJECT_STORE_SECRET_KEY" >/dev/null
+  docker exec "$OBJECT_STORE_CONTAINER" mc mb local/"$OBJECT_STORE_BUCKET" >/dev/null
+fi
+if [ -n "$OBJECT_STORE_CONTAINER" ]; then
+  OBJECT_STORE_IMAGE_ID=$(docker inspect --format '{{.Image}}' "$OBJECT_STORE_CONTAINER")
+  printf '%s\n' "$OBJECT_STORE_IMAGE_ID" >"$OUTPUT/object-store-image-id.txt"
+fi
+
+if [ "$CHECKPOINT_PROFILE" = 1 ]; then
+  cargo build --release --locked --manifest-path "$ROOT/Cargo.toml" \
+    --features checkpoint-profile
+else
+  cargo build --release --locked --manifest-path "$ROOT/Cargo.toml"
+fi
 
 write_config() {
   config=$1
@@ -134,12 +229,12 @@ max_subscriptions = 4
 subscription_relation_capacity = 32
 subscription_arena_bytes = 512 KiB
 object_store = on
-object_store_endpoint = 127.0.0.1:$S3_PORT
-object_store_bucket = performance
+object_store_endpoint = $OBJECT_STORE_ENDPOINT
+object_store_bucket = $OBJECT_STORE_BUCKET
 object_store_prefix = $prefix
-object_store_region = benchmark
-object_store_access_key = benchmark
-object_store_secret_key = benchmark-secret
+object_store_region = $OBJECT_STORE_REGION
+object_store_access_key = $OBJECT_STORE_ACCESS_KEY
+object_store_secret_key = $OBJECT_STORE_SECRET_KEY
 object_store_response_bytes = 512 KiB
 object_store_get_slots = 4
 wal_upload = on
@@ -157,7 +252,9 @@ start_pos3ql() {
   log="$WORK/pos3ql-$prefix.log"
   write_config "$config" "$data" "$prefix" "$POS3QL_PORT"
   sleep 0.1
-  cp "$METRICS" "$WORK/$recovery_label-before.json"
+  if [ -n "$METRICS" ]; then
+    cp "$METRICS" "$WORK/$recovery_label-before.json"
+  fi
   startup_started=$(python3 -c 'import time; print(time.monotonic_ns())')
   "$ROOT/target/release/pos3ql" --config "$config" >"$log" 2>&1 &
   SERVER_PID=$!
@@ -172,14 +269,25 @@ start_pos3ql() {
       startup_finished=$(python3 -c 'import time; print(time.monotonic_ns())')
       startup_seconds=$(python3 -c 'import sys; print((int(sys.argv[2]) - int(sys.argv[1])) / 1_000_000_000)' "$startup_started" "$startup_finished")
       sleep 0.1
-      cp "$METRICS" "$WORK/$recovery_label-after.json"
-      read_gate=
-      if [ "$require_read" = yes ]; then read_gate=--require-read; fi
-      python3 "$ROOT/tools/object-metrics-diff.py" \
-        --before "$WORK/$recovery_label-before.json" \
-        --after "$WORK/$recovery_label-after.json" --label "$recovery_label" \
-        --elapsed-seconds "$startup_seconds" --output "$OUTPUT/$recovery_label.json" \
-        $read_gate
+      if [ -n "$METRICS" ]; then
+        cp "$METRICS" "$WORK/$recovery_label-after.json"
+        if [ "$require_read" = yes ]; then
+          python3 "$ROOT/tools/object-metrics-diff.py" \
+            --before "$WORK/$recovery_label-before.json" \
+            --after "$WORK/$recovery_label-after.json" --require-read \
+            --label "$recovery_label" --elapsed-seconds "$startup_seconds" \
+            --output "$OUTPUT/$recovery_label.json"
+        else
+          python3 "$ROOT/tools/object-metrics-diff.py" \
+            --before "$WORK/$recovery_label-before.json" \
+            --after "$WORK/$recovery_label-after.json" \
+            --label "$recovery_label" --elapsed-seconds "$startup_seconds" \
+            --output "$OUTPUT/$recovery_label.json"
+        fi
+      else
+        python3 "$ROOT/tools/object-metrics-diff.py" --label "$recovery_label" \
+          --elapsed-seconds "$startup_seconds" --output "$OUTPUT/$recovery_label.json"
+      fi
       return
     fi
     if ! server_alive "$SERVER_PID"; then cat "$log" >&2; exit 1; fi
@@ -220,10 +328,17 @@ stop_pos3ql() {
 bench_pos3ql() {
   label=$1
   shift
-  python3 "$ROOT/tools/benchmark.py" \
-    --port "$POS3QL_PORT" --label "$label" --pid "$SERVER_PID" \
-    --fixed-memory-bytes "$MEMORY_PLAN_BYTES" --object-metrics "$METRICS" \
-    --output "$OUTPUT/$label.json" --check "$@" >/dev/null
+  if [ -n "$METRICS" ]; then
+    python3 "$ROOT/tools/benchmark.py" \
+      --port "$POS3QL_PORT" --label "$label" --pid "$SERVER_PID" \
+      --fixed-memory-bytes "$MEMORY_PLAN_BYTES" --object-metrics "$METRICS" \
+      --output "$OUTPUT/$label.json" --check "$@" >/dev/null
+  else
+    python3 "$ROOT/tools/benchmark.py" \
+      --port "$POS3QL_PORT" --label "$label" --pid "$SERVER_PID" \
+      --fixed-memory-bytes "$MEMORY_PLAN_BYTES" \
+      --output "$OUTPUT/$label.json" --check "$@" >/dev/null
+  fi
 }
 
 start_postgresql_baseline() {
@@ -292,6 +407,13 @@ python3 "$ROOT/tools/benchmark-environment.py" \
   --mode "$MODE" --rows "$ROWS" --table-capacity "$TABLE_CAPACITY" \
   --operations "$OPERATIONS" --clients "$CLIENTS" \
   --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS" \
+  --object-latency-injected "$OBJECT_LATENCY_INJECTED" \
+  --object-store-implementation "$OBJECT_STORE_IMPLEMENTATION" \
+  --object-store-backing "$OBJECT_STORE_BACKING" \
+  --object-store-image "$OBJECT_STORE_IMAGE" \
+  --object-store-image-id "$OBJECT_STORE_IMAGE_ID" \
+  --object-store-independent-implementation "$OBJECT_STORE_INDEPENDENT_IMPLEMENTATION" \
+  --object-store-request-metrics "$OBJECT_STORE_REQUEST_METRICS" \
   --disk-cache-mib "$DISK_CACHE_MIB" --timeout-seconds "$BENCH_TIMEOUT_SECONDS" \
   --checkpoint-profile "$CHECKPOINT_PROFILE" \
   --checkpoint-duration-seconds "$CHECKPOINT_DURATION"
@@ -310,16 +432,23 @@ if [ "$MODE" = checkpoint ]; then
   PROFILE_OFFSET=0
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
     PROFILE_OFFSET=$(wc -c < "$WORK/pos3ql-primary.log")
-    cp "$METRICS" "$WORK/checkpoint-profile-before.json"
+    if [ -n "$METRICS" ]; then cp "$METRICS" "$WORK/checkpoint-profile-before.json"; fi
   fi
-  bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
-    --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
-    --maintenance-interval 0.001 --maintenance-limit 3 \
-    --require-maintenance-operations 3 "${TRACE_FEATURES[@]}"
+  if [ "$CHECKPOINT_PROFILE" = 1 ]; then
+    bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
+      --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
+      --maintenance-interval 0.001 --maintenance-limit 3 \
+      --require-maintenance-operations 3 --trace-operations
+  else
+    bench_pos3ql mixed-checkpoint-interference --workload mixed --clients "$CLIENTS" \
+      --operations "$OPERATIONS" --rows "$ROWS" --duration-seconds "$CHECKPOINT_DURATION" \
+      --maintenance-interval 0.001 --maintenance-limit 3 \
+      --require-maintenance-operations 3
+  fi
   stop_pos3ql
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
     sleep 0.1
-    cp "$METRICS" "$WORK/checkpoint-profile-after.json"
+    if [ -n "$METRICS" ]; then cp "$METRICS" "$WORK/checkpoint-profile-after.json"; fi
   fi
   start_postgresql_baseline
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
@@ -340,12 +469,19 @@ if [ "$MODE" = checkpoint ]; then
     --output "$OUTPUT/postgresql18-mixed-checkpoint-interference.json" >/dev/null
   cp "$WORK/pos3ql-primary.log" "$OUTPUT/pos3ql-startup.log"
   if [ "$CHECKPOINT_PROFILE" = 1 ]; then
-    python3 "$ROOT/tools/checkpoint-profile.py" \
-      "$OUTPUT/pos3ql-startup.log" "$OUTPUT/checkpoint-profile.json" \
-      --after-byte-offset "$PROFILE_OFFSET" \
-      --metrics-before "$WORK/checkpoint-profile-before.json" \
-      --metrics-after "$WORK/checkpoint-profile-after.json" \
-      --operation-trace "$OUTPUT/mixed-checkpoint-interference.json"
+    if [ -n "$METRICS" ]; then
+      python3 "$ROOT/tools/checkpoint-profile.py" \
+        "$OUTPUT/pos3ql-startup.log" "$OUTPUT/checkpoint-profile.json" \
+        --after-byte-offset "$PROFILE_OFFSET" \
+        --metrics-before "$WORK/checkpoint-profile-before.json" \
+        --metrics-after "$WORK/checkpoint-profile-after.json" \
+        --operation-trace "$OUTPUT/mixed-checkpoint-interference.json"
+    else
+      python3 "$ROOT/tools/checkpoint-profile.py" \
+        "$OUTPUT/pos3ql-startup.log" "$OUTPUT/checkpoint-profile.json" \
+        --after-byte-offset "$PROFILE_OFFSET" \
+        --operation-trace "$OUTPUT/mixed-checkpoint-interference.json"
+    fi
   fi
   python3 "$ROOT/tools/benchmark-report.py" "$OUTPUT" >"$OUTPUT/report.md"
   echo "performance results: $OUTPUT"

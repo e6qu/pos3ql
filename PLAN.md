@@ -417,6 +417,17 @@ PostgreSQL 18.6 completed the matched SQL and checkpoint workload on its
 recorded durable local tier; its persistence path has no pos3ql object-request
 equivalent.
 
+The benchmark harness now runs the same pos3ql workload against its
+instrumented fixture, pinned MinIO, and pinned SeaweedFS, pairing every backend
+run with a contemporaneous vanilla PostgreSQL 18 baseline. Environment
+artifacts identify the implementation, immutable container reference, backing
+storage, artificial latency, and request-metric availability. A combined
+report rejects mismatched commits, binaries, and workload shapes. Exact
+provider request attribution remains available from the fixture; MinIO and
+SeaweedFS timings report those counters as unavailable. Local containers expand
+implementation coverage but do not satisfy the remaining independently
+operated object-store qualification.
+
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local
 storage medium and durability settings and pos3ql's object store, network,

@@ -6,6 +6,13 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The row-SST delta discovery audit found no external blocker. Exact unpublished
+row identities remain in the startup-sized overlay until their table generation
+publishes, so delta checkpoints avoid an immutable-table scan without relying
+on row-byte residence. Cache-disabled reslice, pinned-snapshot merge, retry,
+object-cold recovery, and storage VOPR regressions qualify the boundary. WAL
+replay now reports configured overlay exhaustion instead of silently losing a
+spilled-row delete marker.
 Checkpoint value-index output pacing found no external blocker: the retained
 fixed-memory sort source survives bounded writer beats and retry, while exact
 table and binding identity prevents one relation's staged install from

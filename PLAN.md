@@ -373,12 +373,10 @@ Every paced value-index and row-merge event stayed within its object-I/O beat
 limits. Correctness validation rejected a resident-only row-SST delta shortcut
 because a changed row may spill before checkpoint. The restored complete
 logical scan made 228 GETs over two delta events, with one 702.96 ms event. This
-is now the next measured construction target: track changed spilled row
-identities explicitly so delta discovery avoids a table-wide provider scan
-without making pre-checkpoint residence an invariant. Row merge made 47 GETs
-over 42 schedule beats and 100 PUTs over 235 write beats; their totals were
-0.14 and 1.02 seconds, with largest events of 25.38 and 24.18 ms. Commit pruning
-remains a separate 1.42-second post-publication cost.
+was the next measured construction target. Row merge made 47 GETs over 42
+schedule beats and 100 PUTs over 235 write beats; their totals were 0.14 and
+1.02 seconds, with largest events of 25.38 and 24.18 ms. Commit pruning was a
+separate 1.42-second post-publication cost.
 
 The complete storage VOPR range then exposed two interleavings hidden by the
 profile: consulting a live committed LSN during output could suppress an
@@ -388,8 +386,36 @@ The captured row-identity set now supplies the stable merge boundary, while
 rollback removes the redundant overlay state. Deterministic seeds 460259
 through 460274 cover outage, cold-start, warm-restart, and rollback variants.
 
-Repeat on larger datasets and representative hardware before asserting
-production ratios.
+The [exact row-delta profile](benchmarks/baselines/2026-09-23-checkpoint-row-delta-discovery-10000/README.md)
+closes the remaining table-wide delta scan. Each committed row retains an
+unpublished-change LSN in the startup-sized overlay until the matching table
+generation publishes. Delta discovery walks only those resident identities;
+the row bytes may be in the heap or an immutable generation. Full rewrites
+retain the complete logical walk, compatible reslices retain their captured
+LSN boundary, and ordinary deltas preserve the resident historical images
+required by pinned-snapshot pair merges. Recovery rejects overlay exhaustion
+on a replayed delete instead of silently losing its tombstone.
+
+Across the same two row-delta events, object GETs fell from 228 to zero,
+summed phase time from 734.49 to 33.34 ms, and the largest event from 702.96
+to 19.84 ms. The eight PUTs and four-PUT event maximum were unchanged. A
+cache-disabled regression proves zero-GET discovery after evicting every
+redundant base row, then verifies the initial delta and an in-progress reslice
+after object-cold recovery. A 24-generation pinned snapshot and the complete
+16-seed storage VOPR range cover merge pruning, retry, outage, corruption, and
+restart interleavings.
+
+The run's row-merge schedule made 216 GETs over 62 events, versus 47 over 42
+events in the preceding duration-floor run, while retaining the eight-GET
+event maximum. Row-merge output made 74 PUTs over 233 events and retained its
+five-PUT maximum. This differing generation shape means shared-host aggregate
+traffic and timing cannot rank another implementation change. The next
+performance evidence should use pinned representative hardware and an
+independently operated compatible object store, then compare like generation
+shapes before changing the already bounded merge and cleanup beats. Actual
+PostgreSQL 18.6 completed the matched SQL and checkpoint workload on its
+recorded durable local tier; its persistence path has no pos3ql object-request
+equivalent.
 
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local

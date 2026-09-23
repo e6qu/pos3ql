@@ -110,8 +110,11 @@ def main():
         )
 
     print("\n## Paired results\n")
-    print("| Backend | Engine | Scenario | ops/s | p99 ms | max ms | object req/op | errors |")
-    print("|---|---|---|---:|---:|---:|---:|---:|")
+    print(
+        "| Backend | Engine | Scenario | completed ops | ops/s | p99 ms | max ms | "
+        "object req/op | errors |"
+    )
+    print("|---|---|---|---:|---:|---:|---:|---:|---:|")
     for backend in BACKENDS:
         results = runs[backend][1]
         for scenario, pos3ql_label, postgres_label in pairs:
@@ -121,6 +124,7 @@ def main():
                 measured = results[label]
                 print(
                     f"| {backend} | {engine} | {scenario} | "
+                    f"{measured['completed_operations']} | "
                     f"{number(measured['throughput_ops_per_second'])} | "
                     f"{number(measured['latency_ms']['p99'])} | "
                     f"{number(measured['latency_ms']['maximum'])} | "
@@ -142,7 +146,9 @@ def main():
             )
     print(
         "\nRatios compare the stated end-to-end setups. PostgreSQL has no corresponding "
-        "object-request measure, and local shared-host samples do not establish production ratios."
+        "object-request measure. Duration-bound operation counts and resulting checkpoint "
+        "generation shapes can differ, and sequential local shared-host samples do not establish "
+        "production ratios or rank object-store implementations."
     )
 
 

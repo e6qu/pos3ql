@@ -11,7 +11,10 @@ now runs paired fixture, MinIO, SeaweedFS, and vanilla PostgreSQL 18 workloads,
 records exact backend provenance, and represents unavailable provider request
 counters explicitly. HTTP readiness closes a MinIO TCP-accept race, and
 optional argument paths no longer rely on empty-array behavior that differs
-between macOS and Linux Bash.
+between macOS and Linux Bash. The clean 10,000-row matrix completed every
+backend and PostgreSQL workload without error; its differing generation shapes
+remain an evidence constraint recorded in PLAN.md rather than an unresolved
+defect.
 The row-SST delta discovery audit found no external blocker. Exact unpublished
 row identities remain in the startup-sized overlay until their table generation
 publishes, so delta checkpoints avoid an immutable-table scan without relying

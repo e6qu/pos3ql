@@ -118,8 +118,9 @@ the pos3ql startup log with its fixed memory plan, and a derived `report.md`.
 
 The baseline runs actual, unmodified PostgreSQL 18 with its ordinary local
 storage and durability settings. Both systems receive the same SQL workload,
-concurrency, row count, and operation count. pos3ql instead publishes durable
-state to object storage. A representative comparison must record PostgreSQL's
+concurrency, row count, and stopping rule; duration-bound runs can complete
+different operation counts. pos3ql instead publishes durable state to object
+storage. A representative comparison must record PostgreSQL's
 storage medium and settings alongside pos3ql's object store, network, and cache
 conditions. End-to-end latency and throughput can be compared directly for the
 stated setups; storage request, cache-tier, and recovery measurements describe
@@ -130,6 +131,13 @@ SeaweedFS implementations. Their PostgreSQL comparisons are exploratory
 baselines; the representative qualification in [PLAN.md](../PLAN.md) also
 requires pinned hardware and an independently operated compatible object
 store.
+
+The first [10,000-row object-store matrix](../benchmarks/baselines/2026-09-23-object-store-matrix-10000/README.md)
+preserves raw fixture, MinIO, SeaweedFS, and paired vanilla PostgreSQL 18.6
+results. All workloads completed without error. Different duration-bound
+foreground counts, row-generation shapes, and sequential PostgreSQL samples
+make it implementation coverage and exploratory evidence rather than a
+provider ranking.
 
 The complete [256-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
 and [1,000-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs-1000/README.md)

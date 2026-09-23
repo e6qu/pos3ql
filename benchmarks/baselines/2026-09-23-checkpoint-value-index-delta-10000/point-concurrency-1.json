@@ -10,36 +10,36 @@
     },
     "attempted_operations": 100,
     "completed_operations": 100,
-    "elapsed_seconds": 2.271162583,
+    "elapsed_seconds": 2.008746125,
     "errors": [],
-    "fixed_memory_occupancy": 0.39543504389786294,
-    "fixed_memory_plan_bytes": 991363750,
+    "fixed_memory_occupancy": 0.3959446033294564,
+    "fixed_memory_plan_bytes": 991494822,
     "latency_ms": {
-      "maximum": 36.6355,
-      "mean": 22.696365399999998,
-      "minimum": 4.593583,
-      "p50": 21.603083,
-      "p95": 30.754167,
-      "p99": 32.963916
+      "maximum": 26.507334,
+      "mean": 20.07483289,
+      "minimum": 5.311041,
+      "p50": 19.896917,
+      "p95": 24.464292,
+      "p99": 25.928459
     },
     "maintenance_operations": 0,
-    "maximum_rss_bytes": 392019968,
+    "maximum_rss_bytes": 392577024,
     "object_requests_per_operation": 4.52,
     "object_store": {
       "errors": 0,
-      "request_body_bytes": 24157068,
+      "request_body_bytes": 24679424,
       "requests": {
         "delete": 0,
         "get": 0,
         "list": 0,
-        "put": 369,
-        "range_get": 83
+        "put": 377,
+        "range_get": 75
       },
-      "response_body_bytes": 219361,
+      "response_body_bytes": 198336,
       "schema_version": 1
     },
     "process_cpu_seconds": null,
-    "throughput_ops_per_second": 44.03031326269432
+    "throughput_ops_per_second": 49.78229889553614
   },
   "schema_version": 1,
   "target_identities": [

@@ -3,31 +3,31 @@
   "label": "postgresql18-mixed-baseline",
   "results": {
     "access_path": {
-      "index_scans": 33798,
-      "index_tuples_fetched": 33798,
+      "index_scans": 17246,
+      "index_tuples_fetched": 17246,
       "sequential_scans": 0,
       "sequential_tuples_read": 0
     },
-    "attempted_operations": 33798,
-    "completed_operations": 33798,
-    "elapsed_seconds": 8.003262792,
+    "attempted_operations": 17246,
+    "completed_operations": 17246,
+    "elapsed_seconds": 8.011145291,
     "errors": [],
     "fixed_memory_occupancy": null,
     "fixed_memory_plan_bytes": null,
     "latency_ms": {
-      "maximum": 44.738458,
-      "mean": 0.9459215728149595,
-      "minimum": 0.114417,
-      "p50": 0.487,
-      "p95": 3.051625,
-      "p99": 7.279875
+      "maximum": 49.224959,
+      "mean": 1.856460256813174,
+      "minimum": 0.141417,
+      "p50": 0.728125,
+      "p95": 7.146166,
+      "p99": 14.380334
     },
     "maintenance_operations": 0,
     "maximum_rss_bytes": null,
     "object_requests_per_operation": null,
     "object_store": null,
     "process_cpu_seconds": null,
-    "throughput_ops_per_second": 4223.027642399075
+    "throughput_ops_per_second": 2152.750870637031
   },
   "schema_version": 1,
   "target_identities": [

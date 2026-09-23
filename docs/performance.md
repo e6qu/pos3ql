@@ -256,13 +256,16 @@ recovery tests read reused payloads after garbage collection. That profile left
 value-index source and external-run work at 910 GETs and 162 PUTs.
 The following [incremental value-index profile](../benchmarks/baselines/2026-09-23-checkpoint-value-index-delta-10000/README.md)
 sorts only resident rows newer than each published value-index LSN and merges
-that delta with a paced ordered stream of the immutable base. Changed row
-identities suppress their old entries, while relation rewrites, catalog changes,
-and `REINDEX` still take the complete rebuild path. Combined schedule and write
-work fell from 910 GETs, 204 PUTs, and 4.05 seconds to zero object GETs, 66 PUTs,
-and 0.38 seconds. The schedule was 12 CPU-only events totaling 2.37 ms.
-Per-beat limits, fixed memory, retry, garbage collection, and object-cold
-recovery remain directly covered. Correctness validation rejected a
+that delta with a paced ordered stream of the immutable base. A startup-bounded
+set captures changed row identities for stable suppression through output and
+retry, while object-resident rows whose binding stayed clean retain their base
+entry. Relation rewrites, catalog changes, and `REINDEX` still take the complete
+rebuild path. Combined schedule and write work fell from 910 GETs, 204 PUTs,
+and 4.05 seconds to zero object GETs, 62 PUTs, and 0.26 seconds. The schedule
+was 12 CPU-only events totaling 2.06 ms. Per-beat limits, fixed memory, retry,
+garbage collection, and object-cold recovery remain directly covered. Storage
+VOPR seeds 460259 through 460274 also cover non-indexed commits during output
+and rollback of object-resident changes. Correctness validation rejected a
 resident-only row-SST delta scan because a changed row may spill before
 checkpoint; its restored complete scan made 228 GETs and identifies the next
 optimization boundary. The current run completed substantially more foreground

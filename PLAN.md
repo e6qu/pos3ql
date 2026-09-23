@@ -360,25 +360,25 @@ ordinary roster chains and navigation trees, and retries restart both inputs.
 
 Across a similar two-generation value-index workload, schedule plus write work
 fell from 460 events, 910 GETs, 204 PUTs, and 4.05 seconds to 76 events, zero
-object GETs, 66 PUTs, and 0.38 seconds. Schedule alone became 12 CPU-only events
-totaling 2.37 ms. Every value-index beat stayed within four PUTs and eight GETs.
-The run completed 1,485 foreground operations versus 825 in the preceding
+object GETs, 62 PUTs, and 0.26 seconds. Schedule alone became 12 CPU-only events
+totaling 2.06 ms. Every value-index beat stayed within four PUTs and eight GETs.
+The run completed 1,372 foreground operations versus 825 in the preceding
 duration-floor run, so aggregate traffic and latency are diagnostic rather than
 a controlled ratio. Actual PostgreSQL 18.6 completed the matched SQL and
 checkpoint workload on its recorded local
-durable tier at 3,043 operations per second and 7.07 ms p99; its persistence
+durable tier at 2,786 operations per second and 9.86 ms p99; its persistence
 path has no pos3ql object-request equivalent.
 
 Every paced value-index and row-merge event stayed within its object-I/O beat
 limits. Correctness validation rejected a resident-only row-SST delta shortcut
 because a changed row may spill before checkpoint. The restored complete
-logical scan made 228 GETs over two delta events, with one 719.40 ms event. This
+logical scan made 228 GETs over two delta events, with one 702.96 ms event. This
 is now the next measured construction target: track changed spilled row
 identities explicitly so delta discovery avoids a table-wide provider scan
-without making pre-checkpoint residence an invariant. Row merge made 41 GETs
-over 40 schedule beats and 86 PUTs over 234 write beats; their totals were 0.12
-and 1.01 seconds, with largest events of 23.73 and 22.66 ms. Commit pruning
-remains a separate 1.20-second post-publication cost.
+without making pre-checkpoint residence an invariant. Row merge made 47 GETs
+over 42 schedule beats and 100 PUTs over 235 write beats; their totals were
+0.14 and 1.02 seconds, with largest events of 25.38 and 24.18 ms. Commit pruning
+remains a separate 1.42-second post-publication cost.
 
 The complete storage VOPR range then exposed two interleavings hidden by the
 profile: consulting a live committed LSN during output could suppress an

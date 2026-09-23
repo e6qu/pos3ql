@@ -9282,15 +9282,15 @@ fn decode_op_inner<'a>(
                 }
                 *config = crate::storage::RoutineConfig { name, value };
             }
-            let mut result_columns =
-                [crate::storage::RoutineArgumentDef::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let mut result_columns = [crate::storage::RoutineArgumentDef::EMPTY;
+                crate::storage::MAX_ROUTINE_OUTPUT_COLUMNS];
             let mut result_column_count = 0;
             let code = *payload.get(at)?;
             at += 1;
             let kind = if matches!(code, 3 | 6 | 7) {
                 result_column_count = *payload.get(at)? as usize;
                 at += 1;
-                if result_column_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                if result_column_count > crate::storage::MAX_ROUTINE_OUTPUT_COLUMNS {
                     return None;
                 }
                 for column in result_columns.iter_mut().take(result_column_count) {
@@ -14199,8 +14199,8 @@ mod tests {
     #[test]
     fn wide_routine_wal_borrows_staging_and_decodes_without_heap_growth() {
         use crate::storage::{
-            MAX_ROUTINE_ARGUMENTS, MAX_ROUTINE_CONFIGS, RoutineArgumentDef, RoutineConfig,
-            RoutineParameterDef, RoutineParameterMode,
+            MAX_ROUTINE_ARGUMENTS, MAX_ROUTINE_CONFIGS, MAX_ROUTINE_OUTPUT_COLUMNS,
+            RoutineArgumentDef, RoutineConfig, RoutineParameterDef, RoutineParameterMode,
         };
         let mut definition = crate::storage::RoutineDef::EMPTY;
         definition.schema = SqlName::parse("public").unwrap();
@@ -14210,7 +14210,7 @@ mod tests {
         definition.created_at = 1;
         definition.argument_count = MAX_ROUTINE_ARGUMENTS;
         definition.parameter_count = MAX_ROUTINE_ARGUMENTS;
-        definition.result_column_count = MAX_ROUTINE_ARGUMENTS;
+        definition.result_column_count = MAX_ROUTINE_OUTPUT_COLUMNS;
         definition.config_count = MAX_ROUTINE_CONFIGS;
         let name = SqlName::parse(&"n".repeat(63)).unwrap();
         let default = StackStr::from_str(&"1".repeat(crate::storage::ROUTINE_DEFAULT_MAX));
@@ -14259,7 +14259,7 @@ mod tests {
             ));
             let (decoded, dependencies) = decode_routine_payload(payload.readable()).unwrap();
             assert_eq!(decoded.argument_count, MAX_ROUTINE_ARGUMENTS);
-            assert_eq!(decoded.result_column_count, MAX_ROUTINE_ARGUMENTS);
+            assert_eq!(decoded.result_column_count, MAX_ROUTINE_OUTPUT_COLUMNS);
             assert_eq!(decoded.config_count, MAX_ROUTINE_CONFIGS);
             assert_eq!(
                 decoded.parameters[MAX_ROUTINE_ARGUMENTS - 1]

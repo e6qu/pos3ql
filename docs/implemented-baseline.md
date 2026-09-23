@@ -251,12 +251,13 @@ active production roadmap is [PLAN.md](../PLAN.md).
   command gates use statement-arena slices rather than fixed policy arrays.
   A 1,025-policy relation qualifies enforcement, catalog output, named
   exhaustion, checkpoint publication, and empty-cache recovery. Policy role
-  lists, routine parameters/results/configuration, and trigger arguments use
-  the parser's complete 64-item boundary. Routine signatures and default
-  metadata admit those shapes; routine manifest fields stream directly into
-  the reserved buffer. `pg_proc` includes TABLE output names, modes, and types
-  alongside input parameters, and single-column TABLE result OIDs match
-  PostgreSQL. Wide callable definitions, rollback, journal replay,
+  lists, routine results/configuration, and trigger arguments use the parser's
+  complete 64-item boundary. Routine input signatures match PostgreSQL's exact
+  100-argument limit, with defaults and independently stored output metadata;
+  routine manifest fields stream directly into the reserved buffer. `pg_proc`
+  includes TABLE output names, modes, and types alongside input parameters, and
+  single-column TABLE result OIDs match PostgreSQL. Wide callable definitions,
+  rollback, journal replay,
   checkpoint recovery, and allocation-forbidden execution share regressions.
   PostgreSQL trigger arguments are zero-based and NULL when absent. Routine
   setting values and reset values share one bounded definition, including

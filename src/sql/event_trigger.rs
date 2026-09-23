@@ -12,7 +12,7 @@ use crate::sql_err;
 use crate::storage::{RoutineKind, Storage};
 use crate::util::StackStr;
 
-pub(crate) const MAX_ADDRESS_PARTS: usize = crate::storage::MAX_ROUTINE_ARGUMENTS;
+pub(crate) const MAX_ADDRESS_PARTS: usize = crate::storage::MAX_DEFINITION_ITEMS;
 type EventIdentity = StackStr<8192>;
 type EventAddressPart = StackStr<512>;
 

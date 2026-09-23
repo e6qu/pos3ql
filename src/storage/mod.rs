@@ -5820,7 +5820,10 @@ fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<
 /// Stored SQL routines share the table-sized catalog budget.  They are not
 /// executable closures: every durable definition is a bounded, replayable SQL
 /// identity and body.
-pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = MAX_DEFINITION_ITEMS;
+/// PostgreSQL's exact maximum number of input arguments for one routine.
+pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = 100;
+/// Routine row results share the engine's table-width boundary.
+pub(crate) const MAX_ROUTINE_OUTPUT_COLUMNS: usize = MAX_COLUMNS;
 pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
 pub(crate) const ROUTINE_DEFAULT_MAX: usize = DEFAULT_EXPR_MAX;
 pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
@@ -6715,7 +6718,7 @@ pub(crate) struct RoutineSpec {
     pub parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
     pub parameter_count: usize,
     pub kind: RoutineKind,
-    pub result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub result_columns: [RoutineArgumentDef; MAX_ROUTINE_OUTPUT_COLUMNS],
     pub result_column_count: usize,
     pub language: RoutineLanguage,
     pub attributes: RoutineAttributes,
@@ -7426,7 +7429,7 @@ pub(crate) struct RoutineDef {
     pub parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
     pub parameter_count: usize,
     pub kind: RoutineKind,
-    pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_OUTPUT_COLUMNS],
     pub(crate) result_column_count: usize,
     pub language: RoutineLanguage,
     pub attributes: RoutineAttributes,
@@ -7450,7 +7453,7 @@ pub(crate) struct PendingRoutineDefinition {
     pub(crate) parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) parameter_count: usize,
     pub(crate) kind: RoutineKind,
-    pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_OUTPUT_COLUMNS],
     pub(crate) result_column_count: usize,
     pub(crate) language: RoutineLanguage,
     pub(crate) attributes: RoutineAttributes,
@@ -7477,7 +7480,7 @@ impl RoutineDef {
         kind: RoutineKind::Function {
             result: RoutineResult::TEXT,
         },
-        result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+        result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
         result_column_count: 0,
         language: RoutineLanguage::Sql,
         attributes: RoutineAttributes::DEFAULT,

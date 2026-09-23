@@ -3530,6 +3530,11 @@ impl<'a> Parser<'a> {
                 }
                 saw_variadic |= matches!(argument.mode, RoutineArgumentMode::Variadic { .. });
                 output_count += usize::from(argument.mode.is_output());
+                if output_count > crate::storage::MAX_COLUMNS {
+                    return Err(
+                        self.limit("routine output parameters", crate::storage::MAX_COLUMNS)
+                    );
+                }
                 arguments[count] = argument;
                 count += 1;
                 if self.eat_op(")")? {
@@ -3565,7 +3570,7 @@ impl<'a> Parser<'a> {
                 let mut columns = [RoutineResultColumn {
                     name: "",
                     type_name: "",
-                }; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                }; crate::storage::MAX_COLUMNS];
                 let mut column_count = 0;
                 loop {
                     if column_count == columns.len() {

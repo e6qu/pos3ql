@@ -65,9 +65,15 @@ The known narrower limits to resolve or justify are:
 - 64 Bind and SQL `PREPARE` parameters against the PostgreSQL wire count of
   65,535; 64 `GROUP BY` terms and 256 grouping sets;
 - 128 result columns; 64 joined relations and 64 `USING` columns;
-- durable 64-item definition shapes, including constraints, routine arguments,
-  enum labels, and policy roles; and
+- durable 64-item definition shapes, including constraints, enum labels, and
+  policy roles; and
 - per-value `tsvector`/`tsquery`, multirange, and geometry widths.
+
+Routine call signatures now match PostgreSQL's exact 100-input-argument limit.
+The independent 64-column routine result boundary remains part of the general
+row-width limit above. Execution, `pg_proc`, WAL, checkpoints, fixed-memory
+operation, object-cold recovery, exact over-limit rejection, and PostgreSQL 18
+differential behavior are qualified at the accepted boundaries.
 
 JSON container, path, result, rendered-text, and JSON_TABLE row widths are
 complete up to statement memory. XMLTABLE row width also follows statement

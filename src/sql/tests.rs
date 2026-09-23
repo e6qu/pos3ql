@@ -9529,7 +9529,7 @@ fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
 }
 
 fn test_engine() -> (Engine, Budget) {
-    test_engine_with_budget(1 << 27)
+    test_engine_with_budget((1 << 27) + (1 << 20))
 }
 
 fn test_engine_with_budget(bytes: usize) -> (Engine, Budget) {
@@ -16065,7 +16065,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget =
-        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -16996,7 +16996,7 @@ fn object_resident_set_records_keep_their_structural_fields() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget =
-        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -21940,7 +21940,7 @@ fn information_schema_column_udt_usage_is_not_silently_capped() {
     config.max_tables = 17;
     config.max_value_indexes = 17 * 64;
     config.wal_buffer_bytes = 1 << 20;
-    let mut budget = Budget::new((1 << 28) + (1 << 20));
+    let mut budget = Budget::new((1 << 28) + (2 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut definition = String::new();
     for table in 0..17 {
@@ -52943,6 +52943,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     use core::fmt::Write as _;
 
     const WIDTH: usize = crate::storage::MAX_DEFINITION_ITEMS;
+    const ROUTINE_WIDTH: usize = crate::storage::MAX_ROUTINE_ARGUMENTS;
     const POLICIES: usize = 40;
     let mut config = test_config("wide-callable-policy");
     config.max_tables = 2;
@@ -52964,13 +52965,17 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
 
     let mut definition = String::from("CREATE FUNCTION wide_arguments(");
-    for argument in 0..WIDTH {
+    for argument in 0..ROUTINE_WIDTH {
         if argument != 0 {
             definition.push(',');
         }
         write!(definition, "a{argument} integer DEFAULT 1000000").unwrap();
     }
-    definition.push_str(") RETURNS integer LANGUAGE SQL AS 'SELECT $1 + $64';");
+    write!(
+        definition,
+        ") RETURNS integer LANGUAGE SQL AS 'SELECT $1 + ${ROUTINE_WIDTH}';"
+    )
+    .unwrap();
     definition.push_str("CREATE FUNCTION wide_result() RETURNS TABLE (");
     for field in 0..WIDTH {
         if field != 0 {
@@ -53048,7 +53053,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     for overflow in [
         format!(
             "CREATE FUNCTION wide_arguments_overflow({}) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
-            (0..=WIDTH)
+            (0..=ROUTINE_WIDTH)
                 .map(|index| format!("a{index} integer"))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -53083,7 +53088,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     }
 
     let mut call = String::from("SELECT wide_arguments(");
-    for argument in 0..WIDTH {
+    for argument in 0..ROUTINE_WIDTH {
         if argument != 0 {
             call.push(',');
         }
@@ -53091,7 +53096,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     }
     call.push(')');
     for (query, expected) in [
-        (call.as_str(), "63"),
+        (call.as_str(), "99"),
         ("SELECT wide_arguments()", "2000000"),
         (
             "SELECT wide_settings(), current_setting('application_name')",
@@ -53112,7 +53117,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
         ),
         (
             "SELECT pronargs, pronargdefaults FROM pg_proc WHERE proname = 'wide_arguments'",
-            "64|64",
+            "100|100",
         ),
         (
             "SELECT cardinality(polroles) FROM pg_policy WHERE polname = 'wide_allow'",
@@ -64428,7 +64433,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget =
-        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let restarted_slot = restarted
         .storage
@@ -68367,7 +68372,7 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget =
-        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -72187,7 +72192,7 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     let mut budget =
-        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,

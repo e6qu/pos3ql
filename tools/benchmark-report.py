@@ -87,6 +87,13 @@ def main():
             f"{environment['machine']}, {environment['logical_cpu_count']} logical CPUs; "
             f"{suite['rows']} rows, {suite['clients']} clients, {cache}{timeout}{latency}.\n"
         )
+        hardware = environment.get("hardware_description")
+        cache_storage = suite.get("cache_storage_description")
+        if hardware or cache_storage:
+            print(
+                f"Benchmark host: {hardware or 'unspecified'}; "
+                f"cache storage: {cache_storage or 'unspecified'}.\n"
+            )
         object_store = environment.get("pos3ql_object_store")
         if object_store:
             image = object_store.get("container_image")
@@ -98,11 +105,33 @@ def main():
                 if object_store.get("request_metrics_available", True)
                 else "provider request metrics unavailable"
             )
+            operation = (
+                "independently operated"
+                if object_store.get("independently_operated")
+                else "operated on the benchmark host"
+            )
+            qualification = (
+                ""
+                if object_store.get("independently_operated")
+                else " This local-host timing is exploratory."
+            )
+            location = ""
+            if object_store.get("independently_operated"):
+                prefix = object_store.get("prefix") or ""
+                location = (
+                    f"; endpoint `{object_store['endpoint']}`; "
+                    f"bucket `{object_store['bucket']}`; prefix `{prefix}`; "
+                    f"region `{object_store['region']}`; "
+                    f"addressing={object_store['addressing']}; "
+                    f"TLS={'on' if object_store['tls'] else 'off'}"
+                )
+                if object_store.get("tls_ca_sha256"):
+                    location += f"; TLS CA `{object_store['tls_ca_sha256'][:20]}…`"
             print(
                 f"pos3ql object store: {object_store['implementation']}{image_text}"
-                f"{image_id_text}; "
-                f"backing: {object_store['backing']}; {metrics}. "
-                "This local-host timing is exploratory.\n"
+                f"{image_id_text}; backing: {object_store['backing']}; {operation}"
+                f"{location}; network: {object_store.get('network_description', 'unspecified')}; "
+                f"{metrics}.{qualification}\n"
             )
         duration = suite.get("checkpoint_duration_seconds", 0)
         if suite_mode == "checkpoint" and duration:

@@ -1,0 +1,50 @@
+{
+  "database_identity": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "label": "postgresql18-mixed-checkpoint-interference",
+  "results": {
+    "access_path": {
+      "index_scans": 49951,
+      "index_tuples_fetched": 49951,
+      "sequential_scans": 0,
+      "sequential_tuples_read": 0
+    },
+    "attempted_operations": 49951,
+    "completed_operations": 49951,
+    "elapsed_seconds": 8.002473084,
+    "errors": [],
+    "fixed_memory_occupancy": null,
+    "fixed_memory_plan_bytes": null,
+    "latency_ms": {
+      "maximum": 24.115791,
+      "mean": 0.6399529328742167,
+      "minimum": 0.110916,
+      "p50": 0.327333,
+      "p95": 1.929208,
+      "p99": 4.232375
+    },
+    "maintenance_operations": 3,
+    "maximum_rss_bytes": null,
+    "object_requests_per_operation": null,
+    "object_store": null,
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 6241.945393089934
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+  ],
+  "workload": {
+    "clients": 4,
+    "maintenance_interval_seconds": 0.001,
+    "maintenance_limit": 3,
+    "minimum_duration_seconds": 8.0,
+    "name": "mixed",
+    "operations_per_client": 100,
+    "require_index": false,
+    "required_maintenance_operations": 3,
+    "rows": 10000,
+    "synchronized": false,
+    "target_count": 1,
+    "timeout_seconds": 300.0
+  }
+}

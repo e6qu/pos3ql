@@ -150,6 +150,15 @@ foreground counts, row-generation shapes, and sequential PostgreSQL samples
 make it implementation coverage and exploratory evidence rather than a
 provider ranking.
 
+The following [resource-matched 10,000-row matrix](../benchmarks/baselines/2026-09-23-resource-matched-postgresql-10000/README.md)
+preserves both PostgreSQL controls for each backend. The matched containers
+received a 12-CPU quota matching the CPU count available to pos3ql and its
+exact 995,951,270-byte fixed memory plan, with an equal memory-plus-swap limit.
+All 27 workloads completed
+without error. The report keeps host-available and matched ratios separate and
+retains the local-persistence, shared-host, and independently operated service
+qualifications.
+
 The complete [256-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)
 and [1,000-row](../benchmarks/baselines/2026-09-20-postgresql18-local-apfs-1000/README.md)
 exploratory baselines use actual PostgreSQL 18.6 on local APFS with durability

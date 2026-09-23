@@ -66677,7 +66677,7 @@ fn dirty_full_roster_merges_across_bounded_checkpoint_beats() {
 }
 
 #[test]
-fn row_merge_retains_wide_pax_source_groups_across_beats() {
+fn row_merge_reuses_unchanged_wide_pax_groups_across_beats() {
     let mut config = test_config("checkpoint-retained-pax-merge");
     config.object_store_on = true;
     config.object_store_sim = true;
@@ -66702,9 +66702,9 @@ fn row_merge_retains_wide_pax_source_groups_across_beats() {
              id integer PRIMARY KEY, \
              c01 integer, c02 integer, c03 integer, c04 integer, \
              c05 integer, c06 integer, c07 integer, c08 integer, \
-             c09 integer, c10 integer, c11 integer, c12 integer); \
+             c09 integer, c10 integer, c11 integer, c12 integer, payload text); \
          INSERT INTO retained_pax_merge \
-           SELECT id, id, id, id, id, id, id, id, id, id, id, id, id \
+           SELECT id, id, id, id, id, id, id, id, id, id, id, id, id, repeat('x', 1024) \
              FROM generate_series(1,256) id",
     );
     assert!(
@@ -66757,10 +66757,17 @@ fn row_merge_retains_wide_pax_source_groups_across_beats() {
     };
     let merge = engine.storage.block_io_stats().saturating_sub(before_merge);
     assert!(
-        merge.object_gets <= 20,
+        merge.object_gets <= 32,
         "the PAX source group was reread across merge beats: {merge:?}"
     );
-    assert!(max_beat_gets <= 8, "one merge beat read too much");
+    assert!(
+        merge.object_puts <= 9,
+        "unchanged PAX groups were rewritten during merge: {merge:?}"
+    );
+    assert!(
+        max_beat_gets <= 17,
+        "one merge beat read too much: {max_beat_gets}"
+    );
     assert!(beats > 2, "the wide merge must cross dispatch beats");
     engine.begin_post_publish_cleanup(published_lsn);
     engine.finish_post_publish_cleanup().unwrap();
@@ -66774,9 +66781,9 @@ fn row_merge_retains_wide_pax_source_groups_across_beats() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*), min(c01), min(c02) FROM retained_pax_merge"
+            "SELECT count(*), min(c01), min(c02), min(length(payload)) FROM retained_pax_merge"
         )),
-        ["256|-1|-2"]
+        ["256|-1|-2|1024"]
     );
 
     drop(engine);
@@ -66787,9 +66794,9 @@ fn row_merge_retains_wide_pax_source_groups_across_beats() {
         data_rows(&run_with(
             &mut recovered,
             &mut recovered_budget,
-            "SELECT count(*), min(c01), min(c02) FROM retained_pax_merge"
+            "SELECT count(*), min(c01), min(c02), min(length(payload)) FROM retained_pax_merge"
         )),
-        ["256|-1|-2"]
+        ["256|-1|-2|1024"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

@@ -106,6 +106,13 @@ impl DataBlockRef {
             Self::Direct(id) | Self::Packed { id, .. } => id,
         }
     }
+
+    fn physical_id(self) -> BlockId {
+        match self {
+            Self::Direct(id) => id,
+            Self::Packed { container, .. } => container,
+        }
+    }
 }
 
 /// A durable row-version key. Ordering is rowid ascending, then commit LSN
@@ -576,6 +583,70 @@ impl SstWriter {
         self.roster[self.roster_len] = id;
         self.roster_len += 1;
         Ok(())
+    }
+
+    fn record_once(&mut self, id: BlockId) -> Result<(), SstError> {
+        if self.roster[..self.roster_len].contains(&id) {
+            return Ok(());
+        }
+        self.record(id)
+    }
+
+    /// Adds one unchanged PAX group to this SST by immutable reference.
+    /// The descriptor and every column container join the new roster so the
+    /// source SST may be collected immediately after publication.
+    pub(crate) fn append_reused_pax_group(
+        &mut self,
+        store: &mut dyn BlockStore,
+        reference: DataBlockRef,
+        descriptor: &[u8],
+    ) -> Result<usize, SstError> {
+        if !self.pax_enabled {
+            return Err(SstError::Encoding);
+        }
+        let layout = pax_layout(descriptor)?;
+        if layout.columns() != self.pax_columns
+            || layout.schema() != &self.pax_schema[..self.pax_columns]
+            || layout.rows() == 0
+        {
+            return Err(SstError::Encoding);
+        }
+        let (first, _) = layout.row_key(descriptor, 0)?;
+        if self.last_key.is_some_and(|last| first <= last) {
+            return Err(SstError::KeyOutOfOrder);
+        }
+        let mut last = first;
+        for row in 0..layout.rows() {
+            let (key, _) = layout.row_key(descriptor, row)?;
+            if row > 0 && key <= last {
+                return Err(SstError::KeyOutOfOrder);
+            }
+            last = key;
+        }
+
+        // Finish any newly encoded group first. Its descriptor staging shares
+        // the fixed packed buffer with the imported reference.
+        self.flush_data(store)?;
+        self.flush_packed(store)?;
+        if self.index_len == MAX_DATA_BLOCKS {
+            self.flush_index_leaf(store)?;
+        }
+        for column in 0..layout.columns() {
+            self.record_once(layout.column_ref(descriptor, column)?.physical_id())?;
+        }
+        self.record_once(reference.physical_id())?;
+        self.index[self.index_len] = (first, reference);
+        self.index_len += 1;
+        self.packed_index_start = self.index_len;
+        for row in 0..layout.rows() {
+            let (key, _) = layout.row_key(descriptor, row)?;
+            for filter in &mut self.filters {
+                bloom::insert(filter, key.rowid);
+            }
+        }
+        self.key_count += layout.rows();
+        self.last_key = Some(last);
+        Ok(layout.rows())
     }
 
     fn flush_data(&mut self, store: &mut dyn BlockStore) -> Result<(), SstError> {
@@ -1070,6 +1141,27 @@ pub(crate) struct SstVersionCursor {
     loaded_ref: Option<DataBlockRef>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SstVersionGroup {
+    reference: DataBlockRef,
+    raw_len: usize,
+    data_len: usize,
+}
+
+impl SstVersionGroup {
+    pub(crate) fn reference(self) -> DataBlockRef {
+        self.reference
+    }
+
+    pub(crate) fn raw_len(self) -> usize {
+        self.raw_len
+    }
+
+    pub(crate) fn data_len(self) -> usize {
+        self.data_len
+    }
+}
+
 impl SstVersionCursor {
     pub(crate) fn new(handle: SstHandle) -> Self {
         Self {
@@ -1078,6 +1170,91 @@ impl SstVersionCursor {
             data_len: 0,
             loaded_ref: None,
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "caller-owned fixed scratch makes cursor suspension allocation-free"
+    )]
+    fn load_group_at(
+        &mut self,
+        store: &mut dyn BlockStore,
+        target: SstKey,
+        index: &mut [u8],
+        raw: &mut [u8],
+        decoded: &mut [u8],
+        column: &mut [u8],
+        assembly: &mut [u8],
+    ) -> Result<Option<(DataBlockRef, usize, BlockType)>, SstError> {
+        let Some(reference) = data_block_ref_for_key(store, &self.handle, index, target)? else {
+            return Ok(None);
+        };
+        // The sparse index mapped `target` to the group already exhausted
+        // without finding it. Reloading would loop on an inconsistent caller.
+        if self.loaded_ref == Some(reference) {
+            return Ok(None);
+        }
+        let (raw_len, block_type) = read_data_block_raw_ref(store, reference, raw, column)?;
+        self.data_len = match (self.handle.format, block_type) {
+            (RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4, BlockType::SstDataPaxV2) => {
+                decode_pax_v2(store, &raw[..raw_len], decoded, column, assembly)?
+            }
+            (
+                RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
+                BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
+            ) => decode_data_block(&raw[..raw_len], block_type, decoded)?,
+            _ => {
+                return Err(SstError::Store(StoreError::Corrupt(
+                    super::BlockError::UnknownType,
+                )));
+            }
+        };
+        self.offset = 0;
+        self.loaded_ref = Some(reference);
+        if self.data_len == 0 {
+            return Err(SstError::Store(StoreError::Corrupt(
+                super::BlockError::Truncated,
+            )));
+        }
+        Ok(Some((reference, raw_len, block_type)))
+    }
+
+    /// Loads the complete group containing `target` when the cursor is at a
+    /// group boundary. Only PAX groups are returned as reuse candidates; an
+    /// ordinary group remains loaded for the following `copy_exact` call.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "caller-owned fixed scratch makes cursor suspension allocation-free"
+    )]
+    pub(crate) fn load_reusable_pax_group(
+        &mut self,
+        store: &mut dyn BlockStore,
+        target: SstKey,
+        index: &mut [u8],
+        raw: &mut [u8],
+        decoded: &mut [u8],
+        column: &mut [u8],
+        assembly: &mut [u8],
+    ) -> Result<Option<SstVersionGroup>, SstError> {
+        if self.offset < self.data_len {
+            return Ok(None);
+        }
+        let Some((reference, raw_len, block_type)) =
+            self.load_group_at(store, target, index, raw, decoded, column, assembly)?
+        else {
+            return Ok(None);
+        };
+        Ok(
+            (block_type == BlockType::SstDataPaxV2).then_some(SstVersionGroup {
+                reference,
+                raw_len,
+                data_len: self.data_len,
+            }),
+        )
+    }
+
+    pub(crate) fn consume_loaded_group(&mut self) {
+        self.offset = self.data_len;
     }
 
     /// Copies the exact scheduled version into `out` while walking forward.
@@ -1098,39 +1275,11 @@ impl SstVersionCursor {
     ) -> Result<Option<SstProbe>, SstError> {
         loop {
             if self.offset >= self.data_len {
-                let Some(reference) = data_block_ref_for_key(store, &self.handle, index, target)?
+                let Some(_) =
+                    self.load_group_at(store, target, index, raw, decoded, column, assembly)?
                 else {
                     return Ok(None);
                 };
-                // The sparse index mapped `target` to the block already
-                // exhausted without finding it. Reloading would loop; the
-                // schedule and source no longer agree.
-                if self.loaded_ref == Some(reference) {
-                    return Ok(None);
-                }
-                let (raw_len, block_type) = read_data_block_raw_ref(store, reference, raw, column)?;
-                self.data_len = match (self.handle.format, block_type) {
-                    (
-                        RowSstFormat::PackedPaxV3 | RowSstFormat::PackedV4,
-                        BlockType::SstDataPaxV2,
-                    ) => decode_pax_v2(store, &raw[..raw_len], decoded, column, assembly)?,
-                    (
-                        RowSstFormat::DirectV2 | RowSstFormat::PackedV4,
-                        BlockType::SstDataV2 | BlockType::SstDataV2Lz4,
-                    ) => decode_data_block(&raw[..raw_len], block_type, decoded)?,
-                    _ => {
-                        return Err(SstError::Store(StoreError::Corrupt(
-                            super::BlockError::UnknownType,
-                        )));
-                    }
-                };
-                self.offset = 0;
-                self.loaded_ref = Some(reference);
-                if self.data_len == 0 {
-                    return Err(SstError::Store(StoreError::Corrupt(
-                        super::BlockError::Truncated,
-                    )));
-                }
             }
 
             let remaining = &decoded[self.offset..self.data_len];
@@ -1505,6 +1654,10 @@ impl PaxLayout {
 
     pub(crate) fn columns(&self) -> usize {
         self.columns
+    }
+
+    pub(crate) fn schema(&self) -> &[ColType] {
+        &self.schema[..self.columns]
     }
 
     pub(crate) fn column_ref(&self, input: &[u8], column: usize) -> Result<DataBlockRef, SstError> {

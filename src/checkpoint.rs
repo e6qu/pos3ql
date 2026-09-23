@@ -23,7 +23,7 @@ use crate::storage::{
 use crate::store::{
     BlockId, BlockStore, BlockType, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat,
     SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan, StoreError,
-    TieredStore, ValueIndexHandle, ValueIndexWriter,
+    TieredStore, ValueIndexHandle, ValueIndexWriter, block_keys_at, copy_block_entry_at,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -1244,6 +1244,103 @@ impl Checkpointer {
             }
             let (key, kind) = scratch[cursor];
             let rowid = key.rowid;
+            let rank = usize::from(kind & 1);
+            let decoded = if rank == 0 {
+                &mut self.merge_source_decoded[..crate::store::MAX_PAYLOAD]
+            } else {
+                &mut self.merge_source_decoded[crate::store::MAX_PAYLOAD..]
+            };
+            let group = self.merge_source_cursors[rank]
+                .as_mut()
+                .expect("merge source cursor initialized with the job")
+                .load_reusable_pax_group(
+                    &mut *blocks.borrow_mut(),
+                    key,
+                    &mut self.merge_source_index,
+                    &mut self.merge_source_raw,
+                    decoded,
+                    &mut self.merge_source_column,
+                    &mut self.merge_row,
+                )
+                .map_err(sst_to_sql)?;
+            if let Some(group) = group {
+                let mut at = 0usize;
+                let mut entries = 0usize;
+                let mut reusable = true;
+                while at < group.data_len() {
+                    let Some((group_key, tombstone, _, next)) =
+                        block_keys_at(&decoded[..group.data_len()], at)
+                    else {
+                        return Err(sql_err!(SQLSTATE_IO, "merge source group is truncated"));
+                    };
+                    let Some(&(scheduled_key, scheduled_kind)) = scratch.get(cursor + entries)
+                    else {
+                        reusable = false;
+                        break;
+                    };
+                    if group_key != scheduled_key
+                        || usize::from(scheduled_kind & 1) != rank
+                        || tombstone != (scheduled_kind & 2 != 0)
+                        || (tombstone && job.drop_tombstones)
+                    {
+                        reusable = false;
+                        break;
+                    }
+                    entries += 1;
+                    at = next;
+                }
+                if reusable && at == group.data_len() && entries > 0 {
+                    let reused = writer
+                        .append_reused_pax_group(
+                            &mut *blocks.borrow_mut(),
+                            group.reference(),
+                            &self.merge_source_raw[..group.raw_len()],
+                        )
+                        .map_err(sst_to_sql)?;
+                    if reused != entries {
+                        return Err(sql_err!(
+                            SQLSTATE_IO,
+                            "merge source group changed while read"
+                        ));
+                    }
+                    let mut at = 0usize;
+                    for _ in 0..entries {
+                        let (group_key, tombstone, len, next) =
+                            block_keys_at(&decoded[..group.data_len()], at).ok_or_else(|| {
+                                sql_err!(SQLSTATE_IO, "merge source group is truncated")
+                            })?;
+                        let mut header = [0u8; VERSIONED_SST_ENTRY_HEADER];
+                        header[0..8].copy_from_slice(&group_key.rowid.to_le_bytes());
+                        header[8..16].copy_from_slice(&group_key.commit_lsn.to_le_bytes());
+                        if tombstone {
+                            header[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+                        } else {
+                            header[16..20].copy_from_slice(&len.to_le_bytes());
+                        }
+                        job.crc.update(&header);
+                        if !tombstone {
+                            let len = len as usize;
+                            copy_block_entry_at(
+                                &mut *blocks.borrow_mut(),
+                                &decoded[..group.data_len()],
+                                at,
+                                &mut self.merge_row[..len],
+                            )
+                            .map_err(sst_to_sql)?;
+                            job.crc.update(&self.merge_row[..len]);
+                        }
+                        at = next;
+                    }
+                    self.merge_source_cursors[rank]
+                        .as_mut()
+                        .expect("merge source cursor initialized with the job")
+                        .consume_loaded_group();
+                    cursor += entries;
+                    processed += entries;
+                    job.count += entries as u64;
+                    continue;
+                }
+            }
             cursor += 1;
             processed += 1;
             if kind & 2 != 0 {
@@ -1264,12 +1361,6 @@ impl Checkpointer {
                 }
                 continue;
             }
-            let rank = usize::from(kind & 1);
-            let decoded = if rank == 0 {
-                &mut self.merge_source_decoded[..crate::store::MAX_PAYLOAD]
-            } else {
-                &mut self.merge_source_decoded[crate::store::MAX_PAYLOAD..]
-            };
             let len = self.merge_source_cursors[rank]
                 .as_mut()
                 .expect("merge source cursor initialized with the job")

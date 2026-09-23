@@ -269,13 +269,14 @@ wal_bytes = 32 MiB
 wal_buffer_bytes = 2 MiB
 max_tables = 16
 max_indexes = 24
+max_views = $MAX_VIEWS
+max_rules = $MAX_RULES
 table_rows = $TABLE_CAPACITY
 value_index_rows = $TABLE_CAPACITY
 max_value_indexes = 24
 max_large_objects = 16
 large_object_pages = 64
 max_large_object_descriptors = 8
-max_rules = 32
 max_extension_scripts = 16
 extension_script_bytes = 256 KiB
 max_foreign_data_wrappers = 4
@@ -520,6 +521,10 @@ run_full_postgresql_suite() {
     --operations "$OPERATIONS" --rows "$ROWS" --check \
     --output "$OUTPUT/$prefix-join-probe.json" >/dev/null
   python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
+    --label "$prefix-catalog-lookup" --workload catalog-lookup --clients "$CLIENTS" \
+    --operations "$OPERATIONS" --rows "$ROWS" --check \
+    --output "$OUTPUT/$prefix-catalog-lookup.json" >/dev/null
+  python3 "$ROOT/tools/benchmark.py" --port "$POSTGRES_PORT" \
     --label "$prefix-insert" --workload insert --clients "$CLIENTS" \
     --operations "$OPERATIONS" --rows "$ROWS" --check \
     --output "$OUTPUT/$prefix-insert.json" >/dev/null
@@ -539,12 +544,18 @@ if [ "$MODE" = smoke ]; then
   OPERATIONS=8
   CLIENTS=4
   REPLICA_SETTING=0
+  CATALOG_RELATIONS=${POS3QL_BENCH_CATALOG_RELATIONS:-16}
 else
   ROWS=${POS3QL_BENCH_ROWS:-10000}
   TABLE_CAPACITY=${POS3QL_BENCH_TABLE_CAPACITY:-16384}
   OPERATIONS=${POS3QL_BENCH_OPERATIONS:-500}
   CLIENTS=${POS3QL_BENCH_CLIENTS:-8}
   REPLICA_SETTING=${POS3QL_BENCH_REPLICAS:-2}
+  if [ "$MODE" = full ]; then
+    CATALOG_RELATIONS=${POS3QL_BENCH_CATALOG_RELATIONS:-128}
+  else
+    CATALOG_RELATIONS=${POS3QL_BENCH_CATALOG_RELATIONS:-0}
+  fi
 fi
 if ! [[ "$ROWS" =~ ^[1-9][0-9]*$ && "$TABLE_CAPACITY" =~ ^[1-9][0-9]*$ &&
   "$OPERATIONS" =~ ^[1-9][0-9]*$ && "$CLIENTS" =~ ^[1-9][0-9]*$ ]]; then
@@ -566,15 +577,31 @@ if ! [[ "$REPLICA_SETTING" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "POS3QL_BENCH_REPLICAS must be a nonnegative decimal count" >&2
   exit 2
 fi
+if ! [[ "$CATALOG_RELATIONS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+  echo "POS3QL_BENCH_CATALOG_RELATIONS must be a nonnegative decimal count" >&2
+  exit 2
+fi
+if [ "$MODE" = checkpoint ] && [ "$CATALOG_RELATIONS" != 0 ]; then
+  echo "checkpoint mode requires POS3QL_BENCH_CATALOG_RELATIONS=0" >&2
+  exit 2
+fi
+if [ "$MODE" != checkpoint ] && [ "$CATALOG_RELATIONS" = 0 ]; then
+  echo "$MODE mode requires POS3QL_BENCH_CATALOG_RELATIONS to be positive" >&2
+  exit 2
+fi
 if [ "$MODE" != smoke ] && [ "$TABLE_CAPACITY" -lt $((ROWS + CLIENTS * OPERATIONS)) ]; then
   echo "POS3QL_BENCH_TABLE_CAPACITY must cover setup and inserted rows" >&2
   exit 2
 fi
 MAX_CONNECTIONS=$((CLIENTS + 4))
+MAX_VIEWS=$((CATALOG_RELATIONS > 0 ? CATALOG_RELATIONS : 1))
+MAX_RULES=$((CATALOG_RELATIONS + 32))
+export POS3QL_BENCH_CATALOG_RELATIONS=$CATALOG_RELATIONS
 python3 "$ROOT/tools/benchmark-environment.py" \
   --output "$OUTPUT/environment.json" --binary "$ROOT/target/release/pos3ql" \
   --mode "$MODE" --rows "$ROWS" --table-capacity "$TABLE_CAPACITY" \
   --operations "$OPERATIONS" --clients "$CLIENTS" \
+  --catalog-relations "$CATALOG_RELATIONS" \
   --replicas "$REPLICA_SETTING" --object-latency-ms "$LATENCY_MS" \
   --object-latency-injected "$OBJECT_LATENCY_INJECTED" \
   --object-store-implementation "$OBJECT_STORE_IMPLEMENTATION" \
@@ -700,6 +727,8 @@ bench_pos3ql warm-memory-ordered-limit --workload ordered-limit --clients "$CLIE
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
 bench_pos3ql warm-memory-join-probe --workload join-probe --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql warm-memory-catalog-lookup --workload catalog-lookup --clients "$CLIENTS" \
+  --operations "$OPERATIONS" --rows "$ROWS"
 bench_pos3ql concurrent-update --workload update --clients "$CLIENTS" \
   --operations "$OPERATIONS" --rows "$ROWS" --synchronized --require-index
 
@@ -771,6 +800,8 @@ DATA_COLD_JOIN="$WORK/data-cold-join"
 start_pos3ql "$DATA_COLD_JOIN" primary cold-object-join-recovery yes
 bench_pos3ql cold-object-join-probe --workload join-probe --clients 1 \
   --operations "$OPERATIONS" --rows "$ROWS" --require-index
+bench_pos3ql cold-object-catalog-lookup --workload catalog-lookup --clients 1 \
+  --operations "$OPERATIONS" --rows "$ROWS"
 
 if [ "$MODE" = full ]; then
   SCALE_ROWS=$((ROWS + CLIENTS * OPERATIONS))

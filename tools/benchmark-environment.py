@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--table-capacity", type=int, required=True)
     parser.add_argument("--operations", type=int, required=True)
     parser.add_argument("--clients", type=int, required=True)
+    parser.add_argument("--catalog-relations", type=int, required=True)
     parser.add_argument("--replicas", type=int, required=True)
     parser.add_argument("--object-latency-ms", type=float, required=True)
     parser.add_argument("--object-latency-injected", type=int, choices=(0, 1), required=True)
@@ -79,6 +80,8 @@ def main():
         parser.error("object latency must be nonnegative and finite")
     if args.mode == "checkpoint" and args.checkpoint_duration_seconds == 0:
         parser.error("checkpoint mode requires a positive duration")
+    if args.catalog_relations < 0:
+        parser.error("catalog relations must be nonnegative")
     if args.object_store_independently_operated:
         if not args.object_store_independent_implementation:
             parser.error("an independently operated object store must be an independent implementation")
@@ -114,6 +117,7 @@ def main():
             "table_capacity": args.table_capacity,
             "operations_per_client": args.operations,
             "clients": args.clients,
+            "catalog_relations": args.catalog_relations,
             "logical_replicas": args.replicas,
             "object_latency_ms": args.object_latency_ms,
             "object_latency_injected": bool(args.object_latency_injected),

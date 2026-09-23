@@ -33,6 +33,8 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             "20",
             "--clients",
             "4",
+            "--catalog-relations",
+            "128",
             "--replicas",
             "2",
             "--object-latency-ms",
@@ -82,6 +84,7 @@ class BenchmarkEnvironmentTests(unittest.TestCase):
             result = json.loads((directory / "environment.json").read_text())
 
         self.assertEqual(result["hardware_description"], "fixed host type")
+        self.assertEqual(result["suite"]["catalog_relations"], 128)
         self.assertEqual(result["suite"]["cache_storage_description"], "local NVMe")
         store = result["pos3ql_object_store"]
         self.assertTrue(store["independently_operated"])

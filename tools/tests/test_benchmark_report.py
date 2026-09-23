@@ -26,6 +26,7 @@ class BenchmarkReportTests(unittest.TestCase):
                     "mode": "full",
                     "rows": 100,
                     "clients": 4,
+                    "catalog_relations": 128,
                     "disk_cache_mib": 1024,
                     "cache_storage_description": "local NVMe",
                     "timeout_seconds": 120,
@@ -69,6 +70,16 @@ class BenchmarkReportTests(unittest.TestCase):
             }
             (directory / "environment.json").write_text(json.dumps(environment))
             (directory / "point.json").write_text(json.dumps(workload))
+            for label, throughput in (
+                ("warm-memory-catalog-lookup", 10),
+                ("postgresql18-catalog-lookup", 20),
+                ("postgresql18-matched-catalog-lookup", 5),
+            ):
+                catalog_workload = json.loads(json.dumps(workload))
+                catalog_workload["label"] = label
+                catalog_workload["workload"] = "catalog-lookup"
+                catalog_workload["results"]["throughput_ops_per_second"] = throughput
+                (directory / f"{label}.json").write_text(json.dumps(catalog_workload))
             completed = subprocess.run(
                 [sys.executable, str(TOOL), str(directory)],
                 cwd=ROOT,
@@ -81,11 +92,17 @@ class BenchmarkReportTests(unittest.TestCase):
             "Benchmark host: pinned test host; cache storage: local NVMe.",
             completed.stdout,
         )
+        self.assertIn("4 clients, 128 catalog relations", completed.stdout)
         self.assertIn("independently operated", completed.stdout)
         self.assertIn("endpoint `objects.example:443`", completed.stdout)
         self.assertIn("TLS CA `58d2cc8bcded4f950c7f…`", completed.stdout)
         self.assertIn("network: same-region private network", completed.stdout)
         self.assertNotIn("local-host timing is exploratory", completed.stdout)
+        self.assertIn("pos3ql / PostgreSQL 18 catalog lookup throughput: 0.50x", completed.stdout)
+        self.assertIn(
+            "pos3ql / resource-matched PostgreSQL 18 catalog lookup throughput: 2.00x",
+            completed.stdout,
+        )
 
 
 if __name__ == "__main__":

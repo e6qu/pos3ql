@@ -148,6 +148,14 @@ rows and all rows inserted by the configured clients and operations.
 Full mode requires at least four clients so its synchronized update workload
 can enforce the group-commit amplification bound; smaller values are rejected
 before measurement.
+Full mode also creates 128 ordinary views in an isolated schema and measures
+exact relation-name resolution plus `pg_class` lookup as unrelated catalog
+relations grow. Smoke mode uses 16 views. Override either count with
+the positive `POS3QL_BENCH_CATALOG_RELATIONS` value; the focused checkpoint
+mode requires zero so catalog setup cannot change its publication profile.
+The selected count is recorded in the environment and every workload
+artifact. Both PostgreSQL controls receive the same catalog and warm lookup
+workload, while pos3ql also repeats it after empty-local-cache recovery.
 CPU and resident-memory sampling uses `/proc` on Linux; peak RSS remains
 available through `ps` on other supported systems.
 
@@ -394,6 +402,7 @@ reference with no corresponding object-request metric.
 | indexed tail range | Repeated selective high-key ranges, including a cold-object run that records bounded key-block reads |
 | ordered limit | Repeated descending key-only `ORDER BY ... LIMIT` scans that must fetch no base tuples, warm and object-cold |
 | parameterized join | Repeated 32-key nested-loop probes whose inner table must use its B-tree, warm and after a dedicated empty-local-cache restart |
+| large catalog | Exact `regclass` resolution and `pg_class` lookup across a configurable schema of unrelated ordinary views, warm and after empty-local-cache recovery |
 | warm disk | Graceful restart with the same disposable local data directory |
 | empty local caches | Restart from a new local directory against the unchanged durable object prefix |
 | concurrent updates | Synchronized hash-index target probes, commit latency, and immutable-batch/commit-head PUT amplification |

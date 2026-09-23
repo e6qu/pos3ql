@@ -106,6 +106,9 @@ fixed local disk block cache (default 128 MiB), and
 seconds). Both settings are recorded in the environment manifest; the timeout
 also appears in each workload file. The capacity must cover both the setup
 rows and all rows inserted by the configured clients and operations.
+Full mode requires at least four clients so its synchronized update workload
+can enforce the group-commit amplification bound; smaller values are rejected
+before measurement.
 CPU and resident-memory sampling uses `/proc` on Linux; peak RSS remains
 available through `ps` on other supported systems.
 

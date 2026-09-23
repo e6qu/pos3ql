@@ -487,6 +487,15 @@ else
   CLIENTS=${POS3QL_BENCH_CLIENTS:-8}
   REPLICA_SETTING=${POS3QL_BENCH_REPLICAS:-2}
 fi
+if ! [[ "$ROWS" =~ ^[1-9][0-9]*$ && "$TABLE_CAPACITY" =~ ^[1-9][0-9]*$ &&
+  "$OPERATIONS" =~ ^[1-9][0-9]*$ && "$CLIENTS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "benchmark rows, table capacity, operations, and clients must be positive decimal integers" >&2
+  exit 2
+fi
+if [ "$MODE" = full ] && [ "$CLIENTS" -lt 4 ]; then
+  echo "full mode requires at least four clients for the group-commit amplification gate" >&2
+  exit 2
+fi
 if [ "$MODE" = checkpoint ]; then
   REPLICA_SETTING=${POS3QL_BENCH_REPLICAS:-0}
   if [ "$REPLICA_SETTING" != 0 ]; then

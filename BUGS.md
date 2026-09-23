@@ -6,6 +6,14 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The resource-matched PostgreSQL baseline audit found no external blocker. Each
+backend run now retains both an unconstrained host-available control and a
+stock PostgreSQL 18 container capped to the CPU availability and exact fixed
+memory plan recorded for pos3ql. The harness validates Docker's effective CPU,
+memory, and no-swap limits instead of accepting an unverified comparison. The
+clean 10,000-row matrix completed all 27 engine and scenario combinations
+without error. Full mode now rejects fewer than four clients up front rather
+than failing its mandatory group-commit amplification gate after partial work.
 The object-store benchmark-matrix audit found no external blocker. The harness
 now runs paired fixture, MinIO, SeaweedFS, and vanilla PostgreSQL 18 workloads,
 records exact backend provenance, and represents unavailable provider request

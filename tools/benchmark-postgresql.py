@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import pathlib
 import subprocess
 
@@ -62,9 +63,46 @@ def capture(args):
 
     image_id = None
     mounts = None
+    resource_limits = None
     if args.docker_container:
         image_id = docker_inspect(args.docker_container, "{{.Image}}")
         mounts = json.loads(docker_inspect(args.docker_container, "{{json .Mounts}}"))
+        resource_limits = {
+            "cpu_quota": int(
+                docker_inspect(args.docker_container, "{{.HostConfig.NanoCpus}}")
+            ) / 1_000_000_000,
+            "memory_bytes": int(
+                docker_inspect(args.docker_container, "{{.HostConfig.Memory}}")
+            ),
+            "memory_swap_bytes": int(
+                docker_inspect(args.docker_container, "{{.HostConfig.MemorySwap}}")
+            ),
+        }
+        if args.resource_profile == "host-available" and any(resource_limits.values()):
+            raise ValueError("host-available PostgreSQL has container resource limits")
+        if args.resource_profile == "resource-matched" and (
+            args.expected_cpus is None or args.expected_memory_bytes is None
+        ):
+            raise ValueError("resource-matched PostgreSQL requires expected resource limits")
+        if args.expected_cpus is not None and not math.isclose(
+            resource_limits["cpu_quota"], args.expected_cpus
+        ):
+            raise ValueError(
+                f"PostgreSQL CPU quota is {resource_limits['cpu_quota']}, "
+                f"expected {args.expected_cpus}"
+            )
+        if (
+            args.expected_memory_bytes is not None
+            and resource_limits["memory_bytes"] != args.expected_memory_bytes
+        ):
+            raise ValueError(
+                f"PostgreSQL memory limit is {resource_limits['memory_bytes']}, "
+                f"expected {args.expected_memory_bytes}"
+            )
+        if args.expected_memory_bytes is not None and resource_limits[
+            "memory_swap_bytes"
+        ] != args.expected_memory_bytes:
+            raise ValueError("resource-matched PostgreSQL swap limit differs from memory")
     return {
         "schema_version": 1,
         "artifact_type": "postgresql_baseline",
@@ -74,6 +112,8 @@ def capture(args):
         "storage_description": args.storage_description,
         "container_image_id": image_id,
         "container_mounts": mounts,
+        "resource_profile": args.resource_profile,
+        "resource_limits": resource_limits,
     }
 
 
@@ -86,7 +126,32 @@ def main():
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--storage-description", required=True)
     parser.add_argument("--docker-container")
+    parser.add_argument(
+        "--resource-profile",
+        choices=("host-available", "resource-matched", "external"),
+        required=True,
+    )
+    parser.add_argument("--expected-cpus", type=float)
+    parser.add_argument("--expected-memory-bytes", type=int)
     args = parser.parse_args()
+    if args.expected_cpus is not None and (
+        not math.isfinite(args.expected_cpus) or args.expected_cpus <= 0
+    ):
+        parser.error("expected CPUs must be positive and finite")
+    if args.expected_memory_bytes is not None and args.expected_memory_bytes <= 0:
+        parser.error("expected memory bytes must be positive")
+    if (args.expected_cpus is not None or args.expected_memory_bytes is not None) and (
+        not args.docker_container or args.resource_profile != "resource-matched"
+    ):
+        parser.error("expected resource limits require resource-matched Docker PostgreSQL")
+    if args.resource_profile == "external" and args.docker_container:
+        parser.error("external PostgreSQL cannot name a Docker container")
+    if args.resource_profile != "external" and not args.docker_container:
+        parser.error("container PostgreSQL profiles require a Docker container")
+    if args.resource_profile == "resource-matched" and (
+        args.expected_cpus is None or args.expected_memory_bytes is None
+    ):
+        parser.error("resource-matched PostgreSQL requires expected CPU and memory limits")
     result = capture(args)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 

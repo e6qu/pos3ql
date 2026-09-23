@@ -27,6 +27,12 @@ def physical_memory():
         return None
 
 
+def available_cpu_count():
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=pathlib.Path, required=True)
@@ -70,7 +76,7 @@ def main():
         "platform": platform.platform(),
         "machine": platform.machine(),
         "processor": platform.processor() or None,
-        "logical_cpu_count": os.cpu_count(),
+        "logical_cpu_count": available_cpu_count(),
         "physical_memory_bytes": physical_memory(),
         "python_version": sys.version.splitlines()[0],
         "rustc_version": command("rustc", "--version"),

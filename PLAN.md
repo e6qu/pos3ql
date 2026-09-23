@@ -419,7 +419,10 @@ equivalent.
 
 The benchmark harness now runs the same pos3ql workload against its
 instrumented fixture, pinned MinIO, and pinned SeaweedFS, pairing every backend
-run with a contemporaneous vanilla PostgreSQL 18 baseline. Environment
+run with contemporaneous host-available and resource-matched vanilla
+PostgreSQL 18 controls. The matched container receives the CPU count available
+to pos3ql and pos3ql's exact fixed startup memory plan, with swap borrowing
+disabled; the report rejects missing or unequal limits. Environment
 artifacts identify the implementation, immutable container reference, backing
 storage, artificial latency, and request-metric availability. A combined
 report rejects mismatched commits, binaries, and workload shapes. Exact
@@ -440,6 +443,20 @@ variation, differing completed foreground counts, and row-merge output of 58,
 497, and 494 block PUTs show that this shared-host duration-floor sample cannot
 rank providers. It establishes executable coverage and exposes the checkpoint
 cost on each stated local setup; the representative run remains outstanding.
+
+The [resource-matched 10,000-row matrix](benchmarks/baselines/2026-09-23-resource-matched-postgresql-10000/README.md)
+adds a second stock PostgreSQL 18.6 control for every backend. Docker recorded
+a 12-CPU quota matching the CPU count available to pos3ql and a
+995,951,270-byte limit matching its fixed memory budget, with swap borrowing
+disabled, while retaining the preceding
+host-available control. All 27 engine and scenario combinations completed
+without error. The matched PostgreSQL mixed-baseline samples measured 6,442.94,
+1,939.32, and 3,660.41 operations per second for fixture, MinIO, and SeaweedFS;
+pos3ql measured 202.10, 215.30, and 276.55. Sequential shared-host variation,
+different completed operation counts, and the distinct durable tiers still
+prevent a controlled production ratio. The resource constraint and provenance
+are now explicit; the representative independently operated run remains
+outstanding.
 
 Repeat long-running measurements on pinned representative hardware with an
 independently operated compatible object store. Record PostgreSQL's local

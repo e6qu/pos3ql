@@ -1,0 +1,50 @@
+{
+  "database_identity": "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin",
+  "label": "mixed-baseline",
+  "results": {
+    "access_path": {
+      "index_scans": 2519,
+      "index_tuples_fetched": 2217,
+      "sequential_scans": 0,
+      "sequential_tuples_read": 0
+    },
+    "attempted_operations": 2217,
+    "completed_operations": 2217,
+    "elapsed_seconds": 8.016515709,
+    "errors": [],
+    "fixed_memory_occupancy": 0.4003583508659013,
+    "fixed_memory_plan_bytes": 995951270,
+    "latency_ms": {
+      "maximum": 90.203417,
+      "mean": 14.45654252142535,
+      "minimum": 0.219458,
+      "p50": 11.528125,
+      "p95": 39.593792,
+      "p99": 60.253875
+    },
+    "maintenance_operations": 0,
+    "maximum_rss_bytes": 398737408,
+    "object_requests_per_operation": null,
+    "object_store": null,
+    "process_cpu_seconds": null,
+    "throughput_ops_per_second": 276.5540641941253
+  },
+  "schema_version": 1,
+  "target_identities": [
+    "PostgreSQL 18.4 (pos3ql 0.1.0) on aarch64-apple-darwin"
+  ],
+  "workload": {
+    "clients": 4,
+    "maintenance_interval_seconds": 0.0,
+    "maintenance_limit": 0,
+    "minimum_duration_seconds": 8.0,
+    "name": "mixed",
+    "operations_per_client": 100,
+    "require_index": false,
+    "required_maintenance_operations": 0,
+    "rows": 10000,
+    "synchronized": false,
+    "target_count": 1,
+    "timeout_seconds": 300.0
+  }
+}

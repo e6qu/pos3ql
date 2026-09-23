@@ -339,13 +339,54 @@ largest event fell from 334.94 to 39.24 ms. The run completed the same
 configured workload and actual PostgreSQL 18 comparison, though its duration
 floor admitted more foreground operations, so aggregate timing is exploratory.
 
-`value_index_schedule` is now the largest checkpoint construction boundary. It
-made 910 GETs and 162 PUTs over 398 events in the reuse profile. Reduce its
-physical source and external-run work while retaining the startup-sized binary
-carry, exact key ordering, selective PAX dependency reads, retry restart,
-four-PUT and eight-GET beat limits, and publication identity. Compare the
-result with actual PostgreSQL 18 under the same SQL workload while continuing
-to report its local durable tier separately from pos3ql object traffic.
+The immutable-group reuse profile left `value_index_schedule` as the largest
+checkpoint construction boundary: 398 events made 910 GETs and 162 PUTs. The
+next change therefore targeted its physical source and external-run work while
+retaining the startup-sized binary carry, exact key ordering, selective PAX
+dependency reads, retry restart, four-PUT and eight-GET beat limits, and
+publication identity.
+
+The [incremental value-index profile](benchmarks/baselines/2026-09-23-checkpoint-value-index-delta-10000/README.md)
+completes that boundary. Ordinary committed changes now sort only resident rows
+newer than the published index LSN, then merge them with a restartable ordered
+stream of the immutable generation. A startup-bounded set captures the exact
+row identities represented by that delta and remains stable through output and
+retry. Suppressing those rows from the base makes key moves, predicate exits,
+deletes, covering payload changes, and posting changes exact replacements
+rather than an accumulating overlay. Object-resident rows whose binding stayed
+clean retain their published entry. Relation rewrites, catalog changes, and
+`REINDEX` retain the complete source walk. Fixed startup buffers cover both
+ordinary roster chains and navigation trees, and retries restart both inputs.
+
+Across a similar two-generation value-index workload, schedule plus write work
+fell from 460 events, 910 GETs, 204 PUTs, and 4.05 seconds to 76 events, zero
+object GETs, 62 PUTs, and 0.26 seconds. Schedule alone became 12 CPU-only events
+totaling 2.06 ms. Every value-index beat stayed within four PUTs and eight GETs.
+The run completed 1,372 foreground operations versus 825 in the preceding
+duration-floor run, so aggregate traffic and latency are diagnostic rather than
+a controlled ratio. Actual PostgreSQL 18.6 completed the matched SQL and
+checkpoint workload on its recorded local
+durable tier at 2,786 operations per second and 9.86 ms p99; its persistence
+path has no pos3ql object-request equivalent.
+
+Every paced value-index and row-merge event stayed within its object-I/O beat
+limits. Correctness validation rejected a resident-only row-SST delta shortcut
+because a changed row may spill before checkpoint. The restored complete
+logical scan made 228 GETs over two delta events, with one 702.96 ms event. This
+is now the next measured construction target: track changed spilled row
+identities explicitly so delta discovery avoids a table-wide provider scan
+without making pre-checkpoint residence an invariant. Row merge made 47 GETs
+over 42 schedule beats and 100 PUTs over 235 write beats; their totals were
+0.14 and 1.02 seconds, with largest events of 25.38 and 24.18 ms. Commit pruning
+remains a separate 1.42-second post-publication cost.
+
+The complete storage VOPR range then exposed two interleavings hidden by the
+profile: consulting a live committed LSN during output could suppress an
+unchanged base entry after a later non-indexed commit, and rollback could leave
+a redundant spilled overlay state that shadowed an immutable index candidate.
+The captured row-identity set now supplies the stable merge boundary, while
+rollback removes the redundant overlay state. Deterministic seeds 460259
+through 460274 cover outage, cold-start, warm-restart, and rollback variants.
 
 Repeat on larger datasets and representative hardware before asserting
 production ratios.

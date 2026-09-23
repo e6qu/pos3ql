@@ -239,8 +239,25 @@ references, and the merged roster keeps every shared physical dependency live.
 Groups affected by duplicate selection, snapshot pruning, or removable
 tombstones rebuild normally. A cache-disabled regression combines both paths,
 runs garbage collection, and reads reused payloads after empty-cache recovery.
-The clean profile records the reduced PUT traffic; remaining value-index
-schedule work is tracked in PLAN.md.
+The clean profile records the reduced PUT traffic and exposed value-index
+schedule work addressed by the following audit.
+The incremental value-index audit found no external blocker. Checkpoint sorting
+now contains only resident rows newer than the published index LSN and merges
+them with a fixed-memory ordered stream of ordinary roster or navigation-tree
+entries. A startup-bounded identity set captured with the delta supplies exact
+base suppression across later commits and writer retries. It covers key moves,
+predicate exits, deletes, covering payloads, and posting tokens without
+accumulating stale generations. Relation rewrites and catalog maintenance
+retain explicit full rebuild state. Fault retry, per-beat object limits,
+garbage collection, and object-cold navigation recovery qualify the path. The
+complete storage VOPR range found that live-LSN suppression could lose an
+unchanged base entry after a non-indexed commit, while rollback could leave a
+redundant spilled overlay state that shadowed an immutable index candidate.
+Exact captured identities and rollback cleanup close both classes; seeds
+460259 through 460274 cover their outage and restart variants. Validation also
+caught an unsafe row-SST delta shortcut: a changed row can spill before the
+checkpoint, so scanning only the resident map lost that row after cold
+recovery. Row-SST delta discovery retains the complete logical scan.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

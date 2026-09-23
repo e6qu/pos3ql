@@ -3571,6 +3571,10 @@ pub(crate) struct Enforcer {
     /// The committed image differs from `durable`. A clean binding can retain
     /// its immutable generation when an unrelated table column changes.
     durable_dirty: bool,
+    /// Catalog maintenance or a row-set replacement requires a fresh base.
+    /// Ordinary committed row changes remain representable as a bounded delta
+    /// over the last published generation.
+    durable_rebuild: bool,
     /// Last logical WAL boundary that changed the binding. Checkpoint
     /// reslices use it to retain an unpublished generation when only another
     /// binding changed after the prior slice.
@@ -25158,9 +25162,88 @@ impl Storage {
         Ok(core::ops::ControlFlow::Continue(()))
     }
 
-    /// Resumes a checkpoint value-index source walk for at most `max_rows`
-    /// physical rowids. The cursor advances before `each` may stop the batch,
-    /// so a later beat never revisits an emitted row.
+    /// Resumes resident rows changed after one published value-index base and
+    /// records the exact row identities represented by the delta. Heap rows
+    /// contribute replacement entries and tombstones only suppress the base.
+    /// A spilled row was captured by a successful row checkpoint; its base
+    /// entry remains current when this binding stayed clean.
+    #[expect(clippy::too_many_arguments, reason = "checkpoint row stream boundary")]
+    pub(crate) fn for_each_value_binding_delta_entry_batch(
+        &self,
+        table_slot: usize,
+        binding: usize,
+        after_lsn: u64,
+        cursor: &mut CheckpointValueCursor,
+        changed_rowids: &mut Vec<u64>,
+        output: &mut [u8],
+        max_rows: usize,
+        each: &mut dyn for<'entry> FnMut(
+            CheckpointValueEntry<'entry>,
+        ) -> Result<core::ops::ControlFlow<()>, SqlError>,
+    ) -> Result<bool, SqlError> {
+        let rows = &self.tables[table_slot].rows;
+        let mut walked = 0usize;
+        while cursor.resident_slot < rows.backing_slot_count() && walked < max_rows {
+            let slot = cursor.resident_slot;
+            cursor.resident_slot += 1;
+            let Some((&rowid, state)) = rows.entry_at_slot(slot) else {
+                continue;
+            };
+            if state.committed_lsn <= after_lsn {
+                continue;
+            }
+            walked += 1;
+            let home = match state.committed {
+                Some(home @ RowHome::Heap(_)) => home,
+                None => {
+                    if changed_rowids.len() == changed_rowids.capacity() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "checkpoint value-index changed-row set exceeds table_rows ({})",
+                            changed_rowids.capacity()
+                        ));
+                    }
+                    changed_rowids.push(rowid);
+                    continue;
+                }
+                // A spilled image was already captured by a successful row
+                // checkpoint. If this binding stayed clean, its base entry
+                // remains current; a binding-changing row cannot spill until
+                // the matching value generation publishes.
+                Some(RowHome::Spilled { .. }) => continue,
+            };
+            if changed_rowids.len() == changed_rowids.capacity() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "checkpoint value-index changed-row set exceeds table_rows ({})",
+                    changed_rowids.capacity()
+                ));
+            }
+            changed_rowids.push(rowid);
+            let Some((key_len, payload_len, hash)) =
+                self.encode_value_binding_entry(table_slot, binding, rowid, home, output)?
+            else {
+                continue;
+            };
+            let (key, payload) = output[..key_len + payload_len].split_at(key_len);
+            if each(CheckpointValueEntry {
+                rowid,
+                commit_lsn: state.committed_lsn,
+                hash,
+                key,
+                payload,
+            })?
+            .is_break()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(cursor.resident_slot == rows.backing_slot_count())
+    }
+
+    /// Resumes a complete checkpoint value-index source walk for at most
+    /// `max_rows` physical rowids. The cursor advances before `each` may stop
+    /// the batch, so a later beat never revisits an emitted row.
     #[expect(clippy::too_many_arguments, reason = "checkpoint row stream boundary")]
     pub(crate) fn for_each_value_binding_entry_batch(
         &self,
@@ -27051,7 +27134,10 @@ impl Storage {
                     .get_mut(&rowid)
                     .expect("row state was just observed");
                 pop_pending_version(versions, free, &mut state.pending);
-                if state.committed.is_none() && state.history.is_empty() && state.pending.is_none()
+                if (state.committed.is_none()
+                    && state.history.is_empty()
+                    && state.pending.is_none())
+                    || Self::redundant_spilled_row_state(state)
                 {
                     tables[table_index].rows.remove(&rowid);
                 }
@@ -27071,7 +27157,7 @@ impl Storage {
     pub fn remove_committed(&mut self, table_index: usize, rowid: u64, commit_lsn: u64) {
         if self.tables[table_index].n_spill_ssts == 0 {
             if self.remove_row_state(table_index, rowid).is_some() {
-                self.mark_value_bindings_dirty_at(table_index, commit_lsn);
+                self.mark_value_bindings_changed_at(table_index, commit_lsn);
                 self.tables[table_index].mark_dirty();
             }
             return;
@@ -27090,7 +27176,7 @@ impl Storage {
                 pending: PendingVersions::empty(),
             },
         );
-        self.mark_value_bindings_dirty_at(table_index, commit_lsn);
+        self.mark_value_bindings_changed_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
     }
@@ -27230,7 +27316,7 @@ impl Storage {
         if state.committed.is_none() && table.n_spill_ssts == 0 {
             table.rows.remove(&rowid);
         }
-        self.mark_value_bindings_dirty_at(table_index, commit_lsn);
+        self.mark_value_bindings_rebuild_at(table_index, commit_lsn);
         let table = &mut self.tables[table_index];
         table.mark_dirty();
     }
@@ -28628,15 +28714,25 @@ impl Storage {
         enforcer.durable_dirty.then_some(enforcer.durable_dirty_lsn)
     }
 
+    pub(crate) fn value_binding_requires_rebuild(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> bool {
+        self.tables[table_index].enforcers[binding]
+            .expect("binding")
+            .durable_rebuild
+    }
+
     /// Invalidates every durable value generation after a committed row-set
     /// replacement that bypasses [`Self::commit_row`] (replay, rewrite,
     /// truncation, or explicit REINDEX maintenance).
     pub(crate) fn mark_value_bindings_dirty(&mut self, table_index: usize) {
         let dirty_lsn = self.lsn.saturating_add(1);
-        self.mark_value_bindings_dirty_at(table_index, dirty_lsn);
+        self.mark_value_bindings_rebuild_at(table_index, dirty_lsn);
     }
 
-    fn mark_value_bindings_dirty_at(&mut self, table_index: usize, dirty_lsn: u64) {
+    pub(crate) fn mark_value_bindings_changed_at(&mut self, table_index: usize, dirty_lsn: u64) {
         let n_enforcers = self.tables[table_index].n_enforcers;
         for enforcer in self.tables[table_index].enforcers[..n_enforcers]
             .iter_mut()
@@ -28644,6 +28740,17 @@ impl Storage {
         {
             enforcer.durable_dirty = true;
             enforcer.durable_dirty_lsn = dirty_lsn;
+        }
+    }
+
+    fn mark_value_bindings_rebuild_at(&mut self, table_index: usize, dirty_lsn: u64) {
+        self.mark_value_bindings_changed_at(table_index, dirty_lsn);
+        let n_enforcers = self.tables[table_index].n_enforcers;
+        for enforcer in self.tables[table_index].enforcers[..n_enforcers]
+            .iter_mut()
+            .flatten()
+        {
+            enforcer.durable_rebuild = true;
         }
     }
 
@@ -28715,6 +28822,7 @@ impl Storage {
         };
         enforcer.durable = handle;
         enforcer.durable_dirty = false;
+        enforcer.durable_rebuild = false;
         Ok(())
     }
 
@@ -29238,6 +29346,7 @@ impl Storage {
                 dependency_mask: wanted.dependency_mask,
                 durable: prior.and_then(|enforcer| enforcer.durable),
                 durable_dirty: prior.is_none_or(|enforcer| enforcer.durable_dirty),
+                durable_rebuild: prior.is_none_or(|enforcer| enforcer.durable_rebuild),
                 durable_dirty_lsn: prior
                     .map_or(new_dirty_lsn, |enforcer| enforcer.durable_dirty_lsn),
             });

@@ -481,6 +481,12 @@ pub(crate) struct NavigationCursor {
     root_entries_known: bool,
 }
 
+pub(crate) enum NavigationCursorStep {
+    Pending,
+    Leaf(BlockId, u64, bool),
+    Done,
+}
+
 impl NavigationCursor {
     pub(crate) fn new(root: BlockId, entries: u64) -> Self {
         let mut result = Self {
@@ -515,7 +521,27 @@ impl NavigationCursor {
         intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
         visit_node: &mut impl FnMut(BlockId) -> bool,
     ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
-        self.next_inner(store, scratch, intersects, visit_node, None)
+        match self.next_inner(store, scratch, intersects, visit_node, None, None)? {
+            NavigationCursorStep::Leaf(id, entries, covering) => Ok(Some((id, entries, covering))),
+            NavigationCursorStep::Done => Ok(None),
+            NavigationCursorStep::Pending => unreachable!("unbounded navigation walk"),
+        }
+    }
+
+    pub(crate) fn next_bounded(
+        &mut self,
+        store: &mut dyn BlockStore,
+        scratch: &mut [u8],
+        max_node_reads: usize,
+    ) -> Result<NavigationCursorStep, ValueIndexError> {
+        self.next_inner(
+            store,
+            scratch,
+            &mut |_, _| true,
+            &mut |_| true,
+            None,
+            Some(max_node_reads),
+        )
     }
 
     /// Visits the same prunable tree as [`Self::next`], but descends each
@@ -531,7 +557,11 @@ impl NavigationCursor {
         visit_node: &mut impl FnMut(BlockId) -> bool,
         priority: &mut impl FnMut(u8, NavigationSummary) -> f64,
     ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
-        self.next_inner(store, scratch, intersects, visit_node, Some(priority))
+        match self.next_inner(store, scratch, intersects, visit_node, Some(priority), None)? {
+            NavigationCursorStep::Leaf(id, entries, covering) => Ok(Some((id, entries, covering))),
+            NavigationCursorStep::Done => Ok(None),
+            NavigationCursorStep::Pending => unreachable!("unbounded ranked navigation walk"),
+        }
     }
 
     fn next_inner(
@@ -541,7 +571,9 @@ impl NavigationCursor {
         intersects: &mut impl FnMut(u8, NavigationSummary) -> bool,
         visit_node: &mut impl FnMut(BlockId) -> bool,
         mut priority: Option<&mut dyn FnMut(u8, NavigationSummary) -> f64>,
-    ) -> Result<Option<(BlockId, u64, bool)>, ValueIndexError> {
+        max_node_reads: Option<usize>,
+    ) -> Result<NavigationCursorStep, ValueIndexError> {
+        let mut node_reads = 0usize;
         while self.count != 0 {
             self.count -= 1;
             let pending = self.pending[self.count];
@@ -552,16 +584,22 @@ impl NavigationCursor {
                 continue;
             }
             if pending.height == Some(0) {
-                return Ok(Some((
+                return Ok(NavigationCursorStep::Leaf(
                     pending.reference.id,
                     pending.reference.entries,
                     self.covering.ok_or(ValueIndexError::Corrupt)?,
-                )));
+                ));
+            }
+            if max_node_reads.is_some_and(|limit| node_reads == limit) {
+                self.pending[self.count] = pending;
+                self.count += 1;
+                return Ok(NavigationCursorStep::Pending);
             }
             if !visit_node(pending.reference.id) {
-                return Ok(None);
+                return Ok(NavigationCursorStep::Done);
             }
             let (len, kind) = store.get(&pending.reference.id, scratch)?;
+            node_reads += 1;
             if !matches!(
                 kind,
                 BlockType::ValueIndexNavigationV1 | BlockType::ValueIndexPostingV1
@@ -664,7 +702,7 @@ impl NavigationCursor {
                 self.count += 1;
             }
         }
-        Ok(None)
+        Ok(NavigationCursorStep::Done)
     }
 }
 

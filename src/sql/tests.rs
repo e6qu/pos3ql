@@ -16065,7 +16065,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget =
-        Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -16995,7 +16995,8 @@ fn object_resident_set_records_keep_their_structural_fields() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget =
+        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -64427,7 +64428,7 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
     let mut restarted_budget =
-        Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let restarted_slot = restarted
         .storage
@@ -64730,7 +64731,11 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
                 lo + 1023
             ),
         );
-        assert!(!message_types(&loaded).contains(&b'E'));
+        assert!(
+            !message_types(&loaded).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&loaded)
+        );
     }
     let indexed = run_with(
         &mut engine,
@@ -64994,6 +64999,156 @@ fn checkpoint_value_index_writes_are_bounded_restartable_and_recoverable() {
               WHERE code LIKE 'm-%'"
         )),
         ["777", "2047"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let _ = std::fs::remove_dir_all(&config.data_dir);
+}
+
+#[test]
+fn checkpoint_value_index_merges_changed_rows_with_cold_navigation_base() {
+    let mut config = test_config("checkpoint-value-index-incremental-navigation");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!(
+        "sql-checkpoint-value-index-incremental-navigation-{}",
+        std::process::id()
+    );
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.table_rows = 4096;
+    config.txn_rows = 4096;
+    config.value_index_rows = 4096;
+    config.work_arena_bytes = 64 << 20;
+    config.memtable_bytes = 32 << 20;
+    config.wal_bytes = 32 << 20;
+    config.wal_buffer_bytes = 32 << 20;
+    config.block_cache_bytes = 0;
+    config.disk_cache_bytes = 0;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE incremental_navigation (
+             id integer PRIMARY KEY, location point NOT NULL, payload bigint NOT NULL,
+             pad0 text NOT NULL, pad1 text NOT NULL, pad2 text NOT NULL, pad3 text NOT NULL,
+             pad4 text NOT NULL, pad5 text NOT NULL, pad6 text NOT NULL, pad7 text NOT NULL)",
+    );
+    for lo in [1, 1025] {
+        let loaded = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "INSERT INTO incremental_navigation
+                 SELECT value, point(value, value), value,
+                        repeat('a', 1024), repeat('b', 1024), repeat('c', 1024), repeat('d', 1024),
+                        repeat('e', 1024), repeat('f', 1024), repeat('g', 1024), repeat('h', 1024)
+                   FROM generate_series({lo}, {}) AS source(value)",
+                lo + 1023
+            ),
+        );
+        assert!(
+            !message_types(&loaded).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&loaded)
+        );
+    }
+    let indexed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX incremental_navigation_gist
+             ON incremental_navigation USING gist (location) INCLUDE (id, payload)",
+    );
+    assert!(!message_types(&indexed).contains(&b'E'));
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    let slot = engine
+        .storage
+        .find_table("public", "incremental_navigation")
+        .unwrap();
+    engine.storage.evict_committed_table(slot);
+    engine.storage.evict_redundant_entries(slot);
+
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE incremental_navigation
+            SET location = point(-1024, -1024), payload = -1
+          WHERE id = 1024",
+    );
+    assert!(!message_types(&changed).contains(&b'E'));
+
+    let mut value_gets = 0u64;
+    let mut value_puts = 0u64;
+    let published_lsn = loop {
+        let active_before = engine.ckpt.as_ref().unwrap().value_index_job_active();
+        let before = engine.storage.block_io_stats();
+        let step = engine
+            .ckpt
+            .as_mut()
+            .unwrap()
+            .checkpoint_step(&mut engine.storage, &mut engine.scratch)
+            .unwrap();
+        let active_after = engine.ckpt.as_ref().unwrap().value_index_job_active();
+        let beat = engine.storage.block_io_stats().saturating_sub(before);
+        if active_before || active_after {
+            value_gets += beat.object_gets;
+            value_puts += beat.object_puts;
+            assert!(
+                beat.object_gets <= 8 && beat.object_puts <= 4,
+                "one incremental value-index beat exceeded its object-I/O bound: {beat:?}"
+            );
+        } else {
+            assert_eq!(
+                beat.object_gets, 0,
+                "a one-row delta checkpoint scanned immutable table rows: {beat:?}"
+            );
+        }
+        match step {
+            crate::checkpoint::CheckpointStep::Published { lsn } => break lsn,
+            crate::checkpoint::CheckpointStep::Working => {}
+            crate::checkpoint::CheckpointStep::Idle => {
+                panic!("incremental value index became idle before publication")
+            }
+        }
+    };
+    assert!(
+        value_gets <= 24,
+        "incremental navigation read the wide row source: {value_gets} GETs"
+    );
+    assert!(
+        value_puts <= 12,
+        "incremental navigation rewrote the complete generation: {value_puts} PUTs"
+    );
+    engine.begin_post_publish_cleanup(published_lsn);
+    engine.finish_post_publish_cleanup().unwrap();
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .finish_maintenance(&engine.storage)
+        .unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, payload FROM incremental_navigation
+              ORDER BY location <-> point(-1024, -1024) LIMIT 1"
+        )),
+        ["1024|-1"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
@@ -68134,7 +68289,8 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget =
+        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -71953,7 +72109,8 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new((1 << 28) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget =
+        Budget::new((1 << 28) + (1 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,

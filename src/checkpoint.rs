@@ -23,7 +23,8 @@ use crate::storage::{
 use crate::store::{
     BlockId, BlockStore, BlockType, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat,
     SstCursor, SstHandle, SstKey, SstReader, SstVersionCursor, SstWriter, StackPlan, StoreError,
-    TieredStore, ValueIndexHandle, ValueIndexWriter, block_keys_at, copy_block_entry_at,
+    TieredStore, ValueIndexHandle, ValueIndexStream, ValueIndexStreamStep, ValueIndexWriter,
+    block_keys_at, copy_block_entry_at,
 };
 use crate::util::StackStr;
 use crate::wal::crc32c::Crc32c;
@@ -347,6 +348,7 @@ struct ValueScheduleJob {
     navigation: Option<crate::store::NavigationSpec>,
     dirty_lsn: u64,
     through_lsn: u64,
+    base: Option<ValueIndexHandle>,
     phase: ValueSchedulePhase,
     source_done: bool,
     pending: Option<PendingValueRow>,
@@ -367,6 +369,9 @@ struct ValueIndexJob {
     navigation: Option<crate::store::NavigationSpec>,
     dirty_lsn: u64,
     through_lsn: u64,
+    base: Option<ValueIndexHandle>,
+    base_len: usize,
+    base_done: bool,
     source: ValueIndexSource,
     previous_posting: Option<(
         [u8; crate::sql::index_signature::PostingToken::KEY_BYTES],
@@ -815,6 +820,8 @@ pub(crate) struct Checkpointer {
     value_sort_rows: Box<[BufferedValueRow]>,
     value_source_cursor: CheckpointValueCursor,
     value_sort_reader: ExternalRunReader,
+    value_base_stream: ValueIndexStream,
+    value_base_entry: Box<[u8]>,
     value_entry: Box<[u8]>,
     value_schedule_job: Option<ValueScheduleJob>,
     value_job: Option<ValueIndexJob>,
@@ -925,6 +932,8 @@ impl Checkpointer {
             + 2 * SstWriter::budget_bytes()
             + ValueIndexWriter::budget_bytes()
             + ExternalRunReader::budget_bytes()
+            + ValueIndexStream::budget_bytes(config.checkpoint_live_blocks)
+            + crate::store::MAX_PAYLOAD
             + 2 * crate::store::MAX_PAYLOAD
             + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
             + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table)
@@ -1463,6 +1472,13 @@ impl Checkpointer {
             .map_err(CheckpointSetupError::Budget)?;
         budget
             .draw(
+                ValueIndexStream::budget_bytes(config.checkpoint_live_blocks)
+                    + crate::store::MAX_PAYLOAD,
+                "checkpoint published value-index stream",
+            )
+            .map_err(CheckpointSetupError::Budget)?;
+        budget
+            .draw(
                 2 * crate::store::MAX_PAYLOAD
                     + VALUE_SORT_ROWS_PER_CHUNK * core::mem::size_of::<BufferedValueRow>()
                     + CheckpointValueCursor::budget_bytes(config.max_spill_generations_per_table),
@@ -1531,6 +1547,8 @@ impl Checkpointer {
                 .into_boxed_slice(),
             value_source_cursor: CheckpointValueCursor::new(config.max_spill_generations_per_table),
             value_sort_reader: ExternalRunReader::new(),
+            value_base_stream: ValueIndexStream::new(config.checkpoint_live_blocks),
+            value_base_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             value_entry: vec![0; crate::store::MAX_PAYLOAD].into_boxed_slice(),
             value_schedule_job: None,
             value_job: None,
@@ -10708,7 +10726,7 @@ impl Checkpointer {
             // every snapshot-retained committed version. The scratch remains
             // one entry per row even when object capacity holds a long chain.
             sort_scratch.clear();
-            storage.for_each_row_state(slot, &mut |rowid, state| {
+            let mut collect = |rowid, state: crate::storage::RowState| {
                 use core::ops::ControlFlow;
                 let has_version = state.committed.is_some()
                     || state.committed_lsn != 0
@@ -10747,7 +10765,12 @@ impl Checkpointer {
                     )
                 })?;
                 Ok(ControlFlow::Continue(()))
-            })?;
+            };
+            // A row changed after the prior slice can already have spilled
+            // before this checkpoint begins. Walk the complete logical row
+            // set, then let `resident` select the heap image or spilled
+            // tombstone/version that belongs in this delta.
+            storage.for_each_row_state(slot, &mut collect)?;
             sort_scratch
                 .as_mut_slice()
                 .sort_unstable_by_key(|(rowid, _)| *rowid);
@@ -10988,6 +11011,9 @@ impl Checkpointer {
         let dirty_lsn = storage
             .value_binding_dirty_lsn(slot, binding)
             .expect("selected value binding is dirty");
+        let base = storage
+            .value_binding_handle(slot, binding)
+            .filter(|_| !storage.value_binding_requires_rebuild(slot, binding));
         self.sst_arena.reset();
         let roster_read = self
             .sst_arena
@@ -11035,6 +11061,7 @@ impl Checkpointer {
                 navigation: storage.value_binding_navigation(slot, binding),
                 dirty_lsn,
                 through_lsn,
+                base,
                 phase: ValueSchedulePhase::Collect,
                 source_done: false,
                 pending: None,
@@ -11088,16 +11115,26 @@ impl Checkpointer {
         left: &[u8],
         right: &[u8],
     ) -> Result<Ordering, SqlError> {
-        if job
-            .navigation
+        Self::compare_value_entries(storage, job.slot, job.binding, job.navigation, left, right)
+    }
+
+    fn compare_value_entries(
+        storage: &Storage,
+        slot: usize,
+        binding: usize,
+        navigation: Option<crate::store::NavigationSpec>,
+        left: &[u8],
+        right: &[u8],
+    ) -> Result<Ordering, SqlError> {
+        if navigation
             .is_some_and(|navigation| navigation.kind == crate::store::NavigationKind::Posting)
         {
             compare_posting_sort_entries(left, right)
         } else {
             storage.compare_value_binding_keys(
-                job.slot,
-                job.binding,
-                job.navigation,
+                slot,
+                binding,
+                navigation,
                 value_sort_key(left)?,
                 value_sort_key(right)?,
             )
@@ -11289,42 +11326,58 @@ impl Checkpointer {
 
         if !job.source_done {
             let mut stopped = false;
-            let done = storage.for_each_value_binding_entry_batch(
-                job.slot,
-                job.binding,
-                &mut self.value_source_cursor,
-                &self.sst_arena,
-                key_output,
-                VALUE_INDEX_SCHEDULE_BEAT_ROWS,
-                VALUE_INDEX_SCHEDULE_BEAT_READS,
-                &mut |entry| {
-                    let pending = PendingValueRow {
-                        rowid: entry.rowid,
-                        commit_lsn: entry.commit_lsn,
-                        hash: entry.hash,
-                        key_len: entry.key.len(),
-                        payload_len: entry.payload.len(),
-                        token_skip: 0,
-                    };
-                    if Self::encode_value_sort_row(
-                        storage,
-                        &mut self.value_source,
-                        &mut self.value_sort_rows,
-                        job,
-                        pending,
-                        entry.key,
-                        entry.payload,
-                        sorted_entry,
-                    )? {
-                        return Ok(core::ops::ControlFlow::Continue(()));
-                    }
-                    self.value_entry[..entry.key.len()].copy_from_slice(entry.key);
-                    self.value_entry[entry.key.len()..entry.key.len() + entry.payload.len()]
-                        .copy_from_slice(entry.payload);
-                    stopped = true;
-                    Ok(core::ops::ControlFlow::Break(()))
-                },
-            )?;
+            let slot = job.slot;
+            let binding = job.binding;
+            let base = job.base;
+            let mut each = |entry: crate::storage::CheckpointValueEntry<'_>| {
+                let pending = PendingValueRow {
+                    rowid: entry.rowid,
+                    commit_lsn: entry.commit_lsn,
+                    hash: entry.hash,
+                    key_len: entry.key.len(),
+                    payload_len: entry.payload.len(),
+                    token_skip: 0,
+                };
+                if Self::encode_value_sort_row(
+                    storage,
+                    &mut self.value_source,
+                    &mut self.value_sort_rows,
+                    job,
+                    pending,
+                    entry.key,
+                    entry.payload,
+                    sorted_entry,
+                )? {
+                    return Ok(core::ops::ControlFlow::Continue(()));
+                }
+                self.value_entry[..entry.key.len()].copy_from_slice(entry.key);
+                self.value_entry[entry.key.len()..entry.key.len() + entry.payload.len()]
+                    .copy_from_slice(entry.payload);
+                stopped = true;
+                Ok(core::ops::ControlFlow::Break(()))
+            };
+            let done = if let Some(base) = base {
+                storage.for_each_value_binding_delta_entry_batch(
+                    slot,
+                    binding,
+                    base.published_lsn,
+                    &mut self.value_source_cursor,
+                    key_output,
+                    VALUE_INDEX_SCHEDULE_BEAT_ROWS,
+                    &mut each,
+                )?
+            } else {
+                storage.for_each_value_binding_entry_batch(
+                    slot,
+                    binding,
+                    &mut self.value_source_cursor,
+                    &self.sst_arena,
+                    key_output,
+                    VALUE_INDEX_SCHEDULE_BEAT_ROWS,
+                    VALUE_INDEX_SCHEDULE_BEAT_READS,
+                    &mut each,
+                )?
+            };
             job.source_done = done && !stopped;
         }
 
@@ -11663,6 +11716,9 @@ impl Checkpointer {
         } else {
             self.value_writer.reset();
         }
+        if let Some(base) = job.base {
+            self.value_base_stream.reset(base, job.navigation.is_some());
+        }
         self.value_job = Some(ValueIndexJob {
             slot: job.slot,
             table_created_at: job.table_created_at,
@@ -11674,6 +11730,9 @@ impl Checkpointer {
             navigation: job.navigation,
             dirty_lsn: job.dirty_lsn,
             through_lsn: job.through_lsn,
+            base: job.base,
+            base_len: 0,
+            base_done: job.base.is_none(),
             source,
             previous_posting: None,
         });
@@ -11790,6 +11849,11 @@ impl Checkpointer {
             ValueIndexSource::InMemory { position, .. } => *position = 0,
             ValueIndexSource::External { started, .. } => *started = false,
         }
+        job.base_len = 0;
+        job.base_done = job.base.is_none();
+        if let Some(base) = job.base {
+            self.value_base_stream.reset(base, job.navigation.is_some());
+        }
     }
 
     /// Streams a sorted value-index generation through a bounded number of
@@ -11866,7 +11930,7 @@ impl Checkpointer {
         }
         let mut processed = 0usize;
         loop {
-            let entry_len = match &job.source {
+            let delta_len = match &job.source {
                 ValueIndexSource::InMemory { rows, position } if position < rows => {
                     let row = self.value_sort_rows[*position];
                     let start = row.offset as usize + 8;
@@ -11884,7 +11948,37 @@ impl Checkpointer {
                 },
                 ValueIndexSource::InMemory { .. } => 0,
             };
-            if entry_len == 0 {
+            while job.base_len == 0 && !job.base_done {
+                let io = self.blocks.borrow().io_stats().saturating_sub(before);
+                let reserve_delta_read =
+                    usize::from(matches!(job.source, ValueIndexSource::External { .. }));
+                let remaining = (VALUE_INDEX_WRITE_BEAT_READS.saturating_sub(io.object_gets))
+                    .saturating_sub(reserve_delta_read as u64)
+                    as usize;
+                let step = self
+                    .value_base_stream
+                    .next_copy(
+                        &mut *self.blocks.borrow_mut(),
+                        remaining,
+                        &mut self.value_base_entry,
+                    )
+                    .map_err(value_index_to_sql)?;
+                match step {
+                    ValueIndexStreamStep::Pending => return Ok(None),
+                    ValueIndexStreamStep::Done => job.base_done = true,
+                    ValueIndexStreamStep::Entry(length) => {
+                        let rowid =
+                            u64::from_le_bytes(self.value_base_entry[8..16].try_into().unwrap());
+                        let published_lsn =
+                            job.base.expect("base stream has a handle").published_lsn;
+                        if storage.value_binding_row_changed_after(job.slot, rowid, published_lsn) {
+                            continue;
+                        }
+                        job.base_len = length;
+                    }
+                }
+            }
+            if delta_len == 0 && job.base_len == 0 {
                 let handle = {
                     let mut blocks = self.blocks.borrow_mut();
                     let mut published = PublishedValueBlockStore {
@@ -11897,6 +11991,33 @@ impl Checkpointer {
                 };
                 return Ok(Some(handle));
             }
+
+            let take_base = match (job.base_len, delta_len) {
+                (0, _) => false,
+                (_, 0) => true,
+                (base_len, delta_len) => {
+                    let base = &self.value_base_entry[..base_len];
+                    let delta = &self.value_entry[..delta_len];
+                    Self::compare_value_entries(
+                        storage,
+                        job.slot,
+                        job.binding,
+                        job.navigation,
+                        base,
+                        delta,
+                    )?
+                    .then_with(|| base[8..16].cmp(&delta[8..16]))
+                    .then_with(|| base[16..24].cmp(&delta[16..24]))
+                    .is_le()
+                }
+            };
+            let entry_len = if take_base {
+                self.value_entry[..job.base_len]
+                    .copy_from_slice(&self.value_base_entry[..job.base_len]);
+                job.base_len
+            } else {
+                delta_len
+            };
 
             let entry = &self.value_entry[..entry_len];
             let key = value_sort_key(entry)?;
@@ -11990,11 +12111,15 @@ impl Checkpointer {
                 }
             }
 
-            match &mut job.source {
-                ValueIndexSource::InMemory { position, .. } => *position += 1,
-                ValueIndexSource::External { .. } => self
-                    .value_sort_reader
-                    .advance(&mut *self.blocks.borrow_mut())?,
+            if take_base {
+                job.base_len = 0;
+            } else {
+                match &mut job.source {
+                    ValueIndexSource::InMemory { position, .. } => *position += 1,
+                    ValueIndexSource::External { .. } => self
+                        .value_sort_reader
+                        .advance(&mut *self.blocks.borrow_mut())?,
+                }
             }
             processed += 1;
             let io = self.blocks.borrow().io_stats().saturating_sub(before);
@@ -14698,6 +14823,7 @@ mod stored_dependency_tests {
         assert_eq!(
             Checkpointer::budget_bytes(&live_blocks) - base_bytes,
             core::mem::size_of::<(BlockId, Option<BlockType>)>()
+                + core::mem::size_of::<(BlockId, bool)>()
         );
 
         let mut garbage = base.clone();

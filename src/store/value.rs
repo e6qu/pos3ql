@@ -10,8 +10,8 @@
 #[cfg(test)]
 use super::navigation::SpatialBounds;
 use super::navigation::{
-    INTERVAL_DATA_BYTES, NavigationCursor, NavigationKind, NavigationSummary, NavigationWriter,
-    POSTING_DATA_BYTES, SIGNATURE_DATA_BYTES, SPATIAL_DATA_BYTES,
+    INTERVAL_DATA_BYTES, NavigationCursor, NavigationCursorStep, NavigationKind, NavigationSummary,
+    NavigationWriter, POSTING_DATA_BYTES, SIGNATURE_DATA_BYTES, SPATIAL_DATA_BYTES,
 };
 use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 
@@ -534,6 +534,250 @@ pub(crate) fn walk_value_roster(
 pub(crate) struct ValueIndexReader<'a> {
     roster: &'a mut [u8],
     data: &'a mut [u8],
+}
+
+pub(crate) enum ValueIndexStreamStep {
+    Pending,
+    Entry(usize),
+    Done,
+}
+
+enum ValueIndexStreamState {
+    RosterCollect(Option<BlockId>),
+    RosterBlocks(usize),
+    Navigation,
+    Done,
+}
+
+/// Restartable ordered walk over one immutable value-index generation.
+///
+/// Ordinary roster blocks are discovered in reverse chain order, then read
+/// oldest first. Navigation trees retain their fixed-depth cursor. Both paths
+/// expose the checkpoint sort-entry encoding so a later generation can merge
+/// a small changed-row run with its already sorted published base.
+pub(crate) struct ValueIndexStream {
+    handle: Option<ValueIndexHandle>,
+    state: ValueIndexStreamState,
+    navigation: Box<NavigationCursor>,
+    blocks: Vec<(BlockId, bool)>,
+    roster: Box<[u8]>,
+    data: Box<[u8]>,
+    data_len: usize,
+    data_at: usize,
+    data_covering: bool,
+    data_expected_entries: Option<u64>,
+    data_entries: u64,
+    entries: u64,
+}
+
+impl ValueIndexStream {
+    pub(crate) fn budget_bytes(block_capacity: usize) -> usize {
+        core::mem::size_of::<Self>()
+            + core::mem::size_of::<NavigationCursor>()
+            + 2 * MAX_PAYLOAD
+            + block_capacity * core::mem::size_of::<(BlockId, bool)>()
+    }
+
+    pub(crate) fn new(block_capacity: usize) -> Self {
+        Self {
+            handle: None,
+            state: ValueIndexStreamState::Done,
+            navigation: Box::new(NavigationCursor::new(BlockId([0; 32]), 0)),
+            blocks: Vec::with_capacity(block_capacity),
+            roster: vec![0; MAX_PAYLOAD].into_boxed_slice(),
+            data: vec![0; MAX_PAYLOAD].into_boxed_slice(),
+            data_len: 0,
+            data_at: 0,
+            data_covering: false,
+            data_expected_entries: None,
+            data_entries: 0,
+            entries: 0,
+        }
+    }
+
+    pub(crate) fn reset(&mut self, handle: ValueIndexHandle, navigation: bool) {
+        self.handle = Some(handle);
+        self.blocks.clear();
+        self.data_len = 0;
+        self.data_at = 0;
+        self.data_expected_entries = None;
+        self.data_entries = 0;
+        self.entries = 0;
+        self.state = if navigation {
+            *self.navigation = NavigationCursor::new(handle.roster, handle.entries);
+            ValueIndexStreamState::Navigation
+        } else {
+            ValueIndexStreamState::RosterCollect(Some(handle.roster))
+        };
+    }
+
+    fn finish_data_block(&mut self) -> Result<(), ValueIndexError> {
+        if self.data_at != self.data_len
+            || self
+                .data_expected_entries
+                .is_some_and(|expected| expected != self.data_entries)
+        {
+            return Err(ValueIndexError::Corrupt);
+        }
+        self.data_len = 0;
+        self.data_at = 0;
+        self.data_expected_entries = None;
+        self.data_entries = 0;
+        Ok(())
+    }
+
+    fn load_data(
+        &mut self,
+        store: &mut dyn BlockStore,
+        id: BlockId,
+        covering: bool,
+        expected_entries: Option<u64>,
+    ) -> Result<(), ValueIndexError> {
+        let (len, kind) = store.get(&id, &mut self.data)?;
+        if kind != BlockType::ValueIndexData {
+            return Err(ValueIndexError::Corrupt);
+        }
+        self.data_len = len;
+        self.data_at = 0;
+        self.data_covering = covering;
+        self.data_expected_entries = expected_entries;
+        self.data_entries = 0;
+        Ok(())
+    }
+
+    fn copy_entry(&mut self, output: &mut [u8]) -> Result<usize, ValueIndexError> {
+        let header = if self.data_covering {
+            COVERING_ENTRY_HEADER
+        } else {
+            ENTRY_HEADER
+        };
+        let at = self.data_at;
+        if self.data_len - at < header {
+            return Err(ValueIndexError::Corrupt);
+        }
+        let key_len = u32::from_le_bytes(self.data[at + 24..at + 28].try_into().unwrap()) as usize;
+        let payload_len = if self.data_covering {
+            u32::from_le_bytes(self.data[at + 28..at + 32].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        let end = at
+            .checked_add(header)
+            .and_then(|start| start.checked_add(key_len))
+            .and_then(|start| start.checked_add(payload_len))
+            .filter(|end| *end <= self.data_len)
+            .ok_or(ValueIndexError::Corrupt)?;
+        let length = COVERING_ENTRY_HEADER
+            .checked_add(key_len)
+            .and_then(|length| length.checked_add(payload_len))
+            .filter(|length| *length <= output.len())
+            .ok_or(ValueIndexError::Corrupt)?;
+        output[..ENTRY_HEADER].copy_from_slice(&self.data[at..at + ENTRY_HEADER]);
+        output[ENTRY_HEADER..COVERING_ENTRY_HEADER]
+            .copy_from_slice(&(payload_len as u32).to_le_bytes());
+        output[COVERING_ENTRY_HEADER..length].copy_from_slice(&self.data[at + header..end]);
+        self.data_at = end;
+        self.data_entries += 1;
+        self.entries += 1;
+        Ok(length)
+    }
+
+    pub(crate) fn next_copy(
+        &mut self,
+        store: &mut dyn BlockStore,
+        max_gets: usize,
+        output: &mut [u8],
+    ) -> Result<ValueIndexStreamStep, ValueIndexError> {
+        if self.data_at < self.data_len {
+            return self.copy_entry(output).map(ValueIndexStreamStep::Entry);
+        }
+        if self.data_len != 0 {
+            self.finish_data_block()?;
+        }
+        loop {
+            match &mut self.state {
+                ValueIndexStreamState::RosterCollect(next) => {
+                    let Some(id) = *next else {
+                        self.state = ValueIndexStreamState::RosterBlocks(self.blocks.len());
+                        continue;
+                    };
+                    if max_gets == 0 {
+                        return Ok(ValueIndexStreamStep::Pending);
+                    }
+                    let (len, kind) = store.get(&id, &mut self.roster)?;
+                    if kind != BlockType::ValueIndexRoster || len < ROSTER_HEADER {
+                        return Err(ValueIndexError::Corrupt);
+                    }
+                    let raw_count = u32::from_le_bytes(self.roster[..4].try_into().unwrap());
+                    let (count, format, covering) = roster_layout(raw_count, len)?;
+                    let mut cursor = ROSTER_HEADER;
+                    let start = self.blocks.len();
+                    for _ in 0..count {
+                        let (block, _, _) = roster_ref(&self.roster[..len], format, &mut cursor)?;
+                        if self.blocks.len() == self.blocks.capacity() {
+                            return Err(ValueIndexError::Corrupt);
+                        }
+                        self.blocks.push((block, covering));
+                    }
+                    if cursor != len {
+                        return Err(ValueIndexError::Corrupt);
+                    }
+                    self.blocks[start..].reverse();
+                    *next = roster_predecessor(&self.roster[..len]);
+                    return Ok(ValueIndexStreamStep::Pending);
+                }
+                ValueIndexStreamState::RosterBlocks(position) => {
+                    if *position == 0 {
+                        let handle = self.handle.ok_or(ValueIndexError::Corrupt)?;
+                        if self.entries != handle.entries {
+                            return Err(ValueIndexError::Corrupt);
+                        }
+                        self.state = ValueIndexStreamState::Done;
+                        return Ok(ValueIndexStreamStep::Done);
+                    }
+                    if max_gets == 0 {
+                        return Ok(ValueIndexStreamStep::Pending);
+                    }
+                    *position -= 1;
+                    let (id, covering) = self.blocks[*position];
+                    self.load_data(store, id, covering, None)?;
+                    if self.data_len == 0 {
+                        return Err(ValueIndexError::Corrupt);
+                    }
+                    return self.copy_entry(output).map(ValueIndexStreamStep::Entry);
+                }
+                ValueIndexStreamState::Navigation => {
+                    if max_gets == 0 {
+                        return Ok(ValueIndexStreamStep::Pending);
+                    }
+                    match self
+                        .navigation
+                        .next_bounded(store, &mut self.roster, max_gets - 1)?
+                    {
+                        NavigationCursorStep::Pending => {
+                            return Ok(ValueIndexStreamStep::Pending);
+                        }
+                        NavigationCursorStep::Done => {
+                            let handle = self.handle.ok_or(ValueIndexError::Corrupt)?;
+                            if self.entries != handle.entries {
+                                return Err(ValueIndexError::Corrupt);
+                            }
+                            self.state = ValueIndexStreamState::Done;
+                            return Ok(ValueIndexStreamStep::Done);
+                        }
+                        NavigationCursorStep::Leaf(id, entries, covering) => {
+                            self.load_data(store, id, covering, Some(entries))?;
+                            if self.data_len == 0 {
+                                return Err(ValueIndexError::Corrupt);
+                            }
+                            return self.copy_entry(output).map(ValueIndexStreamStep::Entry);
+                        }
+                    }
+                }
+                ValueIndexStreamState::Done => return Ok(ValueIndexStreamStep::Done),
+            }
+        }
+    }
 }
 
 impl<'a> ValueIndexReader<'a> {

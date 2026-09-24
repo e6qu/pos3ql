@@ -7,6 +7,108 @@
 use super::*;
 
 #[test]
+fn postgresql_grouping_capacities_execute_without_allocation() {
+    use core::fmt::Write;
+
+    let config = test_config("grouping-capacity");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let arena_bytes = 4 << 20;
+
+    let mut wide =
+        String::from("SELECT count(*) FROM (SELECT x+0 FROM (VALUES (1)) v(x) GROUP BY ");
+    for index in 0..crate::sql::parser::MAX_GROUP_TERMS {
+        if index != 0 {
+            wide.push(',');
+        }
+        write!(wide, "x+{index}").unwrap();
+    }
+    wide.push_str(") grouped");
+    let output = run_with_fixed_memory(&mut engine, &budget, &wide, arena_bytes);
+    assert_eq!(
+        data_rows(&output),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let combined_overflow = wide.replacen("(SELECT x+0", "(SELECT count(*)", 1);
+    let output = run_with_fixed_memory(&mut engine, &budget, &combined_overflow, arena_bytes);
+    assert!(
+        String::from_utf8_lossy(&output).contains(sqlstate::TOO_MANY_COLUMNS),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    wide.insert_str(
+        wide.len() - ") grouped".len(),
+        &format!(",x+{}", crate::sql::parser::MAX_GROUP_TERMS),
+    );
+    let output = run_with_fixed_memory(&mut engine, &budget, &wide, arena_bytes);
+    assert!(
+        String::from_utf8_lossy(&output).contains(sqlstate::TOO_MANY_COLUMNS),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut sets = String::from(
+        "SELECT count(*) FROM (SELECT count(*) FROM (VALUES (1)) v(x) \
+         GROUP BY GROUPING SETS (",
+    );
+    for index in 0..crate::sql::parser::MAX_GROUPING_SETS {
+        if index != 0 {
+            sets.push(',');
+        }
+        sets.push_str("()");
+    }
+    sets.push_str(")) grouped");
+    let output = run_with_fixed_memory(&mut engine, &budget, &sets, arena_bytes);
+    assert_eq!(
+        data_rows(&output),
+        [crate::sql::parser::MAX_GROUPING_SETS.to_string()],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    sets.insert_str(sets.len() - ")) grouped".len(), ",()");
+    let output = run_with_fixed_memory(&mut engine, &budget, &sets, arena_bytes);
+    assert!(
+        String::from_utf8_lossy(&output).contains(sqlstate::STATEMENT_TOO_COMPLEX),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let high_word = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT grouping(x+64), count(*) FROM (VALUES (1)) v(x) \
+         GROUP BY GROUPING SETS ((x+0,x+1,x+2,x+3,x+4,x+5,x+6,x+7,x+8,x+9,\
+         x+10,x+11,x+12,x+13,x+14,x+15,x+16,x+17,x+18,x+19,x+20,x+21,x+22,\
+         x+23,x+24,x+25,x+26,x+27,x+28,x+29,x+30,x+31,x+32,x+33,x+34,x+35,\
+         x+36,x+37,x+38,x+39,x+40,x+41,x+42,x+43,x+44,x+45,x+46,x+47,x+48,\
+         x+49,x+50,x+51,x+52,x+53,x+54,x+55,x+56,x+57,x+58,x+59,x+60,x+61,\
+         x+62,x+63,x+64),(x+0)) ORDER BY 1",
+        arena_bytes,
+    );
+    assert_eq!(data_rows(&high_word), ["0|1", "1|1"]);
+
+    let grouping_arguments = (0..32)
+        .map(|index| format!("x+{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "SELECT grouping({grouping_arguments}) FROM (VALUES (1)) v(x) \
+         GROUP BY {grouping_arguments}"
+    );
+    let output = run_with_fixed_memory(&mut engine, &budget, &query, arena_bytes);
+    assert!(
+        String::from_utf8_lossy(&output).contains(sqlstate::TOO_MANY_ARGUMENTS),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn json_populate_record_uses_table_rowtype_fields() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

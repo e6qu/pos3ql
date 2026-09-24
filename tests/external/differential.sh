@@ -426,6 +426,13 @@ else
   bad "prepared-parameter capacity differential"
   cat "$WORK/parameter-capacity.out"
 fi
+if python3 "$EXT/grouping_capacity_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
+     > "$WORK/grouping-capacity.out" 2>&1; then
+  ok "grouping capacity differential ($(tail -1 "$WORK/grouping-capacity.out"))"
+else
+  bad "grouping capacity differential"
+  cat "$WORK/grouping-capacity.out"
+fi
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
        --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/type-fidelity.out" 2>&1; then

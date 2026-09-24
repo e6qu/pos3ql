@@ -149,11 +149,14 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   SQL `PREPARE`/`EXECUTE` accept PostgreSQL's complete 65,535 parameters;
   prepared metadata, portal values, decoded values, and inferred OIDs remain
   within configured startup buffers and statement memory. Arena exhaustion is
-  SQLSTATE `54000`. Remaining fixed boundaries: 64 `GROUP BY` terms and 256
-  grouping sets (bitmask-keyed expansion), 128-column results, and 64 `JOIN ...
-  USING` columns and join relations. Differential and allocation-forbidden
-  coverage crosses the former boundaries and recovers stored results with
-  empty local caches.
+  SQLSTATE `54000`. `GROUP BY` accepts PostgreSQL 18's 1,664 target-list entry
+  width, grouping-set expansion accepts exactly 4,096 sets, `CUBE` accepts 12
+  elements, and `GROUPING()` accepts 31 arguments. Variable-width masks and
+  recycled per-set scratch keep the complete accepted shape within fixed
+  statement memory. Remaining fixed boundaries are 128-column results and 64
+  `JOIN ... USING` columns and join relations. Differential and
+  allocation-forbidden coverage crosses the former boundaries and recovers
+  stored results with empty local caches.
 - Program length does not share that 64-item arity limit. Simple-protocol
   batches, SQL-language bodies, and PL/pgSQL bodies are sized from their source
   in the fixed statement arena. PL/pgSQL locals, branches, exception handlers

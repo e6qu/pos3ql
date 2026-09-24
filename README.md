@@ -271,9 +271,10 @@ executed, and explained at their written width. Wire Parse/Bind and SQL
 `PREPARE`/`EXECUTE` accept PostgreSQL's complete 65,535-parameter count.
 Prepared type metadata and Bind values consume the configured
 `prepared_bytes` and `portal_bytes`; decoded values and inferred types consume
-the fixed statement arena. Remaining fixed statement boundaries are 64 `GROUP
-BY` terms with 256 grouping sets, 128-column results, and 64 join relations and
-`USING` columns.
+the fixed statement arena. Grouping accepts PostgreSQL 18's 1,664 target-list
+entries, 4,096 expanded grouping sets, 12 `CUBE` elements, and 31 `GROUPING()`
+arguments. Remaining fixed statement boundaries are 128-column results and 64
+join relations and `USING` columns.
 XMLTABLE, JSON_TABLE, and publication-introspection rows use statement memory.
 `EXPLAIN` plan nodes live in the fixed statement arena rather than the worker
 stack, and arena exhaustion returns

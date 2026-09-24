@@ -62,11 +62,19 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- 64 `GROUP BY` terms and 256 grouping sets;
 - 128 result columns; 64 joined relations and 64 `USING` columns;
 - durable 64-item definition shapes, including constraints, enum labels, and
   policy roles; and
 - per-value `tsvector`/`tsquery`, multirange, and geometry widths.
+
+Grouping now follows PostgreSQL 18's target-list width of 1,664 distinct
+expressions, 4,096-set expanded-product limit, 12-element `CUBE` limit, and
+31-argument `GROUPING()` result width. Variable-width arena bitmaps replace the
+former 64-bit mask. Execution retains encoded results in the persistent arena
+tail and recycles each set's scans and aggregate scratch, so the exact 4,096-set
+boundary runs allocation-free in the default statement arena. The accepted and
+next rejected widths, SQLSTATEs, messages, cross-word membership, and results
+are qualified against PostgreSQL 18.6.
 
 Routine call signatures now match PostgreSQL's exact 100-input-argument limit.
 The independent 64-column routine result boundary remains part of the general

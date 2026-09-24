@@ -316,6 +316,13 @@ The integration audit also corrected the connection memory plan to count both
 prepared pools, retained enough prepared slots for `pg_dump`, and replaced the
 withdrawn MinIO image with a provenance-pinned Alpine rebuild whose bucket is
 created by a signed S3 request.
+The grouping-width audit found no external blocker. Grouping expressions and
+sets now use variable-width arena bitmaps at PostgreSQL 18's exact 1,664-entry,
+4,096-set, 12-element `CUBE`, and 31-argument `GROUPING()` boundaries. The
+maximum-set execution test exposed retained per-set scratch that exhausted the
+statement arena; completed encoded rows now move to the persistent tail and
+front scratch is recycled between sets. Allocation-forbidden maximum and
+over-limit execution plus a raw PostgreSQL 18.6 differential qualify the fix.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

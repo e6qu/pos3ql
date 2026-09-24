@@ -1442,6 +1442,11 @@ fi
 # --- generated type fidelity matrix ----------------------------------------
 restart_p3_fresh || exit 1
 echo "=== accepted-type fidelity matrix (real PostgreSQL vs pos3ql) ==="
+if "$PY" "$EXT/result_column_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/result-column-capacity.out" 2>&1; then
+  ok "result-column capacity differential ($(tail -1 "$WORK/result-column-capacity.out"))"
+else
+  bad "result-column capacity differential"; cat "$WORK/result-column-capacity.out"
+fi
 if "$PY" "$EXT/type_fidelity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/type_fidelity.out" 2>&1; then
   ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type_fidelity.out"))"
 else

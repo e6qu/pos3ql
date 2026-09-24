@@ -53,14 +53,13 @@ pub struct SqlPreparedPool {
 struct Slot {
     active: bool,
     name: SqlName,
-    /// Query text followed by one durable type code per declared parameter.
-    /// Both share the slot's configured `prepared_bytes` reservation.
+    /// Query text, one durable code per parameter, then big-endian result OIDs.
+    /// All metadata shares the slot's configured `prepared_bytes` reservation.
     data: FixedBuf,
     text_len: usize,
     n_params: usize,
     prepared_at: i64,
     custom_plans: i64,
-    result_types: [i32; MAX_PREP_RESULTS],
     n_results: usize,
 }
 
@@ -96,7 +95,26 @@ pub(crate) struct PreparedInfo<'a> {
     pub(crate) parameter_type_codes: &'a [u8],
     pub(crate) prepared_at: i64,
     pub(crate) custom_plans: i64,
-    pub(crate) result_types: &'a [i32],
+    pub(crate) result_types: PreparedResultTypes<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedResultTypes<'a> {
+    bytes: &'a [u8],
+}
+
+impl PreparedResultTypes<'_> {
+    pub(crate) fn len(self) -> usize {
+        self.bytes.len() / 4
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = i32> {
+        self.bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_be_bytes(*bytes))
+    }
 }
 
 impl SqlPreparedPool {
@@ -115,7 +133,6 @@ impl SqlPreparedPool {
                 n_params: 0,
                 prepared_at: 0,
                 custom_plans: 0,
-                result_types: [0; MAX_PREP_RESULTS],
                 n_results: 0,
             });
         }
@@ -156,19 +173,30 @@ impl SqlPreparedPool {
             ));
         };
         slot.data.clear();
-        if sql.len().saturating_add(param_types.len()) > slot.data.capacity() {
+        let result_bytes = result_types.len().saturating_mul(4);
+        if sql
+            .len()
+            .saturating_add(param_types.len())
+            .saturating_add(result_bytes)
+            > slot.data.capacity()
+        {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "prepared statement text and parameter types exceed prepared_bytes"
+                "prepared statement text and type metadata exceed prepared_bytes"
             ));
         }
         assert!(slot.data.append(sql.as_bytes()), "capacity checked above");
         for ctype in param_types {
             assert!(slot.data.append(&[ctype.code()]), "capacity checked above");
         }
+        for type_oid in result_types {
+            assert!(
+                slot.data.append(&type_oid.to_be_bytes()),
+                "capacity checked above"
+            );
+        }
         slot.text_len = sql.len();
         slot.n_params = param_types.len();
-        slot.result_types[..result_types.len()].copy_from_slice(result_types);
         slot.n_results = result_types.len();
         slot.name = SqlName::parse(name)?;
         slot.prepared_at = crate::sql::datetime::now_micros();
@@ -222,6 +250,8 @@ impl SqlPreparedPool {
 
     pub(crate) fn visit(&self, mut visitor: impl FnMut(PreparedInfo<'_>)) {
         for slot in self.slots.iter().filter(|slot| slot.active) {
+            let result_start = slot.text_len + slot.n_params;
+            let result_end = result_start + slot.n_results * 4;
             visitor(PreparedInfo {
                 name: slot.name.as_str(),
                 statement: core::str::from_utf8(&slot.data.readable()[..slot.text_len])
@@ -230,7 +260,9 @@ impl SqlPreparedPool {
                     [slot.text_len..slot.text_len + slot.n_params],
                 prepared_at: slot.prepared_at,
                 custom_plans: slot.custom_plans,
-                result_types: &slot.result_types[..slot.n_results],
+                result_types: PreparedResultTypes {
+                    bytes: &slot.data.readable()[result_start..result_end],
+                },
             });
         }
     }

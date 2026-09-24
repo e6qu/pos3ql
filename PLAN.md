@@ -62,7 +62,7 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- 128 result columns; 64 joined relations and 64 `USING` columns;
+- 64 joined relations and 64 `USING` columns;
 - durable 64-item definition shapes, including constraints, enum labels, and
   policy roles; and
 - per-value `tsvector`/`tsquery`, multirange, and geometry widths.
@@ -75,6 +75,13 @@ tail and recycles each set's scans and aggregate scratch, so the exact 4,096-set
 boundary runs allocation-free in the default statement arena. The accepted and
 next rejected widths, SQLSTATEs, messages, cross-word membership, and results
 are qualified against PostgreSQL 18.6.
+
+Query results now follow PostgreSQL 18's 1,664-column target-list boundary.
+Simple, scoped, and set-operation execution, Statement Describe, per-column
+text and binary Bind formats, and the exact 1,665-entry error are qualified
+without runtime allocation against PostgreSQL 18.6. Query threads reserve one
+64 MiB fixed stack at startup for the statically bounded planning, execution,
+and protocol scratch at the complete width.
 
 Routine call signatures now match PostgreSQL's exact 100-input-argument limit.
 The independent 64-column routine result boundary remains part of the general

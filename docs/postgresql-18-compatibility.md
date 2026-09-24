@@ -153,8 +153,10 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   width, grouping-set expansion accepts exactly 4,096 sets, `CUBE` accepts 12
   elements, and `GROUPING()` accepts 31 arguments. Variable-width masks and
   recycled per-set scratch keep the complete accepted shape within fixed
-  statement memory. Remaining fixed boundaries are 128-column results and 64
-  `JOIN ... USING` columns and join relations. Differential and
+  statement memory. Query results accept PostgreSQL's complete 1,664-column
+  target-list width through simple and extended protocol, including one Bind
+  format per column. Remaining fixed boundaries are 64 `JOIN ... USING`
+  columns and join relations. Differential and
   allocation-forbidden coverage crosses the former boundaries and recovers
   stored results with empty local caches.
 - Program length does not share that 64-item arity limit. Simple-protocol

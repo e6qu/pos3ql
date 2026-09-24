@@ -323,6 +323,13 @@ maximum-set execution test exposed retained per-set scratch that exhausted the
 statement arena; completed encoded rows now move to the persistent tail and
 front scratch is recycled between sets. Allocation-forbidden maximum and
 over-limit execution plus a raw PostgreSQL 18.6 differential qualify the fix.
+The result-column audit found no external blocker. Query projection and wire
+metadata now accept PostgreSQL 18's 1,664-column target-list boundary. The
+server and query-bearing test workers use one shared, fixed 64 MiB startup
+stack envelope for the statically bounded scratch. Simple, scoped, and set
+execution, Statement Describe, alternating per-column text and binary Bind
+formats, and the exact 1,665-entry rejection are qualified allocation-free and
+against PostgreSQL 18.6.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

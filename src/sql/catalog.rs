@@ -27802,11 +27802,11 @@ fn pg_prepared_statements<'a>(
                     }
                 };
                 let mut results = [Datum::Null; super::exec::MAX_PROJ];
-                for (target, oid) in results.iter_mut().zip(prepared.result_types) {
-                    let name = intrinsic_type_name(*oid).or_else(|| {
+                for (target, oid) in results.iter_mut().zip(prepared.result_types.iter()) {
+                    let name = intrinsic_type_name(oid).or_else(|| {
                         catalog_types.rows.iter().find_map(|row| {
-                            let matches = matches!(row[0], Datum::Int4(value) if value == *oid)
-                                || matches!(row[0], Datum::Oid(value) if value == *oid as u32);
+                            let matches = matches!(row[0], Datum::Int4(value) if value == oid)
+                                || matches!(row[0], Datum::Oid(value) if value == oid as u32);
                             matches.then(|| match row[1] {
                                 Datum::Text(name) => Some(name),
                                 _ => None,
@@ -27822,7 +27822,7 @@ fn pg_prepared_statements<'a>(
                         return;
                     };
                     *target = Datum::Regtype {
-                        referenced_oid: *oid,
+                        referenced_oid: oid,
                         name,
                     };
                 }

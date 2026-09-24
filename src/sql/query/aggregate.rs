@@ -218,7 +218,8 @@ pub(crate) struct AggState<'a> {
     elem_hint: Option<crate::sql::types::ArrElem>,
     array_input: bool,
     ord_spec: &'a [crate::sql::ast::OrderBy<'a>],
-    ord_collations: [Collation; MAX_PROJ],
+    ord_collations: *mut Collation,
+    ord_collations_len: usize,
     ord: *mut &'a [u8],
     ord_len: usize,
     ord_cap: usize,
@@ -474,7 +475,8 @@ impl Default for AggState<'_> {
             elem_hint: None,
             array_input: false,
             ord_spec: &[],
-            ord_collations: [Collation::None; MAX_PROJ],
+            ord_collations: core::ptr::null_mut(),
+            ord_collations_len: 0,
             ord: core::ptr::null_mut(),
             ord_len: 0,
             ord_cap: 0,
@@ -496,6 +498,34 @@ fn agg_f64(d: &Datum) -> Option<f64> {
 }
 
 impl<'a> AggState<'a> {
+    fn init_order_collations(&mut self, len: usize, arena: &'a Arena) -> Result<(), SqlError> {
+        debug_assert!(self.ord_collations.is_null());
+        let collations = arena
+            .alloc_slice_with(len, |_| Collation::None)
+            .map_err(|_| arena_full())?;
+        self.ord_collations = collations.as_mut_ptr();
+        self.ord_collations_len = collations.len();
+        Ok(())
+    }
+
+    fn order_collations(&self) -> &[Collation] {
+        if self.ord_collations_len == 0 {
+            return &[];
+        }
+        // `init_order_collations` obtains this allocation from the statement
+        // arena carried by the same lifetime as this aggregate state.
+        unsafe { core::slice::from_raw_parts(self.ord_collations, self.ord_collations_len) }
+    }
+
+    fn order_collations_mut(&mut self) -> &mut [Collation] {
+        if self.ord_collations_len == 0 {
+            return &mut [];
+        }
+        // Aggregate states are updated serially, so this is the only mutable
+        // view of the arena allocation installed by `init_order_collations`.
+        unsafe { core::slice::from_raw_parts_mut(self.ord_collations, self.ord_collations_len) }
+    }
+
     pub(crate) fn initialize_custom_direct(
         &mut self,
         node: &Expr<'a>,
@@ -648,6 +678,7 @@ impl<'a> AggState<'a> {
         else {
             return Err(sql_err!(sqlstate::GROUPING_ERROR, "not an aggregate"));
         };
+        self.init_order_collations(args.len().saturating_add(order_by.len()).max(2), arena)?;
         let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
         if args.len() <= argument_oids.len() {
             let mut inferred = true;
@@ -1180,8 +1211,9 @@ impl<'a> AggState<'a> {
                 let mut tuple = [Datum::Null; 1 + MAX_PROJ];
                 tuple[0] = value;
                 for (i, o) in self.ord_spec.iter().enumerate() {
-                    self.ord_collations[i] =
+                    let collation =
                         resolved_expression_collation(o.expression, row, hooks.catalog)?;
+                    self.order_collations_mut()[i] = collation;
                     tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
                 }
                 let enc = crate::sql::exec::encode_projected_pub(
@@ -1317,8 +1349,8 @@ impl<'a> AggState<'a> {
         let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (index, expression) in transition_expressions.iter().enumerate() {
             values[index] = eval_full(expression, arena, params, row, hooks)?;
-            self.ord_collations[index] =
-                resolved_expression_collation(expression, row, hooks.catalog)?;
+            let collation = resolved_expression_collation(expression, row, hooks.catalog)?;
+            self.order_collations_mut()[index] = collation;
         }
         if self.ordered || *distinct {
             let mut tuple = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS * 2];
@@ -1328,8 +1360,9 @@ impl<'a> AggState<'a> {
                 for (index, ordering) in sort_spec.iter().enumerate() {
                     tuple[transition_expressions.len() + index] =
                         eval_full(ordering.expression, arena, params, row, hooks)?;
-                    self.ord_collations[transition_expressions.len() + index] =
+                    let collation =
                         resolved_expression_collation(ordering.expression, row, hooks.catalog)?;
+                    self.order_collations_mut()[transition_expressions.len() + index] = collation;
                 }
             }
             let encoded = crate::sql::exec::encode_projected_pub(
@@ -1739,8 +1772,10 @@ impl<'a> AggState<'a> {
             Datum::Text(text)
         };
         let separator = eval_full(args[1], arena, params, row, hooks)?;
-        self.ord_collations[0] = resolved_expression_collation(args[0], row, hooks.catalog)?;
-        self.ord_collations[1] = resolved_expression_collation(args[1], row, hooks.catalog)?;
+        let value_collation = resolved_expression_collation(args[0], row, hooks.catalog)?;
+        let separator_collation = resolved_expression_collation(args[1], row, hooks.catalog)?;
+        self.order_collations_mut()[0] = value_collation;
+        self.order_collations_mut()[1] = separator_collation;
         let separator = if self.binary_string_agg {
             match separator {
                 Datum::Bytea(bytes) => Datum::Bytea(bytes),
@@ -1781,8 +1816,8 @@ impl<'a> AggState<'a> {
             tuple[0] = value;
             tuple[1] = separator;
             for (i, o) in self.ord_spec.iter().enumerate() {
-                self.ord_collations[i] =
-                    resolved_expression_collation(o.expression, row, hooks.catalog)?;
+                let collation = resolved_expression_collation(o.expression, row, hooks.catalog)?;
+                self.order_collations_mut()[i] = collation;
                 tuple[2 + i] = eval_full(o.expression, arena, params, row, hooks)?;
             }
             let enc =
@@ -2066,7 +2101,7 @@ impl<'a> AggState<'a> {
                     left,
                     right,
                     2,
-                    &self.ord_collations[..2],
+                    &self.order_collations()[..2],
                     catalog,
                     &mut cmp_err,
                 )
@@ -2078,7 +2113,7 @@ impl<'a> AggState<'a> {
                     right,
                     spec,
                     2,
-                    &self.ord_collations[..spec.len()],
+                    &self.order_collations()[..spec.len()],
                     catalog,
                     &mut cmp_err,
                 )
@@ -2394,7 +2429,7 @@ impl<'a> AggState<'a> {
                         left,
                         right,
                         argument_count,
-                        &self.ord_collations[..argument_count],
+                        &self.order_collations()[..argument_count],
                         catalog,
                         &mut comparison_error,
                     )
@@ -2407,7 +2442,7 @@ impl<'a> AggState<'a> {
                         right,
                         self.ord_spec,
                         offset,
-                        &self.ord_collations[offset..offset + self.ord_spec.len()],
+                        &self.order_collations()[offset..offset + self.ord_spec.len()],
                         catalog,
                         &mut comparison_error,
                     )
@@ -2426,7 +2461,7 @@ impl<'a> AggState<'a> {
                         prior,
                         row,
                         argument_count,
-                        &self.ord_collations[..argument_count],
+                        &self.order_collations()[..argument_count],
                         catalog,
                         &mut comparison_error,
                     )
@@ -2604,7 +2639,7 @@ impl<'a> AggState<'a> {
                     right,
                     spec,
                     1,
-                    &self.ord_collations[..spec.len()],
+                    &self.order_collations()[..spec.len()],
                     catalog,
                     &mut cmp_err,
                 )

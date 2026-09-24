@@ -685,9 +685,9 @@ fn parse_environment_nonzero_u64(
 
 #[test]
 fn storage_vopr() {
-    const VOPR_STACK_BYTES: usize = 16 << 20;
+    const VOPR_STACK_BYTES: usize = crate::sql::exec::QUERY_STACK_BYTES;
     let result = std::thread::Builder::new()
-        .name("storage-vopr-16-mib".to_string())
+        .name("storage-vopr-fixed-stack".to_string())
         // The recovery path carries the complete bounded engine and catalog
         // frames. Keep the same explicit envelope on the coordinator and its
         // workers instead of depending on platform thread defaults.

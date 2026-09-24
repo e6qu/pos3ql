@@ -62,8 +62,7 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- 64 Bind and SQL `PREPARE` parameters against the PostgreSQL wire count of
-  65,535; 64 `GROUP BY` terms and 256 grouping sets;
+- 64 `GROUP BY` terms and 256 grouping sets;
 - 128 result columns; 64 joined relations and 64 `USING` columns;
 - durable 64-item definition shapes, including constraints, enum labels, and
   policy roles; and
@@ -74,6 +73,15 @@ The independent 64-column routine result boundary remains part of the general
 row-width limit above. Execution, `pg_proc`, WAL, checkpoints, fixed-memory
 operation, object-cold recovery, exact over-limit rejection, and PostgreSQL 18
 differential behavior are qualified at the accepted boundaries.
+
+Wire Parse/Bind and SQL `PREPARE`/`EXECUTE` now match PostgreSQL's unsigned
+16-bit, 65,535-parameter count. Prepared metadata and portal values use their
+existing startup byte reservations, while decoded values and inferred OIDs use
+statement memory; configured byte or arena exhaustion is SQLSTATE `54000`.
+The maximum count, explicit Parse OIDs, Statement Describe, per-parameter Bind
+formats, execution, `pg_prepared_statements`, allocation-free serving, exact
+over-limit SQL rejection, and PostgreSQL 18.6 differential behavior are
+qualified.
 
 JSON container, path, result, rendered-text, and JSON_TABLE row widths are
 complete up to statement memory. XMLTABLE row width also follows statement

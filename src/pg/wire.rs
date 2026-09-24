@@ -92,6 +92,10 @@ impl<'a> MsgOut<'a> {
         self.bytes(&v.to_be_bytes())
     }
 
+    pub fn u16(&mut self, v: u16) -> &mut Self {
+        self.bytes(&v.to_be_bytes())
+    }
+
     pub fn i32(&mut self, v: i32) -> &mut Self {
         self.bytes(&v.to_be_bytes())
     }
@@ -156,6 +160,13 @@ impl<'a> MsgIn<'a> {
     pub fn i16(&mut self) -> Result<i16, Malformed> {
         let b = self.take(2)?;
         Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+
+    /// Reads a protocol count. PostgreSQL's two-byte count fields use the
+    /// complete unsigned range even though scalar Int16 values are signed.
+    pub fn u16(&mut self) -> Result<u16, Malformed> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
     pub fn i32(&mut self) -> Result<i32, Malformed> {

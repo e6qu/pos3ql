@@ -20134,7 +20134,8 @@ fn resolve_plpgsql_dynamic_prepared<'a>(
             name
         )
     })?;
-    let declared = sqlprep.get_types(name).unwrap_or(&[]);
+    let declared =
+        crate::sql::prep::decode_types(sqlprep.get_type_codes(name).unwrap_or(&[]), context.arena)?;
     let declared_count = declared.len();
     if declared_count != 0 && values.len() != declared_count {
         return Err(sql_err!(

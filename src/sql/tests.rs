@@ -7187,12 +7187,15 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
         } else if sql.starts_with("CREATE OPERATOR custom_ops.+") {
             let arena = Arena::new(&mut budget, "operator parameter inference", 1 << 16).unwrap();
             let transaction = TxnState::new(&mut budget, 32).unwrap();
-            let inferred = engine.infer_param_types(
-                "SELECT $1 OPERATOR(custom_ops.+) $2",
-                &arena,
-                &transaction,
-                &[0; MAX_BIND_PARAMS],
-            );
+            let inferred = engine
+                .infer_param_types(
+                    "SELECT $1 OPERATOR(custom_ops.+) $2",
+                    &arena,
+                    &transaction,
+                    2,
+                    &[],
+                )
+                .unwrap();
             assert_eq!(
                 inferred[..2],
                 [crate::sql::types::oid::INT4, crate::sql::types::oid::INT4]
@@ -17526,49 +17529,55 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
 
     let arena = Arena::new(&mut budget, "parameter inference", 1 << 18).unwrap();
     let transaction = TxnState::new(&mut budget, 64).unwrap();
-    let inferred = engine.infer_param_types(
-        "INSERT INTO protocol_types (state, count) VALUES ($1, $2)",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+    let inferred = engine
+        .infer_param_types(
+            "INSERT INTO protocol_types (state, count) VALUES ($1, $2)",
+            &arena,
+            &transaction,
+            2,
+            &[],
+        )
+        .unwrap();
     assert_eq!(inferred[..2], [enum_oid, domain_oid]);
-    let inferred = engine.infer_param_types(
-        "UPDATE protocol_types SET count = $1 WHERE state = $2",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+    let inferred = engine
+        .infer_param_types(
+            "UPDATE protocol_types SET count = $1 WHERE state = $2",
+            &arena,
+            &transaction,
+            2,
+            &[],
+        )
+        .unwrap();
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
-    let inferred = engine.infer_param_types(
-        "SELECT p.state, count(*) FROM protocol_types p \
+    let inferred = engine
+        .infer_param_types(
+            "SELECT p.state, count(*) FROM protocol_types p \
          JOIN protocol_types q ON p.count = q.count \
          WHERE p.state = $2 GROUP BY p.state HAVING count(*) >= $1",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+            &arena,
+            &transaction,
+            2,
+            &[],
+        )
+        .unwrap();
     assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
-    let inferred = engine.infer_param_types(
-        "SELECT protocol_increment($1)",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+    let inferred = engine
+        .infer_param_types(
+            "SELECT protocol_increment($1)",
+            &arena,
+            &transaction,
+            1,
+            &[],
+        )
+        .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
-    let inferred = engine.infer_param_types(
-        "CALL protocol_record($1)",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+    let inferred = engine
+        .infer_param_types("CALL protocol_record($1)", &arena, &transaction, 1, &[])
+        .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::INT4);
-    let inferred = engine.infer_param_types(
-        "CALL protocol_output($1, $2)",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+    let inferred = engine
+        .infer_param_types("CALL protocol_output($1, $2)", &arena, &transaction, 2, &[])
+        .unwrap();
     assert_eq!(
         inferred[..2],
         [crate::sql::types::oid::INT4, crate::sql::types::oid::INT4]
@@ -17833,12 +17842,9 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
     let mut transaction = TxnState::new(&mut budget, 64).unwrap();
     let arena = Arena::new(&mut budget, "binary parameter", 1 << 18).unwrap();
 
-    let inferred = engine.infer_param_types(
-        "SELECT $1::record",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+    let inferred = engine
+        .infer_param_types("SELECT $1::record", &arena, &transaction, 1, &[])
+        .unwrap();
     assert_eq!(inferred[0], crate::sql::types::oid::RECORD);
 
     assert_eq!(
@@ -42460,12 +42466,15 @@ fn postgresql18_uuid_functions_catalogs_and_input_boundary() {
 
     let arena = Arena::new(&mut budget, "UUID parameter inference", 1 << 15).unwrap();
     let transaction = TxnState::new(&mut budget, 64).unwrap();
-    let inferred = engine.infer_param_types(
-        "SELECT uuid_extract_version($1), uuidv7(shift => $2)",
-        &arena,
-        &transaction,
-        &[0; MAX_BIND_PARAMS],
-    );
+    let inferred = engine
+        .infer_param_types(
+            "SELECT uuid_extract_version($1), uuidv7(shift => $2)",
+            &arena,
+            &transaction,
+            2,
+            &[],
+        )
+        .unwrap();
     assert_eq!(
         inferred[..2],
         [

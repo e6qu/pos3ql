@@ -72,7 +72,6 @@ use crate::stack_format;
 use crate::storage::{ColumnMeta, RowHome, RowLoc, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
-use crate::pg::conn::MAX_BIND_PARAMS;
 use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
 use eval::{
     EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SequenceAccess, SqlError, SqlState, eval, sqlstate,
@@ -7934,7 +7933,10 @@ impl Engine {
                 ),
             }));
         }
-        let mut types = [ColType::Bool; prep::MAX_PREP_PARAMS];
+        let types = match arena.alloc_slice_with(param_types.len(), |_| ColType::Bool) {
+            Ok(types) => types,
+            Err(_) => return Ok(Err(eval::arena_full())),
+        };
         for (index, type_name) in param_types.iter().enumerate() {
             let Some(ctype) = ColType::from_sql_name(type_name) else {
                 return Ok(Err(SqlError {
@@ -8015,12 +8017,7 @@ impl Engine {
         for (target, column) in result_types.iter_mut().zip(&result_columns[..result_count]) {
             *target = column.type_oid;
         }
-        match sqlprep.store(
-            name,
-            sql,
-            &types[..param_types.len()],
-            &result_types[..result_count],
-        ) {
+        match sqlprep.store(name, sql, types, &result_types[..result_count]) {
             Ok(()) => {
                 responder.command_complete("PREPARE")?;
                 Ok(Ok(()))
@@ -9101,29 +9098,33 @@ impl Engine {
     /// A parameter whose type cannot be determined defaults to `text`, and a
     /// client-supplied non-zero OID (from Parse) always wins. Returns the OIDs
     /// for `$1..$n_params`.
-    pub fn infer_param_types(
+    pub fn infer_param_types<'a>(
         &self,
         text: &str,
-        arena: &Arena,
+        arena: &'a Arena,
         txn: &TxnState,
-        client_oids: &[i32],
-    ) -> [i32; MAX_BIND_PARAMS] {
-        let mut oids = [types::oid::TEXT; MAX_BIND_PARAMS];
+        parameter_count: usize,
+        client_oid_bytes: &[u8],
+    ) -> Result<&'a mut [i32], SqlError> {
+        let oids = arena
+            .alloc_slice_with(parameter_count, |_| types::oid::TEXT)
+            .map_err(|_| eval::arena_full())?;
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
-            Err(_) => return oids,
+            Err(_) => return Ok(oids),
         };
         if let Ok(Some(statement)) = parser.next_stmt() {
-            self.infer_stmt_params(&statement, txn.txid, &mut oids);
-            self.infer_resolved_stmt_params(&statement, txn.txid, arena, &mut oids);
+            self.infer_stmt_params(&statement, txn.txid, oids);
+            self.infer_resolved_stmt_params(&statement, txn.txid, arena, oids);
         }
         // A client's explicit (non-zero) parameter type overrides inference.
-        for (i, &c) in client_oids.iter().enumerate().take(MAX_BIND_PARAMS) {
+        for (i, bytes) in client_oid_bytes.as_chunks::<4>().0.iter().enumerate() {
+            let c = i32::from_be_bytes(*bytes);
             if c != 0 {
                 oids[i] = c;
             }
         }
-        oids
+        Ok(oids)
     }
 
     fn infer_resolved_stmt_params<'a>(
@@ -9131,7 +9132,7 @@ impl Engine {
         statement: &'a Stmt<'a>,
         txid: u32,
         arena: &'a Arena,
-        oids: &mut [i32; MAX_BIND_PARAMS],
+        oids: &mut [i32],
     ) {
         match statement {
             Stmt::Select(select) => self.infer_resolved_select_params(select, txid, arena, oids),
@@ -9187,7 +9188,7 @@ impl Engine {
                         if let Expr::Param(index) = argument
                             && expected_oid != types::oid::UNKNOWN
                             && *index >= 1
-                            && (*index as usize) <= MAX_BIND_PARAMS
+                            && (*index as usize) <= oids.len()
                         {
                             oids[*index as usize - 1] = expected_oid;
                         }
@@ -9206,7 +9207,7 @@ impl Engine {
         tree: &'a ast::SetTree<'a>,
         txid: u32,
         arena: &'a Arena,
-        oids: &mut [i32; MAX_BIND_PARAMS],
+        oids: &mut [i32],
     ) {
         match tree {
             ast::SetTree::Select(select) => {
@@ -9224,7 +9225,7 @@ impl Engine {
         select: &'a ast::Select<'a>,
         txid: u32,
         arena: &'a Arena,
-        oids: &mut [i32; MAX_BIND_PARAMS],
+        oids: &mut [i32],
     ) {
         if let Some(tree) = select.set_body {
             self.infer_resolved_set_tree_params(tree, txid, arena, oids);
@@ -9294,13 +9295,13 @@ impl Engine {
         expression: &'a Expr<'a>,
         txid: u32,
         arena: &'a Arena,
-        oids: &mut [i32; MAX_BIND_PARAMS],
+        oids: &mut [i32],
         infer: &impl Fn(&Expr<'a>) -> Option<i32>,
     ) {
-        let assign = |expression: &Expr, type_oid: i32, oids: &mut [i32; MAX_BIND_PARAMS]| {
+        let assign = |expression: &Expr, type_oid: i32, oids: &mut [i32]| {
             if let Expr::Param(index) = expression
                 && *index >= 1
-                && (*index as usize) <= MAX_BIND_PARAMS
+                && (*index as usize) <= oids.len()
             {
                 oids[*index as usize - 1] = type_oid;
             }
@@ -9455,11 +9456,11 @@ impl Engine {
         )
     }
 
-    fn infer_stmt_params(&self, statement: &Stmt, txid: u32, oids: &mut [i32; MAX_BIND_PARAMS]) {
-        let set = |oids: &mut [i32; MAX_BIND_PARAMS], e: &Expr, ty: i32| {
+    fn infer_stmt_params(&self, statement: &Stmt, txid: u32, oids: &mut [i32]) {
+        let set = |oids: &mut [i32], e: &Expr, ty: i32| {
             if let Expr::Param(n) = e
                 && *n >= 1
-                && (*n as usize) <= MAX_BIND_PARAMS
+                && (*n as usize) <= oids.len()
             {
                 oids[*n as usize - 1] = ty;
             }
@@ -9570,12 +9571,7 @@ impl Engine {
         }
     }
 
-    fn infer_select_source_params(
-        &self,
-        select: &ast::Select<'_>,
-        txid: u32,
-        oids: &mut [i32; MAX_BIND_PARAMS],
-    ) {
+    fn infer_select_source_params(&self, select: &ast::Select<'_>, txid: u32, oids: &mut [i32]) {
         if let Some(from) = select.from {
             Self::infer_from_source_params(&from, oids);
         }
@@ -9590,19 +9586,19 @@ impl Engine {
         }
     }
 
-    fn infer_from_source_params(from: &ast::FromClause<'_>, oids: &mut [i32; MAX_BIND_PARAMS]) {
+    fn infer_from_source_params(from: &ast::FromClause<'_>, oids: &mut [i32]) {
         Self::infer_table_sample_params(&from.base, oids);
         for join in from.joins {
             Self::infer_table_sample_params(&join.table, oids);
         }
     }
 
-    fn infer_table_sample_params(table: &ast::TableRef<'_>, oids: &mut [i32; MAX_BIND_PARAMS]) {
+    fn infer_table_sample_params(table: &ast::TableRef<'_>, oids: &mut [i32]) {
         let Some(sample) = table.sample else { return };
-        let assign = |expression: &Expr, oid: i32, oids: &mut [i32; MAX_BIND_PARAMS]| {
+        let assign = |expression: &Expr, oid: i32, oids: &mut [i32]| {
             if let Expr::Param(parameter) = expression
                 && *parameter >= 1
-                && (*parameter as usize) <= MAX_BIND_PARAMS
+                && (*parameter as usize) <= oids.len()
             {
                 oids[*parameter as usize - 1] = oid;
             }
@@ -9613,12 +9609,7 @@ impl Engine {
         }
     }
 
-    fn infer_set_tree_source_params(
-        &self,
-        tree: &ast::SetTree<'_>,
-        txid: u32,
-        oids: &mut [i32; MAX_BIND_PARAMS],
-    ) {
+    fn infer_set_tree_source_params(&self, tree: &ast::SetTree<'_>, txid: u32, oids: &mut [i32]) {
         match tree {
             ast::SetTree::Select(select) => self.infer_select_source_params(select, txid, oids),
             ast::SetTree::Op { left, right, .. } => {
@@ -9631,14 +9622,14 @@ impl Engine {
     /// Types a parameter written as `$n::type` (possibly through further casts)
     /// by the innermost cast wrapping it, as PostgreSQL resolves an otherwise-
     /// unknown parameter from the cast.
-    fn infer_cast_param(expr: &Expr, oids: &mut [i32; MAX_BIND_PARAMS]) {
+    fn infer_cast_param(expr: &Expr, oids: &mut [i32]) {
         if let Expr::Cast {
             operand, type_name, ..
         } = expr
         {
             if let Expr::Param(n) = operand {
                 if *n >= 1
-                    && (*n as usize) <= MAX_BIND_PARAMS
+                    && (*n as usize) <= oids.len()
                     && let Some(ct) = types::ColType::from_sql_name(type_name)
                 {
                     oids[*n as usize - 1] = ct.oid();
@@ -9656,7 +9647,7 @@ impl Engine {
         table: &ast::QualName,
         expression: &Expr,
         txid: u32,
-        oids: &mut [i32; MAX_BIND_PARAMS],
+        oids: &mut [i32],
     ) {
         use ast::BinaryOp::*;
         if let Expr::Binary {
@@ -9674,7 +9665,7 @@ impl Engine {
                     let mut pair = |c: &Expr, p: &Expr| {
                         if let (Expr::Column { name, .. }, Expr::Param(n)) = (c, p)
                             && *n >= 1
-                            && (*n as usize) <= MAX_BIND_PARAMS
+                            && (*n as usize) <= oids.len()
                             && let Some(ty) = self.parameter_type_oid(table, name, txid)
                         {
                             oids[*n as usize - 1] = ty;
@@ -13363,7 +13354,7 @@ impl Engine {
             sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
             message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
         })?;
-        let declared = sqlprep.get_types(name).map_or(0, |types| types.len());
+        let declared = sqlprep.get_type_codes(name).map_or(0, <[u8]>::len);
         if declared != 0 && argument_count != declared {
             return Err(SqlError {
                 sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
@@ -13417,10 +13408,11 @@ impl Engine {
         sqlprep: &SqlPreparedPool,
         arena: &'a Arena,
     ) -> Result<&'a [Datum<'a>], SqlError> {
-        let declared = sqlprep.get_types(name).ok_or_else(|| SqlError {
+        let declared_codes = sqlprep.get_type_codes(name).ok_or_else(|| SqlError {
             sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
             message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
         })?;
+        let declared = prep::decode_types(declared_codes, arena)?;
         if !declared.is_empty() && arguments.len() != declared.len() {
             return Err(SqlError {
                 sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
@@ -16111,10 +16103,10 @@ impl Engine {
                 };
                 // Snapshot the declared parameter types into the arena before
                 // releasing the pool borrow.
-                let decl: &[ColType] = match sqlprep.get_types(name) {
-                    Some(ts) => match arena.alloc_slice_copy(ts) {
-                        Ok(copy) => copy,
-                        Err(_) => return Ok(Err(eval::arena_full())),
+                let decl: &[ColType] = match sqlprep.get_type_codes(name) {
+                    Some(codes) => match prep::decode_types(codes, arena) {
+                        Ok(types) => types,
+                        Err(error) => return Ok(Err(error)),
                     },
                     None => &[],
                 };

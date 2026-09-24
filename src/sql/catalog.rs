@@ -27759,8 +27759,24 @@ fn pg_prepared_statements<'a>(
                 if found_error.is_some() {
                     return;
                 }
-                let mut parameters = [Datum::Null; crate::sql::prep::MAX_PREP_PARAMS];
-                for (target, ctype) in parameters.iter_mut().zip(prepared.parameter_types) {
+                let parameters = match arena
+                    .alloc_slice_with(prepared.parameter_type_codes.len(), |_| Datum::Null)
+                {
+                    Ok(parameters) => parameters,
+                    Err(_) => {
+                        found_error = Some(arena_full());
+                        return;
+                    }
+                };
+                let parameter_types =
+                    match crate::sql::prep::decode_types(prepared.parameter_type_codes, arena) {
+                        Ok(types) => types,
+                        Err(error) => {
+                            found_error = Some(error);
+                            return;
+                        }
+                    };
+                for (target, ctype) in parameters.iter_mut().zip(parameter_types) {
                     let oid = ctype.oid();
                     let Some(name) = intrinsic_type_name(oid) else {
                         found_error = Some(sql_err!(
@@ -27775,18 +27791,16 @@ fn pg_prepared_statements<'a>(
                         name,
                     };
                 }
-                let parameter_types =
-                    match super::array::build(&parameters[..prepared.parameter_types.len()], arena)
-                    {
-                        Ok(raw) => Datum::Array {
-                            element: super::types::ArrElem::Regtype,
-                            raw,
-                        },
-                        Err(error) => {
-                            found_error = Some(error);
-                            return;
-                        }
-                    };
+                let parameter_types = match super::array::build(parameters, arena) {
+                    Ok(raw) => Datum::Array {
+                        element: super::types::ArrElem::Regtype,
+                        raw,
+                    },
+                    Err(error) => {
+                        found_error = Some(error);
+                        return;
+                    }
+                };
                 let mut results = [Datum::Null; super::exec::MAX_PROJ];
                 for (target, oid) in results.iter_mut().zip(prepared.result_types) {
                     let name = intrinsic_type_name(*oid).or_else(|| {

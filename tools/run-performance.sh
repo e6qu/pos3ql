@@ -171,8 +171,10 @@ else
   OBJECT_STORE_BACKING="ephemeral Docker container storage on the benchmark host"
   if [ "$OBJECT_STORE" = minio ]; then
     OBJECT_STORE_IMPLEMENTATION=MinIO
-    OBJECT_STORE_IMAGE=${POS3QL_BENCH_MINIO_IMAGE:-quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e}
-    docker run -d --name "$OBJECT_STORE_CONTAINER" -p "$S3_PORT:9000" \
+    # MinIO RELEASE.2025-10-15T17-29-55Z, rebuilt by alpine-docker/minio
+    # revision 951e146 and pinned to its verified multi-platform digest.
+    OBJECT_STORE_IMAGE=${POS3QL_BENCH_MINIO_IMAGE:-alpine/minio@sha256:cf23643a6cf9ce159c57643ceb88279e431262282428c9e0bf3a7ef1a97e84b4}
+    docker run -d --name "$OBJECT_STORE_CONTAINER" --user 0:0 -p "$S3_PORT:9000" \
       -e MINIO_ROOT_USER="$OBJECT_STORE_ACCESS_KEY" \
       -e MINIO_ROOT_PASSWORD="$OBJECT_STORE_SECRET_KEY" \
       "$OBJECT_STORE_IMAGE" server /data >/dev/null
@@ -225,9 +227,10 @@ if [ -n "$METRICS" ]; then
     sleep 0.05
   done
 elif [ "$OBJECT_STORE" = minio ]; then
-  docker exec "$OBJECT_STORE_CONTAINER" mc alias set local \
-    http://127.0.0.1:9000 "$OBJECT_STORE_ACCESS_KEY" "$OBJECT_STORE_SECRET_KEY" >/dev/null
-  docker exec "$OBJECT_STORE_CONTAINER" mc mb local/"$OBJECT_STORE_BUCKET" >/dev/null
+  curl --fail --silent --show-error \
+    --aws-sigv4 "aws:amz:$OBJECT_STORE_REGION:s3" \
+    --user "$OBJECT_STORE_ACCESS_KEY:$OBJECT_STORE_SECRET_KEY" \
+    --request PUT "http://$OBJECT_STORE_ENDPOINT/$OBJECT_STORE_BUCKET" >/dev/null
 fi
 if [ -n "$OBJECT_STORE_CONTAINER" ]; then
   OBJECT_STORE_IMAGE_ID=$(docker inspect --format '{{.Image}}' "$OBJECT_STORE_CONTAINER")

@@ -3153,33 +3153,7 @@ impl<'a> Parser<'a> {
     )]
     fn from_clause(&mut self) -> Result<FromClause<'a>, ParseError> {
         let base = self.table_ref()?;
-        let dummy = Join {
-            table: TableRef {
-                schema: None,
-                table: "",
-                alias: None,
-                subquery: None,
-                func_args: None,
-                func_argument_names: &[],
-                func_variadic: false,
-                rows_from: None,
-                col_alias: None,
-                inheritance: RelationInheritance::Descendants,
-                sample: None,
-                cte: None,
-                with_ordinality: false,
-                lateral: false,
-                authorization_role: None,
-                bound_table: None,
-                view_access: None,
-            },
-            kind: JoinKind::Inner,
-            on: None,
-            using: None,
-            natural: false,
-        };
-        let mut joins = [dummy; crate::sql::query::MAX_JOIN_TABLES - 1];
-        let mut n = 0;
+        let mut joins = ArenaList::new(self.arena);
         loop {
             let natural = self.eat_ident("natural")?;
             let kind = if natural {
@@ -3227,9 +3201,6 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             };
-            if n == joins.len() {
-                return Err(self.limit("joins", joins.len()));
-            }
             let table = self.table_ref()?;
             let mut using = None;
             let on = if natural || kind == JoinKind::Cross {
@@ -3239,20 +3210,16 @@ impl<'a> Parser<'a> {
                 // against the whole left join tree) are applied at plan time,
                 // where the joined tables' columns are known.
                 self.expect_op("(")?;
-                let mut cols = [""; MAX_USING_COLUMNS];
-                let mut n_cols = 0;
+                let mut cols = ArenaList::new(self.arena);
                 loop {
-                    if n_cols == cols.len() {
-                        return Err(self.limit("USING columns", cols.len()));
-                    }
-                    cols[n_cols] = self.col_ident("column name")?;
-                    n_cols += 1;
+                    let column = self.col_ident("column name")?;
+                    self.push(&mut cols, column)?;
                     if !self.eat_op(",")? {
                         break;
                     }
                 }
                 self.expect_op(")")?;
-                let columns = self.arena_slice(&cols[..n_cols])?;
+                let columns = cols.as_slice();
                 let alias = if self.eat_ident("as")? {
                     Some(self.col_ident("join USING alias")?)
                 } else {
@@ -3264,18 +3231,20 @@ impl<'a> Parser<'a> {
                 self.expect_ident("on")?;
                 Some(self.expression(0)?)
             };
-            joins[n] = Join {
-                table,
-                kind,
-                on,
-                using,
-                natural,
-            };
-            n += 1;
+            self.push(
+                &mut joins,
+                Join {
+                    table,
+                    kind,
+                    on,
+                    using,
+                    natural,
+                },
+            )?;
         }
         Ok(FromClause {
             base,
-            joins: self.arena_slice(&joins[..n])?,
+            joins: joins.as_slice(),
         })
     }
 

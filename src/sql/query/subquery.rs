@@ -19,8 +19,8 @@ use crate::storage::Storage;
 
 use super::setops::materialize_set_body;
 use super::{
-    Chained, MAX_JOIN_TABLES, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema, arena_full,
-    cmp_key_rows, collect_aggs, collect_table_sample_expressions, collect_windows, fold_aggregates,
+    Chained, QueryScope, SUBQUERY_DEPTH, ScopeCols, ScopeSchema, arena_full, cmp_key_rows,
+    collect_aggs, collect_table_sample_expressions, collect_windows, fold_aggregates,
     fromless_aggregate_hooks, pax_column_demand, scan_source_with_pax_columns, select_into_rows,
     select_into_rows_recycling, where_passes,
 };
@@ -1394,8 +1394,15 @@ fn subquery_exists<'a>(
     }
     // The projection list of EXISTS is irrelevant (only row presence matters),
     // but its expressions may carry subqueries; prepare them for the scan.
-    let mut item_exprs: [Option<&Expr>; MAX_PROJ + 1 + 2 * MAX_JOIN_TABLES] =
-        [None; MAX_PROJ + 1 + 2 * MAX_JOIN_TABLES];
+    let sample_capacity = select
+        .from
+        .as_ref()
+        .map_or(0, |from| 2 * (from.joins.len() + 1));
+    let item_exprs = arena
+        .alloc_slice_with(select.items.len() + 1 + sample_capacity, |_| {
+            Option::<&'a Expr<'a>>::None
+        })
+        .map_err(|_| arena_full())?;
     let mut n_items = 0;
     for item in select.items {
         if let SelectItem::Expr { expression, .. } = item {
@@ -1403,12 +1410,12 @@ fn subquery_exists<'a>(
             n_items += 1;
         }
     }
-    item_exprs[MAX_PROJ] = select.where_clause;
+    item_exprs[n_items] = select.where_clause;
     if let Some(from) = &select.from {
-        collect_table_sample_expressions(from, &mut item_exprs[MAX_PROJ + 1..]);
+        collect_table_sample_expressions(from, &mut item_exprs[n_items + 1..]);
     }
     let inner_subs =
-        prepare_subqueries(&item_exprs, storage, txid, arena, params, depth - 1, outer)?;
+        prepare_subqueries(item_exprs, storage, txid, arena, params, depth - 1, outer)?;
     let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         group: None,
@@ -2638,14 +2645,20 @@ fn run_subquery<'a>(
     }
 
     // Inner subqueries first.
-    let mut inner_expressions = [None; 2 + 2 * MAX_JOIN_TABLES];
+    let sample_capacity = select
+        .from
+        .as_ref()
+        .map_or(0, |from| 2 * (from.joins.len() + 1));
+    let inner_expressions = arena
+        .alloc_slice_with(2 + sample_capacity, |_| None)
+        .map_err(|_| arena_full())?;
     inner_expressions[0] = Some(item);
     inner_expressions[1] = select.where_clause;
     if let Some(from) = &select.from {
         collect_table_sample_expressions(from, &mut inner_expressions[2..]);
     }
     let inner_subs = prepare_subqueries(
-        &inner_expressions,
+        inner_expressions,
         storage,
         txid,
         arena,

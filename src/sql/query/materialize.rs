@@ -52,7 +52,7 @@ impl<'a> ColumnLookup<'a> for EncodedRawRow<'_, '_, 'a> {
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
                 let mc = &self.scope.merged[m];
-                for &(t, c) in &mc.parts[..mc.n_parts] {
+                for &(t, c) in mc.parts {
                     let v = crate::sql::exec::decode_projected_col_record(
                         self.bytes,
                         self.raw_at + flat_of(t, c),
@@ -257,7 +257,7 @@ fn materialized_value_at<'a>(
     for table in 0..scope.n {
         let column_count = scope.defs[table].expect("resolved").n_columns;
         if raw_index < column_count {
-            let values = row.values[table].expect("bound");
+            let values = row.table_values(table).expect("bound");
             return if values.is_empty() {
                 Datum::Null
             } else {
@@ -384,11 +384,8 @@ where
 /// column at which physical source row identities begin.
 type MaterializedSelect<'a> = (&'a [&'a [u8]], usize, Option<PostponedProjection>, usize);
 
-type ExternalRowEmitter<'a> = dyn for<'row> FnMut(
-        &[Datum<'row>],
-        &[Option<u64>; super::MAX_JOIN_TABLES],
-    ) -> Result<bool, SqlError>
-    + 'a;
+type ExternalRowEmitter<'a> =
+    dyn for<'row> FnMut(&[Datum<'row>], &[Option<u64>]) -> Result<bool, SqlError> + 'a;
 
 struct MaterializationPlan<'a> {
     n_order: usize,
@@ -1227,7 +1224,7 @@ fn decode_source_rowids(
     row: &[u8],
     identities_at: usize,
     identity_count: usize,
-    output: &mut [Option<u64>; super::MAX_JOIN_TABLES],
+    output: &mut [Option<u64>],
 ) -> Result<(), SqlError> {
     output.fill(None);
     for (table, identity) in output.iter_mut().enumerate().take(identity_count) {
@@ -1256,10 +1253,14 @@ fn prelock_external_run(
     plan: &MaterializationPlan<'_>,
     limit: u64,
     offset: u64,
+    arena: &Arena,
 ) -> Result<(), SqlError> {
     let window = offset.saturating_add(limit);
     let mut logical_index = 0u64;
     let mut boundary_len = 0usize;
+    let source_rowids = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
     storage
         .with_block_store(|blocks| reader.start(blocks, run))
         .expect("spill-attached block store")?;
@@ -1311,14 +1312,13 @@ fn prelock_external_run(
                 if logical_index >= window && !in_ties {
                     false
                 } else {
-                    let mut source_rowids = [None; super::MAX_JOIN_TABLES];
                     decode_source_rowids(
                         row,
                         plan.identities_at,
                         plan.n_identities,
-                        &mut source_rowids,
+                        source_rowids,
                     )?;
-                    if !super::lock_result_row(storage, txid, statement, scope, &source_rowids)? {
+                    if !super::lock_result_row(storage, txid, statement, scope, source_rowids)? {
                         true
                     } else {
                         if statement.with_ties && limit > 0 && logical_index + 1 == window {
@@ -1375,6 +1375,9 @@ pub(crate) fn external_materialized_into<'a>(
         .alloc_slice_with(n_where_lists.max(n_row_lists), |_| {
             super::subquery::empty_subquery_list()
         })
+        .map_err(|_| arena_full())?;
+    let source_rowids = arena
+        .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
     let ordered_candidates = if !statement.distinct
         && statement.distinct_on.is_empty()
@@ -1442,7 +1445,7 @@ pub(crate) fn external_materialized_into<'a>(
                 if !super::lock_result_row(storage, txid, statement, scope, row.rowids)? {
                     return Ok(true);
                 }
-                let mut source_rowids = [None; super::MAX_JOIN_TABLES];
+                source_rowids.fill(None);
                 source_rowids[..row.rowids.len()].copy_from_slice(row.rowids);
                 for_each_materialized_projection(
                     storage,
@@ -1465,7 +1468,7 @@ pub(crate) fn external_materialized_into<'a>(
                     &mut *merge_lists,
                     &mut |_row, projected, _keys| {
                         if logical_index >= offset {
-                            keep_emitting = emit(projected, &source_rowids)?;
+                            keep_emitting = emit(projected, source_rowids)?;
                             emitted += 1;
                         }
                         logical_index += 1;
@@ -1540,7 +1543,7 @@ pub(crate) fn external_materialized_into<'a>(
                                     let column_count =
                                         scope.defs[table].expect("resolved").n_columns;
                                     if raw_index < column_count {
-                                        let values = row.values[table].expect("bound");
+                                        let values = row.table_values(table).expect("bound");
                                         return if values.is_empty() {
                                             Datum::Null
                                         } else {
@@ -1621,6 +1624,7 @@ pub(crate) fn external_materialized_into<'a>(
             &plan,
             limit,
             offset,
+            arena,
         )?;
     }
     storage
@@ -1628,7 +1632,7 @@ pub(crate) fn external_materialized_into<'a>(
         .expect("spill-attached block store")?;
     loop {
         let mut staged_len = 0usize;
-        let mut source_rowids = [None; super::MAX_JOIN_TABLES];
+        source_rowids.fill(None);
         let keep_scanning = {
             let Some(context) = reader.context() else {
                 break;
@@ -1684,9 +1688,9 @@ pub(crate) fn external_materialized_into<'a>(
                         row,
                         plan.identities_at,
                         plan.n_identities,
-                        &mut source_rowids,
+                        source_rowids,
                     )?;
-                    if !super::lock_result_row(storage, txid, statement, scope, &source_rowids)? {
+                    if !super::lock_result_row(storage, txid, statement, scope, source_rowids)? {
                         // SKIP LOCKED removes this tuple below Limit, so it
                         // consumes neither OFFSET nor LIMIT.
                         true
@@ -1744,7 +1748,7 @@ pub(crate) fn external_materialized_into<'a>(
             for (column, value) in output.iter_mut().enumerate().take(plan.width) {
                 *value = crate::sql::exec::decode_projected_col_record(encoded, column, arena)?;
             }
-            if !emit(&output[..plan.width], &source_rowids)? {
+            if !emit(&output[..plan.width], source_rowids)? {
                 return Ok(emitted);
             }
             emitted += 1;
@@ -1890,6 +1894,10 @@ pub(crate) fn materialized_select<'a>(
     }
     let mut emitted = 0u64;
     if !statement.locking.is_empty() {
+        let rowids = match arena.alloc_slice_with(scope.n, |_| None) {
+            Ok(rowids) => rowids,
+            Err(_) => return sql_fail(arena_full()),
+        };
         // Acquire the complete returned lock set before serializing the first
         // DataRow. A later conflict can therefore park and retry the statement
         // without having leaked a partial result to a flushing responder.
@@ -1922,7 +1930,7 @@ pub(crate) fn materialized_select<'a>(
                     break;
                 }
             }
-            let mut rowids = [None; super::MAX_JOIN_TABLES];
+            rowids.fill(None);
             for (table, identity) in rowids.iter_mut().enumerate().take(scope.n) {
                 *identity = match crate::sql::exec::decode_projected_pub(row, identities_at + table)
                 {
@@ -1936,7 +1944,7 @@ pub(crate) fn materialized_select<'a>(
                     }
                 };
             }
-            match super::lock_result_row(storage, txid, statement, scope, &rowids) {
+            match super::lock_result_row(storage, txid, statement, scope, rowids) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => return sql_fail(error),
@@ -1978,7 +1986,7 @@ pub(crate) fn materialized_select<'a>(
                     break;
                 }
             }
-            let mut rowids = [None; super::MAX_JOIN_TABLES];
+            rowids.fill(None);
             for (table, identity) in rowids.iter_mut().enumerate().take(scope.n) {
                 *identity = match crate::sql::exec::decode_projected_pub(row, identities_at + table)
                 {
@@ -1992,7 +2000,7 @@ pub(crate) fn materialized_select<'a>(
                     }
                 };
             }
-            let lock = match super::lock_result_row(storage, txid, statement, scope, &rowids) {
+            let lock = match super::lock_result_row(storage, txid, statement, scope, rowids) {
                 Ok(lock) => lock,
                 Err(error) => return sql_fail(error),
             };

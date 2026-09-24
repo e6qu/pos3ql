@@ -330,6 +330,15 @@ stack envelope for the statically bounded scratch. Simple, scoped, and set
 execution, Statement Describe, alternating per-column text and binary Bind
 formats, and the exact 1,665-entry rejection are qualified allocation-free and
 against PostgreSQL 18.6.
+The join-capacity audit found no external blocker. Parser, scope, executor,
+materialization, subquery, dependency, catalog, and plan state now size range
+tables and accumulated `USING` contributors from the statement arena. Compact
+64-bit PAX-demand, reorder, and parameterized-index proofs remain optional
+optimizations; wider joins execute exactly in identity order with full-row
+decoding. Allocation-forbidden and PostgreSQL 18.6 differential coverage
+qualifies 128 relations through cross and `USING` joins, plans, stored views,
+windows, materialization, subqueries, and joined DML. One explicit `USING`
+list remains coupled to the separately tracked 64-column source-row shape.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

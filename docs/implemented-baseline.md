@@ -157,6 +157,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   Bounded hash joins decode physical and self-describing derived rows at their
   respective boundaries, including external runs, empty builds, and preserved
   LEFT JOIN probes; eligible two-catalog joins no longer require quadratic scans.
+  Join range tables and accumulated `USING` contributor state use exact
+  statement-arena slices. Wider joins skip compact 64-bit access-path proofs
+  and execute exactly in identity order with full-row decoding. A 128-relation
+  PostgreSQL differential covers plans, stored views, windows, materialization,
+  subqueries, and joined DML.
   `pg_constraint` and `pg_attrdef` expose PostgreSQL 18 column order and types,
   with system `tableoid` addressable but excluded from star expansion.
   Hash-source decoding includes addressable hidden fields on both sides.

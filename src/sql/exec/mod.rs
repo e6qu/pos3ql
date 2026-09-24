@@ -17,7 +17,7 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::rowenc;
 use crate::storage::{
-    CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
+    CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, MAX_ROUTINE_OUTPUT_COLUMNS,
     PartitionBound as StoredPartitionBound, PartitionBoundValue, PartitionDef,
     PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
     RoutineArgumentDef, RoutineIdentity, RoutineParameterDef, RoutineParameterMode, RoutineSpec,
@@ -15413,7 +15413,7 @@ struct TriggerExceptionDiagnostic<'a> {
 #[derive(Clone, Copy)]
 struct PlpgsqlSetContract {
     scalar_result: Option<crate::storage::RoutineResult>,
-    columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
+    columns: [RoutineArgumentDef; MAX_ROUTINE_OUTPUT_COLUMNS],
     count: usize,
 }
 
@@ -15432,7 +15432,7 @@ impl<'a> PlpgsqlSetResult<'a> {
         let contract = match routine.kind {
             crate::storage::RoutineKind::SetFunction { result } => PlpgsqlSetContract {
                 scalar_result: Some(result),
-                columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
                 count: 0,
             },
             crate::storage::RoutineKind::RecordFunction { .. }
@@ -31798,7 +31798,7 @@ pub fn create_routine(
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let mut result_columns = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    let mut result_columns = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS];
     let mut result_column_count = 0;
     let kind = match routine.kind {
         super::ast::RoutineCreateKind::Function {
@@ -31883,7 +31883,7 @@ pub fn create_routine(
             }
         }
         super::ast::RoutineCreateKind::TableFunction { columns } => {
-            let mut output = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+            let mut output = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS];
             for (slot, column) in columns.iter().enumerate() {
                 let name = match SqlName::parse(column.name) {
                     Ok(name) => name,
@@ -33186,7 +33186,7 @@ pub fn create_aggregate(
                 parameters,
                 parameter_count: total_arguments,
                 kind,
-                result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
                 result_column_count: 0,
                 language: crate::storage::RoutineLanguage::Internal,
                 attributes: crate::storage::RoutineAttributes::AGGREGATE,
@@ -33240,7 +33240,7 @@ pub fn create_aggregate(
                 parameters,
                 parameter_count: total_arguments,
                 kind,
-                result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_OUTPUT_COLUMNS],
                 result_column_count: 0,
                 language: crate::storage::RoutineLanguage::Internal,
                 attributes: crate::storage::RoutineAttributes::AGGREGATE,

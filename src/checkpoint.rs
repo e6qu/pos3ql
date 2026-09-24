@@ -4211,7 +4211,7 @@ impl Checkpointer {
                         rows_bits: parse_estimate(words.next(), "routine rows")?,
                     };
                     let mut result_columns = [crate::storage::RoutineArgumentDef::EMPTY;
-                        crate::storage::MAX_ROUTINE_ARGUMENTS];
+                        crate::storage::MAX_ROUTINE_OUTPUT_COLUMNS];
                     let mut result_column_count = 0;
                     let kind_code = words
                         .next()
@@ -4240,7 +4240,7 @@ impl Checkpointer {
                         if matches!(code, 3 | 6 | 7) {
                             result_column_count =
                                 parse_field(words.next(), "routine result column count")?;
-                            if result_column_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                            if result_column_count > crate::storage::MAX_ROUTINE_OUTPUT_COLUMNS {
                                 return Err(CheckpointSetupError::Corrupt(
                                     "too many routine result columns",
                                 ));

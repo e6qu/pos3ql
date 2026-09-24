@@ -137,8 +137,10 @@ uses one shared cluster catalog, with no second per-table limit. The development
 configuration reserves 256 slots.
 Row-level security likewise uses an independent `max_policies` pool (default
 256), not eight slots per table. Policy plans draw from the statement arena.
-Routine parameters, output columns, configuration settings, policy role lists,
-and trigger arguments accept the durable 64-item per-definition boundary.
+Routine call signatures accept PostgreSQL's 100 input arguments. Routine output
+columns, configuration settings, policy role lists, and trigger arguments accept
+the durable 64-item per-definition boundary. Input and output metadata are stored
+independently, so `pg_proc` exposes a 100-input, 64-output routine completely.
 Trigger arguments follow PostgreSQL's zero-based `TG_ARGV` and NULL-for-none
 semantics. Exhaustion is a PostgreSQL program-limit error and
 cannot leave a partially published catalog object.

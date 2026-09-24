@@ -296,6 +296,14 @@ recovery. PostgreSQL controls receive the same setup and warm workload. The
 128-relation smoke and reduced full PostgreSQL-control qualification completed
 without errors; representative timing remains part of the external run tracked
 in PLAN.md.
+The routine-width audit found and fixed a coupled 64-column table-function
+descriptor that could panic after widening stored routine metadata. Callable
+input signatures now accept PostgreSQL's exact 100 arguments, result metadata
+retains the explicit 64-column row boundary, and the two capacities have
+distinct fixed arrays. The accepted maxima and over-limit errors are qualified
+through execution, catalog output, allocation-forbidden WAL encoding, journal
+replay, checkpoints, object-cold recovery, and PostgreSQL 18 differential
+execution.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

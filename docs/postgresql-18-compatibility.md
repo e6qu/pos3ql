@@ -119,12 +119,13 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   checkpoint catalog image has a named startup-reserved
   `checkpoint_manifest_bytes` bound and fails before publication if it is full.
   Policies use `max_policies` (default 256) without a second per-table ceiling;
-  their predicates are statement-arena bounded. Routine parameters, output
-  columns, configuration settings, trigger arguments, and policy roles accept
-  the complete 64-item per-definition boundary. This remains below PostgreSQL's
-  100-input-argument routine limit. `RETURNS TABLE` catalog argument metadata
-  includes the independently bounded input and output shapes. Trigger arguments
-  are zero-based and NULL when absent, matching PostgreSQL.
+  their predicates are statement-arena bounded. Routine call signatures match
+  PostgreSQL's 100-input-argument limit. Output columns, configuration settings,
+  trigger arguments, and policy roles accept the complete 64-item
+  per-definition boundary. `RETURNS TABLE` catalog argument metadata includes
+  the independently bounded input and output shapes, including 164 combined
+  entries at their accepted maxima. Trigger arguments are zero-based and NULL
+  when absent, matching PostgreSQL.
   Database and schema catalogs, connection counters, statistics, cloning, and
   publication membership are also startup-sized and survive object-cold
   recovery above their former 32-slot limits. Catalog builders for

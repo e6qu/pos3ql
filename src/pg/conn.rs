@@ -30,10 +30,7 @@ use super::REPORTED_SERVER_VERSION;
 use super::respond::{MAX_RESULT_COLS, Responder, ResultFmt};
 use super::wire::{self, MsgIn, WireFull};
 
-/// Most parameters one Parse/Bind may carry; parameter state is stored inline
-/// per connection slot (PostgreSQL's protocol boundary is 65,535). Kept in
-/// step with SQL PREPARE so neither protocol is a narrower gate than the
-/// other.
+/// PostgreSQL's unsigned 16-bit Parse/Bind parameter boundary.
 pub const MAX_BIND_PARAMS: usize = crate::sql::prep::MAX_PREP_PARAMS;
 
 /// Idle logical streams still need protocol traffic so a downstream can tell a
@@ -122,10 +119,22 @@ fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Resu
 struct Prepared {
     active: bool,
     name: SqlName,
-    text: FixedBuf,
+    /// Query text followed by the big-endian OIDs supplied in Parse. Both
+    /// share the slot's configured `prepared_bytes` reservation.
+    data: FixedBuf,
+    query_len: usize,
     n_params: u16,
-    /// Parameter type OIDs declared in Parse (0 = unspecified → text).
-    param_oids: [i32; MAX_BIND_PARAMS],
+}
+
+impl Prepared {
+    fn query(&self) -> &str {
+        core::str::from_utf8(&self.data.readable()[..self.query_len])
+            .expect("stored from valid UTF-8")
+    }
+
+    fn parameter_oid_bytes(&self) -> &[u8] {
+        &self.data.readable()[self.query_len..]
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,11 +148,8 @@ struct Portal {
     active: bool,
     name: SqlName,
     statement: usize,
+    /// Validated Bind format codes, lengths, and values in wire order.
     params: FixedBuf,
-    /// (offset, len) into `params`; `len == u32::MAX` marks NULL.
-    spans: [(u32, u32); MAX_BIND_PARAMS],
-    /// Per-parameter wire format: false = text, true = binary.
-    binary: [bool; MAX_BIND_PARAMS],
     n_params: u16,
     /// Per-column result format requested by Bind.
     result_formats: ResultFmt,
@@ -430,9 +436,9 @@ impl Conn {
             prepared.push(Prepared {
                 active: false,
                 name: empty,
-                text: FixedBuf::new(budget, "prepared_text", config.prepared_bytes)?,
+                data: FixedBuf::new(budget, "prepared_data", config.prepared_bytes)?,
+                query_len: 0,
                 n_params: 0,
-                param_oids: [0; MAX_BIND_PARAMS],
             });
         }
         let mut portals = Vec::with_capacity(config.max_portals);
@@ -442,8 +448,6 @@ impl Conn {
                 name: empty,
                 statement: 0,
                 params: FixedBuf::new(budget, "portal_params", config.portal_bytes)?,
-                spans: [(0, 0); MAX_BIND_PARAMS],
-                binary: [false; MAX_BIND_PARAMS],
                 n_params: 0,
                 result_formats: ResultFmt::ALL_TEXT,
                 result: FixedBuf::new(budget, "portal_result", config.portal_result_bytes)?,
@@ -2511,25 +2515,18 @@ impl Conn {
 
     fn handle_parse(&mut self, total: usize) -> Step {
         let payload = &self.recv.readable()[5..total];
-        let parse = || -> Result<(&str, &str, usize, [i32; MAX_BIND_PARAMS]), wire::Malformed> {
+        let parse = || -> Result<(&str, &str, usize, &[u8]), wire::Malformed> {
             let mut m = MsgIn::new(payload);
             let name = m.cstr()?;
             let query = m.cstr()?;
-            let n_types = usize::try_from(m.i16()?).map_err(|_| wire::Malformed)?;
-            if n_types > MAX_BIND_PARAMS {
-                return Err(wire::Malformed);
-            }
-            let mut oids = [0i32; MAX_BIND_PARAMS];
-            for slot in oids.iter_mut().take(n_types) {
-                let oid = m.i32()?;
-                *slot = oid;
-            }
+            let n_types = usize::from(m.u16()?);
+            let oid_bytes = m.take(n_types.checked_mul(4).ok_or(wire::Malformed)?)?;
             if !m.done() {
                 return Err(wire::Malformed);
             }
-            Ok((name, query, n_types, oids))
+            Ok((name, query, n_types, oid_bytes))
         };
-        let Ok((name, query, n_types, param_oids)) = parse() else {
+        let Ok((name, query, n_types, param_oid_bytes)) = parse() else {
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
@@ -2639,20 +2636,25 @@ impl Conn {
             );
         };
         let entry = &mut self.prepared[slot];
-        entry.text.clear();
-        if !entry.text.append(query.as_bytes()) {
+        entry.data.clear();
+        if query.len().saturating_add(param_oid_bytes.len()) > entry.data.capacity() {
             entry.active = false;
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
                 "54000",
-                "statement text exceeds prepared_bytes",
+                "statement text and parameter types exceed prepared_bytes",
             );
         }
+        assert!(
+            entry.data.append(query.as_bytes()),
+            "capacity checked above"
+        );
+        assert!(entry.data.append(param_oid_bytes), "capacity checked above");
         entry.active = true;
         entry.name = sql_name;
+        entry.query_len = query.len();
         entry.n_params = n_params as u16;
-        entry.param_oids = param_oids;
 
         let mut responder = Responder::new(&mut self.send);
         match responder.parse_complete() {
@@ -2666,70 +2668,39 @@ impl Conn {
             Malformed,
             UnsupportedFormat,
             TooManyResultCols,
-            TooManyParams,
         }
-        type BindParts<'a> = (
-            &'a str,
-            &'a str,
-            usize,
-            [(u32, u32); MAX_BIND_PARAMS],
-            [bool; MAX_BIND_PARAMS],
-            &'a [u8],
-            ResultFmt,
-        );
+        type BindParts<'a> = (&'a str, &'a str, usize, &'a [u8], ResultFmt);
         let payload = &self.recv.readable()[5..total];
         let parse = || -> Result<BindParts<'_>, BindProblem> {
             let mut m = MsgIn::new(payload);
             let portal = m.cstr().map_err(|_| BindProblem::Malformed)?;
             let statement = m.cstr().map_err(|_| BindProblem::Malformed)?;
-            let n_fmt = usize::try_from(m.i16().map_err(|_| BindProblem::Malformed)?)
+            let parameters_start = payload.len() - m.remaining();
+            let n_fmt = usize::from(m.u16().map_err(|_| BindProblem::Malformed)?);
+            let format_bytes = m
+                .take(n_fmt.checked_mul(2).ok_or(BindProblem::Malformed)?)
                 .map_err(|_| BindProblem::Malformed)?;
-            if n_fmt > MAX_BIND_PARAMS {
-                return Err(BindProblem::TooManyParams);
-            }
-            let mut formats = [false; MAX_BIND_PARAMS];
-            let mut uniform: Option<bool> = None;
-            for slot in formats.iter_mut().take(n_fmt) {
-                let binary = match m.i16().map_err(|_| BindProblem::Malformed)? {
-                    0 => false,
-                    1 => true,
+            for code in format_bytes.as_chunks::<2>().0 {
+                match i16::from_be_bytes(*code) {
+                    0 | 1 => {}
                     _ => return Err(BindProblem::UnsupportedFormat),
-                };
-                if n_fmt == 1 {
-                    uniform = Some(binary);
-                } else {
-                    *slot = binary;
                 }
             }
-            let n_params = usize::try_from(m.i16().map_err(|_| BindProblem::Malformed)?)
-                .map_err(|_| BindProblem::Malformed)?;
-            if n_params > MAX_BIND_PARAMS {
-                return Err(BindProblem::TooManyParams);
-            }
+            let n_params = usize::from(m.u16().map_err(|_| BindProblem::Malformed)?);
             if n_fmt != 0 && n_fmt != 1 && n_fmt != n_params {
                 return Err(BindProblem::Malformed);
             }
-            if let Some(all) = uniform {
-                formats = [all; MAX_BIND_PARAMS];
-            }
-            let values_start = payload.len() - m.remaining();
-            let mut spans = [(0u32, 0u32); MAX_BIND_PARAMS];
-            for span in spans.iter_mut().take(n_params) {
+            for _ in 0..n_params {
                 let len = m.i32().map_err(|_| BindProblem::Malformed)?;
-                if len == -1 {
-                    *span = (0, u32::MAX);
-                } else {
-                    if len < -1 {
-                        return Err(BindProblem::Malformed);
-                    }
-                    let at = payload.len() - m.remaining();
+                if len < -1 {
+                    return Err(BindProblem::Malformed);
+                }
+                if len >= 0 {
                     m.take(len as usize).map_err(|_| BindProblem::Malformed)?;
-                    *span = ((at - values_start) as u32, len as u32);
                 }
             }
-            let values = &payload[values_start..payload.len() - m.remaining()];
-            let n_rfmt = usize::try_from(m.i16().map_err(|_| BindProblem::Malformed)?)
-                .map_err(|_| BindProblem::Malformed)?;
+            let parameters_end = payload.len() - m.remaining();
+            let n_rfmt = usize::from(m.u16().map_err(|_| BindProblem::Malformed)?);
             if n_rfmt > MAX_RESULT_COLS {
                 return Err(BindProblem::TooManyResultCols);
             }
@@ -2750,53 +2721,37 @@ impl Conn {
                 portal,
                 statement,
                 n_params,
-                spans,
-                formats,
-                values,
+                &payload[parameters_start..parameters_end],
                 result_formats,
             ))
         };
-        let (portal_name, stmt_name, n_params, spans, formats, values, result_formats) =
-            match parse() {
-                Ok(x) => x,
-                Err(BindProblem::Malformed) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "malformed Bind message",
-                    );
-                }
-                Err(BindProblem::UnsupportedFormat) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        sqlstate::PROTOCOL_VIOLATION,
-                        "unsupported Bind format code",
-                    );
-                }
-                Err(BindProblem::TooManyResultCols) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many result columns requested in binary format",
-                    );
-                }
-                Err(BindProblem::TooManyParams) => {
-                    return ext_err(
-                        &mut self.send,
-                        &mut self.phase,
-                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        crate::stack_format!(
-                            96,
-                            "too many parameters (the limit is {})",
-                            MAX_BIND_PARAMS
-                        )
-                        .as_str(),
-                    );
-                }
-            };
+        let (portal_name, stmt_name, n_params, parameter_data, result_formats) = match parse() {
+            Ok(x) => x,
+            Err(BindProblem::Malformed) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "malformed Bind message",
+                );
+            }
+            Err(BindProblem::UnsupportedFormat) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "unsupported Bind format code",
+                );
+            }
+            Err(BindProblem::TooManyResultCols) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many result columns requested in binary format",
+                );
+            }
+        };
 
         let Some(stmt_slot) = self
             .prepared
@@ -2824,8 +2779,7 @@ impl Conn {
             // discard its provisional response, and retain only a valid
             // format state for execution.
             self.arena.reset();
-            let text = core::str::from_utf8(self.prepared[stmt_slot].text.readable())
-                .expect("stored from valid UTF-8");
+            let text = self.prepared[stmt_slot].query();
             let mark = self.send.mark();
             let described = {
                 let mut responder = Responder::for_describe(&mut self.send, result_formats);
@@ -2881,12 +2835,40 @@ impl Conn {
                 );
             }
         }
-        // Text-format parameters must be valid UTF-8, checked at bind time.
-        for (i, &(offset, len)) in spans.iter().take(n_params).enumerate() {
-            if !formats[i]
-                && len != u32::MAX
-                && core::str::from_utf8(&values[offset as usize..(offset + len) as usize]).is_err()
-            {
+        // PostgreSQL validates text parameters at Bind after resolving the
+        // statement. Walk the compact metadata a second time so malformed
+        // text cannot enter a portal without retaining one span per value.
+        let mut parameter_message = MsgIn::new(parameter_data);
+        let n_formats = usize::from(
+            parameter_message
+                .u16()
+                .expect("validated Bind format count"),
+        );
+        let format_bytes = parameter_message
+            .take(n_formats * 2)
+            .expect("validated Bind format codes");
+        let stored_count = usize::from(
+            parameter_message
+                .u16()
+                .expect("validated Bind parameter count"),
+        );
+        debug_assert_eq!(stored_count, n_params);
+        for index in 0..n_params {
+            let len = parameter_message
+                .i32()
+                .expect("validated Bind parameter length");
+            if len < 0 {
+                continue;
+            }
+            let value = parameter_message
+                .take(len as usize)
+                .expect("validated Bind parameter value");
+            let binary = match n_formats {
+                0 => false,
+                1 => format_bytes == [0, 1],
+                _ => format_bytes[index * 2..index * 2 + 2] == [0, 1],
+            };
+            if !binary && core::str::from_utf8(value).is_err() {
                 return ext_err(
                     &mut self.send,
                     &mut self.phase,
@@ -2895,7 +2877,6 @@ impl Conn {
                 );
             }
         }
-
         let existing = self
             .portals
             .iter()
@@ -2920,10 +2901,11 @@ impl Conn {
                 "portal name too long",
             );
         };
-        // Copy the raw parameter area; spans index into it.
+        // Retain the validated wire-order metadata and values. Execute walks
+        // this compact representation directly within `portal_bytes`.
         let portal = &mut self.portals[slot];
         portal.params.clear();
-        if !portal.params.append(values) {
+        if !portal.params.append(parameter_data) {
             return ext_err(
                 &mut self.send,
                 &mut self.phase,
@@ -2934,8 +2916,6 @@ impl Conn {
         portal.active = true;
         portal.name = sql_name;
         portal.statement = stmt_slot;
-        portal.spans = spans;
-        portal.binary = formats;
         portal.n_params = n_params as u16;
         portal.result_formats = result_formats;
         portal.result.clear();
@@ -3009,30 +2989,29 @@ impl Conn {
 
         self.arena.reset();
         let n_params = self.prepared[slot].n_params;
-        // Statement Describe: resolve each parameter's type from its use so the
-        // client encodes arguments correctly, and remember it for Bind decoding.
-        if kind == b'S' {
-            let inferred = {
-                let text = core::str::from_utf8(self.prepared[slot].text.readable())
-                    .expect("stored from valid UTF-8");
-                let client = self.prepared[slot].param_oids;
-                engine.infer_param_types(text, &self.arena, &self.txn, &client)
-            };
-            self.prepared[slot].param_oids = inferred;
-        }
-        let param_oids = self.prepared[slot].param_oids;
-        let text = core::str::from_utf8(self.prepared[slot].text.readable())
-            .expect("stored from valid UTF-8");
+        let text = self.prepared[slot].query();
+        let param_oids = match engine.infer_param_types(
+            text,
+            &self.arena,
+            &self.txn,
+            usize::from(n_params),
+            self.prepared[slot].parameter_oid_bytes(),
+        ) {
+            Ok(oids) => oids,
+            Err(error) => {
+                return ext_err(
+                    &mut self.send,
+                    &mut self.phase,
+                    error.sqlstate,
+                    error.message.as_str(),
+                );
+            }
+        };
         let mut responder = Responder::for_describe(&mut self.send, portal_formats);
-        if kind == b'S'
-            && responder
-                .parameter_description(&param_oids[..n_params as usize])
-                .is_err()
-        {
+        if kind == b'S' && responder.parameter_description(param_oids).is_err() {
             return Step::Close;
         }
-        let _parameter_types =
-            crate::sql::exec::enter_bound_parameter_types(&param_oids[..n_params as usize]);
+        let _parameter_types = crate::sql::exec::enter_bound_parameter_types(param_oids);
         match engine.describe(
             text,
             &self.arena,
@@ -3115,32 +3094,59 @@ impl Conn {
                     "prepared statement no longer exists",
                 );
             }
-            let text =
-                core::str::from_utf8(prepared.text.readable()).expect("stored from valid UTF-8");
+            let text = prepared.query();
             if engine.is_copy_statement(text, &self.arena) {
                 // COPY uses CopyData framing, not DataRow/PortalSuspended.
                 // Stream it even when Execute carries a nonzero max_rows.
                 paged = false;
                 self.arena.reset();
             }
-            let mut params = [Datum::Null; MAX_BIND_PARAMS];
+            let parameter_count = usize::from(portal.n_params);
+            let params = match self
+                .arena
+                .alloc_slice_with(parameter_count, |_| Datum::Null)
+            {
+                Ok(params) => params,
+                Err(_) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "bound parameters exceed the statement arena",
+                    );
+                }
+            };
             let raw = portal.params.readable();
             // Resolve every parameter the client left untyped (OID 0) from
             // its use in the query before decoding either wire format. Text
             // Bind values are values of the inferred type, not SQL literals.
-            let mut param_oids = prepared.param_oids;
-            let has_untyped_parameter = (0..portal.n_params as usize).any(|i| param_oids[i] == 0);
-            if has_untyped_parameter {
-                param_oids =
-                    engine.infer_param_types(text, &self.arena, &self.txn, &prepared.param_oids);
-            }
-            for (i, &(offset, len)) in portal
-                .spans
-                .iter()
-                .take(portal.n_params as usize)
-                .enumerate()
-            {
-                if len == u32::MAX {
+            let param_oids = match engine.infer_param_types(
+                text,
+                &self.arena,
+                &self.txn,
+                parameter_count,
+                prepared.parameter_oid_bytes(),
+            ) {
+                Ok(oids) => oids,
+                Err(error) => {
+                    return ext_err(
+                        &mut self.send,
+                        &mut self.phase,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            };
+            let mut message = MsgIn::new(raw);
+            let n_formats = usize::from(message.u16().expect("validated Bind format count"));
+            let format_bytes = message
+                .take(n_formats * 2)
+                .expect("validated Bind format codes");
+            let stored_count = usize::from(message.u16().expect("validated Bind parameter count"));
+            debug_assert_eq!(stored_count, parameter_count);
+            for i in 0..parameter_count {
+                let len = message.i32().expect("validated Bind parameter length");
+                if len == -1 {
                     match engine.coerce_parameter_null(param_oids[i], &self.arena, self.txn.txid) {
                         Ok(value) => params[i] = value,
                         Err(error) => {
@@ -3154,8 +3160,15 @@ impl Conn {
                     }
                     continue;
                 }
-                let bytes = &raw[offset as usize..(offset + len) as usize];
-                if portal.binary[i] {
+                let bytes = message
+                    .take(len as usize)
+                    .expect("validated Bind parameter value");
+                let binary = match n_formats {
+                    0 => false,
+                    1 => format_bytes == [0, 1],
+                    _ => format_bytes[i * 2..i * 2 + 2] == [0, 1],
+                };
+                if binary {
                     match engine.decode_binary_parameter(
                         param_oids[i],
                         bytes,
@@ -3202,8 +3215,8 @@ impl Conn {
                 engine.execute_extended(
                     text,
                     &self.arena,
-                    &params[..portal.n_params as usize],
-                    &param_oids[..portal.n_params as usize],
+                    params,
+                    param_oids,
                     &mut self.txn,
                     &mut self.sqlprep,
                     &mut self.cursors,
@@ -3217,8 +3230,8 @@ impl Conn {
                 engine.execute_extended(
                     text,
                     &self.arena,
-                    &params[..portal.n_params as usize],
-                    &param_oids[..portal.n_params as usize],
+                    params,
+                    param_oids,
                     &mut self.txn,
                     &mut self.sqlprep,
                     &mut self.cursors,
@@ -5149,6 +5162,20 @@ mod tests {
         message
     }
 
+    fn has_backend_message(mut bytes: &[u8], kind: u8) -> bool {
+        while bytes.len() >= 5 {
+            if bytes[0] == kind {
+                return true;
+            }
+            let length = i32::from_be_bytes(bytes[1..5].try_into().unwrap());
+            if length < 4 || bytes.len() < 1 + length as usize {
+                return false;
+            }
+            bytes = &bytes[1 + length as usize..];
+        }
+        false
+    }
+
     #[test]
     fn parse_bind_and_execute_share_the_complete_statement_parameter_width() {
         let directory =
@@ -5160,52 +5187,68 @@ mod tests {
         config.table_rows = 128;
         config.wal_bytes = 1 << 20;
         config.wal_buffer_bytes = 1 << 16;
+        config.conn_recv_buffer_bytes = 2 << 20;
+        config.conn_send_buffer_bytes = 1 << 20;
+        config.sql_arena_bytes = 32 << 20;
+        config.prepared_bytes = 512 << 10;
+        config.portal_bytes = 512 << 10;
         let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
 
-        let query = format!(
-            "SELECT {}",
-            (1..=MAX_BIND_PARAMS)
-                .map(|index| format!("${index}::integer"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let query = format!("SELECT ${MAX_BIND_PARAMS}::integer");
         let mut parse = Vec::new();
         parse.extend_from_slice(b"wide_statement\0");
         parse.extend_from_slice(query.as_bytes());
         parse.push(0);
-        parse.extend_from_slice(&(MAX_BIND_PARAMS as i16).to_be_bytes());
+        parse.extend_from_slice(&(MAX_BIND_PARAMS as u16).to_be_bytes());
         for _ in 0..MAX_BIND_PARAMS {
             parse.extend_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
         }
         connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
-        assert!(matches!(
-            connection.process_message(&mut engine),
-            Step::Continue
-        ));
+        let step = crate::mem::guard::forbid_alloc(|| connection.process_message(&mut engine));
+        assert!(matches!(step, Step::Continue));
         assert_eq!(
             connection.send.readable(),
             &[wire::MSG_PARSE_COMPLETE, 0, 0, 0, 4]
         );
         connection.send.clear();
 
+        let mut describe = Vec::new();
+        describe.extend_from_slice(b"Swide_statement\0");
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_DESCRIBE, &describe));
+        let step = crate::mem::guard::forbid_alloc(|| connection.process_message(&mut engine));
+        assert!(matches!(step, Step::Continue));
+        let response = connection.send.readable();
+        assert_eq!(response[0], wire::MSG_PARAMETER_DESCRIPTION);
+        assert_eq!(
+            u16::from_be_bytes(response[5..7].try_into().unwrap()) as usize,
+            MAX_BIND_PARAMS
+        );
+        connection.send.clear();
+
         let mut bind = Vec::new();
         bind.extend_from_slice(b"wide_portal\0wide_statement\0");
-        bind.extend_from_slice(&0i16.to_be_bytes());
-        bind.extend_from_slice(&(MAX_BIND_PARAMS as i16).to_be_bytes());
+        bind.extend_from_slice(&(MAX_BIND_PARAMS as u16).to_be_bytes());
+        for _ in 0..MAX_BIND_PARAMS {
+            bind.extend_from_slice(&0i16.to_be_bytes());
+        }
+        bind.extend_from_slice(&(MAX_BIND_PARAMS as u16).to_be_bytes());
         for index in 0..MAX_BIND_PARAMS {
-            let value = index.to_string();
-            bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
-            bind.extend_from_slice(value.as_bytes());
+            if index + 1 == MAX_BIND_PARAMS {
+                bind.extend_from_slice(&2i32.to_be_bytes());
+                bind.extend_from_slice(b"42");
+            } else {
+                bind.extend_from_slice(&(-1i32).to_be_bytes());
+            }
         }
         bind.extend_from_slice(&0i16.to_be_bytes());
         connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
-        assert!(matches!(
-            connection.process_message(&mut engine),
-            Step::Continue
-        ));
+        let step = crate::mem::guard::forbid_alloc(|| connection.process_message(&mut engine));
+        assert!(matches!(step, Step::Continue));
         assert_eq!(
             connection.send.readable(),
             &[wire::MSG_BIND_COMPLETE, 0, 0, 0, 4]
@@ -5218,33 +5261,21 @@ mod tests {
         connection
             .recv
             .append(&frontend(wire::FMSG_EXECUTE, &execute));
-        assert!(matches!(
-            connection.process_message(&mut engine),
-            Step::Continue
-        ));
+        let step = crate::mem::guard::forbid_alloc(|| connection.process_message(&mut engine));
+        assert!(matches!(step, Step::Continue));
         let response = connection.send.readable();
         assert_eq!(response[0], wire::MSG_DATA_ROW);
         let frame_len = i32::from_be_bytes(response[1..5].try_into().unwrap()) as usize + 1;
         let row = &response[..frame_len];
-        assert_eq!(
-            u16::from_be_bytes(row[5..7].try_into().unwrap()) as usize,
-            MAX_BIND_PARAMS
-        );
-        let mut at = 7usize;
-        for index in 0..MAX_BIND_PARAMS {
-            let len = i32::from_be_bytes(row[at..at + 4].try_into().unwrap()) as usize;
-            at += 4;
-            assert_eq!(&row[at..at + len], index.to_string().as_bytes());
-            at += len;
-        }
-        assert_eq!(at, frame_len);
+        assert_eq!(u16::from_be_bytes(row[5..7].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(row[7..11].try_into().unwrap()), 2);
+        assert_eq!(&row[11..13], b"42");
+        assert_eq!(frame_len, 13);
 
         connection.send.clear();
         connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
-        assert!(matches!(
-            connection.process_message(&mut engine),
-            Step::Continue
-        ));
+        let step = crate::mem::guard::forbid_alloc(|| connection.process_message(&mut engine));
+        assert!(matches!(step, Step::Continue));
         connection.send.clear();
 
         let mut too_wide_parse = Vec::new();
@@ -5276,30 +5307,45 @@ mod tests {
         ));
         connection.send.clear();
 
-        let mut too_many = Vec::new();
-        too_many.extend_from_slice(b"overflow_portal\0wide_statement\0");
-        too_many.extend_from_slice(&0i16.to_be_bytes());
-        too_many.extend_from_slice(&((MAX_BIND_PARAMS + 1) as i16).to_be_bytes());
-        connection
-            .recv
-            .append(&frontend(wire::FMSG_BIND, &too_many));
-        assert!(matches!(
-            connection.process_message(&mut engine),
-            Step::Continue
-        ));
+        let mut sql = String::with_capacity(MAX_BIND_PARAMS * 13);
+        sql.push_str("PREPARE sql_wide (");
+        for index in 0..MAX_BIND_PARAMS {
+            if index != 0 {
+                sql.push(',');
+            }
+            sql.push_str("integer");
+        }
+        sql.push_str(") AS SELECT $");
+        let _ = core::fmt::Write::write_fmt(&mut sql, format_args!("{MAX_BIND_PARAMS}"));
+        sql.push_str("; EXECUTE sql_wide (");
+        for index in 0..MAX_BIND_PARAMS {
+            if index != 0 {
+                sql.push(',');
+            }
+            sql.push_str(if index + 1 == MAX_BIND_PARAMS {
+                "42"
+            } else {
+                "NULL"
+            });
+        }
+        sql.push_str("); SELECT cardinality(parameter_types) FROM pg_prepared_statements WHERE name = 'sql_wide'; DEALLOCATE sql_wide");
+        let mut query_message = sql.into_bytes();
+        query_message.push(0);
         assert!(
             connection
-                .send
-                .readable()
-                .contains(&wire::MSG_ERROR_RESPONSE)
+                .recv
+                .append(&frontend(wire::FMSG_QUERY, &query_message))
         );
+        let step = crate::mem::guard::forbid_alloc(|| connection.process_message(&mut engine));
+        assert!(matches!(step, Step::Continue));
+        let response = connection.send.readable();
         assert!(
-            connection
-                .send
-                .readable()
-                .windows(5)
-                .any(|bytes| bytes == b"54000")
+            !has_backend_message(response, wire::MSG_ERROR_RESPONSE),
+            "{}",
+            String::from_utf8_lossy(response)
         );
+        assert!(response.windows(2).any(|bytes| bytes == b"42"));
+        assert!(response.windows(5).any(|bytes| bytes == b"65535"));
 
         drop(connection);
         drop(engine);

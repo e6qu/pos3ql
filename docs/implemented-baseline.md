@@ -17,7 +17,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
 - Bounded RAM and local-disk cache tiers over immutable object data.
 - PostgreSQL v3 simple and extended query flows, common drivers, COPY,
   cancellation, TLS, authentication, notifications, and logical-replication
-  mode.
+  mode. Parse/Bind and SQL `PREPARE`/`EXECUTE` accept PostgreSQL's unsigned
+  16-bit parameter count through 65,535. Compact prepared and portal metadata
+  uses configured startup byte reservations, and exact decoded values and
+  inferred OIDs use statement memory. Allocation-forbidden execution and a raw
+  PostgreSQL 18.6 differential qualify the maximum.
 - Broad PostgreSQL 18 SQL, type, procedural, catalog, dump/restore, and tooling
   compatibility. The command inventory records both executable behavior and
   deliberate typed rejection; it is not a claim that every PostgreSQL grammar

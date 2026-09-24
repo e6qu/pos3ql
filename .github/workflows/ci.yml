@@ -126,12 +126,12 @@ jobs:
           - implementation: seaweedfs
             port: 19300
             image: chrislusf/seaweedfs@sha256:08d516132314207d10c8e37cbffc1f32b147d870169688734cc61c6231625b62
-          # Image provenance: MinIO RELEASE.2025-09-07T16-13-09Z, the first
-          # release confirmed to fix the conditional-PutObject regression;
-          # the immutable image also contains `mc` for bucket creation.
+          # Image provenance: MinIO RELEASE.2025-10-15T17-29-55Z, rebuilt by
+          # alpine-docker/minio revision 951e146 and pinned to its verified
+          # multi-platform digest. The release includes the conditional-PUT fix.
           - implementation: minio
             port: 19400
-            image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+            image: alpine/minio@sha256:cf23643a6cf9ce159c57643ceb88279e431262282428c9e0bf3a7ef1a97e84b4
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -160,7 +160,7 @@ jobs:
               -e AWS_SECRET_ACCESS_KEY=pos3ql-contract-secret \
               -e S3_BUCKET=pos3ql-contract "$IMAGE" mini -dir=/data
           else
-            docker run -d --name object-store -p "$PORT:9000" \
+            docker run -d --name object-store --user 0:0 -p "$PORT:9000" \
               -e MINIO_ROOT_USER=pos3ql-contract \
               -e MINIO_ROOT_PASSWORD=pos3ql-contract-secret \
               "$IMAGE" server /data
@@ -176,9 +176,10 @@ jobs:
             sleep 0.2
           done
           if [ "$IMPLEMENTATION" = minio ]; then
-            docker exec object-store mc alias set local \
-              http://127.0.0.1:9000 pos3ql-contract pos3ql-contract-secret
-            docker exec object-store mc mb local/pos3ql-contract
+            curl --fail --silent --show-error \
+              --aws-sigv4 "aws:amz:us-east-1:s3" \
+              --user pos3ql-contract:pos3ql-contract-secret \
+              --request PUT "http://127.0.0.1:$PORT/pos3ql-contract"
           fi
 
       - name: Wait for the shared bucket contract

@@ -722,10 +722,10 @@ impl<'b> Responder<'b> {
         })
     }
 
-    /// All parameters are described as text for now.
+    /// Reports every inferred or client-specified parameter type OID.
     pub fn parameter_description(&mut self, oids: &[i32]) -> Result<(), WireFull> {
         let mut m = MsgOut::begin(self.buffer, wire::MSG_PARAMETER_DESCRIPTION);
-        m.i16(oids.len() as i16);
+        m.u16(oids.len() as u16);
         for &oid in oids {
             m.i32(oid);
         }

@@ -419,6 +419,13 @@ fi
 if want_auxiliary types; then
 printf '%s\n' '' '=== accepted-type fidelity matrix ==='
 restart_pos3ql_clean
+if python3 "$EXT/parameter_capacity_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
+     > "$WORK/parameter-capacity.out" 2>&1; then
+  ok "prepared-parameter capacity differential ($(tail -1 "$WORK/parameter-capacity.out"))"
+else
+  bad "prepared-parameter capacity differential"
+  cat "$WORK/parameter-capacity.out"
+fi
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
        --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/type-fidelity.out" 2>&1; then

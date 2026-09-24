@@ -304,6 +304,18 @@ distinct fixed arrays. The accepted maxima and over-limit errors are qualified
 through execution, catalog output, allocation-forbidden WAL encoding, journal
 replay, checkpoints, object-cold recovery, and PostgreSQL 18 differential
 execution.
+The prepared-parameter audit found no external blocker. Wire parameter counts
+now decode across the complete unsigned 16-bit range, prepared type metadata
+shares each startup-sized statement buffer, and portals retain compact Bind
+metadata instead of compiled span and format arrays. SQL PREPARE type codes use
+the same bounded storage, while inference and decoded values use exact
+statement-arena slices. Allocation-forbidden maximum-width Parse, Bind,
+Statement Describe, Execute, SQL PREPARE, catalog, and over-limit tests pass,
+and a raw PostgreSQL 18.6 differential qualifies all 65,535 parameters.
+The integration audit also corrected the connection memory plan to count both
+prepared pools, retained enough prepared slots for `pg_dump`, and replaced the
+withdrawn MinIO image with a provenance-pinned Alpine rebuild whose bucket is
+created by a signed S3 request.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

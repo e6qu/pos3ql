@@ -145,13 +145,15 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   row-locking clauses, named windows, `ALTER TABLE` actions, aggregates,
   scalar subqueries, set-operation branches, `DISTINCT ON` / `ORDER BY` /
   window partition and ordering keys, GRANT role lists, and `RETURNING` lists
-  all cross the former 64-item (and 256-row) boundaries. Arena exhaustion is
-  SQLSTATE `54000`. Remaining fixed boundaries: 64 Bind and SQL `PREPARE`
-  parameters (PostgreSQL's protocol boundary is 65,535), 64 `GROUP BY` terms
-  and 256 grouping sets (bitmask-keyed expansion), 128-column results, 256
-  rows per XMLTABLE/JSON_TABLE call, and 64 `JOIN ... USING` columns and join
-  relations. Differential and allocation-forbidden coverage crosses the former
-  boundaries and recovers the stored results with empty local caches.
+  all cross the former 64-item (and 256-row) boundaries. Wire Parse/Bind and
+  SQL `PREPARE`/`EXECUTE` accept PostgreSQL's complete 65,535 parameters;
+  prepared metadata, portal values, decoded values, and inferred OIDs remain
+  within configured startup buffers and statement memory. Arena exhaustion is
+  SQLSTATE `54000`. Remaining fixed boundaries: 64 `GROUP BY` terms and 256
+  grouping sets (bitmask-keyed expansion), 128-column results, and 64 `JOIN ...
+  USING` columns and join relations. Differential and allocation-forbidden
+  coverage crosses the former boundaries and recovers stored results with
+  empty local caches.
 - Program length does not share that 64-item arity limit. Simple-protocol
   batches, SQL-language bodies, and PL/pgSQL bodies are sized from their source
   in the fixed statement arena. PL/pgSQL locals, branches, exception handlers

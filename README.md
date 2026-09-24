@@ -267,9 +267,13 @@ staging arrays: select lists, `IN` lists, `VALUES` rows, CTEs, row-locking
 clauses, window definitions and their partition/ordering keys, `ALTER TABLE`
 actions, aggregates, scalar subqueries, set-operation branches, GRANT role
 lists, and multi-hundred-item expression lists are described, planned,
-executed, and explained at their written width. Remaining fixed statement
-boundaries are 64 Bind/SQL-`PREPARE` parameters, 64 `GROUP BY` terms with 256
-grouping sets, 128-column results, and 64 join relations and `USING` columns.
+executed, and explained at their written width. Wire Parse/Bind and SQL
+`PREPARE`/`EXECUTE` accept PostgreSQL's complete 65,535-parameter count.
+Prepared type metadata and Bind values consume the configured
+`prepared_bytes` and `portal_bytes`; decoded values and inferred types consume
+the fixed statement arena. Remaining fixed statement boundaries are 64 `GROUP
+BY` terms with 256 grouping sets, 128-column results, and 64 join relations and
+`USING` columns.
 XMLTABLE, JSON_TABLE, and publication-introspection rows use statement memory.
 `EXPLAIN` plan nodes live in the fixed statement arena rather than the worker
 stack, and arena exhaustion returns

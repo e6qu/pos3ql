@@ -45,9 +45,9 @@ pub struct Config {
     /// sort or hash aggregate that exceeds it errors (54000) rather than
     /// spilling to temporary files.
     pub work_arena_bytes: usize,
-    /// Prepared-statement slots per connection (extended protocol).
+    /// Prepared-statement slots in each connection's wire and SQL pools.
     pub max_prepared: usize,
-    /// Stored query text per prepared statement.
+    /// Stored query text and metadata per wire or SQL prepared statement.
     pub prepared_bytes: usize,
     /// Portal slots per connection.
     pub max_portals: usize,
@@ -74,7 +74,7 @@ pub struct Config {
     /// The shared registry is reserved at startup from this PostgreSQL-shaped
     /// limit; exhaustion is reported instead of allocating while serving.
     pub max_locks_per_transaction: usize,
-    /// Bound-parameter bytes per portal.
+    /// Bound-parameter format, length, and value bytes per portal.
     pub portal_bytes: usize,
     /// Buffered result bytes per portal (Execute max_rows paging).
     pub portal_result_bytes: usize,
@@ -1514,7 +1514,8 @@ impl Config {
             + self.conn_recv_buffer_bytes
             + self.conn_send_buffer_bytes
             + self.sql_arena_bytes
-            + self.max_prepared * self.prepared_bytes
+            // Wire Parse and SQL PREPARE have independent fixed slot pools.
+            + 2 * self.max_prepared * self.prepared_bytes
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
             + self.max_tables * core::mem::size_of::<crate::storage::SqlName>()
             + crate::sql::guc::SeqSession::extra_budget_bytes(self.max_sequences)
@@ -2221,7 +2222,7 @@ sql_arena_bytes = 4096
             );
         let sequence_session = crate::sql::guc::SeqSession::extra_budget_bytes(c.max_sequences);
         let per_connection =
-            830 + publication_selection + cursor_pool + transaction + sequence_session;
+            890 + publication_selection + cursor_pool + transaction + sequence_session;
         assert_eq!(plan.connections, per_connection * 10);
         assert_eq!(plan.total(), per_connection * 10 + 1000 + 2000 + 500 + 250);
     }

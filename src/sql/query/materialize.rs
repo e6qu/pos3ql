@@ -422,9 +422,8 @@ fn projected_collations<'a>(
         };
         if width + remaining > MAX_PROJ {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "select list expands past {} columns",
-                MAX_PROJ
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most 1664 entries"
             ));
         }
         match item {

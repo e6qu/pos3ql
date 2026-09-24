@@ -145,9 +145,8 @@ pub(crate) fn describe_items_with_output_aliases<'q>(
         let mut push = |desc: ColDesc<'q>| -> Result<(), SqlError> {
             if n == out.len() {
                 return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "select list expands past {} columns",
-                    out.len()
+                    sqlstate::TOO_MANY_COLUMNS,
+                    "target lists can have at most 1664 entries"
                 ));
             }
             out[n] = desc;

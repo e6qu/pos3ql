@@ -113,8 +113,12 @@ impl DmlAuthorization {
     }
 }
 
-/// Wildcard expansion can double the select list.
-pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
+/// PostgreSQL's maximum target-list and query-result width.
+pub const MAX_PROJ: usize = 1_664;
+
+/// Fixed stack reserved by every thread that may execute a query. Query
+/// scratch is statically bounded, including PostgreSQL's complete result width.
+pub const QUERY_STACK_BYTES: usize = 64 << 20;
 
 /// Fixed resources needed when logical apply invokes the ordinary trigger
 /// executor. The worker owns all three at startup, so a remote row cannot

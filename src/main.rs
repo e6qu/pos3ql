@@ -7,7 +7,7 @@ use pos3ql::server::Server;
 /// Server construction traverses fixed-capacity catalog state before runtime
 /// allocation freezes. Keep its stack an explicit startup resource instead of
 /// inheriting an OS- and build-mode-dependent main-thread limit.
-const SERVER_STARTUP_STACK_BYTES: usize = 64 << 20;
+const SERVER_STARTUP_STACK_BYTES: usize = pos3ql::sql::exec::QUERY_STACK_BYTES;
 
 fn main() -> ExitCode {
     let worker = std::thread::Builder::new()

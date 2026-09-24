@@ -7,6 +7,79 @@
 use super::*;
 
 #[test]
+fn postgresql_result_column_capacity_executes_without_allocation() {
+    let result = std::thread::Builder::new()
+        .name("result-column-capacity".into())
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+        .spawn(|| {
+            use core::fmt::Write;
+
+            let config = test_config("result-column-capacity");
+            let mut budget = Budget::new(1 << 28);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let mut query = String::from("SELECT ");
+            for index in 0..crate::sql::exec::MAX_PROJ {
+                if index != 0 {
+                    query.push(',');
+                }
+                write!(query, "{index}").unwrap();
+            }
+            let output = run_with_fixed_memory(&mut engine, &budget, &query, 4 << 20);
+            let rows = data_rows(&output);
+            assert_eq!(rows.len(), 1, "{}", String::from_utf8_lossy(&output));
+            assert_eq!(rows[0].split('|').count(), crate::sql::exec::MAX_PROJ);
+            assert!(rows[0].starts_with("0|1|2|"));
+            assert!(rows[0].ends_with("|1662|1663"));
+
+            let scoped = format!("{query} FROM (VALUES (1)) AS v(x)");
+            let output = run_with_fixed_memory(&mut engine, &budget, &scoped, 8 << 20);
+            let rows = data_rows(&output);
+            assert_eq!(rows.len(), 1, "{}", String::from_utf8_lossy(&output));
+            assert_eq!(rows[0].split('|').count(), crate::sql::exec::MAX_PROJ);
+
+            let set = format!("{query} UNION ALL {query}");
+            let output = run_with_fixed_memory(&mut engine, &budget, &set, 16 << 20);
+            let rows = data_rows(&output);
+            assert_eq!(rows.len(), 2, "{}", String::from_utf8_lossy(&output));
+            assert!(
+                rows.iter()
+                    .all(|row| row.split('|').count() == crate::sql::exec::MAX_PROJ)
+            );
+
+            let mut ordered = String::from("SELECT array_agg(x ORDER BY ");
+            for index in 0..129 {
+                if index != 0 {
+                    ordered.push(',');
+                }
+                write!(ordered, "x+{index}").unwrap();
+            }
+            ordered.push_str(") FROM (VALUES (1)) AS v(x)");
+            let output = run_with_fixed_memory(&mut engine, &budget, &ordered, 4 << 20);
+            assert_eq!(data_rows(&output), vec!["{1}"]);
+
+            write!(query, ",{}", crate::sql::exec::MAX_PROJ).unwrap();
+            let output = run_with_fixed_memory(&mut engine, &budget, &query, 4 << 20);
+            let error = String::from_utf8_lossy(&output);
+            assert!(error.contains(sqlstate::TOO_MANY_COLUMNS), "{error}");
+            assert!(
+                error.contains("target lists can have at most 1664 entries"),
+                "{error}"
+            );
+        })
+        .unwrap()
+        .join();
+    if let Err(payload) = result {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            panic!("{message}");
+        }
+        if let Some(message) = payload.downcast_ref::<String>() {
+            panic!("{message}");
+        }
+        panic!("result-column capacity thread panicked");
+    }
+}
+
+#[test]
 fn postgresql_grouping_capacities_execute_without_allocation() {
     use core::fmt::Write;
 
@@ -9634,7 +9707,13 @@ fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
 }
 
 fn test_engine() -> (Engine, Budget) {
-    test_engine_with_budget((1 << 27) + (1 << 20))
+    // The transient record-shape registry is a fixed startup resource whose
+    // capacity follows the PostgreSQL target-list boundary.
+    test_engine_with_budget(test_engine_budget_bytes((1 << 27) + (1 << 20)))
+}
+
+const fn test_engine_budget_bytes(base: usize) -> usize {
+    base + crate::sql::exec::record_shape_pool_bytes(0)
 }
 
 fn test_engine_with_budget(bytes: usize) -> (Engine, Budget) {
@@ -11739,7 +11818,7 @@ fn role_catalog_replays_from_wal() {
 fn logical_replication_slot_survives_wal_and_checkpoint_recovery() {
     let result = std::thread::Builder::new()
         .name("logical-slot-recovery".to_string())
-        .stack_size(16 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_slot_survives_wal_and_checkpoint_recovery_body)
         .expect("spawn bounded slot recovery test")
         .join();
@@ -16133,8 +16212,9 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget =
-        Budget::new((1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget = Budget::new(test_engine_budget_bytes(
+        (1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES,
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -16169,8 +16249,9 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget =
-        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut restarted_budget = Budget::new(test_engine_budget_bytes(
+        (1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES,
+    ));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
@@ -17100,8 +17181,9 @@ fn object_resident_set_records_keep_their_structural_fields() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget =
-        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget = Budget::new(test_engine_budget_bytes(
+        (1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES,
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -18849,7 +18931,7 @@ fn advisory_lock_pool_exhaustion_is_a_named_error() {
 fn logical_replication_publishes_truncate_only_with_pgoutput_v2() {
     std::thread::Builder::new()
         .name("logical-truncate-pgoutput".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_publishes_truncate_only_with_pgoutput_v2_on_sized_stack)
         .expect("logical truncate test thread starts")
         .join()
@@ -18860,7 +18942,7 @@ fn logical_replication_publishes_truncate_only_with_pgoutput_v2() {
 fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput() {
     std::thread::Builder::new()
         .name("logical-slot-acknowledgement".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_slot_acknowledgement_bookkeeping_is_not_pgoutput_on_sized_stack)
         .expect("logical slot acknowledgement test thread starts")
         .join()
@@ -18871,7 +18953,7 @@ fn logical_slot_acknowledgement_bookkeeping_is_not_pgoutput() {
 fn logical_replication_unions_multiple_publications() {
     std::thread::Builder::new()
         .name("logical-publication-union".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_unions_multiple_publications_on_sized_stack)
         .expect("logical publication union test thread starts")
         .join()
@@ -18882,7 +18964,7 @@ fn logical_replication_unions_multiple_publications() {
 fn logical_replication_publication_column_lists_project_relation_and_tuple() {
     std::thread::Builder::new()
         .name("logical-publication-column-list".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(
             logical_replication_publication_column_lists_project_relation_and_tuple_on_sized_stack,
         )
@@ -18895,7 +18977,7 @@ fn logical_replication_publication_column_lists_project_relation_and_tuple() {
 fn logical_replication_generated_column_policy_is_typed_and_applied() {
     std::thread::Builder::new()
         .name("logical-generated-columns".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_generated_column_policy_is_typed_and_applied_on_sized_stack)
         .expect("logical generated-column test thread starts")
         .join()
@@ -18906,7 +18988,7 @@ fn logical_replication_generated_column_policy_is_typed_and_applied() {
 fn logical_replication_selects_a_quoted_publication_name() {
     std::thread::Builder::new()
         .name("logical-quoted-publication".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_selects_a_quoted_publication_name_on_sized_stack)
         .expect("logical quoted publication test thread starts")
         .join()
@@ -18917,7 +18999,7 @@ fn logical_replication_selects_a_quoted_publication_name() {
 fn logical_replication_selects_schema_publications() {
     std::thread::Builder::new()
         .name("logical-schema-publication".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_selects_schema_publications_on_sized_stack)
         .expect("logical schema publication test thread starts")
         .join()
@@ -18928,7 +19010,7 @@ fn logical_replication_selects_schema_publications() {
 fn logical_replication_declares_user_types_before_relations() {
     std::thread::Builder::new()
         .name("logical-replication-types".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_declares_user_types_before_relations_on_sized_stack)
         .expect("logical replication type test thread starts")
         .join()
@@ -18939,7 +19021,7 @@ fn logical_replication_declares_user_types_before_relations() {
 fn logical_replication_omits_transactions_without_published_changes() {
     std::thread::Builder::new()
         .name("logical-publication-filter".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_omits_transactions_without_published_changes_on_sized_stack)
         .expect("logical publication filter test thread starts")
         .join()
@@ -18987,7 +19069,7 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
 fn logical_messages_are_transactional_binary_safe_and_command_ordered() {
     std::thread::Builder::new()
         .name("logical-message-ordering".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_messages_are_transactional_binary_safe_and_command_ordered_body)
         .expect("logical message test thread starts")
         .join()
@@ -19632,7 +19714,7 @@ fn logical_replication_publication_column_lists_project_relation_and_tuple_on_si
 fn logical_replication_emits_the_selected_replica_identity_tuple_kind() {
     std::thread::Builder::new()
         .name("logical-replica-identity".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(logical_replication_emits_the_selected_replica_identity_tuple_kind_on_sized_stack)
         .expect("logical replica identity test thread starts")
         .join()
@@ -22048,7 +22130,7 @@ fn information_schema_column_udt_usage_is_not_silently_capped() {
     config.max_tables = 17;
     config.max_value_indexes = 17 * 64;
     config.wal_buffer_bytes = 1 << 20;
-    let mut budget = Budget::new((1 << 28) + (2 << 20));
+    let mut budget = Budget::new(test_engine_budget_bytes((1 << 28) + (2 << 20)));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut definition = String::new();
     for table in 0..17 {
@@ -28381,7 +28463,7 @@ fn multiway_equijoin_prunes_early() {
 fn range_table_covers_wide_conformance_queries() {
     std::thread::Builder::new()
         .name("wide-range-table-regression".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(range_table_covers_wide_conformance_queries_on_sized_stack)
         .expect("wide range-table test thread starts")
         .join()
@@ -28515,7 +28597,7 @@ fn named_timezone_dst_rendering() {
 fn commit_makes_writes_visible_and_durable() {
     std::thread::Builder::new()
         .name("transaction-durability".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(commit_makes_writes_visible_and_durable_on_sized_stack)
         .expect("transaction durability test thread starts")
         .join()
@@ -41018,7 +41100,7 @@ fn vacuum_and_analyze() {
 fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics() {
     let result = std::thread::Builder::new()
         .name("analyze-wal-recovery".to_string())
-        .stack_size(16 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body)
         .expect("spawn bounded analyze recovery test")
         .join();
@@ -41466,7 +41548,7 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
 fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
     let mut config = test_config("correlated-composite-explain");
     config.wal_buffer_bytes = 1 << 20;
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -42175,7 +42257,7 @@ fn nested_loops_parameterize_plain_column_btree_probes() {
 fn parameterized_join_recycles_candidate_scratch() {
     let mut config = test_config("parameterized-join-scratch");
     config.wal_buffer_bytes = 1 << 20;
-    let mut budget = Budget::new(1 << 27);
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 27));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -51725,7 +51807,7 @@ fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
     config.object_store_bucket = format!("physical-gist-indexes-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 29);
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -51915,7 +51997,7 @@ fn gist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovery_budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
     let cold = data_rows(&run_with(
         &mut recovered,
@@ -51963,7 +52045,7 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
     config.object_store_bucket = format!("physical-knn-indexes-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 29);
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -52129,7 +52211,7 @@ fn gist_and_spgist_knn_ordering_covers_parameters_overlays_mvcc_and_cold_recover
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovery_budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
     let cold = data_rows(&run_with(
         &mut recovered,
@@ -52295,7 +52377,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
     config.object_store_bucket = format!("physical-gin-spgist-indexes-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 29);
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -52508,7 +52590,7 @@ fn gin_and_spgist_indexes_drive_predicates_catalogs_dml_and_cold_object_scans() 
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovery_budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
     let cold = data_rows(&run_with(
         &mut recovered,
@@ -54397,7 +54479,7 @@ fn brin_inclusion_indexes_execute_range_and_network_predicates() {
     config.object_store_bucket = format!("brin-inclusion-indexes-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 29);
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -54519,7 +54601,7 @@ fn brin_inclusion_indexes_execute_range_and_network_predicates() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut recovery_budget = Budget::new(1 << 29);
+    let mut recovery_budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
     let cold = data_rows(&run_with(
         &mut recovered,
@@ -54559,7 +54641,7 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     config.object_store_bucket = format!("composite-index-access-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new(1 << 29);
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
         &mut engine,
@@ -54643,7 +54725,7 @@ fn composite_index_access_is_parameterized_prefix_aware_and_durable() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut restart_budget = Budget::new(1 << 29);
+    let mut restart_budget = Budget::new(test_engine_budget_bytes(1 << 29));
     let mut restarted = Engine::new(&config, &mut restart_budget).unwrap();
     let restarted_slot = restarted
         .storage
@@ -64429,8 +64511,9 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     config.value_index_rows = 1;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget =
-        Budget::new((1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget = Budget::new(test_engine_budget_bytes(
+        (1 << 29) + (96 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES,
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let mut writer = TxnState::new(&mut budget, 256).unwrap();
     let mut reader = TxnState::new(&mut budget, 256).unwrap();
@@ -64543,8 +64626,9 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     drop(engine);
 
     std::fs::remove_dir_all(&config.data_dir).unwrap();
-    let mut restarted_budget =
-        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut restarted_budget = Budget::new(test_engine_budget_bytes(
+        (1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES,
+    ));
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let restarted_slot = restarted
         .storage
@@ -67511,7 +67595,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
 fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
     std::thread::Builder::new()
         .name("cold-pax-regression".into())
-        .stack_size(8 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack)
         .expect("cold PAX test thread starts")
         .join()
@@ -68284,7 +68368,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
 fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive() {
     let result = std::thread::Builder::new()
         .name("failed-wal-upload-recovery".to_string())
-        .stack_size(16 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body)
         .expect("spawn bounded upload recovery test")
         .join();
@@ -68382,7 +68466,7 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
 fn cold_start_then_commit_then_crash_recovers_every_record() {
     let result = std::thread::Builder::new()
         .name("cold-wal-recovery".to_string())
-        .stack_size(16 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(cold_start_then_commit_then_crash_recovers_every_record_body)
         .expect("spawn bounded cold recovery test")
         .join();
@@ -68482,8 +68566,9 @@ fn external_set_multisets_use_the_provider_neutral_block_store() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget =
-        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget = Budget::new(test_engine_budget_bytes(
+        (1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES,
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,
@@ -68713,7 +68798,7 @@ fn external_windows_spill_through_the_provider_neutral_block_store() {
 fn transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery() {
     let result = std::thread::Builder::new()
         .name("transaction-wal-cold-recovery".to_string())
-        .stack_size(16 << 20)
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
         .spawn(transaction_wal_isolated_across_checkpoint_interleaving_and_cold_recovery_body)
         .expect("spawn bounded transaction recovery test")
         .join();
@@ -72302,8 +72387,9 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
     config.block_cache_bytes = crate::store::BLOCK_SIZE;
     config.disk_cache_bytes = crate::store::BLOCK_SIZE;
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget =
-        Budget::new((1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES);
+    let mut budget = Budget::new(test_engine_budget_bytes(
+        (1 << 28) + (2 << 20) + crate::checkpoint::MERGE_SOURCE_SCRATCH_BYTES,
+    ));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(
         &mut engine,

@@ -246,6 +246,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   exhaustion during parse is SQLSTATE `54000`, not a syntax error. PostgreSQL
   18 differential and allocation-forbidden regressions cross the former
   boundaries and recover stored results with empty local caches.
+- Query results accept PostgreSQL 18's complete 1,664-column target-list
+  width. Simple, scoped, and set-operation execution, Statement Describe,
+  per-column text and binary Bind formats, and the exact over-limit error are
+  covered allocation-free and against PostgreSQL 18. Query execution threads
+  reserve the same fixed 64 MiB stack envelope as the server.
 - JSON values and paths use statement memory for container members, result
   items, accessor chains, subscripts, and rendered text. Parser and executor
   stages report named exhaustion instead of imposing the former 1,024-item,

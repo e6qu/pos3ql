@@ -4952,8 +4952,8 @@ pub(crate) fn describe_cursor_select<'a>(
         };
         if count == out.len() {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "select list too wide"
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most 1664 entries"
             ));
         }
         let name = alias.unwrap_or(super::exec::derived_name(expression));
@@ -7584,9 +7584,8 @@ fn project_row_skipping<'a>(
             // A postponed item occupies one slot (wildcards are never skipped).
             if n == MAX_PROJ {
                 return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "select list expands past {} columns",
-                    MAX_PROJ
+                    sqlstate::TOO_MANY_COLUMNS,
+                    "target lists can have at most 1664 entries"
                 ));
             }
             out[n] = Datum::Null;
@@ -7623,9 +7622,8 @@ fn project_row_skipping<'a>(
                 for index in 0..scope.qualified_star_columns(q)? {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "select list expands past {} columns",
-                            MAX_PROJ
+                            sqlstate::TOO_MANY_COLUMNS,
+                            "target lists can have at most 1664 entries"
                         ));
                     }
                     out[n] = value_of(scope.qualified_star_entry(q, index)?);
@@ -7644,9 +7642,8 @@ fn project_row_skipping<'a>(
                 for k in 0..scope.star_columns() {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "select list expands past {} columns",
-                            MAX_PROJ
+                            sqlstate::TOO_MANY_COLUMNS,
+                            "target lists can have at most 1664 entries"
                         ));
                     }
                     out[n] = match scope.star_entry(k) {
@@ -7668,9 +7665,8 @@ fn project_row_skipping<'a>(
                 for field in super::eval::record_star_expand(base, arena, params, row, hooks)? {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "select list expands past {} columns",
-                            MAX_PROJ
+                            sqlstate::TOO_MANY_COLUMNS,
+                            "target lists can have at most 1664 entries"
                         ));
                     }
                     out[n] = field.value;
@@ -7680,9 +7676,8 @@ fn project_row_skipping<'a>(
             SelectItem::Expr { expression, .. } => {
                 if n == MAX_PROJ {
                     return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "select list expands past {} columns",
-                        MAX_PROJ
+                        sqlstate::TOO_MANY_COLUMNS,
+                        "target lists can have at most 1664 entries"
                     ));
                 }
                 out[n] = eval_full(expression, arena, params, &chained, hooks)?;
@@ -7737,8 +7732,8 @@ pub fn describe_scope_items<'q>(
                 for index in 0..scope.qualified_star_columns(q)? {
                     if n == out.len() {
                         return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "select list too wide"
+                            sqlstate::TOO_MANY_COLUMNS,
+                            "target lists can have at most 1664 entries"
                         ));
                     }
                     let entry = scope.qualified_star_entry(q, index)?;
@@ -7757,8 +7752,8 @@ pub fn describe_scope_items<'q>(
                 for k in 0..scope.star_columns() {
                     if n == out.len() {
                         return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "select list too wide"
+                            sqlstate::TOO_MANY_COLUMNS,
+                            "target lists can have at most 1664 entries"
                         ));
                     }
                     let entry = scope.star_entry(k);
@@ -7779,8 +7774,8 @@ pub fn describe_scope_items<'q>(
             SelectItem::Expr { expression, alias } => {
                 if n == out.len() {
                     return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "select list too wide"
+                        sqlstate::TOO_MANY_COLUMNS,
+                        "target lists can have at most 1664 entries"
                     ));
                 }
                 // Multi-table type inference: columns resolve via scope.
@@ -7888,8 +7883,8 @@ pub fn describe_catalog_items_as<'q>(
         {
             if count == out.len() {
                 return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "select list too wide"
+                    sqlstate::TOO_MANY_COLUMNS,
+                    "target lists can have at most 1664 entries"
                 ));
             }
             out[count] = description;
@@ -8590,8 +8585,8 @@ fn describe_scope_record_star<'q>(
     let mut push = |desc: ColDesc<'q>, n: &mut usize| -> Result<(), SqlError> {
         if *n == out.len() {
             return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "select list too wide"
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most 1664 entries"
             ));
         }
         out[*n] = desc;

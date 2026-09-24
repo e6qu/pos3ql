@@ -3128,7 +3128,7 @@ fn append_recursive_state<'a>(
     if select.items.len() + state_count > MAX_PROJ {
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
-            "select list is too wide"
+            "target lists can have at most 1664 entries"
         ));
     }
     let mut items = [SelectItem::Wildcard; MAX_PROJ];
@@ -4050,9 +4050,12 @@ fn subst_select_items<'a>(
                 ));
             }
             for (index, name) in transition.names.iter().copied().enumerate() {
-                let slot = items
-                    .get_mut(count)
-                    .ok_or_else(|| sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"))?;
+                let slot = items.get_mut(count).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::TOO_MANY_COLUMNS,
+                        "target lists can have at most 1664 entries"
+                    )
+                })?;
                 *slot = SelectItem::Expr {
                     expression: if old {
                         transition.old[index]
@@ -4081,9 +4084,12 @@ fn subst_select_items<'a>(
                 alias: *alias,
             },
         };
-        let slot = items
-            .get_mut(count)
-            .ok_or_else(|| sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"))?;
+        let slot = items.get_mut(count).ok_or_else(|| {
+            sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most 1664 entries"
+            )
+        })?;
         *slot = rewritten;
         count += 1;
     }

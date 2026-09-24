@@ -7,7 +7,7 @@ use crate::mem::arena::Arena;
 use crate::stack_format;
 use crate::util::StackStr;
 
-use super::ast::{BinaryOp, Collation, Expr, UnaryOp};
+use super::ast::{BinaryOp, Collation, Expr, GroupingSet, UnaryOp};
 use super::numeric::Numeric;
 use super::types::{ArrElem, ColType, Datum, RecordField};
 
@@ -714,10 +714,8 @@ pub const NO_PARAMS: &[Datum<'static>] = &[];
 /// or node identity (aggregates, subqueries).
 #[derive(Clone, Copy)]
 pub struct EvalHooks<'h, 'a> {
-    /// (group-by expressions, this group's key values, active-column bitmask).
-    /// The bitmask selects which `group_by` columns participate in the current
-    /// grouping set (all bits set for a plain `GROUP BY`); it drives `GROUPING()`.
-    pub group: Option<(&'h [&'h Expr<'h>], &'h [Datum<'a>], u64)>,
+    /// Grouping expressions, this group's key values, and the active set.
+    pub group: Option<(&'h [&'h Expr<'h>], &'h [Datum<'a>], GroupingSet<'h>)>,
     /// (aggregate-call nodes by address, this group's results).
     pub aggs: Option<(&'h [*const Expr<'h>], &'h [Datum<'a>])>,
     /// (subquery nodes by address, their pre-evaluated results).
@@ -2148,6 +2146,12 @@ fn eval_full_inner<'a>(
     if let Expr::Call { name, args, .. } = expression
         && name.eq_ignore_ascii_case("grouping")
     {
+        if args.len() >= i32::BITS as usize {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_ARGUMENTS,
+                "GROUPING must have fewer than 32 arguments"
+            ));
+        }
         let Some((exprs, _, mask)) = hooks.group else {
             return Err(sql_err!(
                 sqlstate::GROUPING_ERROR,
@@ -2162,7 +2166,7 @@ fn eval_full_inner<'a>(
                 .ok_or_else(|| {
                 sql_err!(sqlstate::GROUPING_ERROR, "arguments to GROUPING must be grouping expressions of the associated query level")
             })?;
-            let grouped = mask & (1u64 << idx) != 0;
+            let grouped = mask.contains(idx);
             result = (result << 1) | i32::from(!grouped);
         }
         return Ok(Datum::Int4(result));

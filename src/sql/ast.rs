@@ -3030,12 +3030,9 @@ pub struct Select<'a> {
     /// Whether duplicate grouping sets are retained (`ALL`, PostgreSQL's
     /// default) or collapsed before aggregation (`DISTINCT`).
     pub grouping_set_quantifier: GroupingSetQuantifier,
-    /// Grouping sets for `ROLLUP`/`CUBE`/`GROUPING SETS`. Each element is a
-    /// bitmask over `group_by` indices selecting the columns that group in that
-    /// set (bit *i* set = `group_by[i]` participates; a cleared bit means that
-    /// column is NULL in the set's output rows). Empty means a plain
-    /// `GROUP BY`: a single implicit set of all `group_by` columns.
-    pub grouping_sets: &'a [u64],
+    /// Grouping sets for `ROLLUP`/`CUBE`/`GROUPING SETS`. Empty means a plain
+    /// `GROUP BY`: one implicit set containing every `group_by` expression.
+    pub grouping_sets: &'a [GroupingSet<'a>],
     pub having: Option<&'a Expr<'a>>,
     pub order_by: &'a [OrderBy<'a>],
     pub limit: Option<&'a Expr<'a>>,
@@ -3053,6 +3050,27 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+}
+
+/// A variable-width bitmap over a query's flat `GROUP BY` expression list.
+/// Missing high words are zero, which keeps narrow and empty sets compact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupingSet<'a> {
+    pub(crate) words: &'a [u64],
+}
+
+impl GroupingSet<'_> {
+    pub const EMPTY: Self = Self { words: &[] };
+
+    pub(crate) fn contains(self, index: usize) -> bool {
+        self.words
+            .get(index / u64::BITS as usize)
+            .is_some_and(|word| word & (1u64 << (index % u64::BITS as usize)) != 0)
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.words.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

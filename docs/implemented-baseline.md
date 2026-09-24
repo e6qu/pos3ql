@@ -171,6 +171,14 @@ active production roadmap is [PLAN.md](../PLAN.md).
   stride; constraint kinds and partition-trigger clones occupy disjoint OID
   bands. Finite index/trigger generation ranges reject exhaustion before
   installation, including replay, rather than saturating or failing on reads.
+- Grouping uses variable-width statement-arena bitmaps across PostgreSQL 18's
+  1,664 target-list entries. Expanded grouping sets stop at PostgreSQL's exact
+  4,096 boundary, `CUBE` stops at 12 elements, and `GROUPING()` stops at 31
+  arguments with matching SQLSTATEs and messages. Completed set results move
+  to the persistent arena tail while scan, key, and aggregate scratch is
+  recycled before the next set. Exact-width allocation-forbidden execution and
+  a raw PostgreSQL 18.6 differential cover cross-word membership, accepted
+  maxima, and each next rejected value.
 - Program length is independent of per-construct limits. Simple-query
   batches, SQL function and procedure bodies, and PL/pgSQL functions,
   procedures, triggers, event triggers, and anonymous blocks retain every

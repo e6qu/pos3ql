@@ -4414,26 +4414,74 @@ fn resolve_group_ordinals<'a>(
         }
         Ok(())
     };
-    if !statement.group_by.iter().any(|g| matches!(g, Expr::Int(_))) {
-        refuse_aggregates(statement.group_by)?;
-        return Ok(statement);
-    }
-    // Grouping-set bitmasks index the GROUP BY list, so the parser still caps
-    // it at `parser::MAX_GROUP_TERMS`; a parsed statement always fits.
-    let mut resolved = [&Expr::Null; super::parser::MAX_GROUP_TERMS];
-    for (slot, g) in resolved.iter_mut().zip(statement.group_by) {
-        *slot = match g {
-            Expr::Int(_) => resolve_position_target(g, statement.items, scope, arena, "GROUP BY")?,
-            _ => g,
+    let has_ordinals = statement
+        .group_by
+        .iter()
+        .any(|grouping| matches!(grouping, Expr::Int(_)));
+    let resolved: &[&Expr] = if has_ordinals {
+        let resolved = arena
+            .alloc_slice_with(statement.group_by.len(), |_| &Expr::Null)
+            .map_err(|_| arena_full())?;
+        for (slot, grouping) in resolved.iter_mut().zip(statement.group_by) {
+            *slot = match grouping {
+                Expr::Int(_) => {
+                    resolve_position_target(grouping, statement.items, scope, arena, "GROUP BY")?
+                }
+                _ => grouping,
+            };
+        }
+        &*resolved
+    } else {
+        statement.group_by
+    };
+    refuse_aggregates(resolved)?;
+
+    // PostgreSQL stores visible expressions and otherwise absent grouping
+    // expressions in one target list. Enforce that combined boundary rather
+    // than accepting 1,664 hidden keys beside an additional visible result.
+    let mut target_entries = 0usize;
+    for item in statement.items {
+        target_entries += match item {
+            SelectItem::Wildcard => scope.map_or(0, QueryScope::star_columns),
+            SelectItem::TableWildcard(qualifier) => match scope {
+                Some(scope) => scope.qualified_star_columns(qualifier)?,
+                None => 0,
+            },
+            SelectItem::RecordStar(expression) => {
+                scope.map_or(0, |scope| record_star_width(expression, scope))
+            }
+            SelectItem::Expr { .. } => 1,
         };
     }
-    refuse_aggregates(&resolved[..statement.group_by.len()])?;
-    let group_by = arena
-        .alloc_slice_copy(&resolved[..statement.group_by.len()])
-        .map_err(|_| arena_full())?;
-    let mut rewritten = *statement;
-    rewritten.group_by = &*group_by;
-    Ok(&*arena.alloc(rewritten).map_err(|_| arena_full())?)
+    for (index, grouping) in resolved.iter().enumerate() {
+        let already_visible = statement.items.iter().any(|item| {
+            let SelectItem::Expr { expression, .. } = item else {
+                return false;
+            };
+            **expression == **grouping
+                || scope.is_some_and(|scope| group::same_scope_column(scope, expression, grouping))
+        });
+        let already_counted = resolved[..index].iter().any(|previous| {
+            **previous == **grouping
+                || scope.is_some_and(|scope| group::same_scope_column(scope, previous, grouping))
+        });
+        if !already_visible && !already_counted {
+            target_entries += 1;
+        }
+        if target_entries > super::parser::MAX_GROUP_TERMS {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "target lists can have at most 1664 entries"
+            ));
+        }
+    }
+    if has_ordinals {
+        let mut rewritten = *statement;
+        rewritten.group_by = resolved;
+        Ok(&*arena.alloc(rewritten).map_err(|_| arena_full())?)
+    } else {
+        Ok(statement)
+    }
 }
 
 /// ORDER BY `n` refers to the n-th *output* column: select-list stars count

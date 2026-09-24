@@ -8,7 +8,7 @@
 
 use crate::mem::arena::{Arena, ArenaList};
 use crate::pg::respond::Responder;
-use crate::sql::ast::{Collation, Expr, FromClause, Select, SelectItem};
+use crate::sql::ast::{Collation, Expr, FromClause, GroupingSet, Select, SelectItem};
 use crate::sql::eval::{
     ColumnLookup, EvalHooks, SqlError, SubqueryList, compare_datums_collated, eval_full, sqlstate,
 };
@@ -116,8 +116,8 @@ impl<'a> ColumnLookup<'a> for GroupRow<'_, 'a> {
     }
 }
 
-/// Aggregates and emits the output rows for a single grouping-set `mask` (bit
-/// *i* set = `group_by[i]` participates; a cleared bit collapses that column to
+/// Aggregates and emits the output rows for one grouping set (`group_by[i]`
+/// participates when its bit is set; a cleared bit collapses that column to
 /// NULL so every row shares one group and the output column reads NULL). Returns
 /// the surviving rows (visible columns followed by hidden ORDER BY key columns),
 /// unsorted — the caller concatenates the sets and sorts once.
@@ -135,7 +135,8 @@ pub(super) fn groups_for_mask<'a>(
     scan_where: Option<&'a Expr<'a>>,
     correlated: &'a [&'a Expr<'a>],
     outer: Option<&dyn ColumnLookup<'a>>,
-    mask: u64,
+    mask: GroupingSet<'a>,
+    group_collations: &[Collation],
     row_count: usize,
     agg_ptrs: &'a [*const Expr<'a>],
     order_exprs: &[Option<&'a Expr<'a>>],
@@ -144,11 +145,6 @@ pub(super) fn groups_for_mask<'a>(
     pax_demand: super::PaxReadDemand,
 ) -> Result<&'a [&'a [u8]], SqlError> {
     let n_keys = statement.group_by.len();
-    let mut group_collations = [Collation::None; MAX_PROJ];
-    for (index, expression) in statement.group_by.iter().enumerate() {
-        group_collations[index] = scope.expression_collation(expression)?;
-    }
-    let group_collations = &group_collations[..n_keys];
 
     // Pass 2: encode group keys per row (columns outside this set → NULL),
     // sort them, and compute group assignments. When durable object storage
@@ -215,9 +211,9 @@ pub(super) fn groups_for_mask<'a>(
                     };
                     &row_hooks_store
                 };
-                let mut key_vals = [Datum::Null; MAX_PROJ];
+                let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
                 for (k, g) in statement.group_by.iter().enumerate() {
-                    if mask & (1u64 << k) != 0 {
+                    if mask.contains(k) {
                         key_vals[k] = eval_full(g, arena, params, row, row_hooks)?;
                     }
                 }
@@ -341,9 +337,9 @@ pub(super) fn groups_for_mask<'a>(
                         };
                         &row_hooks_store
                     };
-                    let mut key_vals = [Datum::Null; MAX_PROJ];
+                    let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
                     for (k, g) in statement.group_by.iter().enumerate() {
-                        if mask & (1u64 << k) != 0 {
+                        if mask.contains(k) {
                             key_vals[k] = eval_full(g, arena, params, row, row_hooks)?;
                         }
                     }
@@ -375,7 +371,11 @@ pub(super) fn groups_for_mask<'a>(
                     g += 1;
                 }
             }
-            if keys.is_empty() && mask == 0 { 1 } else { g }
+            if keys.is_empty() && mask.is_empty() {
+                1
+            } else {
+                g
+            }
         };
         let rep_keys_buf = arena
             .alloc_slice_with(ng, |_| empty)
@@ -576,7 +576,7 @@ pub(super) fn groups_for_mask<'a>(
         super::subquery::alloc_merge_scratch(hooks.subs, group_correlated, arena)?;
     let mut output_count = 0usize;
     for g in 0..n_groups {
-        let mut key_vals = [Datum::Null; MAX_PROJ];
+        let mut key_vals = [Datum::Null; crate::sql::parser::MAX_GROUP_TERMS];
         for (k, slot) in key_vals.iter_mut().enumerate().take(n_keys) {
             *slot = crate::sql::exec::decode_projected_pub(rep_keys[g], k);
         }
@@ -840,21 +840,40 @@ pub(super) fn grouped_rows<'a>(
     }
     let order_exprs = &order_arr[..n_order];
 
-    // Grouping sets: the explicit mask list, or a single implicit set of all
+    let group_collations = arena
+        .alloc_slice_with(n_keys, |_| Collation::None)
+        .map_err(|_| arena_full())?;
+    for (index, expression) in statement.group_by.iter().enumerate() {
+        group_collations[index] = scope.expression_collation(expression)?;
+    }
+
+    // Grouping sets: the explicit set list, or a single implicit set of all
     // grouping columns for a plain GROUP BY / plain aggregate.
-    let all_mask = if n_keys >= 64 {
-        u64::MAX
+    let all_words = if n_keys == 0 {
+        &[][..]
     } else {
-        (1u64 << n_keys) - 1
+        let words = n_keys.div_ceil(u64::BITS as usize);
+        &*arena
+            .alloc_slice_with(words, |index| {
+                let tail = n_keys % u64::BITS as usize;
+                if index + 1 == words && tail != 0 {
+                    (1u64 << tail) - 1
+                } else {
+                    u64::MAX
+                }
+            })
+            .map_err(|_| arena_full())?
     };
-    let single = [all_mask];
-    let mut masks: &[u64] = if statement.grouping_sets.is_empty() {
+    let single = [GroupingSet { words: all_words }];
+    let mut masks: &[GroupingSet] = if statement.grouping_sets.is_empty() {
         &single[..]
     } else {
         statement.grouping_sets
     };
-    let mut distinct_masks = [0u64; crate::sql::parser::MAX_GROUPING_SETS];
     if statement.grouping_set_quantifier == crate::sql::ast::GroupingSetQuantifier::Distinct {
+        let distinct_masks = arena
+            .alloc_slice_with(masks.len(), |_| GroupingSet::EMPTY)
+            .map_err(|_| arena_full())?;
         let mut count = 0usize;
         for &mask in masks {
             if !distinct_masks[..count].contains(&mask) {
@@ -864,21 +883,13 @@ pub(super) fn grouped_rows<'a>(
         }
         masks = &distinct_masks[..count];
     }
-    if masks.len() > crate::sql::parser::MAX_GROUPING_SETS {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "too many grouping sets"
-        ));
-    }
 
-    // Aggregate each set independently, then concatenate (a single set is a
-    // straight copy). ORDER BY applies across the combined result, so it is
-    // deferred until after concatenation.
-    let empty_rows: &[&[u8]] = &[];
-    let mut per_set: [&[&[u8]]; crate::sql::parser::MAX_GROUPING_SETS] =
-        [empty_rows; crate::sql::parser::MAX_GROUPING_SETS];
-    let mut total = 0usize;
-    for (si, &mask) in masks.iter().enumerate() {
+    // Each set's scans, keys, and aggregate states are temporary. Preserve its
+    // self-contained encoded rows in the persistent tail, then recycle front
+    // scratch before the next set so 4,096 sets do not multiply workspace.
+    let mut combined_rows = ArenaList::new_persistent(arena);
+    for &mask in masks {
+        let scratch = arena.mark();
         let rows = groups_for_mask(
             storage,
             scope,
@@ -893,6 +904,7 @@ pub(super) fn grouped_rows<'a>(
             correlated,
             outer,
             mask,
+            group_collations,
             row_count,
             agg_ptrs,
             order_exprs,
@@ -900,21 +912,19 @@ pub(super) fn grouped_rows<'a>(
             n_order,
             pax_columns,
         )?;
-        per_set[si] = rows;
-        total += rows.len();
-    }
-
-    let empty: &[u8] = &[];
-    let out_rows: &mut [&[u8]] = arena
-        .alloc_slice_with(total, |_| empty)
-        .map_err(|_| arena_full())?;
-    let mut at = 0usize;
-    for rows in &per_set[..masks.len()] {
-        for &r in rows.iter() {
-            out_rows[at] = r;
-            at += 1;
+        for &row in rows {
+            let saved = arena
+                .alloc_persistent_slice_with(row.len(), |index| row[index])
+                .map_err(|_| arena_full())?;
+            combined_rows.push(&*saved).map_err(|_| arena_full())?;
         }
+        // Every front reference produced by groups_for_mask is dead after the
+        // encoded rows above are copied to the persistent tail.
+        unsafe { arena.rewind_to(scratch) };
     }
+    let out_rows = arena
+        .alloc_slice_copy(combined_rows.as_slice())
+        .map_err(|_| arena_full())?;
 
     let mut live = out_rows.len();
     if statement.distinct {
@@ -1068,7 +1078,7 @@ pub(super) fn grouped_select<'a>(
 /// Whether two expressions are column references resolving to the same scope
 /// column — PostgreSQL's semantic key match, where `a` and `t.a` are one
 /// grouping key.
-fn same_scope_column(scope: &QueryScope, a: &Expr, b: &Expr) -> bool {
+pub(super) fn same_scope_column(scope: &QueryScope, a: &Expr, b: &Expr) -> bool {
     let (
         Expr::Column {
             qualifier: qa,

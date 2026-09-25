@@ -1764,11 +1764,12 @@ impl<'b> Responder<'b> {
         kind: crate::sql::types::RangeKind,
     ) {
         message.field(|message| {
-            let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
-            let count = crate::sql::range::split_components(text, &mut components)
-                .expect("multirange datums are canonical");
+            let count =
+                crate::sql::range::component_count(text).expect("multirange datums are canonical");
             message.i32(count as i32);
-            for component in &components[..count] {
+            for component in
+                crate::sql::range::components(text).expect("multirange datums are canonical")
+            {
                 message.field(|message| Self::encode_range_binary_body(message, component, kind));
             }
         });
@@ -2510,6 +2511,37 @@ mod tests {
                 0, 0, 0, 17, 0x02, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0,
                 7, // second range.
             ]
+        );
+    }
+
+    #[test]
+    fn binary_multirange_output_crosses_the_former_component_limit() {
+        use core::fmt::Write;
+
+        let mut text = String::from("{");
+        for index in 0..128 {
+            if index != 0 {
+                text.push(',');
+            }
+            write!(text, "[{},{})", index * 3, index * 3 + 1).unwrap();
+        }
+        text.push('}');
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 8 << 10).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let mut message = MsgOut::begin(&mut buffer, b'd');
+            Responder::encode_value_binary(
+                &mut message,
+                &Datum::Multirange {
+                    text: &text,
+                    kind: RangeKind::Int4,
+                },
+            );
+            message.finish().unwrap();
+        });
+        assert_eq!(
+            i32::from_be_bytes(buffer.readable()[9..13].try_into().unwrap()),
+            128
         );
     }
 }

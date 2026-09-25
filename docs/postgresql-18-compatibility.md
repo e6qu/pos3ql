@@ -197,6 +197,11 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   with SQLSTATE `54000`, as do accepted-width operations that exhaust the
   fixed statement arena. `format()` output also uses statement memory rather
   than a separate 4 KiB compiled buffer.
+- Multirange values have no separate 64-component or 1 KiB rendered-text
+  limit. Text and binary input/output, binary COPY, constructors, aggregates,
+  set operations, comparison, hashing, bounds, `unnest`, indexes, rows, WAL,
+  checkpoints, and object-cold recovery use streaming component readers or
+  exact statement-arena slices. Arena exhaustion is SQLSTATE `54000`.
 - Compatibility is not universal merely because all top-level command names
   are classified. Unsupported clauses, type combinations, functions, catalog
   objects, and physical assumptions must return explicit errors.

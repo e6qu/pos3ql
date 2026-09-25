@@ -22,6 +22,13 @@ except ImportError as e:
     print("psycopg not installed:", e, file=sys.stderr)
     sys.exit(2)
 
+WIDE_MULTIRANGE = Multirange(
+    [Range(index * 3, index * 3 + 1, "[)") for index in range(128)]
+)
+WIDE_MULTIRANGE_SQL = "'{%s}'::int4multirange" % ",".join(
+    "[%d,%d)" % (index * 3, index * 3 + 1) for index in range(128)
+)
+
 
 def connect(host, port):
     return psycopg.connect(host=host, port=port, user="postgres", dbname="postgres", autocommit=True)
@@ -45,6 +52,7 @@ CASES = [
     ("SELECT (%b::int4range)::text", [Range(empty=True)]),
     ("SELECT (%b::int8range)::text", [Range(100, 200, "[]")]),
     ("SELECT (%b::int4multirange)::text", [Multirange([Range(1, 3, "[)"), Range(5, 7, "[)")])]),
+    ("SELECT (%b::int4multirange)::text", [WIDE_MULTIRANGE]),
 ]
 
 
@@ -67,6 +75,7 @@ RESULT_CASES = [
     "SELECT '(,5)'::int4range",
     "SELECT 'empty'::int4range",
     "SELECT '{[1,3),[5,7)}'::int4multirange",
+    "SELECT " + WIDE_MULTIRANGE_SQL,
     "SELECT ROW(42::int4, NULL::text)",
     "SELECT ROW(state, positive, pair) FROM binary_result_rows",
     "SELECT ROW(binary_result_state_echo(state), binary_result_positive_echo(positive), "

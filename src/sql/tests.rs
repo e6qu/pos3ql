@@ -17984,6 +17984,83 @@ fn range_multirange_support_aggregates_and_expansion_are_typed() {
 }
 
 #[test]
+fn multirange_width_uses_statement_memory_and_survives_object_cold_recovery() {
+    use core::fmt::Write;
+
+    let mut literal = String::from("{");
+    for index in 0..128 {
+        if index != 0 {
+            literal.push(',');
+        }
+        let lower = index * 3;
+        write!(literal, "[{lower},{})", lower + 1).unwrap();
+    }
+    literal.push('}');
+
+    let mut config = test_config("multirange-value-width");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = false;
+    config.wal_upload_sync = false;
+    config.object_store_bucket = format!("multirange-value-width-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let setup = format!(
+        "CREATE TABLE multirange_value_width (id integer PRIMARY KEY, spans int4multirange); \
+         INSERT INTO multirange_value_width VALUES (1, '{literal}'); \
+         CREATE INDEX multirange_value_width_spans ON multirange_value_width USING gist (spans); \
+         CREATE VIEW multirange_value_width_view AS SELECT spans FROM multirange_value_width; \
+         SELECT range_merge(spans), lower_inc(spans), upper_inf(spans), \
+                hash_multirange(spans) = hash_multirange(spans) \
+           FROM multirange_value_width; \
+         SELECT id FROM multirange_value_width WHERE spans && '{{[381,382)}}'"
+    );
+    let expansion = "SELECT count(*), min(lower(value)), max(upper(value)) \
+           FROM multirange_value_width, unnest(spans) AS expanded(value); \
+         SELECT count(*) FROM multirange_value_width, \
+                unnest(spans + '{[400,401)}') AS expanded(value); \
+         SELECT count(*) FROM multirange_value_width, \
+                unnest(spans - '{[3,4)}') AS expanded(value); \
+         SELECT count(*) FROM multirange_value_width, \
+                unnest(spans * '{[0,382)}') AS expanded(value)";
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut session = ConfiguredTransactionSession::new(&config, &mut budget);
+    let output = session.success(&mut engine, &setup, true);
+    assert_eq!(
+        data_rows(&output),
+        ["[0,382)|t|f|t", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = session.success(&mut engine, expansion, false);
+    assert_eq!(
+        data_rows(&output),
+        ["128|0|382", "129", "127", "128"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(session);
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with_arena_bytes(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT count(*), min(lower(value)), max(upper(value)) \
+           FROM multirange_value_width_view, unnest(spans) AS expanded(value); \
+         SELECT id FROM multirange_value_width WHERE spans && '{[381,382)}'",
+        8 << 20,
+    );
+    assert_eq!(data_rows(&recovered), ["128|0|382", "1"]);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
     let config = test_config("range-array-restart");
     {
@@ -63875,6 +63952,51 @@ fn alter_index_rename_is_transactional_durable_and_typed() {
         ["renamed index comment"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
+fn partition_recursion_ignores_dropped_descendants_after_parent_slot_reuse() {
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&test_config("partition-slot-reuse"), &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE discarded_root (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE discarded_low PARTITION OF discarded_root \
+           FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE discarded_high PARTITION OF discarded_root \
+           FOR VALUES FROM (10) TO (20)",
+    );
+    run_with(&mut engine, &mut budget, "DROP TABLE discarded_root");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replacement_root (id integer, value text, payload text) \
+           PARTITION BY RANGE (id)",
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX replacement_value_idx ON replacement_root \
+           (id, value COLLATE \"C\") INCLUDE (payload) WHERE id >= 0",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "dropped descendants must not follow a reused parent slot: {}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relation.relkind, count(inheritance.inhrelid) \
+             FROM pg_class relation \
+             LEFT JOIN pg_inherits inheritance ON inheritance.inhparent = relation.oid \
+             WHERE relation.relname = 'replacement_value_idx' \
+             GROUP BY relation.relkind",
+        )),
+        ["I|0"]
+    );
 }
 
 #[test]

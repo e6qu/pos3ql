@@ -249,8 +249,9 @@ jobs:
         include:
           # Keep the instrumented corpus and auxiliary probes in independent
           # workers so cold setup plus measurement stays below ten minutes.
-          - { name: corpus-a, corpus_shard: "0-of-2", auxiliary: none }
-          - { name: corpus-b, corpus_shard: "1-of-2", auxiliary: none }
+          - { name: corpus-a, corpus_shard: "0-of-3", auxiliary: none }
+          - { name: corpus-b, corpus_shard: "1-of-3", auxiliary: none }
+          - { name: corpus-c, corpus_shard: "2-of-3", auxiliary: none }
           - { name: auxiliary, corpus_shard: "none", auxiliary: all }
     services:
       postgres:

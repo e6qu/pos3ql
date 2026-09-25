@@ -249,21 +249,18 @@ pub(crate) fn dispatch<'a>(
                 // component texts are collected then canonicalized. A NULL argument
                 // makes the whole result NULL, matching PostgreSQL's strict
                 // multirange constructors.
-                let mut comps: [&str; range::MAX_MULTIRANGE] = [""; range::MAX_MULTIRANGE];
-                let mut n = 0usize;
+                let mut comps = crate::mem::arena::ArenaList::new(arena);
                 let mut add = |value: Datum<'a>| -> Result<bool, SqlError> {
                     match value {
                         Datum::Null => Ok(true),
                         Datum::Range { text, kind: k } if k == kind => {
                             if !range::is_empty(text) {
-                                if n == range::MAX_MULTIRANGE {
-                                    return Err(sql_err!(
+                                comps.push(text).map_err(|_| {
+                                    sql_err!(
                                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                        "multirange has too many component ranges"
-                                    ));
-                                }
-                                comps[n] = text;
-                                n += 1;
+                                        "multirange components exceed the statement arena"
+                                    )
+                                })?;
                             }
                             Ok(false)
                         }
@@ -294,7 +291,7 @@ pub(crate) fn dispatch<'a>(
                         }
                     }
                 }
-                let text = range::canonicalize_multirange(&mut comps[..n], kind, arena)?;
+                let text = range::canonicalize_multirange(comps.as_mut_slice(), kind, arena)?;
                 Ok(Datum::Multirange { text, kind })
             }
             "multirange" => {
@@ -325,20 +322,19 @@ pub(crate) fn dispatch<'a>(
                         Ok(Datum::Bool(range::bound_inc(text, name == "lower_inc")?))
                     }
                     Datum::Multirange { text, kind: _ } => {
-                        let mut components = [""; range::MAX_MULTIRANGE];
-                        let count = range::split_components(text, &mut components)?;
-                        if count == 0 {
-                            Ok(Datum::Bool(false))
-                        } else {
+                        let mut components = range::components(text)?;
+                        if let Some(first) = components.next() {
                             let component = if name == "upper_inc" {
-                                components[count - 1]
+                                components.last().unwrap_or(first)
                             } else {
-                                components[0]
+                                first
                             };
                             Ok(Datum::Bool(range::bound_inc(
                                 component,
                                 name == "lower_inc",
                             )?))
+                        } else {
+                            Ok(Datum::Bool(false))
                         }
                     }
                     other => Err(type_mismatch(name, &other)),
@@ -354,21 +350,20 @@ pub(crate) fn dispatch<'a>(
                         range::upper_inf(text)?
                     })),
                     Datum::Multirange { text, kind: _ } => {
-                        let mut components = [""; range::MAX_MULTIRANGE];
-                        let count = range::split_components(text, &mut components)?;
-                        if count == 0 {
-                            Ok(Datum::Bool(false))
-                        } else {
+                        let mut components = range::components(text)?;
+                        if let Some(first) = components.next() {
                             let component = if name == "upper_inf" {
-                                components[count - 1]
+                                components.last().unwrap_or(first)
                             } else {
-                                components[0]
+                                first
                             };
                             Ok(Datum::Bool(if name == "lower_inf" {
                                 range::lower_inf(component)?
                             } else {
                                 range::upper_inf(component)?
                             }))
+                        } else {
+                            Ok(Datum::Bool(false))
                         }
                     }
                     other => Err(type_mismatch(name, &other)),
@@ -380,21 +375,16 @@ pub(crate) fn dispatch<'a>(
                     return match value {
                         Datum::Null => Ok(Datum::Null),
                         Datum::Multirange { text, kind } => {
-                            let mut components = [""; range::MAX_MULTIRANGE];
-                            let count = range::split_components(text, &mut components)?;
-                            if count == 0 {
+                            let mut components = range::components(text)?;
+                            if let Some(first) = components.next() {
+                                let last = components.last().unwrap_or(first);
                                 Ok(Datum::Range {
-                                    text: "empty",
+                                    text: range::merge(first, last, kind, arena)?,
                                     kind,
                                 })
                             } else {
                                 Ok(Datum::Range {
-                                    text: range::merge(
-                                        components[0],
-                                        components[count - 1],
-                                        kind,
-                                        arena,
-                                    )?,
+                                    text: "empty",
                                     kind,
                                 })
                             }

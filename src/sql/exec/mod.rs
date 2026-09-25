@@ -53477,14 +53477,18 @@ fn decode_binary_multirange<'a>(
     let bad = || sql_err!(sqlstate::BAD_COPY_FILE_FORMAT, "invalid binary multirange");
     let mut reader = crate::pg::wire::MsgIn::new(bytes);
     let count = reader.i32().map_err(|_| bad())?;
-    if !(0..=crate::sql::range::MAX_MULTIRANGE as i32).contains(&count) {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "multirange has too many ranges"
-        ));
+    if count < 0 || count as usize > reader.remaining() / 5 {
+        return Err(bad());
     }
-    let mut ranges = [""; crate::sql::range::MAX_MULTIRANGE];
-    for slot in ranges.iter_mut().take(count as usize) {
+    let ranges = arena
+        .alloc_slice_with(count as usize, |_| "")
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "binary multirange components exceed the statement arena"
+            )
+        })?;
+    for slot in ranges.iter_mut() {
         let len = reader.i32().map_err(|_| bad())?;
         let field = reader.take(len as usize).map_err(|_| bad())?;
         let mut inner = crate::pg::wire::MsgIn::new(field);
@@ -53496,8 +53500,7 @@ fn decode_binary_multirange<'a>(
     if !reader.done() {
         return Err(bad());
     }
-    let text =
-        crate::sql::range::canonicalize_multirange(&mut ranges[..count as usize], kind, arena)?;
+    let text = crate::sql::range::canonicalize_multirange(ranges, kind, arena)?;
     Ok(Datum::Multirange { text, kind })
 }
 
@@ -54155,20 +54158,19 @@ pub(crate) fn binary_field_plan<'a>(
             Ok(BinaryFieldPlan::Range(flags, lower, upper))
         }
         Datum::Multirange { text, kind } => {
-            let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
-            let n = crate::sql::range::split_components(text, &mut components)?;
-            let mut parts: [RangeBinaryParts; crate::sql::range::MAX_MULTIRANGE] =
-                [(0u8, None, None); crate::sql::range::MAX_MULTIRANGE];
-            for (slot, &component) in parts.iter_mut().zip(components.iter()).take(n) {
+            let n = crate::sql::range::component_count(text)?;
+            let parts = arena
+                .alloc_slice_with(n, |_| (0u8, None, None))
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "COPY BINARY multirange exceeds the statement arena"
+                    )
+                })?;
+            for (slot, component) in parts.iter_mut().zip(crate::sql::range::components(text)?) {
                 *slot = parse_range_bounds(component, *kind, arena)?;
             }
-            let stored = arena.alloc_slice_copy(&parts[..n]).map_err(|_| {
-                sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "COPY BINARY multirange exceeds the statement arena"
-                )
-            })?;
-            Ok(BinaryFieldPlan::Multirange(stored))
+            Ok(BinaryFieldPlan::Multirange(parts))
         }
         Datum::Array { element, raw }
             if matches!(
@@ -62649,11 +62651,17 @@ fn synchronize_inherited_constraint_changes(
 }
 
 fn partition_depth_from(storage: &Storage, child: usize, root: usize, txid: u32) -> Option<usize> {
+    if !storage.table_slot_visible_to(child, txid) || !storage.table_slot_visible_to(root, txid) {
+        return None;
+    }
     let mut current = child;
     let mut depth = 0usize;
     while let Some(attachment) = storage.table_def(current, txid).partition.attachment {
         depth += 1;
         current = usize::from(attachment.parent);
+        if current >= storage.table_count() || !storage.table_slot_visible_to(current, txid) {
+            return None;
+        }
         if current == root {
             return Some(depth);
         }
@@ -69559,6 +69567,40 @@ mod tests {
             crate::sql::array::get(raw, element, ELEMENTS as usize - 1),
             Some(Datum::Int4(ELEMENTS))
         );
+    }
+
+    #[test]
+    fn binary_multirange_crosses_the_former_component_limit() {
+        const COMPONENTS: i32 = 128;
+        let mut bytes = Vec::with_capacity(4 + COMPONENTS as usize * 21);
+        bytes.extend_from_slice(&COMPONENTS.to_be_bytes());
+        for index in 0..COMPONENTS {
+            bytes.extend_from_slice(&17_i32.to_be_bytes());
+            bytes.push(0x02);
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&(index * 3).to_be_bytes());
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&(index * 3 + 1).to_be_bytes());
+        }
+
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "wide binary multirange", 1 << 19).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let datum = decode_binary_field(
+                ColType::Multirange(crate::sql::types::RangeKind::Int4),
+                &bytes,
+                &arena,
+            )
+            .unwrap();
+            let Datum::Multirange { text, .. } = datum else {
+                panic!("multirange expected");
+            };
+            assert_eq!(crate::sql::range::component_count(text).unwrap(), 128);
+            assert_eq!(
+                crate::sql::range::component_at(text, 127).unwrap(),
+                Some("[381,382)")
+            );
+        });
     }
 
     #[test]

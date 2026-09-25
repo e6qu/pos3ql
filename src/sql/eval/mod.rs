@@ -4485,18 +4485,16 @@ fn call<'a>(
                 Datum::Array { element, raw } => {
                     Ok(super::array::get(raw, element, k - 1).unwrap_or(Datum::Null))
                 }
-                Datum::Multirange { text, kind } => {
-                    let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
-                    let count = crate::sql::range::split_components(text, &mut components)?;
-                    Ok(if k <= count {
+                Datum::Multirange { text, kind } => Ok(
+                    if let Some(component) = crate::sql::range::component_at(text, k - 1)? {
                         Datum::Range {
-                            text: components[k - 1],
+                            text: component,
                             kind,
                         }
                     } else {
                         Datum::Null
-                    })
-                }
+                    },
+                ),
                 Datum::Null => Ok(Datum::Null),
                 _ => Err(type_mismatch("unnest requires an array or multirange", &a)),
             }

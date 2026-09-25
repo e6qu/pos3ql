@@ -9,7 +9,7 @@
 //! describe, and an executing form that also materializes derived tables.
 
 use crate::mem::arena::{Arena, ArenaList};
-use crate::sql::ast::{BinaryOp, Expr, FromClause, MAX_USING_COLUMNS, MaterializedCte, TableRef};
+use crate::sql::ast::{BinaryOp, Expr, FromClause, MaterializedCte, TableRef};
 use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
@@ -17,14 +17,10 @@ use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, UserTy
 use crate::util::StackStr;
 
 use super::{
-    Chained, MAX_JOIN_TABLES, arena_full, collect_aggs, collect_windows, common_using_type,
-    select_into_rows, synth_derived_def, synth_derived_def_outer, table_func_def,
-    table_func_def_outer, table_func_rows_outer,
+    Chained, arena_full, collect_aggs, collect_windows, common_using_type, select_into_rows,
+    synth_derived_def, synth_derived_def_outer, table_func_def, table_func_def_outer,
+    table_func_rows_outer,
 };
-
-/// Upper bound on distinct USING/NATURAL-merged columns across a join tree
-/// (chained merges of the same name allocate a fresh entry per join).
-pub const MAX_MERGED_COLUMNS: usize = crate::storage::MAX_COLUMNS;
 
 fn validate_table_sample<'a>(
     storage: &Storage,
@@ -96,8 +92,7 @@ fn validate_table_sample<'a>(
 #[derive(Clone, Copy)]
 pub struct MergedColumn<'d> {
     pub name: &'d str,
-    pub parts: [(usize, usize); MAX_JOIN_TABLES],
-    pub n_parts: usize,
+    pub parts: &'d [(usize, usize)],
     /// The merged column's type: the common type of the contributors.
     pub ctype: ColType,
 }
@@ -232,13 +227,12 @@ impl<'d> QueryScope<'d> {
             .iter()
             .map(|join| {
                 if join.natural {
-                    MAX_USING_COLUMNS
+                    MAX_COLUMNS
                 } else {
                     join.using.map_or(0, |using| using.columns.len())
                 }
             })
-            .sum::<usize>()
-            .min(MAX_MERGED_COLUMNS);
+            .sum::<usize>();
         let has_merges = merged_capacity != 0;
         let names = arena
             .alloc_slice_with(table_count, |_| "")
@@ -273,15 +267,14 @@ impl<'d> QueryScope<'d> {
         let merged = arena
             .alloc_slice_with(merged_capacity.max(1), |_| MergedColumn {
                 name: "",
-                parts: [(0, 0); MAX_JOIN_TABLES],
-                n_parts: 0,
+                parts: &[],
                 ctype: ColType::Bool,
             })
             .map_err(|_| arena_full())?;
         let output = arena
             .alloc_slice_with(
                 if has_merges {
-                    table_count * MAX_COLUMNS
+                    table_count.saturating_mul(MAX_COLUMNS)
                 } else {
                     1
                 },
@@ -1110,30 +1103,25 @@ impl<'d> QueryScope<'d> {
             }
             // The using-column list: explicit, or (NATURAL) every left-tree
             // output name the right table also has, in left output order.
-            let mut using = [""; MAX_USING_COLUMNS];
-            let mut n_using = 0usize;
-            if let Some(clause) = join.using {
-                using[..clause.columns.len()].copy_from_slice(clause.columns);
-                n_using = clause.columns.len();
+            let mut natural_using = [""; MAX_COLUMNS];
+            let using = if let Some(clause) = join.using {
+                clause.columns
             } else {
+                let mut n_using = 0usize;
                 for entry in &out[..n_out] {
                     let name = self.output_name(*entry);
-                    if right_def.column_index(name).is_some() && !using[..n_using].contains(&name) {
-                        if n_using == MAX_USING_COLUMNS {
-                            return Err(sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "NATURAL join merges more than {} columns",
-                                MAX_USING_COLUMNS
-                            ));
-                        }
-                        using[n_using] = name;
+                    if right_def.column_index(name).is_some()
+                        && !natural_using[..n_using].contains(&name)
+                    {
+                        natural_using[n_using] = name;
                         n_using += 1;
                     }
                 }
-            }
+                &natural_using[..n_using]
+            };
             let mut predicate: Option<&'d Expr<'d>> = None;
             let first_new_merge = self.n_merged;
-            for &name in &using[..n_using] {
+            for &name in using {
                 // The name must be unique in the left tree and present on
                 // the right (empirically pinned against PostgreSQL 18.4).
                 let mut left_entry = None;
@@ -1175,32 +1163,22 @@ impl<'d> QueryScope<'d> {
                         right_type.name()
                     ));
                 };
-                if self.n_merged == MAX_MERGED_COLUMNS {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "join tree merges more than {} USING columns",
-                        MAX_MERGED_COLUMNS
-                    ));
-                }
-                let mut merge = MergedColumn {
-                    name,
-                    parts: [(0, 0); MAX_JOIN_TABLES],
-                    n_parts: 0,
-                    ctype,
+                let (first_part, prior_parts) = match left {
+                    ResolvedColumn::Table(t, c) => (Some((t, c)), &[][..]),
+                    ResolvedColumn::Merged(m) => (None, self.merged[m].parts),
                 };
-                match left {
-                    ResolvedColumn::Table(t, c) => {
-                        merge.parts[0] = (t, c);
-                        merge.n_parts = 1;
-                    }
-                    ResolvedColumn::Merged(m) => {
-                        let prior = &self.merged[m];
-                        merge.parts[..prior.n_parts].copy_from_slice(&prior.parts[..prior.n_parts]);
-                        merge.n_parts = prior.n_parts;
-                    }
-                }
-                merge.parts[merge.n_parts] = (right_t, right_c);
-                merge.n_parts += 1;
+                let parts = scratch_arena
+                    .alloc_slice_with(
+                        prior_parts.len() + usize::from(first_part.is_some()) + 1,
+                        |index| {
+                            first_part
+                                .filter(|_| index == 0)
+                                .or_else(|| prior_parts.get(index).copied())
+                                .unwrap_or((right_t, right_c))
+                        },
+                    )
+                    .map_err(|_| arena_full())?;
+                let merge = MergedColumn { name, parts, ctype };
                 self.merged[self.n_merged] = merge;
                 self.n_merged += 1;
                 // Remove the consumed left entry; the merged column is
@@ -1264,7 +1242,7 @@ impl<'d> QueryScope<'d> {
             n_out += n_new;
             for c in 0..right_def.n_columns {
                 let consumed = (first_new_merge..self.n_merged)
-                    .any(|m| self.merged[m].parts[self.merged[m].n_parts - 1] == (right_t, c));
+                    .any(|m| self.merged[m].parts.last() == Some(&(right_t, c)));
                 if !consumed {
                     out[n_out] = ResolvedColumn::Table(right_t, c);
                     n_out += 1;
@@ -1299,8 +1277,8 @@ impl<'d> QueryScope<'d> {
             ResolvedColumn::Table(table, column) => {
                 self.defs[table].expect("resolved").columns[column].collation
             }
-            ResolvedColumn::Merged(merged) => self.merged[merged].parts
-                [..self.merged[merged].n_parts]
+            ResolvedColumn::Merged(merged) => self.merged[merged]
+                .parts
                 .first()
                 .map(|&(table, column)| {
                     self.defs[table].expect("resolved").columns[column].collation
@@ -1365,8 +1343,10 @@ impl<'d> QueryScope<'d> {
                 .map_err(|_| arena_full())?),
             ResolvedColumn::Merged(m) => {
                 let mc = &self.merged[m];
-                let mut args = [&Expr::Null as &'d Expr<'d>; MAX_JOIN_TABLES];
-                for (i, &(t, c)) in mc.parts[..mc.n_parts].iter().enumerate() {
+                let args = arena
+                    .alloc_slice_with(mc.parts.len(), |_| &Expr::Null as &'d Expr<'d>)
+                    .map_err(|_| arena_full())?;
+                for (i, &(t, c)) in mc.parts.iter().enumerate() {
                     args[i] = &*arena
                         .alloc(Expr::Column {
                             qualifier: Some(self.names[t]),
@@ -1374,9 +1354,6 @@ impl<'d> QueryScope<'d> {
                         })
                         .map_err(|_| arena_full())?;
                 }
-                let args = arena
-                    .alloc_slice_copy(&args[..mc.n_parts])
-                    .map_err(|_| arena_full())?;
                 Ok(&*arena
                     .alloc(Expr::Call {
                         name: "coalesce",

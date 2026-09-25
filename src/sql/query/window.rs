@@ -24,10 +24,10 @@ use crate::{sql_err, stack_format};
 use super::group::row_passes_correlated_where;
 use super::subquery::{correlated_in_expression, correlated_scan_conjuncts};
 use super::{
-    AggState, GroupedRewrite, MAX_JOIN_TABLES, Outcome, QueryScope, arena_full,
-    collect_grouped_aggs, merge_correlated, pax_column_demand, project_row, record_star_width,
-    resolve_order_target, rewrite_grouped_expr, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, sql_fail, sql_ok, window_row,
+    AggState, GroupedRewrite, Outcome, QueryScope, arena_full, collect_grouped_aggs,
+    merge_correlated, pax_column_demand, project_row, record_star_width, resolve_order_target,
+    rewrite_grouped_expr, scan_source_recycling_with_pax_columns, scan_source_with_pax_columns,
+    sql_fail, sql_ok, window_row,
 };
 
 fn window_scan_where<'a>(
@@ -1444,7 +1444,9 @@ pub(crate) fn project_window_rows<'a>(
     let (where_scalars, where_lists) =
         super::subquery::alloc_merge_scratch(Some(base), correlated, arena)?;
     // Flat-row column offsets per table.
-    let mut offs = [0usize; MAX_JOIN_TABLES];
+    let offs = arena
+        .alloc_slice_with(scope.n, |_| 0usize)
+        .map_err(|_| arena_full())?;
     let mut total = 0usize;
     for t in 0..scope.n {
         offs[t] = total;
@@ -1520,7 +1522,7 @@ pub(crate) fn project_window_rows<'a>(
                 .map_err(|_| arena_full())?;
             for (t, offset) in offs.iter().enumerate().take(scope.n) {
                 let def = scope.defs[t].expect("resolved");
-                let vals = row.values[t].expect("bound");
+                let vals = row.table_values(t).expect("bound");
                 for c in 0..def.n_columns {
                     flat[offset + c] = if vals.is_empty() {
                         Datum::Null
@@ -1541,9 +1543,8 @@ pub(crate) fn project_window_rows<'a>(
         .alloc_slice_with(win_nodes.len(), |_| empty)
         .map_err(|_| arena_full())?;
     for (wi, &node) in win_nodes.iter().enumerate() {
-        win_vals[wi] = compute_window(
-            storage, txid, node, rows, scope, &offs, arena, params, hooks,
-        )?;
+        win_vals[wi] =
+            compute_window(storage, txid, node, rows, scope, offs, arena, params, hooks)?;
     }
     let win_ptrs: &[*const Expr] = arena
         .alloc_slice_with(win_nodes.len(), |i| win_nodes[i] as *const Expr)
@@ -1577,7 +1578,7 @@ pub(crate) fn project_window_rows<'a>(
         for (w, wval) in win_vals.iter().enumerate().take(win_nodes.len()) {
             wv[w] = wval[i];
         }
-        let jr = window_row(scope, rows[i], &offs);
+        let jr = window_row(scope, rows[i], offs);
         // Correlated subqueries in the select list / ORDER BY re-evaluate per
         // output row (their outer references resolve to this window row).
         let row_subs;
@@ -1754,7 +1755,9 @@ pub(crate) fn external_window_into<'a>(
     let (where_scalars, where_lists) =
         super::subquery::alloc_merge_scratch(Some(base), correlated, arena)?;
     // Flat-row column offsets per table.
-    let mut offs = [0usize; MAX_JOIN_TABLES];
+    let offs = arena
+        .alloc_slice_with(scope.n, |_| 0usize)
+        .map_err(|_| arena_full())?;
     let mut total = 0usize;
     for (t, offset) in offs.iter_mut().enumerate().take(scope.n) {
         *offset = total;
@@ -1891,7 +1894,7 @@ pub(crate) fn external_window_into<'a>(
                                     for (t, offset) in offs.iter().enumerate().take(scope.n) {
                                         let nc = scope.defs[t].expect("resolved").n_columns;
                                         if flat < offset + nc {
-                                            let vals = row.values[t].expect("bound");
+                                            let vals = row.table_values(t).expect("bound");
                                             return if vals.is_empty() {
                                                 Datum::Null
                                             } else {
@@ -1933,29 +1936,29 @@ pub(crate) fn external_window_into<'a>(
                 .alloc_slice_with(16, |_| 0)
                 .map_err(|_| arena_full())?;
             let mut count = 0usize;
-            let mut finish_partition =
-                |rows: &[&'a [Datum<'a>]], pos_of: &[i64]| -> Result<(), SqlError> {
-                    let out = compute_window(
-                        storage, txid, node, rows, scope, &offs, arena, params, hooks,
-                    )?;
-                    for (r, &pos) in pos_of.iter().enumerate() {
-                        storage
-                            .with_block_store(|blocks| {
-                                win_sorter.push_projected_by(
-                                    blocks,
-                                    3,
-                                    |index| match index {
-                                        0 => Datum::Int8(pos),
-                                        1 => Datum::Int4(wi as i32),
-                                        _ => out[r],
-                                    },
-                                    &mut win_compare,
-                                )
-                            })
-                            .expect("spill-attached block store")?;
-                    }
-                    Ok(())
-                };
+            let mut finish_partition = |rows: &[&'a [Datum<'a>]],
+                                        pos_of: &[i64]|
+             -> Result<(), SqlError> {
+                let out =
+                    compute_window(storage, txid, node, rows, scope, offs, arena, params, hooks)?;
+                for (r, &pos) in pos_of.iter().enumerate() {
+                    storage
+                        .with_block_store(|blocks| {
+                            win_sorter.push_projected_by(
+                                blocks,
+                                3,
+                                |index| match index {
+                                    0 => Datum::Int8(pos),
+                                    1 => Datum::Int4(wi as i32),
+                                    _ => out[r],
+                                },
+                                &mut win_compare,
+                            )
+                        })
+                        .expect("spill-attached block store")?;
+                }
+                Ok(())
+            };
             loop {
                 let keep_scanning = {
                     let Some(context) = spec_reader.context() else {

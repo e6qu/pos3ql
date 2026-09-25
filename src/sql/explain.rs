@@ -13,7 +13,7 @@ use crate::sql::ast::{
     BinaryOp, ExplainFormat, ExplainOptions, ExplainSerialize, Expr, JoinKind, Select, SelectItem,
     SetOp, SetQuery, SetTree, Stmt,
 };
-use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::eval::{SqlError, arena_full, sqlstate};
 use crate::sql::guc::PlannerSettings;
 use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
@@ -927,8 +927,13 @@ pub(super) fn plan_select<'a>(
     let mut object_requests = 0u64;
     let mut cache_blocks = 0u64;
     let mut hash_join = false;
-    let mut table_order: [usize; query::MAX_JOIN_TABLES] = core::array::from_fn(|index| index);
-    let mut parameterized_indexes = [None; query::MAX_JOIN_TABLES];
+    let table_count = scope.as_ref().map_or(0, |scope| scope.n);
+    let table_order = arena
+        .alloc_slice_with(table_count, |index| index)
+        .map_err(|_| arena_full())?;
+    let parameterized_indexes = arena
+        .alloc_slice_with(table_count, |_| None)
+        .map_err(|_| arena_full())?;
     if let Some(scope) = &scope {
         let reorderable = statement.from.as_ref().is_some_and(|from| {
             from.joins
@@ -937,7 +942,12 @@ pub(super) fn plan_select<'a>(
                 && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
         });
         if reorderable {
-            table_order = query::join_order(storage, scope, statement.where_clause);
+            table_order.copy_from_slice(query::join_order(
+                storage,
+                scope,
+                statement.where_clause,
+                arena,
+            )?);
         }
         if let Some(from) = statement.from.as_ref() {
             for depth in 1..scope.n {
@@ -1462,16 +1472,20 @@ pub(super) fn plan_modification<'a>(
         let target_slot = relation_slot(storage, txid, target.schema, target.name)
             .expect("target existence checked above");
         let scope = QueryScope::resolve_schema(storage, from, txid, arena)?;
-        let mut order: [usize; query::MAX_JOIN_TABLES] = core::array::from_fn(|index| index);
+        let order = arena
+            .alloc_slice_with(scope.n, |index| index)
+            .map_err(|_| arena_full())?;
         if from
             .joins
             .iter()
             .all(|join| matches!(join.kind, JoinKind::Cross))
             && !scope.lateral[..scope.n].iter().any(|&lateral| lateral)
         {
-            order = query::join_order(storage, &scope, predicate);
+            order.copy_from_slice(query::join_order(storage, &scope, predicate, arena)?);
         }
-        let mut parameterized = [None; query::MAX_JOIN_TABLES];
+        let parameterized = arena
+            .alloc_slice_with(scope.n, |_| None)
+            .map_err(|_| arena_full())?;
         for depth in 0..scope.n {
             let table = order[depth];
             parameterized[table] = query::parameterized_index_access_plan(
@@ -1492,7 +1506,9 @@ pub(super) fn plan_modification<'a>(
         let mut rows = target_scan.rows.max(1);
         let mut object_requests = target_scan.object_requests;
         let mut cache_blocks = target_scan.cache_blocks;
-        let mut source_nodes = [PlanNode::EMPTY; query::MAX_JOIN_TABLES];
+        let source_nodes = arena
+            .alloc_slice_with(scope.n, |_| PlanNode::EMPTY)
+            .map_err(|_| arena_full())?;
         for &table in &order[..scope.n] {
             let node = scan_node(
                 storage,

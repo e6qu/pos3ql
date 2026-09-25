@@ -20,6 +20,8 @@ use crate::storage::{
     StoredQueryDependency,
 };
 
+use super::arena_full;
+
 #[derive(Clone, Copy)]
 struct CollectionContext<'a> {
     path: &'a PathContext,
@@ -1957,15 +1959,17 @@ fn record_relation_column_references<'a>(
     from: &'a crate::sql::ast::FromClause<'a>,
     select: &'a Select<'a>,
     dependencies: &mut StoredQueryDependencies,
-    _arena: &'a Arena,
+    arena: &'a Arena,
 ) -> Result<(), SqlError> {
-    let mut sources = [RelationSource {
-        class: DependencyClass::Table,
-        slot: 0,
-        exposed: "",
-        columns: [""; MAX_COLUMNS],
-        n_columns: 0,
-    }; super::MAX_JOIN_TABLES];
+    let sources = arena
+        .alloc_slice_with(from.joins.len() + 1, |_| RelationSource {
+            class: DependencyClass::Table,
+            slot: 0,
+            exposed: "",
+            columns: [""; MAX_COLUMNS],
+            n_columns: 0,
+        })
+        .map_err(|_| arena_full())?;
     let mut n_sources = 0;
     for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
         if table.subquery.is_some() || table.is_function_source() {
@@ -1975,12 +1979,6 @@ fn record_relation_column_references<'a>(
         else {
             continue;
         };
-        if n_sources == sources.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "view query exceeds static source bound"
-            ));
-        }
         let source = &mut sources[n_sources];
         source.exposed = table.alias.unwrap_or(table.table);
         match relation {
@@ -2137,7 +2135,7 @@ fn mark_resolved_column(
             dependencies.mark_referenced_column(DependencyClass::Table, scope.slots[table], column)
         }
         super::ResolvedColumn::Merged(merged) => {
-            for &(table, column) in &scope.merged[merged].parts[..scope.merged[merged].n_parts] {
+            for &(table, column) in scope.merged[merged].parts {
                 dependencies.mark_referenced_column(
                     DependencyClass::Table,
                     scope.slots[table],

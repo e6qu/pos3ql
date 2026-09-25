@@ -15,7 +15,7 @@ use crate::sql::types::Datum;
 use crate::sql_err;
 use crate::storage::Storage;
 
-use super::{MAX_JOIN_TABLES, QueryScope, ResolvedColumn, ScopeCols, arena_full};
+use super::{MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, ScopeCols, arena_full};
 
 /// Top-level qualification terms retained for cost ordering and join
 /// pushdown. A full 64-relation equality chain has 63 terms; leave another
@@ -25,6 +25,9 @@ pub(super) const MAX_CONJUNCTS: usize = 128;
 /// The set of table indices (as a bitmask) an expression references. `None` if
 /// it contains a construct not analyzable for pushdown (subquery, aggregate, …).
 pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> {
+    if scope.n > MAX_OPTIMIZED_JOIN_TABLES {
+        return None;
+    }
     use Expr::*;
     match expression {
         Null | Bool(_) | Int(_) | Float(_) | NumericLit(_) | Str(_) | BitLit(_) | Param(_) => {
@@ -35,11 +38,7 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
             // Merged USING/NATURAL column: reads every contributing table.
             ResolvedColumn::Merged(m) => {
                 let mc = &scope.merged[m];
-                Some(
-                    mc.parts[..mc.n_parts]
-                        .iter()
-                        .fold(0u64, |mask, &(t, _)| mask | (1 << t)),
-                )
+                Some(mc.parts.iter().fold(0u64, |mask, &(t, _)| mask | (1 << t)))
             }
         },
         Unary { operand, .. }
@@ -109,14 +108,17 @@ pub(super) fn expr_tables(expression: &Expr, scope: &QueryScope) -> Option<u64> 
 /// plan stable across equivalent FROM permutations without stored statistics,
 /// and pushes unconstrained tables last. Results do not change because join
 /// order is free for inner/cross joins.
-pub(crate) fn join_order(
+pub(crate) fn join_order<'a>(
     storage: &Storage,
     scope: &QueryScope,
     where_clause: Option<&Expr>,
-) -> [usize; MAX_JOIN_TABLES] {
-    let mut order = core::array::from_fn(|i| i);
-    fill_join_order(storage, scope, where_clause, &mut order[..scope.n]);
-    order
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let order = arena
+        .alloc_slice_with(scope.n, |index| index)
+        .map_err(|_| arena_full())?;
+    fill_join_order(storage, scope, where_clause, order);
+    Ok(order)
 }
 
 pub(crate) fn fill_join_order(
@@ -126,7 +128,7 @@ pub(crate) fn fill_join_order(
     order: &mut [usize],
 ) {
     let n = scope.n;
-    if n < 2 {
+    if !(2..=MAX_OPTIMIZED_JOIN_TABLES).contains(&n) {
         return;
     }
     // Collect analyzable WHERE conjuncts and their static selectivity.

@@ -1447,6 +1447,11 @@ if "$PY" "$EXT/result_column_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > 
 else
   bad "result-column capacity differential"; cat "$WORK/result-column-capacity.out"
 fi
+if "$PY" "$EXT/join_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/join-capacity.out" 2>&1; then
+  ok "join capacity differential ($(tail -1 "$WORK/join-capacity.out"))"
+else
+  bad "join capacity differential"; cat "$WORK/join-capacity.out"
+fi
 if "$PY" "$EXT/type_fidelity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/type_fidelity.out" 2>&1; then
   ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type_fidelity.out"))"
 else

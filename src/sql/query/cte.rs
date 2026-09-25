@@ -20,7 +20,7 @@ use crate::sql_err;
 use crate::storage::Storage;
 
 use super::setops::{describe_set_body, external_set_body_into, materialize_set_body};
-use super::{MAX_JOIN_TABLES, and_where, arena_full, check_timeout};
+use super::{and_where, arena_full, check_timeout};
 
 /// Expands a statement's `WITH` list (and any view reference) for the
 /// describe path, which needs the shape but not the rows.
@@ -436,12 +436,6 @@ fn prepend_rule_source<'a>(
             joins: &[],
         });
     };
-    if existing.joins.len() + 1 >= super::MAX_JOIN_TABLES {
-        return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "rewrite action has too many joined relations"
-        ));
-    }
     let joins = arena
         .alloc_slice_with(existing.joins.len() + 1, |index| {
             if index == 0 {
@@ -4351,30 +4345,22 @@ fn subst_from<'a>(
     arena: &'a Arena,
 ) -> Result<FromClause<'a>, SqlError> {
     let base = subst_tableref(&f.base, context, arena)?;
-    let dummy = Join {
-        table: f.base,
-        kind: JoinKind::Inner,
-        on: None,
-        using: None,
-        natural: false,
-    };
-    let mut joins = [dummy; MAX_JOIN_TABLES - 1];
-    if f.joins.len() > joins.len() {
-        return Err(sql_err!(sqlstate::TOO_MANY_ARGUMENTS, "too many joins"));
+    let mut joins = crate::mem::arena::ArenaList::new(arena);
+    for j in f.joins {
+        joins
+            .push(Join {
+                table: subst_tableref(&j.table, context, arena)?,
+                kind: j.kind,
+                on: opt_subst(j.on, context, arena)?,
+                using: j.using,
+                natural: j.natural,
+            })
+            .map_err(|_| arena_full())?;
     }
-    for (i, j) in f.joins.iter().enumerate() {
-        joins[i] = Join {
-            table: subst_tableref(&j.table, context, arena)?,
-            kind: j.kind,
-            on: opt_subst(j.on, context, arena)?,
-            using: j.using,
-            natural: j.natural,
-        };
-    }
-    let joins = arena
-        .alloc_slice_copy(&joins[..f.joins.len()])
-        .map_err(|_| arena_full())?;
-    Ok(FromClause { base, joins })
+    Ok(FromClause {
+        base,
+        joins: joins.as_slice(),
+    })
 }
 
 fn subst_tableref<'a>(

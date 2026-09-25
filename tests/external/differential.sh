@@ -440,6 +440,13 @@ else
   bad "result-column capacity differential"
   cat "$WORK/result-column-capacity.out"
 fi
+if python3 "$EXT/join_capacity_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
+     > "$WORK/join-capacity.out" 2>&1; then
+  ok "join capacity differential ($(tail -1 "$WORK/join-capacity.out"))"
+else
+  bad "join capacity differential"
+  cat "$WORK/join-capacity.out"
+fi
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
        --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/type-fidelity.out" 2>&1; then

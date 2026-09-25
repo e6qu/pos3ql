@@ -31703,12 +31703,13 @@ fn info_table_constraints<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("table_constraints", true);
-    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
-        * (crate::storage::MAX_COLUMNS * 2
-            + crate::storage::MAX_UNIQUES
-            + crate::storage::MAX_CHECKS
-            + crate::storage::MAX_FKEYS);
-    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let per_table = crate::storage::MAX_COLUMNS * 2
+        + crate::storage::MAX_UNIQUES
+        + crate::storage::MAX_CHECKS
+        + crate::storage::MAX_FKEYS;
+    let output = arena
+        .alloc_slice_with(storage.table_count().saturating_mul(per_table), |_| &[][..])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     let mut append = |name: &str,
                       kind: &str,
@@ -31917,11 +31918,12 @@ fn info_key_column_usage<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("key_column_usage", true);
-    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES
-        * (crate::storage::MAX_COLUMNS
-            + crate::storage::MAX_UNIQUES * crate::storage::MAX_INDEX_COLS
-            + crate::storage::MAX_FKEYS * crate::storage::MAX_INDEX_COLS);
-    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let per_table = crate::storage::MAX_COLUMNS
+        + crate::storage::MAX_UNIQUES * crate::storage::MAX_INDEX_COLS
+        + crate::storage::MAX_FKEYS * crate::storage::MAX_INDEX_COLS;
+    let output = arena
+        .alloc_slice_with(storage.table_count().saturating_mul(per_table), |_| &[][..])
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     let mut append = |table: &TableDef,
                       name: &str,
@@ -32800,8 +32802,14 @@ fn info_referential_constraints<'a>(
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = schema::require("referential_constraints", true);
-    const MAX_ROWS: usize = crate::sql::query::MAX_JOIN_TABLES * crate::storage::MAX_FKEYS;
-    let mut output: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
+    let output = arena
+        .alloc_slice_with(
+            storage
+                .table_count()
+                .saturating_mul(crate::storage::MAX_FKEYS),
+            |_| &[][..],
+        )
+        .map_err(|_| arena_full())?;
     let mut count = 0;
     for slot in 0..storage.table_count() {
         if !storage.table_slot_visible_to(slot, txid) {

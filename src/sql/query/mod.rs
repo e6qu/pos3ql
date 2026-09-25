@@ -60,7 +60,7 @@ pub(crate) use scan::{
 
 mod scope;
 pub(crate) use cte::{bind_dml_materialized_relations, bind_materialized_relations};
-pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
+pub use scope::{MergedColumn, QueryScope, ResolvedColumn};
 
 mod cte;
 mod dependencies;
@@ -402,14 +402,9 @@ use window::{
     rewrite_grouped_windows, window_select,
 };
 
-/// Static executor envelope for one range table.
-///
-/// This matches the largest catalog the server's conformance configuration
-/// can expose and keeps every range-table array allocation-free.  Runtime
-/// work is proportional to `QueryScope::n`; the envelope only reserves
-/// scratch, so a query can use every configured relation slot without a
-/// second, smaller executor limit.
-pub const MAX_JOIN_TABLES: usize = 64;
+/// Relation count handled by compact `u64` planner proofs. Wider joins execute
+/// exactly with arena-sized state and skip these optional access-path proofs.
+pub(crate) const MAX_OPTIMIZED_JOIN_TABLES: usize = u64::BITS as usize;
 use core::cell::{Cell, RefCell};
 std::thread_local! {
     /// Wall-clock deadline (micros since 2000-01-01) for the running statement;
@@ -5079,16 +5074,14 @@ pub(super) fn collect_windows<'a>(
 fn window_row<'r, 'a>(
     scope: &'r QueryScope<'a>,
     flat: &'r [Datum<'a>],
-    offs: &[usize],
+    offs: &'r [usize],
 ) -> JoinRow<'r, 'a, 'a> {
-    let mut values: [Option<&[Datum]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
-    for (t, offset) in offs.iter().enumerate().take(scope.n) {
-        let nc = scope.defs[t].expect("resolved").n_columns;
-        values[t] = Some(&flat[*offset..*offset + nc]);
-    }
     JoinRow {
         scope,
-        values,
+        values: scan::JoinRowValues::Flat {
+            values: flat,
+            offsets: offs,
+        },
         rowids: &[],
     }
 }
@@ -5747,10 +5740,9 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     // Subqueries first (uncorrelated, evaluated once).
     let n_items = statement.items.len();
     let n_order = statement.order_by.len();
-    let sub_exprs = match arena
-        .alloc_slice_with(4 + n_items + n_order + 2 * MAX_JOIN_TABLES, |_| {
-            Option::<&Expr>::None
-        }) {
+    let sub_exprs = match arena.alloc_slice_with(4 + n_items + n_order + 2 * scope.n, |_| {
+        Option::<&Expr>::None
+    }) {
         Ok(s) => s,
         Err(_) => return sql_fail(arena_full()),
     };
@@ -7004,8 +6996,9 @@ fn select_into_rows_mode<'a>(
         let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, seq, outer)?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
         check_key_types(statement, &scope, arena)?;
-        let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ + 2 * MAX_JOIN_TABLES] =
-            [None; 2 + MAX_PROJ + 2 * MAX_JOIN_TABLES];
+        let sub_exprs = arena
+            .alloc_slice_with(2 + statement.items.len() + 2 * scope.n, |_| None)
+            .map_err(|_| arena_full())?;
         sub_exprs[0] = statement.where_clause;
         sub_exprs[1] = statement.having;
         for (i, item) in statement.items.iter().enumerate() {
@@ -7013,8 +7006,8 @@ fn select_into_rows_mode<'a>(
                 sub_exprs[2 + i] = Some(expression);
             }
         }
-        collect_table_sample_expressions(from, &mut sub_exprs[2 + MAX_PROJ..]);
-        let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
+        collect_table_sample_expressions(from, &mut sub_exprs[2 + statement.items.len()..]);
+        let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params)?;
         let hooks = EvalHooks {
             group: None,
             aggs: None,
@@ -7052,8 +7045,13 @@ fn select_into_rows_mode<'a>(
         }
         return Ok(());
     }
-    let mut sub_exprs: [Option<&Expr>; 1 + MAX_PROJ + 2 * MAX_JOIN_TABLES] =
-        [None; 1 + MAX_PROJ + 2 * MAX_JOIN_TABLES];
+    let sample_capacity = statement
+        .from
+        .as_ref()
+        .map_or(0, |from| 2 * (from.joins.len() + 1));
+    let sub_exprs = arena
+        .alloc_slice_with(1 + statement.items.len() + sample_capacity, |_| None)
+        .map_err(|_| arena_full())?;
     sub_exprs[0] = statement.where_clause;
     for (i, item) in statement.items.iter().enumerate() {
         if let SelectItem::Expr { expression, .. } = item {
@@ -7096,7 +7094,7 @@ fn select_into_rows_mode<'a>(
         // FROM-less: one row (or zero, when WHERE is false), unless a
         // set-returning function in the list expands it to several.
         let subs = prepare_subqueries(
-            &sub_exprs,
+            sub_exprs,
             storage,
             txid,
             arena,
@@ -7169,9 +7167,9 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     };
 
-    collect_table_sample_expressions(from, &mut sub_exprs[1 + MAX_PROJ..]);
+    collect_table_sample_expressions(from, &mut sub_exprs[1 + statement.items.len()..]);
     let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, seq, outer)?;
-    let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
+    let outer_subs = prepare_outer_subqueries(sub_exprs, storage, txid, arena, params)?;
     let correlated = outer_subs.correlated;
     let where_correlated = correlated_in_expression(statement.where_clause, correlated, arena)?;
     let hooks = EvalHooks {
@@ -7596,7 +7594,7 @@ fn project_row_skipping<'a>(
             SelectItem::TableWildcard(q) => {
                 let value_of = |entry| match entry {
                     ResolvedColumn::Table(t, c) => {
-                        let values = row.values[t].expect("bound");
+                        let values = row.table_values(t).expect("bound");
                         if values.is_empty() {
                             Datum::Null
                         } else {
@@ -7605,10 +7603,11 @@ fn project_row_skipping<'a>(
                     }
                     ResolvedColumn::Merged(m) => {
                         let merged = &scope.merged[m];
-                        merged.parts[..merged.n_parts]
+                        merged
+                            .parts
                             .iter()
                             .map(|&(t, c)| {
-                                let values = row.values[t].expect("bound");
+                                let values = row.table_values(t).expect("bound");
                                 if values.is_empty() {
                                     Datum::Null
                                 } else {
@@ -7632,7 +7631,7 @@ fn project_row_skipping<'a>(
             }
             SelectItem::Wildcard => {
                 let value_of = |t: usize, c: usize| {
-                    let vals = row.values[t].expect("bound");
+                    let vals = row.table_values(t).expect("bound");
                     if vals.is_empty() {
                         Datum::Null
                     } else {
@@ -7651,7 +7650,7 @@ fn project_row_skipping<'a>(
                         // Merged USING/NATURAL column: first non-null side.
                         ResolvedColumn::Merged(m) => {
                             let mc = &scope.merged[m];
-                            mc.parts[..mc.n_parts]
+                            mc.parts
                                 .iter()
                                 .map(|&(t, c)| value_of(t, c))
                                 .find(|v| !v.is_null())
@@ -9310,10 +9309,12 @@ pub fn first_from_match<'a>(
 ) -> Result<bool, SqlError> {
     let scope =
         QueryScope::resolve_exec_outer(storage, from, txid, arena, params, None, Some(target))?;
-    let mut subquery_expressions = [None; 1 + 2 * MAX_JOIN_TABLES];
+    let subquery_expressions = arena
+        .alloc_slice_with(1 + 2 * scope.n, |_| None)
+        .map_err(|_| arena_full())?;
     subquery_expressions[0] = where_clause;
     collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
-    let subs = subquery_hooks(&subquery_expressions, storage, txid, arena, params)?;
+    let subs = subquery_hooks(subquery_expressions, storage, txid, arena, params)?;
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,

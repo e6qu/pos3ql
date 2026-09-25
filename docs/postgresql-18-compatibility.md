@@ -155,10 +155,13 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   recycled per-set scratch keep the complete accepted shape within fixed
   statement memory. Query results accept PostgreSQL's complete 1,664-column
   target-list width through simple and extended protocol, including one Bind
-  format per column. Remaining fixed boundaries are 64 `JOIN ... USING`
-  columns and join relations. Differential and
-  allocation-forbidden coverage crosses the former boundaries and recovers
-  stored results with empty local caches.
+  format per column. Join range tables and accumulated `USING` merge state use
+  statement memory; compact access-path proofs remain optional for wider
+  joins, which execute in identity order with full-row decoding. PostgreSQL 18
+  differential and allocation-forbidden coverage crosses 64 relations through
+  plans, stored views, windows, materialization, subqueries, and joined DML.
+  One explicit `USING` list remains bounded by the 64-column source-row shape.
+  Stored results recover with empty local caches.
 - Program length does not share that 64-item arity limit. Simple-protocol
   batches, SQL-language bodies, and PL/pgSQL bodies are sized from their source
   in the fixed statement arena. PL/pgSQL locals, branches, exception handlers

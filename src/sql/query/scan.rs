@@ -29,7 +29,7 @@ use super::plan::{
     is_error_safe,
 };
 use super::{
-    MAX_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, reorder_qual,
+    MAX_OPTIMIZED_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, reorder_qual,
     simplify_qual, where_passes,
 };
 
@@ -102,20 +102,22 @@ fn sample_includes(plan: Option<TableSamplePlan>, rowid: Option<u64>) -> Result<
 
 #[derive(Clone, Copy)]
 struct ActivePolicyTables {
-    slots: [usize; MAX_JOIN_TABLES],
+    slots: [usize; MAX_POLICY_DEPTH],
     count: usize,
 }
 
 std::thread_local! {
     static ACTIVE_POLICY_TABLES: core::cell::Cell<ActivePolicyTables> = const {
         core::cell::Cell::new(ActivePolicyTables {
-            slots: [usize::MAX; MAX_JOIN_TABLES],
+            slots: [usize::MAX; MAX_POLICY_DEPTH],
             count: 0,
         })
     };
 }
 
 struct PolicyEvaluationGuard(ActivePolicyTables);
+
+const MAX_POLICY_DEPTH: usize = 64;
 
 impl Drop for PolicyEvaluationGuard {
     fn drop(&mut self) {
@@ -631,7 +633,7 @@ impl<'a> IndexedCandidates<'a> {
 /// encoding; a columnar source can instead hand the executor its already
 /// decoded selected values without reconstituting unneeded payloads.
 #[derive(Clone, Copy)]
-enum BoundRow<'a> {
+pub(crate) enum BoundRow<'a> {
     Encoded(&'a [u8]),
     Values(&'a [Datum<'a>]),
 }
@@ -643,7 +645,7 @@ enum BoundRow<'a> {
 /// column from its decoded row.
 #[derive(Clone, Copy)]
 struct PaxColumnDemand {
-    masks: [u64; MAX_JOIN_TABLES],
+    masks: [u64; MAX_OPTIMIZED_JOIN_TABLES],
 }
 
 /// Why a source intentionally uses full-row decoding.
@@ -708,12 +710,12 @@ impl PaxReadDemand {
 impl PaxColumnDemand {
     const fn empty() -> Self {
         Self {
-            masks: [0; MAX_JOIN_TABLES],
+            masks: [0; MAX_OPTIMIZED_JOIN_TABLES],
         }
     }
 
     fn observe(&mut self, table: usize, column: usize) {
-        debug_assert!(table < MAX_JOIN_TABLES);
+        debug_assert!(table < MAX_OPTIMIZED_JOIN_TABLES);
         debug_assert!(column < u64::BITS as usize);
         self.masks[table] |= 1u64 << column;
     }
@@ -734,7 +736,10 @@ pub(super) fn pax_column_demand(
     from: &FromClause,
     expressions: &[&Expr],
 ) -> PaxReadDemand {
-    if scope.n == 0 || scope.defs[..scope.n].iter().any(Option::is_none) {
+    if scope.n == 0
+        || scope.n > MAX_OPTIMIZED_JOIN_TABLES
+        || scope.defs[..scope.n].iter().any(Option::is_none)
+    {
         return PaxReadDemand::full_row(PaxFullRowReason::IncompleteScope);
     }
     pax_column_demand_bounded(scope, from, expressions)
@@ -2193,7 +2198,7 @@ pub(crate) fn parameterized_index_access_plan<'a>(
     outer_available: bool,
     arena: &'a Arena,
 ) -> Result<Option<IndexAccessPlan<'a>>, SqlError> {
-    if depth >= scope.n || (depth == 0 && !outer_available) {
+    if scope.n > MAX_OPTIMIZED_JOIN_TABLES || depth >= scope.n || (depth == 0 && !outer_available) {
         return Ok(None);
     }
     let table = order[depth];
@@ -2242,7 +2247,7 @@ pub(crate) fn parameterized_index_access_plan<'a>(
         {
             Ok(ResolvedColumn::Table(source, _)) => tables |= 1u64 << source,
             Ok(ResolvedColumn::Merged(merged)) => {
-                for &(source, _) in &scope.merged[merged].parts[..scope.merged[merged].n_parts] {
+                for &(source, _) in scope.merged[merged].parts {
                     tables |= 1u64 << source;
                 }
             }
@@ -3796,17 +3801,63 @@ fn compare_ordered_index_keys(
 
 /// One assembled source row: per table, decoded values (empty slice =
 /// LEFT-join null row; None = not yet joined).
+#[derive(Clone, Copy)]
+pub(crate) enum JoinRowValues<'s, 'v> {
+    Bound {
+        bound: &'s [Option<BoundRow<'v>>],
+        order: &'s [usize],
+        count: usize,
+        buffers: &'s [[Datum<'v>; MAX_COLUMNS]],
+    },
+    Flat {
+        values: &'s [Datum<'v>],
+        offsets: &'s [usize],
+    },
+}
+
 pub struct JoinRow<'s, 'v, 'd> {
     pub scope: &'s QueryScope<'d>,
-    pub values: [Option<&'s [Datum<'v>]>; MAX_JOIN_TABLES],
+    pub(crate) values: JoinRowValues<'s, 'v>,
     /// Stable MVCC identities for physical base-table contributors. Derived
     /// rows, function rows, and outer-join null sides carry `None`.
     pub rowids: &'s [Option<u64>],
 }
 
+impl<'s, 'v> JoinRow<'s, 'v, '_> {
+    pub(crate) fn table_values(&self, table: usize) -> Option<&'s [Datum<'v>]> {
+        match self.values {
+            JoinRowValues::Bound {
+                bound,
+                order,
+                count,
+                buffers,
+            } => {
+                let position = order[..count].iter().position(|source| *source == table)?;
+                match bound[table] {
+                    Some(BoundRow::Encoded(bytes)) => {
+                        let width = if self.scope.derived[table].is_some() {
+                            crate::sql::exec::projected_row_width(bytes)
+                        } else {
+                            self.scope.defs[table].expect("resolved").n_columns
+                        };
+                        Some(&buffers[position][..width])
+                    }
+                    Some(BoundRow::Values(values)) => Some(values),
+                    None => Some(&[]),
+                }
+            }
+            JoinRowValues::Flat { values, offsets } => {
+                let start = *offsets.get(table)?;
+                let width = self.scope.defs[table].expect("resolved").n_columns;
+                Some(&values[start..start + width])
+            }
+        }
+    }
+}
+
 impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
-        let one = |t: usize, c: usize| match self.values[t] {
+        let one = |t: usize, c: usize| match self.table_values(t) {
             // Empty slice = LEFT-join null row.
             Some([]) => Ok(Datum::Null),
             Some(vals) => Ok(vals[c]),
@@ -3821,7 +3872,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             // Merged USING/NATURAL column: the first non-null contributor.
             ResolvedColumn::Merged(m) => {
                 let mc = &self.scope.merged[m];
-                for &(t, c) in &mc.parts[..mc.n_parts] {
+                for &(t, c) in mc.parts {
                     let v = one(t, c)?;
                     if !v.is_null() {
                         return Ok(v);
@@ -3835,7 +3886,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
         let table = self.scope.table_index(qualifier)?;
         let visible = self.scope.defs[table].expect("resolved").n_columns;
-        self.values[table]
+        self.table_values(table)
             .and_then(|values| values.get(visible + index))
             .copied()
             .ok_or_else(|| {
@@ -3858,8 +3909,8 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
                 .and_then(|definition| definition.columns.get(column))
                 .map(|column| column.collation)
                 .unwrap_or(crate::sql::ast::Collation::None),
-            Some(ResolvedColumn::Merged(merged)) => self.scope.merged[merged].parts
-                [..self.scope.merged[merged].n_parts]
+            Some(ResolvedColumn::Merged(merged)) => self.scope.merged[merged]
+                .parts
                 .first()
                 .and_then(|&(table, column)| self.scope.defs[table]?.columns.get(column))
                 .map(|column| column.collation)
@@ -3896,7 +3947,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             return Ok(true);
         }
         let t = self.scope.table_index(table)?;
-        match self.values[t] {
+        match self.table_values(t) {
             Some([]) => Ok(false), // outer-join null row
             Some(_) => Ok(true),
             None => Err(sql_err!(
@@ -3932,7 +3983,7 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
         let t = self.scope.table_index(table)?;
         let def = self.scope.defs[t].expect("resolved");
-        let vals = match self.values[t] {
+        let vals = match self.table_values(t) {
             Some([]) => return Ok(None), // outer-join null row
             Some(vals) => vals,
             None => {
@@ -5244,17 +5295,15 @@ fn scan_source_mode<'a>(
         storage: &Storage,
         txid: u32,
         scope: &'s QueryScope<'d>,
-        bound: &[Option<BoundRow<'v>>],
+        bound: &'s [Option<BoundRow<'v>>],
         bound_rowids: &'s [Option<u64>],
-        order: &[usize],
+        order: &'s [usize],
         count: usize,
         buffers: &'s mut [[Datum<'v>; MAX_COLUMNS]],
         arena: &'v Arena,
     ) -> Result<JoinRow<'s, 'v, 'd>, SqlError> {
-        let mut values: [Option<&[Datum]>; MAX_JOIN_TABLES] = [None; MAX_JOIN_TABLES];
         // Split buffers so each table borrows a distinct buffer. `order` maps the
-        // execution position to the scope-table index, so a reordered join still
-        // fills each table's own `values` slot.
+        // execution position to the scope-table index.
         let mut rest: &mut [[Datum<'v>; MAX_COLUMNS]] = buffers;
         for &t in order.iter().take(count) {
             let (buffer, tail) = rest.split_first_mut().expect("enough buffers");
@@ -5276,22 +5325,24 @@ fn scan_source_mode<'a>(
                             // field access sees its shape.
                             *slot = crate::sql::exec::decode_projected_col_record(bytes, c, arena)?;
                         }
-                        values[t] = Some(&buffer[..width]);
                     } else {
                         let mut schema = [ColType::Bool; MAX_COLUMNS];
                         def.schema(&mut schema);
                         rowenc::decode(bytes, &schema[..def.n_columns], buffer)?;
                         refresh_catalog_object_names(storage, txid, buffer, arena)?;
-                        values[t] = Some(&buffer[..def.n_columns]);
                     }
                 }
-                Some(BoundRow::Values(row_values)) => values[t] = Some(row_values),
-                None => values[t] = Some(&[]), // outer-join null row
+                Some(BoundRow::Values(_)) | None => {}
             }
         }
         Ok(JoinRow {
             scope,
-            values,
+            values: JoinRowValues::Bound {
+                bound,
+                order,
+                count,
+                buffers,
+            },
             rowids: &bound_rowids[..scope.n],
         })
     }
@@ -5982,7 +6033,9 @@ fn scan_source_mode<'a>(
             )?;
             let context = crate::sql::exec::RowCtx {
                 def: scope.defs[source].expect("row-security source is resolved"),
-                values: assembled.values[source].expect("row-security row is bound"),
+                values: assembled
+                    .table_values(source)
+                    .expect("row-security row is bound"),
                 alias: None,
             };
             if !row_security_passes(plan, &context, storage, txid, arena, params, hooks)? {
@@ -6790,7 +6843,9 @@ fn scan_source_mode<'a>(
         indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?
     };
     let indexed = indexed_override.or(automatic_indexed.as_ref());
-    let mut parameterized_plans = [None; MAX_JOIN_TABLES];
+    let parameterized_plans = arena
+        .alloc_slice_with(scope.n, |_| None)
+        .map_err(|_| arena_full())?;
     for depth in 0..scope.n {
         if automatic_index
             && security_plans[order[depth]].is_none()
@@ -6960,7 +7015,7 @@ fn scan_source_mode<'a>(
                     )?;
                     let context = crate::sql::exec::RowCtx {
                         def: scope.defs[d].expect("row-security source is resolved"),
-                        values: row.values[d].expect("row-security row is bound"),
+                        values: row.table_values(d).expect("row-security row is bound"),
                         alias: None,
                     };
                     if !row_security_passes(plan, &context, storage, txid, arena, params, hooks)? {

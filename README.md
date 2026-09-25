@@ -275,8 +275,10 @@ the fixed statement arena. Grouping accepts PostgreSQL 18's 1,664 target-list
 entries, 4,096 expanded grouping sets, 12 `CUBE` elements, and 31 `GROUPING()`
 arguments. Query results match PostgreSQL's 1,664-column target-list boundary,
 including Statement Describe and per-column text or binary Bind formats.
-Remaining fixed statement boundaries are 64 join relations and `USING`
-columns.
+Join range tables and accumulated `USING` merge state use statement memory;
+128-relation execution is qualified through plans, stored views, windows,
+materialization, subqueries, joined DML, and PostgreSQL 18 differential tests.
+One explicit `USING` list remains bounded by the 64-column source-row shape.
 XMLTABLE, JSON_TABLE, and publication-introspection rows use statement memory.
 `EXPLAIN` plan nodes live in the fixed statement arena rather than the worker
 stack, and arena exhaustion returns

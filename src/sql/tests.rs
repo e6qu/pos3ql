@@ -7,6 +7,138 @@
 use super::*;
 
 #[test]
+fn wide_join_trees_execute_without_allocation() {
+    let result = std::thread::Builder::new()
+        .name("join-capacity".into())
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+        .spawn(|| {
+            use core::fmt::Write;
+
+            const RELATIONS: usize = 128;
+            let config = test_config("join-capacity");
+            let mut budget = Budget::new(1 << 28);
+            let mut engine = Engine::new(&config, &mut budget).unwrap();
+            let setup = run_with(
+                &mut engine,
+                &mut budget,
+                "CREATE TABLE j(id integer); \
+                 INSERT INTO j VALUES (1); \
+                 CREATE TABLE join_capacity_target(id integer, note text); \
+                 INSERT INTO join_capacity_target VALUES (1, 'before')",
+            );
+            assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+
+            let mut sources = String::new();
+            for index in 0..RELATIONS {
+                if index != 0 {
+                    sources.push(',');
+                }
+                write!(sources, "j t{index}").unwrap();
+            }
+            let cross = format!("SELECT t0.id+t127.id FROM {sources}");
+            let output = run_with_fixed_memory(&mut engine, &budget, &cross, 32 << 20);
+            assert_eq!(
+                data_rows(&output),
+                ["2"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+
+            let ordered = format!("{cross} ORDER BY 1");
+            let output = run_with_fixed_memory(&mut engine, &budget, &ordered, 32 << 20);
+            assert_eq!(
+                data_rows(&output),
+                ["2"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+
+            let window = format!("SELECT row_number() OVER (), t0.id+t127.id FROM {sources}");
+            let output = run_with_fixed_memory(&mut engine, &budget, &window, 32 << 20);
+            assert_eq!(
+                data_rows(&output),
+                ["1|2"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+
+            let exists = format!("SELECT EXISTS ({cross})");
+            let output = run_with_fixed_memory(&mut engine, &budget, &exists, 32 << 20);
+            assert_eq!(
+                data_rows(&output),
+                ["t"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+
+            let explain = format!("EXPLAIN {cross}");
+            let output = run_with_fixed_memory(&mut engine, &budget, &explain, 32 << 20);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+
+            let create_view = format!(
+                "CREATE VIEW join_capacity_view AS SELECT t0.id+t127.id AS total FROM {sources}"
+            );
+            let output = run_with_fixed_memory(&mut engine, &budget, &create_view, 32 << 20);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+            let output = run_with_fixed_memory(
+                &mut engine,
+                &budget,
+                "SELECT total FROM join_capacity_view",
+                32 << 20,
+            );
+            assert_eq!(
+                data_rows(&output),
+                ["2"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+
+            let update = format!(
+                "UPDATE join_capacity_target SET note='after' FROM {sources} \
+                 WHERE t0.id=t127.id RETURNING join_capacity_target.note"
+            );
+            let output = run_with_fixed_memory(&mut engine, &budget, &update, 32 << 20);
+            assert_eq!(
+                data_rows(&output),
+                ["after"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+
+            let mut using = String::from("SELECT id FROM j AS t0");
+            for index in 1..RELATIONS {
+                write!(using, " JOIN j AS t{index} USING (id)").unwrap();
+            }
+            let output = run_with_fixed_memory(&mut engine, &budget, &using, 32 << 20);
+            assert_eq!(
+                data_rows(&output),
+                ["1"],
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        })
+        .unwrap()
+        .join();
+    if let Err(payload) = result {
+        if let Some(message) = payload.downcast_ref::<&str>() {
+            panic!("{message}");
+        }
+        if let Some(message) = payload.downcast_ref::<String>() {
+            panic!("{message}");
+        }
+        panic!("join capacity thread panicked");
+    }
+}
+
+#[test]
 fn postgresql_result_column_capacity_executes_without_allocation() {
     let result = std::thread::Builder::new()
         .name("result-column-capacity".into())

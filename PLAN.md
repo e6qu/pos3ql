@@ -62,7 +62,8 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- 64 joined relations and 64 `USING` columns;
+- 64-column relation and table-function row shapes, which also bound one
+  explicit `JOIN ... USING` list;
 - durable 64-item definition shapes, including constraints, enum labels, and
   policy roles; and
 - per-value `tsvector`/`tsquery`, multirange, and geometry widths.
@@ -82,6 +83,15 @@ text and binary Bind formats, and the exact 1,665-entry error are qualified
 without runtime allocation against PostgreSQL 18.6. Query threads reserve one
 64 MiB fixed stack at startup for the statically bounded planning, execution,
 and protocol scratch at the complete width.
+
+Join range tables and accumulated `USING` merge state now use exact
+statement-arena slices rather than a 64-relation executor envelope. Compact
+`u64` access-path proofs remain an optimization for at most 64 sources; wider
+joins retain identity order and full-row decoding, preserving exact execution.
+Allocation-forbidden and PostgreSQL 18.6 differential coverage qualifies 128
+relations through cross and `USING` joins, materialization, windows,
+subqueries, plans, stored views, and joined DML. One explicit `USING` list is
+still bounded by the 64-column source-row shape tracked above.
 
 Routine call signatures now match PostgreSQL's exact 100-input-argument limit.
 The independent 64-column routine result boundary remains part of the general

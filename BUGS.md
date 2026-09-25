@@ -299,7 +299,7 @@ in PLAN.md.
 The routine-width audit found and fixed a coupled 64-column table-function
 descriptor that could panic after widening stored routine metadata. Callable
 input signatures now accept PostgreSQL's exact 100 arguments, result metadata
-retains the explicit 64-column row boundary, and the two capacities have
+uses the independent 1,664-column executable tuple boundary, and the capacities have
 distinct fixed arrays. The accepted maxima and over-limit errors are qualified
 through execution, catalog output, allocation-forbidden WAL encoding, journal
 replay, checkpoints, object-cold recovery, and PostgreSQL 18 differential
@@ -325,7 +325,7 @@ front scratch is recycled between sets. Allocation-forbidden maximum and
 over-limit execution plus a raw PostgreSQL 18.6 differential qualify the fix.
 The result-column audit found no external blocker. Query projection and wire
 metadata now accept PostgreSQL 18's 1,664-column target-list boundary. The
-server and query-bearing test workers use one shared, fixed 64 MiB startup
+server and query-bearing test workers use one shared, fixed 128 MiB startup
 stack envelope for the statically bounded scratch. Simple, scoped, and set
 execution, Statement Describe, alternating per-column text and binary Bind
 formats, and the exact 1,665-entry rejection are qualified allocation-free and
@@ -337,8 +337,8 @@ tables and accumulated `USING` contributors from the statement arena. Compact
 optimizations; wider joins execute exactly in identity order with full-row
 decoding. Allocation-forbidden and PostgreSQL 18.6 differential coverage
 qualifies 128 relations through cross and `USING` joins, plans, stored views,
-windows, materialization, subqueries, and joined DML. One explicit `USING`
-list remains coupled to the separately tracked 64-column source-row shape.
+windows, materialization, subqueries, and joined DML. Explicit `USING` lists
+now follow the 1,600-column relation boundary.
 The multirange-width audit found no external blocker. Component readers now
 stream from the canonical value, while canonicalization, constructors, and set
 operations use exact statement-arena slices and rendered output uses exact
@@ -346,12 +346,43 @@ arena bytes. Allocation-forbidden 128-component execution, binary Bind/result
 and COPY comparison with PostgreSQL 18.6, indexes, WAL, checkpoints, and
 object-cold recovery cross the former 64-component and 1 KiB limits. The audit
 also found that coverage instrumentation plus half of the growing SQL corpus
-could exceed its ten-minute worker limit; the corpus now has three guarded
+could exceed its worker limit; the corpus now has three guarded
 shards while auxiliary probes retain their independent worker. That split
 exposed dropped partition descendants whose stored parent ordinal could match a
 new relation after catalog-slot reuse. Partition ancestry now requires every
 node to be transaction-visible, and a focused reuse regression covers recursive
 index creation against the new parent.
+The relation-width audit found no external blocker. Stored relation, view,
+named-composite, and record-definition shapes now accept 1,600 columns, while
+executable table-function tuples accept 1,664. The audit replaced one-word
+durable column masks, widened counts and ordinals with backward readers, moved
+transient record shapes into statement memory, and streamed composite
+checkpoint records directly into the reserved manifest. It also separated
+physical full-row decoding from exact high-column authorization after a
+column-level privilege regression exposed the coupling. Allocation-forbidden
+boundary execution, WAL replay, checkpoint publication, object-cold recovery,
+and a raw PostgreSQL 18.6 differential qualify the accepted and rejected
+widths. CI then exposed a recursive-CTE regression: every iteration rebuilt a
+full 1,664-slot relation definition and exhausted the default statement arena
+at 100 one-column rows. Materialized recursive relations now retain one typed
+definition, including the recursive reference's column aliases. Focused 32 MiB
+regressions cover both plain and aliased recursion. The growing library,
+curated differential, and seeded fuzz suites now run as guarded deterministic
+shards under the unchanged 15-minute job ceiling. Those shards exposed another
+width-coupling regression: scalar projection inspected set-returning routine
+candidates for every row by copying the complete widened routine definition.
+Candidate probes now read the transaction-visible kind, attributes, signature,
+and defaults in place, and projections without a set-returning call skip the
+per-row materialization scratch. The PostgreSQL 18.6 differential covering
+1,100 mutable calls and a 70,000-row scroll cursor fell from a timeout to a
+bounded passing run. Coverage also exposed stack-sensitive pgoutput decoding:
+decoded tuple and relation messages embedded complete 1,600-column arrays.
+They now retain validated borrowed wire views and iterate without allocation,
+including at the maximum width. Instrumented exact, binary COPY, type,
+PostgreSQL regression, and sqllogictest phases now have independent workers.
+The deterministic fuzz sequence likewise runs in four 2,500-statement quarters
+after a 5,000-statement half matched PostgreSQL completely but reached the job
+ceiling during teardown.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

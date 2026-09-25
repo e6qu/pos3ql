@@ -1434,20 +1434,41 @@ const EMPTY_RECORD_SHAPE_FIELD: RecordShapeField = RecordShapeField {
 struct NamedRecordShape {
     fields: [RecordShapeField; MAX_SHAPE_FIELDS],
     name: crate::util::StackStr<64>,
-    len: u8,
+    len: u16,
     slot: u16,
 }
 
-const EMPTY_NAMED_RECORD_SHAPE: NamedRecordShape = NamedRecordShape {
+static EMPTY_NAMED_RECORD_SHAPE: NamedRecordShape = NamedRecordShape {
     fields: [EMPTY_RECORD_SHAPE_FIELD; MAX_SHAPE_FIELDS],
     name: crate::util::StackStr::new(),
     len: 0,
     slot: u16::MAX,
 };
 
+#[derive(Clone, Copy)]
+struct TransientRecordShape {
+    fields: *const RecordShapeField,
+    len: u16,
+}
+
+const EMPTY_TRANSIENT_RECORD_SHAPE: TransientRecordShape = TransientRecordShape {
+    fields: core::ptr::null(),
+    len: 0,
+};
+
+impl TransientRecordShape {
+    fn fields(self) -> &'static [RecordShapeField] {
+        if self.len == 0 {
+            return &[];
+        }
+        // The statement arena owns this slice. The registry resets at the next
+        // statement boundary before any shape can be observed again.
+        unsafe { core::slice::from_raw_parts(self.fields, usize::from(self.len)) }
+    }
+}
+
 struct ShapePool {
-    fields: [[RecordShapeField; MAX_SHAPE_FIELDS]; MAX_TRANSIENT_SHAPES],
-    lens: [u8; MAX_TRANSIENT_SHAPES],
+    transient: [TransientRecordShape; MAX_TRANSIENT_SHAPES],
     n: usize,
     named: Box<[NamedRecordShape]>,
     named_n: usize,
@@ -1468,8 +1489,7 @@ std::thread_local! {
 
 fn empty_shape_pool(named_capacity: usize) -> Box<ShapePool> {
     Box::new(ShapePool {
-        fields: [[EMPTY_RECORD_SHAPE_FIELD; MAX_SHAPE_FIELDS]; MAX_TRANSIENT_SHAPES],
-        lens: [0; MAX_TRANSIENT_SHAPES],
+        transient: [EMPTY_TRANSIENT_RECORD_SHAPE; MAX_TRANSIENT_SHAPES],
         n: 0,
         named: vec![EMPTY_NAMED_RECORD_SHAPE; named_capacity].into_boxed_slice(),
         named_n: 0,
@@ -1527,7 +1547,7 @@ pub fn register_named_composite_shape(
         let at = pool.named_n;
         pool.named[at].name = crate::util::StackStr::from_str(name);
         pool.named[at].slot = slot;
-        pool.named[at].len = fields.len() as u8;
+        pool.named[at].len = fields.len() as u16;
         for (out, field) in pool.named[at].fields.iter_mut().zip(fields) {
             out.name = crate::util::StackStr::from_str(field.name.as_str());
             out.ctype = field.ctype;
@@ -1583,16 +1603,24 @@ fn composite_slot_field_metadata(slot: u16, field: &str) -> Option<StaticTypeMet
 /// Registers a record shape, returning its handle, or None when the
 /// statement's pool is exhausted (the caller then leaves the column without
 /// a shape and field access fails loudly, never wrongly).
-pub(crate) fn register_record_shape(fields: &[RecordShapeField]) -> Option<i32> {
+pub(crate) fn register_record_shape(
+    fields: &[RecordShapeField],
+    arena: &crate::mem::arena::Arena,
+) -> Option<i32> {
     RECORD_SHAPES.with(|p| {
         let mut p = p.borrow_mut();
         let pool = p.get_or_insert_with(|| empty_shape_pool(32));
         if pool.n == MAX_TRANSIENT_SHAPES || fields.len() > MAX_SHAPE_FIELDS {
             return None;
         }
+        let stored = arena
+            .alloc_persistent_slice_with(fields.len(), |index| fields[index])
+            .ok()?;
         let at = pool.n;
-        pool.fields[at][..fields.len()].copy_from_slice(fields);
-        pool.lens[at] = fields.len() as u8;
+        pool.transient[at] = TransientRecordShape {
+            fields: stored.as_ptr(),
+            len: fields.len() as u16,
+        };
         pool.n += 1;
         Some(at as i32)
     })
@@ -1614,7 +1642,8 @@ pub(crate) fn record_shape_field_metadata(
         if at >= pool.n {
             return None;
         }
-        pool.fields[at][..pool.lens[at] as usize]
+        pool.transient[at]
+            .fields()
             .iter()
             .find(|f| f.name.as_str().eq_ignore_ascii_case(field))
             .map(|f| (f.metadata(), f.nested))
@@ -1637,10 +1666,11 @@ pub fn visit_record_shape_metadata(
         if at >= pool.n {
             return None;
         }
-        for f in &pool.fields[at][..pool.lens[at] as usize] {
+        let fields = pool.transient[at].fields();
+        for f in fields {
             visit(f.name.as_str(), f.metadata());
         }
-        Some(pool.lens[at] as usize)
+        Some(fields.len())
     })
 }
 
@@ -1742,7 +1772,11 @@ fn expression_static_metadata(
 /// from its arguments (nested rows recursively); a whole-row reference takes
 /// its table's columns; the `json_each` family its declared pair. None when
 /// no static shape exists (field access then fails loudly, never wrongly).
-pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<i32> {
+pub fn register_shape_for(
+    expr: &Expr,
+    columns: &dyn ColTypeResolver,
+    arena: &crate::mem::arena::Arena,
+) -> Option<i32> {
     if let Some(handle) = expr_record_handle(expr, columns) {
         return Some(handle);
     }
@@ -1852,7 +1886,7 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
         }
         _ => return None,
     }
-    register_record_shape(&fields[..n])
+    register_record_shape(&fields[..n], arena)
 }
 
 /// Static field names PostgreSQL assigns an anonymous record (`ROW(...)`):

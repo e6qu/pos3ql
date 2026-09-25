@@ -132,8 +132,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   capacities are checked against disjoint `pg_type` OID bands before serving.
 - Wide schema definitions no longer encounter narrower storage-only limits:
   table constraint kinds and domain checks use the parser's complete 64-item
-  bounded list, named composites use the 64-column row boundary, partition
-  keys and index tuples use PostgreSQL 18's exact 32-attribute limits, and
+  bounded list; tables, views, named composites, and record definition lists
+  use PostgreSQL 18's 1,600-column relation boundary; partition keys and index
+  tuples use PostgreSQL 18's exact 32-attribute limits; and
   LIST bounds use the complete 64-value parser list. Direct inheritance
   parents, defaults across every view column, subscription publication names,
   event-trigger tags, foreign OPTIONS clauses, and operator-family operators
@@ -260,7 +261,14 @@ active production roadmap is [PLAN.md](../PLAN.md).
   width. Simple, scoped, and set-operation execution, Statement Describe,
   per-column text and binary Bind formats, and the exact over-limit error are
   covered allocation-free and against PostgreSQL 18. Query execution threads
-  reserve the same fixed 64 MiB stack envelope as the server.
+  reserve the same fixed 128 MiB stack envelope as the server, and the default
+  statement arena is 32 MiB.
+- Table-function results accept the independent 1,664-column executable tuple
+  width. Wide column sets preserve high-ordinal dependencies, trigger update
+  lists, publication projections, column privileges, and index metadata across
+  WAL and checkpoints. Legacy one-word durable records remain readable, and
+  empty-cache recovery qualifies tables, views, composites, routines, and
+  high-column metadata at their accepted boundaries.
 - JSON values and paths use statement memory for container members, result
   items, accessor chains, subscripts, and rendered text. Parser and executor
   stages report named exhaustion instead of imposing the former 1,024-item,
@@ -278,9 +286,9 @@ active production roadmap is [PLAN.md](../PLAN.md).
   command gates use statement-arena slices rather than fixed policy arrays.
   A 1,025-policy relation qualifies enforcement, catalog output, named
   exhaustion, checkpoint publication, and empty-cache recovery. Policy role
-  lists, routine results/configuration, and trigger arguments use the parser's
-  complete 64-item boundary. Routine input signatures match PostgreSQL's exact
-  100-argument limit, with defaults and independently stored output metadata;
+  lists, routine configuration, and trigger arguments use the parser's complete
+  64-item boundary. Routine input signatures match PostgreSQL's exact
+  100-argument limit, while output metadata accepts 1,664 columns;
   routine manifest fields stream directly into the reserved buffer. `pg_proc`
   includes TABLE output names, modes, and types alongside input parameters, and
   single-column TABLE result OIDs match PostgreSQL. Wide callable definitions,

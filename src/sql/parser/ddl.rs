@@ -3531,9 +3531,15 @@ impl<'a> Parser<'a> {
                 saw_variadic |= matches!(argument.mode, RoutineArgumentMode::Variadic { .. });
                 output_count += usize::from(argument.mode.is_output());
                 if output_count > crate::storage::MAX_COLUMNS {
-                    return Err(
-                        self.limit("routine output parameters", crate::storage::MAX_COLUMNS)
-                    );
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "target lists can have at most {} entries",
+                            crate::storage::MAX_COLUMNS
+                        ),
+                        sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                    });
                 }
                 arguments[count] = argument;
                 count += 1;
@@ -3574,7 +3580,15 @@ impl<'a> Parser<'a> {
                 let mut column_count = 0;
                 loop {
                     if column_count == columns.len() {
-                        return Err(self.limit("function result columns", columns.len()));
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "target lists can have at most {} entries",
+                                columns.len()
+                            ),
+                            sqlstate: sqlstate::TOO_MANY_COLUMNS,
+                        });
                     }
                     columns[column_count] = RoutineResultColumn {
                         name: self.any_ident("function result column")?,

@@ -102,7 +102,7 @@ impl RelationMap {
         let mut remote_to_local = [usize::MAX; MAX_COLUMNS];
         let mut key_remote_to_local = [usize::MAX; MAX_COLUMNS];
         let mut key_count = 0;
-        for (remote, column) in relation.columns().iter().enumerate() {
+        for (remote, column) in relation.columns().enumerate() {
             let local = definition.column_index(column.name).ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_COLUMN,

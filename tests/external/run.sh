@@ -211,7 +211,7 @@ object_store_access_key = ${S3_TEST_ACCESS_KEY}
 object_store_secret_key = ${S3_TEST_SECRET_KEY}
 wal_upload = on
 wal_upload_sync = on
-sql_arena_bytes = 4MiB
+sql_arena_bytes = 32MiB
 wal_buffer_bytes = 4MiB
 max_tables = 64
 # The spill-ingest scenario writes 24,000 rows; this is the fixed per-table
@@ -1013,7 +1013,7 @@ object_store_access_key = ${S3_TEST_ACCESS_KEY}
 object_store_secret_key = ${S3_TEST_SECRET_KEY}
 wal_upload = on
 wal_upload_sync = on
-sql_arena_bytes = 4MiB
+sql_arena_bytes = 32MiB
 wal_buffer_bytes = 2MiB
 max_tables = 16
 table_rows = 4096

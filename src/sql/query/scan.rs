@@ -19,7 +19,9 @@ use crate::sql::eval::{
 };
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
-use crate::storage::{MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, TableDef, rowenc};
+use crate::storage::{
+    ColumnSet, MAX_COLUMNS, MAX_INDEX_COLS, PolicyCommandKind, Storage, TableDef, rowenc,
+};
 use crate::util::StackStr;
 
 const _: () = assert!(MAX_INDEX_COLS <= u32::BITS as usize);
@@ -592,8 +594,8 @@ pub(crate) struct IndexedCandidates<'a> {
     n_columns: usize,
     expression_mask: u32,
     key_types: [ColType; MAX_INDEX_COLS],
-    include_mask: u64,
-    payload_mask: u64,
+    include_mask: ColumnSet,
+    payload_mask: ColumnSet,
     keys: Option<&'a [IndexKeyCandidate]>,
     encoded_keys: &'a [u8],
 }
@@ -616,16 +618,17 @@ impl<'a> IndexedCandidates<'a> {
     }
 
     fn covers(&self, demanded: u64) -> bool {
+        let mut available = self.include_mask;
+        for (position, &column) in self.columns[..self.n_columns].iter().enumerate() {
+            if self.expression_mask & (1 << position) == 0 {
+                available.insert(usize::from(column));
+            }
+        }
         self.keys.is_some()
-            && self.include_mask & !self.payload_mask == 0
-            && ((self.columns[..self.n_columns]
-                .iter()
-                .enumerate()
-                .filter(|(position, _)| self.expression_mask & (1 << position) == 0)
-                .fold(0u64, |mask, (_, column)| mask | (1u64 << column))
-                | self.include_mask)
-                & demanded)
-                == demanded
+            && self.include_mask.difference(self.payload_mask).is_empty()
+            && ColumnSet::from_low_word(demanded)
+                .difference(available)
+                .is_empty()
     }
 }
 
@@ -646,6 +649,8 @@ pub(crate) enum BoundRow<'a> {
 #[derive(Clone, Copy)]
 struct PaxColumnDemand {
     masks: [u64; MAX_OPTIMIZED_JOIN_TABLES],
+    referenced: [ColumnSet; MAX_OPTIMIZED_JOIN_TABLES],
+    has_wide_column: bool,
 }
 
 /// Why a source intentionally uses full-row decoding.
@@ -657,6 +662,7 @@ pub(super) enum PaxFullRowReason {
     WildcardProjection,
     UnprovableExpression,
     RowSecurityPolicy,
+    WideColumn,
 }
 
 /// The only two legal physical read modes for a source scan.
@@ -691,18 +697,22 @@ impl PaxReadDemand {
     /// The selected PAX fields for `table`, if this scan has a proof.
     pub(crate) fn selected_mask(self, table: usize) -> Option<u64> {
         match self.0 {
-            PaxReadMode::FullRow {
-                reason:
-                    PaxFullRowReason::IncompleteScope
-                    | PaxFullRowReason::WildcardProjection
-                    | PaxFullRowReason::UnprovableExpression
-                    | PaxFullRowReason::RowSecurityPolicy,
-                columns,
-            } => {
-                debug_assert!(columns.masks.iter().all(|mask| *mask == 0));
-                None
-            }
+            PaxReadMode::FullRow { .. } => None,
             PaxReadMode::Selected(columns) => Some(columns.mask(table)),
+        }
+    }
+
+    /// SQL-visible columns proven to be referenced by this scan. Physical
+    /// decoding may still require a full row when one lies beyond the compact
+    /// PAX mask.
+    fn referenced_columns(self, table: usize, n_columns: usize) -> ColumnSet {
+        match self.0 {
+            PaxReadMode::Selected(columns)
+            | PaxReadMode::FullRow {
+                reason: PaxFullRowReason::WideColumn,
+                columns,
+            } => columns.referenced(table),
+            PaxReadMode::FullRow { .. } => ColumnSet::all(n_columns),
         }
     }
 }
@@ -711,18 +721,29 @@ impl PaxColumnDemand {
     const fn empty() -> Self {
         Self {
             masks: [0; MAX_OPTIMIZED_JOIN_TABLES],
+            referenced: [ColumnSet::EMPTY; MAX_OPTIMIZED_JOIN_TABLES],
+            has_wide_column: false,
         }
     }
 
-    fn observe(&mut self, table: usize, column: usize) {
+    fn observe(&mut self, table: usize, column: usize) -> bool {
         debug_assert!(table < MAX_OPTIMIZED_JOIN_TABLES);
-        debug_assert!(column < u64::BITS as usize);
+        self.referenced[table].insert(column);
+        if column >= u64::BITS as usize {
+            self.has_wide_column = true;
+            return true;
+        }
         self.masks[table] |= 1u64 << column;
+        true
     }
 
     /// The verified physical fields required for one base source.
     pub(crate) fn mask(self, table: usize) -> u64 {
         self.masks[table]
+    }
+
+    fn referenced(self, table: usize) -> ColumnSet {
+        self.referenced[table]
     }
 }
 
@@ -742,9 +763,14 @@ pub(super) fn pax_column_demand(
     {
         return PaxReadDemand::full_row(PaxFullRowReason::IncompleteScope);
     }
-    pax_column_demand_bounded(scope, from, expressions)
-        .map(PaxReadDemand::selected)
-        .unwrap_or_else(|| PaxReadDemand::full_row(PaxFullRowReason::UnprovableExpression))
+    match pax_column_demand_bounded(scope, from, expressions) {
+        Some(columns) if columns.has_wide_column => PaxReadDemand(PaxReadMode::FullRow {
+            reason: PaxFullRowReason::WideColumn,
+            columns,
+        }),
+        Some(columns) => PaxReadDemand::selected(columns),
+        None => PaxReadDemand::full_row(PaxFullRowReason::UnprovableExpression),
+    }
 }
 
 #[inline(never)]
@@ -849,7 +875,11 @@ fn pax_column_demand_bounded(
     fn collect(expression: &Expr, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         match expression {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                Ok(ResolvedColumn::Table(table, column)) => columns.observe(table, column),
+                Ok(ResolvedColumn::Table(table, column)) => {
+                    if !columns.observe(table, column) {
+                        return false;
+                    }
+                }
                 // An unresolved name can be an enclosing correlated column.
                 // The select walker records it against the enclosing physical
                 // scope while this inner scan needs no local span for it.
@@ -921,7 +951,7 @@ pub(crate) struct IndexAccessPlan<'a> {
     method: crate::sql::ast::IndexAccessMethod,
     index_oid: i32,
     index_name: StackStr<64>,
-    include_mask: u64,
+    include_mask: ColumnSet,
     expression_mask: u32,
     columns: [u16; MAX_INDEX_COLS],
     key_types: [ColType; MAX_INDEX_COLS],
@@ -942,7 +972,7 @@ pub(crate) struct OrderedIndexAccessPlan<'a> {
     access: IndexAccessPlan<'a>,
     index_oid: i32,
     index_name: StackStr<64>,
-    include_mask: u64,
+    include_mask: ColumnSet,
     covering_ready: bool,
     order_positions: [u8; MAX_INDEX_COLS],
     order: &'a [OrderBy<'a>],
@@ -966,15 +996,19 @@ impl<'a> OrderedIndexAccessPlan<'a> {
     }
 
     pub(crate) fn covers(&self, demanded: u64) -> bool {
+        let mut available = self.include_mask;
+        for (position, &column) in self.access.columns[..self.access.n_columns]
+            .iter()
+            .enumerate()
+        {
+            if self.access.expression_mask & (1 << position) == 0 {
+                available.insert(usize::from(column));
+            }
+        }
         self.covering_ready
-            && ((self.access.columns[..self.access.n_columns]
-                .iter()
-                .enumerate()
-                .filter(|(position, _)| self.access.expression_mask & (1 << position) == 0)
-                .fold(0u64, |mask, (_, column)| mask | (1u64 << column))
-                | self.include_mask)
-                & demanded)
-                == demanded
+            && ColumnSet::from_low_word(demanded)
+                .difference(available)
+                .is_empty()
     }
 }
 
@@ -3196,7 +3230,8 @@ fn indexed_candidates_for_plan<'a>(
                     n_columns: plan.n_columns,
                     expression_mask: plan.expression_mask,
                     key_types: plan.key_types,
-                    include_mask: ordered_plan.map_or(0, |ordered| ordered.include_mask),
+                    include_mask: ordered_plan
+                        .map_or(ColumnSet::EMPTY, |ordered| ordered.include_mask),
                     payload_mask: storage.value_binding_include_mask(slot, plan.binding),
                     keys: None,
                     encoded_keys: &[],
@@ -3734,7 +3769,7 @@ fn indexed_candidates_for_plan<'a>(
         n_columns: plan.n_columns,
         expression_mask: plan.expression_mask,
         key_types: plan.key_types,
-        include_mask: ordered_plan.map_or(0, |ordered| ordered.include_mask),
+        include_mask: ordered_plan.map_or(ColumnSet::EMPTY, |ordered| ordered.include_mask),
         payload_mask: storage.value_binding_include_mask(slot, plan.binding),
         keys: ordered_keys,
         encoded_keys: retained_key_bytes,
@@ -4931,15 +4966,9 @@ fn scan_source_mode<'a>(
                         "expanded view source has no output definition"
                     )
                 })?;
-                let demanded = pax_demand.selected_mask(table).unwrap_or_else(|| {
-                    if definition.n_columns == u64::BITS as usize {
-                        u64::MAX
-                    } else {
-                        (1u64 << definition.n_columns) - 1
-                    }
-                });
-                let mut allowed = demanded != 0;
-                if demanded == 0 {
+                let demanded = pax_demand.referenced_columns(table, definition.n_columns);
+                let mut allowed = !demanded.is_empty();
+                if demanded.is_empty() {
                     allowed = (0..definition.n_columns).any(|column| {
                         crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
                             |target| {
@@ -4954,7 +4983,7 @@ fn scan_source_mode<'a>(
                     });
                 }
                 for column in 0..definition.n_columns {
-                    if demanded & (1u64 << column) == 0 {
+                    if !demanded.contains(column) {
                         continue;
                     }
                     let target = crate::storage::ColumnPrivilegeTarget::new(object, column as u16)?;
@@ -4995,15 +5024,9 @@ fn scan_source_mode<'a>(
                 crate::storage::PrivilegeSet::SELECT,
                 txid,
             ) {
-                let demanded = pax_demand.selected_mask(table).unwrap_or_else(|| {
-                    if definition.n_columns == u64::BITS as usize {
-                        u64::MAX
-                    } else {
-                        (1u64 << definition.n_columns) - 1
-                    }
-                });
-                let mut allowed = demanded != 0;
-                if demanded == 0 {
+                let demanded = pax_demand.referenced_columns(table, definition.n_columns);
+                let mut allowed = !demanded.is_empty();
+                if demanded.is_empty() {
                     allowed = (0..definition.n_columns).any(|column| {
                         crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
                             |target| {
@@ -5018,7 +5041,7 @@ fn scan_source_mode<'a>(
                     });
                 }
                 for column in 0..definition.n_columns {
-                    if demanded & (1u64 << column) == 0 {
+                    if !demanded.contains(column) {
                         continue;
                     }
                     let target = crate::storage::ColumnPrivilegeTarget::new(object, column as u16)?;
@@ -6540,7 +6563,7 @@ fn scan_source_mode<'a>(
                 let mut payload_types = [ColType::Bool; MAX_COLUMNS];
                 let mut n_payload = 0usize;
                 for (column, metadata) in definition.columns().iter().enumerate() {
-                    if access.payload_mask & (1u64 << column) != 0 {
+                    if access.payload_mask.contains(column) {
                         payload_types[n_payload] = metadata.ctype;
                         n_payload += 1;
                     }
@@ -6581,7 +6604,7 @@ fn scan_source_mode<'a>(
                         for (column, value) in
                             values.iter_mut().enumerate().take(definition.n_columns)
                         {
-                            if access.payload_mask & (1u64 << column) != 0 {
+                            if access.payload_mask.contains(column) {
                                 *value = payload_values[payload_position];
                                 payload_position += 1;
                             }

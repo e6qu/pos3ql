@@ -13,8 +13,10 @@
 #   FUZZ_COUNT / FUZZ_SEED     generative fuzz statements / seed (default 20000 / 1)
 #   FUZZ_BUDGET                allowed fuzz divergences before failing (ratchet; default 0)
 #   FUZZ_UNSUPPORTED_BUDGET    allowed unsupported generated statements (default 0)
-#   RUN_FAST / RUN_SLT / RUN_FUZZ
-#                              select deterministic, sqllogictest, and fuzz phases
+#   RUN_CORE / RUN_CORPUS / RUN_AUX / RUN_SLT / RUN_FUZZ
+#                              select deterministic phase groups
+#   FAST_CORPUS_SHARD(S)       selected curated-corpus file slice
+#   FUZZ_START                 first ordinal in the seeded fuzz sequence
 #
 # Gating steps (a failure fails CI): wire probe, psycopg driver, the curated
 # differential SQL corpus, and the sqllogictest replay. The fuzzer is gated by
@@ -50,6 +52,17 @@ SLT_QUERY_SHARDS=${SLT_QUERY_SHARDS:-1}
 RUN_FAST=${RUN_FAST:-1}
 RUN_SLT=${RUN_SLT:-1}
 RUN_FUZZ=${RUN_FUZZ:-1}
+RUN_CORE=${RUN_CORE:-$RUN_FAST}
+RUN_CORPUS=${RUN_CORPUS:-$RUN_FAST}
+RUN_AUX=${RUN_AUX:-$RUN_FAST}
+FAST_CORPUS_SHARD=${FAST_CORPUS_SHARD:-0}
+FAST_CORPUS_SHARDS=${FAST_CORPUS_SHARDS:-1}
+FUZZ_START=${FUZZ_START:-0}
+if ! [[ "$FAST_CORPUS_SHARD" =~ ^[0-9]+$ && "$FAST_CORPUS_SHARDS" =~ ^[1-9][0-9]*$ ]] \
+    || (( FAST_CORPUS_SHARD >= FAST_CORPUS_SHARDS )); then
+  echo "FAST_CORPUS_SHARD must be in [0, FAST_CORPUS_SHARDS)" >&2
+  exit 1
+fi
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 REFERENCE_EXTENSION_CONTROL_ROOT=${POS3QL_REFERENCE_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
 
@@ -235,7 +248,7 @@ restart_p3_fresh() {
   return 1
 }
 
-if [[ "$RUN_FAST" == 1 ]]; then
+if [[ "$RUN_CORE" == 1 ]]; then
 # --- raw wire-protocol probes ----------------------------------------------
 echo "=== wire protocol probes ==="
 if POS3QL_PORT=$P3_PORT POS3QL_EXTENSION_WIRE=1 \
@@ -1314,12 +1327,9 @@ else
     fi
   fi
 fi
-
-# The differential corpora assume an empty pos3ql catalog.
-restart_p3_fresh || exit 1
+fi
 
 # --- curated differential SQL corpus (rows + SQLSTATEs must match) ----------
-echo "=== differential SQL corpus (real PostgreSQL vs pos3ql) ==="
 normalize() {
   sed -E \
     -e 's/^psql:[^:]*:[0-9]+: ERROR:  ([0-9A-Z]{5}):.*/ERROR \1/' \
@@ -1379,15 +1389,29 @@ reset_corpus_pair() {
   reset_user_relations "$PGHOST" "$PGPORT"
   reset_user_relations 127.0.0.1 "$P3_PORT"
 }
+
+if [[ "$RUN_CORPUS" == 1 ]]; then
+# The differential corpora assume an empty pos3ql catalog.
+restart_p3_fresh || exit 1
+echo "=== differential SQL corpus (real PostgreSQL vs pos3ql) ==="
 reset_corpus_pair
+corpus_ordinal=0
 for f in "$EXT"/differential/*.sql; do
+  if (( corpus_ordinal % FAST_CORPUS_SHARDS != FAST_CORPUS_SHARD )); then
+    corpus_ordinal=$((corpus_ordinal + 1))
+    continue
+  fi
   n=$(basename "$f" .sql)
   run_corpus "$PGHOST" "$PGPORT" "$WORK/$n.pg" "$f"
   run_corpus 127.0.0.1 "$P3_PORT" "$WORK/$n.p3" "$f"
   if diff -u "$WORK/$n.pg" "$WORK/$n.p3" > "$WORK/$n.diff"; then ok "corpus: $n"
   else bad "corpus: $n"; head -40 "$WORK/$n.diff"; fi
   reset_corpus_pair
+  corpus_ordinal=$((corpus_ordinal + 1))
 done
+fi
+
+if [[ "$RUN_AUX" == 1 ]]; then
 
 # These are unmodified inputs from PostgreSQL's own regression suite. Run the
 # selected dependency-closed schedule against both engines; PostgreSQL remains
@@ -1447,6 +1471,11 @@ if "$PY" "$EXT/result_column_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > 
 else
   bad "result-column capacity differential"; cat "$WORK/result-column-capacity.out"
 fi
+if "$PY" "$EXT/relation_column_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/relation-column-capacity.out" 2>&1; then
+  ok "relation-column capacity differential ($(tail -1 "$WORK/relation-column-capacity.out"))"
+else
+  bad "relation-column capacity differential"; cat "$WORK/relation-column-capacity.out"
+fi
 if "$PY" "$EXT/join_capacity_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" > "$WORK/join-capacity.out" 2>&1; then
   ok "join capacity differential ($(tail -1 "$WORK/join-capacity.out"))"
 else
@@ -1505,8 +1534,9 @@ if [[ "$RUN_FUZZ" == 1 ]]; then
   restart_p3_fresh || exit 1
 
   # --- generative differential fuzzer (gated by a ratchet budget) ----------
-  echo "=== generative fuzzer (count=$FUZZ_COUNT seed=$FUZZ_SEED, divergence budget=$FUZZ_BUDGET, unsupported budget=$FUZZ_UNSUPPORTED_BUDGET) ==="
-  "$PY" "$EXT/fuzz_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" \
+  echo "=== generative fuzzer (start=$FUZZ_START count=$FUZZ_COUNT seed=$FUZZ_SEED, divergence budget=$FUZZ_BUDGET, unsupported budget=$FUZZ_UNSUPPORTED_BUDGET) ==="
+  "$PY" "$EXT/fuzz_diff.py" --pg "$PGPORT" --p3 "$P3_PORT" \
+    --start "$FUZZ_START" --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" \
     --max-unsupported "$FUZZ_UNSUPPORTED_BUDGET" \
     > "$WORK/fuzz.out" 2>&1 || true
   DIV=$(grep -oE 'divergence=[0-9]+' "$WORK/fuzz.out" | tail -1 | cut -d= -f2)

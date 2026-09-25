@@ -28,8 +28,14 @@ pub enum TupleColumn<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tuple<'a> {
-    columns: [TupleColumn<'a>; MAX_COLUMNS],
+    columns: &'a [u8],
     count: usize,
+}
+
+#[derive(Clone)]
+pub struct TupleColumns<'a> {
+    input: Input<'a>,
+    remaining: usize,
 }
 
 /// Which publisher row image accompanies an UPDATE or DELETE. Both tuple
@@ -61,10 +67,31 @@ pub enum UpdateIdentity<'a> {
 }
 
 impl<'a> Tuple<'a> {
-    pub fn columns(&self) -> &[TupleColumn<'a>] {
-        &self.columns[..self.count]
+    pub fn columns(&self) -> TupleColumns<'a> {
+        TupleColumns {
+            input: Input::new(self.columns),
+            remaining: self.count,
+        }
     }
 }
+
+impl<'a> Iterator for TupleColumns<'a> {
+    type Item = TupleColumn<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        Some(tuple_column(&mut self.input).expect("validated pgoutput tuple"))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for TupleColumns<'_> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RelationColumn<'a> {
@@ -74,28 +101,48 @@ pub struct RelationColumn<'a> {
     pub type_modifier: i32,
 }
 
-const EMPTY_RELATION_COLUMN: RelationColumn<'static> = RelationColumn {
-    key: false,
-    name: "",
-    type_oid: 0,
-    type_modifier: 0,
-};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Relation<'a> {
     pub id: u32,
     pub namespace: &'a str,
     pub name: &'a str,
     pub replica_identity: u8,
-    columns: [RelationColumn<'a>; MAX_COLUMNS],
+    columns: &'a [u8],
     count: usize,
 }
 
 impl<'a> Relation<'a> {
-    pub fn columns(&self) -> &[RelationColumn<'a>] {
-        &self.columns[..self.count]
+    pub fn columns(&self) -> RelationColumns<'a> {
+        RelationColumns {
+            input: Input::new(self.columns),
+            remaining: self.count,
+        }
     }
 }
+
+#[derive(Clone)]
+pub struct RelationColumns<'a> {
+    input: Input<'a>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for RelationColumns<'a> {
+    type Item = RelationColumn<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        Some(relation_column(&mut self.input).expect("validated pgoutput relation"))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for RelationColumns<'_> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Truncate<'a> {
@@ -217,6 +264,7 @@ pub enum CopyData<'a> {
     },
 }
 
+#[derive(Clone)]
 struct Input<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -295,23 +343,44 @@ fn tuple_data<'a>(input: &mut Input<'a>) -> Result<Tuple<'a>, DecodeError> {
     if count > MAX_COLUMNS {
         return Err(DecodeError::Limit);
     }
-    let mut columns = [TupleColumn::Null; MAX_COLUMNS];
-    for column in &mut columns[..count] {
-        *column = match input.u8()? {
-            b'n' => TupleColumn::Null,
-            b'u' => TupleColumn::UnchangedToast,
-            b't' => {
-                let length = input.i32()?.try_into().map_err(|_| DecodeError::Invalid)?;
-                TupleColumn::Text(input.bytes(length)?)
-            }
-            b'b' => {
-                let length = input.i32()?.try_into().map_err(|_| DecodeError::Invalid)?;
-                TupleColumn::Binary(input.bytes(length)?)
-            }
-            _ => return Err(DecodeError::Invalid),
-        };
+    let start = input.at;
+    for _ in 0..count {
+        tuple_column(input)?;
     }
-    Ok(Tuple { columns, count })
+    Ok(Tuple {
+        columns: &input.bytes[start..input.at],
+        count,
+    })
+}
+
+fn tuple_column<'a>(input: &mut Input<'a>) -> Result<TupleColumn<'a>, DecodeError> {
+    match input.u8()? {
+        b'n' => Ok(TupleColumn::Null),
+        b'u' => Ok(TupleColumn::UnchangedToast),
+        b't' => {
+            let length = input.i32()?.try_into().map_err(|_| DecodeError::Invalid)?;
+            Ok(TupleColumn::Text(input.bytes(length)?))
+        }
+        b'b' => {
+            let length = input.i32()?.try_into().map_err(|_| DecodeError::Invalid)?;
+            Ok(TupleColumn::Binary(input.bytes(length)?))
+        }
+        _ => Err(DecodeError::Invalid),
+    }
+}
+
+fn relation_column<'a>(input: &mut Input<'a>) -> Result<RelationColumn<'a>, DecodeError> {
+    let key = match input.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(DecodeError::Invalid),
+    };
+    Ok(RelationColumn {
+        key,
+        name: input.cstr()?,
+        type_oid: input.u32()?,
+        type_modifier: input.i32()?,
+    })
 }
 
 fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, DecodeError> {
@@ -356,19 +425,9 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
             if count > MAX_COLUMNS {
                 return Err(DecodeError::Limit);
             }
-            let mut columns = [EMPTY_RELATION_COLUMN; MAX_COLUMNS];
-            for column in &mut columns[..count] {
-                let key = match input.u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(DecodeError::Invalid),
-                };
-                *column = RelationColumn {
-                    key,
-                    name: input.cstr()?,
-                    type_oid: input.u32()?,
-                    type_modifier: input.i32()?,
-                };
+            let columns_start = input.at;
+            for _ in 0..count {
+                relation_column(&mut input)?;
             }
             Message::Relation {
                 xid,
@@ -377,7 +436,7 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                     namespace,
                     name,
                     replica_identity,
-                    columns,
+                    columns: &input.bytes[columns_start..input.at],
                     count,
                 },
             }
@@ -617,14 +676,35 @@ mod tests {
                 panic!("wrong frame")
             };
             assert_eq!((start_lsn, end_lsn, relation_id), (7, 9, 7));
-            assert_eq!(
-                new.columns(),
-                [
-                    TupleColumn::Text(b"42"),
-                    TupleColumn::Null,
-                    TupleColumn::Binary(&[9]),
-                ]
-            );
+            assert!(new.columns().eq([
+                TupleColumn::Text(b"42"),
+                TupleColumn::Null,
+                TupleColumn::Binary(&[9]),
+            ]));
+        });
+    }
+
+    #[test]
+    fn maximum_width_tuple_is_a_borrowed_allocation_free_view() {
+        assert!(core::mem::size_of::<CopyData<'_>>() <= 256);
+        let mut bytes = vec![0_u8; 25];
+        bytes[0] = b'w';
+        bytes.push(b'I');
+        bytes.extend_from_slice(&7_u32.to_be_bytes());
+        bytes.push(b'N');
+        bytes.extend_from_slice(&(MAX_COLUMNS as u16).to_be_bytes());
+        bytes.extend(core::iter::repeat_n(b'n', MAX_COLUMNS));
+
+        guard::forbid_alloc(|| {
+            let CopyData::XLogData {
+                message: Message::Insert { new, .. },
+                ..
+            } = copy_data(&bytes).unwrap()
+            else {
+                panic!("wrong frame")
+            };
+            assert_eq!(new.columns().len(), MAX_COLUMNS);
+            assert!(new.columns().all(|column| column == TupleColumn::Null));
         });
     }
 
@@ -644,7 +724,7 @@ mod tests {
         };
         assert_eq!(relation.id, 5);
         assert_eq!(relation.namespace, "pub");
-        assert_eq!(relation.columns()[0].name, "id");
+        assert_eq!(relation.columns().next().unwrap().name, "id");
         assert_eq!(
             copy_data(&bytes[..25 + relation_frame.len() - 1]),
             Err(DecodeError::Truncated)
@@ -774,13 +854,14 @@ mod tests {
         };
         assert_eq!(relation_id, 7);
         assert_eq!(old.identity, ReplicaIdentity::Key);
-        assert_eq!(
-            old.tuple.columns(),
-            [TupleColumn::Text(b"1"), TupleColumn::Text(b"old")]
+        assert!(
+            old.tuple
+                .columns()
+                .eq([TupleColumn::Text(b"1"), TupleColumn::Text(b"old")])
         );
-        assert_eq!(
-            new.columns(),
-            [TupleColumn::Text(b"1"), TupleColumn::UnchangedToast]
+        assert!(
+            new.columns()
+                .eq([TupleColumn::Text(b"1"), TupleColumn::UnchangedToast])
         );
     }
 

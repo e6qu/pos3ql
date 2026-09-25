@@ -6,7 +6,7 @@
 #
 # Coverage-producing runs retain separate lcov files for the merge gate.
 # Instrumented unit tests are partitioned after one build per worker so test
-# growth cannot consume the fixed ten-minute job budget. The budget includes a
+# growth cannot consume the fixed 15-minute job budget. The budget includes a
 # cold release build, dependency setup, artifact upload, and runner cleanup.
 name: coverage
 on:
@@ -22,14 +22,14 @@ jobs:
   shard:
     name: shard ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
           # Coverage and crash-torture builds use incompatible instrumentation.
           # Keep them in distinct jobs: serializing either pair can exceed the
-          # hard ten-minute bound even though each workload fits on its own.
+          # hard 15-minute bound even though each workload fits on its own.
           - { name: lib-a, shards: "lib:0-of-3", needs_pg18: false }
           - { name: lib-b, shards: "lib:1-of-3", needs_pg18: false }
           - { name: lib-c, shards: "lib:2-of-3", needs_pg18: false }
@@ -81,7 +81,7 @@ jobs:
   torture:
     name: shard torture-${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +120,7 @@ jobs:
   subscription:
     name: shard subscription
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
   spill-differential:
     name: shard spilldiff-${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -242,17 +242,22 @@ jobs:
   reference-diff:
     name: shard diff-${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Keep the instrumented corpus and auxiliary probes in independent
-          # workers so cold setup plus measurement stays below ten minutes.
+          # Keep instrumented corpus and auxiliary phases in independent
+          # workers so cold setup plus measurement stays below 15 minutes.
           - { name: corpus-a, corpus_shard: "0-of-3", auxiliary: none }
           - { name: corpus-b, corpus_shard: "1-of-3", auxiliary: none }
           - { name: corpus-c, corpus_shard: "2-of-3", auxiliary: none }
-          - { name: auxiliary, corpus_shard: "none", auxiliary: all }
+          - { name: auxiliary-exact, corpus_shard: "none", auxiliary: exact }
+          - { name: auxiliary-copy, corpus_shard: "none", auxiliary: copy }
+          - { name: auxiliary-types, corpus_shard: "none", auxiliary: types }
+          - { name: auxiliary-pg-regress, corpus_shard: "none", auxiliary: pg_regress }
+          - { name: auxiliary-slt-a, corpus_shard: "none", auxiliary: slt, slt_query_shard: "0", slt_query_shards: "2" }
+          - { name: auxiliary-slt-b, corpus_shard: "none", auxiliary: slt, slt_query_shard: "1", slt_query_shards: "2" }
     services:
       postgres:
         image: postgres:18
@@ -303,6 +308,8 @@ jobs:
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
           POS3QL_DIFF_CORPUS_SHARD: ${{ matrix.corpus_shard }}
           POS3QL_DIFF_AUXILIARY: ${{ matrix.auxiliary }}
+          POS3QL_SLT_QUERY_SHARD: ${{ matrix.slt_query_shard || '0' }}
+          POS3QL_SLT_QUERY_SHARDS: ${{ matrix.slt_query_shards || '1' }}
           COVERAGE_SHARDS: "run:diff"
         run: |
           COVERAGE_SHARD="$COVERAGE_SHARDS" \

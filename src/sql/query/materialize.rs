@@ -181,15 +181,19 @@ fn for_each_materialized_projection<'a>(
         };
         &owned_hooks
     };
-    let project_set = prepare_project_set(
-        statement.items,
-        storage,
-        txid,
-        arena,
-        params,
-        row,
-        row_hooks,
-    )?;
+    let project_set = if has_srf {
+        prepare_project_set(
+            statement.items,
+            storage,
+            txid,
+            arena,
+            params,
+            row,
+            row_hooks,
+        )?
+    } else {
+        super::srf::ProjectSet::single()
+    };
     for expansion in 1..=project_set.count {
         let srf_hooks;
         let use_hooks: &EvalHooks = if project_set.any || has_srf {

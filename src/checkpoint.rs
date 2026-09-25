@@ -16,9 +16,9 @@ use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::stack_format;
 use crate::storage::{
-    CheckpointValueCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, OwnedDatum, PartitionBound,
-    PartitionBoundValue, PartitionDef, PartitionStrategy, RowHome, SerializedStoredQueryDependency,
-    SqlName, Storage, TableDef,
+    CheckpointValueCursor, ColumnDefault, ColumnMeta, MAX_COLUMNS, MAX_RELATION_COLUMNS,
+    OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef, PartitionStrategy, RowHome,
+    SerializedStoredQueryDependency, SqlName, Storage, TableDef,
 };
 use crate::store::{
     BlockId, BlockStore, BlockType, MAX_ASSEMBLED, MAX_INLINE_ROW, OwnedObjectStore, RowSstFormat,
@@ -243,7 +243,7 @@ enum SlotInstall {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SliceLayout {
     column_types: [u8; MAX_COLUMNS],
-    n_columns: u8,
+    n_columns: u16,
     fillfactor: u8,
 }
 
@@ -257,7 +257,7 @@ impl SliceLayout {
     fn from_storage(storage: &Storage, slot: usize) -> Self {
         let definition = &storage.table(slot).def;
         let mut layout = Self::EMPTY;
-        layout.n_columns = definition.n_columns as u8;
+        layout.n_columns = definition.n_columns as u16;
         layout.fillfactor = definition.storage_options.fillfactor.unwrap_or(0);
         for (target, column) in layout.column_types.iter_mut().zip(definition.columns()) {
             *target = column.ctype.code();
@@ -273,7 +273,7 @@ struct ValueInstall {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_columns: usize,
     index_created_at: Option<u64>,
-    include_mask: u64,
+    include_mask: crate::storage::ColumnSet,
     dirty_lsn: u64,
     handle: Option<ValueIndexHandle>,
 }
@@ -344,7 +344,7 @@ struct ValueScheduleJob {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_columns: usize,
     index_created_at: Option<u64>,
-    include_mask: u64,
+    include_mask: crate::storage::ColumnSet,
     navigation: Option<crate::store::NavigationSpec>,
     dirty_lsn: u64,
     through_lsn: u64,
@@ -365,7 +365,7 @@ struct ValueIndexJob {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     n_columns: usize,
     index_created_at: Option<u64>,
-    include_mask: u64,
+    include_mask: crate::storage::ColumnSet,
     navigation: Option<crate::store::NavigationSpec>,
     dirty_lsn: u64,
     through_lsn: u64,
@@ -385,7 +385,7 @@ type LoadedValueIndex = (
     [u16; crate::storage::MAX_INDEX_COLS],
     usize,
     Option<u64>,
-    u64,
+    crate::storage::ColumnSet,
     ValueIndexHandle,
 );
 
@@ -2203,7 +2203,7 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     let mindex: usize = parse_field(words.next(), "table index")?;
                     let n_cols: usize = parse_field(words.next(), "table columns")?;
-                    if n_cols > MAX_COLUMNS {
+                    if n_cols > MAX_RELATION_COLUMNS {
                         return Err(CheckpointSetupError::Corrupt("too many columns"));
                     }
                     let has_toast = parse_bool_field(words.next(), "table toast relation")?;
@@ -7784,53 +7784,49 @@ impl Checkpointer {
                 definition.database,
             )?;
             use core::fmt::Write;
-            let mut line = StackStr::<10_240>::new();
-            let hex = |line: &mut StackStr<10_240>, value: &str| {
-                if value.is_empty() {
-                    let _ = write!(line, "0");
-                } else {
-                    for byte in value.as_bytes() {
-                        let _ = write!(line, "{byte:02x}");
-                    }
-                }
+            let manifest_full = || {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "checkpoint manifest is full; raise checkpoint_manifest_bytes"
+                )
             };
-            let _ = write!(line, "cmp ");
-            hex(&mut line, definition.schema.as_str());
-            let _ = write!(line, " ");
-            hex(&mut line, definition.name.as_str());
-            let _ = write!(line, " {}", definition.n_fields);
+            write!(
+                &mut self.manifest_buf,
+                "cmp {} {} {}",
+                ManifestZeroName(definition.schema.as_str()),
+                ManifestZeroName(definition.name.as_str()),
+                definition.n_fields
+            )
+            .map_err(|_| manifest_full())?;
             for field in definition.fields() {
-                let _ = write!(line, " ");
-                hex(&mut line, field.name.as_str());
-                let _ = write!(
-                    line,
-                    " {} {} {} {} {} {} ",
+                write!(
+                    &mut self.manifest_buf,
+                    " {} {} {} {} {} {} {} {} {}",
+                    ManifestZeroName(field.name.as_str()),
                     field.attribute_number,
                     u8::from(field.dropped),
                     u8::from(field.not_null),
                     field.ctype.code(),
                     field.type_mod,
                     field.collation.code(),
-                );
-                hex(
-                    &mut line,
-                    field
-                        .user_type
-                        .as_ref()
-                        .map(|identity| identity.schema.as_str())
-                        .unwrap_or(""),
-                );
-                let _ = write!(line, " ");
-                hex(
-                    &mut line,
-                    field
-                        .user_type
-                        .as_ref()
-                        .map(|identity| identity.name.as_str())
-                        .unwrap_or(""),
-                );
+                    ManifestZeroName(
+                        field
+                            .user_type
+                            .as_ref()
+                            .map(|identity| identity.schema.as_str())
+                            .unwrap_or("")
+                    ),
+                    ManifestZeroName(
+                        field
+                            .user_type
+                            .as_ref()
+                            .map(|identity| identity.name.as_str())
+                            .unwrap_or("")
+                    )
+                )
+                .map_err(|_| manifest_full())?;
             }
-            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+            writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
         }
         for (_, method) in storage.checkpoint_access_methods() {
             write_database_context(
@@ -11723,7 +11719,7 @@ impl Checkpointer {
             self.value_writer.reset_navigation(
                 spec.position,
                 spec.kind,
-                job.include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
+                !job.include_mask.is_empty() && spec.kind != crate::store::NavigationKind::Posting,
             );
         } else {
             self.value_writer.reset();
@@ -11853,7 +11849,7 @@ impl Checkpointer {
             self.value_writer.reset_navigation(
                 spec.position,
                 spec.kind,
-                job.include_mask != 0 && spec.kind != crate::store::NavigationKind::Posting,
+                !job.include_mask.is_empty() && spec.kind != crate::store::NavigationKind::Posting,
             );
         } else {
             self.value_writer.reset();
@@ -12094,13 +12090,13 @@ impl Checkpointer {
                             &mut published,
                             (hash, rowid, commit_lsn),
                             key,
-                            (job.include_mask != 0
+                            (!job.include_mask.is_empty()
                                 && spec.kind != crate::store::NavigationKind::Posting)
                                 .then_some(payload),
                             summary.expect("navigation summary was computed"),
                             &mut compare_keys,
                         )
-                    } else if job.include_mask == 0 {
+                    } else if job.include_mask.is_empty() {
                         self.value_writer.append(
                             &mut published,
                             hash,
@@ -13115,7 +13111,8 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
         ));
     }
     let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
-    let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+    let mut table_column_masks =
+        [crate::storage::ColumnSet::EMPTY; crate::storage::MAX_PUBLICATION_TABLES];
     let mut table_include_descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
     let mut table_filter_sql =
         [crate::util::StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
@@ -13350,7 +13347,8 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     let events =
         crate::sql::ast::TriggerEvents::from_bits(parse_field(words.next(), "trigger events")?)
             .ok_or(CheckpointSetupError::Corrupt("trigger events"))?;
-    let update_columns: u64 = parse_field(words.next(), "trigger update columns")?;
+    let update_columns: crate::storage::ColumnSet =
+        parse_field(words.next(), "trigger update columns")?;
     let old_table = match words
         .next()
         .ok_or(CheckpointSetupError::Corrupt("trigger old table"))?
@@ -13475,7 +13473,7 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
         || (!matches!(
             transition_tables,
             crate::storage::TriggerTransitionTables::None
-        ) && update_columns != 0)
+        ) && !update_columns.is_empty())
         || words.next().is_some()
     {
         return Err(CheckpointSetupError::Corrupt("malformed trigger record"));
@@ -13994,7 +13992,7 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
         .next()
         .ok_or(CheckpointSetupError::Corrupt("invalid view columns"))?;
     let count = parse_field::<usize>(Some(count), "view column count")?;
-    if count > crate::storage::MAX_COLUMNS {
+    if count > crate::storage::MAX_RELATION_COLUMNS {
         return Err(CheckpointSetupError::Corrupt("view column count"));
     }
     let mut names = [crate::storage::SqlName::EMPTY; crate::storage::MAX_COLUMNS];
@@ -14162,6 +14160,9 @@ struct ManifestViewColumns(crate::storage::ViewColumns);
 
 struct ManifestName<'a>(&'a str);
 
+/// Older manifest records use a single zero for an absent optional name.
+struct ManifestZeroName<'a>(&'a str);
+
 // Stream variable-width routine fields into the one startup-reserved manifest
 // buffer. No intermediate field can truncate and publish an unreadable record.
 struct ManifestRoutineArguments<'a>(&'a [crate::storage::RoutineArgumentDef]);
@@ -14275,6 +14276,18 @@ impl core::fmt::Display for ManifestName<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.0.is_empty() {
             return output.write_str("-");
+        }
+        for byte in self.0.as_bytes() {
+            write!(output, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for ManifestZeroName<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return output.write_str("0");
         }
         for byte in self.0.as_bytes() {
             write!(output, "{byte:02x}")?;
@@ -14962,7 +14975,7 @@ mod stored_dependency_tests {
                 name: SqlName::parse("current_name").unwrap(),
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_name").unwrap(),
-                referenced_columns: 0b101,
+                referenced_columns: crate::storage::ColumnSet::from_low_word(0b101),
             })
             .unwrap();
         dependencies
@@ -14975,7 +14988,7 @@ mod stored_dependency_tests {
                 name: SqlName::parse("expanded").unwrap(),
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_function").unwrap(),
-                referenced_columns: 0,
+                referenced_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         let encoded = format!("{}", ManifestDependencies(dependencies.view()));

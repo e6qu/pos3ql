@@ -2217,7 +2217,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn materialize_composite<'a>(
         &self,
         slot: u16,
-        physical_fields: u8,
+        physical_fields: u16,
         text: &'a str,
         arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {
@@ -5997,6 +5997,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         // A set-returning `_pg_expandarray(array)` expands each row into one output
         // row per array element.
         let srf_call = find_srf(statement.items);
+        let projection_has_project_set = has_project_set(statement.items, storage, txid);
         // This stream is the only path whose projection is consumed directly
         // from the scan callback. Its complete row demand is therefore known
         // here: projection expressions plus the complete WHERE. Every other
@@ -6073,15 +6074,19 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
                 };
                 // Number of output rows this source row yields (1, unless an
                 // `_pg_expandarray` expands it per array element).
-                let project_set = prepare_project_set(
-                    statement.items,
-                    storage,
-                    txid,
-                    arena,
-                    params,
-                    row,
-                    row_hooks,
-                )?;
+                let project_set = if projection_has_project_set {
+                    prepare_project_set(
+                        statement.items,
+                        storage,
+                        txid,
+                        arena,
+                        params,
+                        row,
+                        row_hooks,
+                    )?
+                } else {
+                    srf::ProjectSet::single()
+                };
                 for k in 1..=project_set.count {
                     if emitted >= limit {
                         break;
@@ -7383,6 +7388,7 @@ fn select_into_rows_mode<'a>(
     // A set-returning `_pg_expandarray(array)` in the projection expands each
     // source row into one output row per array element.
     let srf_call = find_srf(statement.items);
+    let projection_has_project_set = has_project_set(statement.items, storage, txid);
     // Per-row correlated-subquery scratch, allocated once and reused across
     // the scan (this path may run without per-row arena recycling).
     let (n_scalar_scratch, n_list_scratch) =
@@ -7433,15 +7439,19 @@ fn select_into_rows_mode<'a>(
             None => &hooks,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
-        let project_set = prepare_project_set(
-            statement.items,
-            storage,
-            txid,
-            arena,
-            params,
-            row,
-            row_hooks,
-        )?;
+        let project_set = if projection_has_project_set {
+            prepare_project_set(
+                statement.items,
+                storage,
+                txid,
+                arena,
+                params,
+                row,
+                row_hooks,
+            )?
+        } else {
+            srf::ProjectSet::single()
+        };
         if !project_set.any && srf_call.is_none() {
             let n = project_row(
                 statement.items,

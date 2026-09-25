@@ -10,7 +10,7 @@ use core::fmt::Write as _;
 
 use crate::mem::arena::Arena;
 use crate::storage::{
-    ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, OwnedDatum, PartitionBound,
+    ColumnMeta, ColumnSet, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, OwnedDatum, PartitionBound,
     PartitionBoundValue, PartitionStrategy, PolicyCommandKind, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
@@ -10785,19 +10785,21 @@ fn parent_constraint_oid(
     for (column, metadata) in parent.columns().iter().enumerate() {
         if metadata.primary {
             if !is_exclusion && is_primary && columns == [column as u16] {
-                return index_oid(parent_slot, position) + 500_000;
+                return index_oid(parent_slot, position)
+                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         } else if metadata.unique {
             if !is_exclusion && !is_primary && columns == [column as u16] {
-                return index_oid(parent_slot, position) + 500_000;
+                return index_oid(parent_slot, position)
+                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         }
     }
     for unique in parent.uniques() {
         if !is_exclusion && unique.is_primary == is_primary && unique.columns() == columns {
-            return index_oid(parent_slot, position) + 500_000;
+            return index_oid(parent_slot, position) + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
         }
         position += 1;
     }
@@ -10816,7 +10818,8 @@ fn parent_constraint_oid(
                     == child_exclusion.operators[..child_exclusion.n_cols]
                 && exclusion.predicate == child_exclusion.predicate
             {
-                return index_oid(parent_slot, position) + 500_000;
+                return index_oid(parent_slot, position)
+                    + crate::storage::INDEX_CONSTRAINT_OID_OFFSET;
             }
             position += 1;
         }
@@ -11074,7 +11077,7 @@ pub(crate) fn ordered_value_index_identity(
     equality_prefix: usize,
     order_positions: &[u8],
     order: &[crate::sql::ast::OrderBy<'_>],
-) -> Option<(i32, StackStr<64>, u64)> {
+) -> Option<(i32, StackStr<64>, ColumnSet)> {
     if order_positions.len() != order.len() {
         return None;
     }
@@ -11124,14 +11127,16 @@ pub(crate) fn ordered_value_index_identity(
             }
             backwards = Some(direction);
         }
-        let key_mask = index.columns[..index.n_cols]
-            .iter()
-            .fold(0u64, |mask, column| mask | (1u64 << column));
-        let include_mask = index.include_columns[..index.n_include_cols]
-            .iter()
-            .fold(0u64, |mask, column| mask | (1u64 << column))
-            & !key_mask;
-        if found.is_none_or(|(_, _, prior_mask): (i32, StackStr<64>, u64)| {
+        let mut key_mask = ColumnSet::EMPTY;
+        for &column in &index.columns[..index.n_cols] {
+            key_mask.insert(usize::from(column));
+        }
+        let mut include_mask = ColumnSet::EMPTY;
+        for &column in &index.include_columns[..index.n_include_cols] {
+            include_mask.insert(usize::from(column));
+        }
+        include_mask = include_mask.difference(key_mask);
+        if found.is_none_or(|(_, _, prior_mask): (i32, StackStr<64>, ColumnSet)| {
             include_mask.count_ones() > prior_mask.count_ones()
         }) {
             found = Some((index.oid, index.name, include_mask));
@@ -13072,7 +13077,7 @@ pub fn trigger_def_text<'a>(
         )
         .map_err(|_| super::eval::arena_full())?;
         event_count += 1;
-        if event == super::ast::TriggerEvents::UPDATE && trigger.update_columns != 0 {
+        if event == super::ast::TriggerEvents::UPDATE && !trigger.update_columns.is_empty() {
             output
                 .write_str(" OF ")
                 .map_err(|_| super::eval::arena_full())?;
@@ -13086,7 +13091,7 @@ pub fn trigger_def_text<'a>(
             };
             let mut written = 0usize;
             for column in 0..definition.n_columns {
-                if trigger.update_columns & (1u64 << column) == 0 {
+                if !trigger.update_columns.contains(column) {
                     continue;
                 }
                 if written != 0 {
@@ -14665,7 +14670,13 @@ pub(crate) const FIRST_FK_OID: i32 = 10_000_000;
 pub(crate) const FIRST_CHECK_OID: i32 = 20_000_000;
 pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 30_000_000;
 pub(crate) const FIRST_NOT_NULL_OID: i32 = 40_000_000;
-pub(crate) const FIRST_DETACHED_PARTITION_CHECK_OID: i32 = 50_000_000;
+pub(crate) const FIRST_DETACHED_PARTITION_CHECK_OID: i32 = 110_000_000;
+
+pub(crate) const fn not_null_constraint_oid(table_slot: usize, column_index: usize) -> i32 {
+    FIRST_NOT_NULL_OID
+        + table_slot as i32 * crate::storage::MAX_RELATION_COLUMNS as i32
+        + column_index as i32
+}
 
 /// The current catalog OID of a named table constraint. Constraint comments
 /// retain the table-slot/name identity because index and check positions are
@@ -14682,7 +14693,7 @@ pub(crate) fn table_constraint_oid(
     let mut index_constraint = None;
     visit_indexes(storage, txid, |index| {
         if index.is_constraint && index.table_slot == table_slot && index.name.as_str() == name {
-            index_constraint = Some(index.oid + 500_000);
+            index_constraint = Some(index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET);
         }
     });
     if index_constraint.is_some() {
@@ -14724,9 +14735,7 @@ pub(crate) fn table_constraint_oid(
             column.not_null.is_required()
                 && not_null_constraint_name(table, column).as_str() == name
         })
-        .map(|(index, _)| {
-            FIRST_NOT_NULL_OID + table_slot as i32 * MAX_COLUMNS as i32 + index as i32
-        })
+        .map(|(index, _)| not_null_constraint_oid(table_slot, index))
 }
 
 /// Resolve a table constraint OID back to its stable table/name identity.
@@ -14774,7 +14783,10 @@ pub(crate) fn table_constraint_identity_by_oid(
         }
         let mut index_name = None;
         visit_indexes(storage, txid, |index| {
-            if index.table_slot == table_slot && index.is_constraint && index.oid + 500_000 == oid {
+            if index.table_slot == table_slot
+                && index.is_constraint
+                && index.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET == oid
+            {
                 index_name = Some(StackStr::from_str(index.name.as_str()));
             }
         });
@@ -15039,7 +15051,7 @@ pub fn constraint_def_text<'a>(
     }
     let indexes = collect_indexes(storage, txid, arena)?;
     for info in indexes {
-        if oid != info.oid + 500_000 || !info.is_constraint {
+        if oid != info.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET || !info.is_constraint {
             continue;
         }
         let table = storage.table_def(info.table_slot, txid);
@@ -16922,13 +16934,13 @@ fn pg_publication_rel<'a>(
                     rows.len()
                 ));
             }
-            let prattrs = if *column_mask == 0 {
+            let prattrs = if column_mask.is_empty() {
                 Datum::Null
             } else {
                 let mut attributes = [0u16; crate::storage::MAX_COLUMNS];
                 let mut attribute_count = 0usize;
                 for column in 0..crate::storage::MAX_COLUMNS {
-                    if column_mask & (1u64 << column) != 0 {
+                    if column_mask.contains(column) {
                         attributes[attribute_count] = column as u16;
                         attribute_count += 1;
                     }
@@ -17005,16 +17017,16 @@ fn pg_publication_tables<'a>(
             let effective_explicit =
                 super::publication_partition_member(storage, publication, output);
             let implicit_mask = || {
-                output_definition
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, column)| {
-                        !column.default.is_generated()
-                            || published.publish_generated_columns
-                                == crate::storage::PublishGeneratedColumns::Stored
-                    })
-                    .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
+                let mut mask = ColumnSet::EMPTY;
+                for (column, metadata) in output_definition.columns().iter().enumerate() {
+                    if !metadata.default.is_generated()
+                        || published.publish_generated_columns
+                            == crate::storage::PublishGeneratedColumns::Stored
+                    {
+                        mask.insert(column);
+                    }
+                }
+                mask
             };
             let column_mask = if published.all_tables || schema {
                 implicit_mask()
@@ -17030,7 +17042,11 @@ fn pg_publication_tables<'a>(
                     implicit_mask()
                 } else {
                     let mask = published.table_column_masks[index];
-                    if mask == 0 { implicit_mask() } else { mask }
+                    if mask.is_empty() {
+                        implicit_mask()
+                    } else {
+                        mask
+                    }
                 }
             } else {
                 implicit_mask()
@@ -17038,7 +17054,7 @@ fn pg_publication_tables<'a>(
             let mut attribute_values = [Datum::Null; crate::storage::MAX_COLUMNS];
             let mut attribute_count = 0;
             for (column, metadata) in output_definition.columns().iter().enumerate() {
-                if column_mask & (1u64 << column) != 0 {
+                if column_mask.contains(column) {
                     attribute_values[attribute_count] = text(metadata.name.as_str(), arena)?;
                     attribute_count += 1;
                 }
@@ -18342,7 +18358,7 @@ fn pg_inherits<'a>(
     }
     for index in indexes {
         let parent_oid = if index.constraint_parent_oid != 0 {
-            index.constraint_parent_oid - 500_000
+            index.constraint_parent_oid - crate::storage::INDEX_CONSTRAINT_OID_OFFSET
         } else if let Some(parent) = index
             .explicit_definition
             .and_then(|definition| definition.parent)
@@ -19490,7 +19506,7 @@ fn pg_constraint<'a>(
         }
         out[n] = row(
             &[
-                Datum::Int4(info.oid + 500_000), // constraint oid, distinct from the index's
+                Datum::Int4(info.oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET),
                 text(info.name.as_str(), arena)?,
                 Datum::Int4(info.table_oid),
                 Datum::Int4(0),
@@ -19612,7 +19628,10 @@ fn pg_constraint<'a>(
         let root_row = n;
         out[n] = row(
             &[
-                Datum::Int4(crate::storage::trigger_oid(&trigger) + 500_000),
+                Datum::Int4(
+                    crate::storage::trigger_oid(&trigger)
+                        + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                ),
                 text(trigger.name_to(txid).as_str(), arena)?,
                 Datum::Int4(table_oid(storage, table)),
                 Datum::Int4(0),
@@ -19662,7 +19681,10 @@ fn pg_constraint<'a>(
             }
             let mut clone = [Datum::Null; 29];
             clone.copy_from_slice(out[root_row]);
-            clone[0] = Datum::Int4(partition_trigger_oid(&trigger, child)? + 500_000);
+            clone[0] = Datum::Int4(
+                partition_trigger_oid(&trigger, child)?
+                    + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+            );
             clone[2] = Datum::Int4(table_oid(storage, child));
             clone[18] = Datum::Int4(namespace_oid(
                 storage,
@@ -19798,9 +19820,7 @@ fn pg_constraint<'a>(
             let constraint_name = not_null_constraint_name(table, column);
             out[n] = row(
                 &[
-                    Datum::Int4(
-                        FIRST_NOT_NULL_OID + slot as i32 * MAX_COLUMNS as i32 + column_index as i32,
-                    ),
+                    Datum::Int4(not_null_constraint_oid(slot, column_index)),
                     text(constraint_name.as_str(), arena)?,
                     Datum::Int4(table_oid(storage, slot)),
                     Datum::Int4(0),
@@ -20203,7 +20223,7 @@ fn pg_depend<'a>(
             .entries()
             .iter()
             .map(|dependency| {
-                if dependency.referenced_columns == 0 {
+                if dependency.referenced_columns.is_empty() {
                     1
                 } else {
                     dependency.referenced_columns.count_ones() as usize
@@ -20705,7 +20725,7 @@ fn pg_depend<'a>(
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
-            if dependency.referenced_columns == 0 {
+            if dependency.referenced_columns.is_empty() {
                 push(
                     2618,
                     rewrite_oid,
@@ -20715,8 +20735,8 @@ fn pg_depend<'a>(
                     "n",
                 )?;
             } else {
-                for column in 0..u64::BITS as usize {
-                    if dependency.referenced_columns & (1u64 << column) != 0 {
+                for column in 0..MAX_COLUMNS {
+                    if dependency.referenced_columns.contains(column) {
                         push(
                             2618,
                             rewrite_oid,
@@ -20744,7 +20764,7 @@ fn pg_depend<'a>(
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
             };
-            if dependency.referenced_columns == 0 {
+            if dependency.referenced_columns.is_empty() {
                 push(
                     2618,
                     rule.oid(),
@@ -20754,8 +20774,8 @@ fn pg_depend<'a>(
                     "n",
                 )?;
             } else {
-                for column in 0..u64::BITS as usize {
-                    if dependency.referenced_columns & (1u64 << column) != 0 {
+                for column in 0..MAX_COLUMNS {
+                    if dependency.referenced_columns.contains(column) {
                         push(
                             2618,
                             rule.oid(),
@@ -20814,10 +20834,17 @@ fn pg_depend<'a>(
                     "a",
                 )?;
             }
-            push(2606, trigger_oid + 500_000, 2620, trigger_oid, 0, "i")?;
+            push(
+                2606,
+                trigger_oid + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                2620,
+                trigger_oid,
+                0,
+                "i",
+            )?;
         }
         for column in 0..MAX_COLUMNS {
-            if trigger.update_columns & (1u64 << column) != 0 {
+            if trigger.update_columns.contains(column) {
                 push(
                     2620,
                     trigger_oid,
@@ -20869,10 +20896,17 @@ fn pg_depend<'a>(
                         "a",
                     )?;
                 }
-                push(2606, clone_oid + 500_000, 2620, clone_oid, 0, "i")?;
+                push(
+                    2606,
+                    clone_oid + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
+                    2620,
+                    clone_oid,
+                    0,
+                    "i",
+                )?;
             }
             for column in 0..MAX_COLUMNS {
-                if trigger.update_columns & (1u64 << column) != 0 {
+                if trigger.update_columns.contains(column) {
                     push(
                         2620,
                         clone_oid,
@@ -24936,7 +24970,8 @@ fn pg_trigger<'a>(
                 referenced_table,
                 timing,
             } => (
-                crate::storage::trigger_oid(&trigger) + 500_000,
+                crate::storage::trigger_oid(&trigger)
+                    + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET,
                 timing,
                 referenced_table.map_or(0, |slot| table_oid(storage, usize::from(slot))),
             ),
@@ -24977,7 +25012,7 @@ fn pg_trigger<'a>(
         let mut update_columns = [u16::MAX; MAX_COLUMNS];
         let mut update_count = 0usize;
         for column in 0..MAX_COLUMNS {
-            if trigger.update_columns & (1u64 << column) != 0 {
+            if trigger.update_columns.contains(column) {
                 update_columns[update_count] = column as u16;
                 update_count += 1;
             }
@@ -25083,7 +25118,7 @@ fn pg_trigger<'a>(
                 },
             );
             if matches!(trigger.kind, crate::storage::TriggerKind::Constraint { .. }) {
-                clone[11] = Datum::Int4(clone_oid + 500_000);
+                clone[11] = Datum::Int4(clone_oid + crate::storage::TRIGGER_CONSTRAINT_OID_OFFSET);
             }
             rows[count] = row(&clone, arena)?;
             count += 1;
@@ -31157,12 +31192,7 @@ fn info_view_column_usage<'a>(
                     ));
                 }
                 let columns = storage.table_def(table_slot, txid).columns().len();
-                let valid_mask = if columns == u64::BITS as usize {
-                    u64::MAX
-                } else {
-                    (1u64 << columns) - 1
-                };
-                if dependency.referenced_columns & !valid_mask != 0 {
+                if !dependency.referenced_columns.fits(columns) {
                     return Err(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "view \"{}\" has a stale column dependency",
@@ -31187,12 +31217,7 @@ fn info_view_column_usage<'a>(
                     [super::types::ColDesc::new("", 0, 0); crate::storage::MAX_COLUMNS];
                 let n_columns =
                     describe_stored_view(storage, txid, source_slot, arena, &mut columns)?;
-                let valid_mask = if n_columns == u64::BITS as usize {
-                    u64::MAX
-                } else {
-                    (1u64 << n_columns) - 1
-                };
-                if dependency.referenced_columns & !valid_mask != 0 {
+                if !dependency.referenced_columns.fits(n_columns) {
                     return Err(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "view \"{}\" has a stale column dependency",
@@ -31217,7 +31242,7 @@ fn info_view_column_usage<'a>(
                 crate::storage::DependencyClass::Table => {
                     let table = storage.table_def(dependency.slot as usize, txid);
                     for column in 0..table.columns().len() {
-                        if dependency.referenced_columns & (1u64 << column) != 0 {
+                        if dependency.referenced_columns.contains(column) {
                             out[index] = row(
                                 &[
                                     text("postgres", arena)?,
@@ -31242,7 +31267,7 @@ fn info_view_column_usage<'a>(
                     let n_columns =
                         describe_stored_view(storage, txid, source_slot, arena, &mut columns)?;
                     for (column, descriptor) in columns.iter().enumerate().take(n_columns) {
-                        if dependency.referenced_columns & (1u64 << column) != 0 {
+                        if dependency.referenced_columns.contains(column) {
                             out[index] = row(
                                 &[
                                     text("postgres", arena)?,
@@ -32097,7 +32122,7 @@ fn info_constraint_column_usage<'a>(
             let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
             let columns = crate::sql::exec::check_referenced_columns(expression, table)?;
             for (index, _) in table.columns().iter().enumerate() {
-                if columns & (1u64 << index) != 0 {
+                if columns.contains(index) {
                     append(table, table, index as u16, check.name.as_str())?;
                 }
             }

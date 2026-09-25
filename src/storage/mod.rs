@@ -26,7 +26,178 @@ use crate::store::BlockStore;
 use crate::util::StackStr;
 use crate::{sql_err, stack_format};
 
-pub(crate) use rowenc::MAX_COLUMNS;
+pub(crate) use rowenc::{MAX_COLUMNS, MAX_RELATION_COLUMNS};
+
+const COLUMN_SET_WORDS: usize = MAX_COLUMNS.div_ceil(u64::BITS as usize);
+
+/// A fixed-width set of physical relation attributes. PostgreSQL numbers
+/// ordinary attributes from one; callers use the corresponding zero-based
+/// physical column index here. Keeping this type at catalog, DML, and replay
+/// boundaries prevents a wider relation from being truncated to one machine
+/// word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnSet {
+    words: [u64; COLUMN_SET_WORDS],
+}
+
+impl ColumnSet {
+    pub(crate) const ENCODED_BYTES: usize = COLUMN_SET_WORDS * core::mem::size_of::<u64>();
+    pub(crate) const EMPTY: Self = Self {
+        words: [0; COLUMN_SET_WORDS],
+    };
+
+    pub(crate) const fn from_low_word(word: u64) -> Self {
+        let mut set = Self::EMPTY;
+        set.words[0] = word;
+        set
+    }
+
+    pub(crate) fn all(columns: usize) -> Self {
+        debug_assert!(columns <= MAX_COLUMNS);
+        let mut set = Self::EMPTY;
+        for column in 0..columns {
+            set.insert(column);
+        }
+        set
+    }
+
+    pub(crate) fn from_column(column: usize) -> Self {
+        let mut set = Self::EMPTY;
+        set.insert(column);
+        set
+    }
+
+    pub(crate) fn insert(&mut self, column: usize) {
+        debug_assert!(column < MAX_COLUMNS);
+        self.words[column / u64::BITS as usize] |= 1u64 << (column % u64::BITS as usize);
+    }
+
+    pub(crate) const fn contains(&self, column: usize) -> bool {
+        column < MAX_COLUMNS
+            && self.words[column / u64::BITS as usize] & (1u64 << (column % u64::BITS as usize))
+                != 0
+    }
+
+    pub(crate) fn intersects(self, other: Self) -> bool {
+        self.words
+            .iter()
+            .zip(other.words)
+            .any(|(left, right)| left & right != 0)
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        let mut index = 0;
+        while index < COLUMN_SET_WORDS {
+            if self.words[index] != 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    pub(crate) fn count_ones(self) -> u32 {
+        self.words.iter().map(|word| word.count_ones()).sum()
+    }
+
+    pub(crate) fn first(self) -> Option<usize> {
+        self.words
+            .iter()
+            .copied()
+            .enumerate()
+            .find_map(|(word, bits)| {
+                (bits != 0).then_some(word * u64::BITS as usize + bits.trailing_zeros() as usize)
+            })
+    }
+
+    pub(crate) fn fits(self, columns: usize) -> bool {
+        if columns >= MAX_COLUMNS {
+            return true;
+        }
+        (columns..MAX_COLUMNS).all(|column| !self.contains(column))
+    }
+
+    pub(crate) fn union_with(&mut self, other: Self) {
+        for (target, source) in self.words.iter_mut().zip(other.words) {
+            *target |= source;
+        }
+    }
+
+    pub(crate) fn difference(self, other: Self) -> Self {
+        let mut result = self;
+        for (target, removed) in result.words.iter_mut().zip(other.words) {
+            *target &= !removed;
+        }
+        result
+    }
+
+    pub(crate) const fn words(&self) -> &[u64; COLUMN_SET_WORDS] {
+        &self.words
+    }
+
+    pub(crate) fn set_word(&mut self, index: usize, word: u64) -> bool {
+        let Some(target) = self.words.get_mut(index) else {
+            return false;
+        };
+        *target = word;
+        true
+    }
+}
+
+impl core::fmt::Display for ColumnSet {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.words[1..].iter().all(|word| *word == 0) {
+            return self.words[0].fmt(formatter);
+        }
+        formatter.write_str("x")?;
+        let mut separator = "";
+        for (index, word) in self.words.iter().copied().enumerate() {
+            if word == 0 {
+                continue;
+            }
+            write!(formatter, "{separator}{index:x}:{word:x}")?;
+            separator = ",";
+        }
+        Ok(())
+    }
+}
+
+impl core::str::FromStr for ColumnSet {
+    type Err = core::num::ParseIntError;
+
+    fn from_str(source: &str) -> Result<Self, Self::Err> {
+        if let Some(encoded) = source.strip_prefix('x') {
+            let mut result = Self::EMPTY;
+            for entry in encoded.split(',') {
+                let (index, word) = entry.split_once(':').unwrap_or(("", ""));
+                let index = usize::from_str_radix(index, 16)?;
+                let word = u64::from_str_radix(word, 16)?;
+                if index >= COLUMN_SET_WORDS {
+                    return "".parse::<u64>().map(|_| result);
+                }
+                result.words[index] = word;
+            }
+            Ok(result)
+        } else {
+            source.parse::<u64>().map(Self::from_low_word)
+        }
+    }
+}
+
+impl core::ops::BitOrAssign for ColumnSet {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.union_with(rhs);
+    }
+}
+
+impl core::ops::BitOr for ColumnSet {
+    type Output = Self;
+
+    fn bitor(mut self, rhs: Self) -> Self::Output {
+        self |= rhs;
+        self
+    }
+}
 
 /// Maximum explicit relation membership entries in one publication.  WAL
 /// encodes this count in one byte, so the capacity derives from that boundary
@@ -1169,7 +1340,10 @@ pub(crate) const DEFAULT_EXPR_MAX: usize = 120;
 /// Every accepted view column may carry a default. Keeping the sparse entries
 /// at the view-column boundary prevents ALTER VIEW from introducing a narrower
 /// catalog-only limit.
-pub(crate) const MAX_VIEW_DEFAULTS: usize = MAX_COLUMNS;
+// Defaults carry parsed expressions and are substantially larger than column
+// names. Keep their fixed resource limit independent from PostgreSQL's
+// relation-width boundary so widening rows does not multiply every view slot.
+pub(crate) const MAX_VIEW_DEFAULTS: usize = 64;
 
 impl ColumnMeta {
     pub const EMPTY: Self = ColumnMeta {
@@ -2192,7 +2366,7 @@ pub(crate) struct PendingChange {
     /// captured before WAL publication, while an object-resident prior image
     /// may still return a suspendable read, and invalidates only durable value
     /// indexes whose keys, predicates, or included payload depend on them.
-    pub changed_columns: u64,
+    pub changed_columns: ColumnSet,
     /// Insert and delete change index membership even when an index expression
     /// or predicate references no table column.
     pub changes_existence: bool,
@@ -2711,7 +2885,7 @@ impl TableStatistics {
 /// share identical tuples and draw from the separately configured global
 /// value-index pool. This roster must never become a narrower constraint
 /// boundary than the table definition it accelerates and enforces.
-pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS;
+pub(crate) const MAX_VALUE_ENFORCERS: usize = MAX_RELATION_COLUMNS + MAX_UNIQUES + MAX_EXCLUSIONS;
 
 /// Extended-statistics objects and their computed values are startup-bounded.
 /// PostgreSQL accepts more objects/keys/MCV entries; crossing one of these
@@ -3567,11 +3741,11 @@ pub(crate) struct Enforcer {
     ordered: bool,
     /// Union of included columns for compatible named indexes sharing this
     /// physical key binding. Key columns are never repeated in this mask.
-    include_mask: u64,
+    include_mask: ColumnSet,
     /// Columns that can affect this binding's key, predicate membership, or
     /// included payload. Expression and partial-index references are folded in
     /// when the binding is built, so commit need not reparse catalog SQL.
-    dependency_mask: u64,
+    dependency_mask: ColumnSet,
     durable: Option<crate::store::ValueIndexHandle>,
     /// The committed image differs from `durable`. A clean binding can retain
     /// its immutable generation when an unrelated table column changes.
@@ -3884,7 +4058,7 @@ pub struct StoredQueryDependency {
     /// at one, so bit zero represents attnum 1). Relation-only dependencies
     /// retain zero; this avoids treating an unknown column set as every
     /// column when reconstructing catalog dependencies.
-    pub referenced_columns: u64,
+    pub referenced_columns: ColumnSet,
     pub schema: SqlName,
     pub name: SqlName,
     pub referenced_schema: SqlName,
@@ -3895,7 +4069,7 @@ pub struct StoredQueryDependency {
 pub(crate) struct SerializedStoredQueryDependency {
     pub class: DependencyClass,
     pub identity: StoredDependencyIdentity,
-    pub referenced_columns: u64,
+    pub referenced_columns: ColumnSet,
     pub schema: SqlName,
     pub name: SqlName,
     pub referenced_schema: SqlName,
@@ -3907,7 +4081,7 @@ impl StoredQueryDependency {
         class: DependencyClass::Table,
         slot: 0,
         identity: StoredDependencyIdentity::Name,
-        referenced_columns: 0,
+        referenced_columns: ColumnSet::EMPTY,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         referenced_schema: SqlName::EMPTY,
@@ -4142,12 +4316,12 @@ impl StoredQueryDependencies {
         slot: usize,
         column: usize,
     ) -> Result<(), SqlError> {
-        let bit = 1u64.checked_shl(column as u32).ok_or_else(|| {
-            sql_err!(
+        if column >= MAX_COLUMNS {
+            return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "stored query references a column beyond the static attribute bound"
-            )
-        })?;
+            ));
+        }
         let len = usize::from(self.len);
         let dependency = self
             .entry_storage_mut()
@@ -4160,7 +4334,7 @@ impl StoredQueryDependencies {
                     "column dependency has no owning relation dependency"
                 )
             })?;
-        dependency.referenced_columns |= bit;
+        dependency.referenced_columns.insert(column);
         Ok(())
     }
 
@@ -4599,7 +4773,7 @@ pub struct ViewDefinition {
 pub struct ViewColumns {
     names: [SqlName; MAX_COLUMNS],
     defaults: [ViewColumnDefault; MAX_VIEW_DEFAULTS],
-    count: u8,
+    count: u16,
     aliases: bool,
 }
 
@@ -4612,11 +4786,11 @@ impl ViewColumns {
     };
 
     pub fn from_names(names: &[&str]) -> Result<Self, SqlError> {
-        if names.len() > MAX_COLUMNS {
+        if names.len() > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
-                "view has more than {} columns",
-                MAX_COLUMNS
+                "tables can have at most {} columns",
+                MAX_RELATION_COLUMNS
             ));
         }
         let mut output = Self::EMPTY;
@@ -4631,17 +4805,17 @@ impl ViewColumns {
             }
             output.names[index] = parsed;
         }
-        output.count = names.len() as u8;
+        output.count = names.len() as u16;
         output.aliases = true;
         Ok(output)
     }
 
     pub fn from_sql_names(names: &[SqlName]) -> Result<Self, SqlError> {
-        if names.len() > MAX_COLUMNS {
+        if names.len() > MAX_RELATION_COLUMNS {
             return Err(sql_err!(
                 sqlstate::TOO_MANY_COLUMNS,
-                "view has more than {} columns",
-                MAX_COLUMNS
+                "tables can have at most {} columns",
+                MAX_RELATION_COLUMNS
             ));
         }
         let mut output = Self::EMPTY;
@@ -4655,7 +4829,7 @@ impl ViewColumns {
             }
             output.names[index] = name;
         }
-        output.count = names.len() as u8;
+        output.count = names.len() as u16;
         output.aliases = true;
         Ok(output)
     }
@@ -4684,7 +4858,7 @@ impl ViewColumns {
             let mut default = ColumnDefault::NONE;
             let mut slot = 0;
             while slot < MAX_VIEW_DEFAULTS {
-                if self.defaults[slot].column == index as u8 {
+                if self.defaults[slot].column == index as u16 {
                     default = self.defaults[slot].default;
                     break;
                 }
@@ -4702,7 +4876,7 @@ impl ViewColumns {
         }
         self.defaults
             .iter()
-            .find(|entry| entry.column == index as u8)
+            .find(|entry| entry.column == index as u16)
             .map(|entry| &entry.default)
     }
 
@@ -4722,7 +4896,7 @@ impl ViewColumns {
         if let Some(entry) = self
             .defaults
             .iter_mut()
-            .find(|entry| entry.column == index as u8)
+            .find(|entry| entry.column == index as u16)
         {
             if matches!(default, ColumnDefault::None) {
                 *entry = ViewColumnDefault::EMPTY;
@@ -4737,7 +4911,7 @@ impl ViewColumns {
         let Some(entry) = self
             .defaults
             .iter_mut()
-            .find(|entry| entry.column == u8::MAX)
+            .find(|entry| entry.column == u16::MAX)
         else {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -4746,7 +4920,7 @@ impl ViewColumns {
             ));
         };
         *entry = ViewColumnDefault {
-            column: index as u8,
+            column: index as u16,
             default,
         };
         Ok(self)
@@ -4783,13 +4957,13 @@ impl ViewColumns {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ViewColumnDefault {
-    column: u8,
+    column: u16,
     default: ColumnDefault,
 }
 
 impl ViewColumnDefault {
     const EMPTY: Self = Self {
-        column: u8::MAX,
+        column: u16::MAX,
         default: ColumnDefault::NONE,
     };
 }
@@ -4912,7 +5086,7 @@ pub struct PublicationDef {
     pub tables: [u16; MAX_PUBLICATION_TABLES],
     /// A zero mask means the member publishes all columns; otherwise bit n
     /// selects PostgreSQL attribute n + 1.
-    pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
+    pub table_column_masks: [ColumnSet; MAX_PUBLICATION_TABLES],
     /// Ordinary inheritance descendants selected by each explicit member.
     /// Partition descendants are always implicit PostgreSQL members.
     pub table_include_descendants: [bool; MAX_PUBLICATION_TABLES],
@@ -4938,7 +5112,7 @@ pub struct PublicationDef {
 pub(crate) struct PublicationDefinition {
     pub all_tables: bool,
     pub tables: [u16; MAX_PUBLICATION_TABLES],
-    pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
+    pub table_column_masks: [ColumnSet; MAX_PUBLICATION_TABLES],
     pub table_include_descendants: [bool; MAX_PUBLICATION_TABLES],
     pub table_filters: PublicationFilters,
     pub table_count: usize,
@@ -4980,7 +5154,7 @@ pub struct PublicationSpec<'a> {
     pub name: SqlName,
     pub all_tables: bool,
     pub tables: &'a [u16],
-    pub table_column_masks: &'a [u64],
+    pub table_column_masks: &'a [ColumnSet],
     pub table_include_descendants: &'a [bool],
     pub table_filter_sql: &'a [StackStr<PUBLICATION_FILTER_SQL_MAX>],
     pub schemas: &'a [u8],
@@ -5791,18 +5965,18 @@ pub(crate) const MAX_VIEW_TYPE_OID_SLOTS: usize = (crate::sql::types::oid::FIRST
     - crate::sql::types::oid::FIRST_VIEW_COMPOSITE)
     as usize;
 
-pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = 80_000_000;
-pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 100_000_000;
+pub(crate) const FIRST_IMPLICIT_INDEX_OID: i32 = 120_000_000;
+pub(crate) const INDEX_CONSTRAINT_OID_OFFSET: i32 =
+    (MAX_TABLE_TYPE_OID_SLOTS * MAX_VALUE_ENFORCERS) as i32;
+pub(crate) const FIRST_EXPLICIT_INDEX_OID: i32 = 300_000_000;
 pub(crate) const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000_000;
-pub(crate) const INDEX_CONSTRAINT_OID_OFFSET: i32 = 500_000;
-pub(crate) const MAX_INDEX_OID_GENERATION: u64 =
-    (FIRST_PARTITION_TRIGGER_OID - FIRST_EXPLICIT_INDEX_OID - INDEX_CONSTRAINT_OID_OFFSET - 1)
-        as u64;
+pub(crate) const TRIGGER_CONSTRAINT_OID_OFFSET: i32 = 500_000;
+pub(crate) const MAX_INDEX_OID_GENERATION: u64 = INDEX_CONSTRAINT_OID_OFFSET as u64 - 1;
 // Reserve complete table-slot strides and the derived constraint OID at the
 // top of the signed OID space. Validate before installation, not catalog reads.
 pub(crate) const MAX_TRIGGER_OID_GENERATION: u64 = (i32::MAX as u64
     - FIRST_PARTITION_TRIGGER_OID as u64
-    - INDEX_CONSTRAINT_OID_OFFSET as u64
+    - TRIGGER_CONSTRAINT_OID_OFFSET as u64
     - (MAX_TABLE_TYPE_OID_SLOTS as u64 - 1))
     / MAX_TABLE_TYPE_OID_SLOTS as u64;
 
@@ -5822,7 +5996,7 @@ fn bounded_catalog_generation(value: u64, maximum: u64, object: &str) -> Result<
 /// identity and body.
 /// PostgreSQL's exact maximum number of input arguments for one routine.
 pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = 100;
-/// Routine row results share the engine's table-width boundary.
+/// Routine row results use PostgreSQL's executable target-list boundary.
 pub(crate) const MAX_ROUTINE_OUTPUT_COLUMNS: usize = MAX_COLUMNS;
 pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
 pub(crate) const ROUTINE_DEFAULT_MAX: usize = DEFAULT_EXPR_MAX;
@@ -7521,6 +7695,43 @@ impl RoutineDef {
         self.required_argument_count() <= arity && arity <= self.argument_count
     }
 
+    fn pending_definition_for(&self, txid: u32) -> Option<&PendingRoutineDefinition> {
+        self.pending_definition
+            .as_ref()
+            .filter(|pending| pending.txid == txid)
+    }
+
+    fn kind_for(&self, txid: u32) -> RoutineKind {
+        self.pending_definition_for(txid)
+            .map_or(self.kind, |pending| pending.kind)
+    }
+
+    fn attributes_for(&self, txid: u32) -> RoutineAttributes {
+        self.pending_definition_for(txid)
+            .map_or(self.attributes, |pending| pending.attributes)
+    }
+
+    fn accepts_input_arity_for(&self, arity: usize, txid: u32) -> bool {
+        let (argument_count, parameters) = self.pending_definition_for(txid).map_or(
+            (
+                self.argument_count,
+                &self.parameters[..self.parameter_count],
+            ),
+            |pending| {
+                (
+                    pending.argument_count,
+                    &pending.parameters[..pending.parameter_count],
+                )
+            },
+        );
+        let required = parameters
+            .iter()
+            .filter(|parameter| parameter.mode.is_input())
+            .take_while(|parameter| parameter.mode.default().is_none())
+            .count();
+        required <= arity && arity <= argument_count
+    }
+
     pub(crate) fn parameter_for_input(&self, input_index: usize) -> Option<RoutineParameterDef> {
         self.parameters()
             .iter()
@@ -7841,7 +8052,7 @@ pub(crate) struct TriggerDef {
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
-    pub(crate) update_columns: u64,
+    pub(crate) update_columns: ColumnSet,
     pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) arguments: TriggerArguments,
@@ -7864,7 +8075,7 @@ pub(crate) struct TriggerDefinition {
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
-    pub(crate) update_columns: u64,
+    pub(crate) update_columns: ColumnSet,
     pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) arguments: TriggerArguments,
@@ -7966,7 +8177,7 @@ pub(crate) struct TriggerSpec {
     pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
-    pub(crate) update_columns: u64,
+    pub(crate) update_columns: ColumnSet,
     pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) arguments: TriggerArguments,
@@ -7995,12 +8206,12 @@ pub(crate) const fn trigger_shape_is_valid(
     timing: crate::sql::ast::TriggerTiming,
     level: crate::sql::ast::TriggerLevel,
     events: crate::sql::ast::TriggerEvents,
-    update_columns: u64,
+    update_columns: ColumnSet,
     transition_tables: TriggerTransitionTables,
 ) -> bool {
     let has_transition_tables = !matches!(transition_tables, TriggerTransitionTables::None);
     if (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
-        || (has_transition_tables && update_columns != 0)
+        || (has_transition_tables && !update_columns.is_empty())
         || !transition_tables.is_valid_for(timing, level, events)
     {
         return false;
@@ -8214,7 +8425,7 @@ impl TriggerDef {
         timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).expect("INSERT event is valid"),
-        update_columns: 0,
+        update_columns: ColumnSet::EMPTY,
         transition_tables: TriggerTransitionTables::None,
         when: None,
         arguments: TriggerArguments::EMPTY,
@@ -8408,7 +8619,7 @@ pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = (crate::sql::types::oid::F
     as usize;
 /// Named composites share the durable row-format column boundary. This avoids
 /// accepting a table shape that the corresponding named record cannot model.
-pub(crate) const MAX_COMPOSITE_FIELDS: usize = MAX_COLUMNS;
+pub(crate) const MAX_COMPOSITE_FIELDS: usize = MAX_RELATION_COLUMNS;
 
 /// One member of an enum type: a label plus its sort key. Ordering among enum
 /// values is by `sort` (PostgreSQL's `pg_enum.enumsortorder`), *not* by label
@@ -15432,7 +15643,7 @@ impl Storage {
                     pending_name: None,
                     all_tables: false,
                     tables: [u16::MAX; MAX_PUBLICATION_TABLES],
-                    table_column_masks: [0; MAX_PUBLICATION_TABLES],
+                    table_column_masks: [ColumnSet::EMPTY; MAX_PUBLICATION_TABLES],
                     table_include_descendants: [false; MAX_PUBLICATION_TABLES],
                     table_filters: PublicationFilters::EMPTY,
                     table_count: 0,
@@ -24765,8 +24976,11 @@ impl Storage {
         decoded_columns: Option<u64>,
         each: &mut SpilledRowBatchVisitor<'a, 'callback>,
     ) -> Result<(), SqlError> {
-        let decoded_columns =
-            decoded_columns.map(|mask| core::array::from_fn(|column| mask & (1u64 << column) != 0));
+        let decoded_columns = decoded_columns.map(|mask| {
+            core::array::from_fn(|column| {
+                column < u64::BITS as usize && mask & (1u64 << column) != 0
+            })
+        });
         let rows = arena
             .alloc_slice_with(SPILL_SCAN_BATCH_ROWS, |_| SpilledRow {
                 rowid: 0,
@@ -25329,9 +25543,8 @@ impl Storage {
             .dependency_mask;
         // PAX source reads need only key, predicate, expression, and INCLUDE
         // dependencies. Unselected values decode as NULL and are never read.
-        let decoded_columns = core::array::from_fn(|column| {
-            column < n_columns && dependency_mask & (1u64 << column) != 0
-        });
+        let decoded_columns =
+            core::array::from_fn(|column| column < n_columns && dependency_mask.contains(column));
         let decoded_count = decoded_columns[..n_columns]
             .iter()
             .filter(|&&selected| selected)
@@ -26974,13 +27187,9 @@ impl Storage {
         pending: Option<RowLoc>,
         txid: u32,
         track_statistics: bool,
-    ) -> Result<(u64, bool), SqlError> {
+    ) -> Result<(ColumnSet, bool), SqlError> {
         let columns = self.tables[table_index].def.n_columns;
-        let all_columns = if columns == u64::BITS as usize {
-            u64::MAX
-        } else {
-            (1u64 << columns) - 1
-        };
+        let all_columns = ColumnSet::all(columns);
         // Row rewrites and changes under a transaction-private definition can
         // use a different physical schema. Their enforcers are rebuilt at the
         // DDL boundary, so conservative invalidation is both sufficient and
@@ -27011,12 +27220,12 @@ impl Storage {
                 &mut committed_payloads,
                 &mut committed_nulls,
             )?;
-            let mut changed = 0u64;
+            let mut changed = ColumnSet::EMPTY;
             for column in 0..columns {
                 if committed_nulls[column] != pending_nulls[column]
                     || committed_payloads[column] != pending_payloads[column]
                 {
-                    changed |= 1u64 << column;
+                    changed.insert(column);
                 }
             }
             Ok((changed, false))
@@ -27237,7 +27446,8 @@ impl Storage {
             .iter_mut()
             .flatten()
         {
-            if pending.changes_existence || enforcer.dependency_mask & pending.changed_columns != 0
+            if pending.changes_existence
+                || enforcer.dependency_mask.intersects(pending.changed_columns)
             {
                 enforcer.durable_dirty = true;
                 enforcer.durable_dirty_lsn = commit_lsn;
@@ -28720,7 +28930,11 @@ impl Storage {
         (enforcer.columns, enforcer.n_cols)
     }
 
-    pub(crate) fn value_binding_include_mask(&self, table_index: usize, binding: usize) -> u64 {
+    pub(crate) fn value_binding_include_mask(
+        &self,
+        table_index: usize,
+        binding: usize,
+    ) -> ColumnSet {
         self.tables[table_index].enforcers[binding]
             .expect("binding")
             .include_mask
@@ -28839,7 +29053,7 @@ impl Storage {
         table_index: usize,
         columns: &[u16],
         index_created_at: Option<u64>,
-        include_mask: u64,
+        include_mask: ColumnSet,
         handle: Option<crate::store::ValueIndexHandle>,
     ) -> Result<(), SqlError> {
         let n_enforcers = self.tables[table_index].n_enforcers;
@@ -28912,7 +29126,7 @@ impl Storage {
         let mut payload = [Datum::Null; MAX_COLUMNS];
         let mut n_payload = 0usize;
         for (column, value) in values.iter().enumerate() {
-            if enforcer.include_mask & (1u64 << column) != 0 {
+            if enforcer.include_mask.contains(column) {
                 payload[n_payload] = *value;
                 n_payload += 1;
             }
@@ -29166,8 +29380,8 @@ impl Storage {
             key_types: [ColType; MAX_INDEX_COLS],
             collations: [Collation; MAX_INDEX_COLS],
             ordered: bool,
-            include_mask: u64,
-            dependency_mask: u64,
+            include_mask: ColumnSet,
+            dependency_mask: ColumnSet,
         }
         const EMPTY_BINDING: WantedBinding = WantedBinding {
             columns: [0; MAX_INDEX_COLS],
@@ -29176,8 +29390,8 @@ impl Storage {
             key_types: [ColType::Bool; MAX_INDEX_COLS],
             collations: [Collation::None; MAX_INDEX_COLS],
             ordered: true,
-            include_mask: 0,
-            dependency_mask: 0,
+            include_mask: ColumnSet::EMPTY,
+            dependency_mask: ColumnSet::EMPTY,
         };
         let mut want = [EMPTY_BINDING; MAX_VALUE_ENFORCERS];
         let mut n_want = 0usize;
@@ -29199,7 +29413,7 @@ impl Storage {
                     want[n_want].n_columns = 1;
                     want[n_want].key_types[0] = col.ctype;
                     want[n_want].collations[0] = col.collation;
-                    want[n_want].dependency_mask = 1u64 << i;
+                    want[n_want].dependency_mask.insert(i);
                     n_want += 1;
                 }
             }
@@ -29213,7 +29427,7 @@ impl Storage {
                 for (position, column) in cols.iter().enumerate() {
                     want[n_want].key_types[position] = def.columns[*column as usize].ctype;
                     want[n_want].collations[position] = def.columns[*column as usize].collation;
-                    want[n_want].dependency_mask |= 1u64 << column;
+                    want[n_want].dependency_mask.insert(usize::from(*column));
                 }
                 n_want += 1;
             }
@@ -29258,20 +29472,20 @@ impl Storage {
                     index.collations[position]
                         != table_definition.columns[*column as usize].collation
                 });
-            let key_mask = columns
+            let mut key_mask = ColumnSet::EMPTY;
+            for (position, column) in columns.iter().copied().enumerate() {
+                if index.expressions[position].is_none() {
+                    key_mask.insert(usize::from(column));
+                }
+            }
+            let mut include_mask = ColumnSet::EMPTY;
+            for column in index.include_columns[..index.n_include_cols]
                 .iter()
-                .enumerate()
-                .fold(0u64, |mask, (position, column)| {
-                    if index.expressions[position].is_none() {
-                        mask | (1u64 << column)
-                    } else {
-                        mask
-                    }
-                });
-            let include_mask = index.include_columns[..index.n_include_cols]
-                .iter()
-                .fold(0u64, |mask, column| mask | (1u64 << column))
-                & !key_mask;
+                .copied()
+            {
+                include_mask.insert(usize::from(column));
+            }
+            include_mask = include_mask.difference(key_mask);
             if !special
                 && let Some(cached) = want[..n_want].iter_mut().find(|cached| {
                     cached.index_created_at.is_none()
@@ -29442,9 +29656,11 @@ impl Storage {
             let dependency_mask = self.tables[table_index].enforcers[..n_enf]
                 .iter()
                 .flatten()
-                .fold(0u64, |mask, enforcer| mask | enforcer.dependency_mask);
+                .fold(ColumnSet::EMPTY, |mask, enforcer| {
+                    mask | enforcer.dependency_mask
+                });
             let demanded = core::array::from_fn(|column| {
-                column < n_columns && dependency_mask & (1u64 << column) != 0
+                column < n_columns && dependency_mask.contains(column)
             });
             let demanded_count = demanded[..n_columns].iter().filter(|&&set| set).count();
             self.spill_merged_walk_bytes(
@@ -29910,6 +30126,13 @@ impl Storage {
     }
 
     pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
+        if def.n_columns > MAX_RELATION_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "tables can have at most {} columns",
+                MAX_RELATION_COLUMNS
+            ));
+        }
         def.has_toast |= def
             .columns()
             .iter()
@@ -31639,7 +31862,7 @@ impl Storage {
         };
         let mut members = [u16::MAX; MAX_PUBLICATION_TABLES];
         members[..spec.tables.len()].copy_from_slice(spec.tables);
-        let mut table_column_masks = [0u64; MAX_PUBLICATION_TABLES];
+        let mut table_column_masks = [ColumnSet::EMPTY; MAX_PUBLICATION_TABLES];
         table_column_masks[..spec.table_column_masks.len()]
             .copy_from_slice(spec.table_column_masks);
         let mut table_include_descendants = [false; MAX_PUBLICATION_TABLES];
@@ -35880,8 +36103,8 @@ impl Storage {
     }
 
     pub(crate) fn has_aggregate_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {
-        self.has_routine_candidate(name, arity, txid, |routine| {
-            matches!(routine.kind, RoutineKind::Aggregate(_))
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
+            matches!(kind, RoutineKind::Aggregate(_))
         })
     }
 
@@ -36161,7 +36384,7 @@ impl Storage {
     }
 
     pub(crate) fn has_set_routine_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {
-        self.has_routine_candidate(name, arity, txid, |routine| routine.kind.is_set_returning())
+        self.has_routine_candidate(name, arity, txid, |kind, _| kind.is_set_returning())
     }
 
     pub(crate) fn has_function_routine_candidate(
@@ -36170,9 +36393,9 @@ impl Storage {
         arity: usize,
         txid: u32,
     ) -> bool {
-        self.has_routine_candidate(name, arity, txid, |routine| {
+        self.has_routine_candidate(name, arity, txid, |kind, _| {
             matches!(
-                routine.kind,
+                kind,
                 RoutineKind::Function { .. }
                     | RoutineKind::SetFunction { .. }
                     | RoutineKind::RecordFunction { .. }
@@ -36187,14 +36410,14 @@ impl Storage {
         arity: usize,
         txid: u32,
     ) -> bool {
-        self.has_routine_candidate(name, arity, txid, |routine| {
+        self.has_routine_candidate(name, arity, txid, |kind, attributes| {
             matches!(
-                routine.kind,
+                kind,
                 RoutineKind::Function { .. }
                     | RoutineKind::SetFunction { .. }
                     | RoutineKind::RecordFunction { .. }
                     | RoutineKind::TableFunction
-            ) && routine.attributes.volatility == RoutineVolatility::Volatile
+            ) && attributes.volatility == RoutineVolatility::Volatile
         })
     }
 
@@ -36203,17 +36426,16 @@ impl Storage {
         name: &str,
         arity: usize,
         txid: u32,
-        accepts: impl Fn(RoutineDef) -> bool,
+        accepts: impl Fn(RoutineKind, RoutineAttributes) -> bool,
     ) -> bool {
         let matches = |schema: &str, routine_name: &str| {
             self.routines.iter().any(|routine| {
-                let definition = routine.definition_for(txid);
                 routine.database == self.current_database
                     && routine.visible_to(txid)
-                    && accepts(definition)
-                    && definition.accepts_input_arity(arity)
-                    && definition.schema_for(txid).as_str() == schema
-                    && definition.name_for(txid).as_str() == routine_name
+                    && accepts(routine.kind_for(txid), routine.attributes_for(txid))
+                    && routine.accepts_input_arity_for(arity, txid)
+                    && routine.schema_for(txid).as_str() == schema
+                    && routine.name_for(txid).as_str() == routine_name
             })
         };
         if let Some((schema, routine_name)) = name.split_once('.') {
@@ -45095,7 +45317,7 @@ mod tests {
                 txid: 7,
                 cid: 3,
                 loc: Some(RowLoc { offset: 20, len: 4 }),
-                changed_columns: u64::MAX,
+                changed_columns: ColumnSet::all(MAX_COLUMNS),
                 changes_existence: false,
             },
         )
@@ -45649,7 +45871,7 @@ mod tests {
                 txid: 7,
                 cid: 1,
                 loc: Some(location),
-                changed_columns: u64::MAX,
+                changed_columns: ColumnSet::all(MAX_COLUMNS),
                 changes_existence: true,
             },
         )

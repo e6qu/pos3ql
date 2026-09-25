@@ -4746,7 +4746,7 @@ pub enum Datum<'a> {
         /// layout version, not a display arity: dropped attributes retain
         /// their position and added attributes cannot be mistaken for old
         /// trailing values.
-        physical_fields: u8,
+        physical_fields: u16,
         text: &'a str,
     },
     /// A user-defined enum value. `slot` identifies the enum type (for OID /

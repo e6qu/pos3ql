@@ -120,12 +120,11 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   `checkpoint_manifest_bytes` bound and fails before publication if it is full.
   Policies use `max_policies` (default 256) without a second per-table ceiling;
   their predicates are statement-arena bounded. Routine call signatures match
-  PostgreSQL's 100-input-argument limit. Output columns, configuration settings,
-  trigger arguments, and policy roles accept the complete 64-item
-  per-definition boundary. `RETURNS TABLE` catalog argument metadata includes
-  the independently bounded input and output shapes, including 164 combined
-  entries at their accepted maxima. Trigger arguments are zero-based and NULL
-  when absent, matching PostgreSQL.
+  PostgreSQL's 100-input-argument limit. Executable routine results accept
+  1,664 output columns; configuration settings, trigger arguments, and policy
+  roles retain their documented 64-item definition bounds. `RETURNS TABLE`
+  catalog argument metadata keeps input and output shapes independent. Trigger
+  arguments are zero-based and NULL when absent, matching PostgreSQL.
   Database and schema catalogs, connection counters, statistics, cloning, and
   publication membership are also startup-sized and survive object-cold
   recovery above their former 32-slot limits. Catalog builders for
@@ -133,12 +132,12 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   according to transaction-visible cardinality. Remaining per-object inline
   bounds and the documented catalog-identity widths still limit accepted scale.
 - Index tuples and partition keys enforce PostgreSQL 18's exact 32-attribute
-  boundaries. The current bounded parser and row format support 64 table
-  constraints of each modeled kind, 64 domain checks, 64 named-composite
-  fields, and 64 LIST-bound values. Those accepted widths are enforced and
-  preserved through record typing, catalogs, WAL, checkpoints, and object-cold
-  recovery; wider PostgreSQL tables, composites, constraint collections, and
-  LIST bounds remain loud program-limit errors rather than partial objects.
+  boundaries. Tables, views, named composites, and record column definition
+  lists accept PostgreSQL's 1,600-column relation width. The bounded parser
+  supports 64 table constraints of each modeled kind, 64 domain checks, and 64
+  LIST-bound values. Accepted widths are preserved through record typing,
+  catalogs, WAL, checkpoints, and object-cold recovery; wider constraint
+  collections and LIST bounds remain loud program-limit errors.
 - Statement lists are bounded by the fixed statement arena, not by compiled
   staging arrays: select lists, `IN` lists, `ARRAY` constructors, `CASE` arms,
   function arguments up to PostgreSQL's own 100, `VALUES` rows, CTEs,
@@ -160,7 +159,9 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   joins, which execute in identity order with full-row decoding. PostgreSQL 18
   differential and allocation-forbidden coverage crosses 64 relations through
   plans, stored views, windows, materialization, subqueries, and joined DML.
-  One explicit `USING` list remains bounded by the 64-column source-row shape.
+  Explicit `USING` lists follow the 1,600-column relation shape. High-column
+  dependencies, publications, triggers, and column privileges retain complete
+  column sets even when physical scans use full-row decoding.
   Stored results recover with empty local caches.
 - Program length does not share that 64-item arity limit. Simple-protocol
   batches, SQL-language bodies, and PL/pgSQL bodies are sized from their source

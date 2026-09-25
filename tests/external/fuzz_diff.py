@@ -19,7 +19,7 @@ Everything is deterministic from `--seed`; the PRNG is stdlib random seeded
 once, so a reported seed reproduces the exact sequence.
 
 Usage:
-  fuzz_diff.py --pg PORT --p3 PORT [--count N] [--seed S] [--max-print K]
+  fuzz_diff.py --pg PORT --p3 PORT [--start N] [--count N] [--seed S] [--max-print K]
                [--max-unsupported N]
 """
 import argparse
@@ -462,11 +462,15 @@ def main():
     ap.add_argument("--pg-user", default="postgres")
     ap.add_argument("--p3-user", default="postgres")
     ap.add_argument("--count", type=int, default=2000)
+    ap.add_argument("--start", type=int, default=0,
+                    help="first statement ordinal from the seeded sequence")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-print", type=int, default=25)
     ap.add_argument("--max-unsupported", type=int,
                     help="fail when generated PostgreSQL-valid statements are unsupported")
     args = ap.parse_args()
+    if args.start < 0 or args.count < 0:
+        ap.error("--start and --count must be non-negative")
 
     # This generator deliberately produces unbounded unique SQL. Automatic
     # client-side prepare would consume the server's bounded named-statement
@@ -507,13 +511,15 @@ def main():
         setup(engine, cur, values)
 
     rng = random.Random(args.seed)
+    for _ in range(args.start):
+        rng.randint(0, 2**63)
     gen = Gen(rng)
     stats = {"match": 0, "unsupported": 0, "divergence": 0}
     unsupp_hist = {}
     unsupp_examples = {}
     divergences = []
 
-    for i in range(args.count):
+    for i in range(args.start, args.start + args.count):
         # Per-statement sub-seed so a divergence reproduces exactly.
         sub = rng.randint(0, 2**63)
         gen.rng = random.Random(sub)
@@ -551,7 +557,8 @@ def main():
         for reason, count in top:
             print(f"  {count:4d}  {reason}")
             print(f"        e.g. {unsupp_examples[reason]}")
-    print(f"\nTOTAL: {args.count} statements (seed {args.seed})  "
+    print(f"\nTOTAL: {args.count} statements (seed {args.seed}, "
+          f"range {args.start}..{args.start + args.count})  "
           f"match={stats['match']}  unsupported={stats['unsupported']}  "
           f"divergence={stats['divergence']}")
     unsupported_over_budget = (args.max_unsupported is not None

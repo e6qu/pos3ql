@@ -13,7 +13,7 @@ use crate::mem::buffer::FixedBuf;
 use crate::mem::fixed_vec::FixedVec;
 use crate::sql::eval::sqlstate;
 use crate::sql_err;
-use crate::storage::RowLoc;
+use crate::storage::{ColumnSet, RowLoc};
 use crate::util::StackStr;
 
 use super::ast::TransactionIsolation;
@@ -651,7 +651,7 @@ pub(crate) struct DeferredTriggerTuple {
 pub(crate) struct DeferredTriggerEvent {
     pub(crate) kind: DeferredTriggerKind,
     pub(crate) event: u8,
-    pub(crate) updated_columns: u64,
+    pub(crate) updated_columns: ColumnSet,
     pub(crate) old: Option<DeferredTriggerTuple>,
     pub(crate) new: Option<DeferredTriggerTuple>,
 }
@@ -1772,7 +1772,7 @@ impl TxnState {
         identity: ConstraintIdentity,
         effective_table: u16,
         event: u8,
-        updated_columns: u64,
+        updated_columns: ColumnSet,
         old: Option<&[u8]>,
         new: Option<&[u8]>,
     ) -> Result<(), SqlError> {
@@ -1794,7 +1794,7 @@ impl TxnState {
         trigger_slot: u16,
         effective_table: u16,
         event: u8,
-        updated_columns: u64,
+        updated_columns: ColumnSet,
         old: Option<&[u8]>,
         new: Option<&[u8]>,
     ) -> Result<(), SqlError> {
@@ -1815,7 +1815,7 @@ impl TxnState {
         &mut self,
         kind: DeferredTriggerKind,
         event: u8,
-        updated_columns: u64,
+        updated_columns: ColumnSet,
         old: Option<&[u8]>,
         new: Option<&[u8]>,
     ) -> Result<(), SqlError> {

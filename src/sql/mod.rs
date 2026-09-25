@@ -69,7 +69,7 @@ use crate::pg::respond::Responder;
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
-use crate::storage::{ColumnMeta, RowHome, RowLoc, SqlName, Storage};
+use crate::storage::{ColumnMeta, ColumnSet, RowHome, RowLoc, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
@@ -1392,12 +1392,12 @@ struct ReplicationType {
 #[derive(Clone, Copy)]
 struct LogicalReplicaIdentity {
     wire: pgoutput::ReplicaIdentity,
-    key_mask: u64,
+    key_mask: ColumnSet,
 }
 
 impl LogicalReplicaIdentity {
     fn usable_for_change(self) -> bool {
-        self.key_mask != 0
+        !self.key_mask.is_empty()
     }
 }
 
@@ -1406,28 +1406,23 @@ fn logical_replica_identity(
     table_slot: usize,
 ) -> Result<LogicalReplicaIdentity, SqlError> {
     let definition = storage.table_def(table_slot, 0);
-    let all_columns = if definition.n_columns == crate::storage::MAX_COLUMNS {
-        u64::MAX
-    } else {
-        (1u64 << definition.n_columns) - 1
-    };
+    let all_columns = ColumnSet::all(definition.n_columns);
     match definition.replica_identity {
         crate::storage::ReplicaIdentityMode::Nothing => Ok(LogicalReplicaIdentity {
             wire: pgoutput::ReplicaIdentity::Nothing,
-            key_mask: 0,
+            key_mask: ColumnSet::EMPTY,
         }),
         crate::storage::ReplicaIdentityMode::Full => Ok(LogicalReplicaIdentity {
             wire: pgoutput::ReplicaIdentity::Full,
             key_mask: all_columns,
         }),
         crate::storage::ReplicaIdentityMode::Default => {
-            let key_mask = definition
-                .columns()
-                .iter()
-                .enumerate()
-                .fold(0u64, |mask, (column, definition)| {
-                    mask | (u64::from(definition.primary) << column)
-                });
+            let mut key_mask = ColumnSet::EMPTY;
+            for (column, definition) in definition.columns().iter().enumerate() {
+                if definition.primary {
+                    key_mask.insert(column);
+                }
+            }
             Ok(LogicalReplicaIdentity {
                 wire: pgoutput::ReplicaIdentity::Default,
                 key_mask,
@@ -1451,10 +1446,12 @@ fn logical_replica_identity(
                     ));
                 }
             }
-            let key_mask = selected.map_or(0, |index| {
-                index.columns[..index.n_cols]
-                    .iter()
-                    .fold(0u64, |mask, column| mask | (1u64 << column))
+            let key_mask = selected.map_or(ColumnSet::EMPTY, |index| {
+                let mut mask = ColumnSet::EMPTY;
+                for column in index.columns[..index.n_cols].iter().copied() {
+                    mask.insert(usize::from(column));
+                }
+                mask
             });
             Ok(LogicalReplicaIdentity {
                 wire: pgoutput::ReplicaIdentity::Index,
@@ -1495,7 +1492,7 @@ fn emit_replication_relation(
     table_slot: usize,
     definition: &crate::storage::TableDef,
     relation_id: u32,
-    column_mask: u64,
+    column_mask: ColumnSet,
     responder: &mut Responder,
     end_lsn: u64,
 ) -> Result<(), SqlError> {
@@ -1504,9 +1501,9 @@ fn emit_replication_relation(
     let mut selected_count = 0usize;
     let replica_identity = logical_replica_identity(storage, table_slot)?;
     for (index, column) in definition.columns().iter().enumerate() {
-        if column_mask & (1u64 << index) != 0 {
+        if column_mask.contains(index) {
             selected_columns[selected_count] = *column;
-            selected_key_columns[selected_count] = replica_identity.key_mask & (1u64 << index) != 0;
+            selected_key_columns[selected_count] = replica_identity.key_mask.contains(index);
             selected_count += 1;
         }
     }
@@ -1841,22 +1838,26 @@ fn publication_projection_mask(
     storage: &Storage,
     publication: &crate::storage::PublicationDef,
     table_slot: usize,
-) -> Option<u64> {
+) -> Option<ColumnSet> {
     if table_slot == storage.large_object_page_table() {
         return None;
     }
     let implicit_mask = || {
-        storage
+        let mut mask = ColumnSet::EMPTY;
+        for (column, metadata) in storage
             .table_def(table_slot, 0)
             .columns()
             .iter()
             .enumerate()
-            .filter(|(_, column)| {
-                !column.default.is_generated()
-                    || publication.publish_generated_columns
-                        == crate::storage::PublishGeneratedColumns::Stored
-            })
-            .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
+        {
+            if !metadata.default.is_generated()
+                || publication.publish_generated_columns
+                    == crate::storage::PublishGeneratedColumns::Stored
+            {
+                mask.insert(column);
+            }
+        }
+        mask
     };
     if publication.all_tables
         || publication_partition_schema_member(storage, publication, table_slot)
@@ -1871,7 +1872,11 @@ fn publication_projection_mask(
         return Some(implicit_mask());
     }
     let mask = publication.table_column_masks[index];
-    Some(if mask == 0 { implicit_mask() } else { mask })
+    Some(if mask.is_empty() {
+        implicit_mask()
+    } else {
+        mask
+    })
 }
 
 fn mismatched_publication_columns(storage: &Storage, table_slot: usize) -> SqlError {
@@ -1892,7 +1897,7 @@ fn publication_column_mask(
     publication_names: &[SqlName],
     table_slot: usize,
     operation: PublicationOperation,
-) -> Result<Option<u64>, SqlError> {
+) -> Result<Option<ColumnSet>, SqlError> {
     if matches!(
         operation,
         PublicationOperation::Update | PublicationOperation::Delete
@@ -2008,12 +2013,12 @@ fn publication_row_matches(
 
 fn project_replication_values<'a>(
     values: &[Datum<'a>],
-    column_mask: u64,
+    column_mask: ColumnSet,
 ) -> ([Datum<'a>; crate::storage::MAX_COLUMNS], usize) {
     let mut projected = [Datum::Null; crate::storage::MAX_COLUMNS];
     let mut count = 0usize;
     for (index, value) in values.iter().enumerate() {
-        if column_mask & (1u64 << index) != 0 {
+        if column_mask.contains(index) {
             projected[count] = *value;
             count += 1;
         }
@@ -10188,6 +10193,7 @@ impl Engine {
                     column_names,
                     column_types,
                     column_collations,
+                    definition: None,
                     source: ast::MaterializedCteSource::Inline(rows),
                 })
                 .map_err(|_| query::arena_full_pub())?;
@@ -18812,10 +18818,53 @@ fn apply_table_wal_payload(storage: &mut Storage, payload: &[u8]) -> Result<(), 
 }
 
 #[inline(never)]
-fn apply_routine_wal_payload(storage: &mut Storage, payload: &[u8]) -> Result<(), SqlError> {
-    let (definition, dependencies) = crate::wal::decode_routine_payload(payload)
+fn apply_routine_wal_payload(
+    storage: &mut Storage,
+    payload: &[u8],
+    wide_results: bool,
+) -> Result<(), SqlError> {
+    let (definition, dependencies) = crate::wal::decode_routine_payload(payload, wide_results)
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid routine journal payload"))?;
     storage.replay_create_routine(definition, dependencies.materialize()?)
+}
+
+#[inline(never)]
+fn apply_composite_wal_payload(
+    storage: &mut Storage,
+    payload: &[u8],
+    wide_fields: bool,
+) -> Result<(), SqlError> {
+    let (slot, definition) = crate::wal::decode_composite_payload(payload, wide_fields)
+        .ok_or_else(|| {
+            sql_err!(
+                eval::sqlstate::DATA_EXCEPTION,
+                "invalid composite journal payload"
+            )
+        })?;
+    apply_composite_wal_definition(storage, usize::from(slot), definition)
+}
+
+fn apply_composite_wal_definition(
+    storage: &mut Storage,
+    slot: usize,
+    def: crate::storage::CompositeDef,
+) -> Result<(), SqlError> {
+    let spec = crate::storage::CompositeSpec {
+        fields: def.fields,
+        n_fields: def.n_fields,
+    };
+    if storage.composite(slot).visible_to(0) {
+        let mut definition = storage.composite_for(slot, 0);
+        definition.schema = def.schema;
+        definition.name = def.name;
+        definition.fields = spec.fields;
+        definition.n_fields = spec.n_fields;
+        storage.stage_composite_alter(slot, definition, 0)?;
+        storage.commit_composite_alter(slot, 0);
+    } else {
+        storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
+    }
+    Ok(())
 }
 
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
@@ -19531,6 +19580,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             check_option,
             dependencies,
         } => {
+            let columns = columns.materialize().ok_or_else(|| {
+                sql_err!(
+                    eval::sqlstate::DATA_EXCEPTION,
+                    "invalid view column journal payload"
+                )
+            })?;
             // Replay reconstructs committed state: create then promote.
             let mut buffer = crate::util::StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
             use core::fmt::Write;
@@ -19652,6 +19707,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             columns,
         } => {
+            let columns = columns.materialize().ok_or_else(|| {
+                sql_err!(
+                    eval::sqlstate::DATA_EXCEPTION,
+                    "invalid view column journal payload"
+                )
+            })?;
             let slot = storage
                 .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
                 .map(|object| object.slot as usize)
@@ -19794,6 +19855,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             publish_via_partition_root,
             publish_generated_columns,
         } => {
+            let table_column_masks =
+                table_column_masks.materialize(table_count).ok_or_else(|| {
+                    sql_err!(
+                        eval::sqlstate::DATA_EXCEPTION,
+                        "invalid publication column masks"
+                    )
+                })?;
             let slot = storage.create_publication(
                 crate::storage::PublicationSpec {
                     name: crate::storage::SqlName::parse(name)?,
@@ -19837,6 +19905,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             publish_via_partition_root,
             publish_generated_columns,
         } => {
+            let table_column_masks =
+                table_column_masks.materialize(table_count).ok_or_else(|| {
+                    sql_err!(
+                        eval::sqlstate::DATA_EXCEPTION,
+                        "invalid publication column masks"
+                    )
+                })?;
             let definition = crate::storage::PublicationDefinition {
                 all_tables,
                 tables,
@@ -20320,7 +20395,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_domain_drop(slot);
             }
         }
-        WalOp::RestoreRoutine(payload) => apply_routine_wal_payload(storage, payload)?,
+        WalOp::RestoreRoutine {
+            payload,
+            wide_results,
+        } => apply_routine_wal_payload(storage, payload, wide_results)?,
         WalOp::CreateRoutine { .. } => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -20385,24 +20463,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::CreateComposite {
             slot,
             definition: def,
-        } => {
-            let spec = crate::storage::CompositeSpec {
-                fields: def.fields,
-                n_fields: def.n_fields,
-            };
-            let slot = slot as usize;
-            if storage.composite(slot).visible_to(0) {
-                let mut definition = storage.composite_for(slot, 0);
-                definition.schema = def.schema;
-                definition.name = def.name;
-                definition.fields = spec.fields;
-                definition.n_fields = spec.n_fields;
-                storage.stage_composite_alter(slot, definition, 0)?;
-                storage.commit_composite_alter(slot, 0);
-            } else {
-                storage.create_composite_at(slot, def.schema, def.name, spec, 0)?;
-            }
-        }
+        } => apply_composite_wal_definition(storage, usize::from(slot), *def)?,
+        WalOp::RestoreComposite {
+            payload,
+            wide_fields,
+        } => apply_composite_wal_payload(storage, payload, wide_fields)?,
         WalOp::DropComposite { schema, name } => {
             if let Some(slot) = storage.drop_composite(schema, name, 0)? {
                 storage.commit_composite_drop(slot);

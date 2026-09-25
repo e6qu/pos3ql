@@ -3246,9 +3246,7 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            catalog::FIRST_NOT_NULL_OID
-                                + slot as i32 * crate::storage::MAX_COLUMNS as i32
-                                + column_index as i32,
+                            catalog::not_null_constraint_oid(slot, column_index),
                             name.as_str(),
                         ),
                         true,
@@ -3300,7 +3298,11 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_constraint(old, index_oid + 500_000, *name),
+                        detached_constraint(
+                            old,
+                            index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                            *name,
+                        ),
                         true,
                         false,
                     )?;
@@ -3321,7 +3323,11 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_constraint(old, index_oid + 500_000, *name),
+                        detached_constraint(
+                            old,
+                            index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                            *name,
+                        ),
                         true,
                         false,
                     )?;
@@ -3357,7 +3363,11 @@ fn push_alter_table_drops(
                                 push_drop_once(
                                     output,
                                     count,
-                                    detached_constraint(old, index_oid + 500_000, *name),
+                                    detached_constraint(
+                                        old,
+                                        index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                                        *name,
+                                    ),
                                     true,
                                     false,
                                 )?;
@@ -3374,9 +3384,7 @@ fn push_alter_table_drops(
                                     count,
                                     detached_constraint(
                                         old,
-                                        catalog::FIRST_NOT_NULL_OID
-                                            + slot as i32 * crate::storage::MAX_COLUMNS as i32
-                                            + column_index as i32,
+                                        catalog::not_null_constraint_oid(slot, column_index),
                                         *name,
                                     ),
                                     true,
@@ -3439,9 +3447,7 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::FIRST_NOT_NULL_OID
-                        + slot as i32 * crate::storage::MAX_COLUMNS as i32
-                        + column_index as i32,
+                    catalog::not_null_constraint_oid(slot, column_index),
                     name.as_str(),
                 ),
                 false,
@@ -3465,7 +3471,11 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_constraint(old, index_oid + 500_000, name.as_str()),
+                detached_constraint(
+                    old,
+                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    name.as_str(),
+                ),
                 false,
                 false,
             )?;
@@ -3488,7 +3498,11 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_constraint(old, index_oid + 500_000, unique.name.as_str()),
+                detached_constraint(
+                    old,
+                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    unique.name.as_str(),
+                ),
                 false,
                 false,
             )?;
@@ -3511,7 +3525,11 @@ fn push_alter_table_drops(
             push_drop_once(
                 output,
                 count,
-                detached_constraint(old, index_oid + 500_000, exclusion.name.as_str()),
+                detached_constraint(
+                    old,
+                    index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
+                    exclusion.name.as_str(),
+                ),
                 false,
                 false,
             )?;
@@ -3638,9 +3656,7 @@ fn push_table_drop_dependents(
                 count,
                 EventObjectRef::TableConstraint {
                     table: table_ref,
-                    oid: catalog::FIRST_NOT_NULL_OID
-                        + slot as i32 * crate::storage::MAX_COLUMNS as i32
-                        + index as i32,
+                    oid: catalog::not_null_constraint_oid(slot, index),
                     name,
                 },
                 false,
@@ -3695,7 +3711,7 @@ fn push_table_drop_dependents(
                 count,
                 EventObjectRef::TableConstraint {
                     table: table_ref,
-                    oid: index_oid + 500_000,
+                    oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
                     name,
                 },
                 false,
@@ -3722,7 +3738,7 @@ fn push_table_drop_dependents(
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: index_oid + 500_000,
+                oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
                 name: StackStr::from_str(unique.name.as_str()),
             },
             false,
@@ -3748,7 +3764,7 @@ fn push_table_drop_dependents(
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: index_oid + 500_000,
+                oid: index_oid + crate::storage::INDEX_CONSTRAINT_OID_OFFSET,
                 name: StackStr::from_str(exclusion.name.as_str()),
             },
             false,

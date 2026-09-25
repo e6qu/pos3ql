@@ -30,6 +30,16 @@ Block headers also carry a typed block identity. A row SST format defines the
 allowed index-entry shape and block types together. A recognized block type in
 the wrong row SST format is corruption rather than an alternate decoding path.
 
+Journal records version field-width changes with distinct kind bytes. Current
+writers use publication kinds 139/140, trigger kind 141, routine kind 142,
+composite kind 143, and view kinds 144/145 for wide column sets and 16-bit
+counts. Readers retain the preceding publication, trigger, routine, composite,
+and view kinds. Stored-query dependencies use marker `0xfe` for the complete
+column set and retain the `0xff` and legacy readers. Table statistics use the
+v4 marker 253 for 16-bit counts and ordinals while retaining v3 marker 254.
+Manifest v14 keeps its text grammar: sparse column sets parse old one-word
+values, and wide composite fields stream into the configured manifest buffer.
+
 ## Compatible online changes
 
 A compatible format change must add a distinct identity and a reader before a

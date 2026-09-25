@@ -66,7 +66,7 @@ The known narrower limits to resolve or justify are:
   explicit `JOIN ... USING` list;
 - durable 64-item definition shapes, including constraints, enum labels, and
   policy roles; and
-- per-value `tsvector`/`tsquery`, multirange, and geometry widths.
+- per-value `tsvector`/`tsquery` and geometry widths.
 
 Grouping now follows PostgreSQL 18's target-list width of 1,664 distinct
 expressions, 4,096-set expanded-product limit, 12-element `CUBE` limit, and
@@ -111,8 +111,17 @@ qualified.
 JSON container, path, result, rendered-text, and JSON_TABLE row widths are
 complete up to statement memory. XMLTABLE row width also follows statement
 memory within the separately bounded XPath index. SQL array value width is
-complete up to its durable 16-bit element count. Statement lists other than
-the exceptions above are bounded by statement memory.
+complete up to its durable 16-bit element count. Multirange component and
+rendered-value widths now follow the value bytes and statement memory rather
+than fixed 64-component and 1 KiB scratch arrays. Streaming readers cover
+comparison, hashing, bounds, index summaries, and set-returning expansion;
+canonicalization and set operations use exact arena slices. Allocation-free
+128-component execution, binary Bind/result and COPY differential coverage
+against PostgreSQL 18.6, indexes, WAL, checkpoints, and object-cold recovery
+qualify the lifted boundary. Partition ancestry also requires every catalog
+slot in the chain to remain transaction-visible, so dropped descendants cannot
+reattach when a parent slot is reused. Statement lists other than the
+exceptions above are bounded by statement memory.
 
 For each changed capacity, qualify the full accepted width through parse or
 wire input, execution, catalog output where applicable, journal encoding,

@@ -1721,10 +1721,7 @@ fn srf_count_positional<'a, R: ColumnLookup<'a>>(
         }
         match crate::sql::eval::text_view(eval_full(args[0], arena, params, row, hooks)?) {
             Datum::Array { raw, .. } => Ok(crate::sql::array::len(raw)),
-            Datum::Multirange { text, .. } => {
-                let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
-                crate::sql::range::split_components(text, &mut components)
-            }
+            Datum::Multirange { text, .. } => crate::sql::range::component_count(text),
             Datum::Int2Vector(raw) => Ok(raw.len() / 2),
             Datum::OidVector(raw) => Ok(raw.len() / 4),
             Datum::Null => Ok(0),
@@ -4721,8 +4718,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             match *value {
                 Datum::Array { raw, .. } => count = count.max(crate::sql::array::len(raw)),
                 Datum::Multirange { text, .. } => {
-                    let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
-                    count = count.max(crate::sql::range::split_components(text, &mut components)?);
+                    count = count.max(crate::sql::range::component_count(text)?);
                 }
                 Datum::Null => {}
                 _ => {
@@ -4753,12 +4749,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                         .and_then(Iterator::next)
                         .unwrap_or(Datum::Null),
                     Datum::Multirange { text, kind } => {
-                        let mut components = [""; crate::sql::range::MAX_MULTIRANGE];
-                        let component_count =
-                            crate::sql::range::split_components(text, &mut components)?;
-                        if row_index < component_count {
+                        if let Some(component) = crate::sql::range::component_at(text, row_index)? {
                             Datum::Range {
-                                text: components[row_index],
+                                text: component,
                                 kind,
                             }
                         } else {

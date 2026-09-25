@@ -448,6 +448,13 @@ else
   cat "$WORK/join-capacity.out"
 fi
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
+  if "$ROOT_VENV/bin/python" "$EXT/binary_param_diff.py" \
+       --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/binary-param.out" 2>&1; then
+    ok "binary parameter/result differential"
+  else
+    bad "binary parameter/result differential"
+    cat "$WORK/binary-param.out"
+  fi
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
        --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/type-fidelity.out" 2>&1; then
     ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type-fidelity.out"))"

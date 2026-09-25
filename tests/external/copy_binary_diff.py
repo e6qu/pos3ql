@@ -141,6 +141,10 @@ REFERENCE_INSERT = """INSERT INTO cb_references VALUES (
   ARRAY['cb_reference_relation'::regclass], ARRAY['public'::regnamespace],
   ARRAY[10::regrole])"""
 
+WIDE_MULTIRANGE_SQL = "'{%s}'::int4multirange" % ",".join(
+    "[%d,%d)" % (index * 3, index * 3 + 1) for index in range(128)
+)
+
 
 def connect(host, port):
     connection = psycopg.connect(
@@ -312,6 +316,25 @@ def main():
             if a != b:
                 print("  first byte diff at %d: pg=%02x p3=%02x" % (i, a, b))
                 break
+
+    pg_wide_multirange = dump_query(pg, "SELECT " + WIDE_MULTIRANGE_SQL)
+    p3_wide_multirange = dump_query(p3, "SELECT " + WIDE_MULTIRANGE_SQL)
+    if pg_wide_multirange == p3_wide_multirange:
+        print("ok: 128-component multirange COPY output is byte-identical")
+    else:
+        fails += 1
+        print("DIVERGENCE: 128-component multirange COPY output differs")
+    for connection in (pg, p3):
+        connection.execute("DROP TABLE IF EXISTS cb_wide_multirange")
+        connection.execute("CREATE TABLE cb_wide_multirange (value int4multirange)")
+        load(connection, pg_wide_multirange, "cb_wide_multirange")
+    pg_wide_rows = pg.execute("SELECT value::text FROM cb_wide_multirange").fetchall()
+    p3_wide_rows = p3.execute("SELECT value::text FROM cb_wide_multirange").fetchall()
+    if pg_wide_rows == p3_wide_rows:
+        print("ok: PostgreSQL 128-component multirange COPY input matches")
+    else:
+        fails += 1
+        print("DIVERGENCE: 128-component multirange COPY input differs")
 
     # Load PostgreSQL's dump into both and compare the reconstructed rows.
     for c in (pg, p3):

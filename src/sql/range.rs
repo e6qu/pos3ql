@@ -48,17 +48,17 @@ pub(crate) fn outer_bounds(text: &str, multirange: bool) -> Result<OuterBounds<'
             upper: parsed.upper,
         });
     }
-    let mut components = [""; MAX_MULTIRANGE];
-    let count = split_components(text, &mut components)?;
-    if count == 0 {
+    let mut components = components(text)?;
+    let Some(first_text) = components.next() else {
         return Ok(OuterBounds {
             empty: true,
             lower: None,
             upper: None,
         });
-    }
-    let first = parse(components[0])?;
-    let last = parse(components[count - 1])?;
+    };
+    let last_text = components.last().unwrap_or(first_text);
+    let first = parse(first_text)?;
+    let last = parse(last_text)?;
     Ok(OuterBounds {
         empty: false,
         lower: first.lower,
@@ -939,17 +939,44 @@ fn pick_upper<'a>(
 
 // ── Multirange support ──────────────────────────────────────────────────────
 
-/// Upper bound on the number of component ranges a multirange may hold.
-/// Exceeding it is a loud error, never silent truncation.
-pub const MAX_MULTIRANGE: usize = 64;
+/// Iterator over one canonical multirange's component range texts. Component
+/// count is bounded by the value bytes and statement memory, not a compiled
+/// array width.
+#[derive(Clone, Copy)]
+pub(crate) struct Components<'a> {
+    inner: &'a str,
+    at: usize,
+}
 
-/// Splits a canonical multirange text `{r1,r2,...}` into its component range
-/// texts (no canonicalization; input is assumed already canonical). Commas
-/// inside a component's brackets are not separators. Returns the count.
-pub fn split_components<'a>(
-    text: &'a str,
-    out: &mut [&'a str; MAX_MULTIRANGE],
-) -> Result<usize, SqlError> {
+impl<'a> Iterator for Components<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.at >= self.inner.len() {
+            return None;
+        }
+        let bytes = self.inner.as_bytes();
+        let start = self.at;
+        let mut depth = 0i32;
+        while self.at < bytes.len() {
+            match bytes[self.at] {
+                b'[' | b'(' => depth += 1,
+                b']' | b')' => depth -= 1,
+                b',' if depth == 0 => {
+                    let component = self.inner[start..self.at].trim();
+                    self.at += 1;
+                    return Some(component);
+                }
+                _ => {}
+            }
+            self.at += 1;
+        }
+        Some(self.inner[start..].trim())
+    }
+}
+
+/// Validates the multirange container and returns a streaming component view.
+pub(crate) fn components(text: &str) -> Result<Components<'_>, SqlError> {
     let bad = || {
         sql_err!(
             sqlstate::INVALID_TEXT_REPRESENTATION,
@@ -964,36 +991,44 @@ pub fn split_components<'a>(
         .ok_or_else(bad)?
         .trim();
     if inner.is_empty() {
-        return Ok(0);
+        return Ok(Components { inner, at: 0 });
     }
     let bytes = inner.as_bytes();
     let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut n = 0usize;
-    let mut push = |seg: &'a str, n: &mut usize| -> Result<(), SqlError> {
-        if *n == MAX_MULTIRANGE {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "multirange has too many component ranges"
-            ));
-        }
-        out[*n] = seg.trim();
-        *n += 1;
-        Ok(())
-    };
-    for (i, &b) in bytes.iter().enumerate() {
+    for &b in bytes {
         match b {
             b'[' | b'(' => depth += 1,
-            b']' | b')' => depth -= 1,
-            b',' if depth == 0 => {
-                push(&inner[start..i], &mut n)?;
-                start = i + 1;
-            }
+            b']' | b')' if depth > 0 => depth -= 1,
+            b']' | b')' => return Err(bad()),
             _ => {}
         }
     }
-    push(&inner[start..], &mut n)?;
-    Ok(n)
+    if depth != 0 {
+        return Err(bad());
+    }
+    Ok(Components { inner, at: 0 })
+}
+
+pub(crate) fn component_count(text: &str) -> Result<usize, SqlError> {
+    Ok(components(text)?.count())
+}
+
+pub(crate) fn component_at(text: &str, index: usize) -> Result<Option<&str>, SqlError> {
+    Ok(components(text)?.nth(index))
+}
+
+fn component_slice<'a>(text: &'a str, arena: &'a Arena) -> Result<&'a mut [&'a str], SqlError> {
+    let count = component_count(text)?;
+    let out = arena.alloc_slice_with(count, |_| "").map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange components exceed the statement arena"
+        )
+    })?;
+    for (slot, component) in out.iter_mut().zip(components(text)?) {
+        *slot = component;
+    }
+    Ok(out)
 }
 
 /// Sorts (by lower bound) and merges overlapping/adjacent component ranges into
@@ -1004,67 +1039,90 @@ pub fn canonicalize_multirange<'a>(
     kind: RangeKind,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let n = ranges.len();
-    // Allocation-free insertion sort by full-range order.
-    for i in 1..n {
-        let mut j = i;
-        while j > 0 && cmp_ranges(ranges[j - 1], ranges[j], kind)? == Ordering::Greater {
-            ranges.swap(j - 1, j);
-            j -= 1;
+    // Rust's unstable slice sort uses no heap scratch. Capture the first
+    // malformed component error because a comparator cannot return Result.
+    let mut comparison_error = None;
+    ranges.sort_unstable_by(|left, right| match cmp_ranges(left, right, kind) {
+        Ok(ordering) => ordering,
+        Err(error) => {
+            if comparison_error.is_none() {
+                comparison_error = Some(error);
+            }
+            Ordering::Equal
         }
+    });
+    if let Some(error) = comparison_error {
+        return Err(error);
     }
-    // Merge overlapping or adjacent neighbours (input is sorted).
-    let mut merged: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
+    // Merge overlapping or adjacent neighbours in place (input is sorted).
     let mut k = 0usize;
-    for &r in ranges.iter() {
+    for i in 0..ranges.len() {
+        let r = ranges[i];
         if k == 0 {
-            merged[0] = r;
+            ranges[0] = r;
             k = 1;
             continue;
         }
-        if overlaps(merged[k - 1], r, kind)? || adjacent(merged[k - 1], r, kind)? {
-            merged[k - 1] = merge(merged[k - 1], r, kind, arena)?;
+        if overlaps(ranges[k - 1], r, kind)? || adjacent(ranges[k - 1], r, kind)? {
+            ranges[k - 1] = merge(ranges[k - 1], r, kind, arena)?;
         } else {
-            merged[k] = r;
+            ranges[k] = r;
             k += 1;
         }
     }
-    render_multirange(&merged[..k], arena)
+    render_multirange(&ranges[..k], arena)
 }
 
 /// Renders component range texts as `{r1,r2,...}` (or `{}`) into the arena.
 fn render_multirange<'a>(ranges: &[&str], arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let mut buf = StackStr::<1024>::new();
-    let _ = buf.write_char('{');
-    for (i, r) in ranges.iter().enumerate() {
-        if i > 0 {
-            let _ = buf.write_char(',');
-        }
-        let _ = buf.write_str(r);
-    }
-    let _ = buf.write_char('}');
-    if buf.is_truncated() {
-        return Err(sql_err!(
+    let payload = ranges
+        .iter()
+        .try_fold(0usize, |n, range| n.checked_add(range.len()))
+        .and_then(|n| n.checked_add(ranges.len().saturating_sub(1)))
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "multirange value too large"
+            )
+        })?;
+    let bytes = arena.alloc_slice_with(payload, |_| 0u8).map_err(|_| {
+        sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "multirange value too large"
-        ));
+            "multirange value exceeds the statement arena"
+        )
+    })?;
+    bytes[0] = b'{';
+    let mut at = 1usize;
+    for (index, range) in ranges.iter().enumerate() {
+        if index != 0 {
+            bytes[at] = b',';
+            at += 1;
+        }
+        bytes[at..at + range.len()].copy_from_slice(range.as_bytes());
+        at += range.len();
     }
-    alloc(arena, buf.as_str())
+    bytes[at] = b'}';
+    Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
 }
 
 /// Parses a multirange literal `{ r1, r2, ... }` (or `{}`) into canonical form:
 /// each component canonicalized, empty components dropped, then sorted and
 /// overlapping/adjacent components merged.
 pub fn parse_multirange<'a>(
-    input: &str,
+    input: &'a str,
     kind: RangeKind,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let mut raw: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let n = split_components(input, &mut raw)?;
-    let mut canon: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
+    let raw = component_slice(input, arena)?;
+    let canon = arena.alloc_slice_with(raw.len(), |_| "").map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange components exceed the statement arena"
+        )
+    })?;
     let mut m = 0usize;
-    for &c in &raw[..n] {
+    for &c in raw.iter() {
         let p = parse(c)?;
         let cx = canonical(&p, kind, arena)?;
         if cx != "empty" {
@@ -1097,15 +1155,14 @@ pub fn multirange_bound<'a>(
     upper: bool,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut comps: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let n = split_components(text, &mut comps)?;
-    if n == 0 {
+    let mut comps = components(text)?;
+    let Some(first) = comps.next() else {
         return Ok(Datum::Null);
-    }
+    };
     if upper {
-        upper_datum(comps[n - 1], kind, arena)
+        upper_datum(comps.last().unwrap_or(first), kind, arena)
     } else {
-        lower_datum(comps[0], kind, arena)
+        lower_datum(first, kind, arena)
     }
 }
 
@@ -1116,20 +1173,24 @@ pub fn multirange_union<'a>(
     kind: RangeKind,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let mut comps: [&str; MAX_MULTIRANGE * 2] = [""; MAX_MULTIRANGE * 2];
-    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let na = split_components(a, &mut ca)?;
-    let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let nb = split_components(b, &mut cb)?;
-    if na + nb > MAX_MULTIRANGE * 2 {
-        return Err(sql_err!(
+    let na = component_count(a)?;
+    let nb = component_count(b)?;
+    let count = na.checked_add(nb).ok_or_else(|| {
+        sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "multirange has too many component ranges"
-        ));
+            "multirange value too large"
+        )
+    })?;
+    let comps = arena.alloc_slice_with(count, |_| "").map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange components exceed the statement arena"
+        )
+    })?;
+    for (slot, component) in comps.iter_mut().zip(components(a)?.chain(components(b)?)) {
+        *slot = component;
     }
-    comps[..na].copy_from_slice(&ca[..na]);
-    comps[na..na + nb].copy_from_slice(&cb[..nb]);
-    canonicalize_multirange(&mut comps[..na + nb], kind, arena)
+    canonicalize_multirange(comps, kind, arena)
 }
 
 /// `A * B`: the intersection of two multiranges (pairwise component overlaps).
@@ -1139,24 +1200,51 @@ pub fn multirange_intersect<'a>(
     kind: RangeKind,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let na = split_components(a, &mut ca)?;
-    let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let nb = split_components(b, &mut cb)?;
-    let mut out: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
+    let na = component_count(a)?;
+    let nb = component_count(b)?;
+    let capacity = na.checked_add(nb).ok_or_else(|| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange value too large"
+        )
+    })?;
+    let out = arena.alloc_slice_with(capacity, |_| "").map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange components exceed the statement arena"
+        )
+    })?;
     let mut n = 0usize;
-    for &ai in &ca[..na] {
-        for &bj in &cb[..nb] {
-            let x = intersect(ai, bj, kind, arena)?;
-            if x != "empty" {
-                if n == MAX_MULTIRANGE {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "multirange has too many component ranges"
-                    ));
-                }
-                out[n] = x;
-                n += 1;
+    let mut left_components = components(a)?;
+    let mut right_components = components(b)?;
+    let mut left = left_components.next();
+    let mut right = right_components.next();
+    while let (Some(left_text), Some(right_text)) = (left, right) {
+        let left_parsed = parse(left_text)?;
+        let right_parsed = parse(right_text)?;
+        if strictly_left(&left_parsed, &right_parsed, kind)? {
+            left = left_components.next();
+            continue;
+        }
+        if strictly_left(&right_parsed, &left_parsed, kind)? {
+            right = right_components.next();
+            continue;
+        }
+        out[n] = intersect(left_text, right_text, kind, arena)?;
+        n += 1;
+        match cmp_bound(
+            left_parsed.upper,
+            left_parsed.upper_inc,
+            right_parsed.upper,
+            right_parsed.upper_inc,
+            false,
+            kind,
+        )? {
+            Ordering::Less => left = left_components.next(),
+            Ordering::Greater => right = right_components.next(),
+            Ordering::Equal => {
+                left = left_components.next();
+                right = right_components.next();
             }
         }
     }
@@ -1206,57 +1294,80 @@ pub fn multirange_difference<'a>(
     kind: RangeKind,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let na = split_components(a, &mut ca)?;
-    let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let nb = split_components(b, &mut cb)?;
+    let na = component_count(a)?;
+    let nb = component_count(b)?;
+    let capacity = na
+        .checked_add(nb)
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "multirange value too large"
+            )
+        })?;
+    let ca = component_slice(a, arena)?;
     // Working set of surviving pieces, grown as B's components split them.
-    let mut pieces: [&str; MAX_MULTIRANGE * 2] = [""; MAX_MULTIRANGE * 2];
+    let pieces = arena.alloc_slice_with(capacity, |_| "").map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange components exceed the statement arena"
+        )
+    })?;
+    let next = arena.alloc_slice_with(capacity, |_| "").map_err(|_| {
+        sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "multirange components exceed the statement arena"
+        )
+    })?;
     let mut np = na;
-    pieces[..na].copy_from_slice(&ca[..na]);
-    for &bj in &cb[..nb] {
+    pieces[..na].copy_from_slice(ca);
+    let mut current_is_pieces = true;
+    for bj in components(b)? {
         let parsed_b = parse(bj)?;
-        let mut next: [&str; MAX_MULTIRANGE * 2] = [""; MAX_MULTIRANGE * 2];
         let mut nn = 0usize;
-        let mut push = |s: &'a str, nn: &mut usize| -> Result<(), SqlError> {
-            if *nn == MAX_MULTIRANGE * 2 {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "multirange has too many component ranges"
-                ));
-            }
-            next[*nn] = s;
-            *nn += 1;
-            Ok(())
+        let (source, target): (&[&str], &mut [&str]) = if current_is_pieces {
+            (&pieces[..np], &mut next[..])
+        } else {
+            (&next[..np], &mut pieces[..])
         };
-        for &piece in &pieces[..np] {
+        for &piece in source {
             if overlaps(piece, bj, kind)? {
                 let mut rem: [&str; 2] = [""; 2];
                 let k = range_minus(&parse(piece)?, &parsed_b, kind, arena, &mut rem)?;
                 for &r in &rem[..k] {
-                    push(r, &mut nn)?;
+                    target[nn] = r;
+                    nn += 1;
                 }
             } else {
-                push(piece, &mut nn)?;
+                target[nn] = piece;
+                nn += 1;
             }
         }
-        pieces = next;
         np = nn;
+        current_is_pieces = !current_is_pieces;
     }
-    canonicalize_multirange(&mut pieces[..np], kind, arena)
+    if current_is_pieces {
+        canonicalize_multirange(&mut pieces[..np], kind, arena)
+    } else {
+        canonicalize_multirange(&mut next[..np], kind, arena)
+    }
 }
 
 /// `A && B`: whether two multiranges share any point.
 pub fn multirange_overlaps(a: &str, b: &str, kind: RangeKind) -> Result<bool, SqlError> {
-    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let na = split_components(a, &mut ca)?;
-    let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let nb = split_components(b, &mut cb)?;
-    for &ai in &ca[..na] {
-        for &bj in &cb[..nb] {
-            if overlaps(ai, bj, kind)? {
-                return Ok(true);
-            }
+    let mut left_components = components(a)?;
+    let mut right_components = components(b)?;
+    let mut left = left_components.next();
+    let mut right = right_components.next();
+    while let (Some(left_text), Some(right_text)) = (left, right) {
+        let left_parsed = parse(left_text)?;
+        let right_parsed = parse(right_text)?;
+        if strictly_left(&left_parsed, &right_parsed, kind)? {
+            left = left_components.next();
+        } else if strictly_left(&right_parsed, &left_parsed, kind)? {
+            right = right_components.next();
+        } else {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -1279,9 +1390,7 @@ pub fn multirange_contains_multirange<'a>(
 
 /// `A @> element`: some component range contains the element text.
 pub fn multirange_contains_elem(a: &str, kind: RangeKind, element: &str) -> Result<bool, SqlError> {
-    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let na = split_components(a, &mut ca)?;
-    for &ai in &ca[..na] {
+    for ai in components(a)? {
         if contains_elem(ai, kind, element)? {
             return Ok(true);
         }
@@ -1298,20 +1407,23 @@ pub fn multirange_position(
     kind: RangeKind,
     predicate: MultirangePosition,
 ) -> Result<bool, SqlError> {
-    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let na = split_components(a, &mut ca)?;
-    let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let nb = split_components(b, &mut cb)?;
-    if na == 0 || nb == 0 {
+    let mut ca = components(a)?;
+    let mut cb = components(b)?;
+    let Some(a_first) = ca.next() else {
         return Ok(false);
-    }
+    };
+    let Some(b_first) = cb.next() else {
+        return Ok(false);
+    };
+    let a_last = ca.last().unwrap_or(a_first);
+    let b_last = cb.last().unwrap_or(b_first);
     Ok(match predicate {
-        MultirangePosition::Before => strictly_before(ca[na - 1], cb[0], kind)?,
-        MultirangePosition::After => strictly_after(ca[0], cb[nb - 1], kind)?,
-        MultirangePosition::NotRightOf => not_right_of(ca[na - 1], cb[nb - 1], kind)?,
-        MultirangePosition::NotLeftOf => not_left_of(ca[0], cb[0], kind)?,
+        MultirangePosition::Before => strictly_before(a_last, b_first, kind)?,
+        MultirangePosition::After => strictly_after(a_first, b_last, kind)?,
+        MultirangePosition::NotRightOf => not_right_of(a_last, b_last, kind)?,
+        MultirangePosition::NotLeftOf => not_left_of(a_first, b_first, kind)?,
         MultirangePosition::Adjacent => {
-            adjacent(ca[na - 1], cb[0], kind)? || adjacent(ca[0], cb[nb - 1], kind)?
+            adjacent(a_last, b_first, kind)? || adjacent(a_first, b_last, kind)?
         }
     })
 }
@@ -1426,10 +1538,8 @@ pub fn hash_multirange(
     seed: Option<i64>,
     arena: &Arena,
 ) -> Result<u64, SqlError> {
-    let mut components = [""; MAX_MULTIRANGE];
-    let count = split_components(text, &mut components)?;
     let mut result = 1u64;
-    for component in &components[..count] {
+    for component in components(text)? {
         result = result
             .wrapping_mul(31)
             .wrapping_add(hash_range(component, kind, seed, arena)?);
@@ -1443,17 +1553,21 @@ pub fn hash_multirange(
 /// Total order over two canonical multiranges: compare component ranges
 /// pairwise; when one is a prefix of the other, the shorter sorts first.
 pub fn cmp_multiranges(a: &str, b: &str, kind: RangeKind) -> Result<Ordering, SqlError> {
-    let mut ca: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let na = split_components(a, &mut ca)?;
-    let mut cb: [&str; MAX_MULTIRANGE] = [""; MAX_MULTIRANGE];
-    let nb = split_components(b, &mut cb)?;
-    for i in 0..na.min(nb) {
-        let o = cmp_ranges(ca[i], cb[i], kind)?;
-        if o != Ordering::Equal {
-            return Ok(o);
+    let mut ca = components(a)?;
+    let mut cb = components(b)?;
+    loop {
+        match (ca.next(), cb.next()) {
+            (Some(left), Some(right)) => {
+                let ordering = cmp_ranges(left, right, kind)?;
+                if ordering != Ordering::Equal {
+                    return Ok(ordering);
+                }
+            }
+            (Some(_), None) => return Ok(Ordering::Greater),
+            (None, Some(_)) => return Ok(Ordering::Less),
+            (None, None) => return Ok(Ordering::Equal),
         }
     }
-    Ok(na.cmp(&nb))
 }
 
 #[cfg(test)]
@@ -1572,6 +1686,73 @@ mod tests {
         assert!(!multirange_overlaps("{[1,5)}", "{[6,8)}", Int4).unwrap());
         assert!(multirange_contains_multirange("{[1,10)}", "{[2,4)}", Int4, &arena).unwrap());
         assert!(!multirange_contains_multirange("{[1,5)}", "{[2,8)}", Int4, &arena).unwrap());
+    }
+
+    #[test]
+    fn multirange_components_are_statement_memory_bounded() {
+        let mut wide = String::from("{");
+        for index in 0..128 {
+            if index != 0 {
+                wide.push(',');
+            }
+            let lower = index * 3;
+            write!(wide, "[{lower},{})", lower + 1).unwrap();
+        }
+        wide.push('}');
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "wide_multirange", 1 << 19).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let canonical = parse_multirange(&wide, Int4, &arena).unwrap();
+            assert_eq!(component_count(canonical).unwrap(), 128);
+            assert_eq!(component_at(canonical, 64).unwrap(), Some("[192,193)"));
+            assert_eq!(
+                multirange_union(canonical, "{[400,401)}", Int4, &arena)
+                    .and_then(component_count)
+                    .unwrap(),
+                129
+            );
+            assert_eq!(
+                multirange_difference(canonical, "{[3,4)}", Int4, &arena)
+                    .and_then(component_count)
+                    .unwrap(),
+                127
+            );
+            assert_eq!(
+                multirange_intersect(canonical, "{[0,382)}", Int4, &arena)
+                    .and_then(component_count)
+                    .unwrap(),
+                128
+            );
+            assert!(multirange_overlaps(canonical, "{[381,382)}", Int4).unwrap());
+            assert_eq!(
+                cmp_multiranges(canonical, canonical, Int4).unwrap(),
+                Ordering::Equal
+            );
+            assert_eq!(
+                hash_multirange(canonical, Int4, None, &arena).unwrap(),
+                hash_multirange(canonical, Int4, None, &arena).unwrap()
+            );
+        });
+
+        let mut interleaved = String::from("{");
+        for index in 0..128 {
+            if index != 0 {
+                interleaved.push(',');
+            }
+            let lower = index * 3 + 1;
+            write!(interleaved, "[{lower},{})", lower + 1).unwrap();
+        }
+        interleaved.push('}');
+        let mut linear_budget = crate::mem::Budget::new(1 << 15);
+        let linear_arena =
+            Arena::new(&mut linear_budget, "interleaved wide multiranges", 1 << 14).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                multirange_intersect(&wide, &interleaved, Int4, &linear_arena).unwrap(),
+                "{}"
+            );
+            assert!(!multirange_overlaps(&wide, &interleaved, Int4).unwrap());
+        });
     }
 
     #[test]

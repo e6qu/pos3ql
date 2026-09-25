@@ -424,7 +424,10 @@ comparison/set/hash/canonical/subdiff support routines, union and intersection
 aggregates, and multirange `unnest`. Exact polymorphic procedure, operator,
 aggregate, btree, and hash catalogs agree with PostgreSQL. Values keep their
 type through arrays, binary wire/COPY, rows, indexes, constraints, generated
-columns, views, WAL, checkpoints, and object-cold recovery.
+columns, views, WAL, checkpoints, and object-cold recovery. Component parsing,
+canonicalization, set operations, hashing, comparison, `unnest`, and rendered
+output are bounded by value bytes and the fixed statement arena rather than a
+64-component or 1 KiB compiled scratch limit.
 
 PostgreSQL `tid` and `cid` values and arrays retain their exact unsigned tuple
 and command identity through SQL, btree/hash support, text and binary wire/COPY,

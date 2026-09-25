@@ -54,6 +54,21 @@ for spill_entry in \
     fi
 done
 
+# Coverage instrumentation plus the complete SQL differential corpus no longer
+# fits two workers under the ten-minute ceiling. Keep all three corpus slices
+# and the independent auxiliary probe worker explicit.
+reference_matrix=.github/workflows/coverage.yml
+for reference_entry in \
+    '- { name: corpus-a, corpus_shard: "0-of-3", auxiliary: none }' \
+    '- { name: corpus-b, corpus_shard: "1-of-3", auxiliary: none }' \
+    '- { name: corpus-c, corpus_shard: "2-of-3", auxiliary: none }' \
+    '- { name: auxiliary, corpus_shard: "none", auxiliary: all }'; do
+    if ! grep -Fq -- "$reference_entry" "$reference_matrix"; then
+        printf 'CI timeout guard: missing reference differential shard definition %s\n' "$reference_entry" >&2
+        failed=1
+    fi
+done
+
 # Four independent VOPR ranges preserve the complete 16-seed corpus while
 # keeping each range, including a cold rebuild, within its five-minute cap.
 vopr_workflow=.github/workflows/ci.yml

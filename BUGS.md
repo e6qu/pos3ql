@@ -339,6 +339,19 @@ decoding. Allocation-forbidden and PostgreSQL 18.6 differential coverage
 qualifies 128 relations through cross and `USING` joins, plans, stored views,
 windows, materialization, subqueries, and joined DML. One explicit `USING`
 list remains coupled to the separately tracked 64-column source-row shape.
+The multirange-width audit found no external blocker. Component readers now
+stream from the canonical value, while canonicalization, constructors, and set
+operations use exact statement-arena slices and rendered output uses exact
+arena bytes. Allocation-forbidden 128-component execution, binary Bind/result
+and COPY comparison with PostgreSQL 18.6, indexes, WAL, checkpoints, and
+object-cold recovery cross the former 64-component and 1 KiB limits. The audit
+also found that coverage instrumentation plus half of the growing SQL corpus
+could exceed its ten-minute worker limit; the corpus now has three guarded
+shards while auxiliary probes retain their independent worker. That split
+exposed dropped partition descendants whose stored parent ordinal could match a
+new relation after catalog-slot reuse. Partition ancestry now requires every
+node to be transaction-visible, and a focused reuse regression covers recursive
+index creation against the new parent.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

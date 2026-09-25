@@ -238,6 +238,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   `format()` results grow in that arena rather than stopping at 4 KiB. PostgreSQL 18
   differential and allocation-forbidden regressions cross the old boundary
   and recover the stored values with empty local caches.
+- Multirange values use streaming component readers for bounds, comparison,
+  hashing, index summaries, and expansion, and exact statement-arena slices
+  for canonicalization and set operations. Text and binary wire/COPY paths,
+  indexes, rows, WAL, checkpoints, and empty-cache recovery cross the former
+  64-component and 1 KiB rendered-value limits.
 - Statement lists are bounded by the statement arena, not the parser's former
   64-item staging arrays or the 256-row VALUES staging: select lists, `IN`
   lists, `ARRAY` constructors, `CASE` arms, function arguments up to

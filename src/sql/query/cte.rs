@@ -1749,6 +1749,7 @@ fn materialize_query_cte<'a>(
             column_names,
             column_types,
             column_collations,
+            definition: None,
             source: crate::sql::ast::MaterializedCteSource::Inline(rows),
         })
         .map(|relation| &*relation)
@@ -2841,6 +2842,7 @@ fn reject_recursive_name_collision<'a>(
             column_names: decoration.column_names,
             column_types: decoration.column_types,
             column_collations: decoration.column_collations,
+            definition: None,
             source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
         })
         .map_err(|_| arena_full())?;
@@ -3064,15 +3066,28 @@ fn recursive_noncycle_rows<'a>(
 }
 
 fn recursive_table_qualifier<'a>(select: &'a Select<'a>, name: &str) -> Option<&'a str> {
+    recursive_select_reference(select, name).map(|table| table.alias.unwrap_or(table.table))
+}
+
+fn recursive_select_reference<'a>(select: &'a Select<'a>, name: &str) -> Option<&'a TableRef<'a>> {
     let matches = |table: &'a TableRef<'a>| {
         (table.schema.is_none()
             && table.subquery.is_none()
             && !table.is_function_source()
             && table.table == name)
-            .then_some(table.alias.unwrap_or(table.table))
+            .then_some(table)
     };
     let from = select.from.as_ref()?;
     matches(&from.base).or_else(|| from.joins.iter().find_map(|join| matches(&join.table)))
+}
+
+fn recursive_tree_reference<'a>(tree: &'a SetTree<'a>, name: &str) -> Option<&'a TableRef<'a>> {
+    match tree {
+        SetTree::Select(select) => recursive_select_reference(select, name),
+        SetTree::Op { left, right, .. } => {
+            recursive_tree_reference(left, name).or_else(|| recursive_tree_reference(right, name))
+        }
+    }
 }
 
 fn append_recursive_state<'a>(
@@ -3216,6 +3231,7 @@ fn describe_recursive_materialized<'a>(
             column_names: decoration.column_names,
             column_types: decoration.column_types,
             column_collations: decoration.column_collations,
+            definition: None,
             source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
         })
         .map(|relation| &*relation)
@@ -3576,6 +3592,31 @@ fn materialize_recursive<'a>(
     let base_column_collations = arena
         .alloc_slice_with(ncols, |index| described[index].collation)
         .map_err(|_| arena_full())?;
+    let mut working_column_names = [""; MAX_PROJ];
+    working_column_names[..ncols].copy_from_slice(base_column_names);
+    if let Some(aliases) =
+        recursive_tree_reference(recursive_tree, cte.name).and_then(|reference| reference.col_alias)
+    {
+        if aliases.len() > ncols {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "table \"{}\" has {} columns available but {} columns specified",
+                cte.name,
+                ncols,
+                aliases.len()
+            ));
+        }
+        working_column_names[..aliases.len()].copy_from_slice(aliases);
+    }
+    let working_definition = super::scope::materialized_definition(
+        storage,
+        txid,
+        cte.name,
+        &working_column_names[..ncols],
+        base_column_types,
+        base_column_collations,
+        arena,
+    )?;
     let decoration = prepare_recursive_decoration(
         cte,
         base_column_names,
@@ -3594,6 +3635,19 @@ fn materialize_recursive<'a>(
     let column_names = decoration.column_names;
     let column_types = decoration.column_types;
     let column_collations = decoration.column_collations;
+    let definition = if !decorated && working_column_names[..ncols] == column_names[..] {
+        working_definition
+    } else {
+        super::scope::materialized_definition(
+            storage,
+            txid,
+            cte.name,
+            column_names,
+            column_types,
+            column_collations,
+            arena,
+        )?
+    };
 
     if storage.spill_attached() {
         let base_raw = external_recursive_tree(
@@ -3618,6 +3672,7 @@ fn materialize_recursive<'a>(
                 column_names: base_column_names,
                 column_types: base_column_types,
                 column_collations: base_column_collations,
+                definition: Some(working_definition),
                 source: crate::sql::ast::MaterializedCteSource::RecursiveExternal(working_source),
             })
             .map_err(|_| arena_full())?;
@@ -3707,6 +3762,7 @@ fn materialize_recursive<'a>(
                 column_names,
                 column_types,
                 column_collations,
+                definition: Some(definition),
                 source: crate::sql::ast::MaterializedCteSource::External(all),
             })
             .map_err(|_| arena_full())?);
@@ -3756,6 +3812,7 @@ fn materialize_recursive<'a>(
             column_names: base_column_names,
             column_types: base_column_types,
             column_collations: base_column_collations,
+            definition: Some(working_definition),
             source: crate::sql::ast::MaterializedCteSource::RecursiveInline(working_source),
         })
         .map_err(|_| arena_full())?;
@@ -3856,6 +3913,7 @@ fn materialize_recursive<'a>(
             column_names,
             column_types,
             column_collations,
+            definition: Some(definition),
             source: crate::sql::ast::MaterializedCteSource::Inline(all_rows),
         })
         .map_err(|_| arena_full())?)

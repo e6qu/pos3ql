@@ -113,6 +113,49 @@ pub enum ResolvedColumn {
     Merged(usize),
 }
 
+pub(crate) fn materialized_definition<'a>(
+    storage: &Storage,
+    txid: u32,
+    name: &str,
+    column_names: &[&str],
+    column_types: &[(i32, i16, i32)],
+    column_collations: &[crate::sql::ast::Collation],
+    arena: &'a Arena,
+) -> Result<&'a TableDef, SqlError> {
+    debug_assert_eq!(column_names.len(), column_types.len());
+    debug_assert_eq!(column_names.len(), column_collations.len());
+    let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+    for (index, slot) in columns.iter_mut().enumerate().take(column_names.len()) {
+        let (ctype, user_type) =
+            crate::sql::exec::catalog_column_type(storage, txid, column_types[index].0)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "CTE column \"{}\" type (oid {}) is not supported",
+                        column_names[index],
+                        column_types[index].0
+                    )
+                })?;
+        *slot = ColumnMeta {
+            name: SqlName::parse(column_names[index])?,
+            ctype,
+            type_mod: column_types[index].2,
+            collation: column_collations[index],
+            user_type,
+            ..ColumnMeta::EMPTY
+        };
+    }
+    arena
+        .alloc(TableDef {
+            name: SqlName::parse(name)?,
+            columns,
+            n_columns: column_names.len(),
+            ..TableDef::empty()
+        })
+        .map(|definition| &*definition)
+        .map_err(|_| arena_full())
+}
+
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
@@ -384,40 +427,35 @@ impl<'d> QueryScope<'d> {
                 aliases.len()
             ));
         }
-        let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
-        for (i, slot) in columns.iter_mut().enumerate().take(ncols) {
-            let name = tref
+        let mut names = [""; MAX_COLUMNS];
+        for (index, name) in names.iter_mut().enumerate().take(ncols) {
+            *name = tref
                 .col_alias
-                .and_then(|a| a.get(i).copied())
-                .unwrap_or(m.column_names[i]);
-            let (ctype, user_type) =
-                crate::sql::exec::catalog_column_type(storage, txid, m.column_types[i].0)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "CTE column \"{}\" type (oid {}) is not supported",
-                            name,
-                            m.column_types[i].0
-                        )
-                    })?;
-            *slot = ColumnMeta {
-                name: SqlName::parse(name)?,
-                ctype,
-                type_mod: m.column_types[i].2,
-                collation: m.column_collations[i],
-                user_type,
-                ..ColumnMeta::EMPTY
-            };
+                .and_then(|aliases| aliases.get(index).copied())
+                .unwrap_or(m.column_names[index]);
         }
-        let def = TableDef {
-            name: SqlName::parse(exposed)?,
-            columns,
-            n_columns: ncols,
-            ..TableDef::empty()
+        let cached = m.definition.filter(|definition| {
+            definition.n_columns == ncols
+                && definition
+                    .columns()
+                    .iter()
+                    .zip(&names[..ncols])
+                    .all(|(column, name)| column.name.as_str() == *name)
+        });
+        let def_reference = match cached {
+            Some(definition) => definition,
+            None => materialized_definition(
+                storage,
+                txid,
+                exposed,
+                &names[..ncols],
+                m.column_types,
+                m.column_collations,
+                arena,
+            )?,
         };
-        let def_reference = arena.alloc(def).map_err(|_| arena_full())?;
         self.names[self.n] = exposed;
-        self.defs[self.n] = Some(&*def_reference);
+        self.defs[self.n] = Some(def_reference);
         self.derived[self.n] = Some(if materialize { m.rows() } else { &[] });
         self.external_runs[self.n] = if materialize { m.external_run() } else { None };
         self.slots[self.n] = usize::MAX;

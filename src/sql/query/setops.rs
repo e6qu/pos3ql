@@ -1101,16 +1101,19 @@ fn merge_set_collations(
 fn describe_set_collations(
     tree: &SetTree<'_>,
     column_count: usize,
-    leaves: &[[SetColumnCollation; MAX_PROJ]],
+    leaves: &[SetColumnCollation],
     next_leaf: &mut usize,
-    workspace: &mut [[SetColumnCollation; MAX_PROJ]],
+    workspace: &mut [SetColumnCollation],
     next_node: &mut usize,
 ) -> Result<usize, SqlError> {
     let output = *next_node;
     *next_node += 1;
     match tree {
         SetTree::Select(_) => {
-            workspace[output][..column_count].copy_from_slice(&leaves[*next_leaf][..column_count]);
+            let source = *next_leaf * column_count;
+            let destination = output * column_count;
+            workspace[destination..destination + column_count]
+                .copy_from_slice(&leaves[source..source + column_count]);
             *next_leaf += 1;
         }
         SetTree::Op {
@@ -1136,17 +1139,19 @@ fn describe_set_collations(
                 next_node,
             )?;
             let allow_indeterminate = *operator == SetOp::Union && *all;
-            let left = workspace[left];
-            let right = workspace[right];
-            for ((result, left), right) in workspace[output][..column_count]
-                .iter_mut()
-                .zip(left)
-                .zip(right)
-            {
-                *result = merge_set_collations(left, right, allow_indeterminate)?;
+            let left = left * column_count;
+            let right = right * column_count;
+            let output = output * column_count;
+            for column in 0..column_count {
+                let mut result = merge_set_collations(
+                    workspace[left + column],
+                    workspace[right + column],
+                    allow_indeterminate,
+                )?;
                 if result.derivation == CollationDerivation::Explicit {
                     result.derivation = CollationDerivation::Implicit;
                 }
+                workspace[output + column] = result;
             }
         }
     }
@@ -1172,7 +1177,7 @@ fn register_first_leaf_record_shapes(
     }
     let mark = arena.mark();
     let result = register_record_shapes_inner(storage, statement, txid, arena, columns, count);
-    // The fixed record registry owns its fields; descriptors retain handles only.
+    // Record fields live in the arena's persistent tail; descriptors retain handles only.
     unsafe {
         arena.rewind_to(mark);
     }
@@ -1216,6 +1221,7 @@ fn register_record_shapes_inner(
                                 storage,
                                 txid,
                             },
+                            arena,
                         ),
                         None => crate::sql::exec::register_shape_for(
                             expression,
@@ -1226,6 +1232,7 @@ fn register_record_shapes_inner(
                                 storage,
                                 txid,
                             },
+                            arena,
                         ),
                     };
                     if let Some(handle) = handle {
@@ -1344,7 +1351,7 @@ pub(crate) fn describe_set_body<'a>(
     let n_cols = describe_leaf(storage, leaf0, txid, columns, arena)?;
     register_first_leaf_record_shapes(storage, leaf0, txid, arena, columns, n_cols)?;
     let leaf_collations = arena
-        .alloc_slice_with(leaves.len(), |_| [SetColumnCollation::NONE; MAX_PROJ])
+        .alloc_slice_with(leaves.len() * n_cols, |_| SetColumnCollation::NONE)
         .map_err(|_| arena_full())?;
     // `None` = still undetermined (an untyped NULL / UNKNOWN column adopts the
     // type of the other branches, as PostgreSQL resolves an unknown literal).
@@ -1352,7 +1359,7 @@ pub(crate) fn describe_set_body<'a>(
     for (c, col) in columns[..n_cols].iter().enumerate() {
         let unknown = leaf_col_unknown(storage, leaf0, c, txid, arena);
         if !unknown {
-            leaf_collations[0][c] = SetColumnCollation {
+            leaf_collations[c] = SetColumnCollation {
                 value: col.collation,
                 derivation: col.collation_derivation,
             };
@@ -1388,7 +1395,7 @@ pub(crate) fn describe_set_body<'a>(
             if leaf_col_unknown(storage, leaf_ref, c, txid, arena) {
                 continue; // an untyped NULL column adopts the running type
             }
-            leaf_collations[leaf_index + 1][c] = SetColumnCollation {
+            leaf_collations[(leaf_index + 1) * n_cols + c] = SetColumnCollation {
                 value: lc[c].collation,
                 derivation: lc[c].collation_derivation,
             };
@@ -1436,8 +1443,8 @@ pub(crate) fn describe_set_body<'a>(
         col.typlen = target[c].typlen();
     }
     let collation_workspace = arena
-        .alloc_slice_with(2 * leaves.len() - 1, |_| {
-            [SetColumnCollation::NONE; MAX_PROJ]
+        .alloc_slice_with((2 * leaves.len() - 1) * n_cols, |_| {
+            SetColumnCollation::NONE
         })
         .map_err(|_| arena_full())?;
     let mut next_collation_leaf = 0;
@@ -1452,7 +1459,7 @@ pub(crate) fn describe_set_body<'a>(
     )?;
     for (index, (column, collation)) in columns[..n_cols]
         .iter_mut()
-        .zip(&collation_workspace[collation_root])
+        .zip(&collation_workspace[collation_root * n_cols..(collation_root + 1) * n_cols])
         .enumerate()
     {
         if target[index].is_collatable() && collation.derivation == CollationDerivation::None {

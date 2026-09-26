@@ -208,7 +208,11 @@ pub fn projected_value_len(v: &Datum) -> usize {
             }
             n
         }
-        Datum::CompositeText { text, .. } => 2 + 1 + 4 + text.len(),
+        Datum::CompositeText {
+            physical_fields,
+            text,
+            ..
+        } => 2 + physical_field_count_len(*physical_fields) + 4 + text.len(),
     }
 }
 
@@ -611,10 +615,10 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         } => {
             out[0] = 33;
             out[1..3].copy_from_slice(&slot.to_le_bytes());
-            out[3] = *physical_fields;
-            out[4..8].copy_from_slice(&(text.len() as u32).to_le_bytes());
-            out[8..8 + text.len()].copy_from_slice(text.as_bytes());
-            8 + text.len()
+            let prefix = encode_physical_field_count(*physical_fields, &mut out[3..]);
+            out[3 + prefix..7 + prefix].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[7 + prefix..7 + prefix + text.len()].copy_from_slice(text.as_bytes());
+            7 + prefix + text.len()
         }
     }
 }
@@ -965,9 +969,12 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         }
         33 => {
             let slot = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
-            let physical_fields = bytes[at + 2];
-            let len = u32::from_le_bytes(bytes[at + 3..at + 7].try_into().unwrap()) as usize;
-            let text = core::str::from_utf8(&bytes[at + 7..at + 7 + len])
+            let (physical_fields, prefix) =
+                decode_physical_field_count(&bytes[at + 2..]).expect("projected composite prefix");
+            let length_at = at + 2 + prefix;
+            let len =
+                u32::from_le_bytes(bytes[length_at..length_at + 4].try_into().unwrap()) as usize;
+            let text = core::str::from_utf8(&bytes[length_at + 4..length_at + 4 + len])
                 .expect("projected composite text was encoded from valid UTF-8");
             (
                 Datum::CompositeText {
@@ -975,10 +982,34 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
                     physical_fields,
                     text,
                 },
-                7 + len,
+                2 + prefix + 4 + len,
             )
         }
         _ => unreachable!("tags are exhaustive"),
+    }
+}
+
+const fn physical_field_count_len(fields: u16) -> usize {
+    if fields < u8::MAX as u16 { 1 } else { 3 }
+}
+
+fn encode_physical_field_count(fields: u16, output: &mut [u8]) -> usize {
+    if fields < u8::MAX as u16 {
+        output[0] = fields as u8;
+        1
+    } else {
+        output[0] = u8::MAX;
+        output[1..3].copy_from_slice(&fields.to_le_bytes());
+        3
+    }
+}
+
+fn decode_physical_field_count(input: &[u8]) -> Option<(u16, usize)> {
+    let first = *input.first()?;
+    if first != u8::MAX {
+        Some((u16::from(first), 1))
+    } else {
+        Some((u16::from_le_bytes(input.get(1..3)?.try_into().ok()?), 3))
     }
 }
 

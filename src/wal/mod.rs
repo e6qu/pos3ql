@@ -14,10 +14,10 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::{BtreeOperatorClass, ColType};
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass,
+    CheckConstraint, ColumnDefault, ColumnMeta, ColumnSet, ColumnStatistics, DependencyClass,
     ExtendedStatisticsData, ExtendedStatisticsMcv, FkAction, ForeignKey, MAX_COLUMNS,
-    MAX_INDEX_COLS, OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef,
-    PartitionStrategy, RoleAttributes, SerializedStoredQueryDependency, SqlName,
+    MAX_INDEX_COLS, MAX_RELATION_COLUMNS, OwnedDatum, PartitionBound, PartitionBoundValue,
+    PartitionDef, PartitionStrategy, RoleAttributes, SerializedStoredQueryDependency, SqlName,
     StoredDependencyIdentity, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
 };
 use crate::util::StackStr;
@@ -51,6 +51,7 @@ impl CommittedBatch {
     }
 }
 const TABLE_STATISTICS_V3: u8 = u8::MAX - 1;
+const TABLE_STATISTICS_V4: u8 = u8::MAX - 2;
 
 // One registry defines both durable discriminants and startup recognition.
 macro_rules! wal_record_kinds {
@@ -127,6 +128,16 @@ wal_record_kinds! {
 /// Wider text-search slot identity. Kind 111 remains decodable so existing
 /// journals retain their durable meaning.
     KIND_SET_TEXT_SEARCH_V2 = 133;
+/// Wide relation column sets. V2 publication and original trigger records
+/// remain readable as one-word sets.
+    KIND_CREATE_PUBLICATION_V3 = 139;
+    KIND_ALTER_PUBLICATION_V3 = 140;
+    KIND_CREATE_TRIGGER_V2 = 141;
+/// Routine result counts widened from one byte to PostgreSQL's tuple width.
+    KIND_CREATE_ROUTINE_V2 = 142;
+    KIND_CREATE_COMPOSITE_V2 = 143;
+    KIND_CREATE_VIEW_V2 = 144;
+    KIND_SET_VIEW_COLUMNS_V2 = 145;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -256,6 +267,142 @@ fn append_stored_dependency_name(buffer: &mut FixedBuf, name: &str) -> bool {
         && buffer.append(name.as_bytes())
 }
 
+fn append_column_set(buffer: &mut FixedBuf, columns: ColumnSet) -> bool {
+    columns
+        .words()
+        .iter()
+        .all(|word| buffer.append(&word.to_le_bytes()))
+}
+
+fn take_column_set(payload: &[u8], at: &mut usize) -> Option<ColumnSet> {
+    let mut columns = ColumnSet::EMPTY;
+    for index in 0..ColumnSet::ENCODED_BYTES / core::mem::size_of::<u64>() {
+        let word = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
+        *at += 8;
+        if !columns.set_word(index, word) {
+            return None;
+        }
+    }
+    Some(columns)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WalColumnSets<'a> {
+    Captured(&'a [ColumnSet]),
+    Encoded { bytes: &'a [u8], wide: bool },
+}
+
+impl WalColumnSets<'_> {
+    fn append(self, buffer: &mut FixedBuf, count: usize) -> bool {
+        match self {
+            Self::Captured(columns) => {
+                columns.len() == count
+                    && columns
+                        .iter()
+                        .copied()
+                        .all(|columns| append_column_set(buffer, columns))
+            }
+            Self::Encoded { bytes, wide: true } => {
+                bytes.len() == count * ColumnSet::ENCODED_BYTES && buffer.append(bytes)
+            }
+            Self::Encoded { bytes, wide: false } => {
+                if bytes.len() != count * core::mem::size_of::<u64>() {
+                    return false;
+                }
+                bytes.as_chunks::<8>().0.iter().all(|bytes| {
+                    append_column_set(buffer, ColumnSet::from_low_word(u64::from_le_bytes(*bytes)))
+                })
+            }
+        }
+    }
+
+    pub(crate) fn materialize(
+        self,
+        count: usize,
+    ) -> Option<[ColumnSet; crate::storage::MAX_PUBLICATION_TABLES]> {
+        if count > crate::storage::MAX_PUBLICATION_TABLES {
+            return None;
+        }
+        let mut result = [ColumnSet::EMPTY; crate::storage::MAX_PUBLICATION_TABLES];
+        match self {
+            Self::Captured(columns) => result[..count].copy_from_slice(columns.get(..count)?),
+            Self::Encoded { bytes, wide } => {
+                let mut at = 0;
+                for target in &mut result[..count] {
+                    *target = if wide {
+                        take_column_set(bytes, &mut at)?
+                    } else {
+                        let word = u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?);
+                        at += 8;
+                        ColumnSet::from_low_word(word)
+                    };
+                }
+                if at != bytes.len() {
+                    return None;
+                }
+            }
+        }
+        Some(result)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WalViewColumns<'a> {
+    Captured(&'a crate::storage::ViewColumns),
+    Encoded { bytes: &'a [u8], wide_count: bool },
+}
+
+impl WalViewColumns<'_> {
+    fn encoded_len(self) -> usize {
+        match self {
+            Self::Captured(columns) => {
+                3 + columns
+                    .names()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        1 + name.as_str().len()
+                            + encoded_view_default_len(
+                                columns.default_at(index).expect("view column exists"),
+                            )
+                    })
+                    .sum::<usize>()
+            }
+            Self::Encoded {
+                bytes,
+                wide_count: true,
+            } => bytes.len(),
+            Self::Encoded {
+                bytes,
+                wide_count: false,
+            } => bytes.len() + 1,
+        }
+    }
+
+    fn append(self, buffer: &mut FixedBuf) -> bool {
+        match self {
+            Self::Captured(columns) => append_view_columns(buffer, columns),
+            Self::Encoded {
+                bytes,
+                wide_count: true,
+            } => buffer.append(bytes),
+            Self::Encoded {
+                bytes: _,
+                wide_count: false,
+            } => self
+                .materialize()
+                .is_some_and(|columns| append_view_columns(buffer, &columns)),
+        }
+    }
+
+    pub(crate) fn materialize(self) -> Option<crate::storage::ViewColumns> {
+        match self {
+            Self::Captured(columns) => Some(*columns),
+            Self::Encoded { bytes, wide_count } => decode_view_columns(bytes, wide_count),
+        }
+    }
+}
+
 /// Stored-query dependencies cross the WAL boundary in one of two compact
 /// forms: a reference to the creation-time set while appending, or a slice of
 /// the encoded record while replaying. Keeping the fixed dependency array out
@@ -276,7 +423,7 @@ impl WalStoredQueryDependencies<'_> {
                     .iter()
                     .map(|dependency| {
                         1 + 4
-                            + 8
+                            + ColumnSet::ENCODED_BYTES
                             + 1
                             + dependency.schema.as_str().len()
                             + 1
@@ -295,11 +442,11 @@ impl WalStoredQueryDependencies<'_> {
     fn append(self, buffer: &mut FixedBuf) -> bool {
         match self {
             Self::Captured(dependencies) => {
-                let mut ok = buffer.append(&[0xff, dependencies.entries().len() as u8]);
+                let mut ok = buffer.append(&[0xfe, dependencies.entries().len() as u8]);
                 for dependency in dependencies.entries() {
                     ok &= buffer.append(&[dependency.class as u8])
                         && buffer.append(&dependency.identity.encoded().to_le_bytes())
-                        && buffer.append(&dependency.referenced_columns.to_le_bytes())
+                        && append_column_set(buffer, dependency.referenced_columns)
                         && append_stored_dependency_name(buffer, dependency.schema.as_str())
                         && append_stored_dependency_name(buffer, dependency.name.as_str())
                         && append_stored_dependency_name(
@@ -347,13 +494,13 @@ impl WalTableStatistics<'_> {
                 1 + 8
                     + 4
                     + 8
-                    + 1
+                    + 2
                     + statistics
                         .columns
                         .iter()
                         .filter(|column| column.valid)
                         .count()
-                        * (1 + 4 + 8 + 4 + 4)
+                        * (2 + 4 + 8 + 4 + 4)
             }
             Self::Encoded(bytes) => bytes.len(),
         }
@@ -367,16 +514,16 @@ impl WalTableStatistics<'_> {
                     .iter()
                     .filter(|column| column.valid)
                     .count();
-                let mut ok = buffer.append(&[TABLE_STATISTICS_V3])
+                let mut ok = buffer.append(&[TABLE_STATISTICS_V4])
                     && buffer.append(&statistics.rows.to_le_bytes())
                     && buffer.append(&statistics.average_row_width.to_le_bytes())
                     && buffer.append(&statistics.analyzed_generation.to_le_bytes())
-                    && buffer.append(&[valid_columns as u8]);
+                    && buffer.append(&(valid_columns as u16).to_le_bytes());
                 for (index, column) in statistics.columns.iter().enumerate() {
                     if !column.valid {
                         continue;
                     }
-                    ok &= buffer.append(&[index as u8])
+                    ok &= buffer.append(&(index as u16).to_le_bytes())
                         && buffer.append(&column.null_fraction_ppm.to_le_bytes())
                         && buffer.append(&column.distinct_values.to_le_bytes())
                         && buffer.append(&column.distinct_fraction_ppm.to_le_bytes())
@@ -617,7 +764,7 @@ pub(crate) enum WalOp<'a> {
     CreateView {
         schema: &'a str,
         name: &'a str,
-        columns: crate::storage::ViewColumns,
+        columns: WalViewColumns<'a>,
         sql: &'a str,
         /// The creator's search_path, under which the body re-resolves.
         path: &'a str,
@@ -640,7 +787,7 @@ pub(crate) enum WalOp<'a> {
     SetViewColumns {
         schema: &'a str,
         name: &'a str,
-        columns: crate::storage::ViewColumns,
+        columns: WalViewColumns<'a>,
     },
     RenameView {
         schema: &'a str,
@@ -676,7 +823,7 @@ pub(crate) enum WalOp<'a> {
         owner: u16,
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
-        table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
+        table_column_masks: WalColumnSets<'a>,
         table_include_descendants: [bool; crate::storage::MAX_PUBLICATION_TABLES],
         table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
             crate::storage::MAX_PUBLICATION_TABLES],
@@ -699,7 +846,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
-        table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
+        table_column_masks: WalColumnSets<'a>,
         table_include_descendants: [bool; crate::storage::MAX_PUBLICATION_TABLES],
         table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
             crate::storage::MAX_PUBLICATION_TABLES],
@@ -807,7 +954,7 @@ pub(crate) enum WalOp<'a> {
         timing: u8,
         level: crate::sql::ast::TriggerLevel,
         events: crate::sql::ast::TriggerEvents,
-        update_columns: u64,
+        update_columns: ColumnSet,
         old_table: Option<&'a str>,
         new_table: Option<&'a str>,
         when: Option<&'a str>,
@@ -1127,7 +1274,11 @@ pub(crate) enum WalOp<'a> {
     /// part of the record: fields and rows refer to it directly.
     CreateComposite {
         slot: u16,
-        definition: crate::storage::CompositeDef,
+        definition: &'a crate::storage::CompositeDef,
+    },
+    RestoreComposite {
+        payload: &'a [u8],
+        wide_fields: bool,
     },
     DropComposite {
         schema: &'a str,
@@ -1137,7 +1288,10 @@ pub(crate) enum WalOp<'a> {
         definition: &'a crate::storage::RoutineDef,
         dependencies: WalStoredQueryDependencies<'a>,
     },
-    RestoreRoutine(&'a [u8]),
+    RestoreRoutine {
+        payload: &'a [u8],
+        wide_results: bool,
+    },
     SetCast(crate::storage::CastDef),
     DropCast {
         source: crate::storage::RoutineResult,
@@ -2129,16 +2283,16 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Delete { .. } => KIND_DELETE,
         WalOp::Truncate { .. } => KIND_TRUNCATE_WIDE,
         WalOp::LogicalMessage { .. } => KIND_LOGICAL_MESSAGE,
-        WalOp::CreateView { .. } => KIND_CREATE_VIEW,
+        WalOp::CreateView { .. } => KIND_CREATE_VIEW_V2,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::SetViewOptions { .. } => KIND_SET_VIEW_OPTIONS,
-        WalOp::SetViewColumns { .. } => KIND_SET_VIEW_COLUMNS,
+        WalOp::SetViewColumns { .. } => KIND_SET_VIEW_COLUMNS_V2,
         WalOp::RenameView { .. } => KIND_RENAME_VIEW,
         WalOp::SetRule { .. } => KIND_SET_RULE,
         WalOp::DropRule { .. } => KIND_DROP_RULE,
-        WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION_V2,
+        WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION_V3,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
-        WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION_V2,
+        WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION_V3,
         WalOp::SetPublicationOwner { .. } => KIND_SET_PUBLICATION_OWNER,
         WalOp::RenamePublication { .. } => KIND_RENAME_PUBLICATION,
         WalOp::CreateSubscription { .. } => KIND_CREATE_SUBSCRIPTION,
@@ -2154,7 +2308,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetSubscriptionOwner { .. } => KIND_SET_SUBSCRIPTION_OWNER,
         WalOp::RenameSubscription { .. } => KIND_RENAME_SUBSCRIPTION,
         WalOp::AlterReplicationSlot { .. } => KIND_ALTER_REPLICATION_SLOT,
-        WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER,
+        WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER_V2,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
         WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
         WalOp::SetPolicy { .. } => KIND_SET_POLICY,
@@ -2207,9 +2361,22 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
         WalOp::AlterEnumIdentity { .. } => KIND_ALTER_ENUM_IDENTITY,
-        WalOp::CreateComposite { .. } => KIND_CREATE_COMPOSITE,
+        WalOp::CreateComposite { .. }
+        | WalOp::RestoreComposite {
+            wide_fields: true, ..
+        } => KIND_CREATE_COMPOSITE_V2,
+        WalOp::RestoreComposite {
+            wide_fields: false, ..
+        } => KIND_CREATE_COMPOSITE,
         WalOp::DropComposite { .. } => KIND_DROP_COMPOSITE,
-        WalOp::CreateRoutine { .. } | WalOp::RestoreRoutine(_) => KIND_CREATE_ROUTINE,
+        WalOp::CreateRoutine { .. }
+        | WalOp::RestoreRoutine {
+            wide_results: true, ..
+        } => KIND_CREATE_ROUTINE_V2,
+        WalOp::RestoreRoutine {
+            wide_results: false,
+            ..
+        } => KIND_CREATE_ROUTINE,
         WalOp::SetCast(_) => KIND_SET_CAST,
         WalOp::DropCast { .. } => KIND_DROP_CAST,
         WalOp::SetOperator { .. } => KIND_SET_OPERATOR,
@@ -2457,21 +2624,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             dependencies,
         } => {
             1 + name.len()
-                + 1
-                + 1
-                + columns
-                    .names()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| {
-                        1 + name.as_str().len()
-                            + encoded_view_default_len(
-                                columns
-                                    .default_at(index)
-                                    .expect("view column index is bounded by its name slice"),
-                            )
-                    })
-                    .sum::<usize>()
+                + columns.encoded_len()
                 + 3
                 + sql.len()
                 + 1
@@ -2487,26 +2640,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             schema,
             name,
             columns,
-        } => {
-            1 + name.len()
-                + 1
-                + schema.len()
-                + 1
-                + 1
-                + columns
-                    .names()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, column)| {
-                        1 + column.as_str().len()
-                            + encoded_view_default_len(
-                                columns
-                                    .default_at(index)
-                                    .expect("view column index is bounded by its name slice"),
-                            )
-                    })
-                    .sum::<usize>()
-        }
+        } => 1 + name.len() + 1 + schema.len() + columns.encoded_len(),
         WalOp::RenameView {
             schema,
             name,
@@ -2522,8 +2656,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             dependencies,
             ..
         } => {
-            2 + 8
-                + 1
+            1 + 8
+                + 2
                 + 2
                 + table_schema.len()
                 + 1
@@ -2559,7 +2693,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + 1
-                + table_count * 11
+                + table_count * (3 + ColumnSet::ENCODED_BYTES)
                 + schema_count
                 + table_filter_sql[..*table_count]
                     .iter()
@@ -2578,7 +2712,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + 1
-                + table_count * 11
+                + table_count * (3 + ColumnSet::ENCODED_BYTES)
                 + schema_count
                 + table_filter_sql[..*table_count]
                     .iter()
@@ -2682,7 +2816,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 4
                 + referenced_schema.map_or(0, str::len)
                 + referenced_table.map_or(0, str::len)
-                + 16
+                + 8
+                + ColumnSet::ENCODED_BYTES
                 + old_table.map_or(0, str::len)
                 + new_table.map_or(0, str::len)
                 + when.map_or(0, str::len)
@@ -2997,10 +3132,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n
         }
         WalOp::RestoreDomain(payload)
-        | WalOp::RestoreRoutine(payload)
+        | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
         | WalOp::RestoreOperatorClass(payload) => payload.len(),
+        WalOp::RestoreComposite { payload, .. } => payload.len(),
         WalOp::DropDomain { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::CreateEnum(def) => {
             let mut n = 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
@@ -3024,7 +3160,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::CreateComposite {
             definition: def, ..
         } => {
-            let mut n = 2 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
+            let mut n = 2 + 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 2;
             for field in def.fields() {
                 n += 1 + field.name.as_str().len() + 2 + 1 + 1 + 1 + 4 + 1 + 1;
                 if let Some(identity) = field.user_type {
@@ -3116,7 +3252,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + match def.kind {
                     crate::storage::RoutineKind::TableFunction
                     | crate::storage::RoutineKind::RecordFunction { .. } => {
-                        1 + def.result_columns[..def.result_column_count]
+                        2 + def.result_columns[..def.result_column_count]
                             .iter()
                             .map(|column| {
                                 1 + column.name.as_str().len()
@@ -4210,17 +4346,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             dependencies,
         } => {
             name_bytes(buffer, name)
-                && buffer.append(&[columns.len() as u8])
-                && buffer.append(&[u8::from(columns.has_aliases())])
-                && columns.names().iter().enumerate().all(|(index, name)| {
-                    name_bytes(buffer, name.as_str())
-                        && append_view_default(
-                            buffer,
-                            columns
-                                .default_at(index)
-                                .expect("view column index is bounded by its name slice"),
-                        )
-                })
+                && columns.append(buffer)
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
                 && name_bytes(buffer, schema)
@@ -4253,21 +4379,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             schema,
             name,
             columns,
-        } => {
-            name_bytes(buffer, name)
-                && name_bytes(buffer, schema)
-                && buffer.append(&[columns.len() as u8])
-                && buffer.append(&[u8::from(columns.has_aliases())])
-                && columns.names().iter().enumerate().all(|(index, column)| {
-                    name_bytes(buffer, column.as_str())
-                        && append_view_default(
-                            buffer,
-                            columns
-                                .default_at(index)
-                                .expect("view column index is bounded by its name slice"),
-                        )
-                })
-        }
+        } => name_bytes(buffer, name) && name_bytes(buffer, schema) && columns.append(buffer),
         WalOp::RenameView {
             schema,
             name,
@@ -4364,9 +4476,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for table in &tables[..*table_count] {
                 ok = ok && buffer.append(&table.to_le_bytes());
             }
-            for mask in &table_column_masks[..*table_count] {
-                ok = ok && buffer.append(&mask.to_le_bytes());
-            }
+            ok = ok && table_column_masks.append(buffer, *table_count);
             for descendants in &table_include_descendants[..*table_count] {
                 ok = ok && buffer.append(&[u8::from(*descendants)]);
             }
@@ -4412,9 +4522,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for table in &tables[..*table_count] {
                 ok = ok && buffer.append(&table.to_le_bytes());
             }
-            for mask in &table_column_masks[..*table_count] {
-                ok = ok && buffer.append(&mask.to_le_bytes());
-            }
+            ok = ok && table_column_masks.append(buffer, *table_count);
             for descendants in &table_include_descendants[..*table_count] {
                 ok = ok && buffer.append(&[u8::from(*descendants)]);
             }
@@ -5061,7 +5169,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::RestoreDomain(payload)
-        | WalOp::RestoreRoutine(payload)
+        | WalOp::RestoreRoutine { payload, .. }
         | WalOp::RestoreForeignTable(payload)
         | WalOp::RestoreOperatorFamily(payload)
         | WalOp::RestoreOperatorClass(payload) => buffer.append(payload),
@@ -5105,7 +5213,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let mut ok = buffer.append(&slot.to_le_bytes())
                 && name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
-                && buffer.append(&[def.n_fields as u8]);
+                && buffer.append(&(def.n_fields as u16).to_le_bytes());
             for field in def.fields() {
                 ok &= name_bytes(buffer, field.name.as_str())
                     && buffer.append(&field.attribute_number.to_le_bytes())
@@ -5125,6 +5233,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok
         }
+        WalOp::RestoreComposite { payload, .. } => buffer.append(payload),
         WalOp::DropComposite { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
@@ -5220,8 +5329,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 crate::storage::RoutineKind::TableFunction
                     | crate::storage::RoutineKind::RecordFunction { .. }
             ) {
-                ok &= def.result_column_count <= u8::MAX as usize
-                    && buffer.append(&[def.result_column_count as u8]);
+                ok &= def.result_column_count <= u16::MAX as usize
+                    && buffer.append(&(def.result_column_count as u16).to_le_bytes());
                 for column in &def.result_columns[..def.result_column_count] {
                     ok &= name_bytes(buffer, column.name.as_str())
                         && buffer.append(&[column.ctype.code()]);
@@ -5762,7 +5871,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, referenced_schema.unwrap_or(""))
                 && name_bytes(buffer, referenced_table.unwrap_or(""))
                 && buffer.append(&[*timing, level.code(), events.bits()])
-                && buffer.append(&update_columns.to_le_bytes())
+                && append_column_set(buffer, *update_columns)
                 && name_bytes(buffer, old_table.unwrap_or(""))
                 && name_bytes(buffer, new_table.unwrap_or(""))
                 && u16::try_from(when_len)
@@ -5862,13 +5971,21 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
     let Some(&first) = payload.first() else {
         return false;
     };
-    let (count, mut at, has_columns) = if first == 0xff {
+    let (count, mut at, column_bytes) = if matches!(first, 0xfe | 0xff) {
         let Some(&count) = payload.get(1) else {
             return false;
         };
-        (count, 2, true)
+        (
+            count,
+            2,
+            if first == 0xfe {
+                ColumnSet::ENCODED_BYTES
+            } else {
+                8
+            },
+        )
     } else {
-        (first, 1, false)
+        (first, 1, 0)
     };
     if count as usize > crate::storage::MAX_STORED_QUERY_DEPENDENCIES {
         return false;
@@ -5894,11 +6011,11 @@ fn validate_stored_query_dependencies(payload: &[u8]) -> bool {
             return false;
         }
         at += 4;
-        if has_columns {
-            if payload.get(at..at + 8).is_none() {
+        if column_bytes != 0 {
+            if payload.get(at..at + column_bytes).is_none() {
                 return false;
             }
-            at += 8;
+            at += column_bytes;
         }
         for _ in 0..4 {
             if stored_dependency_name(payload, &mut at).is_none() {
@@ -5914,8 +6031,9 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
     if !validate_stored_query_dependencies(payload) {
         return None;
     }
-    let has_columns = payload[0] == 0xff;
-    let count = payload[has_columns as usize] as usize;
+    let marker = payload[0];
+    let has_columns = matches!(marker, 0xfe | 0xff);
+    let count = payload[usize::from(has_columns)] as usize;
     let mut at = if has_columns { 2 } else { 1 };
     let mut dependencies = StoredQueryDependencies::with_recovery_limit(count.max(1));
     for _ in 0..count {
@@ -5926,12 +6044,14 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
             i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?),
         )?;
         at += 4;
-        let referenced_columns = if has_columns {
+        let referenced_columns = if marker == 0xfe {
+            take_column_set(payload, &mut at)?
+        } else if marker == 0xff {
             let columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
-            columns
+            ColumnSet::from_low_word(columns)
         } else {
-            0
+            ColumnSet::EMPTY
         };
         let schema = stored_dependency_name(payload, &mut at)?;
         let name = stored_dependency_name(payload, &mut at)?;
@@ -5953,7 +6073,8 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
 }
 
 fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
-    if payload.first().copied() != Some(TABLE_STATISTICS_V3) {
+    let format = payload.first().copied()?;
+    if !matches!(format, TABLE_STATISTICS_V3 | TABLE_STATISTICS_V4) {
         return None;
     }
     let mut at = 1usize;
@@ -5963,8 +6084,15 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
     at += 4;
     let analyzed_generation = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
     at += 8;
-    let count = *payload.get(at)? as usize;
-    at += 1;
+    let count = if format == TABLE_STATISTICS_V4 {
+        let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
+        count
+    } else {
+        let count = *payload.get(at)? as usize;
+        at += 1;
+        count
+    };
     if count > MAX_COLUMNS {
         return None;
     }
@@ -5976,8 +6104,15 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
         columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
     };
     for _ in 0..count {
-        let column = *payload.get(at)? as usize;
-        at += 1;
+        let column = if format == TABLE_STATISTICS_V4 {
+            let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+            at += 2;
+            column
+        } else {
+            let column = *payload.get(at)? as usize;
+            at += 1;
+            column
+        };
         if column >= MAX_COLUMNS || statistics.columns[column].valid {
             return None;
         }
@@ -6511,13 +6646,39 @@ pub(crate) fn decode_domain_payload(payload: &[u8]) -> Option<crate::storage::Do
 #[inline(never)]
 pub(crate) fn decode_routine_payload(
     payload: &[u8],
+    wide_results: bool,
 ) -> Option<(crate::storage::RoutineDef, WalStoredQueryDependencies<'_>)> {
     let mut decoded = None;
     decode_op_inner(
-        KIND_CREATE_ROUTINE,
+        if wide_results {
+            KIND_CREATE_ROUTINE_V2
+        } else {
+            KIND_CREATE_ROUTINE
+        },
         payload,
         WalDecodeOutput {
             routine: Some(&mut decoded),
+            ..WalDecodeOutput::NONE
+        },
+    )?;
+    decoded
+}
+
+#[inline(never)]
+pub(crate) fn decode_composite_payload(
+    payload: &[u8],
+    wide_fields: bool,
+) -> Option<(u16, crate::storage::CompositeDef)> {
+    let mut decoded = None;
+    decode_op_inner(
+        if wide_fields {
+            KIND_CREATE_COMPOSITE_V2
+        } else {
+            KIND_CREATE_COMPOSITE
+        },
+        payload,
+        WalDecodeOutput {
+            composite: Some(&mut decoded),
             ..WalDecodeOutput::NONE
         },
     )?;
@@ -6585,6 +6746,7 @@ struct WalDecodeOutput<'output, 'payload> {
             WalStoredQueryDependencies<'payload>,
         )>,
     >,
+    composite: Option<&'output mut Option<(u16, crate::storage::CompositeDef)>>,
     foreign_table: Option<
         &'output mut Option<(
             u16,
@@ -6601,6 +6763,7 @@ impl WalDecodeOutput<'_, '_> {
         table: None,
         domain: None,
         routine: None,
+        composite: None,
         foreign_table: None,
         operator_family: None,
         operator_class: None,
@@ -6616,6 +6779,7 @@ fn decode_op_inner<'a>(
         table: decoded_table,
         domain: decoded_domain,
         routine: decoded_routine,
+        composite: decoded_composite,
         foreign_table: decoded_foreign_table,
         operator_family: decoded_operator_family,
         operator_class: decoded_operator_class,
@@ -6827,7 +6991,7 @@ fn decode_op_inner<'a>(
             let name = take_name(&mut at)?;
             let n_cols = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
-            if n_cols > MAX_COLUMNS {
+            if n_cols > MAX_RELATION_COLUMNS {
                 return None;
             }
             let has_toast = stored_boolean(*payload.get(at)?)?;
@@ -7338,32 +7502,36 @@ fn decode_op_inner<'a>(
                 content,
             })
         }),
-        KIND_CREATE_VIEW => decode_large_op(|| {
+        KIND_CREATE_VIEW | KIND_CREATE_VIEW_V2 => decode_large_op(|| {
+            let wide_columns = kind == KIND_CREATE_VIEW_V2;
             let name = take_name(&mut at)?;
-            let column_count = *payload.get(at)? as usize;
-            at += 1;
-            let aliases = match *payload.get(at)? {
+            let columns_start = at;
+            let column_count = if wide_columns {
+                let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                count
+            } else {
+                let count = *payload.get(at)? as usize;
+                at += 1;
+                count
+            };
+            match *payload.get(at)? {
                 0 => false,
                 1 => true,
                 _ => return None,
             };
             at += 1;
-            if column_count > crate::storage::MAX_COLUMNS {
+            if column_count > crate::storage::MAX_RELATION_COLUMNS {
                 return None;
             }
-            let mut column_names = [""; crate::storage::MAX_COLUMNS];
-            let mut defaults = [crate::storage::ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
-            for index in 0..column_count {
-                column_names[index] = take_name(&mut at)?;
-                defaults[index] = decode_view_default(payload, &mut at)?;
+            for _ in 0..column_count {
+                take_name(&mut at)?;
+                decode_view_default(payload, &mut at)?;
             }
-            let mut columns =
-                crate::storage::ViewColumns::from_names(&column_names[..column_count])
-                    .ok()?
-                    .with_aliases(aliases);
-            for (index, default) in defaults[..column_count].iter().copied().enumerate() {
-                columns = columns.with_default(index, default).ok()?;
-            }
+            let columns = WalViewColumns::Encoded {
+                bytes: payload.get(columns_start..at)?,
+                wide_count: wide_columns,
+            };
             let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let raw = payload.get(at..at + sql_len)?;
@@ -7437,32 +7605,37 @@ fn decode_op_inner<'a>(
                 check_option,
             })
         }),
-        KIND_SET_VIEW_COLUMNS => decode_large_op(|| {
+        KIND_SET_VIEW_COLUMNS | KIND_SET_VIEW_COLUMNS_V2 => decode_large_op(|| {
+            let wide_columns = kind == KIND_SET_VIEW_COLUMNS_V2;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let count = *payload.get(at)? as usize;
-            at += 1;
-            let aliases = match *payload.get(at)? {
+            let columns_start = at;
+            let count = if wide_columns {
+                let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                count
+            } else {
+                let count = *payload.get(at)? as usize;
+                at += 1;
+                count
+            };
+            match *payload.get(at)? {
                 0 => false,
                 1 => true,
                 _ => return None,
             };
             at += 1;
-            if count > crate::storage::MAX_COLUMNS {
+            if count > crate::storage::MAX_RELATION_COLUMNS {
                 return None;
             }
-            let mut names = [""; crate::storage::MAX_COLUMNS];
-            let mut defaults = [crate::storage::ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
-            for index in 0..count {
-                names[index] = take_name(&mut at)?;
-                defaults[index] = decode_view_default(payload, &mut at)?;
+            for _ in 0..count {
+                take_name(&mut at)?;
+                decode_view_default(payload, &mut at)?;
             }
-            let mut columns = crate::storage::ViewColumns::from_names(&names[..count])
-                .ok()?
-                .with_aliases(aliases);
-            for (index, default) in defaults[..count].iter().copied().enumerate() {
-                columns = columns.with_default(index, default).ok()?;
-            }
+            let columns = WalViewColumns::Encoded {
+                bytes: payload.get(columns_start..at)?,
+                wide_count: wide_columns,
+            };
             (at == payload.len()).then_some(WalOp::SetViewColumns {
                 schema,
                 name,
@@ -7591,7 +7764,8 @@ fn decode_op_inner<'a>(
                 name,
             })
         }),
-        KIND_CREATE_PUBLICATION_V2 => decode_large_op(|| {
+        KIND_CREATE_PUBLICATION_V2 | KIND_CREATE_PUBLICATION_V3 => decode_large_op(|| {
+            let wide_columns = kind == KIND_CREATE_PUBLICATION_V3;
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -7612,11 +7786,18 @@ fn decode_op_inner<'a>(
                 *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
             }
-            let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
-            for mask in &mut table_column_masks[..count] {
-                *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-                at += 8;
-            }
+            let mask_bytes = count
+                * if wide_columns {
+                    ColumnSet::ENCODED_BYTES
+                } else {
+                    core::mem::size_of::<u64>()
+                };
+            let encoded_masks = payload.get(at..at + mask_bytes)?;
+            at += mask_bytes;
+            let table_column_masks = WalColumnSets::Encoded {
+                bytes: encoded_masks,
+                wide: wide_columns,
+            };
             let mut table_include_descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
             for descendants in &mut table_include_descendants[..count] {
                 *descendants = match *payload.get(at)? {
@@ -7670,7 +7851,8 @@ fn decode_op_inner<'a>(
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPublication { name })
         }),
-        KIND_ALTER_PUBLICATION_V2 => decode_large_op(|| {
+        KIND_ALTER_PUBLICATION_V2 | KIND_ALTER_PUBLICATION_V3 => decode_large_op(|| {
+            let wide_columns = kind == KIND_ALTER_PUBLICATION_V3;
             let name = take_name(&mut at)?;
             let flags = *payload.get(at)?;
             at += 1;
@@ -7689,11 +7871,18 @@ fn decode_op_inner<'a>(
                 *table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
             }
-            let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
-            for mask in &mut table_column_masks[..count] {
-                *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-                at += 8;
-            }
+            let mask_bytes = count
+                * if wide_columns {
+                    ColumnSet::ENCODED_BYTES
+                } else {
+                    core::mem::size_of::<u64>()
+                };
+            let encoded_masks = payload.get(at..at + mask_bytes)?;
+            at += mask_bytes;
+            let table_column_masks = WalColumnSets::Encoded {
+                bytes: encoded_masks,
+                wide: wide_columns,
+            };
             let mut table_include_descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
             for descendants in &mut table_include_descendants[..count] {
                 *descendants = match *payload.get(at)? {
@@ -7956,7 +8145,8 @@ fn decode_op_inner<'a>(
             let new_name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::RenameSubscription { name, new_name })
         }),
-        KIND_CREATE_TRIGGER => decode_large_op(|| {
+        KIND_CREATE_TRIGGER | KIND_CREATE_TRIGGER_V2 => decode_large_op(|| {
+            let wide_columns = kind == KIND_CREATE_TRIGGER_V2;
             let name = take_name(&mut at)?;
             let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
             at += 1;
@@ -7994,8 +8184,13 @@ fn decode_op_inner<'a>(
             let level = crate::sql::ast::TriggerLevel::from_code(*payload.get(at + 1)?)?;
             let events = crate::sql::ast::TriggerEvents::from_bits(*payload.get(at + 2)?)?;
             at += 3;
-            let update_columns = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-            at += 8;
+            let update_columns = if wide_columns {
+                take_column_set(payload, &mut at)?
+            } else {
+                let word = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                at += 8;
+                ColumnSet::from_low_word(word)
+            };
             let old_table = take_name(&mut at)?;
             let new_table = take_name(&mut at)?;
             let old_table = (!old_table.is_empty()).then_some(old_table);
@@ -9023,13 +9218,21 @@ fn decode_op_inner<'a>(
                 new_name,
             })
         }),
-        KIND_CREATE_COMPOSITE => decode_large_op(|| {
+        KIND_CREATE_COMPOSITE | KIND_CREATE_COMPOSITE_V2 => decode_large_op(|| {
+            let wide_fields = kind == KIND_CREATE_COMPOSITE_V2;
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let n_fields = *payload.get(at)? as usize;
-            at += 1;
+            let n_fields = if wide_fields {
+                let count = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                count
+            } else {
+                let count = *payload.get(at)? as usize;
+                at += 1;
+                count
+            };
             if n_fields > crate::storage::MAX_COMPOSITE_FIELDS {
                 return None;
             }
@@ -9079,19 +9282,26 @@ fn decode_op_inner<'a>(
                     not_null,
                 };
             }
-            (at == payload.len()).then_some(WalOp::CreateComposite {
-                slot,
-                definition: crate::storage::CompositeDef {
-                    database: crate::storage::DatabaseOid::POSTGRES,
-                    created_at: 0,
-                    schema: SqlName::parse(schema).ok()?,
-                    name: SqlName::parse(name).ok()?,
-                    ownership: crate::storage::Ownership::BOOTSTRAP,
-                    fields,
-                    n_fields,
-                    pending_definition: None,
-                    ddl_state: crate::storage::CatalogDdlState::Absent,
-                },
+            if at != payload.len() {
+                return None;
+            }
+            let definition = crate::storage::CompositeDef {
+                database: crate::storage::DatabaseOid::POSTGRES,
+                created_at: 0,
+                schema: SqlName::parse(schema).ok()?,
+                name: SqlName::parse(name).ok()?,
+                ownership: crate::storage::Ownership::BOOTSTRAP,
+                fields,
+                n_fields,
+                pending_definition: None,
+                ddl_state: crate::storage::CatalogDdlState::Absent,
+            };
+            if let Some(output) = decoded_composite {
+                *output = Some((slot, definition));
+            }
+            Some(WalOp::RestoreComposite {
+                payload,
+                wide_fields,
             })
         }),
         KIND_DROP_COMPOSITE => decode_large_op(|| {
@@ -9099,7 +9309,8 @@ fn decode_op_inner<'a>(
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropComposite { schema, name })
         }),
-        KIND_CREATE_ROUTINE => decode_large_op(|| {
+        KIND_CREATE_ROUTINE | KIND_CREATE_ROUTINE_V2 => decode_large_op(|| {
+            let wide_results = kind == KIND_CREATE_ROUTINE_V2;
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
@@ -9288,8 +9499,16 @@ fn decode_op_inner<'a>(
             let code = *payload.get(at)?;
             at += 1;
             let kind = if matches!(code, 3 | 6 | 7) {
-                result_column_count = *payload.get(at)? as usize;
-                at += 1;
+                result_column_count = if wide_results {
+                    let count =
+                        u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                    at += 2;
+                    count
+                } else {
+                    let count = *payload.get(at)? as usize;
+                    at += 1;
+                    count
+                };
                 if result_column_count > crate::storage::MAX_ROUTINE_OUTPUT_COLUMNS {
                     return None;
                 }
@@ -9366,7 +9585,10 @@ fn decode_op_inner<'a>(
                     WalStoredQueryDependencies::Encoded(encoded_dependencies),
                 ));
             }
-            Some(WalOp::RestoreRoutine(payload))
+            Some(WalOp::RestoreRoutine {
+                payload,
+                wide_results,
+            })
         }),
         KIND_SET_CAST => decode_large_op(|| {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
@@ -10594,6 +10816,70 @@ fn encoded_view_default_len(default: crate::storage::ColumnDefault) -> usize {
             unreachable!("view columns cannot carry generated expressions")
         }
     }
+}
+
+fn append_view_columns(buffer: &mut FixedBuf, columns: &crate::storage::ViewColumns) -> bool {
+    buffer.append(&(columns.len() as u16).to_le_bytes())
+        && buffer.append(&[u8::from(columns.has_aliases())])
+        && columns.names().iter().enumerate().all(|(index, name)| {
+            name.as_str().len() <= u8::MAX as usize
+                && buffer.append(&[name.as_str().len() as u8])
+                && buffer.append(name.as_str().as_bytes())
+                && append_view_default(
+                    buffer,
+                    columns.default_at(index).expect("view column exists"),
+                )
+        })
+}
+
+fn decode_view_columns(payload: &[u8], wide_count: bool) -> Option<crate::storage::ViewColumns> {
+    let (count, mut at) = if wide_count {
+        let count = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?) as usize;
+        (count, 2)
+    } else {
+        let count = *payload.first()? as usize;
+        (count, 1)
+    };
+    if count > crate::storage::MAX_COLUMNS {
+        return None;
+    }
+    let aliases = match *payload.get(at)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    at += 1;
+    let mut names = [""; crate::storage::MAX_COLUMNS];
+    let mut default_indexes = [0usize; crate::storage::MAX_VIEW_DEFAULTS];
+    let mut defaults = [crate::storage::ColumnDefault::NONE; crate::storage::MAX_VIEW_DEFAULTS];
+    let mut default_count = 0usize;
+    for (index, name) in names[..count].iter_mut().enumerate() {
+        let len = *payload.get(at)? as usize;
+        at += 1;
+        *name = core::str::from_utf8(payload.get(at..at + len)?).ok()?;
+        at += len;
+        let default = decode_view_default(payload, &mut at)?;
+        if !matches!(default, crate::storage::ColumnDefault::None) {
+            if default_count == defaults.len() {
+                return None;
+            }
+            default_indexes[default_count] = index;
+            defaults[default_count] = default;
+            default_count += 1;
+        }
+    }
+    if at != payload.len() {
+        return None;
+    }
+    let mut columns = crate::storage::ViewColumns::from_names(&names[..count])
+        .ok()?
+        .with_aliases(aliases);
+    for index in 0..default_count {
+        columns = columns
+            .with_default(default_indexes[index], defaults[index])
+            .ok()?;
+    }
+    Some(columns)
 }
 
 fn append_view_default(buffer: &mut FixedBuf, default: crate::storage::ColumnDefault) -> bool {
@@ -11918,7 +12204,7 @@ mod tests {
                 name: SqlName::parse("items").unwrap(),
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("items").unwrap(),
-                referenced_columns: 0b101,
+                referenced_columns: ColumnSet::from_low_word(0b101),
             })
             .unwrap();
         dependencies
@@ -11931,11 +12217,11 @@ mod tests {
                 name: SqlName::parse("expanded").unwrap(),
                 referenced_schema: SqlName::parse("").unwrap(),
                 referenced_name: SqlName::parse("original_function").unwrap(),
-                referenced_columns: 0,
+                referenced_columns: crate::storage::ColumnSet::EMPTY,
             })
             .unwrap();
         let mut budget = crate::mem::budget::Budget::new(1024);
-        let mut encoded = FixedBuf::new(&mut budget, "wal dependency test", 256).unwrap();
+        let mut encoded = FixedBuf::new(&mut budget, "wal dependency test", 1024).unwrap();
         assert!(WalStoredQueryDependencies::Captured(dependencies.view()).append(&mut encoded));
         assert_eq!(
             WalStoredQueryDependencies::Encoded(encoded.readable())
@@ -12774,7 +13060,7 @@ mod tests {
                 timing: 0,
                 level: crate::sql::ast::TriggerLevel::Row,
                 events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
-                update_columns: 0,
+                update_columns: ColumnSet::EMPTY,
                 old_table: None,
                 new_table: None,
                 when: None,
@@ -12783,7 +13069,7 @@ mod tests {
             },
         ));
         let incomplete_payload = &payload.readable()[..payload.len() - 10];
-        assert!(decode_op(KIND_CREATE_TRIGGER, incomplete_payload).is_none());
+        assert!(decode_op(KIND_CREATE_TRIGGER_V2, incomplete_payload).is_none());
     }
 
     #[test]
@@ -12807,7 +13093,7 @@ mod tests {
                 timing: 1,
                 level: crate::sql::ast::TriggerLevel::Statement,
                 events: crate::sql::ast::TriggerEvents::from_bits(2).unwrap(),
-                update_columns: 0,
+                update_columns: ColumnSet::EMPTY,
                 old_table: Some("old_orders"),
                 new_table: Some("new_orders"),
                 when: None,
@@ -12819,7 +13105,7 @@ mod tests {
             old_table,
             new_table,
             ..
-        }) = decode_op(KIND_CREATE_TRIGGER, payload.readable())
+        }) = decode_op(KIND_CREATE_TRIGGER_V2, payload.readable())
         else {
             panic!("transition trigger did not decode");
         };
@@ -12848,7 +13134,7 @@ mod tests {
                 timing: 2,
                 level: crate::sql::ast::TriggerLevel::Row,
                 events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
-                update_columns: 0,
+                update_columns: ColumnSet::EMPTY,
                 old_table: None,
                 new_table: None,
                 when: None,
@@ -12857,7 +13143,7 @@ mod tests {
             },
         ));
         let Some(WalOp::CreateTrigger { target, timing, .. }) =
-            decode_op(KIND_CREATE_TRIGGER, payload.readable())
+            decode_op(KIND_CREATE_TRIGGER_V2, payload.readable())
         else {
             panic!("view trigger did not decode");
         };
@@ -12919,7 +13205,7 @@ mod tests {
             &WalOp::CreateView {
                 schema: "public",
                 name: "reader_view",
-                columns: create_columns,
+                columns: WalViewColumns::Captured(&create_columns),
                 sql: "SELECT * FROM protected",
                 path: "public",
                 security_invoker: true,
@@ -12934,10 +13220,11 @@ mod tests {
             check_option,
             columns,
             ..
-        }) = decode_op(KIND_CREATE_VIEW, payload.readable())
+        }) = decode_op(KIND_CREATE_VIEW_V2, payload.readable())
         else {
             panic!("view payload did not decode");
         };
+        let columns = columns.materialize().unwrap();
         assert!(security_invoker);
         assert_eq!(security_barrier, 1);
         assert_eq!(check_option, 2);
@@ -12969,14 +13256,15 @@ mod tests {
             &WalOp::SetViewColumns {
                 schema: "public",
                 name: "reader_view",
-                columns,
+                columns: WalViewColumns::Captured(&columns),
             },
         ));
         let Some(WalOp::SetViewColumns { columns, .. }) =
-            decode_op(KIND_SET_VIEW_COLUMNS, payload.readable())
+            decode_op(KIND_SET_VIEW_COLUMNS_V2, payload.readable())
         else {
             panic!("view-column payload did not decode");
         };
+        let columns = columns.materialize().unwrap();
         assert!(columns.has_aliases());
         assert_eq!(columns.names()[0].as_str(), "published_value");
         assert!(matches!(
@@ -13036,7 +13324,7 @@ mod tests {
                 timing: 0,
                 level: crate::sql::ast::TriggerLevel::Row,
                 events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
-                update_columns: 0,
+                update_columns: ColumnSet::EMPTY,
                 old_table: None,
                 new_table: None,
                 when: None,
@@ -13048,7 +13336,7 @@ mod tests {
             arguments,
             argument_count,
             ..
-        }) = decode_op(KIND_CREATE_TRIGGER, payload.readable())
+        }) = decode_op(KIND_CREATE_TRIGGER_V2, payload.readable())
         else {
             panic!("trigger arguments did not decode");
         };
@@ -13083,28 +13371,26 @@ mod tests {
             dropped: true,
             not_null: false,
         };
+        let definition = crate::storage::CompositeDef {
+            database: crate::storage::DatabaseOid::POSTGRES,
+            created_at: 0,
+            schema: crate::storage::SqlName::parse("public").unwrap(),
+            name: crate::storage::SqlName::parse("evolving").unwrap(),
+            ownership: crate::storage::Ownership::BOOTSTRAP,
+            fields,
+            n_fields: 2,
+            pending_definition: None,
+            ddl_state: crate::storage::CatalogDdlState::Absent,
+        };
         let op = WalOp::CreateComposite {
             slot: 7,
-            definition: crate::storage::CompositeDef {
-                database: crate::storage::DatabaseOid::POSTGRES,
-                created_at: 0,
-                schema: crate::storage::SqlName::parse("public").unwrap(),
-                name: crate::storage::SqlName::parse("evolving").unwrap(),
-                ownership: crate::storage::Ownership::BOOTSTRAP,
-                fields,
-                n_fields: 2,
-                pending_definition: None,
-                ddl_state: crate::storage::CatalogDdlState::Absent,
-            },
+            definition: &definition,
         };
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "composite WAL", 2048).unwrap();
         assert!(append_payload(&mut payload, &op));
-        let Some(WalOp::CreateComposite { slot, definition }) =
-            decode_op(KIND_CREATE_COMPOSITE, payload.readable())
-        else {
-            panic!("composite WAL did not decode");
-        };
+        let (slot, definition) =
+            decode_composite_payload(payload.readable(), true).expect("composite WAL decodes");
         assert_eq!(slot, 7);
         assert_eq!(definition.fields()[0].attribute_number, 1);
         assert!(definition.fields()[0].not_null);
@@ -13264,6 +13550,7 @@ mod tests {
             let mut publication_tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
             publication_tables[0] = 3;
             publication_tables[1] = 7;
+            let publication_masks = [ColumnSet::EMPTY; crate::storage::MAX_PUBLICATION_TABLES];
             wal.append_committed(
                 13,
                 &WalOp::CreatePublication {
@@ -13271,7 +13558,7 @@ mod tests {
                     owner: 7,
                     all_tables: false,
                     tables: publication_tables,
-                    table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
+                    table_column_masks: WalColumnSets::Captured(&publication_masks[..2]),
                     table_include_descendants: [false; crate::storage::MAX_PUBLICATION_TABLES],
                     table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
@@ -13292,7 +13579,7 @@ mod tests {
                     name: "changes",
                     all_tables: false,
                     tables: publication_tables,
-                    table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
+                    table_column_masks: WalColumnSets::Captured(&publication_masks[..2]),
                     table_include_descendants: [false; crate::storage::MAX_PUBLICATION_TABLES],
                     table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
@@ -13370,7 +13657,7 @@ mod tests {
                     timing: 0,
                     level: crate::sql::ast::TriggerLevel::Row,
                     events: crate::sql::ast::TriggerEvents::from_bits(3).unwrap(),
-                    update_columns: 3,
+                    update_columns: ColumnSet::from_low_word(3),
                     old_table: None,
                     new_table: None,
                     when: Some("NEW.total > OLD.total"),
@@ -14244,7 +14531,7 @@ mod tests {
                 crate::storage::StoredQueryDependencies::EMPTY.view(),
             ),
         };
-        let mut budget = Budget::new(128 << 10);
+        let mut budget = Budget::new(256 << 10);
         let mut payload = FixedBuf::new(
             &mut budget,
             "wide routine payload",
@@ -14254,10 +14541,10 @@ mod tests {
         crate::mem::guard::forbid_alloc(|| {
             assert!(append_payload(&mut payload, &operation));
             assert!(matches!(
-                decode_op(KIND_CREATE_ROUTINE, payload.readable()),
-                Some(WalOp::RestoreRoutine(_))
+                decode_op(KIND_CREATE_ROUTINE_V2, payload.readable()),
+                Some(WalOp::RestoreRoutine { .. })
             ));
-            let (decoded, dependencies) = decode_routine_payload(payload.readable()).unwrap();
+            let (decoded, dependencies) = decode_routine_payload(payload.readable(), true).unwrap();
             assert_eq!(decoded.argument_count, MAX_ROUTINE_ARGUMENTS);
             assert_eq!(decoded.result_column_count, MAX_ROUTINE_OUTPUT_COLUMNS);
             assert_eq!(decoded.config_count, MAX_ROUTINE_CONFIGS);
@@ -14274,8 +14561,52 @@ mod tests {
                 crate::storage::ROUTINE_CONFIG_VALUE_MAX
             );
             assert!(dependencies.materialize().is_ok());
-            assert!(decode_routine_payload(&payload.readable()[..payload.len() - 1]).is_none());
+            assert!(
+                decode_routine_payload(&payload.readable()[..payload.len() - 1], true).is_none()
+            );
         });
+    }
+
+    #[test]
+    fn wide_table_statistics_round_trip_high_column_ordinals() {
+        let mut statistics = TableStatistics::EMPTY;
+        statistics.valid = true;
+        statistics.rows = 7;
+        statistics.average_row_width = 12;
+        statistics.analyzed_generation = 9;
+        statistics.columns[1599] = ColumnStatistics {
+            valid: true,
+            null_fraction_ppm: 125_000,
+            distinct_values: 6,
+            distinct_fraction_ppm: 0,
+            average_width: 4,
+        };
+        let captured = WalTableStatistics::Captured(&statistics);
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "wide table statistics", 1024).unwrap();
+        assert!(captured.append(&mut payload));
+        assert_eq!(payload.readable()[0], TABLE_STATISTICS_V4);
+        let decoded = WalTableStatistics::Encoded(payload.readable())
+            .materialize()
+            .unwrap();
+        assert_eq!(decoded, statistics);
+
+        let mut legacy_budget = Budget::new(128);
+        let mut legacy = FixedBuf::new(&mut legacy_budget, "legacy table statistics", 128).unwrap();
+        assert!(legacy.append(&[TABLE_STATISTICS_V3]));
+        assert!(legacy.append(&7u64.to_le_bytes()));
+        assert!(legacy.append(&12u32.to_le_bytes()));
+        assert!(legacy.append(&9u64.to_le_bytes()));
+        assert!(legacy.append(&[1, 63]));
+        assert!(legacy.append(&125_000u32.to_le_bytes()));
+        assert!(legacy.append(&6u64.to_le_bytes()));
+        assert!(legacy.append(&0u32.to_le_bytes()));
+        assert!(legacy.append(&4u32.to_le_bytes()));
+        let legacy = WalTableStatistics::Encoded(legacy.readable())
+            .materialize()
+            .unwrap();
+        assert!(legacy.columns[63].valid);
+        assert_eq!(legacy.columns[63].distinct_values, 6);
     }
 
     #[test]

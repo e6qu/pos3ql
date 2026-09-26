@@ -114,6 +114,9 @@ fn vopr_config(seed: u64) -> Config {
     config.block_cache_bytes = 512 * 1024;
     config.disk_cache_bytes = 1 << 20;
     config.max_tables = 4;
+    // Each VOPR world owns exactly one session. Keep fixed per-connection
+    // metadata aligned with that modeled concurrency.
+    config.max_connections = 1;
     config.max_views = 4;
     config.max_materialized_views = 4;
     config.max_routines = 4;
@@ -162,7 +165,12 @@ impl World {
     }
 
     fn start_engine(&mut self) {
-        let mut budget = Budget::new(1 << 28);
+        let plan = self
+            .config
+            .memory_plan(0, Engine::extra_budget_bytes(&self.config));
+        // The VOPR uses its own 1 MiB capture buffer in place of the server's
+        // configured connection send buffer.
+        let mut budget = Budget::new(plan.total() + (1 << 20));
         let engine = Box::new(
             Engine::new(&self.config, &mut budget)
                 .unwrap_or_else(|e| panic!("seed {}: engine start failed: {e}", self.seed)),

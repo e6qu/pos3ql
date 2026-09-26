@@ -2,4 +2,4 @@
 # Query and recovery frames include the complete bounded result width. Keep
 # tests on the same fixed stack envelope as the server instead of inheriting a
 # platform-dependent worker default.
-RUST_MIN_STACK = { value = "67108864", force = true }
+RUST_MIN_STACK = { value = "134217728", force = true }

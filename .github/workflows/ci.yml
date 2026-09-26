@@ -80,13 +80,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --lib --bins -- -D warnings
 
-      - name: Test
-        run: >-
-          cargo test --locked -- --skip sim::storage::storage_vopr
-          --skip sql::tests::external_cold_order_and_distinct_runs_use_object_storage
-          --skip sql::tests::external_recursive_runs_use_object_storage
-          --skip sql::tests::external_lateral_runs_use_object_storage
-          --skip sql::tests::external_set_runs_use_object_storage
+      - name: Integration guards
+        run: cargo test --locked --test no_noops --test sqlstate_gate
 
       - name: S3 profile-v1 contract
         run: |
@@ -114,6 +109,33 @@ jobs:
           POS3QL_OBJECT_STORE_SECRET_KEY=pos3ql-contract-secret \
           POS3QL_OBJECT_STORE_TLS=off \
           cargo test --locked --test object_store_it -- --test-threads=1
+
+  library-tests:
+    name: library tests (${{ matrix.partition }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0-of-3, 1-of-3, 2-of-3]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-library-tests-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Rebuild checked-out crate
+        run: cargo clean -p pos3ql
+
+      - name: Test library shard
+        run: sh tools/test-lib-shard.sh '${{ matrix.partition }}'
 
   object-store-compatibility:
     name: object-store (${{ matrix.implementation }})

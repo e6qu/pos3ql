@@ -12,7 +12,13 @@ use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 
-pub(crate) const MAX_COLUMNS: usize = 64;
+/// PostgreSQL 18's transient tuple/target-list boundary
+/// (`MaxTupleAttributeNumber`). Stored relations and named composites use the
+/// narrower [`MAX_RELATION_COLUMNS`] boundary.
+pub(crate) const MAX_COLUMNS: usize = 1_664;
+/// PostgreSQL 18's stored-relation and named-composite attribute boundary
+/// (`MaxHeapAttributeNumber`).
+pub(crate) const MAX_RELATION_COLUMNS: usize = 1_600;
 
 pub(crate) fn encoded_len(values: &[Datum]) -> usize {
     let mut n = 2 + values.len().div_ceil(8);
@@ -23,7 +29,11 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Record(_) | Datum::Composite { .. } | Datum::PgDdlCommand => {
                 unreachable!("record cannot be a stored column value")
             }
-            Datum::CompositeText { text, .. } => 5 + text.len(),
+            Datum::CompositeText {
+                physical_fields,
+                text,
+                ..
+            } => physical_field_count_len(*physical_fields) + 4 + text.len(),
             Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
             Datum::Regtype { name, .. } => 8 + name.len(),
             Datum::RegObject { name, .. } => 12 + name.len(),
@@ -98,10 +108,10 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 text,
                 ..
             } => {
-                rest[0] = *physical_fields;
-                rest[1..5].copy_from_slice(&(text.len() as u32).to_le_bytes());
-                rest[5..5 + text.len()].copy_from_slice(text.as_bytes());
-                take = 5 + text.len();
+                let prefix = encode_physical_field_count(*physical_fields, rest);
+                rest[prefix..prefix + 4].copy_from_slice(&(text.len() as u32).to_le_bytes());
+                rest[prefix + 4..prefix + 4 + text.len()].copy_from_slice(text.as_bytes());
+                take = prefix + 4 + text.len();
             }
             Datum::Int2Vector(raw) | Datum::OidVector(raw) => {
                 rest[..4].copy_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -926,8 +936,10 @@ pub(crate) fn decode<'a>(
                 out[i] = Datum::Enum { slot, sort, label };
             }
             ColType::Composite(slot) => {
-                let physical_fields = *bytes.get(at).ok_or_else(corrupt)?;
-                at += 1;
+                let (physical_fields, consumed) =
+                    decode_physical_field_count(bytes.get(at..).ok_or_else(corrupt)?)
+                        .ok_or_else(corrupt)?;
+                at += consumed;
                 let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;
                 at += 4;
@@ -948,6 +960,30 @@ pub(crate) fn decode<'a>(
         }
     }
     Ok(())
+}
+
+const fn physical_field_count_len(fields: u16) -> usize {
+    if fields < u8::MAX as u16 { 1 } else { 3 }
+}
+
+fn encode_physical_field_count(fields: u16, output: &mut [u8]) -> usize {
+    if fields < u8::MAX as u16 {
+        output[0] = fields as u8;
+        1
+    } else {
+        output[0] = u8::MAX;
+        output[1..3].copy_from_slice(&fields.to_le_bytes());
+        3
+    }
+}
+
+fn decode_physical_field_count(input: &[u8]) -> Option<(u16, usize)> {
+    let first = *input.first()?;
+    if first != u8::MAX {
+        Some((u16::from(first), 1))
+    } else {
+        Some((u16::from_le_bytes(input.get(1..3)?.try_into().ok()?), 3))
+    }
 }
 
 #[cfg(test)]

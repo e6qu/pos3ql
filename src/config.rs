@@ -336,7 +336,7 @@ impl Config {
             password: String::new(),
             conn_recv_buffer_bytes: 64 * KIB,
             conn_send_buffer_bytes: 64 * KIB,
-            sql_arena_bytes: 4 * MIB,
+            sql_arena_bytes: 32 * MIB,
             work_arena_bytes: 64 * MIB,
             max_prepared: 64,
             prepared_bytes: 8 * KIB,

@@ -14,7 +14,7 @@ use crate::sql::exec::MAX_PROJ;
 
 use crate::sql::types::{ColDesc, ColType, Datum};
 use crate::sql_err;
-use crate::storage::{ColumnMeta, MAX_COLUMNS, RoutineDef, SqlName, Storage, TableDef};
+use crate::storage::{ColumnMeta, ColumnSet, MAX_COLUMNS, RoutineDef, SqlName, Storage, TableDef};
 use crate::util::StackStr;
 
 use super::setops::describe_set_body;
@@ -456,14 +456,14 @@ fn publication_output_relation_for(
     }
 }
 
-fn publication_int2vector<'a>(mask: u64, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn publication_int2vector<'a>(mask: ColumnSet, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let count = mask.count_ones() as usize;
     let raw = arena
         .alloc_slice_with(count * 2, |_| 0u8)
         .map_err(|_| arena_full())?;
     let mut output = 0usize;
     for column in 0..MAX_COLUMNS {
-        if mask & (1u64 << column) == 0 {
+        if !mask.contains(column) {
             continue;
         }
         let attribute_number = i16::try_from(column + 1).map_err(|_| {
@@ -584,23 +584,23 @@ fn publication_table_rows<'a>(
                 definition.schemas[..definition.schema_count].contains(&(slot as u8))
             });
         let implicit_mask = || {
-            table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(_, column)| {
-                    !column.default.is_generated()
-                        || definition.publish_generated_columns
-                            == crate::storage::PublishGeneratedColumns::Stored
-                })
-                .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
+            let mut mask = ColumnSet::EMPTY;
+            for (column, metadata) in table.columns().iter().enumerate() {
+                if !metadata.default.is_generated()
+                    || definition.publish_generated_columns
+                        == crate::storage::PublishGeneratedColumns::Stored
+                {
+                    mask.insert(column);
+                }
+            }
+            mask
         };
         let (column_mask, filter) = if definition.all_tables || schema {
             (implicit_mask(), None)
         } else if let Some(index) = explicit {
             let selected = definition.table_column_masks[index];
             (
-                if selected == 0 {
+                if selected.is_empty() {
                     implicit_mask()
                 } else {
                     selected
@@ -710,6 +710,16 @@ pub(super) struct ProjectSet<'a> {
     pub count: usize,
     pub values: &'a [ProjectSetValue<'a>],
     pub any: bool,
+}
+
+impl ProjectSet<'_> {
+    pub(super) const fn single() -> Self {
+        Self {
+            count: 1,
+            values: &[],
+            any: false,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1848,6 +1858,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                                         storage,
                                         txid,
                                     },
+                                    arena,
                                 )
                             {
                                 descriptors[slot].type_mod = handle;
@@ -1969,6 +1980,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                                     storage,
                                     txid,
                                 },
+                                arena,
                             )
                         {
                             descriptors[slot].type_mod = handle;
@@ -2434,6 +2446,13 @@ fn json_to_record_append_columns(
             "a column definition list is required for functions returning record"
         ));
     };
+    if definitions.len() > crate::storage::MAX_RELATION_COLUMNS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "column definition lists can have at most {} entries",
+            crate::storage::MAX_RELATION_COLUMNS
+        ));
+    }
     for (index, definition) in definitions.iter().enumerate() {
         if index == output.len() {
             return Err(sql_err!(

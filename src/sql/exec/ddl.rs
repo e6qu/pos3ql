@@ -9,8 +9,8 @@ use crate::sql::eval::{EvalHooks, NoColumns, SqlError, cast_to, eval_full, sqlst
 use crate::sql::types::ColType;
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnDefault, ColumnMeta, ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS,
-    OwnedDatum, SqlName, Storage, TableDef, UniqueKey,
+    CheckConstraint, ColumnDefault, ColumnMeta, ColumnSet, ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS,
+    MAX_RELATION_COLUMNS, OwnedDatum, SqlName, Storage, TableDef, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -23,11 +23,11 @@ pub(super) fn build_def(
     txid: u32,
     arena: &Arena,
 ) -> Result<TableDef, SqlError> {
-    if columns.len() > MAX_COLUMNS {
+    if columns.len() > MAX_RELATION_COLUMNS {
         return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            sqlstate::TOO_MANY_COLUMNS,
             "tables can have at most {} columns",
-            MAX_COLUMNS
+            MAX_RELATION_COLUMNS
         ));
     }
     let mut def = TableDef {
@@ -568,13 +568,20 @@ pub(super) fn resolve_cols(
 /// into `cols` (bit `i` = column `i`), so the caller can name the constraint
 /// the way PostgreSQL does — `<table>_<column>_check` when the predicate
 /// references exactly one column, `<table>_check` otherwise.
-pub(crate) fn check_referenced_columns(expression: &Expr, def: &TableDef) -> Result<u64, SqlError> {
-    let mut columns = 0;
+pub(crate) fn check_referenced_columns(
+    expression: &Expr,
+    def: &TableDef,
+) -> Result<ColumnSet, SqlError> {
+    let mut columns = ColumnSet::EMPTY;
     validate_check_refs(expression, def, &mut columns)?;
     Ok(columns)
 }
 
-fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Result<(), SqlError> {
+fn validate_check_refs(
+    expression: &Expr,
+    def: &TableDef,
+    cols: &mut ColumnSet,
+) -> Result<(), SqlError> {
     match expression {
         Expr::SchemaColumn { table, .. } => {
             return Err(sql_err!(
@@ -598,8 +605,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
                     name
                 ));
             };
-            // MAX_COLUMNS is 64, so a column index always fits the u64 mask.
-            *cols |= 1u64 << index;
+            cols.insert(index);
         }
         Expr::RoutineParam { .. } => {}
         Expr::RecursiveState { .. } => {}
@@ -992,12 +998,15 @@ pub(super) fn auto_key_name(
 /// predicate references exactly one column, `<table>_check` when it references
 /// zero or several — with the smallest numeric suffix (`_check1`, `_check2`, …)
 /// that avoids colliding with a constraint the table already carries.
-pub(super) fn auto_check_name(def: &TableDef, referenced_cols: u64) -> Result<SqlName, SqlError> {
+pub(super) fn auto_check_name(
+    def: &TableDef,
+    referenced_cols: ColumnSet,
+) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
     let mut base = crate::util::StackStr::<64>::new();
     let _ = write!(base, "{}", def.name.as_str());
     if referenced_cols.count_ones() == 1 {
-        let column = referenced_cols.trailing_zeros() as usize;
+        let column = referenced_cols.first().expect("one referenced column");
         let _ = write!(base, "_{}", def.columns()[column].name.as_str());
     }
     let _ = write!(base, "_check");

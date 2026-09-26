@@ -17,9 +17,9 @@ use crate::sql_err;
 use crate::stack_format;
 use crate::storage::rowenc;
 use crate::storage::{
-    CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS, MAX_ROUTINE_OUTPUT_COLUMNS,
-    PartitionBound as StoredPartitionBound, PartitionBoundValue, PartitionDef,
-    PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
+    CHECK_SQL_MAX, ColumnMeta, ColumnSet, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
+    MAX_ROUTINE_OUTPUT_COLUMNS, PartitionBound as StoredPartitionBound, PartitionBoundValue,
+    PartitionDef, PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
     RoutineArgumentDef, RoutineIdentity, RoutineParameterDef, RoutineParameterMode, RoutineSpec,
     RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
 };
@@ -118,7 +118,7 @@ pub const MAX_PROJ: usize = 1_664;
 
 /// Fixed stack reserved by every thread that may execute a query. Query
 /// scratch is statically bounded, including PostgreSQL's complete result width.
-pub const QUERY_STACK_BYTES: usize = 64 << 20;
+pub const QUERY_STACK_BYTES: usize = 128 << 20;
 
 /// Fixed resources needed when logical apply invokes the ordinary trigger
 /// executor. The worker owns all three at startup, so a remote row cannot
@@ -3386,11 +3386,11 @@ fn build_def_with_likes(
 
 /// Appends one column, rejecting a name already taken.
 fn push_column(def: &mut TableDef, n: &mut usize, column: ColumnMeta) -> Result<(), SqlError> {
-    if *n == MAX_COLUMNS {
+    if *n == crate::storage::MAX_RELATION_COLUMNS {
         return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            sqlstate::TOO_MANY_COLUMNS,
             "tables can have at most {} columns",
-            MAX_COLUMNS
+            crate::storage::MAX_RELATION_COLUMNS
         ));
     }
     if def.columns[..*n]
@@ -4757,10 +4757,10 @@ where
             new_values[target] = coerce(v, &def.columns()[target], storage, txn.txid, arena)?;
         }
     }
-    let mut updated_columns = 0u64;
+    let mut updated_columns = ColumnSet::EMPTY;
     for (name, _) in assigns {
         let column = def.column_index(name).expect("validated above");
-        updated_columns |= 1u64 << column;
+        updated_columns.insert(column);
     }
     let generated = parse_generated(def, arena)?;
     if !fire_partition_row_triggers(
@@ -12876,7 +12876,9 @@ fn remove_schema_from_publications(
                 name: name.as_str(),
                 all_tables: definition.all_tables,
                 tables: definition.tables,
-                table_column_masks: definition.table_column_masks,
+                table_column_masks: crate::wal::WalColumnSets::Captured(
+                    &definition.table_column_masks[..definition.table_count],
+                ),
                 table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: definition
                     .table_filters
@@ -13005,7 +13007,9 @@ pub fn create_publication(
                     owner,
                     all_tables,
                     tables: members,
-                    table_column_masks,
+                    table_column_masks: crate::wal::WalColumnSets::Captured(
+                        &table_column_masks[..table_count],
+                    ),
                     table_include_descendants,
                     table_filter_sql,
                     table_count,
@@ -14149,7 +14153,7 @@ pub fn alter_publication(
                     .copy_within(index + 1..definition.table_count, index);
                 definition.table_count -= 1;
                 definition.tables[definition.table_count] = u16::MAX;
-                definition.table_column_masks[definition.table_count] = 0;
+                definition.table_column_masks[definition.table_count] = ColumnSet::EMPTY;
                 definition.table_include_descendants[definition.table_count] = false;
                 definition_filter_sql[definition.table_count] = StackStr::new();
             }
@@ -14208,7 +14212,9 @@ pub fn alter_publication(
             name,
             all_tables: definition.all_tables,
             tables: definition.tables,
-            table_column_masks: definition.table_column_masks,
+            table_column_masks: crate::wal::WalColumnSets::Captured(
+                &definition.table_column_masks[..definition.table_count],
+            ),
             table_include_descendants: definition.table_include_descendants,
             table_filter_sql: definition_filter_sql,
             table_count: definition.table_count,
@@ -14237,7 +14243,7 @@ pub fn alter_publication(
 
 type PublicationMembers = (
     [u16; crate::storage::MAX_PUBLICATION_TABLES],
-    [u64; crate::storage::MAX_PUBLICATION_TABLES],
+    [ColumnSet; crate::storage::MAX_PUBLICATION_TABLES],
     [bool; crate::storage::MAX_PUBLICATION_TABLES],
     [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
         crate::storage::MAX_PUBLICATION_TABLES],
@@ -14245,10 +14251,10 @@ type PublicationMembers = (
 );
 
 fn validate_publication_target_mix(
-    column_masks: &[u64],
+    column_masks: &[ColumnSet],
     schema_count: usize,
 ) -> Result<(), SqlError> {
-    if schema_count != 0 && column_masks.iter().any(|mask| *mask != 0) {
+    if schema_count != 0 && column_masks.iter().any(|mask| !mask.is_empty()) {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "cannot specify a column list when publishing tables in a schema"
@@ -14262,7 +14268,7 @@ fn validate_partitioned_publication_features<const N: usize>(
     txid: u32,
     publication: &str,
     tables: &[u16],
-    column_masks: &[u64],
+    column_masks: &[ColumnSet],
     filters: &[StackStr<N>],
     publish_via_partition_root: bool,
 ) -> Result<(), SqlError> {
@@ -14281,7 +14287,7 @@ fn validate_partitioned_publication_features<const N: usize>(
                 definition.name.as_str()
             ));
         }
-        if *column_mask != 0 {
+        if !column_mask.is_empty() {
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "cannot use column list for relation \"{}.{}\" in publication \"{}\" when publish_via_partition_root is false",
@@ -14301,7 +14307,7 @@ fn publication_members(
     require_replica_identity: bool,
 ) -> Result<PublicationMembers, SqlError> {
     let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
-    let mut masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+    let mut masks = [ColumnSet::EMPTY; crate::storage::MAX_PUBLICATION_TABLES];
     let mut descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
     let mut filters = [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
     for (index, table) in tables.iter().enumerate() {
@@ -14330,7 +14336,7 @@ fn publication_members(
                 table.relation.name
             ));
         }
-        let mut mask = 0u64;
+        let mut mask = ColumnSet::EMPTY;
         for (column_index, column_name) in table.columns.iter().enumerate() {
             let Some(column) = definition.column_index(column_name) else {
                 return Err(sql_err!(
@@ -14340,15 +14346,14 @@ fn publication_members(
                     table.relation.name
                 ));
             };
-            let bit = 1u64 << column;
-            if mask & bit != 0 {
+            if mask.contains(column) {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_COLUMN,
                     "column \"{}\" is listed more than once",
                     column_name
                 ));
             }
-            mask |= bit;
+            mask.insert(column);
             debug_assert!(column_index < crate::storage::MAX_COLUMNS);
         }
         if require_replica_identity {
@@ -14374,7 +14379,7 @@ fn publication_members(
             }
             if require_replica_identity
                 && replica_identity_columns(storage, slot, txid)?
-                    .is_none_or(|identity| referenced & !identity != 0)
+                    .is_none_or(|identity| !referenced.difference(identity).is_empty())
             {
                 return Err(sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
@@ -14433,15 +14438,15 @@ fn validate_publication_replica_identity(
 fn validate_publication_column_mask(
     storage: &Storage,
     table_slot: usize,
-    mask: u64,
+    mask: ColumnSet,
     txid: u32,
 ) -> Result<(), SqlError> {
-    if mask == 0 {
+    if mask.is_empty() {
         return Ok(());
     }
     let identity = replica_identity_columns(storage, table_slot, txid)?;
     if let Some(identity) = identity
-        && mask & identity == identity
+        && identity.difference(mask).is_empty()
     {
         return Ok(());
     }
@@ -14455,25 +14460,20 @@ fn replica_identity_columns(
     storage: &Storage,
     table_slot: usize,
     txid: u32,
-) -> Result<Option<u64>, SqlError> {
+) -> Result<Option<ColumnSet>, SqlError> {
     let definition = storage.table_def(table_slot, txid);
-    let all_columns = if definition.n_columns == MAX_COLUMNS {
-        u64::MAX
-    } else {
-        (1u64 << definition.n_columns) - 1
-    };
+    let all_columns = ColumnSet::all(definition.n_columns);
     match definition.replica_identity {
         crate::storage::ReplicaIdentityMode::Nothing => Ok(None),
         crate::storage::ReplicaIdentityMode::Full => Ok(Some(all_columns)),
         crate::storage::ReplicaIdentityMode::Default => {
-            let identity = definition
-                .columns()
-                .iter()
-                .enumerate()
-                .fold(0u64, |mask, (index, column)| {
-                    mask | (u64::from(column.primary) << index)
-                });
-            Ok((identity != 0).then_some(identity))
+            let mut identity = ColumnSet::EMPTY;
+            for (index, column) in definition.columns().iter().enumerate() {
+                if column.primary {
+                    identity.insert(index);
+                }
+            }
+            Ok((!identity.is_empty()).then_some(identity))
         }
         crate::storage::ReplicaIdentityMode::Index => {
             let mut identity = None;
@@ -14486,9 +14486,10 @@ fn replica_identity_columns(
                 {
                     continue;
                 }
-                let columns = index.columns[..index.n_cols]
-                    .iter()
-                    .fold(0u64, |mask, column| mask | (1u64 << column));
+                let mut columns = ColumnSet::EMPTY;
+                for column in index.columns[..index.n_cols].iter().copied() {
+                    columns.insert(usize::from(column));
+                }
                 if identity.replace(columns).is_some() {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -15480,7 +15481,7 @@ impl<'a> PlpgsqlSetResult<'a> {
                         if count == 1 { "" } else { "s" }
                     ));
                 }
-                let mut cast = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+                let mut cast = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
                 for (index, column) in columns[..count].iter().enumerate() {
                     let projected = encode_projected_pub(&[values[index]], arena)?;
                     cast[index] = cast_to(decode_projected_pub(projected, 0), column.ctype, arena)?;
@@ -15523,10 +15524,10 @@ struct TriggerExecutionStatus<'a> {
     found: Option<bool>,
     row_count: i64,
     set_result: Option<*mut PlpgsqlSetResult<'a>>,
-    set_output_locals: [usize; MAX_ROUTINE_ARGUMENTS],
+    set_output_locals: [usize; MAX_ROUTINE_OUTPUT_COLUMNS],
     set_output_count: usize,
-    set_output_values: [Datum<'a>; MAX_ROUTINE_ARGUMENTS],
-    set_output_shadow_depth: [u8; MAX_ROUTINE_ARGUMENTS],
+    set_output_values: [Datum<'a>; MAX_ROUTINE_OUTPUT_COLUMNS],
+    set_output_shadow_depth: [u8; MAX_ROUTINE_OUTPUT_COLUMNS],
 }
 
 impl<'a> Default for TriggerExecutionStatus<'a> {
@@ -15535,10 +15536,10 @@ impl<'a> Default for TriggerExecutionStatus<'a> {
             found: Some(false),
             row_count: 0,
             set_result: None,
-            set_output_locals: [0; MAX_ROUTINE_ARGUMENTS],
+            set_output_locals: [0; MAX_ROUTINE_OUTPUT_COLUMNS],
             set_output_count: 0,
-            set_output_values: [Datum::Null; MAX_ROUTINE_ARGUMENTS],
-            set_output_shadow_depth: [0; MAX_ROUTINE_ARGUMENTS],
+            set_output_values: [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS],
+            set_output_shadow_depth: [0; MAX_ROUTINE_OUTPUT_COLUMNS],
         }
     }
 }
@@ -19084,7 +19085,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     let mut result = PlpgsqlSetResult::for_routine(routine);
     let mut status = TriggerExecutionStatus::default();
     status.collect_set_rows(&mut result);
-    let mut output_local_indices = [0usize; MAX_ROUTINE_ARGUMENTS];
+    let mut output_local_indices = [0usize; MAX_ROUTINE_OUTPUT_COLUMNS];
     for (index, output) in output_columns.iter().enumerate() {
         output_local_indices[index] = locals
             .iter()
@@ -22977,7 +22978,7 @@ fn execute_trigger_block<'a>(
                 Ok(None)
             }),
             TriggerStatement::ReturnNext(expression) => execute_trigger_statement(|| {
-                let mut values = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+                let mut values = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
                 let count = match expression {
                     Some(expression) => {
                         let transition = TriggerTransition {
@@ -23067,13 +23068,13 @@ fn execute_trigger_block<'a>(
                     Some(&scope),
                     Some(&sequence),
                     &mut |values| {
-                        if values.len() > MAX_ROUTINE_ARGUMENTS {
+                        if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                             return Err(sql_err!(
                                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                                 "RETURN QUERY produced too many columns"
                             ));
                         }
-                        let mut detached = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+                        let mut detached = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
                         for (index, value) in values.iter().copied().enumerate() {
                             detached[index] = detached_trigger_datum(value, context.arena)?;
                         }
@@ -23102,13 +23103,13 @@ fn execute_trigger_block<'a>(
                     context.txn.txid,
                 );
                 execute_plpgsql_dynamic_query(context, query, &scope, &sequence, &mut |values| {
-                    if values.len() > MAX_ROUTINE_ARGUMENTS {
+                    if values.len() > MAX_ROUTINE_OUTPUT_COLUMNS {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "RETURN QUERY EXECUTE produced too many columns"
                         ));
                     }
-                    let mut detached = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+                    let mut detached = [Datum::Null; MAX_ROUTINE_OUTPUT_COLUMNS];
                     for (index, value) in values.iter().copied().enumerate() {
                         detached[index] = detached_trigger_datum(value, context.arena)?;
                     }
@@ -25381,7 +25382,7 @@ fn fire_row_trigger_slot<'a>(
     definition: &TableDef,
     event: u8,
     before: bool,
-    updated_columns: u64,
+    updated_columns: ColumnSet,
     old: Option<&[Datum<'a>]>,
     new: Option<&mut [Datum<'a>]>,
 ) -> Result<Option<bool>, SqlError> {
@@ -25419,8 +25420,8 @@ fn fire_row_trigger_slot<'a>(
             }
         || !trigger.events.contains(event)
         || (event == 2
-            && trigger.update_columns != 0
-            && trigger.update_columns & updated_columns == 0)
+            && !trigger.update_columns.is_empty()
+            && !trigger.update_columns.intersects(updated_columns))
     {
         return Ok(None);
     }
@@ -25519,7 +25520,7 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
     definition: &TableDef,
     event: u8,
     before: bool,
-    updated_columns: u64,
+    updated_columns: ColumnSet,
     old: Option<&[Datum<'a>]>,
     mut new: Option<&mut [Datum<'a>]>,
 ) -> Result<bool, SqlError> {
@@ -25823,7 +25824,7 @@ fn fire_partition_row_triggers<'a>(
     event: u8,
     before: bool,
     root_already_fired: bool,
-    updated_columns: u64,
+    updated_columns: ColumnSet,
     old: Option<&[Datum<'a>]>,
     mut new: Option<&mut [Datum<'a>]>,
 ) -> Result<bool, SqlError> {
@@ -26002,6 +26003,7 @@ fn transition_relation<'a>(
             column_names: names,
             column_types: types,
             column_collations: collations,
+            definition: None,
             source: crate::sql::ast::MaterializedCteSource::Inline(rows),
         })
         .map(|relation| &*relation)
@@ -26056,7 +26058,7 @@ fn fire_statement_triggers_with_rows<'a>(
     definition: &TableDef,
     event: u8,
     before: bool,
-    updated_columns: u64,
+    updated_columns: ColumnSet,
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let mut last_name: Option<SqlName> = None;
@@ -26089,8 +26091,8 @@ fn fire_statement_triggers_with_rows<'a>(
                 }
             || !trigger.events.contains(event)
             || (event == 2
-                && trigger.update_columns != 0
-                && trigger.update_columns & updated_columns == 0)
+                && !trigger.update_columns.is_empty()
+                && !trigger.update_columns.intersects(updated_columns))
         {
             continue;
         }
@@ -26183,7 +26185,7 @@ fn fire_after_triggers_with_rows<'a>(
     target: crate::storage::TriggerTarget,
     definition: &TableDef,
     event: u8,
-    updated_columns: u64,
+    updated_columns: ColumnSet,
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let trigger_depth = context.txn.trigger_depth();
@@ -26222,7 +26224,7 @@ fn fire_statement_triggers<'a>(
     definition: &TableDef,
     event: u8,
     before: bool,
-    updated_columns: u64,
+    updated_columns: ColumnSet,
 ) -> Result<(), SqlError> {
     fire_statement_triggers_with_rows(
         context,
@@ -26648,7 +26650,7 @@ pub fn create_trigger(
         .expect("parser constructs a non-empty known trigger event list");
     let timing = trigger.timing;
     let level = trigger.level;
-    let mut update_columns = 0u64;
+    let mut update_columns = ColumnSet::EMPTY;
     for name in trigger.update_columns {
         let Some(column) = target_definition.column_index(name) else {
             return sql_fail(sql_err!(
@@ -26658,7 +26660,7 @@ pub fn create_trigger(
                 trigger.table.name
             ));
         };
-        update_columns |= 1u64 << column;
+        update_columns.insert(column);
     }
     let when = match trigger.when {
         Some(source) => {
@@ -30163,7 +30165,7 @@ pub fn drop_collation(
                 lsn,
                 &WalOp::CreateComposite {
                     slot: composite_slot as u16,
-                    definition: composite,
+                    definition: &composite,
                 },
             ) {
                 storage.rollback_composite_alter(composite_slot, prior);
@@ -35384,7 +35386,7 @@ pub fn create_view(
                     &WalOp::CreateView {
                         schema: schema.as_str(),
                         name: name.name,
-                        columns,
+                        columns: crate::wal::WalViewColumns::Captured(&columns),
                         sql,
                         path: raw_path,
                         security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
@@ -35736,7 +35738,7 @@ pub fn alter_view(
                     &WalOp::SetViewColumns {
                         schema: schema.as_str(),
                         name: view_name.as_str(),
-                        columns,
+                        columns: crate::wal::WalViewColumns::Captured(&columns),
                     },
                 )
             };
@@ -35787,7 +35789,7 @@ pub fn alter_view(
                     &WalOp::SetViewColumns {
                         schema: schema.as_str(),
                         name: view_name.as_str(),
-                        columns,
+                        columns: crate::wal::WalViewColumns::Captured(&columns),
                     },
                 )
             };
@@ -35842,7 +35844,7 @@ pub fn alter_view(
                     &WalOp::SetViewColumns {
                         schema: schema.as_str(),
                         name: view_name.as_str(),
-                        columns,
+                        columns: crate::wal::WalViewColumns::Captured(&columns),
                     },
                 )
             };
@@ -36006,7 +36008,7 @@ fn rewrite_view_column_dependents(
                 .any(|dependency| {
                     dependency.class == crate::storage::DependencyClass::View
                         && usize::from(dependency.slot) == source_view
-                        && dependency.referenced_columns & (1u64 << source_column) != 0
+                        && dependency.referenced_columns.contains(source_column)
                 });
         if !references_column {
             continue;
@@ -36068,7 +36070,7 @@ fn rewrite_view_column_dependents(
                 &WalOp::CreateView {
                     schema: view.schema.as_str(),
                     name: view.name.as_str(),
-                    columns: dependent_columns,
+                    columns: crate::wal::WalViewColumns::Captured(&dependent_columns),
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),
                     security_invoker: matches!(
@@ -41300,8 +41302,8 @@ fn build_composite_spec(
 ) -> Result<crate::storage::CompositeSpec, SqlError> {
     if fields.len() > crate::storage::MAX_COMPOSITE_FIELDS {
         return Err(sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "a composite type may have at most {} fields",
+            sqlstate::TOO_MANY_COLUMNS,
+            "tables can have at most {} columns",
             crate::storage::MAX_COMPOSITE_FIELDS
         ));
     }
@@ -41456,7 +41458,7 @@ pub fn create_composite(
         lsn,
         &WalOp::CreateComposite {
             slot: slot as u16,
-            definition: storage.composite_for(slot, txn.txid),
+            definition: &storage.composite_for(slot, txn.txid),
         },
     ) {
         storage.rollback_composite_create(slot);
@@ -42225,7 +42227,7 @@ fn cascade_drop_composite_fields(
         lsn,
         &WalOp::CreateComposite {
             slot: composite_slot as u16,
-            definition: altered,
+            definition: &altered,
         },
     ) {
         storage.rollback_composite_alter(composite_slot, prior);
@@ -42590,7 +42592,7 @@ fn dependency_references_table_column(
 ) -> bool {
     dependency.class == crate::storage::DependencyClass::Table
         && usize::from(dependency.slot) == table
-        && dependency.referenced_columns & (1u64 << column) != 0
+        && dependency.referenced_columns.contains(column)
 }
 
 fn policy_depends_on_selected_stored_query(
@@ -42835,12 +42837,11 @@ fn apply_column_drop_dependencies(
             let mut expression = false;
             for source in index.expressions[..index.n_cols].iter().flatten() {
                 let parsed = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-                expression |=
-                    check_referenced_columns(parsed, &table_definition)? & (1u64 << column) != 0;
+                expression |= check_referenced_columns(parsed, &table_definition)?.contains(column);
             }
             let predicate = if let Some(source) = index.predicate {
                 let parsed = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-                check_referenced_columns(parsed, &table_definition)? & (1u64 << column) != 0
+                check_referenced_columns(parsed, &table_definition)?.contains(column)
             } else {
                 false
             };
@@ -42865,8 +42866,7 @@ fn apply_column_drop_dependencies(
                     crate::storage::ExtendedStatisticsKey::Expression(source) => {
                         let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
                         depends |= check_referenced_columns(expression, &table_definition)?
-                            & (1u64 << column)
-                            != 0;
+                            .contains(column);
                     }
                 }
             }
@@ -42994,9 +42994,9 @@ fn stage_publication_column_drop_dependencies(
             false
         } else {
             let expression = crate::sql::parser::parse_expr(filter, arena)?;
-            check_referenced_columns(expression, &table_definition)? & (1u64 << column) != 0
+            check_referenced_columns(expression, &table_definition)?.contains(column)
         };
-        let projection_depends = definition.table_column_masks[member] & (1u64 << column) != 0;
+        let projection_depends = definition.table_column_masks[member].contains(column);
         if !filter_depends && !projection_depends {
             continue;
         }
@@ -43024,7 +43024,7 @@ fn stage_publication_column_drop_dependencies(
         filters.copy_within(member + 1..definition.table_count, member);
         definition.table_count -= 1;
         definition.tables[definition.table_count] = u16::MAX;
-        definition.table_column_masks[definition.table_count] = 0;
+        definition.table_column_masks[definition.table_count] = ColumnSet::EMPTY;
         definition.table_include_descendants[definition.table_count] = false;
         filters[definition.table_count] = StackStr::new();
         definition.table_filters =
@@ -43039,7 +43039,9 @@ fn stage_publication_column_drop_dependencies(
                 name: name.as_str(),
                 all_tables: definition.all_tables,
                 tables: definition.tables,
-                table_column_masks: definition.table_column_masks,
+                table_column_masks: crate::wal::WalColumnSets::Captured(
+                    &definition.table_column_masks[..definition.table_count],
+                ),
                 table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: filters,
                 table_count: definition.table_count,
@@ -44533,7 +44535,7 @@ fn alter_composite_type(
         lsn,
         &WalOp::CreateComposite {
             slot: slot as u16,
-            definition: altered,
+            definition: &altered,
         },
     ) {
         storage.rollback_composite_alter(slot, prior);
@@ -44799,13 +44801,13 @@ fn remap_publication_column_projections(
         let mut changed = false;
         for member in 0..definition.table_count {
             if usize::from(definition.tables[member]) != table
-                || definition.table_column_masks[member] == 0
+                || definition.table_column_masks[member].is_empty()
             {
                 continue;
             }
-            let mut remapped = 0u64;
+            let mut remapped = ColumnSet::EMPTY;
             for (old, mapped) in column_mapping.iter().copied().enumerate() {
-                if definition.table_column_masks[member] & (1u64 << old) == 0 {
+                if !definition.table_column_masks[member].contains(old) {
                     continue;
                 }
                 let Some(new) = (mapped != u16::MAX).then_some(usize::from(mapped)) else {
@@ -44814,7 +44816,7 @@ fn remap_publication_column_projections(
                         "publication projection retained a dropped column"
                     ));
                 };
-                remapped |= 1u64 << new;
+                remapped.insert(new);
             }
             changed |= remapped != definition.table_column_masks[member];
             definition.table_column_masks[member] = remapped;
@@ -44836,7 +44838,9 @@ fn remap_publication_column_projections(
                 name: name.as_str(),
                 all_tables: definition.all_tables,
                 tables: definition.tables,
-                table_column_masks: definition.table_column_masks,
+                table_column_masks: crate::wal::WalColumnSets::Captured(
+                    &definition.table_column_masks[..definition.table_count],
+                ),
                 table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: filters,
                 table_count: definition.table_count,
@@ -44926,7 +44930,9 @@ fn rewrite_table_publication_column_references(
                 name: name.as_str(),
                 all_tables: definition.all_tables,
                 tables: definition.tables,
-                table_column_masks: definition.table_column_masks,
+                table_column_masks: crate::wal::WalColumnSets::Captured(
+                    &definition.table_column_masks[..definition.table_count],
+                ),
                 table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: filters,
                 table_count: definition.table_count,
@@ -45379,7 +45385,7 @@ fn rewrite_composite_dependent_views(
                 &WalOp::CreateView {
                     schema: view.schema.as_str(),
                     name: view.name.as_str(),
-                    columns: view.columns,
+                    columns: crate::wal::WalViewColumns::Captured(&view.columns),
                     sql: rewritten.as_str(),
                     path: creation_path.as_str(),
                     security_invoker: matches!(
@@ -50982,7 +50988,7 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
 
 /// The resolved, owned form of a COPY's format options — owned because a COPY
 /// FROM STDIN's [`CopySetup`] outlives the statement arena. The `force_*` fields
-/// are bitmasks over table column indices.
+/// are fixed sets over table column indices.
 #[derive(Clone, Copy)]
 pub struct CopyFmt {
     pub csv: bool,
@@ -50994,9 +51000,9 @@ pub struct CopyFmt {
     pub null: StackStr<64>,
     pub default: Option<StackStr<64>>,
     pub force_quote_all: bool,
-    pub force_quote: u64,
-    pub force_not_null: u64,
-    pub force_null: u64,
+    pub force_quote: ColumnSet,
+    pub force_not_null: ColumnSet,
+    pub force_null: ColumnSet,
 }
 
 impl CopyFmt {
@@ -51025,9 +51031,8 @@ impl CopyFmt {
                 "COPY DEFAULT string is too long"
             ));
         }
-        // Resolve a FORCE column list into a bitmask over table columns.
-        let mask = |names: &[&str]| -> Result<u64, SqlError> {
-            let mut bits = 0u64;
+        let mask = |names: &[&str]| -> Result<ColumnSet, SqlError> {
+            let mut columns = ColumnSet::EMPTY;
             for name in names {
                 let Some(index) = def.column_index(name) else {
                     return Err(sql_err!(
@@ -51037,9 +51042,9 @@ impl CopyFmt {
                         table_name
                     ));
                 };
-                bits |= 1u64 << index;
+                columns.insert(index);
             }
-            Ok(bits)
+            Ok(columns)
         };
         let delimiter = options.delimiter_byte();
         let quote = options.quote_byte();
@@ -51065,8 +51070,8 @@ impl CopyFmt {
         })
     }
 
-    fn forced(mask: u64, column: usize) -> bool {
-        column < 64 && mask & (1u64 << column) != 0
+    fn forced(columns: ColumnSet, column: usize) -> bool {
+        columns.contains(column)
     }
 }
 
@@ -51104,9 +51109,10 @@ pub fn copy_begin(
         }
         statement.columns.len()
     };
-    let target_columns = targets[..n_targets]
-        .iter()
-        .fold(0u64, |mask, column| mask | (1u64 << column));
+    let mut target_columns = ColumnSet::EMPTY;
+    for &column in &targets[..n_targets] {
+        target_columns.insert(column);
+    }
     require_table_column_privilege(
         storage,
         table_index,
@@ -51258,9 +51264,9 @@ pub(crate) fn subscription_copy_setup(
             null: StackStr::from_str("\\N"),
             default: None,
             force_quote_all: false,
-            force_quote: 0,
-            force_not_null: 0,
-            force_null: 0,
+            force_quote: ColumnSet::EMPTY,
+            force_not_null: ColumnSet::EMPTY,
+            force_null: ColumnSet::EMPTY,
         },
         on_error: crate::sql::ast::CopyErrorAction::Stop,
         reject_limit: None,
@@ -51310,7 +51316,7 @@ pub fn copy_statement_begin(
         &definition,
         TriggerEvents::INSERT,
         true,
-        0,
+        ColumnSet::EMPTY,
     )
 }
 
@@ -51383,7 +51389,7 @@ pub fn copy_statement_end(
         setup.table_index.into(),
         &definition,
         TriggerEvents::INSERT,
-        0,
+        ColumnSet::EMPTY,
         transition_capture.as_ref().map(TransitionCapture::rows),
     )
 }
@@ -51731,7 +51737,7 @@ fn finish_copy_row<'a>(
         TriggerEvents::INSERT,
         true,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut values[..definition.n_columns]),
     )? {
@@ -51829,7 +51835,7 @@ fn finish_copy_row<'a>(
         TriggerEvents::INSERT,
         false,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut values[..definition.n_columns]),
     )?;
@@ -51902,7 +51908,7 @@ pub fn apply_replication_insert(
         TriggerEvents::INSERT,
         true,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut values[..definition.n_columns]),
     )? {
@@ -51953,7 +51959,7 @@ pub fn apply_replication_insert(
         TriggerEvents::INSERT,
         false,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut values[..definition.n_columns]),
     )?;
@@ -52000,7 +52006,7 @@ fn decode_replication_tuple_for_columns<'a>(
     }
     let definition = storage.table_def(table_slot, txn.txid);
     let mut values = [Datum::Null; MAX_COLUMNS];
-    for (remote, field) in tuple.columns().iter().enumerate() {
+    for (remote, field) in tuple.columns().enumerate() {
         let local = remote_to_local[remote];
         let column = &definition.columns()[local];
         values[local] = match field {
@@ -52052,7 +52058,7 @@ fn decode_replication_old_tuple<'a>(
         ));
     }
     let identity_columns = binding.identity_local_columns(old.identity);
-    for (remote, field) in old.tuple.columns().iter().enumerate() {
+    for (remote, field) in old.tuple.columns().enumerate() {
         let local = binding.remote_to_local()[remote];
         if identity_columns.contains(&local) && matches!(field, TupleColumn::UnchangedToast) {
             return Err(sql_err!(
@@ -52254,7 +52260,7 @@ pub fn apply_replication_delete(
         TriggerEvents::DELETE,
         true,
         false,
-        0,
+        ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         None,
     )? {
@@ -52296,7 +52302,7 @@ pub fn apply_replication_delete(
         TriggerEvents::DELETE,
         false,
         false,
-        0,
+        ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         None,
     )?;
@@ -52320,7 +52326,7 @@ pub(crate) fn apply_replication_update(
         UpdateIdentity::Old(old) => locate_replication_row(storage, txn, binding, old, arena)?,
         UpdateIdentity::NewTupleKey => {
             let expected = decode_replication_tuple(storage, txn, binding, new, arena, true)?;
-            for (remote, field) in new.columns().iter().enumerate() {
+            for (remote, field) in new.columns().enumerate() {
                 let local = binding.remote_to_local()[remote];
                 if binding.key_local_columns().contains(&local)
                     && matches!(field, TupleColumn::UnchangedToast)
@@ -52395,7 +52401,7 @@ pub(crate) fn apply_replication_update(
             new_values[column] = *value;
         }
     }
-    for (remote, field) in new.columns().iter().enumerate() {
+    for (remote, field) in new.columns().enumerate() {
         if matches!(field, TupleColumn::UnchangedToast) {
             let local = binding.remote_to_local()[remote];
             new_values[local] = old_values[local];
@@ -52423,7 +52429,7 @@ pub(crate) fn apply_replication_update(
         TriggerEvents::UPDATE,
         true,
         false,
-        0,
+        ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         Some(&mut new_values[..definition.n_columns]),
     )? {
@@ -52509,7 +52515,7 @@ pub(crate) fn apply_replication_update(
         TriggerEvents::UPDATE,
         false,
         false,
-        0,
+        ColumnSet::EMPTY,
         Some(&old_values[..definition.n_columns]),
         Some(&mut new_values[..definition.n_columns]),
     )?;
@@ -53362,7 +53368,7 @@ fn decode_binary_array<'a>(
                         slot: composite_slot,
                         physical_fields: storage
                             .composite_for(composite_slot as usize, txid)
-                            .n_fields as u8,
+                            .n_fields as u16,
                         text: composite_storage_text(value, composite_slot, storage, txid, arena)?,
                     },
                     value => value,
@@ -53380,7 +53386,7 @@ fn decode_binary_array<'a>(
                 };
                 Datum::CompositeText {
                     slot,
-                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u8,
+                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
                     text: arena.alloc_str_display(value).map_err(|_| {
                         sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -53882,8 +53888,8 @@ fn copy_fmt_for_columns(
             "COPY NULL string is too long"
         ));
     }
-    let mask = |cols: &[&str]| -> Result<u64, SqlError> {
-        let mut bits = 0u64;
+    let mask = |cols: &[&str]| -> Result<ColumnSet, SqlError> {
+        let mut columns = ColumnSet::EMPTY;
         for name in cols {
             let Some(index) = names.iter().position(|n| n.eq_ignore_ascii_case(name)) else {
                 return Err(sql_err!(
@@ -53892,9 +53898,9 @@ fn copy_fmt_for_columns(
                     name
                 ));
             };
-            bits |= 1u64 << index;
+            columns.insert(index);
         }
-        Ok(bits)
+        Ok(columns)
     };
     let delimiter = options.delimiter_byte();
     let quote = options.quote_byte();
@@ -53915,8 +53921,8 @@ fn copy_fmt_for_columns(
         default: None,
         force_quote_all: options.force_quote_all,
         force_quote: mask(options.force_quote)?,
-        force_not_null: 0,
-        force_null: 0,
+        force_not_null: ColumnSet::EMPTY,
+        force_null: ColumnSet::EMPTY,
     })
 }
 
@@ -54715,6 +54721,9 @@ fn merge_source_demand(
             let Some(column) = source.column_index(name) else {
                 return false;
             };
+            if column >= u64::BITS as usize {
+                return false;
+            }
             *columns |= 1u64 << column;
             true
         }
@@ -54780,11 +54789,11 @@ fn merge_source_columns(
     }
     for item in statement.returning.items {
         match item {
-            SelectItem::Wildcard => columns |= all_columns_mask(source),
+            SelectItem::Wildcard => return None,
             SelectItem::TableWildcard(qualifier)
                 if qualifier.eq_ignore_ascii_case(source_alias) =>
             {
-                columns |= all_columns_mask(source);
+                return None;
             }
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression)
                 if !merge_source_demand(expression, source_alias, source, &mut columns) =>
@@ -55043,26 +55052,25 @@ pub fn merge<'a>(
     let def = *storage.table_def(table_index, txn.txid);
     let foreign_target = def.kind == crate::storage::TableKind::Foreign;
     let target_alias = statement.target_alias.or(Some(statement.target.name));
-    let mut update_columns = 0u64;
-    let mut insert_columns = 0u64;
+    let mut update_columns = ColumnSet::EMPTY;
+    let mut insert_columns = ColumnSet::EMPTY;
     for when in statement.whens {
         match when.action() {
             MergeAction::Update(assignments) => {
-                let mut assigned = 0u64;
+                let mut assigned = ColumnSet::EMPTY;
                 for (name, _) in assignments {
                     let Some(column) = def.column_index(name) else {
                         return sql_fail(undefined_column(name));
                     };
-                    let bit = 1u64 << column;
-                    if assigned & bit != 0 {
+                    if assigned.contains(column) {
                         return sql_fail(sql_err!(
                             sqlstate::SYNTAX_ERROR,
                             "multiple assignments to same column \"{}\"",
                             name
                         ));
                     }
-                    assigned |= bit;
-                    update_columns |= bit;
+                    assigned.insert(column);
+                    update_columns.insert(column);
                 }
             }
             MergeAction::Insert {
@@ -55073,28 +55081,27 @@ pub fn merge<'a>(
                 if columns.is_empty() {
                     insert_columns |= all_columns_mask(&def);
                 } else {
-                    let mut assigned = 0u64;
+                    let mut assigned = ColumnSet::EMPTY;
                     for name in columns {
                         let Some(column) = def.column_index(name) else {
                             return sql_fail(undefined_column(name));
                         };
-                        let bit = 1u64 << column;
-                        if assigned & bit != 0 {
+                        if assigned.contains(column) {
                             return sql_fail(sql_err!(
                                 sqlstate::SYNTAX_ERROR,
                                 "column \"{}\" specified more than once",
                                 name
                             ));
                         }
-                        assigned |= bit;
-                        insert_columns |= bit;
+                        assigned.insert(column);
+                        insert_columns.insert(column);
                     }
                 }
             }
             _ => {}
         }
     }
-    let reads_target = match (|| -> Result<u64, SqlError> {
+    let reads_target = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = expression_dml_target_columns(
             statement.on,
             &def,
@@ -55187,7 +55194,7 @@ pub fn merge<'a>(
     {
         return sql_fail(error);
     }
-    if reads_target != 0
+    if !reads_target.is_empty()
         && let Err(error) = require_table_column_privilege(
             storage,
             table_index,
@@ -55206,7 +55213,7 @@ pub fn merge<'a>(
     ) {
         return sql_fail(error);
     }
-    let reads_target = reads_target != 0;
+    let reads_target = !reads_target.is_empty();
     let current_role = match storage.current_role_slot(txn.txid) {
         Some(role) => role,
         None => {
@@ -55296,14 +55303,14 @@ pub fn merge<'a>(
     } else {
         None
     };
-    let mut merge_update_columns = 0u64;
+    let mut merge_update_columns = ColumnSet::EMPTY;
     for when in statement.whens {
         if let MergeAction::Update(assignments) = when.action() {
             for (name, _) in assignments {
                 let Some(column) = def.column_index(name) else {
                     return sql_fail(undefined_column(name));
                 };
-                merge_update_columns |= 1u64 << column;
+                merge_update_columns.insert(column);
             }
         }
     }
@@ -55341,7 +55348,7 @@ pub fn merge<'a>(
                 if event == TriggerEvents::UPDATE {
                     merge_update_columns
                 } else {
-                    0
+                    ColumnSet::EMPTY
                 },
             )
         {
@@ -55403,7 +55410,12 @@ pub fn merge<'a>(
         Some(columns) => {
             let mut items = [SelectItem::Wildcard; MAX_COLUMNS];
             let mut count = 0usize;
-            for (index, column) in source_all_def.columns().iter().enumerate() {
+            for (index, column) in source_all_def
+                .columns()
+                .iter()
+                .take(u64::BITS as usize)
+                .enumerate()
+            {
                 if columns & (1u64 << index) == 0 {
                     continue;
                 }
@@ -55950,7 +55962,7 @@ pub fn merge<'a>(
                             TriggerEvents::DELETE,
                             true,
                             false,
-                            0,
+                            ColumnSet::EMPTY,
                             Some(target_vals[j]),
                             None,
                         ) {
@@ -56018,7 +56030,7 @@ pub fn merge<'a>(
                             TriggerEvents::DELETE,
                             false,
                             false,
-                            0,
+                            ColumnSet::EMPTY,
                             Some(deleted_values),
                             None,
                         ) {
@@ -56061,14 +56073,14 @@ pub fn merge<'a>(
                         }
                         let mut new_values = [Datum::Null; MAX_COLUMNS];
                         new_values[..def.n_columns].copy_from_slice(target_vals[j]);
-                        let mut action_update_columns = 0u64;
+                        let mut action_update_columns = ColumnSet::EMPTY;
                         let mut action_targets = [0usize; MAX_COLUMNS];
                         for (assignment, (name, expression)) in assignments.iter().enumerate() {
                             let Some(ci) = def.column_index(name) else {
                                 return sql_fail(undefined_column(name));
                             };
                             action_targets[assignment] = ci;
-                            action_update_columns |= 1u64 << ci;
+                            action_update_columns.insert(ci);
                             if def.columns()[ci].default.is_generated()
                                 && !matches!(expression, Expr::DefaultMarker)
                             {
@@ -56576,7 +56588,7 @@ pub fn merge<'a>(
                 if event == TriggerEvents::UPDATE {
                     merge_update_columns
                 } else {
-                    0
+                    ColumnSet::EMPTY
                 },
                 match event {
                     TriggerEvents::INSERT => {
@@ -56741,7 +56753,7 @@ fn merge_insert<'a>(
         TriggerEvents::INSERT,
         true,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut row_arr[..def.n_columns]),
     )? {
@@ -56827,7 +56839,7 @@ fn merge_insert<'a>(
         TriggerEvents::INSERT,
         false,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut row_arr[..def.n_columns]),
     )?;
@@ -56891,7 +56903,7 @@ where
         TriggerEvents::INSERT,
         true,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut values[..definition.n_columns]),
     ) {
@@ -57050,7 +57062,7 @@ where
         TriggerEvents::INSERT,
         false,
         false,
-        0,
+        ColumnSet::EMPTY,
         None,
         Some(&mut values[..definition.n_columns]),
     ) {
@@ -57162,15 +57174,15 @@ pub(crate) fn fire_view_statement_triggers(
 ) -> Result<(), SqlError> {
     let definition = view_trigger_definition(storage, view_slot, txn.txid, arena)?;
     let (event, updated_columns) = match statement {
-        Stmt::Insert(_) => (TriggerEvents::INSERT, 0),
-        Stmt::Delete(_) => (TriggerEvents::DELETE, 0),
+        Stmt::Insert(_) => (TriggerEvents::INSERT, ColumnSet::EMPTY),
+        Stmt::Delete(_) => (TriggerEvents::DELETE, ColumnSet::EMPTY),
         Stmt::Update(update) => {
-            let mut columns = 0u64;
+            let mut columns = ColumnSet::EMPTY;
             for (name, _) in update.assignments {
                 let column = definition
                     .column_index(name)
                     .ok_or_else(|| undefined_column(name))?;
-                columns |= 1u64 << column;
+                columns.insert(column);
             }
             (TriggerEvents::UPDATE, columns)
         }
@@ -57829,7 +57841,7 @@ fn fire_view_row_trigger<'a>(
         definition,
         event,
         true,
-        0,
+        ColumnSet::EMPTY,
         old,
         new,
     )
@@ -57959,7 +57971,10 @@ where
     };
     let insert_columns = targets[..n_targets]
         .iter()
-        .fold(0u64, |mask, column| mask | (1u64 << column));
+        .fold(ColumnSet::EMPTY, |mut mask, column| {
+            mask.insert(*column);
+            mask
+        });
     if let Err(error) = require_table_column_privilege_as(
         storage,
         table_index,
@@ -57987,7 +58002,7 @@ where
     };
     let conflict_update_columns = match statement.on_conflict.and_then(|conflict| conflict.update) {
         Some(assignments) => {
-            let mut columns = 0u64;
+            let mut columns = ColumnSet::EMPTY;
             for (name, _) in assignments {
                 let Some(column) = def.column_index(name) else {
                     return sql_fail(sql_err!(
@@ -57997,7 +58012,7 @@ where
                         def.name.as_str()
                     ));
                 };
-                columns |= 1u64 << column;
+                columns.insert(column);
             }
             Some(columns)
         }
@@ -58015,7 +58030,7 @@ where
     {
         return sql_fail(error);
     }
-    let conflict_read_columns = match (|| -> Result<u64, SqlError> {
+    let conflict_read_columns = match (|| -> Result<ColumnSet, SqlError> {
         let mut columns = returning_dml_target_columns(
             statement.returning,
             &def,
@@ -58053,7 +58068,7 @@ where
         Ok(columns) => columns,
         Err(error) => return sql_fail(error),
     };
-    if conflict_read_columns != 0
+    if !conflict_read_columns.is_empty()
         && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
@@ -58147,7 +58162,7 @@ where
         &def,
         1,
         true,
-        0,
+        ColumnSet::EMPTY,
     ) {
         return sql_fail(error);
     }
@@ -58453,7 +58468,7 @@ where
             table_index.into(),
             &def,
             1,
-            0,
+            ColumnSet::EMPTY,
             transition_capture.as_ref().map(TransitionCapture::rows),
         ) {
             return sql_fail(error);
@@ -58688,7 +58703,7 @@ where
         table_index.into(),
         &def,
         1,
-        0,
+        ColumnSet::EMPTY,
         transition_capture.as_ref().map(TransitionCapture::rows),
     ) {
         return sql_fail(error);
@@ -59041,12 +59056,8 @@ fn emit_merge_returning<'a>(
     }
 }
 
-fn all_columns_mask(definition: &TableDef) -> u64 {
-    if definition.n_columns == u64::BITS as usize {
-        u64::MAX
-    } else {
-        (1u64 << definition.n_columns) - 1
-    }
+fn all_columns_mask(definition: &TableDef) -> ColumnSet {
+    ColumnSet::all(definition.n_columns)
 }
 
 fn expression_dml_target_columns(
@@ -59056,7 +59067,7 @@ fn expression_dml_target_columns(
     storage: &Storage,
     txid: u32,
     arena: &Arena,
-) -> Result<u64, SqlError> {
+) -> Result<ColumnSet, SqlError> {
     expression_dml_target_columns_with_output_aliases(
         expression,
         definition,
@@ -59076,14 +59087,14 @@ fn expression_dml_target_columns_with_output_aliases(
     txid: u32,
     arena: &Arena,
     output_aliases: &[&str],
-) -> Result<u64, SqlError> {
+) -> Result<ColumnSet, SqlError> {
     let target_name = alias.unwrap_or(definition.name.as_str());
     fn directly_read_columns(
         expression: &Expr,
         definition: &TableDef,
         target_name: &str,
         output_aliases: &[&str],
-    ) -> Result<u64, SqlError> {
+    ) -> Result<ColumnSet, SqlError> {
         let columns = match expression {
             Expr::Column { qualifier, name }
             | Expr::RoutineParam {
@@ -59094,7 +59105,7 @@ fn expression_dml_target_columns_with_output_aliases(
             {
                 definition
                     .column_index(name)
-                    .map_or(0, |column| 1u64 << column)
+                    .map_or(ColumnSet::EMPTY, ColumnSet::from_column)
             }
             Expr::WholeRow(qualifier)
                 if *qualifier == target_name || output_aliases.contains(qualifier) =>
@@ -59108,9 +59119,9 @@ fn expression_dml_target_columns_with_output_aliases(
             } if *schema == definition.schema.as_str() && *table == definition.name.as_str() => {
                 definition
                     .column_index(name)
-                    .map_or(0, |column| 1u64 << column)
+                    .map_or(ColumnSet::EMPTY, ColumnSet::from_column)
             }
-            _ => 0,
+            _ => ColumnSet::EMPTY,
         };
         let mut child_columns = columns;
         super::query::walk_children(expression, &mut |child| {
@@ -59133,9 +59144,9 @@ fn returning_dml_target_columns(
     storage: &Storage,
     txid: u32,
     arena: &Arena,
-) -> Result<u64, SqlError> {
+) -> Result<ColumnSet, SqlError> {
     let output_aliases = [returning.old_name(), returning.new_name()];
-    let mut columns = 0u64;
+    let mut columns = ColumnSet::EMPTY;
     for item in returning.items {
         columns |= match item {
             SelectItem::Wildcard => all_columns_mask(definition),
@@ -59145,7 +59156,7 @@ fn returning_dml_target_columns(
                 {
                     all_columns_mask(definition)
                 } else {
-                    0
+                    ColumnSet::EMPTY
                 }
             }
             SelectItem::RecordStar(expression) | SelectItem::Expr { expression, .. } => {
@@ -59191,7 +59202,7 @@ pub(crate) fn update<'a>(
         Err(error) => return sql_fail(error),
     };
     let mut targets = [0usize; MAX_COLUMNS];
-    let mut updated_columns = 0u64;
+    let mut updated_columns = ColumnSet::EMPTY;
     for (i, (name, _)) in statement.assignments.iter().enumerate() {
         let Some(column) = def.column_index(name) else {
             return sql_fail(sql_err!(
@@ -59209,10 +59220,10 @@ pub(crate) fn update<'a>(
             ));
         }
         targets[i] = column;
-        updated_columns |= 1u64 << column;
+        updated_columns.insert(column);
     }
-    let reads_target = match (|| -> Result<u64, SqlError> {
-        let mut columns = 0u64;
+    let reads_target = match (|| -> Result<ColumnSet, SqlError> {
+        let mut columns = ColumnSet::EMPTY;
         if let Some(expression) = statement.where_clause {
             columns |= expression_dml_target_columns(
                 expression,
@@ -59256,7 +59267,7 @@ pub(crate) fn update<'a>(
     ) {
         return sql_fail(error);
     }
-    if reads_target != 0
+    if !reads_target.is_empty()
         && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
@@ -59379,7 +59390,7 @@ pub(crate) fn update<'a>(
         Ok(plan) => plan,
         Err(error) => return sql_fail(error),
     };
-    let select_security = if reads_target != 0 {
+    let select_security = if !reads_target.is_empty() {
         match super::query::plan_row_security(
             storage,
             table_index,
@@ -60251,8 +60262,8 @@ pub(crate) fn delete<'a>(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
-    let reads_target = match (|| -> Result<u64, SqlError> {
-        let mut columns = 0u64;
+    let reads_target = match (|| -> Result<ColumnSet, SqlError> {
+        let mut columns = ColumnSet::EMPTY;
         if let Some(expression) = statement.where_clause {
             columns |= expression_dml_target_columns(
                 expression,
@@ -60276,7 +60287,7 @@ pub(crate) fn delete<'a>(
         Ok(reads) => reads,
         Err(error) => return sql_fail(error),
     };
-    if reads_target != 0
+    if !reads_target.is_empty()
         && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
@@ -60307,7 +60318,7 @@ pub(crate) fn delete<'a>(
         &def,
         4,
         true,
-        0,
+        ColumnSet::EMPTY,
     ) {
         return sql_fail(error);
     }
@@ -60347,7 +60358,7 @@ pub(crate) fn delete<'a>(
         Ok(plan) => plan,
         Err(error) => return sql_fail(error),
     };
-    let select_security = if reads_target != 0 {
+    let select_security = if !reads_target.is_empty() {
         match super::query::plan_row_security(
             storage,
             table_index,
@@ -60514,7 +60525,7 @@ pub(crate) fn delete<'a>(
                 TriggerEvents::DELETE,
                 true,
                 false,
-                0,
+                ColumnSet::EMPTY,
                 Some(&old_values[..def.n_columns]),
                 None,
             ) {
@@ -60566,7 +60577,7 @@ pub(crate) fn delete<'a>(
                 TriggerEvents::DELETE,
                 false,
                 false,
-                0,
+                ColumnSet::EMPTY,
                 Some(&old_transition[..def.n_columns]),
                 None,
             ) {
@@ -60637,7 +60648,7 @@ pub(crate) fn delete<'a>(
                 TriggerEvents::DELETE,
                 true,
                 false,
-                0,
+                ColumnSet::EMPTY,
                 Some(&old_values[..def.n_columns]),
                 None,
             ) {
@@ -60725,7 +60736,7 @@ pub(crate) fn delete<'a>(
                 TriggerEvents::DELETE,
                 false,
                 false,
-                0,
+                ColumnSet::EMPTY,
                 Some(&old_transition[..def.n_columns]),
                 None,
             ) {
@@ -60755,7 +60766,7 @@ pub(crate) fn delete<'a>(
         table_index.into(),
         &def,
         4,
-        0,
+        ColumnSet::EMPTY,
         transition_capture.as_ref().map(TransitionCapture::rows),
     ) {
         return sql_fail(error);
@@ -60928,7 +60939,7 @@ pub fn truncate(
             &definition,
             8,
             true,
-            0,
+            ColumnSet::EMPTY,
         ) {
             return sql_fail(error);
         }
@@ -60973,7 +60984,7 @@ pub fn truncate(
                 &definition,
                 8,
                 false,
-                0,
+                ColumnSet::EMPTY,
             ) {
                 return sql_fail(error);
             }
@@ -61081,7 +61092,7 @@ pub fn truncate(
             &definition,
             8,
             false,
-            0,
+            ColumnSet::EMPTY,
         ) {
             return sql_fail(error);
         }
@@ -61744,7 +61755,7 @@ fn drop_column_constraints(
     for read in 0..definition.n_checks {
         let check = definition.checks[read];
         let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-        if check_referenced_columns(expression, definition)? & (1u64 << column) != 0 {
+        if check_referenced_columns(expression, definition)?.contains(column) {
             remember(check.name)?;
         } else {
             definition.checks[write] = check;
@@ -63378,9 +63389,9 @@ fn detached_partition_constraint_name(
     child: &TableDef,
     scheme: crate::storage::PartitionScheme,
 ) -> Result<SqlName, SqlError> {
-    let mut referenced = 0u64;
+    let mut referenced = ColumnSet::EMPTY;
     for key in &scheme.keys[..usize::from(scheme.n_keys)] {
-        referenced |= 1u64 << key;
+        referenced.insert(usize::from(*key));
     }
     ddl::auto_check_name(child, referenced)
 }
@@ -64689,11 +64700,11 @@ fn alter_table_relation(
                         c.name
                     ));
                 }
-                if new_def.n_columns == MAX_COLUMNS {
+                if new_def.n_columns == crate::storage::MAX_RELATION_COLUMNS {
                     return sql_fail(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        sqlstate::TOO_MANY_COLUMNS,
                         "tables can have at most {} columns",
-                        MAX_COLUMNS
+                        crate::storage::MAX_RELATION_COLUMNS
                     ));
                 }
                 let mut meta = match build_column(c, &*storage, txn.txid, arena) {
@@ -67644,7 +67655,7 @@ pub(crate) fn coerce<'a>(
         let text = composite_storage_text(typed, slot, storage, txid, arena)?;
         return Ok(Datum::CompositeText {
             slot,
-            physical_fields: storage.composite_for(slot as usize, txid).n_fields as u8,
+            physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
             text,
         });
     }
@@ -67898,7 +67909,7 @@ fn coerce_composite_value_inner<'a>(
                 decode_stored_composite_text(
                     text,
                     nested_slot,
-                    crate::storage::MAX_COMPOSITE_FIELDS as u8,
+                    crate::storage::MAX_COMPOSITE_FIELDS as u16,
                     storage,
                     txid,
                     arena,
@@ -67936,7 +67947,7 @@ pub(crate) fn decode_composite_text<'a>(
 pub(crate) fn decode_stored_composite_text<'a>(
     text: &'a str,
     slot: u16,
-    physical_fields: u8,
+    physical_fields: u16,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -68200,7 +68211,7 @@ pub(crate) fn coerce_user_type_array_element<'a>(
                 value @ Datum::CompositeText { .. } => value,
                 value @ Datum::Composite { .. } => Datum::CompositeText {
                     slot,
-                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u8,
+                    physical_fields: storage.composite_for(slot as usize, txid).n_fields as u16,
                     text: composite_storage_text(value, slot, storage, txid, arena)?,
                 },
                 _ => unreachable!("composite coercion returns a composite datum"),
@@ -68706,7 +68717,7 @@ pub(crate) fn require_rewrite_input_privileges(
         }
         let slot = usize::from(dependency.slot);
         let target_only = target_dependency == Some((dependency.class, slot))
-            && dependency.referenced_columns == 0
+            && dependency.referenced_columns.is_empty()
             && !source_dependencies.depends_on(dependency.class, slot);
         if target_only {
             continue;
@@ -68737,7 +68748,7 @@ pub(crate) fn require_rewrite_input_privileges(
         crate::sql::ast::Stmt::Insert(insert) => {
             let table = resolve_dml_table(storage, &insert.table, txid)?;
             let definition = storage.table_def(table, txid);
-            let mut insert_columns = 0u64;
+            let mut insert_columns = ColumnSet::EMPTY;
             if insert.columns.is_empty() {
                 insert_columns = all_columns_mask(definition);
             } else {
@@ -68750,7 +68761,7 @@ pub(crate) fn require_rewrite_input_privileges(
                             insert.table.name
                         )
                     })?;
-                    insert_columns |= 1u64 << column;
+                    insert_columns.insert(column);
                 }
             }
             require_table_column_privilege_as(
@@ -68769,7 +68780,7 @@ pub(crate) fn require_rewrite_input_privileges(
                 txid,
                 arena,
             )?;
-            if read_columns != 0 {
+            if !read_columns.is_empty() {
                 require_table_column_privilege_as(
                     storage,
                     table,
@@ -68783,8 +68794,8 @@ pub(crate) fn require_rewrite_input_privileges(
         crate::sql::ast::Stmt::Update(update) => {
             let table = resolve_dml_table(storage, &update.table, txid)?;
             let definition = storage.table_def(table, txid);
-            let mut updated_columns = 0u64;
-            let mut read_columns = 0u64;
+            let mut updated_columns = ColumnSet::EMPTY;
+            let mut read_columns = ColumnSet::EMPTY;
             for (name, expression) in update.assignments {
                 let column = definition.column_index(name).ok_or_else(|| {
                     sql_err!(
@@ -68794,7 +68805,7 @@ pub(crate) fn require_rewrite_input_privileges(
                         update.table.name
                     )
                 })?;
-                updated_columns |= 1u64 << column;
+                updated_columns.insert(column);
                 read_columns |= expression_dml_target_columns(
                     expression,
                     definition,
@@ -68830,7 +68841,7 @@ pub(crate) fn require_rewrite_input_privileges(
                 role,
                 txid,
             )?;
-            if read_columns != 0 {
+            if !read_columns.is_empty() {
                 require_table_column_privilege_as(
                     storage,
                     table,
@@ -68869,7 +68880,7 @@ pub(crate) fn require_rewrite_input_privileges(
                     arena,
                 )?;
             }
-            if read_columns != 0 {
+            if !read_columns.is_empty() {
                 require_table_column_privilege_as(
                     storage,
                     table,
@@ -68944,7 +68955,7 @@ fn require_table_column_privilege(
     storage: &Storage,
     table: usize,
     privilege: crate::storage::PrivilegeSet,
-    columns: u64,
+    columns: ColumnSet,
     txid: u32,
 ) -> Result<(), SqlError> {
     let role = storage.current_role_slot(txid).ok_or_else(|| {
@@ -68960,7 +68971,7 @@ fn require_table_column_privilege_as(
     storage: &Storage,
     table: usize,
     privilege: crate::storage::PrivilegeSet,
-    columns: u64,
+    columns: ColumnSet,
     role: usize,
     txid: u32,
 ) -> Result<(), SqlError> {
@@ -68970,9 +68981,9 @@ fn require_table_column_privilege_as(
         return Ok(());
     }
     let definition = storage.table_def(table, txid);
-    let allowed = columns != 0
+    let allowed = !columns.is_empty()
         && (0..definition.n_columns)
-            .filter(|column| columns & (1u64 << column) != 0)
+            .filter(|column| columns.contains(*column))
             .all(|column| {
                 crate::storage::ColumnPrivilegeTarget::new(object, column as u16)
                     .is_ok_and(|target| storage.has_column_privilege(target, role, privilege, txid))
@@ -68990,7 +69001,7 @@ fn require_table_column_privilege_as(
 fn require_table_read_privilege_as(
     storage: &Storage,
     table: usize,
-    columns: u64,
+    columns: ColumnSet,
     role: usize,
     txid: u32,
 ) -> Result<(), SqlError> {
@@ -69000,7 +69011,7 @@ fn require_table_read_privilege_as(
         return Ok(());
     }
     let definition = storage.table_def(table, txid);
-    let allowed = if columns == 0 {
+    let allowed = if columns.is_empty() {
         (0..definition.n_columns).any(|column| {
             crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(|target| {
                 storage.has_column_privilege(
@@ -69013,7 +69024,7 @@ fn require_table_read_privilege_as(
         })
     } else {
         (0..definition.n_columns)
-            .filter(|column| columns & (1u64 << column) != 0)
+            .filter(|column| columns.contains(*column))
             .all(|column| {
                 crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
                     |target| {
@@ -69132,7 +69143,7 @@ fn require_view_column_privilege_as(
     storage: &Storage,
     view: usize,
     privilege: crate::storage::PrivilegeSet,
-    columns: u64,
+    columns: ColumnSet,
     role: usize,
     txid: u32,
 ) -> Result<(), SqlError> {
@@ -69145,9 +69156,9 @@ fn require_view_column_privilege_as(
     if storage.has_object_privilege(object, role, privilege, txid) {
         return Ok(());
     }
-    let allowed = columns != 0
-        && (0..u64::BITS as usize)
-            .filter(|column| columns & (1u64 << column) != 0)
+    let allowed = !columns.is_empty()
+        && (0..MAX_COLUMNS)
+            .filter(|column| columns.contains(*column))
             .all(|column| {
                 crate::storage::ColumnPrivilegeTarget::new(object, column as u16)
                     .is_ok_and(|target| storage.has_column_privilege(target, role, privilege, txid))
@@ -69165,7 +69176,7 @@ fn require_view_column_privilege_as(
 fn require_view_read_privilege_as(
     storage: &Storage,
     view: usize,
-    columns: u64,
+    columns: ColumnSet,
     role: usize,
     txid: u32,
 ) -> Result<(), SqlError> {
@@ -69178,7 +69189,7 @@ fn require_view_read_privilege_as(
     if storage.has_object_privilege(object, role, crate::storage::PrivilegeSet::SELECT, txid) {
         return Ok(());
     }
-    if columns == 0
+    if columns.is_empty()
         && storage.has_any_column_privilege(
             object,
             role,
@@ -69239,11 +69250,11 @@ pub(crate) fn require_view_dml_privileges(
 ) -> Result<DmlAuthorization, SqlError> {
     let role = authorization.role(storage, txid)?;
     let definition = view_privilege_definition(storage, view, txid, arena)?;
-    let target_mask = |names: &[&str]| -> Result<u64, SqlError> {
+    let target_mask = |names: &[&str]| -> Result<ColumnSet, SqlError> {
         if names.is_empty() {
             return Ok(all_columns_mask(&definition));
         }
-        names.iter().try_fold(0u64, |mask, name| {
+        names.iter().try_fold(ColumnSet::EMPTY, |mut mask, name| {
             definition.column_index(name).map_or_else(
                 || {
                     Err(sql_err!(
@@ -69253,7 +69264,10 @@ pub(crate) fn require_view_dml_privileges(
                         definition.name.as_str()
                     ))
                 },
-                |column| Ok(mask | (1u64 << column)),
+                |column| {
+                    mask.insert(column);
+                    Ok(mask)
+                },
             )
         })
     };
@@ -69275,7 +69289,7 @@ pub(crate) fn require_view_dml_privileges(
                 txid,
                 arena,
             )?;
-            if reads != 0 {
+            if !reads.is_empty() {
                 require_view_column_privilege_as(
                     storage,
                     view,
@@ -69287,8 +69301,8 @@ pub(crate) fn require_view_dml_privileges(
             }
         }
         crate::sql::ast::Stmt::Update(update) => {
-            let mut writes = 0u64;
-            let mut reads = 0u64;
+            let mut writes = ColumnSet::EMPTY;
+            let mut reads = ColumnSet::EMPTY;
             for (name, expression) in update.assignments {
                 writes |= target_mask(core::slice::from_ref(name))?;
                 reads |= expression_dml_target_columns(
@@ -69326,7 +69340,7 @@ pub(crate) fn require_view_dml_privileges(
                 role,
                 txid,
             )?;
-            if reads != 0 {
+            if !reads.is_empty() {
                 require_view_column_privilege_as(
                     storage,
                     view,
@@ -69363,7 +69377,7 @@ pub(crate) fn require_view_dml_privileges(
                     arena,
                 )?;
             }
-            if reads != 0 {
+            if !reads.is_empty() {
                 require_view_column_privilege_as(
                     storage,
                     view,

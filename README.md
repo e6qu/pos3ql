@@ -278,7 +278,9 @@ including Statement Describe and per-column text or binary Bind formats.
 Join range tables and accumulated `USING` merge state use statement memory;
 128-relation execution is qualified through plans, stored views, windows,
 materialization, subqueries, joined DML, and PostgreSQL 18 differential tests.
-One explicit `USING` list remains bounded by the 64-column source-row shape.
+Tables, views, named composites, record column definition lists, and explicit
+`USING` lists accept PostgreSQL's 1,600-column relation width. Table-function
+results accept the independent 1,664-column executable tuple width.
 XMLTABLE, JSON_TABLE, and publication-introspection rows use statement memory.
 `EXPLAIN` plan nodes live in the fixed statement arena rather than the worker
 stack, and arena exhaustion returns

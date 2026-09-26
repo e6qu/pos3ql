@@ -11,8 +11,6 @@ use pos3ql::object_store::{ByteRange, Precondition};
 use pos3ql::pg::respond::Responder;
 use pos3ql::sql::Engine;
 
-const ENGINE_BUDGET_BYTES: usize = 512 << 20;
-
 struct TestDirectory(std::path::PathBuf);
 
 impl TestDirectory {
@@ -96,7 +94,7 @@ fn engine_config(run: &str, data_dir: &str) -> Option<(Config, TestDirectory)> {
     let directory = TestDirectory::new(run);
     let dir = directory.0.join(data_dir);
     config.data_dir = dir.to_str().unwrap().to_string();
-    config.max_connections = 8;
+    config.max_connections = 1;
     config.memtable_bytes = 1 << 20;
     config.max_tables = 8;
     config.max_views = 8;
@@ -116,6 +114,12 @@ fn engine_config(run: &str, data_dir: &str) -> Option<(Config, TestDirectory)> {
     config.object_store_on = true;
     config.object_store_prefix = format!("ckpt-it/{}-{run}/", std::process::id());
     Some((config, directory))
+}
+
+fn engine_budget_bytes(config: &Config) -> usize {
+    config
+        .memory_plan(0, Engine::extra_budget_bytes(config))
+        .total()
 }
 
 #[test]
@@ -175,7 +179,7 @@ fn rpo_zero_disk_loss_recovery() {
     cfg.wal_upload = true;
 
     {
-        let mut budget = Budget::new(ENGINE_BUDGET_BYTES);
+        let mut budget = Budget::new(engine_budget_bytes(&cfg));
         let mut e = Engine::new(&cfg, &mut budget).unwrap();
         run_sql(
             &mut e,
@@ -198,7 +202,7 @@ fn rpo_zero_disk_loss_recovery() {
     let dir = directory.0.join("wiped");
     cfg2.data_dir = dir.to_str().unwrap().to_string();
     {
-        let mut budget = Budget::new(ENGINE_BUDGET_BYTES);
+        let mut budget = Budget::new(engine_budget_bytes(&cfg2));
         let mut e = Engine::new(&cfg2, &mut budget).unwrap();
         let out = run_sql(
             &mut e,
@@ -220,7 +224,7 @@ fn delta_checkpoint_carries_clean_tables() {
         eprintln!("POS3QL_OBJECT_STORE_ENDPOINT not set; skipping");
         return;
     };
-    let mut budget = Budget::new(ENGINE_BUDGET_BYTES);
+    let mut budget = Budget::new(engine_budget_bytes(&cfg));
     let mut e = Engine::new(&cfg, &mut budget).unwrap();
     run_sql(&mut e, &mut budget, "CREATE TABLE stable (id int, v text)");
     run_sql(&mut e, &mut budget, "CREATE TABLE churn (id int, v text)");
@@ -246,7 +250,7 @@ fn delta_checkpoint_carries_clean_tables() {
     let mut cfg2 = cfg.clone();
     let dir = directory.0.join("b");
     cfg2.data_dir = dir.to_str().unwrap().to_string();
-    let mut budget2 = Budget::new(ENGINE_BUDGET_BYTES);
+    let mut budget2 = Budget::new(engine_budget_bytes(&cfg2));
     let mut e2 = Engine::new(&cfg2, &mut budget2).unwrap();
     let out = run_sql(&mut e2, &mut budget2, "SELECT v FROM stable");
     assert!(
@@ -266,7 +270,7 @@ fn checkpoint_and_cold_start_from_bucket() {
 
     // Node A: write data, checkpoint, write a WAL tail after the checkpoint.
     {
-        let mut budget = Budget::new(ENGINE_BUDGET_BYTES);
+        let mut budget = Budget::new(engine_budget_bytes(&config_a));
         let mut e = Engine::new(&config_a, &mut budget).unwrap();
         run_sql(
             &mut e,
@@ -302,7 +306,7 @@ fn checkpoint_and_cold_start_from_bucket() {
 
     // Node A restarts with its disk intact: manifest + WAL tail replay.
     {
-        let mut budget = Budget::new(ENGINE_BUDGET_BYTES);
+        let mut budget = Budget::new(engine_budget_bytes(&config_a));
         let mut e = Engine::new(&config_a, &mut budget).unwrap();
         let out = run_sql(
             &mut e,
@@ -321,7 +325,7 @@ fn checkpoint_and_cold_start_from_bucket() {
     let dir_b = directory.0.join("b");
     config_b.data_dir = dir_b.to_str().unwrap().to_string();
     {
-        let mut budget = Budget::new(ENGINE_BUDGET_BYTES);
+        let mut budget = Budget::new(engine_budget_bytes(&config_b));
         let mut e = Engine::new(&config_b, &mut budget).unwrap();
         let out = run_sql(
             &mut e,

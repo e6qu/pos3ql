@@ -956,7 +956,7 @@ pub trait CatalogAccess {
     fn materialize_composite<'a>(
         &self,
         _slot: u16,
-        _physical_fields: u8,
+        _physical_fields: u16,
         _text: &'a str,
         _arena: &'a Arena,
     ) -> Result<Datum<'a>, SqlError> {

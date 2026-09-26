@@ -3202,12 +3202,27 @@ pub struct Cte<'a> {
 /// inline subquery. Rows are projected-encoded; type, typmod, and collation
 /// metadata retain the exact derived-relation state without a storage-layer
 /// dependency.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct MaterializedCte<'a> {
     pub column_names: &'a [&'a str],
     pub column_types: &'a [(i32, i16, i32)],
     pub column_collations: &'a [Collation],
+    /// Reusable relation metadata for references with the same effective
+    /// column names.
+    /// A recursive CTE resolves the same relation once per iteration, so
+    /// rebuilding a full PostgreSQL-width definition there would consume the
+    /// statement arena in proportion to recursion depth.
+    pub(crate) definition: Option<&'a crate::storage::TableDef>,
     pub(crate) source: MaterializedCteSource<'a>,
+}
+
+impl PartialEq for MaterializedCte<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.column_names == other.column_names
+            && self.column_types == other.column_types
+            && self.column_collations == other.column_collations
+            && self.source == other.source
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

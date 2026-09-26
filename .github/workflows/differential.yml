@@ -7,11 +7,9 @@ name: Differential
 # against PostgreSQL as the oracle.
 #
 # Sharded so every job fits the 15-minute cap while total coverage is
-# preserved: four shards each replay a quarter of the vendored sqllogictest
-# corpus's query blocks (all files and statements on every shard), a fifth
-# shard runs the full generative fuzzer, and a sixth runs the deterministic
-# wire/tooling/curated-corpus gates once. Repeating those gates in every slow
-# shard wastes the fixed wall-clock budget and can cancel a healthy fuzzer.
+# preserved: four shards replay the vendored sqllogictest queries, four replay
+# disjoint quarters of one seeded fuzzer sequence, and deterministic protocol,
+# curated-corpus, and auxiliary gates run in their own bounded shards.
 
 on:
   push:
@@ -28,9 +26,8 @@ jobs:
   differential:
     name: differential (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # Hard ceiling on every CI job: 15 minutes. Each shard runs one quarter of
-    # the sqllogictest queries, the fuzzer alone, or the deterministic gates
-    # alone; the cap still guarantees a pathological query can never wedge CI.
+    # Hard ceiling on every CI job: 15 minutes. The cap guarantees a
+    # pathological query can never wedge CI.
     timeout-minutes: 15
 
     strategy:
@@ -41,34 +38,158 @@ jobs:
         include:
           - shard: slt-1
             run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
             run_slt: "1"
             query_shard: "0"
             run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
           - shard: slt-2
             run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
             run_slt: "1"
             query_shard: "1"
             run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
           - shard: slt-3
             run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
             run_slt: "1"
             query_shard: "2"
             run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
           - shard: slt-4
             run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
             run_slt: "1"
             query_shard: "3"
             run_fuzz: "0"
-          - shard: fuzz
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+          - shard: fuzz-1
             run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
-          - shard: fast
+            fuzz_start: "0"
+            fuzz_count: "2500"
+            corpus_shard: "0"
+          - shard: fuzz-2
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "2500"
+            fuzz_count: "2500"
+            corpus_shard: "0"
+          - shard: fuzz-3
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "5000"
+            fuzz_count: "2500"
+            corpus_shard: "0"
+          - shard: fuzz-4
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "7500"
+            fuzz_count: "2500"
+            corpus_shard: "0"
+          - shard: core
             run_fast: "1"
+            run_core: "1"
+            run_corpus: "0"
+            run_aux: "0"
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+          - shard: corpus-1
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "1"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
+          - shard: corpus-2
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "1"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "1"
+          - shard: corpus-3
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "1"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "2"
+          - shard: corpus-4
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "1"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "3"
+          - shard: auxiliary
+            run_fast: "1"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "1"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "0"
+            fuzz_start: "0"
+            fuzz_count: "0"
+            corpus_shard: "0"
 
     services:
       postgres:
@@ -155,11 +276,17 @@ jobs:
           # classify any block as unsupported.
           SLT_UNSUPPORTED_BUDGET: "0"
           RUN_FAST: ${{ matrix.run_fast }}
+          RUN_CORE: ${{ matrix.run_core }}
+          RUN_CORPUS: ${{ matrix.run_corpus }}
+          RUN_AUX: ${{ matrix.run_aux }}
           RUN_SLT: ${{ matrix.run_slt }}
           RUN_FUZZ: ${{ matrix.run_fuzz }}
-          # The fuzzer runs alone on its own shard and keeps all 10k generated
-          # statements. Ignored on the other shards (RUN_FUZZ=0).
-          FUZZ_COUNT: "10000"
+          FAST_CORPUS_SHARDS: "4"
+          FAST_CORPUS_SHARD: ${{ matrix.corpus_shard }}
+          # The two fuzz shards cover disjoint halves of the same 10k-statement
+          # seeded sequence. Ignored on the other shards (RUN_FUZZ=0).
+          FUZZ_START: ${{ matrix.fuzz_start }}
+          FUZZ_COUNT: ${{ matrix.fuzz_count }}
           FUZZ_SEED: "3"
           # Generated PostgreSQL-valid statements must execute, not be silently
           # classified as unsupported by the differential harness.

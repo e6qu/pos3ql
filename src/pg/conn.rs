@@ -5579,7 +5579,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5662,7 +5662,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5787,7 +5787,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5891,7 +5891,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -5993,7 +5993,7 @@ mod tests {
         config.data_dir = directory.to_string_lossy().into_owned();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine");
         let mut connection = Conn::new(&config, &mut budget).expect("connection");
         connection.phase = Phase::Ready;
@@ -6071,7 +6071,7 @@ mod tests {
     fn recycled_connection_clears_configured_sequence_state_without_allocating() {
         let mut config = Config::default_dev();
         config.max_sequences = 80;
-        let mut budget = Budget::new(64 << 20);
+        let mut budget = Budget::new(256 << 20);
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
         connection.guc.seq_session().record_nextval(79, 11, 37);
         assert_eq!(connection.guc.seq_session().currval(79, 11), Some(37));
@@ -6131,7 +6131,7 @@ mod tests {
         let mut config = Config::default_dev();
         config.max_tables = 8;
         config.table_rows = 256;
-        let mut budget = Budget::new(1 << 29);
+        let mut budget = Budget::new(1 << 30);
         let mut engine = Engine::new(&config, &mut budget).expect("engine budget");
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
         connection.recv.append(b"E\0\0\0\x04S\0\0\0\x04");
@@ -6162,7 +6162,7 @@ mod tests {
     #[test]
     fn administrative_termination_is_a_fatal_non_reading_wire_state() {
         let config = Config::default_dev();
-        let mut budget = Budget::new(64 << 20);
+        let mut budget = Budget::new(256 << 20);
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
         connection.recv.append(b"Q\0\0\0\x05");
         connection.park(false, 0);
@@ -6184,7 +6184,7 @@ mod tests {
         server.set_nonblocking(true).expect("nonblocking server");
 
         let config = Config::default_dev();
-        let mut budget = Budget::new(64 << 20);
+        let mut budget = Budget::new(256 << 20);
         let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
         connection.open(server, 71);
         assert!(connection.terminate_by_administrator());

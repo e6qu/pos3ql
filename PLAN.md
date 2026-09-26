@@ -62,8 +62,6 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- 64-column relation and table-function row shapes, which also bound one
-  explicit `JOIN ... USING` list;
 - durable 64-item definition shapes, including constraints, enum labels, and
   policy roles; and
 - per-value `tsvector`/`tsquery` and geometry widths.
@@ -81,8 +79,34 @@ Query results now follow PostgreSQL 18's 1,664-column target-list boundary.
 Simple, scoped, and set-operation execution, Statement Describe, per-column
 text and binary Bind formats, and the exact 1,665-entry error are qualified
 without runtime allocation against PostgreSQL 18.6. Query threads reserve one
-64 MiB fixed stack at startup for the statically bounded planning, execution,
-and protocol scratch at the complete width.
+128 MiB fixed stack and the default configuration reserves a 32 MiB statement
+arena at startup for the statically bounded planning, execution, and protocol
+scratch at the complete width.
+
+Stored tables, views, named composites, and record column definition lists now
+follow PostgreSQL 18's 1,600-column relation boundary. Table-function results
+use the independent 1,664-column executable tuple boundary. Wide column sets
+replace one-word masks in dependencies, triggers, publications, privileges,
+indexes, checkpoints, and WAL; older durable records remain readable. Compact
+64-bit scan proofs remain a physical optimization, while authorization retains
+the exact SQL-visible columns when a high ordinal requires full-row decoding.
+The accepted widths, high-column DML and metadata, exact 1,601/1,665 errors,
+allocation-free execution, WAL replay, checkpoint publication, empty-cache
+object recovery, and raw-wire PostgreSQL 18.6 differential behavior are
+qualified. Materialized recursive relations retain their synthesized typed
+definition across fixpoint iterations, so recursion depth no longer multiplies
+the complete relation-width metadata in statement memory. Plain and aliased
+100-row recursion are qualified in the default 32 MiB arena. Routine candidate
+probes read the active transaction's small signature fields in place, and
+ordinary projections bypass set-returning function materialization, so widened
+metadata is not copied or cleared per row. The 1,100-call and 70,000-row scroll
+cursor differential completes against PostgreSQL 18.6. Logical replication
+decodes maximum-width relation and tuple frames as validated borrowed wire
+views, keeping the decoded message size independent of the 1,600-column limit.
+CI preserves the complete library, curated PostgreSQL differential, and
+10,000-statement seeded fuzz suites in deterministic shards below the
+15-minute worker ceiling; the seeded sequence runs in four 2,500-statement
+quarters, and instrumented auxiliary phases have independent workers.
 
 Join range tables and accumulated `USING` merge state now use exact
 statement-arena slices rather than a 64-relation executor envelope. Compact
@@ -90,12 +114,12 @@ statement-arena slices rather than a 64-relation executor envelope. Compact
 joins retain identity order and full-row decoding, preserving exact execution.
 Allocation-forbidden and PostgreSQL 18.6 differential coverage qualifies 128
 relations through cross and `USING` joins, materialization, windows,
-subqueries, plans, stored views, and joined DML. One explicit `USING` list is
-still bounded by the 64-column source-row shape tracked above.
+subqueries, plans, stored views, and joined DML. Explicit `USING` lists now
+follow the 1,600-column relation shape.
 
 Routine call signatures now match PostgreSQL's exact 100-input-argument limit.
-The independent 64-column routine result boundary remains part of the general
-row-width limit above. Execution, `pg_proc`, WAL, checkpoints, fixed-memory
+The independent executable routine result boundary is 1,664 columns. Execution,
+`pg_proc`, WAL, checkpoints, fixed-memory
 operation, object-cold recovery, exact over-limit rejection, and PostgreSQL 18
 differential behavior are qualified at the accepted boundaries.
 

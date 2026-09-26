@@ -2185,6 +2185,8 @@ sql_arena_bytes = 4096
             41 * core::mem::size_of::<crate::storage::PolicyDef>()
                 + crate::storage::stored_query_dependency_budget_bytes(&larger)
                 - crate::storage::stored_query_dependency_budget_bytes(&defaults)
+                + crate::storage::policy_role_budget_bytes(&larger)
+                - crate::storage::policy_role_budget_bytes(&defaults)
         );
         assert_eq!(
             Config::parse("max_policies = 1025\n").unwrap().max_policies,

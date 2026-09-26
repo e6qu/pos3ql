@@ -121,8 +121,9 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   Policies use `max_policies` (default 256) without a second per-table ceiling;
   their predicates are statement-arena bounded. Routine call signatures match
   PostgreSQL's 100-input-argument limit. Executable routine results accept
-  1,664 output columns; configuration settings, trigger arguments, and policy
-  roles retain their documented 64-item definition bounds. `RETURNS TABLE`
+  1,664 output columns; configuration settings and trigger arguments retain
+  their documented 64-item definition bounds. Policy role lists accept the
+  complete startup-sized role catalog plus `PUBLIC`. `RETURNS TABLE`
   catalog argument metadata keeps input and output shapes independent. Trigger
   arguments are zero-based and NULL when absent, matching PostgreSQL.
   Database and schema catalogs, connection counters, statistics, cloning, and

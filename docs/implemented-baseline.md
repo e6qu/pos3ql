@@ -286,8 +286,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   command gates use statement-arena slices rather than fixed policy arrays.
   A 1,025-policy relation qualifies enforcement, catalog output, named
   exhaustion, checkpoint publication, and empty-cache recovery. Policy role
-  lists, routine configuration, and trigger arguments use the parser's complete
-  64-item boundary. Routine input signatures match PostgreSQL's exact
+  lists accept every startup-configured role plus `PUBLIC`, with startup-sized
+  committed, transactional, and recovery images. Routine configuration and
+  trigger arguments use the parser's complete 64-item boundary. Routine input
+  signatures match PostgreSQL's exact
   100-argument limit, while output metadata accepts 1,664 columns;
   routine manifest fields stream directly into the reserved buffer. `pg_proc`
   includes TABLE output names, modes, and types alongside input parameters, and

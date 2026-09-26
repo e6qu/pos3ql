@@ -39,10 +39,11 @@ fi
 # auxiliary probes. Each worker has a fixed 15-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
-    '- { name: a, corpus_shard: "0-of-4", auxiliary: none }' \
-    '- { name: b, corpus_shard: "1-of-4", auxiliary: none }' \
-    '- { name: c, corpus_shard: "2-of-4", auxiliary: none }' \
-    '- { name: d, corpus_shard: "3-of-4", auxiliary: none }' \
+    '- { name: a, corpus_shard: "0-of-5", auxiliary: none }' \
+    '- { name: b, corpus_shard: "1-of-5", auxiliary: none }' \
+    '- { name: c, corpus_shard: "2-of-5", auxiliary: none }' \
+    '- { name: d, corpus_shard: "3-of-5", auxiliary: none }' \
+    '- { name: e, corpus_shard: "4-of-5", auxiliary: none }' \
     '- { name: exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \
@@ -84,22 +85,22 @@ for test_partition in 0-of-3 1-of-3 2-of-3; do
     fi
 done
 
-# The differential matrix owns every disjoint deterministic phase and all four
-# quarters of the original seeded fuzz sequence.
+# The differential matrix owns every disjoint deterministic phase and all five
+# slices of the original seeded fuzz sequence.
 differential_workflow=.github/workflows/differential.yml
 for differential_shard in \
-    slt-1 slt-2 slt-3 slt-4 fuzz-1 fuzz-2 fuzz-3 fuzz-4 core \
+    slt-1 slt-2 slt-3 slt-4 fuzz-1 fuzz-2 fuzz-3 fuzz-4 fuzz-5 core \
     corpus-1 corpus-2 corpus-3 corpus-4 auxiliary; do
     if ! grep -Fq -- "- shard: $differential_shard" "$differential_workflow"; then
         printf 'CI timeout guard: missing differential shard %s\n' "$differential_shard" >&2
         failed=1
     fi
 done
-if (( $(grep -Fc 'fuzz_count: "2500"' "$differential_workflow") != 4 )); then
-    printf '%s\n' 'CI timeout guard: differential fuzz must retain four 2,500-statement quarters' >&2
+if (( $(grep -Fc 'fuzz_count: "2000"' "$differential_workflow") != 5 )); then
+    printf '%s\n' 'CI timeout guard: differential fuzz must retain five 2,000-statement slices' >&2
     failed=1
 fi
-for fuzz_start in 0 2500 5000 7500; do
+for fuzz_start in 0 2000 4000 6000 8000; do
     if ! grep -Fq -- "fuzz_start: \"$fuzz_start\"" "$differential_workflow"; then
         printf 'CI timeout guard: missing differential fuzz start %s\n' "$fuzz_start" >&2
         failed=1

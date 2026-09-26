@@ -138,6 +138,9 @@ wal_record_kinds! {
     KIND_CREATE_COMPOSITE_V2 = 143;
     KIND_CREATE_VIEW_V2 = 144;
     KIND_SET_VIEW_COLUMNS_V2 = 145;
+/// Policy role counts widened from one byte to the configured role catalog.
+/// Kind 69 remains decodable so existing journals retain their durable meaning.
+    KIND_SET_POLICY_V2 = 146;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -656,6 +659,63 @@ impl TriggerTargetKind {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalPolicyRoles<'a> {
+    Names(&'a [SqlName]),
+    Encoded { bytes: &'a [u8], count: usize },
+}
+
+impl<'a> WalPolicyRoles<'a> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Names(names) => names.len(),
+            Self::Encoded { count, .. } => count,
+        }
+    }
+
+    pub(crate) fn iter(self) -> WalPolicyRoleIter<'a> {
+        WalPolicyRoleIter {
+            roles: self,
+            index: 0,
+            byte_offset: 0,
+        }
+    }
+}
+
+pub(crate) struct WalPolicyRoleIter<'a> {
+    roles: WalPolicyRoles<'a>,
+    index: usize,
+    byte_offset: usize,
+}
+
+impl<'a> Iterator for WalPolicyRoleIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.roles.len() {
+            return None;
+        }
+        self.index += 1;
+        match self.roles {
+            WalPolicyRoles::Names(names) => Some(names[self.index - 1].as_str()),
+            WalPolicyRoles::Encoded { bytes, .. } => {
+                let length = usize::from(bytes[self.byte_offset]);
+                let start = self.byte_offset + 1;
+                let end = start + length;
+                self.byte_offset = end;
+                Some(core::str::from_utf8(&bytes[start..end]).expect("validated policy role name"))
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.roles.len() - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for WalPolicyRoleIter<'_> {}
+
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
@@ -981,8 +1041,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         command: u8,
         permissive: bool,
-        roles: [SqlName; crate::storage::MAX_POLICY_ROLES],
-        role_count: usize,
+        roles: WalPolicyRoles<'a>,
         using: Option<&'a str>,
         with_check: Option<&'a str>,
         dependencies: WalStoredQueryDependencies<'a>,
@@ -2311,7 +2370,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateTrigger { .. } => KIND_CREATE_TRIGGER_V2,
         WalOp::DropTrigger { .. } => KIND_DROP_TRIGGER,
         WalOp::AlterTrigger { .. } => KIND_ALTER_TRIGGER,
-        WalOp::SetPolicy { .. } => KIND_SET_POLICY,
+        WalOp::SetPolicy { .. } => KIND_SET_POLICY_V2,
         WalOp::DropPolicy { .. } => KIND_DROP_POLICY,
         WalOp::Commit { .. } => KIND_COMMIT,
         WalOp::PrepareTransaction { .. } => KIND_PREPARE_TRANSACTION,
@@ -2846,7 +2905,6 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             name,
             roles,
-            role_count,
             using,
             with_check,
             dependencies,
@@ -2857,11 +2915,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + table.len()
                 + 1
                 + name.len()
-                + 3
-                + roles[..*role_count]
-                    .iter()
-                    .map(|role| 1 + role.as_str().len())
-                    .sum::<usize>()
+                + 6
+                + roles.iter().map(|role| 1 + role.len()).sum::<usize>()
                 + 2
                 + using.map_or(0, str::len)
                 + 2
@@ -5917,7 +5972,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             command,
             permissive,
             roles,
-            role_count,
             using,
             with_check,
             dependencies,
@@ -5931,11 +5985,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, name)
                 && buffer.append(&[*command, u8::from(*permissive)])
-                && (*role_count <= crate::storage::MAX_POLICY_ROLES)
-                && buffer.append(&[*role_count as u8])
-                && roles[..*role_count]
-                    .iter()
-                    .all(|role| name_bytes(buffer, role.as_str()))
+                && u32::try_from(roles.len())
+                    .ok()
+                    .is_some_and(|count| buffer.append(&count.to_le_bytes()))
+                && roles.iter().all(|role| name_bytes(buffer, role))
                 && append_expression(buffer, *using)
                 && append_expression(buffer, *with_check)
                 && dependencies.append(buffer)
@@ -8282,7 +8335,7 @@ fn decode_op_inner<'a>(
                 enabled,
             })
         }),
-        KIND_SET_POLICY => decode_large_op(|| {
+        KIND_SET_POLICY | KIND_SET_POLICY_V2 => decode_large_op(|| {
             let schema = take_name(&mut at)?;
             let table = take_name(&mut at)?;
             let name = take_name(&mut at)?;
@@ -8294,15 +8347,28 @@ fn decode_op_inner<'a>(
                 _ => return None,
             };
             at += 2;
-            let role_count = usize::from(*payload.get(at)?);
-            at += 1;
-            if role_count == 0 || role_count > crate::storage::MAX_POLICY_ROLES {
+            let role_count = if kind == KIND_SET_POLICY {
+                let count = usize::from(*payload.get(at)?);
+                at += 1;
+                count
+            } else {
+                let count = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                usize::try_from(count).ok()?
+            };
+            if role_count == 0
+                || (kind == KIND_SET_POLICY && role_count > crate::storage::MAX_DEFINITION_ITEMS)
+            {
                 return None;
             }
-            let mut roles = [SqlName::EMPTY; crate::storage::MAX_POLICY_ROLES];
-            for role in &mut roles[..role_count] {
-                *role = SqlName::parse(take_name(&mut at)?).ok()?;
+            let roles_start = at;
+            for _ in 0..role_count {
+                SqlName::parse(take_name(&mut at)?).ok()?;
             }
+            let roles = WalPolicyRoles::Encoded {
+                bytes: &payload[roles_start..at],
+                count: role_count,
+            };
             let mut take_expression = || {
                 let length = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
@@ -8326,7 +8392,6 @@ fn decode_op_inner<'a>(
                 command,
                 permissive,
                 roles,
-                role_count,
                 using,
                 with_check,
                 dependencies: WalStoredQueryDependencies::Encoded(encoded),
@@ -13155,8 +13220,7 @@ mod tests {
     fn policy_and_view_security_payloads_roundtrip() {
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "security payload", 4096).unwrap();
-        let mut roles = [SqlName::EMPTY; crate::storage::MAX_POLICY_ROLES];
-        roles[0] = SqlName::parse("reader").unwrap();
+        let roles = [SqlName::parse("reader").unwrap()];
         let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
         let create_columns = crate::storage::ViewColumns::from_derived_names(&["value"])
             .unwrap()
@@ -13173,8 +13237,7 @@ mod tests {
                 name: "reader_rows",
                 command: crate::storage::PolicyCommandKind::Update.code(),
                 permissive: false,
-                roles,
-                role_count: 1,
+                roles: WalPolicyRoles::Names(&roles),
                 using: Some("tenant = 'reader'"),
                 with_check: Some("tenant = current_user"),
                 dependencies: WalStoredQueryDependencies::Captured(dependencies.view()),
@@ -13184,20 +13247,43 @@ mod tests {
             command,
             permissive,
             roles,
-            role_count,
             using,
             with_check,
             ..
-        }) = decode_op(KIND_SET_POLICY, payload.readable())
+        }) = decode_op(KIND_SET_POLICY_V2, payload.readable())
         else {
             panic!("policy payload did not decode");
         };
         assert_eq!(command, crate::storage::PolicyCommandKind::Update.code());
         assert!(!permissive);
-        assert_eq!(role_count, 1);
-        assert_eq!(roles[0].as_str(), "reader");
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles.iter().next(), Some("reader"));
         assert_eq!(using, Some("tenant = 'reader'"));
         assert_eq!(with_check, Some("tenant = current_user"));
+
+        payload.clear();
+        let append_name = |buffer: &mut FixedBuf, value: &str| {
+            buffer.append(&[value.len() as u8]) && buffer.append(value.as_bytes())
+        };
+        let using = "tenant = 'reader'";
+        let with_check = "tenant = current_user";
+        assert!(
+            append_name(&mut payload, "public")
+                && append_name(&mut payload, "protected")
+                && append_name(&mut payload, "reader_rows")
+                && payload.append(&[crate::storage::PolicyCommandKind::Update.code(), 0, 1,])
+                && append_name(&mut payload, "reader")
+                && payload.append(&(using.len() as u16).to_le_bytes())
+                && payload.append(using.as_bytes())
+                && payload.append(&(with_check.len() as u16).to_le_bytes())
+                && payload.append(with_check.as_bytes())
+                && WalStoredQueryDependencies::Captured(dependencies.view()).append(&mut payload)
+        );
+        let Some(WalOp::SetPolicy { roles, .. }) = decode_op(KIND_SET_POLICY, payload.readable())
+        else {
+            panic!("legacy policy payload did not decode");
+        };
+        assert_eq!(roles.iter().collect::<Vec<_>>(), ["reader"]);
 
         payload.clear();
         assert!(append_payload(

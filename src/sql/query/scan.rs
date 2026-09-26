@@ -183,7 +183,7 @@ pub(crate) fn plan_row_security<'a>(
             continue;
         }
         let policy_definition = policy.definition_for(txid);
-        if !policy_definition.roles.applies_to(storage, role, txid) {
+        if !storage.policy_applies_to_role(slot, role, txid) {
             continue;
         }
         let expression = match expression_kind {

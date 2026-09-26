@@ -546,21 +546,18 @@ fn streaming_scalar_subquery<'a>(
                 .expect("external scalar-subquery run has a block store")
         },
     )?;
-    let run = storage
-        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
-        .expect("external scalar-subquery run has a block store")?;
-    drop(sorter);
-    let value = match run {
-        Some(run) => {
-            let mut reader = storage.external_run_reader()?;
-            storage
-                .with_block_store(|blocks| reader.start(blocks, run))
-                .expect("external scalar-subquery run has a block store")?;
-            let row = reader.row().expect("one scalar-subquery row");
-            let encoded = arena.alloc_slice_copy(row).map_err(|_| arena_full())?;
+    // Cardinality is checked before each push, so the only retained row always
+    // fits the startup-sized chunk and never needs a temporary object.
+    let value = match sorter.in_memory_rows(&mut compare)? {
+        Some(0) => Datum::Null,
+        Some(1) => {
+            let encoded = arena
+                .alloc_slice_copy(sorter.in_memory_row(0))
+                .map_err(|_| arena_full())?;
             crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?
         }
-        None => Datum::Null,
+        Some(_) => unreachable!("scalar subquery cardinality was checked while streaming"),
+        None => unreachable!("one scalar-subquery row cannot spill its startup-sized chunk"),
     };
     Ok((value, witness))
 }

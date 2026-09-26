@@ -7,8 +7,8 @@ name: Differential
 # against PostgreSQL as the oracle.
 #
 # Sharded so every job fits the 15-minute cap while total coverage is
-# preserved: four shards replay the vendored sqllogictest queries, four replay
-# disjoint quarters of one seeded fuzzer sequence, and deterministic protocol,
+# preserved: four shards replay the vendored sqllogictest queries, five replay
+# disjoint slices of one seeded fuzzer sequence, and deterministic protocol,
 # curated-corpus, and auxiliary gates run in their own bounded shards.
 
 on:
@@ -89,7 +89,7 @@ jobs:
             query_shard: "0"
             run_fuzz: "1"
             fuzz_start: "0"
-            fuzz_count: "2500"
+            fuzz_count: "2000"
             corpus_shard: "0"
           - shard: fuzz-2
             run_fast: "0"
@@ -99,8 +99,8 @@ jobs:
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
-            fuzz_start: "2500"
-            fuzz_count: "2500"
+            fuzz_start: "2000"
+            fuzz_count: "2000"
             corpus_shard: "0"
           - shard: fuzz-3
             run_fast: "0"
@@ -110,8 +110,8 @@ jobs:
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
-            fuzz_start: "5000"
-            fuzz_count: "2500"
+            fuzz_start: "4000"
+            fuzz_count: "2000"
             corpus_shard: "0"
           - shard: fuzz-4
             run_fast: "0"
@@ -121,8 +121,19 @@ jobs:
             run_slt: "0"
             query_shard: "0"
             run_fuzz: "1"
-            fuzz_start: "7500"
-            fuzz_count: "2500"
+            fuzz_start: "6000"
+            fuzz_count: "2000"
+            corpus_shard: "0"
+          - shard: fuzz-5
+            run_fast: "0"
+            run_core: "0"
+            run_corpus: "0"
+            run_aux: "0"
+            run_slt: "0"
+            query_shard: "0"
+            run_fuzz: "1"
+            fuzz_start: "8000"
+            fuzz_count: "2000"
             corpus_shard: "0"
           - shard: core
             run_fast: "1"
@@ -283,7 +294,7 @@ jobs:
           RUN_FUZZ: ${{ matrix.run_fuzz }}
           FAST_CORPUS_SHARDS: "4"
           FAST_CORPUS_SHARD: ${{ matrix.corpus_shard }}
-          # The two fuzz shards cover disjoint halves of the same 10k-statement
+          # The fuzz shards cover disjoint slices of the same 10k-statement
           # seeded sequence. Ignored on the other shards (RUN_FUZZ=0).
           FUZZ_START: ${{ matrix.fuzz_start }}
           FUZZ_COUNT: ${{ matrix.fuzz_count }}

@@ -26919,14 +26919,17 @@ pub fn create_trigger(
     sql_ok()
 }
 
-fn resolve_policy_roles(
+fn resolve_policy_roles<'a>(
     storage: &Storage,
     roles: &[crate::sql::ast::PolicyRole<'_>],
     txid: u32,
-) -> Result<crate::storage::PolicyRoles, SqlError> {
+    arena: &'a Arena,
+) -> Result<&'a [u16], SqlError> {
     let current = super::eval::funcs::system::current_user_owned();
     let session = super::eval::funcs::system::session_user_owned();
-    let mut resolved = [crate::storage::PUBLIC_ROLE; crate::storage::MAX_POLICY_ROLES];
+    let resolved = arena
+        .alloc_slice_with(roles.len(), |_| crate::storage::PUBLIC_ROLE)
+        .map_err(|_| arena_full())?;
     let mut count = 0usize;
     for role in roles {
         let slot = match role {
@@ -26967,33 +26970,29 @@ fn resolve_policy_roles(
         if resolved[..count].contains(&slot) {
             continue;
         }
-        if count == resolved.len() {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "a policy can target at most {} roles",
-                resolved.len()
-            ));
-        }
         resolved[count] = slot;
         count += 1;
     }
-    crate::storage::PolicyRoles::from_slice(&resolved[..count])
+    Ok(&resolved[..count])
 }
 
-fn policy_wal_roles(
+fn policy_wal_roles<'a>(
     storage: &Storage,
-    roles: crate::storage::PolicyRoles,
+    roles: &[u16],
     txid: u32,
-) -> [SqlName; crate::storage::MAX_POLICY_ROLES] {
-    let mut names = [SqlName::EMPTY; crate::storage::MAX_POLICY_ROLES];
-    for (index, role) in roles.entries().iter().copied().enumerate() {
+    arena: &'a Arena,
+) -> Result<&'a [SqlName], SqlError> {
+    let names = arena
+        .alloc_slice_with(roles.len(), |_| SqlName::EMPTY)
+        .map_err(|_| arena_full())?;
+    for (index, role) in roles.iter().copied().enumerate() {
         names[index] = if role == crate::storage::PUBLIC_ROLE {
             SqlName::parse("public").expect("PUBLIC is a valid role name")
         } else {
             storage.role_name(usize::from(role), txid)
         };
     }
-    names
+    Ok(names)
 }
 
 fn policy_expression_source(
@@ -27121,7 +27120,7 @@ pub fn create_policy(
     ) {
         return sql_fail(error);
     }
-    let roles = match resolve_policy_roles(storage, policy.roles, txn.txid) {
+    let roles = match resolve_policy_roles(storage, policy.roles, txn.txid, arena) {
         Ok(roles) => roles,
         Err(error) => return sql_fail(error),
     };
@@ -27143,7 +27142,6 @@ pub fn create_policy(
         }
     };
     let definition = crate::storage::PolicyDefinition {
-        roles,
         using: match policy_expression_source(using) {
             Ok(source) => source,
             Err(error) => return sql_fail(error),
@@ -27172,6 +27170,7 @@ pub fn create_policy(
                 crate::sql::ast::PolicyPermissiveness::Permissive
             ),
             definition,
+            roles,
         },
         &dependencies,
         txn.txid,
@@ -27188,7 +27187,13 @@ pub fn create_policy(
     {
         Ok(())
     } else {
-        let wal_roles = policy_wal_roles(storage, definition.roles, txn.txid);
+        let wal_roles = match policy_wal_roles(storage, roles, txn.txid, arena) {
+            Ok(roles) => roles,
+            Err(error) => {
+                storage.rollback_policy_create(slot);
+                return sql_fail(error);
+            }
+        };
         let lsn = storage.bump_lsn();
         wal.stage(
             txn.txid,
@@ -27202,8 +27207,7 @@ pub fn create_policy(
                     policy.permissiveness,
                     crate::sql::ast::PolicyPermissiveness::Permissive
                 ),
-                roles: wal_roles,
-                role_count: definition.roles.entries().len(),
+                roles: crate::wal::WalPolicyRoles::Names(wal_roles),
                 using: definition.using.as_ref().map(|source| source.as_str()),
                 with_check: definition.with_check.as_ref().map(|source| source.as_str()),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(dependencies.view()),
@@ -27258,12 +27262,17 @@ pub fn alter_policy(
         ));
     };
     let mut definition = storage.policy(slot).definition_for(txn.txid);
-    if let Some(roles) = alteration.roles {
-        definition.roles = match resolve_policy_roles(storage, roles, txn.txid) {
+    let roles = if let Some(roles) = alteration.roles {
+        match resolve_policy_roles(storage, roles, txn.txid, arena) {
             Ok(roles) => roles,
             Err(error) => return sql_fail(error),
-        };
-    }
+        }
+    } else {
+        match arena.alloc_slice_copy(storage.policy_roles(slot, txn.txid)) {
+            Ok(roles) => &*roles,
+            Err(_) => return sql_fail(arena_full()),
+        }
+    };
     if let Some(expression) = alteration.using {
         definition.using = match policy_expression_source(Some(expression)) {
             Ok(source) => source,
@@ -27281,7 +27290,7 @@ pub fn alter_policy(
             Ok(dependencies) => dependencies,
             Err(error) => return sql_fail(error),
         };
-    let prior = match storage.alter_policy(slot, definition, &dependencies, txn.txid) {
+    let prior = match storage.alter_policy(slot, definition, roles, &dependencies, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
@@ -27295,7 +27304,13 @@ pub fn alter_policy(
     {
         Ok(())
     } else {
-        let wal_roles = policy_wal_roles(storage, definition.roles, txn.txid);
+        let wal_roles = match policy_wal_roles(storage, roles, txn.txid, arena) {
+            Ok(roles) => roles,
+            Err(error) => {
+                storage.rollback_policy_alter(slot, prior);
+                return sql_fail(error);
+            }
+        };
         let lsn = storage.bump_lsn();
         wal.stage(
             txn.txid,
@@ -27306,8 +27321,7 @@ pub fn alter_policy(
                 name: policy.name.as_str(),
                 command: policy.command.code(),
                 permissive: policy.permissive,
-                roles: wal_roles,
-                role_count: definition.roles.entries().len(),
+                roles: crate::wal::WalPolicyRoles::Names(wal_roles),
                 using: definition.using.as_ref().map(|source| source.as_str()),
                 with_check: definition.with_check.as_ref().map(|source| source.as_str()),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(dependencies.view()),
@@ -44678,11 +44692,14 @@ fn rewrite_table_policy_column_references(
         }
         let dependencies =
             validate_policy_definition(storage, table, &definition, txn.txid, arena)?;
-        let prior = storage.alter_policy(slot, definition, &dependencies, txn.txid)?;
+        let roles = arena
+            .alloc_slice_copy(storage.policy_roles(slot, txn.txid))
+            .map_err(|_| arena_full())?;
+        let prior = storage.alter_policy(slot, definition, roles, &dependencies, txn.txid)?;
         let table_definition = storage.table_def(table, txn.txid);
         let table_schema = table_definition.schema;
         let table_name = table_definition.name;
-        let wal_roles = policy_wal_roles(storage, definition.roles, txn.txid);
+        let wal_roles = policy_wal_roles(storage, roles, txn.txid, arena)?;
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(
             txn.txid,
@@ -44693,8 +44710,7 @@ fn rewrite_table_policy_column_references(
                 name: policy.name.as_str(),
                 command: policy.command.code(),
                 permissive: policy.permissive,
-                roles: wal_roles,
-                role_count: definition.roles.entries().len(),
+                roles: crate::wal::WalPolicyRoles::Names(wal_roles),
                 using: definition.using.as_ref().map(|source| source.as_str()),
                 with_check: definition.with_check.as_ref().map(|source| source.as_str()),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(dependencies.view()),

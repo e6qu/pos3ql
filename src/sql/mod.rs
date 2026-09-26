@@ -19089,7 +19089,6 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             command,
             permissive,
             roles,
-            role_count,
             using,
             with_check,
             dependencies,
@@ -19105,24 +19104,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     ));
                 }
             };
-            let mut role_slots = [crate::storage::PUBLIC_ROLE; crate::storage::MAX_POLICY_ROLES];
-            for (index, role) in roles[..role_count].iter().enumerate() {
-                role_slots[index] = if role.as_str().eq_ignore_ascii_case("public") {
-                    crate::storage::PUBLIC_ROLE
-                } else {
-                    storage.find_role_visible(role.as_str(), 0).ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "journal policy references unknown role \"{}\"",
-                            role.as_str()
-                        )
-                    })? as u16
-                };
-            }
             let dependencies =
                 storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
             storage.replay_set_policy(
-                crate::storage::PolicySpec {
+                crate::storage::RecoveredPolicySpec {
                     name: crate::storage::SqlName::parse(name)?,
                     table: table_slot,
                     command: crate::storage::PolicyCommandKind::from_code(command).ok_or_else(
@@ -19135,13 +19120,13 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     )?,
                     permissive,
                     definition: crate::storage::PolicyDefinition {
-                        roles: crate::storage::PolicyRoles::from_slice(&role_slots[..role_count])?,
                         using: using.map(crate::storage::policy_expression).transpose()?,
                         with_check: with_check
                             .map(crate::storage::policy_expression)
                             .transpose()?,
                     },
                 },
+                roles.iter(),
                 dependencies,
             )?;
         }

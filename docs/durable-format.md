@@ -40,6 +40,14 @@ v4 marker 253 for 16-bit counts and ordinals while retaining v3 marker 254.
 Manifest v14 keeps its text grammar: sparse column sets parse old one-word
 values, and wide composite fields stream into the configured manifest buffer.
 
+Manifest v14 also fixes table constraints at 64 entries per modeled kind and
+domain checks at 64 entries. Their journal counts are unsigned bytes, while
+their positions use a 64-entry stride in synthesized `pg_constraint` and
+referential-trigger OIDs. The 65th entry is rejected with SQLSTATE `54000`
+before catalog mutation. Raising this boundary would renumber durable catalog
+identities, so it requires an explicit format and OID migration rather than a
+constant change.
+
 ## Compatible online changes
 
 A compatible format change must add a distinct identity and a reader before a

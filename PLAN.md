@@ -60,9 +60,15 @@ accepted shape, SQL or wire error, storage representation, and the reason for
 keeping or lifting it. Explicit rejection protects correctness but does not
 make a smaller accepted surface PostgreSQL-compatible at that width.
 
-The known narrower limits to resolve or justify are:
-
-- durable 64-item constraint definition shapes.
+The audited durable 64-item constraint definition shape is retained by
+manifest v14. Table constraints accept 64 entries per modeled kind and domains
+accept 64 checks; the next item fails with SQLSTATE `54000` before catalog
+mutation. Constraint positions are durable `pg_constraint` and referential
+trigger OID identities with a 64-entry per-object stride. Raising the boundary
+therefore requires an explicit format and OID migration that preserves existing
+identities. Accepted-width catalog, WAL, checkpoint, empty-cache recovery, and
+PostgreSQL differential coverage keep the current boundary exact. This remains
+a documented PostgreSQL scale divergence rather than a compatibility claim.
 
 Policy role lists now accept every configured catalog role plus `PUBLIC`.
 Startup-sized committed, transactional, and recovery images preserve stored
@@ -139,8 +145,9 @@ decodes maximum-width relation and tuple frames as validated borrowed wire
 views, keeping the decoded message size independent of the 1,600-column limit.
 CI preserves the complete library, curated PostgreSQL differential, and
 10,000-statement seeded fuzz suites in deterministic shards below the
-15-minute worker ceiling; the seeded sequence and forced-spill corpus each run
-in five slices, and instrumented auxiliary phases have independent workers.
+15-minute worker ceiling; the seeded sequence runs in five slices, the growing
+forced-spill corpus runs in six, and instrumented auxiliary phases have
+independent workers.
 
 Join range tables and accumulated `USING` merge state now use exact
 statement-arena slices rather than a 64-relation executor envelope. Compact

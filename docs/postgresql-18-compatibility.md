@@ -147,7 +147,10 @@ PostgreSQL.
   supports 64 table constraints of each modeled kind, 64 domain checks, and 64
   LIST-bound values. Accepted widths are preserved through record typing,
   catalogs, WAL, checkpoints, and object-cold recovery; wider constraint
-  collections and LIST bounds remain loud program-limit errors.
+  collections and LIST bounds remain loud program-limit errors. Constraint
+  positions are also durable catalog and referential-trigger OID identities.
+  The 64-entry stride is retained by manifest v14 until an explicit format and
+  OID migration can preserve existing identities.
 - Statement lists are bounded by the fixed statement arena, not by compiled
   staging arrays: select lists, `IN` lists, `ARRAY` constructors, `CASE` arms,
   function arguments up to PostgreSQL's own 100, `VALUES` rows, CTEs,

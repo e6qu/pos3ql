@@ -39,11 +39,12 @@ fi
 # auxiliary probes. Each worker has a fixed 15-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
-    '- { name: a, corpus_shard: "0-of-5", auxiliary: none }' \
-    '- { name: b, corpus_shard: "1-of-5", auxiliary: none }' \
-    '- { name: c, corpus_shard: "2-of-5", auxiliary: none }' \
-    '- { name: d, corpus_shard: "3-of-5", auxiliary: none }' \
-    '- { name: e, corpus_shard: "4-of-5", auxiliary: none }' \
+    '- { name: a, corpus_shard: "0-of-6", auxiliary: none }' \
+    '- { name: b, corpus_shard: "1-of-6", auxiliary: none }' \
+    '- { name: c, corpus_shard: "2-of-6", auxiliary: none }' \
+    '- { name: d, corpus_shard: "3-of-6", auxiliary: none }' \
+    '- { name: e, corpus_shard: "4-of-6", auxiliary: none }' \
+    '- { name: f, corpus_shard: "5-of-6", auxiliary: none }' \
     '- { name: exact, corpus_shard: "none", auxiliary: exact }' \
     '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
     '- { name: types, corpus_shard: "none", auxiliary: types }' \

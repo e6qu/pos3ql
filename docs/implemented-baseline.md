@@ -5,6 +5,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
 
 - Object-native commit publication, checkpoints, crash recovery, and recovery
   with empty RAM and disk caches.
+- Manifest v14 retains 64 table constraints per modeled kind and 64 domain
+  checks. The complete accepted width is qualified through catalogs, WAL,
+  checkpoints, empty-cache recovery, and PostgreSQL differential execution;
+  the next item fails before mutation with SQLSTATE `54000`. Shared catalog OID
+  constructors keep event triggers and catalog rows on the durable 64-entry
+  stride.
 - Manifest and row SST formats have explicit reader and writer identities.
   Manifest v13 upgrades to v14 on the next checkpoint; direct v2 and packed PAX
   v3 row generations coexist with packed v4 generations. New full slices and

@@ -61,23 +61,28 @@ impl Point {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Geo {
+struct Geo<'a> {
     kind: GeometryKind,
-    points: [Point; 128],
+    points: &'a mut [Point],
     count: usize,
     closed: bool,
     extra: f64,
     extra2: f64,
 }
 
-fn decoded(kind: GeometryKind, text: &str) -> Result<Geo, SqlError> {
-    let (values, count, closed) = points_parts(kind, text)?;
-    let mut points = [Point::default(); 128];
+fn decoded<'a>(
+    kind: GeometryKind,
+    text: &str,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Geo<'a>, SqlError> {
+    let (values, count, closed) = points_parts(kind, text, arena)?;
     let point_count = match kind {
         GeometryKind::Circle | GeometryKind::Line => 1,
         _ => count / 2,
     };
+    let points = arena
+        .alloc_slice_with(point_count, |_| Point::default())
+        .map_err(|_| super::super::arena_full())?;
     for (output, input) in points
         .iter_mut()
         .zip(values[..point_count * 2].as_chunks::<2>().0)
@@ -106,7 +111,8 @@ fn decoded(kind: GeometryKind, text: &str) -> Result<Geo, SqlError> {
 }
 
 fn line_coefficients(kind: GeometryKind, text: &str) -> Result<(f64, f64, f64), SqlError> {
-    let (values, _, _) = points_parts(kind, text)?;
+    let mut values = [0.0; 4];
+    geometry::components(kind, text, &mut values)?;
     match kind {
         GeometryKind::Line => Ok((values[0], values[1], values[2])),
         GeometryKind::Lseg => {
@@ -117,9 +123,12 @@ fn line_coefficients(kind: GeometryKind, text: &str) -> Result<(f64, f64, f64), 
     }
 }
 
-fn geo_from_datum(value: Datum<'_>) -> Result<(Geo, &str), SqlError> {
+fn geo_from_datum<'a>(
+    value: Datum<'a>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<(Geo<'a>, &'a str), SqlError> {
     match value {
-        Datum::Geometry { kind, text } => Ok((decoded(kind, text)?, text)),
+        Datum::Geometry { kind, text } => Ok((decoded(kind, text, arena)?, text)),
         other => Err(type_error(type_name_of_geometry(&other))),
     }
 }
@@ -131,7 +140,7 @@ fn type_name_of_geometry(value: &Datum<'_>) -> &'static str {
     }
 }
 
-fn bounds(geo: &Geo) -> (f64, f64, f64, f64) {
+fn bounds(geo: &Geo<'_>) -> (f64, f64, f64, f64) {
     if geo.kind == GeometryKind::Circle {
         let center = geo.points[0];
         return (
@@ -463,65 +472,38 @@ fn area_of(geo: &Geo) -> f64 {
 }
 
 fn render_geo<'a>(geo: &Geo, arena: &'a crate::mem::arena::Arena) -> Result<Datum<'a>, SqlError> {
-    let mut out = StackStr::<2048>::new();
+    let count = match geo.kind {
+        GeometryKind::Line | GeometryKind::Circle => 3,
+        _ => geo
+            .count
+            .checked_mul(2)
+            .ok_or_else(super::super::arena_full)?,
+    };
+    let values = arena
+        .alloc_slice_with(count, |_| 0.0)
+        .map_err(|_| super::super::arena_full())?;
     match geo.kind {
-        GeometryKind::Point => write_point(&mut out, geo.points[0].x, geo.points[0].y),
-        GeometryKind::Lseg => {
-            let _ = out.write_str("[");
-            write_point(&mut out, geo.points[0].x, geo.points[0].y);
-            let _ = out.write_str(",");
-            write_point(&mut out, geo.points[1].x, geo.points[1].y);
-            let _ = out.write_str("]");
-        }
-        GeometryKind::Box => {
-            let (high_x, high_y, low_x, low_y) = bounds(geo);
-            write_point(&mut out, high_x, high_y);
-            let _ = out.write_str(",");
-            write_point(&mut out, low_x, low_y);
-        }
-        GeometryKind::Path => {
-            let mut values = [0.0; 256];
-            for (index, point) in geo.points[..geo.count].iter().enumerate() {
-                values[index * 2] = point.x;
-                values[index * 2 + 1] = point.y;
-            }
-            write_points(&mut out, &values[..geo.count * 2], geo.closed);
-        }
-        GeometryKind::Polygon => {
-            let _ = out.write_str("(");
-            for (index, point) in geo.points[..geo.count].iter().enumerate() {
-                if index != 0 {
-                    let _ = out.write_str(",");
-                }
-                write_point(&mut out, point.x, point.y);
-            }
-            let _ = out.write_str(")");
-        }
         GeometryKind::Line => {
-            let _ = write!(
-                out,
-                "{{{},{},{}}}",
-                PgFloat8(geo.points[0].x),
-                PgFloat8(geo.extra),
-                PgFloat8(geo.extra2)
-            );
+            values.copy_from_slice(&[geo.points[0].x, geo.extra, geo.extra2]);
         }
         GeometryKind::Circle => {
-            let _ = out.write_str("<");
-            write_point(&mut out, geo.points[0].x, geo.points[0].y);
-            let _ = write!(out, ",{}>", PgFloat8(geo.extra));
+            values.copy_from_slice(&[geo.points[0].x, geo.points[0].y, geo.extra]);
+        }
+        _ => {
+            for (output, point) in values
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(geo.points.iter())
+            {
+                *output = [point.x, point.y];
+            }
         }
     }
-    if matches!(geo.kind, GeometryKind::Line | GeometryKind::Circle) {
-        return arena
-            .alloc_str(out.as_str())
-            .map(|text| Datum::Geometry {
-                kind: geo.kind,
-                text,
-            })
-            .map_err(|_| super::super::arena_full());
-    }
-    geometry_value(geo.kind, out.as_str(), arena)
+    geometry::render(geo.kind, values, geo.closed, arena).map(|text| Datum::Geometry {
+        kind: geo.kind,
+        text,
+    })
 }
 
 fn type_error(name: &str) -> SqlError {
@@ -555,15 +537,22 @@ fn geometry_value<'a>(
 }
 
 fn point_parts(text: &str) -> Result<(f64, f64), SqlError> {
-    let mut values = [0.0; 256];
+    let mut values = [0.0; 2];
     let (count, _) = geometry::components(GeometryKind::Point, text, &mut values)?;
     debug_assert_eq!(count, 2);
     Ok((values[0], values[1]))
 }
 
-fn points_parts(kind: GeometryKind, text: &str) -> Result<([f64; 256], usize, bool), SqlError> {
-    let mut values = [0.0; 256];
-    let (count, closed) = geometry::components(kind, text, &mut values)?;
+fn points_parts<'a>(
+    kind: GeometryKind,
+    text: &str,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<(&'a mut [f64], usize, bool), SqlError> {
+    let (count, _) = geometry::component_count(kind, text)?;
+    let values = arena
+        .alloc_slice_with(count, |_| 0.0)
+        .map_err(|_| super::super::arena_full())?;
+    let (count, closed) = geometry::components(kind, text, values)?;
     Ok((values, count, closed))
 }
 
@@ -571,19 +560,12 @@ fn write_point(out: &mut StackStr<2048>, x: f64, y: f64) {
     let _ = write!(out, "({},{})", PgFloat8(x), PgFloat8(y));
 }
 
-fn write_points(out: &mut StackStr<2048>, values: &[f64], closed: bool) {
-    let _ = out.write_str(if closed { "(" } else { "[" });
-    for (index, point) in values.as_chunks::<2>().0.iter().enumerate() {
-        if index != 0 {
-            let _ = out.write_str(",");
-        }
-        write_point(out, point[0], point[1]);
-    }
-    let _ = out.write_str(if closed { ")" } else { "]" });
-}
-
-fn center_of(kind: GeometryKind, text: &str) -> Result<(f64, f64), SqlError> {
-    let (values, count, _) = points_parts(kind, text)?;
+fn center_of(
+    kind: GeometryKind,
+    text: &str,
+    arena: &crate::mem::arena::Arena,
+) -> Result<(f64, f64), SqlError> {
+    let (values, count, _) = points_parts(kind, text, arena)?;
     match kind {
         GeometryKind::Point | GeometryKind::Circle => Ok((values[0], values[1])),
         GeometryKind::Box | GeometryKind::Lseg => {
@@ -603,8 +585,12 @@ fn center_of(kind: GeometryKind, text: &str) -> Result<(f64, f64), SqlError> {
     }
 }
 
-fn box_parts(kind: GeometryKind, text: &str) -> Result<(f64, f64, f64, f64), SqlError> {
-    let (values, count, _) = points_parts(kind, text)?;
+fn box_parts(
+    kind: GeometryKind,
+    text: &str,
+    arena: &crate::mem::arena::Arena,
+) -> Result<(f64, f64, f64, f64), SqlError> {
+    let (values, count, _) = points_parts(kind, text, arena)?;
     match kind {
         GeometryKind::Point => Ok((values[0], values[1], values[0], values[1])),
         GeometryKind::Box => Ok((values[0], values[1], values[2], values[3])),
@@ -750,8 +736,8 @@ pub(crate) fn dispatch<'a>(
                 }
                 let left_line = line_coefficients(left_kind, left_text)?;
                 let right_line = line_coefficients(right_kind, right_text)?;
-                let left_geo = decoded(left_kind, left_text)?;
-                let right_geo = decoded(right_kind, right_text)?;
+                let left_geo = decoded(left_kind, left_text, arena)?;
+                let right_geo = decoded(right_kind, right_text, arena)?;
                 Ok(Datum::Bool(if left_kind == GeometryKind::Lseg {
                     if name == "isparallel" {
                         fp_eq(
@@ -788,7 +774,7 @@ pub(crate) fn dispatch<'a>(
                                     | GeometryKind::Polygon
                             ) =>
                         {
-                            let (x, y) = center_of(kind, text)?;
+                            let (x, y) = center_of(kind, text, arena)?;
                             let mut out = StackStr::<2048>::new();
                             write_point(&mut out, x, y);
                             built(GeometryKind::Point, out.as_str())
@@ -817,7 +803,7 @@ pub(crate) fn dispatch<'a>(
                             },
                         ) => {
                             let (high_x, high_y, low_x, low_y) =
-                                box_parts(GeometryKind::Box, text)?;
+                                box_parts(GeometryKind::Box, text, arena)?;
                             let mut out = StackStr::<2048>::new();
                             let _ = out.write_str("[");
                             write_point(&mut out, high_x, high_y);
@@ -832,7 +818,7 @@ pub(crate) fn dispatch<'a>(
                                 GeometryKind::Point | GeometryKind::Circle | GeometryKind::Polygon
                             ) =>
                         {
-                            let (high_x, high_y, low_x, low_y) = box_parts(kind, text)?;
+                            let (high_x, high_y, low_x, low_y) = box_parts(kind, text, arena)?;
                             let mut out = StackStr::<2048>::new();
                             write_point(&mut out, high_x, high_y);
                             let _ = out.write_str(",");
@@ -886,7 +872,7 @@ pub(crate) fn dispatch<'a>(
                             text,
                         } => {
                             let (high_x, high_y, low_x, low_y) =
-                                box_parts(GeometryKind::Box, text)?;
+                                box_parts(GeometryKind::Box, text, arena)?;
                             let x = (high_x + low_x) / 2.0;
                             let y = (high_y + low_y) / 2.0;
                             let radius = (high_x - low_x).hypot(high_y - low_y) / 2.0;
@@ -900,8 +886,9 @@ pub(crate) fn dispatch<'a>(
                             kind: GeometryKind::Polygon,
                             text,
                         } => {
-                            let (values, count, _) = points_parts(GeometryKind::Polygon, text)?;
-                            let (x, y) = center_of(GeometryKind::Polygon, text)?;
+                            let (values, count, _) =
+                                points_parts(GeometryKind::Polygon, text, arena)?;
+                            let (x, y) = center_of(GeometryKind::Polygon, text, arena)?;
                             let mut radius = 0.0;
                             for point in values[..count].as_chunks::<2>().0 {
                                 radius += (point[0] - x).hypot(point[1] - y);
@@ -961,15 +948,19 @@ pub(crate) fn dispatch<'a>(
                     if circle.is_null() {
                         return Ok(Datum::Null);
                     }
-                    if !(2..=128).contains(&count) {
-                        return Err(sql_err!(
-                            sqlstate::INVALID_PARAMETER_VALUE,
-                            "polygon must have between 2 and 128 points"
-                        ));
-                    }
+                    let count = usize::try_from(count)
+                        .ok()
+                        .filter(|count| *count >= 2)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INVALID_PARAMETER_VALUE,
+                                "polygon must have at least 2 points"
+                            )
+                        })?;
                     let (values, _, _) = points_parts(
                         GeometryKind::Circle,
                         geometry(circle, GeometryKind::Circle, name)?,
+                        arena,
                     )?;
                     if values[2].abs() <= EPSILON {
                         return Err(sql_err!(
@@ -977,22 +968,22 @@ pub(crate) fn dispatch<'a>(
                             "cannot convert circle with radius zero to polygon"
                         ));
                     }
-                    let mut out = StackStr::<2048>::new();
-                    let _ = out.write_str("(");
+                    let component_count =
+                        count.checked_mul(2).ok_or_else(super::super::arena_full)?;
+                    let output = arena
+                        .alloc_slice_with(component_count, |_| 0.0)
+                        .map_err(|_| super::super::arena_full())?;
                     let angle_step = core::f64::consts::TAU / count as f64;
                     for index in 0..count {
-                        if index != 0 {
-                            let _ = out.write_str(",");
-                        }
                         let angle = angle_step * index as f64;
-                        write_point(
-                            &mut out,
-                            values[0] - values[2] * angle.cos(),
-                            values[1] + values[2] * angle.sin(),
-                        );
+                        output[index * 2] = values[0] - values[2] * angle.cos();
+                        output[index * 2 + 1] = values[1] + values[2] * angle.sin();
                     }
-                    let _ = out.write_str(")");
-                    return built(GeometryKind::Polygon, out.as_str());
+                    let text = geometry::render(GeometryKind::Polygon, output, true, arena)?;
+                    return Ok(Datum::Geometry {
+                        kind: GeometryKind::Polygon,
+                        text,
+                    });
                 }
                 want(1)?;
                 match arg(0)? {
@@ -1005,17 +996,20 @@ pub(crate) fn dispatch<'a>(
                         kind: GeometryKind::Path,
                         text,
                     } => {
-                        let mut polygon = StackStr::<2048>::new();
-                        let _ = polygon.write_str("(");
-                        let _ = polygon.write_str(&text[1..text.len() - 1]);
-                        let _ = polygon.write_str(")");
-                        built(GeometryKind::Polygon, polygon.as_str())
+                        let (values, count, _) = points_parts(GeometryKind::Path, text, arena)?;
+                        geometry::render(GeometryKind::Polygon, &values[..count], true, arena).map(
+                            |text| Datum::Geometry {
+                                kind: GeometryKind::Polygon,
+                                text,
+                            },
+                        )
                     }
                     Datum::Geometry {
                         kind: GeometryKind::Box,
                         text,
                     } => {
-                        let (high_x, high_y, low_x, low_y) = box_parts(GeometryKind::Box, text)?;
+                        let (high_x, high_y, low_x, low_y) =
+                            box_parts(GeometryKind::Box, text, arena)?;
                         let mut out = StackStr::<2048>::new();
                         let _ = out.write_str("(");
                         write_point(&mut out, low_x, low_y);
@@ -1036,7 +1030,7 @@ pub(crate) fn dispatch<'a>(
                             Datum::Geometry { text, .. } => text,
                             _ => unreachable!(),
                         };
-                        let (values, _, _) = points_parts(GeometryKind::Circle, literal)?;
+                        let (values, _, _) = points_parts(GeometryKind::Circle, literal, arena)?;
                         if values[2].abs() <= EPSILON {
                             return Err(sql_err!(
                                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1081,6 +1075,7 @@ pub(crate) fn dispatch<'a>(
                 let (values, _, _) = points_parts(
                     GeometryKind::Circle,
                     geometry(value, GeometryKind::Circle, name)?,
+                    arena,
                 )?;
                 Ok(Datum::Float8(
                     values[2] * if name == "diameter" { 2.0 } else { 1.0 },
@@ -1100,7 +1095,7 @@ pub(crate) fn dispatch<'a>(
                     }
                     _ => return Err(type_error(name)),
                 };
-                let (values, _, _) = points_parts(kind, text)?;
+                let (values, _, _) = points_parts(kind, text, arena)?;
                 let (x, y) = if kind == GeometryKind::Circle {
                     (values[0], values[1])
                 } else {
@@ -1123,7 +1118,7 @@ pub(crate) fn dispatch<'a>(
                     } => (kind, text),
                     _ => return Err(type_error(name)),
                 };
-                let (_, count, _) = points_parts(kind, text)?;
+                let (_, count, _) = points_parts(kind, text, arena)?;
                 Ok(Datum::Int4((count / 2) as i32))
             }
             "diagonal" => {
@@ -1132,8 +1127,11 @@ pub(crate) fn dispatch<'a>(
                 if value.is_null() {
                     return Ok(Datum::Null);
                 }
-                let (high_x, high_y, low_x, low_y) =
-                    box_parts(GeometryKind::Box, geometry(value, GeometryKind::Box, name)?)?;
+                let (high_x, high_y, low_x, low_y) = box_parts(
+                    GeometryKind::Box,
+                    geometry(value, GeometryKind::Box, name)?,
+                    arena,
+                )?;
                 let mut out = StackStr::<2048>::new();
                 let _ = out.write_str("[");
                 write_point(&mut out, high_x, high_y);
@@ -1148,8 +1146,11 @@ pub(crate) fn dispatch<'a>(
                 if value.is_null() {
                     return Ok(Datum::Null);
                 }
-                let (high_x, high_y, low_x, low_y) =
-                    box_parts(GeometryKind::Box, geometry(value, GeometryKind::Box, name)?)?;
+                let (high_x, high_y, low_x, low_y) = box_parts(
+                    GeometryKind::Box,
+                    geometry(value, GeometryKind::Box, name)?,
+                    arena,
+                )?;
                 Ok(Datum::Float8(if name == "width" {
                     high_x - low_x
                 } else {
@@ -1175,10 +1176,16 @@ pub(crate) fn dispatch<'a>(
                 if left.is_null() || right.is_null() {
                     return Ok(Datum::Null);
                 }
-                let (ahx, ahy, alx, aly) =
-                    box_parts(GeometryKind::Box, geometry(left, GeometryKind::Box, name)?)?;
-                let (bhx, bhy, blx, bly) =
-                    box_parts(GeometryKind::Box, geometry(right, GeometryKind::Box, name)?)?;
+                let (ahx, ahy, alx, aly) = box_parts(
+                    GeometryKind::Box,
+                    geometry(left, GeometryKind::Box, name)?,
+                    arena,
+                )?;
+                let (bhx, bhy, blx, bly) = box_parts(
+                    GeometryKind::Box,
+                    geometry(right, GeometryKind::Box, name)?,
+                    arena,
+                )?;
                 let mut out = StackStr::<2048>::new();
                 write_point(&mut out, ahx.max(bhx), ahy.max(bhy));
                 let _ = out.write_str(",");
@@ -1195,28 +1202,21 @@ pub(crate) fn dispatch<'a>(
                     Datum::Geometry { kind, text } => (kind, text),
                     _ => return Err(type_error(name)),
                 };
-                let (values, count, closed) = points_parts(kind, text)?;
+                let (values, count, closed) = points_parts(kind, text, arena)?;
                 match name {
                     "isclosed" | "isopen" if kind == GeometryKind::Path => {
                         Ok(Datum::Bool(closed == (name == "isclosed")))
                     }
-                    "pclose" | "popen" if kind == GeometryKind::Path => {
-                        let mut canonical = StackStr::<2048>::new();
-                        let _ = canonical.write_str(if name == "pclose" { "(" } else { "[" });
-                        for index in (0..count).step_by(2) {
-                            if index != 0 {
-                                let _ = canonical.write_str(",");
-                            }
-                            let _ = write!(
-                                canonical,
-                                "({},{})",
-                                PgFloat8(values[index]),
-                                PgFloat8(values[index + 1])
-                            );
-                        }
-                        let _ = canonical.write_str(if name == "pclose" { ")" } else { "]" });
-                        built(GeometryKind::Path, canonical.as_str())
-                    }
+                    "pclose" | "popen" if kind == GeometryKind::Path => geometry::render(
+                        GeometryKind::Path,
+                        &values[..count],
+                        name == "pclose",
+                        arena,
+                    )
+                    .map(|text| Datum::Geometry {
+                        kind: GeometryKind::Path,
+                        text,
+                    }),
                     "area" if kind == GeometryKind::Circle => {
                         Ok(Datum::Float8(core::f64::consts::PI * values[2] * values[2]))
                     }
@@ -1773,7 +1773,7 @@ pub(crate) fn operator<'a>(
         return Some(Ok(Datum::Null));
     }
     Some((|| {
-        let (left, left_text) = geo_from_datum(arguments[0])?;
+        let (left, left_text) = geo_from_datum(arguments[0], arena)?;
         if arguments.len() == 1 {
             return match name {
                 "@-@" => {
@@ -1786,7 +1786,7 @@ pub(crate) fn operator<'a>(
                     Ok(Datum::Float8(length))
                 }
                 "@@" => {
-                    let (x, y) = center_of(left.kind, left_text)?;
+                    let (x, y) = center_of(left.kind, left_text, arena)?;
                     render_point(Point { x, y }, arena)
                 }
                 "#" => Ok(Datum::Int4(left.count as i32)),
@@ -1801,22 +1801,35 @@ pub(crate) fn operator<'a>(
                 _ => Err(operator_undefined(name)),
             };
         }
-        let (right, right_text) = geo_from_datum(arguments[1])?;
+        let (right, right_text) = geo_from_datum(arguments[1], arena)?;
         match name {
             "+" if left.kind == GeometryKind::Path && right.kind == GeometryKind::Path => {
                 if left.closed || right.closed {
                     return Ok(Datum::Null);
                 }
-                if left.count + right.count > 128 {
-                    return Err(sql_err!(
+                let count = left.count.checked_add(right.count).ok_or_else(|| {
+                    sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "path has too many points"
-                    ));
-                }
-                let mut joined = left;
-                joined.points[left.count..left.count + right.count]
-                    .copy_from_slice(&right.points[..right.count]);
-                joined.count += right.count;
+                        "path exceeds the statement arena"
+                    )
+                })?;
+                let points = arena
+                    .alloc_slice_with(count, |index| {
+                        if index < left.count {
+                            left.points[index]
+                        } else {
+                            right.points[index - left.count]
+                        }
+                    })
+                    .map_err(|_| super::super::arena_full())?;
+                let joined = Geo {
+                    kind: GeometryKind::Path,
+                    points,
+                    count,
+                    closed: false,
+                    extra: 0.0,
+                    extra2: 0.0,
+                };
                 render_geo(&joined, arena)
             }
             "+" | "-" | "*" | "/" if right.kind == GeometryKind::Point => {
@@ -1832,15 +1845,17 @@ pub(crate) fn operator<'a>(
                 if high_x < low_x || high_y < low_y {
                     return Ok(Datum::Null);
                 }
+                let points = arena
+                    .alloc_slice_with(2, |_| Point::default())
+                    .map_err(|_| super::super::arena_full())?;
                 let geo = Geo {
                     kind: GeometryKind::Box,
-                    points: [Point::default(); 128],
+                    points,
                     count: 2,
                     closed: false,
                     extra: 0.0,
                     extra2: 0.0,
                 };
-                let mut geo = geo;
                 geo.points[0] = Point {
                     x: high_x,
                     y: high_y,
@@ -2038,7 +2053,7 @@ pub(crate) fn subscript<'a>(
     index: i64,
     arena: &'a crate::mem::arena::Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let geo = decoded(kind, text)?;
+    let geo = decoded(kind, text, arena)?;
     match kind {
         GeometryKind::Point => match index {
             0 => Ok(Datum::Float8(geo.points[0].x)),
@@ -2070,7 +2085,7 @@ pub(crate) fn set_subscript<'a>(
     value: Datum<'a>,
     arena: &'a crate::mem::arena::Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut geo = decoded(kind, text)?;
+    let mut geo = decoded(kind, text, arena)?;
     match kind {
         GeometryKind::Point | GeometryKind::Line => {
             let coordinate = datum_f64("point subscript assignment", value)?;
@@ -2097,7 +2112,7 @@ pub(crate) fn set_subscript<'a>(
             else {
                 return Err(type_error("geometric subscript assignment"));
             };
-            let replacement = decoded(GeometryKind::Point, text)?.points[0];
+            let replacement = decoded(GeometryKind::Point, text, arena)?.points[0];
             match usize::try_from(index) {
                 Ok(index @ 0..=1) => geo.points[index] = replacement,
                 _ => {

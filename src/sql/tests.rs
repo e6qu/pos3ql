@@ -47068,6 +47068,29 @@ fn geometric_operators_cover_transforms_relations_and_distance() {
 }
 
 #[test]
+fn geometric_values_use_statement_memory_beyond_the_former_point_limit() {
+    let (mut engine, budget) = test_engine();
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT npoints(polygon(300, circle '<(0,0),1>')), \
+                npoints(path(polygon(300, circle '<(0,0),1>')) + point '(1,2)'), \
+                npoints(popen(path(polygon(150, circle '<(0,0),1>'))) + \
+                        popen(path(polygon(150, circle '<(2,2),1>')))), \
+                isclosed(pclose(path(polygon(300, circle '<(0,0),1>')))), \
+                length(path(polygon(300, circle '<(0,0),1>'))) > 0, \
+                octet_length(polygon(300, circle '<(0,0),1>')::text) > 2048",
+        8 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["300|300|300|t|t|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn geometric_subscripts_read_and_update_typed_components() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -47186,6 +47209,7 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
             &mut budget,
             "CREATE TABLE durable_geometric_values (\
                point_value point, line_value line, path_values path[], \
+               wide_polygon polygon, wide_path path, \
                circle_value circle DEFAULT '<(0,0),10>', \
                constructed_circle circle DEFAULT circle(point '(1,2)', -3), \
                default_point point DEFAULT '(8,9)', \
@@ -47195,7 +47219,12 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
              INSERT INTO durable_geometric_values (point_value, line_value, path_values) VALUES \
                ('(1,2)', '((1,2),(3,4))', \
                 ARRAY['[(1,2),(3,4)]'::path, '((5,6),(7,8))'::path]); \
+             UPDATE durable_geometric_values \
+                SET wide_polygon = polygon(300, circle '<(0,0),1>'), \
+                    wide_path = path(polygon(300, circle '<(0,0),1>')); \
              UPDATE durable_geometric_values SET line_value[0] = 0, line_value[1] = 0; \
+             CREATE INDEX durable_geometric_wide_polygon \
+                 ON durable_geometric_values USING gist (wide_polygon); \
              CREATE VIEW durable_geometric_view AS \
                SELECT (point_value + point '(2,3)')::text AS translated, \
                       point_value <-> point '(1,2)' AS distance, \
@@ -47220,11 +47249,16 @@ fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
             "SELECT point_value::text, line_value::text, path_values::text, default_point::text, \
                     constructed_circle::text, origin_distance \
                FROM durable_geometric_values; \
+             SELECT npoints(wide_polygon), npoints(wide_path), length(wide_path) > 0, \
+                    octet_length(wide_polygon::text) > 2048 \
+               FROM durable_geometric_values \
+              WHERE wide_polygon && polygon(300, circle '<(0,0),1>'); \
              SELECT translated, distance, contains_point, line_constant \
                FROM durable_geometric_view",
         )),
         [
             "(1,2)|{0,0,1}|{\"[(1,2),(3,4)]\",\"((5,6),(7,8))\"}|(8,9)|<(1,2),-3>|2.23606797749979",
+            "300|300|t|t",
             "(3,5)|0|t|1"
         ]
     );

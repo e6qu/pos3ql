@@ -6,6 +6,11 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The geometric-value width audit found no external blocker. Path and polygon
+parsing, generated values, operators, binary wire bodies, and spatial index
+summaries now use exact statement memory or streaming traversal. A 300-point
+boundary is covered under allocation-forbidden execution, SQL differential
+comparison, GiST lookup, checkpoint publication, and empty-cache recovery.
 The enum-label capacity audit found no external blocker. Enum member storage is
 now reserved from `max_enum_labels_per_type` for committed, transactional, and
 recovery images; savepoint rollback, unsafe new-value tracking, widened WAL,

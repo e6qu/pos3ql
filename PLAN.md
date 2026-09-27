@@ -63,7 +63,7 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 The known narrower limits to resolve or justify are:
 
 - durable 64-item constraint definition shapes; and
-- per-value `tsvector`/`tsquery` and geometry widths.
+- per-value `tsvector`/`tsquery` widths.
 
 Policy role lists now accept every configured catalog role plus `PUBLIC`.
 Startup-sized committed, transactional, and recovery images preserve stored
@@ -79,6 +79,13 @@ committed-member boundary without a 64-bit mask, and new WAL records carry a
 Wide allocation-forbidden catalog checks also removed scalar subqueries' former
 one-row temporary object publication; their cardinality-bounded result now
 stays in the startup-sized external-sort chunk.
+
+Path and polygon values now use exact statement-arena slices for parsing,
+operators, construction, and binary receive. Index summaries and binary send
+stream components without a per-value point array. Text and binary round trips,
+wide operators, GiST lookup, checkpoint publication, and empty-cache object
+recovery are qualified with 300-point values beyond the former 128-point and
+2 KiB text limits; the SQL boundary is compared with PostgreSQL.
 
 Grouping now follows PostgreSQL 18's target-list width of 1,664 distinct
 expressions, 4,096-set expanded-product limit, 12-element `CUBE` limit, and

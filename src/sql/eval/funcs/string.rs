@@ -339,9 +339,12 @@ pub(crate) fn dispatch<'a>(
                                     | crate::sql::types::GeometryKind::Path
                             ) =>
                     {
-                        let mut values = [0.0; 256];
-                        let (count, closed) =
-                            crate::sql::geometry::components(kind, text, &mut values)?;
+                        let (component_count, _) =
+                            crate::sql::geometry::component_count(kind, text)?;
+                        let values = arena
+                            .alloc_slice_with(component_count, |_| 0.0)
+                            .map_err(|_| super::super::arena_full())?;
+                        let (count, closed) = crate::sql::geometry::components(kind, text, values)?;
                         let mut total = 0.0;
                         for index in (2..count).step_by(2) {
                             total += (values[index] - values[index - 2])

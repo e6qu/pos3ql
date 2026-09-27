@@ -347,7 +347,9 @@ PL/pgSQL, WAL, checkpoint, and object-cold recovery boundaries apply.
 PostgreSQL planar geometry includes all seven native value types, documented
 construction and conversion functions, transforms, distance and intersection
 operators, spatial relationships, component reads and updates, prepared-query
-typing, binary wire values, and object-cold recovery.
+typing, binary wire values, and object-cold recovery. Variable-width path and
+polygon values use statement memory through parsing, operators, wire encoding,
+spatial indexing, checkpoints, and recovery.
 
 PostgreSQL transaction introspection includes `xid8`, `pg_snapshot`, their
 historical `txid` aliases, snapshot set-returning functions, current-ID and

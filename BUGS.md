@@ -411,6 +411,15 @@ publishing their single buffered row as a temporary object. They now consume
 that row directly from the startup-sized external-sort chunk. Memory-plan
 regression coverage accounts for the role images alongside policy definitions
 and stored-query dependencies.
+The full-text value-width audit found no external blocker. Vector lexemes,
+positions, query nodes, ranking operands, headline words, and set-returning
+state now use statement memory, while binary output and index folding stream
+canonical values. The audit preserves PostgreSQL's distinct text and binary
+lexeme limits and per-lexeme position truncation. Allocation-forbidden wide
+execution, binary round trips, GIN and GiST indexes, checkpoint publication,
+empty-cache recovery, and PostgreSQL 18.6 differential coverage cross the
+former 512-item and 2,048-total-position limits. Forced-spill coverage also
+unnests the durable vector through the external lateral path.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

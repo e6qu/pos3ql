@@ -7,7 +7,7 @@
 use core::cmp::Ordering;
 use core::fmt::Write as _;
 
-use crate::mem::arena::Arena;
+use crate::mem::arena::{Arena, ArenaList};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::Datum;
 use crate::sql_err;
@@ -69,11 +69,13 @@ pub(crate) const fn restore_query(source: &str) -> TsQuery<'_> {
     TsQuery(source)
 }
 
-pub const MAX_LEXEMES: usize = 512;
-pub const MAX_POSITIONS: usize = 2_048;
-pub const MAX_QUERY_NODES: usize = 512;
 const MAX_QUERY_DEPTH: usize = 64;
-const MAX_LEXEME_BYTES: usize = 2_046;
+// Text input reserves one byte for PostgreSQL's internal terminator. Binary
+// input carries that terminator separately and can fill the 11-bit field.
+const MAX_TEXT_LEXEME_BYTES: usize = 2_046;
+const MAX_WIRE_LEXEME_BYTES: usize = 2_047;
+const MAX_LEXEME_POSITIONS: usize = 256;
+const MAX_TEXT_SEARCH_STORAGE_BYTES: usize = (1 << 20) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextSearchConfig {
@@ -118,40 +120,34 @@ pub struct Position {
 #[derive(Clone, Copy, Debug, Default)]
 struct VectorLexeme<'a> {
     text: &'a str,
-    positions_start: u16,
-    positions_len: u16,
+    positions_start: usize,
+    positions_len: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
 pub struct Vector<'a> {
-    lexemes: [VectorLexeme<'a>; MAX_LEXEMES],
-    lexeme_count: usize,
-    positions: [Position; MAX_POSITIONS],
-    position_count: usize,
+    lexemes: ArenaList<'a, VectorLexeme<'a>>,
+    positions: ArenaList<'a, Position>,
 }
 
 impl<'a> Vector<'a> {
-    fn empty() -> Self {
+    fn empty(arena: &'a Arena) -> Self {
         Self {
-            lexemes: [VectorLexeme::default(); MAX_LEXEMES],
-            lexeme_count: 0,
-            positions: [Position::default(); MAX_POSITIONS],
-            position_count: 0,
+            lexemes: ArenaList::new(arena),
+            positions: ArenaList::new(arena),
         }
     }
 
     pub fn lexeme_count(&self) -> usize {
-        self.lexeme_count
+        self.lexemes.len()
     }
 
     pub fn lexeme(&self, index: usize) -> Option<(&'a str, &[Position])> {
-        let entry = *self.lexemes.get(index)?;
-        if index >= self.lexeme_count {
-            return None;
-        }
-        let start = usize::from(entry.positions_start);
-        let end = start + usize::from(entry.positions_len);
-        Some((entry.text, &self.positions[start..end]))
+        let entry = *self.lexemes.as_slice().get(index)?;
+        let end = entry.positions_start + entry.positions_len;
+        Some((
+            entry.text,
+            &self.positions.as_slice()[entry.positions_start..end],
+        ))
     }
 }
 
@@ -185,15 +181,16 @@ fn unescape_lexeme<'a>(
     start: usize,
     end: usize,
     quoted: bool,
+    max_bytes: usize,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let raw = &source.as_bytes()[start..end];
-    if raw.len() > MAX_LEXEME_BYTES * 2 {
+    if raw.len() > max_bytes * 2 {
         return Err(capacity("text-search lexeme"));
     }
     if !raw.contains(&b'\\') && !(quoted && raw.contains(&b'\'')) {
         let text = &source[start..end];
-        if text.len() > MAX_LEXEME_BYTES {
+        if text.len() > max_bytes {
             return Err(capacity("text-search lexeme"));
         }
         return Ok(text);
@@ -220,7 +217,7 @@ fn unescape_lexeme<'a>(
         written += 1;
         read += 1;
     }
-    if written > MAX_LEXEME_BYTES {
+    if written > max_bytes {
         return Err(capacity("text-search lexeme"));
     }
     core::str::from_utf8(&out[..written]).map_err(|_| syntax("text search value", source))
@@ -266,8 +263,12 @@ fn parse_position(source: &str, at: &mut usize) -> Result<Position, SqlError> {
     Ok(Position { number, weight })
 }
 
-pub fn parse_vector<'a>(source: &'a str, arena: &'a Arena) -> Result<Vector<'a>, SqlError> {
-    let mut vector = Vector::empty();
+fn parse_vector_with_limit<'a>(
+    source: &'a str,
+    max_lexeme_bytes: usize,
+    arena: &'a Arena,
+) -> Result<Vector<'a>, SqlError> {
+    let mut vector = Vector::empty(arena);
     let bytes = source.as_bytes();
     let mut at = 0usize;
     while at < bytes.len() {
@@ -276,9 +277,6 @@ pub fn parse_vector<'a>(source: &'a str, arena: &'a Arena) -> Result<Vector<'a>,
         }
         if at == bytes.len() {
             break;
-        }
-        if vector.lexeme_count == MAX_LEXEMES {
-            return Err(capacity("tsvector"));
         }
         let quoted = bytes[at] == b'\'';
         let (start, end) = if quoted {
@@ -320,16 +318,16 @@ pub fn parse_vector<'a>(source: &'a str, arena: &'a Arena) -> Result<Vector<'a>,
             }
             (start, at)
         };
-        let text = unescape_lexeme(source, start, end, quoted, arena)?;
-        let positions_start = vector.position_count;
+        let text = unescape_lexeme(source, start, end, quoted, max_lexeme_bytes, arena)?;
+        let positions_start = vector.positions.len();
         if bytes.get(at) == Some(&b':') {
             at += 1;
             loop {
-                if vector.position_count == MAX_POSITIONS {
-                    return Err(capacity("tsvector positions"));
-                }
-                vector.positions[vector.position_count] = parse_position(source, &mut at)?;
-                vector.position_count += 1;
+                let position = parse_position(source, &mut at)?;
+                vector
+                    .positions
+                    .push(position)
+                    .map_err(|_| arena_full("tsvector positions"))?;
                 if bytes.get(at) != Some(&b',') {
                     break;
                 }
@@ -342,16 +340,24 @@ pub fn parse_vector<'a>(source: &'a str, arena: &'a Arena) -> Result<Vector<'a>,
         {
             return Err(syntax("tsvector", source));
         }
-        vector.lexemes[vector.lexeme_count] = VectorLexeme {
-            text,
-            positions_start: positions_start as u16,
-            positions_len: (vector.position_count - positions_start) as u16,
-        };
-        vector.lexeme_count += 1;
+        vector
+            .lexemes
+            .push(VectorLexeme {
+                text,
+                positions_start,
+                positions_len: vector.positions.len() - positions_start,
+            })
+            .map_err(|_| arena_full("tsvector"))?;
     }
-    vector.lexemes[..vector.lexeme_count]
+    vector
+        .lexemes
+        .as_mut_slice()
         .sort_unstable_by(|left, right| left.text.as_bytes().cmp(right.text.as_bytes()));
     Ok(vector)
+}
+
+pub fn parse_vector<'a>(source: &'a str, arena: &'a Arena) -> Result<Vector<'a>, SqlError> {
+    parse_vector_with_limit(source, MAX_WIRE_LEXEME_BYTES, arena)
 }
 
 struct ArenaText<'a> {
@@ -417,28 +423,35 @@ fn write_u16(out: &mut ArenaText<'_>, value: u16) -> Result<(), SqlError> {
 }
 
 pub fn canonical_vector<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let vector = parse_vector(source, arena)?;
+    canonical_vector_with_limit(source, MAX_TEXT_LEXEME_BYTES, arena)
+}
+
+fn canonical_vector_with_limit<'a>(
+    source: &'a str,
+    max_lexeme_bytes: usize,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let vector = parse_vector_with_limit(source, max_lexeme_bytes, arena)?;
     let output_capacity = source
         .len()
         .checked_mul(3)
-        .and_then(|n| n.checked_add(MAX_POSITIONS * 8 + MAX_LEXEMES * 4))
+        .and_then(|n| n.checked_add(vector.positions.len() * 8 + vector.lexemes.len() * 4))
         .ok_or_else(|| capacity("tsvector"))?;
     let mut out = ArenaText::new(arena, output_capacity, "tsvector")?;
     let mut index = 0usize;
     let mut first = true;
-    let mut gathered = [Position::default(); MAX_POSITIONS];
-    while index < vector.lexeme_count {
-        let text = vector.lexemes[index].text;
+    let mut storage_bytes = 0usize;
+    let gathered = arena
+        .alloc_slice_with(vector.positions.len(), |_| Position::default())
+        .map_err(|_| arena_full("tsvector positions"))?;
+    while index < vector.lexemes.len() {
+        let text = vector.lexemes.as_slice()[index].text;
         let mut next = index;
         let mut count = 0usize;
-        while next < vector.lexeme_count && vector.lexemes[next].text == text {
-            let entry = vector.lexemes[next];
-            let start = usize::from(entry.positions_start);
-            let end = start + usize::from(entry.positions_len);
-            for position in &vector.positions[start..end] {
-                if count == gathered.len() {
-                    return Err(capacity("tsvector positions"));
-                }
+        while next < vector.lexemes.len() && vector.lexemes.as_slice()[next].text == text {
+            let entry = vector.lexemes.as_slice()[next];
+            let end = entry.positions_start + entry.positions_len;
+            for position in &vector.positions.as_slice()[entry.positions_start..end] {
                 gathered[count] = *position;
                 count += 1;
             }
@@ -451,9 +464,24 @@ pub fn canonical_vector<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str
             if unique > 0 && gathered[unique - 1].number == position.number {
                 gathered[unique - 1].weight = gathered[unique - 1].weight.max(position.weight);
             } else {
+                if unique == MAX_LEXEME_POSITIONS {
+                    break;
+                }
                 gathered[unique] = position;
                 unique += 1;
             }
+        }
+        storage_bytes = storage_bytes
+            .checked_add(text.len())
+            .ok_or_else(|| capacity("tsvector"))?;
+        if unique > 0 {
+            storage_bytes = storage_bytes.next_multiple_of(2);
+            storage_bytes = storage_bytes
+                .checked_add(2 + unique * 2)
+                .ok_or_else(|| capacity("tsvector"))?;
+        }
+        if storage_bytes > MAX_TEXT_SEARCH_STORAGE_BYTES {
+            return Err(capacity("tsvector storage"));
         }
         if !first {
             out.push_byte(b' ')?;
@@ -487,55 +515,45 @@ pub enum QueryNode<'a> {
         weights: u8,
         prefix: bool,
     },
-    Not(u16),
-    And(u16, u16),
-    Or(u16, u16),
+    Not(u32),
+    And(u32, u32),
+    Or(u32, u32),
     Phrase {
-        left: u16,
-        right: u16,
+        left: u32,
+        right: u32,
         distance: u16,
     },
 }
 
-#[derive(Clone, Copy, Debug)]
 pub struct Query<'a> {
-    nodes: [QueryNode<'a>; MAX_QUERY_NODES],
-    count: usize,
-    root: Option<u16>,
+    nodes: ArenaList<'a, QueryNode<'a>>,
+    root: Option<u32>,
 }
 
 impl<'a> Query<'a> {
-    fn empty() -> Self {
+    fn empty(arena: &'a Arena) -> Self {
         Self {
-            nodes: [QueryNode::Lexeme {
-                text: "",
-                weights: 0,
-                prefix: false,
-            }; MAX_QUERY_NODES],
-            count: 0,
+            nodes: ArenaList::new(arena),
             root: None,
         }
     }
 
-    fn push(&mut self, node: QueryNode<'a>) -> Result<u16, SqlError> {
-        if self.count == self.nodes.len() {
-            return Err(capacity("tsquery"));
-        }
-        let index = self.count as u16;
-        self.nodes[self.count] = node;
-        self.count += 1;
+    fn push(&mut self, node: QueryNode<'a>) -> Result<u32, SqlError> {
+        let index = u32::try_from(self.nodes.len()).map_err(|_| capacity("tsquery"))?;
+        self.nodes.push(node).map_err(|_| arena_full("tsquery"))?;
         Ok(index)
     }
 
-    pub fn root(&self) -> Option<u16> {
+    pub fn root(&self) -> Option<u32> {
         self.root
     }
 
-    pub fn node(&self, index: u16) -> Option<QueryNode<'a>> {
-        self.nodes
-            .get(usize::from(index))
-            .copied()
-            .filter(|_| usize::from(index) < self.count)
+    pub fn node(&self, index: u32) -> Option<QueryNode<'a>> {
+        self.nodes.as_slice().get(index as usize).copied()
+    }
+
+    fn nodes(&self) -> &'a [QueryNode<'a>] {
+        self.nodes.as_slice()
     }
 }
 
@@ -544,6 +562,9 @@ struct QueryParser<'a> {
     arena: &'a Arena,
     at: usize,
     depth: usize,
+    max_lexeme_bytes: usize,
+    enforce_operand_storage: bool,
+    operand_bytes: usize,
     query: Query<'a>,
 }
 
@@ -583,7 +604,7 @@ impl<'a> QueryParser<'a> {
         Ok(self.query)
     }
 
-    fn parse_or(&mut self) -> Result<u16, SqlError> {
+    fn parse_or(&mut self) -> Result<u32, SqlError> {
         let mut left = self.parse_and()?;
         while self.consume(b'|') {
             let right = self.parse_and()?;
@@ -592,7 +613,7 @@ impl<'a> QueryParser<'a> {
         Ok(left)
     }
 
-    fn parse_and(&mut self) -> Result<u16, SqlError> {
+    fn parse_and(&mut self) -> Result<u32, SqlError> {
         let mut left = self.parse_phrase()?;
         while self.consume(b'&') {
             let right = self.parse_phrase()?;
@@ -601,7 +622,7 @@ impl<'a> QueryParser<'a> {
         Ok(left)
     }
 
-    fn parse_phrase(&mut self) -> Result<u16, SqlError> {
+    fn parse_phrase(&mut self) -> Result<u32, SqlError> {
         let mut left = self.parse_unary()?;
         loop {
             self.skip_ws();
@@ -639,7 +660,7 @@ impl<'a> QueryParser<'a> {
         Ok(left)
     }
 
-    fn parse_unary(&mut self) -> Result<u16, SqlError> {
+    fn parse_unary(&mut self) -> Result<u32, SqlError> {
         if self.consume(b'!') {
             let child = self.parse_unary()?;
             return self.query.push(QueryNode::Not(child));
@@ -647,7 +668,7 @@ impl<'a> QueryParser<'a> {
         self.parse_primary()
     }
 
-    fn parse_primary(&mut self) -> Result<u16, SqlError> {
+    fn parse_primary(&mut self) -> Result<u32, SqlError> {
         self.skip_ws();
         if self.consume(b'(') {
             self.depth += 1;
@@ -708,7 +729,21 @@ impl<'a> QueryParser<'a> {
             }
             (start, self.at)
         };
-        let text = unescape_lexeme(self.source, start, end, quoted, self.arena)?;
+        let text = unescape_lexeme(
+            self.source,
+            start,
+            end,
+            quoted,
+            self.max_lexeme_bytes,
+            self.arena,
+        )?;
+        if self.enforce_operand_storage && self.operand_bytes >= MAX_TEXT_SEARCH_STORAGE_BYTES {
+            return Err(capacity("tsquery storage"));
+        }
+        self.operand_bytes = self
+            .operand_bytes
+            .checked_add(text.len() + 1)
+            .ok_or_else(|| capacity("tsquery storage"))?;
         let mut weights = 0u8;
         let mut prefix = false;
         if bytes.get(self.at) == Some(&b':') {
@@ -738,12 +773,24 @@ impl<'a> QueryParser<'a> {
 }
 
 pub fn parse_query<'a>(source: &'a str, arena: &'a Arena) -> Result<Query<'a>, SqlError> {
+    parse_query_with_limit(source, MAX_WIRE_LEXEME_BYTES, false, arena)
+}
+
+fn parse_query_with_limit<'a>(
+    source: &'a str,
+    max_lexeme_bytes: usize,
+    enforce_operand_storage: bool,
+    arena: &'a Arena,
+) -> Result<Query<'a>, SqlError> {
     QueryParser {
         source,
         arena,
         at: 0,
         depth: 0,
-        query: Query::empty(),
+        max_lexeme_bytes,
+        enforce_operand_storage,
+        operand_bytes: 0,
+        query: Query::empty(arena),
     }
     .parse()
 }
@@ -760,7 +807,7 @@ fn query_precedence(node: QueryNode<'_>) -> u8 {
 
 fn write_query_node(
     query: &Query<'_>,
-    index: u16,
+    index: u32,
     parent_precedence: u8,
     out: &mut ArenaText<'_>,
 ) -> Result<(), SqlError> {
@@ -825,14 +872,14 @@ fn write_query_node(
 }
 
 pub fn canonical_query<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let query = parse_query(source, arena)?;
+    let query = parse_query_with_limit(source, MAX_TEXT_LEXEME_BYTES, true, arena)?;
     let Some(root) = query.root else {
         return Ok("");
     };
     let output_capacity = source
         .len()
         .checked_mul(4)
-        .and_then(|n| n.checked_add(MAX_QUERY_NODES * 8))
+        .and_then(|n| n.checked_add(query.nodes.len() * 8))
         .ok_or_else(|| capacity("tsquery"))?;
     let mut out = ArenaText::new(arena, output_capacity, "tsquery")?;
     write_query_node(&query, root, 0, &mut out)?;
@@ -843,7 +890,8 @@ fn format_query<'a>(query: &Query<'_>, arena: &'a Arena) -> Result<&'a str, SqlE
     let Some(root) = query.root else {
         return Ok("");
     };
-    let output_capacity = query.nodes[..query.count]
+    let output_capacity = query
+        .nodes()
         .iter()
         .try_fold(1usize, |size, node| {
             let addition = match node {
@@ -941,7 +989,7 @@ pub(crate) fn emit_vector_binary(source: &str, mut emit: impl FnMut(&[u8])) -> u
             at += 1;
         }
         let raw = scan_quoted(bytes, &mut at);
-        let mut positions = [Position::default(); MAX_POSITIONS];
+        let mut positions = [Position::default(); MAX_LEXEME_POSITIONS];
         let mut position_count = 0usize;
         if bytes.get(at) == Some(&b':') {
             at += 1;
@@ -966,172 +1014,210 @@ pub(crate) fn emit_vector_binary(source: &str, mut emit: impl FnMut(&[u8])) -> u
 }
 
 #[derive(Clone, Copy)]
-enum WireQueryNode<'a> {
+enum CanonicalExpression<'a> {
     Lexeme {
         raw: &'a [u8],
         weights: u8,
         prefix: bool,
     },
-    Not(u16),
-    And(u16, u16),
-    Or(u16, u16),
-    Phrase {
-        left: u16,
-        right: u16,
+    Not(&'a [u8]),
+    Binary {
+        operator: u8,
         distance: u16,
+        left: &'a [u8],
+        right: &'a [u8],
     },
 }
 
-struct WireQuery<'a> {
-    nodes: [WireQueryNode<'a>; MAX_QUERY_NODES],
-    count: usize,
-    root: Option<u16>,
+fn trim_query_space(mut source: &[u8]) -> &[u8] {
+    while source.first() == Some(&b' ') {
+        source = &source[1..];
+    }
+    while source.last() == Some(&b' ') {
+        source = &source[..source.len() - 1];
+    }
+    source
 }
 
-impl<'a> WireQuery<'a> {
-    fn empty() -> Self {
-        Self {
-            nodes: [WireQueryNode::Lexeme {
-                raw: &[],
-                weights: 0,
-                prefix: false,
-            }; MAX_QUERY_NODES],
-            count: 0,
-            root: None,
-        }
-    }
-
-    fn push(&mut self, node: WireQueryNode<'a>) -> u16 {
-        debug_assert!(self.count < self.nodes.len(), "canonical tsquery capacity");
-        let index = self.count as u16;
-        self.nodes[self.count] = node;
-        self.count += 1;
-        index
-    }
-}
-
-struct WireQueryParser<'a> {
-    source: &'a [u8],
-    at: usize,
-    query: WireQuery<'a>,
-}
-
-impl<'a> WireQueryParser<'a> {
-    fn skip_ws(&mut self) {
-        while self.source.get(self.at) == Some(&b' ') {
-            self.at += 1;
-        }
-    }
-    fn consume(&mut self, byte: u8) -> bool {
-        self.skip_ws();
-        if self.source.get(self.at) == Some(&byte) {
-            self.at += 1;
-            true
-        } else {
-            false
-        }
-    }
-    fn parse(mut self) -> WireQuery<'a> {
-        self.skip_ws();
-        if self.at == self.source.len() {
-            return self.query;
-        }
-        self.query.root = Some(self.parse_or());
-        self.skip_ws();
-        debug_assert_eq!(self.at, self.source.len(), "canonical tsquery suffix");
-        self.query
-    }
-    fn parse_or(&mut self) -> u16 {
-        let mut left = self.parse_and();
-        while self.consume(b'|') {
-            let right = self.parse_and();
-            left = self.query.push(WireQueryNode::Or(left, right));
-        }
-        left
-    }
-    fn parse_and(&mut self) -> u16 {
-        let mut left = self.parse_phrase();
-        while self.consume(b'&') {
-            let right = self.parse_phrase();
-            left = self.query.push(WireQueryNode::And(left, right));
-        }
-        left
-    }
-    fn parse_phrase(&mut self) -> u16 {
-        let mut left = self.parse_unary();
-        loop {
-            self.skip_ws();
-            let rest = &self.source[self.at..];
-            let distance = if rest.starts_with(b"<->") {
-                self.at += 3;
-                Some(1)
-            } else if rest.first() == Some(&b'<') {
-                self.at += 1;
-                let mut value = 0u16;
-                while let Some(byte @ b'0'..=b'9') = self.source.get(self.at).copied() {
-                    value = value
-                        .saturating_mul(10)
-                        .saturating_add(u16::from(byte - b'0'));
-                    self.at += 1;
+fn strip_query_parentheses(mut source: &[u8]) -> &[u8] {
+    source = trim_query_space(source);
+    while source.starts_with(b"( ") && source.ends_with(b" )") {
+        let mut depth = 0usize;
+        let mut at = 0usize;
+        let mut closes_at_end = false;
+        while at < source.len() {
+            match source[at] {
+                b'\'' => {
+                    at += 1;
+                    while at < source.len() {
+                        if source[at] == b'\\' {
+                            at += 2;
+                        } else if source[at] == b'\'' {
+                            at += 1;
+                            break;
+                        } else {
+                            at += 1;
+                        }
+                    }
                 }
-                debug_assert_eq!(self.source.get(self.at), Some(&b'>'));
-                self.at += 1;
-                Some(value)
-            } else {
-                None
-            };
-            let Some(distance) = distance else { break };
-            let right = self.parse_unary();
-            left = self.query.push(WireQueryNode::Phrase {
-                left,
-                right,
-                distance,
-            });
-        }
-        left
-    }
-    fn parse_unary(&mut self) -> u16 {
-        if self.consume(b'!') {
-            let child = self.parse_unary();
-            return self.query.push(WireQueryNode::Not(child));
-        }
-        self.parse_primary()
-    }
-    fn parse_primary(&mut self) -> u16 {
-        self.skip_ws();
-        if self.consume(b'(') {
-            let node = self.parse_or();
-            debug_assert!(self.consume(b')'));
-            return node;
-        }
-        let raw = scan_quoted(self.source, &mut self.at);
-        let mut weights = 0u8;
-        let mut prefix = false;
-        if self.source.get(self.at) == Some(&b':') {
-            self.at += 1;
-            while let Some(byte) = self.source.get(self.at).copied() {
-                match byte {
-                    b'*' => prefix = true,
-                    b'A' => weights |= 1 << 3,
-                    b'B' => weights |= 1 << 2,
-                    b'C' => weights |= 1 << 1,
-                    b'D' => weights |= 1,
-                    _ => break,
+                b'(' => {
+                    depth += 1;
+                    at += 1;
                 }
-                self.at += 1;
+                b')' => {
+                    depth -= 1;
+                    at += 1;
+                    if depth == 0 {
+                        closes_at_end = at == source.len();
+                        break;
+                    }
+                }
+                _ => at += 1,
             }
         }
-        self.query.push(WireQueryNode::Lexeme {
-            raw,
-            weights,
-            prefix,
-        })
+        if !closes_at_end {
+            break;
+        }
+        source = trim_query_space(&source[2..source.len() - 2]);
+    }
+    source
+}
+
+fn canonical_expression(source: &[u8]) -> CanonicalExpression<'_> {
+    let source = strip_query_parentheses(source);
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    let mut or = None;
+    let mut and = None;
+    let mut phrase = None;
+    while at < source.len() {
+        match source[at] {
+            b'\'' => {
+                at += 1;
+                while at < source.len() {
+                    if source[at] == b'\\' {
+                        at += 2;
+                    } else if source[at] == b'\'' {
+                        at += 1;
+                        break;
+                    } else {
+                        at += 1;
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                at += 1;
+            }
+            b')' => {
+                depth -= 1;
+                at += 1;
+            }
+            b'|' if depth == 0 => {
+                or = Some(at);
+                at += 1;
+            }
+            b'&' if depth == 0 => {
+                and = Some(at);
+                at += 1;
+            }
+            b'<' if depth == 0 => {
+                let begin = at;
+                at += 1;
+                let distance = if source.get(at..at + 2) == Some(&b"->"[..]) {
+                    at += 2;
+                    1
+                } else {
+                    let mut value = 0u16;
+                    while let Some(byte @ b'0'..=b'9') = source.get(at).copied() {
+                        value = value
+                            .saturating_mul(10)
+                            .saturating_add(u16::from(byte - b'0'));
+                        at += 1;
+                    }
+                    value
+                };
+                debug_assert_eq!(source.get(at), Some(&b'>'));
+                at += 1;
+                phrase = Some((begin, at, distance));
+            }
+            _ => at += 1,
+        }
+    }
+    let binary = if let Some(operator) = or {
+        Some((operator, operator + 1, 3, 0))
+    } else if let Some(operator) = and {
+        Some((operator, operator + 1, 2, 0))
+    } else {
+        phrase.map(|(begin, end, distance)| (begin, end, 4, distance))
+    };
+    if let Some((begin, end, operator, distance)) = binary {
+        return CanonicalExpression::Binary {
+            operator,
+            distance,
+            left: trim_query_space(&source[..begin]),
+            right: trim_query_space(&source[end..]),
+        };
+    }
+    if source.first() == Some(&b'!') {
+        return CanonicalExpression::Not(trim_query_space(&source[1..]));
+    }
+    let mut at = 0usize;
+    let raw = scan_quoted(source, &mut at);
+    let mut weights = 0u8;
+    let mut prefix = false;
+    if source.get(at) == Some(&b':') {
+        at += 1;
+        for byte in &source[at..] {
+            match *byte {
+                b'*' => prefix = true,
+                b'A' => weights |= 1 << 3,
+                b'B' => weights |= 1 << 2,
+                b'C' => weights |= 1 << 1,
+                b'D' => weights |= 1,
+                _ => break,
+            }
+        }
+    }
+    CanonicalExpression::Lexeme {
+        raw,
+        weights,
+        prefix,
     }
 }
 
-fn emit_query_node(query: &WireQuery<'_>, index: u16, emit: &mut impl FnMut(&[u8])) -> usize {
-    match query.nodes[usize::from(index)] {
-        WireQueryNode::Lexeme {
+fn canonical_query_node_count(source: &[u8]) -> usize {
+    let mut count = 0usize;
+    let mut at = 0usize;
+    while at < source.len() {
+        match source[at] {
+            b'\'' => {
+                count += 1;
+                at += 1;
+                while at < source.len() {
+                    if source[at] == b'\\' {
+                        at += 2;
+                    } else if source[at] == b'\'' {
+                        at += 1;
+                        break;
+                    } else {
+                        at += 1;
+                    }
+                }
+            }
+            b'!' | b'&' | b'|' | b'<' => {
+                count += 1;
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    count
+}
+
+fn emit_query_binary_node(source: &[u8], emit: &mut impl FnMut(&[u8])) -> usize {
+    match canonical_expression(source) {
+        CanonicalExpression::Lexeme {
             raw,
             weights,
             prefix,
@@ -1141,43 +1227,40 @@ fn emit_query_node(query: &WireQuery<'_>, index: u16, emit: &mut impl FnMut(&[u8
             emit(&[0]);
             4 + len
         }
-        WireQueryNode::Not(child) => {
+        CanonicalExpression::Not(child) => {
             emit(&[2, 1]);
-            2 + emit_query_node(query, child, emit)
+            2 + emit_query_binary_node(child, emit)
         }
-        WireQueryNode::And(left, right) | WireQueryNode::Or(left, right) => {
-            let operator = if matches!(query.nodes[usize::from(index)], WireQueryNode::And(..)) {
-                2
-            } else {
-                3
-            };
-            emit(&[2, operator]);
-            2 + emit_query_node(query, right, emit) + emit_query_node(query, left, emit)
-        }
-        WireQueryNode::Phrase {
+        CanonicalExpression::Binary {
+            operator,
+            distance,
             left,
             right,
-            distance,
         } => {
-            emit(&[2, 4]);
-            emit_i16(emit, distance as i16);
-            4 + emit_query_node(query, right, emit) + emit_query_node(query, left, emit)
+            emit(&[2, operator]);
+            let header = if operator == 4 {
+                emit_i16(emit, distance as i16);
+                4
+            } else {
+                2
+            };
+            header + emit_query_binary_node(right, emit) + emit_query_binary_node(left, emit)
         }
     }
 }
 
 /// Emits a PostgreSQL `tsquerysend` body in its right-first prefix order.
 pub(crate) fn emit_query_binary(source: &str, mut emit: impl FnMut(&[u8])) -> usize {
-    let query = WireQueryParser {
-        source: source.as_bytes(),
-        at: 0,
-        query: WireQuery::empty(),
+    let count = canonical_query_node_count(source.as_bytes());
+    emit_i32(
+        &mut emit,
+        i32::try_from(count).expect("canonical tsquery item count"),
+    );
+    4 + if source.is_empty() {
+        0
+    } else {
+        emit_query_binary_node(source.as_bytes(), &mut emit)
     }
-    .parse();
-    emit_i32(&mut emit, query.count as i32);
-    4 + query
-        .root
-        .map_or(0, |root| emit_query_node(&query, root, &mut emit))
 }
 
 pub(crate) fn decode_vector_binary<'a>(
@@ -1188,7 +1271,6 @@ pub(crate) fn decode_vector_binary<'a>(
     let count = input.i32().map_err(|_| syntax("tsvector binary", ""))?;
     let count = usize::try_from(count)
         .ok()
-        .filter(|count| *count <= MAX_LEXEMES)
         .ok_or_else(|| syntax("tsvector binary", ""))?;
     let mut raw = ArenaText::new(
         arena,
@@ -1197,13 +1279,13 @@ pub(crate) fn decode_vector_binary<'a>(
     )?;
     for index in 0..count {
         let lexeme = input.cstr().map_err(|_| syntax("tsvector binary", ""))?;
-        if lexeme.is_empty() || lexeme.len() > MAX_LEXEME_BYTES {
+        if lexeme.is_empty() || lexeme.len() > MAX_WIRE_LEXEME_BYTES {
             return Err(syntax("tsvector binary", ""));
         }
         let position_count = input.i16().map_err(|_| syntax("tsvector binary", ""))?;
         let position_count = usize::try_from(position_count)
             .ok()
-            .filter(|count| *count <= MAX_POSITIONS)
+            .filter(|count| *count <= MAX_LEXEME_POSITIONS)
             .ok_or_else(|| syntax("tsvector binary", ""))?;
         if index > 0 {
             raw.push_byte(b' ')?;
@@ -1239,42 +1321,92 @@ pub(crate) fn decode_vector_binary<'a>(
     if !input.done() {
         return Err(syntax("tsvector binary", ""));
     }
-    canonical_vector(raw.finish(), arena)
+    canonical_vector_with_limit(raw.finish(), MAX_WIRE_LEXEME_BYTES, arena)
 }
 
-fn decode_query_item<'a>(
-    input: &mut crate::pg::wire::MsgIn<'a>,
+#[derive(Clone, Copy)]
+struct QueryDecodeFrame {
+    operator: u8,
+    distance: u16,
+    right: Option<u32>,
+}
+
+fn complete_decoded_query_node<'a>(
+    mut node: u32,
     query: &mut Query<'a>,
-    remaining: &mut usize,
-    depth: usize,
-) -> Result<u16, SqlError> {
-    if depth > MAX_QUERY_DEPTH || *remaining == 0 {
-        return Err(syntax("tsquery binary", ""));
-    }
-    *remaining -= 1;
-    match input.u8().map_err(|_| syntax("tsquery binary", ""))? {
-        1 => {
-            let weights = input.u8().map_err(|_| syntax("tsquery binary", ""))?;
-            let prefix = input.u8().map_err(|_| syntax("tsquery binary", ""))?;
-            if weights > 0x0f || prefix > 1 {
+    frames: &mut ArenaList<'a, QueryDecodeFrame>,
+    root: &mut Option<u32>,
+) -> Result<(), SqlError> {
+    loop {
+        let Some(frame) = frames.as_mut_slice().last_mut() else {
+            if root.replace(node).is_some() {
                 return Err(syntax("tsquery binary", ""));
             }
-            let text = input.cstr().map_err(|_| syntax("tsquery binary", ""))?;
-            if text.is_empty() || text.len() > MAX_LEXEME_BYTES {
-                return Err(syntax("tsquery binary", ""));
-            }
-            query.push(QueryNode::Lexeme {
-                text,
-                weights,
-                prefix: prefix != 0,
-            })
+            return Ok(());
+        };
+        if frame.operator != 1 && frame.right.is_none() {
+            frame.right = Some(node);
+            return Ok(());
         }
-        2 => match input.u8().map_err(|_| syntax("tsquery binary", ""))? {
+        let frame = *frame;
+        frames.truncate(frames.len() - 1);
+        node = query.push(match frame.operator {
+            1 => QueryNode::Not(node),
+            2 => QueryNode::And(node, frame.right.expect("binary query right child")),
+            3 => QueryNode::Or(node, frame.right.expect("binary query right child")),
+            4 => QueryNode::Phrase {
+                left: node,
+                right: frame.right.expect("binary query right child"),
+                distance: frame.distance,
+            },
+            _ => return Err(syntax("tsquery binary", "")),
+        })?;
+    }
+}
+
+pub(crate) fn decode_query_binary<'a>(
+    bytes: &'a [u8],
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let mut input = crate::pg::wire::MsgIn::new(bytes);
+    let count = input.i32().map_err(|_| syntax("tsquery binary", ""))?;
+    let count = usize::try_from(count)
+        .ok()
+        .ok_or_else(|| syntax("tsquery binary", ""))?;
+    let mut query = Query::empty(arena);
+    let mut frames = ArenaList::new(arena);
+    let mut root = None;
+    let mut operand_bytes = 0usize;
+    for _ in 0..count {
+        match input.u8().map_err(|_| syntax("tsquery binary", ""))? {
             1 => {
-                let child = decode_query_item(input, query, remaining, depth + 1)?;
-                query.push(QueryNode::Not(child))
+                let weights = input.u8().map_err(|_| syntax("tsquery binary", ""))?;
+                let prefix = input.u8().map_err(|_| syntax("tsquery binary", ""))?;
+                if weights > 0x0f || prefix > 1 {
+                    return Err(syntax("tsquery binary", ""));
+                }
+                let text = input.cstr().map_err(|_| syntax("tsquery binary", ""))?;
+                if text.is_empty() || text.len() > MAX_WIRE_LEXEME_BYTES {
+                    return Err(syntax("tsquery binary", ""));
+                }
+                if operand_bytes >= MAX_TEXT_SEARCH_STORAGE_BYTES {
+                    return Err(syntax("tsquery binary", ""));
+                }
+                operand_bytes = operand_bytes
+                    .checked_add(text.len() + 1)
+                    .ok_or_else(|| syntax("tsquery binary", ""))?;
+                let node = query.push(QueryNode::Lexeme {
+                    text,
+                    weights,
+                    prefix: prefix != 0,
+                })?;
+                complete_decoded_query_node(node, &mut query, &mut frames, &mut root)?;
             }
-            operator @ 2..=4 => {
+            2 => {
+                let operator = input.u8().map_err(|_| syntax("tsquery binary", ""))?;
+                if !(1..=4).contains(&operator) {
+                    return Err(syntax("tsquery binary", ""));
+                }
                 let distance = if operator == 4 {
                     u16::from_be_bytes(
                         input
@@ -1286,46 +1418,21 @@ fn decode_query_item<'a>(
                 } else {
                     0
                 };
-                let right = decode_query_item(input, query, remaining, depth + 1)?;
-                let left = decode_query_item(input, query, remaining, depth + 1)?;
-                query.push(match operator {
-                    2 => QueryNode::And(left, right),
-                    3 => QueryNode::Or(left, right),
-                    _ => QueryNode::Phrase {
-                        left,
-                        right,
+                frames
+                    .push(QueryDecodeFrame {
+                        operator,
                         distance,
-                    },
-                })
+                        right: None,
+                    })
+                    .map_err(|_| arena_full("tsquery binary"))?;
             }
-            _ => Err(syntax("tsquery binary", "")),
-        },
-        _ => Err(syntax("tsquery binary", "")),
+            _ => return Err(syntax("tsquery binary", "")),
+        }
     }
-}
-
-pub(crate) fn decode_query_binary<'a>(
-    bytes: &'a [u8],
-    arena: &'a Arena,
-) -> Result<&'a str, SqlError> {
-    let mut input = crate::pg::wire::MsgIn::new(bytes);
-    let count = input.i32().map_err(|_| syntax("tsquery binary", ""))?;
-    let mut remaining = usize::try_from(count)
-        .ok()
-        .filter(|count| *count <= MAX_QUERY_NODES)
-        .ok_or_else(|| syntax("tsquery binary", ""))?;
-    let mut query = Query::empty();
-    if remaining > 0 {
-        query.root = Some(decode_query_item(
-            &mut input,
-            &mut query,
-            &mut remaining,
-            0,
-        )?);
-    }
-    if remaining != 0 || !input.done() {
+    if !frames.is_empty() || root.is_none() != (count == 0) || !input.done() {
         return Err(syntax("tsquery binary", ""));
     }
+    query.root = root;
     format_query(&query, arena)
 }
 
@@ -1355,7 +1462,7 @@ impl MatchResult {
 
 fn eval_query_node(
     query: &Query<'_>,
-    index: u16,
+    index: u32,
     vector: &Vector<'_>,
 ) -> Result<MatchResult, SqlError> {
     Ok(
@@ -1581,8 +1688,8 @@ fn is_english_stop_word(word: &str) -> bool {
     )
 }
 
-fn english_stem(word: &str) -> StackStr<MAX_LEXEME_BYTES> {
-    let mut stem = StackStr::<MAX_LEXEME_BYTES>::from_str(word);
+fn english_stem(word: &str) -> StackStr<MAX_TEXT_LEXEME_BYTES> {
+    let mut stem = StackStr::<MAX_TEXT_LEXEME_BYTES>::from_str(word);
     if !word.is_ascii() || word.len() <= 2 {
         return stem;
     }
@@ -1792,7 +1899,7 @@ fn porter_short_syllable(word: &str) -> bool {
 }
 
 fn porter_replace(
-    word: &mut StackStr<MAX_LEXEME_BYTES>,
+    word: &mut StackStr<MAX_TEXT_LEXEME_BYTES>,
     suffix: &str,
     replacement: &str,
     region: usize,
@@ -1845,7 +1952,7 @@ pub(crate) fn normalize_token<'a>(
     config: TextSearchConfig,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
-    let mut lower = StackStr::<MAX_LEXEME_BYTES>::new();
+    let mut lower = StackStr::<MAX_TEXT_LEXEME_BYTES>::new();
     for character in token.chars().flat_map(char::to_lowercase) {
         lower
             .write_char(character)
@@ -1924,16 +2031,20 @@ fn builtin_token_is_mapped(token_type: u8) -> bool {
     matches!(token_type, 1..=11 | 15..=22)
 }
 
-type DocumentLexemes<'a> = ([Option<&'a str>; MAX_LEXEMES], [u16; MAX_LEXEMES], usize);
+#[derive(Clone, Copy)]
+struct DocumentLexeme<'a> {
+    token: &'a str,
+    position: u16,
+}
+
+type DocumentLexemes<'a> = &'a [DocumentLexeme<'a>];
 
 fn document_tokens_with<'a>(
     document: &str,
     arena: &'a Arena,
     mut normalize: impl FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
 ) -> Result<DocumentLexemes<'a>, SqlError> {
-    let mut tokens = [None; MAX_LEXEMES];
-    let mut positions = [0u16; MAX_LEXEMES];
-    let mut count = 0usize;
+    let mut tokens = ArenaList::new(arena);
     let mut position = 0u32;
     let mut emit = |kind: u8, source: &str| -> Result<(), SqlError> {
         if source.is_empty() {
@@ -1944,12 +2055,12 @@ fn document_tokens_with<'a>(
             TextSearchLexeme::StopWord => position = position.saturating_add(1),
             TextSearchLexeme::Lexeme(token) => {
                 position = position.saturating_add(1);
-                if count == MAX_LEXEMES {
-                    return Err(capacity("text-search document"));
-                }
-                tokens[count] = Some(token);
-                positions[count] = position.min(16_383) as u16;
-                count += 1;
+                tokens
+                    .push(DocumentLexeme {
+                        token,
+                        position: position.min(16_383) as u16,
+                    })
+                    .map_err(|_| arena_full("text-search document"))?;
             }
         }
         Ok(())
@@ -2078,7 +2189,7 @@ fn document_tokens_with<'a>(
         }
         at = at.max(end);
     }
-    Ok((tokens, positions, count))
+    Ok(tokens.as_slice())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2090,23 +2201,20 @@ pub(crate) struct ParserToken<'a> {
 pub(crate) fn parse_document<'a>(
     document: &str,
     arena: &'a Arena,
-) -> Result<([ParserToken<'a>; MAX_LEXEMES], usize), SqlError> {
-    let mut tokens = [ParserToken { kind: 0, text: "" }; MAX_LEXEMES];
-    let mut count = 0usize;
+) -> Result<&'a [ParserToken<'a>], SqlError> {
+    let mut tokens = ArenaList::new(arena);
     let _ = document_tokens_with(document, arena, |kind, text, arena| {
-        let slot = tokens
-            .get_mut(count)
-            .ok_or_else(|| capacity("text-search parser output"))?;
-        *slot = ParserToken {
-            kind,
-            text: arena
-                .alloc_str(text)
-                .map_err(|_| arena_full("text-search parser output"))?,
-        };
-        count += 1;
+        tokens
+            .push(ParserToken {
+                kind,
+                text: arena
+                    .alloc_str(text)
+                    .map_err(|_| arena_full("text-search parser output"))?,
+            })
+            .map_err(|_| arena_full("text-search parser output"))?;
         Ok(TextSearchLexeme::Unmapped)
     })?;
-    Ok((tokens, count))
+    Ok(tokens.as_slice())
 }
 
 pub(crate) const TOKEN_TYPES: [(&str, &str); 23] = [
@@ -2156,22 +2264,22 @@ pub fn to_tsvector<'a>(
     document: &str,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let (tokens, positions, count) = document_tokens(config, document, arena)?;
+    let tokens = document_tokens(config, document, arena)?;
     let mut raw = ArenaText::new(
         arena,
         document
             .len()
             .saturating_mul(3)
-            .saturating_add(count * 12 + 1),
+            .saturating_add(tokens.len() * 12 + 1),
         "tsvector",
     )?;
-    for index in 0..count {
+    for (index, token) in tokens.iter().enumerate() {
         if index > 0 {
             raw.push_byte(b' ')?;
         }
-        raw.push_quoted(tokens[index].expect("token count invariant"))?;
+        raw.push_quoted(token.token)?;
         raw.push_byte(b':')?;
-        write_u16(&mut raw, positions[index])?;
+        write_u16(&mut raw, token.position)?;
     }
     canonical_vector(raw.finish(), arena)
 }
@@ -2181,8 +2289,8 @@ pub(crate) fn to_tsvector_with<'a>(
     arena: &'a Arena,
     normalize: impl FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
 ) -> Result<&'a str, SqlError> {
-    let (tokens, positions, count) = document_tokens_with(document, arena, normalize)?;
-    vector_from_document_tokens(document.len(), &tokens, &positions, count, arena)
+    let tokens = document_tokens_with(document, arena, normalize)?;
+    vector_from_document_tokens(document.len(), tokens, arena)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2307,8 +2415,8 @@ pub(crate) fn json_to_tsvector_with<'a>(
     let mut raw = ArenaText::new(
         arena,
         source_bytes
-            .saturating_mul(3)
-            .saturating_add(MAX_POSITIONS * 8 + MAX_LEXEMES * 4 + 1),
+            .saturating_mul(16)
+            .saturating_add(segment_count * 4 + 1),
         "JSON tsvector",
     )?;
     let mut position_base = 0u16;
@@ -2352,25 +2460,23 @@ pub(crate) fn json_to_tsvector_with<'a>(
 
 fn vector_from_document_tokens<'a>(
     document_len: usize,
-    tokens: &[Option<&'a str>; MAX_LEXEMES],
-    positions: &[u16; MAX_LEXEMES],
-    count: usize,
+    tokens: &[DocumentLexeme<'a>],
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let mut raw = ArenaText::new(
         arena,
         document_len
             .saturating_mul(3)
-            .saturating_add(count * 12 + 1),
+            .saturating_add(tokens.len() * 12 + 1),
         "tsvector",
     )?;
-    for index in 0..count {
+    for (index, token) in tokens.iter().enumerate() {
         if index > 0 {
             raw.push_byte(b' ')?;
         }
-        raw.push_quoted(tokens[index].expect("token count invariant"))?;
+        raw.push_quoted(token.token)?;
         raw.push_byte(b':')?;
-        write_u16(&mut raw, positions[index])?;
+        write_u16(&mut raw, token.position)?;
     }
     canonical_vector(raw.finish(), arena)
 }
@@ -2418,7 +2524,7 @@ pub(crate) fn explicit_text_to_query_with<'a>(
     let Some(root) = parsed.root() else {
         return Ok("");
     };
-    let mut normalized = Query::empty();
+    let mut normalized = Query::empty(arena);
     let result = normalize_explicit_node(&parsed, root, &mut normalized, arena, &mut normalize, 0)?;
     normalized.root = result.root;
     format_query(&normalized, arena)
@@ -2426,18 +2532,18 @@ pub(crate) fn explicit_text_to_query_with<'a>(
 
 #[derive(Clone, Copy)]
 struct NormalizedQueryNode {
-    root: Option<u16>,
+    root: Option<u32>,
     leading_gap: u16,
     trailing_gap: u16,
 }
 
 fn clone_normalized_query_node<'a>(
     source: &Query<'a>,
-    index: u16,
+    index: u32,
     target: &mut Query<'a>,
     weights: u8,
     prefix: bool,
-) -> Result<u16, SqlError> {
+) -> Result<u32, SqlError> {
     Ok(
         match source.node(index).ok_or_else(|| syntax("tsquery", ""))? {
             QueryNode::Lexeme { text, .. } => target.push(QueryNode::Lexeme {
@@ -2478,7 +2584,7 @@ fn clone_normalized_query_node<'a>(
 
 fn normalize_explicit_node<'a>(
     source: &Query<'a>,
-    index: u16,
+    index: u32,
     target: &mut Query<'a>,
     arena: &'a Arena,
     normalize: &mut dyn FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
@@ -2599,7 +2705,7 @@ fn text_to_query_normalized<'a>(
     if mode == QueryInput::Websearch {
         return websearch_to_query(source, arena, normalize);
     }
-    let (tokens, positions, count) = document_tokens_with(source, arena, |kind, token, arena| {
+    let tokens = document_tokens_with(source, arena, |kind, token, arena| {
         normalize(kind, token, arena)
     })?;
     let mut raw = ArenaText::new(
@@ -2607,17 +2713,16 @@ fn text_to_query_normalized<'a>(
         source
             .len()
             .saturating_mul(4)
-            .saturating_add(count * 16 + 1),
+            .saturating_add(tokens.len() * 16 + 1),
         "tsquery",
     )?;
     let mut prior_position = 0u16;
-    for (emitted, index) in (0..count).enumerate() {
-        let token = tokens[index].expect("token count invariant");
+    for (emitted, token) in tokens.iter().enumerate() {
         if emitted > 0 {
             match mode {
                 QueryInput::Plain => raw.push_str(" & ")?,
                 QueryInput::Phrase => {
-                    let distance = positions[index].saturating_sub(prior_position);
+                    let distance = token.position.saturating_sub(prior_position);
                     if distance == 1 {
                         raw.push_str(" <-> ")?;
                     } else {
@@ -2629,8 +2734,8 @@ fn text_to_query_normalized<'a>(
                 QueryInput::Websearch => unreachable!("web search uses its parser"),
             }
         }
-        raw.push_quoted(token)?;
-        prior_position = positions[index];
+        raw.push_quoted(token.token)?;
+        prior_position = token.position;
     }
     canonical_query(raw.finish(), arena)
 }
@@ -2640,8 +2745,7 @@ fn websearch_to_query<'a>(
     arena: &'a Arena,
     normalize: &mut dyn FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
 ) -> Result<&'a str, SqlError> {
-    let mut groups: [Option<&'a str>; MAX_QUERY_NODES] = [None; MAX_QUERY_NODES];
-    let mut group_count = 0usize;
+    let mut groups = ArenaList::new(arena);
     let mut current: Option<&'a str> = None;
     let mut at = 0usize;
     let bytes = source.as_bytes();
@@ -2661,11 +2765,7 @@ fn websearch_to_query<'a>(
         {
             at += 2;
             if let Some(query) = current.take() {
-                if group_count == groups.len() {
-                    return Err(capacity("tsquery"));
-                }
-                groups[group_count] = Some(query);
-                group_count += 1;
+                groups.push(query).map_err(|_| arena_full("tsquery"))?;
             }
             continue;
         }
@@ -2710,14 +2810,10 @@ fn websearch_to_query<'a>(
         });
     }
     if let Some(query) = current {
-        if group_count == groups.len() {
-            return Err(capacity("tsquery"));
-        }
-        groups[group_count] = Some(query);
-        group_count += 1;
+        groups.push(query).map_err(|_| arena_full("tsquery"))?;
     }
     let mut result: Option<&'a str> = None;
-    for group in groups[..group_count].iter().flatten() {
+    for group in groups.as_slice() {
         result = Some(match result {
             Some(left) => combine_queries(left, group, " | ", arena)?,
             None => group,
@@ -2882,9 +2978,9 @@ pub fn query_tree<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str, SqlE
     };
     fn clean<'a>(
         source: &Query<'a>,
-        node: u16,
+        node: u32,
         output: &mut Query<'a>,
-    ) -> Result<Option<u16>, SqlError> {
+    ) -> Result<Option<u32>, SqlError> {
         Ok(match source.node(node).expect("query node") {
             node @ QueryNode::Lexeme { .. } => Some(output.push(node)?),
             QueryNode::Not(_) => None,
@@ -2924,7 +3020,7 @@ pub fn query_tree<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str, SqlE
             }
         })
     }
-    let mut output = Query::empty();
+    let mut output = Query::empty(arena);
     output.root = clean(&query, root, &mut output)?;
     if output.root.is_none() {
         return Ok("T");
@@ -2934,9 +3030,9 @@ pub fn query_tree<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str, SqlE
 
 fn query_subtree_equal(
     left: &Query<'_>,
-    left_index: u16,
+    left_index: u32,
     right: &Query<'_>,
-    right_index: u16,
+    right_index: u32,
 ) -> bool {
     match (
         left.node(left_index).expect("query node"),
@@ -2970,9 +3066,9 @@ fn query_subtree_equal(
 
 fn clone_query_subtree<'a>(
     source: &Query<'a>,
-    index: u16,
+    index: u32,
     output: &mut Query<'a>,
-) -> Result<u16, SqlError> {
+) -> Result<u32, SqlError> {
     let node = match source.node(index).expect("query node") {
         node @ QueryNode::Lexeme { .. } => node,
         QueryNode::Not(child) => QueryNode::Not(clone_query_subtree(source, child, output)?),
@@ -2999,11 +3095,11 @@ fn clone_query_subtree<'a>(
 
 fn rewrite_query_subtree<'a>(
     source: &Query<'a>,
-    index: u16,
+    index: u32,
     target: &Query<'a>,
     replacement: &Query<'a>,
     output: &mut Query<'a>,
-) -> Result<Option<u16>, SqlError> {
+) -> Result<Option<u32>, SqlError> {
     if target
         .root
         .is_some_and(|root| query_subtree_equal(source, index, target, root))
@@ -3078,7 +3174,7 @@ pub fn rewrite_query<'a>(
     if target.root.is_none() {
         return format_query(&source, arena);
     }
-    let mut output = Query::empty();
+    let mut output = Query::empty(arena);
     output.root = rewrite_query_subtree(&source, root, &target, &replacement, &mut output)?;
     format_query(&output, arena)
 }
@@ -3153,22 +3249,15 @@ pub(crate) fn headline_with<'a>(
     mut normalize: impl FnMut(u8, &str, &'a Arena) -> Result<TextSearchLexeme<'a>, SqlError>,
 ) -> Result<&'a str, SqlError> {
     let query = parse_query(query_text, arena)?;
-    let mut terms = [("", false); MAX_QUERY_NODES];
-    let mut term_count = 0usize;
-    for node in &query.nodes[..query.count] {
-        if let QueryNode::Lexeme { text, prefix, .. } = node
-            && term_count < terms.len()
-        {
-            terms[term_count] = (text, *prefix);
-            term_count += 1;
+    let mut terms = ArenaList::new(arena);
+    for node in query.nodes() {
+        if let QueryNode::Lexeme { text, prefix, .. } = *node {
+            terms
+                .push((text, prefix))
+                .map_err(|_| arena_full("ts_headline"))?;
         }
     }
-    let mut words = [HeadlineWord {
-        start: 0,
-        end: 0,
-        hit: false,
-    }; MAX_LEXEMES];
-    let mut word_count = 0usize;
+    let mut words = ArenaList::new(arena);
     let mut begin = None;
     for (offset, character) in document
         .char_indices()
@@ -3179,37 +3268,37 @@ pub(crate) fn headline_with<'a>(
             continue;
         }
         let Some(start) = begin.take() else { continue };
-        if word_count == words.len() {
-            return Err(capacity("ts_headline"));
-        }
         let word = &document[start..offset];
         let hit = match normalize(token_type(word), word, arena)? {
-            TextSearchLexeme::Lexeme(lexeme) => terms[..term_count]
+            TextSearchLexeme::Lexeme(lexeme) => terms
+                .as_slice()
                 .iter()
                 .any(|(term, prefix)| lexeme == *term || *prefix && lexeme.starts_with(term)),
             TextSearchLexeme::Unmapped | TextSearchLexeme::StopWord => false,
         };
-        words[word_count] = HeadlineWord {
-            start,
-            end: offset,
-            hit,
-        };
-        word_count += 1;
+        words
+            .push(HeadlineWord {
+                start,
+                end: offset,
+                hit,
+            })
+            .map_err(|_| arena_full("ts_headline"))?;
     }
-    if word_count == 0 {
+    if words.is_empty() {
         return arena
             .alloc_str(document)
             .map_err(|_| arena_full("ts_headline"));
     }
 
-    let mut fragments = [(0usize, 0usize); MAX_LEXEMES];
-    let fragment_count = if options.highlight_all {
-        fragments[0] = (0, word_count - 1);
-        1
+    let mut fragments = ArenaList::new(arena);
+    if options.highlight_all {
+        fragments
+            .push((0, words.len() - 1))
+            .map_err(|_| arena_full("ts_headline"))?;
     } else if options.max_fragments == 0 {
-        let first_hit = words[..word_count].iter().position(|word| word.hit);
+        let first_hit = words.as_slice().iter().position(|word| word.hit);
         let start = first_hit.unwrap_or(0);
-        let mut end = (start + options.min_words.saturating_sub(1)).min(word_count - 1);
+        let mut end = (start + options.min_words.saturating_sub(1)).min(words.len() - 1);
         let mut begin = start;
         if end + 1 - begin < options.min_words {
             begin = end.saturating_add(1).saturating_sub(options.min_words);
@@ -3217,38 +3306,40 @@ pub(crate) fn headline_with<'a>(
         if end + 1 - begin > options.max_words {
             end = begin + options.max_words - 1;
         }
-        fragments[0] = (begin, end);
-        1
+        fragments
+            .push((begin, end))
+            .map_err(|_| arena_full("ts_headline"))?;
     } else {
-        let mut count = 0usize;
-        for (hit, word) in words[..word_count].iter().enumerate() {
-            if !word.hit || count == options.max_fragments {
+        for (hit, word) in words.as_slice().iter().enumerate() {
+            if !word.hit || fragments.len() == options.max_fragments {
                 continue;
             }
             let before = options.max_words.saturating_sub(1) / 2;
             let mut begin = hit.saturating_sub(before);
-            let mut end = (begin + options.max_words.saturating_sub(1)).min(word_count - 1);
+            let mut end = (begin + options.max_words.saturating_sub(1)).min(words.len() - 1);
             begin = end
                 .saturating_add(1)
                 .saturating_sub(options.max_words)
                 .min(begin);
-            if count > 0 && begin <= fragments[count - 1].1 {
-                fragments[count - 1].1 = fragments[count - 1].1.max(end);
+            if let Some(previous) = fragments.as_mut_slice().last_mut()
+                && begin <= previous.1
+            {
+                previous.1 = previous.1.max(end);
                 continue;
             }
             if end + 1 - begin < options.min_words {
-                end = (begin + options.min_words - 1).min(word_count - 1);
+                end = (begin + options.min_words - 1).min(words.len() - 1);
             }
-            fragments[count] = (begin, end);
-            count += 1;
+            fragments
+                .push((begin, end))
+                .map_err(|_| arena_full("ts_headline"))?;
         }
-        if count == 0 {
-            fragments[0] = (0, options.min_words.saturating_sub(1).min(word_count - 1));
-            1
-        } else {
-            count
+        if fragments.is_empty() {
+            fragments
+                .push((0, options.min_words.saturating_sub(1).min(words.len() - 1)))
+                .map_err(|_| arena_full("ts_headline"))?;
         }
-    };
+    }
 
     let mut out = ArenaText::new(
         arena,
@@ -3259,25 +3350,29 @@ pub(crate) fn headline_with<'a>(
                     .len()
                     .saturating_mul(options.start.len().saturating_add(options.stop.len())),
             )
-            .saturating_add(fragment_count.saturating_mul(options.fragment_delimiter.len()))
+            .saturating_add(
+                fragments
+                    .len()
+                    .saturating_mul(options.fragment_delimiter.len()),
+            )
             .saturating_add(1),
         "ts_headline",
     )?;
-    for (begin, end) in &mut fragments[..fragment_count] {
+    for (begin, end) in fragments.as_mut_slice() {
         while *end > *begin
             && *end + 1 - *begin > options.min_words
-            && !words[*end].hit
-            && words[*end].end - words[*end].start <= options.short_word
+            && !words.as_slice()[*end].hit
+            && words.as_slice()[*end].end - words.as_slice()[*end].start <= options.short_word
         {
             *end -= 1;
         }
     }
-    for (fragment, (begin, end)) in fragments[..fragment_count].iter().copied().enumerate() {
+    for (fragment, (begin, end)) in fragments.as_slice().iter().copied().enumerate() {
         if fragment > 0 {
             out.push_str(options.fragment_delimiter)?;
         }
-        let byte_start = words[begin].start;
-        let mut byte_end = words[end].end;
+        let byte_start = words.as_slice()[begin].start;
+        let mut byte_end = words.as_slice()[end].end;
         for character in document[byte_end..].chars() {
             if token_char(character) || character.is_whitespace() {
                 break;
@@ -3285,7 +3380,7 @@ pub(crate) fn headline_with<'a>(
             byte_end += character.len_utf8();
         }
         let mut at = byte_start;
-        for word in &words[begin..=end] {
+        for word in &words.as_slice()[begin..=end] {
             out.push_str(&document[at..word.start])?;
             if word.hit {
                 out.push_str(options.start)?;
@@ -3364,15 +3459,19 @@ pub fn phrase_queries_distance<'a>(
 }
 
 pub fn query_node_count(source: &str, arena: &Arena) -> Result<i32, SqlError> {
-    Ok(parse_query(source, arena)?.count as i32)
+    i32::try_from(parse_query(source, arena)?.nodes.len()).map_err(|_| capacity("tsquery"))
 }
 
 pub fn query_operand_count(source: &str, arena: &Arena) -> Result<i32, SqlError> {
     let query = parse_query(source, arena)?;
-    Ok(query.nodes[..query.count]
-        .iter()
-        .filter(|node| matches!(node, QueryNode::Lexeme { .. }))
-        .count() as i32)
+    i32::try_from(
+        query
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node, QueryNode::Lexeme { .. }))
+            .count(),
+    )
+    .map_err(|_| capacity("tsquery"))
 }
 
 pub fn concat_vectors<'a>(left: &str, right: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
@@ -3485,11 +3584,12 @@ pub fn not_query<'a>(source: &'a str, arena: &'a Arena) -> Result<&'a str, SqlEr
 pub fn query_contains(container: &str, contained: &str, arena: &Arena) -> Result<bool, SqlError> {
     let container = parse_query(container, arena)?;
     let contained = parse_query(contained, arena)?;
-    for candidate in &contained.nodes[..contained.count] {
+    for candidate in contained.nodes() {
         let QueryNode::Lexeme { text, .. } = *candidate else {
             continue;
         };
-        let found = container.nodes[..container.count]
+        let found = container
+            .nodes()
             .iter()
             .any(|node| matches!(node, QueryNode::Lexeme { text: other, .. } if *other == text));
         if !found {
@@ -3529,11 +3629,10 @@ pub fn rank_with_options(
         return Ok(0.0);
     }
     if cover_density {
-        return rank_cover_density(&vector, &query, weights, normalization);
+        return rank_cover_density(&vector, &query, weights, normalization, arena);
     }
-    let mut operands: [Option<RankOperand<'_>>; MAX_QUERY_NODES] = [None; MAX_QUERY_NODES];
-    let mut operand_count = 0usize;
-    for node in &query.nodes[..query.count] {
+    let mut operands: ArenaList<'_, RankOperand<'_>> = ArenaList::new(arena);
+    for node in query.nodes() {
         let QueryNode::Lexeme {
             text,
             weights,
@@ -3542,34 +3641,33 @@ pub fn rank_with_options(
         else {
             continue;
         };
-        if operands[..operand_count]
+        if operands
+            .as_slice()
             .iter()
-            .flatten()
             .any(|operand| operand.text == text)
         {
             continue;
         }
-        operands[operand_count] = Some(RankOperand {
-            text,
-            weights,
-            prefix,
-        });
-        operand_count += 1;
+        operands
+            .push(RankOperand {
+                text,
+                weights,
+                prefix,
+            })
+            .map_err(|_| arena_full("ts_rank"))?;
     }
-    if operand_count == 0 {
+    if operands.is_empty() {
         return Ok(0.0);
     }
-    operands[..operand_count].sort_unstable_by(|left, right| {
-        left.expect("rank operand")
-            .text
-            .cmp(right.expect("rank operand").text)
-    });
-    let root = query.nodes[usize::from(query.root().expect("checked root"))];
+    operands
+        .as_mut_slice()
+        .sort_unstable_by(|left, right| left.text.cmp(right.text));
+    let root = query.nodes()[query.root().expect("checked root") as usize];
     let conjunction = matches!(root, QueryNode::And(_, _) | QueryNode::Phrase { .. });
-    let mut result = if conjunction && operand_count >= 2 {
-        rank_and(&vector, &operands[..operand_count], weights)
+    let mut result = if conjunction && operands.len() >= 2 {
+        rank_and(&vector, operands.as_slice(), weights, arena)?
     } else {
-        rank_or(&vector, &operands[..operand_count], weights)
+        rank_or(&vector, operands.as_slice(), weights)
     };
     if result < 0.0 {
         result = 1e-20;
@@ -3588,9 +3686,9 @@ fn matching_lexeme(operand: RankOperand<'_>, lexeme: &str) -> bool {
     lexeme == operand.text || (operand.prefix && lexeme.starts_with(operand.text))
 }
 
-fn rank_or(vector: &Vector<'_>, operands: &[Option<RankOperand<'_>>], weights: [f32; 4]) -> f32 {
+fn rank_or(vector: &Vector<'_>, operands: &[RankOperand<'_>], weights: [f32; 4]) -> f32 {
     let mut score = 0.0f32;
-    for operand in operands.iter().flatten().copied() {
+    for operand in operands.iter().copied() {
         for index in 0..vector.lexeme_count() {
             let (candidate, positions) = vector.lexeme(index).expect("vector index");
             if !matching_lexeme(operand, candidate) {
@@ -3625,11 +3723,7 @@ fn rank_or(vector: &Vector<'_>, operands: &[Option<RankOperand<'_>>], weights: [
     score / operands.len() as f32
 }
 
-fn rank_positions(
-    vector: &Vector<'_>,
-    operand: RankOperand<'_>,
-    output: &mut [Position; MAX_POSITIONS],
-) -> usize {
+fn rank_positions(vector: &Vector<'_>, operand: RankOperand<'_>, output: &mut [Position]) -> usize {
     let mut count = 0usize;
     for index in 0..vector.lexeme_count() {
         let (lexeme, positions) = vector.lexeme(index).expect("vector index");
@@ -3666,14 +3760,24 @@ fn word_distance(distance: u16) -> f32 {
     }
 }
 
-fn rank_and(vector: &Vector<'_>, operands: &[Option<RankOperand<'_>>], weights: [f32; 4]) -> f32 {
+fn rank_and(
+    vector: &Vector<'_>,
+    operands: &[RankOperand<'_>],
+    weights: [f32; 4],
+    arena: &Arena,
+) -> Result<f32, SqlError> {
     let mut result = -1.0f32;
-    let mut current_positions = [Position::default(); MAX_POSITIONS];
-    let mut earlier_positions = [Position::default(); MAX_POSITIONS];
-    for (index, operand) in operands.iter().flatten().copied().enumerate() {
-        let current_count = rank_positions(vector, operand, &mut current_positions);
-        for earlier in operands[..index].iter().flatten().copied() {
-            let earlier_count = rank_positions(vector, earlier, &mut earlier_positions);
+    let position_capacity = rank_vector_length(vector);
+    let current_positions = arena
+        .alloc_slice_with(position_capacity, |_| Position::default())
+        .map_err(|_| arena_full("ts_rank positions"))?;
+    let earlier_positions = arena
+        .alloc_slice_with(position_capacity, |_| Position::default())
+        .map_err(|_| arena_full("ts_rank positions"))?;
+    for (index, operand) in operands.iter().copied().enumerate() {
+        let current_count = rank_positions(vector, operand, current_positions);
+        for earlier in operands[..index].iter().copied() {
+            let earlier_count = rank_positions(vector, earlier, earlier_positions);
             for left in &current_positions[..current_count] {
                 for right in &earlier_positions[..earlier_count] {
                     let mut distance = left.number.abs_diff(right.number);
@@ -3693,7 +3797,7 @@ fn rank_and(vector: &Vector<'_>, operands: &[Option<RankOperand<'_>>], weights: 
             }
         }
     }
-    result
+    Ok(result)
 }
 
 fn rank_vector_length(vector: &Vector<'_>) -> usize {
@@ -3732,40 +3836,31 @@ fn rank_cover_density(
     query: &Query<'_>,
     weights: [f32; 4],
     normalization: i32,
+    arena: &Arena,
 ) -> Result<f32, SqlError> {
     #[derive(Clone, Copy)]
-    struct DocumentEntry {
+    struct DocumentEntry<'a> {
         position: Position,
-        lexeme: u16,
-        operands: [u64; MAX_QUERY_NODES / 64],
-    }
-
-    impl DocumentEntry {
-        const EMPTY: Self = Self {
-            position: Position {
-                number: 0,
-                weight: 0,
-            },
-            lexeme: 0,
-            operands: [0; MAX_QUERY_NODES / 64],
-        };
-
-        fn contains(self, node: u16) -> bool {
-            self.operands[usize::from(node) / 64] & (1 << (usize::from(node) % 64)) != 0
-        }
+        lexeme: &'a str,
     }
 
     fn cover_match(
         query: &Query<'_>,
-        node: u16,
-        document: &[DocumentEntry],
+        node: u32,
+        document: &[DocumentEntry<'_>],
     ) -> Result<MatchResult, SqlError> {
         Ok(
             match query.node(node).ok_or_else(|| syntax("tsquery", ""))? {
-                QueryNode::Lexeme { .. } => {
+                QueryNode::Lexeme {
+                    text,
+                    weights,
+                    prefix,
+                } => {
                     let mut result = MatchResult::empty(false);
                     for entry in document {
-                        if entry.contains(node) {
+                        if (entry.lexeme == text || prefix && entry.lexeme.starts_with(text))
+                            && (weights == 0 || weights & (1 << entry.position.weight) != 0)
+                        {
                             result.truth = true;
                             result.add(entry.position.number);
                         }
@@ -3828,54 +3923,41 @@ fn rank_cover_density(
     let Some(root) = query.root() else {
         return Ok(0.0);
     };
-    let mut document = [DocumentEntry::EMPTY; MAX_POSITIONS];
-    let mut document_count = 0usize;
+    let mut document = ArenaList::new(arena);
     for lexeme_index in 0..vector.lexeme_count() {
         let (lexeme, positions) = vector.lexeme(lexeme_index).expect("vector index");
         if positions.is_empty() {
             continue;
         }
-        let mut matching = [0u64; MAX_QUERY_NODES / 64];
-        for (node_index, node) in query.nodes[..query.count].iter().enumerate() {
-            let QueryNode::Lexeme { text, prefix, .. } = *node else {
-                continue;
-            };
-            if lexeme == text || prefix && lexeme.starts_with(text) {
-                matching[node_index / 64] |= 1 << (node_index % 64);
-            }
-        }
-        if matching.iter().all(|word| *word == 0) {
+        if !query.nodes().iter().any(|node| {
+            matches!(node, QueryNode::Lexeme { text, prefix, .. }
+                if lexeme == *text || *prefix && lexeme.starts_with(text))
+        }) {
             continue;
         }
         for position in positions {
-            let mut operands = matching;
-            for (node_index, node) in query.nodes[..query.count].iter().enumerate() {
-                let QueryNode::Lexeme {
-                    weights: required, ..
-                } = *node
-                else {
-                    continue;
-                };
-                if required != 0 && required & (1 << position.weight) == 0 {
-                    operands[node_index / 64] &= !(1 << (node_index % 64));
-                }
-            }
-            if operands.iter().all(|word| *word == 0) {
+            if !query.nodes().iter().any(|node| {
+                matches!(node, QueryNode::Lexeme { text, weights: required, prefix }
+                    if (lexeme == *text || *prefix && lexeme.starts_with(text))
+                        && (*required == 0 || *required & (1 << position.weight) != 0))
+            }) {
                 continue;
             }
-            document[document_count] = DocumentEntry {
-                position: *position,
-                lexeme: lexeme_index as u16,
-                operands,
-            };
-            document_count += 1;
+            document
+                .push(DocumentEntry {
+                    position: *position,
+                    lexeme,
+                })
+                .map_err(|_| arena_full("ts_rank_cd document"))?;
         }
     }
-    document[..document_count]
+    document
+        .as_mut_slice()
         .sort_unstable_by_key(|entry| (entry.position.number, entry.position.weight, entry.lexeme));
-    if document_count == 0 {
+    if document.is_empty() {
         return Ok(0.0);
     }
+    let document = document.as_slice();
 
     let inverse_weights = weights.map(|weight| 1.0f64 / f64::from(weight));
     let mut result = 0.0f64;
@@ -3883,8 +3965,8 @@ fn rank_cover_density(
     let mut distance_sum = 0.0f64;
     let mut previous_extent_position = 0.0f64;
     let mut cursor = 0usize;
-    while cursor < document_count {
-        let Some(end) = (cursor..document_count).find(|end| {
+    while cursor < document.len() {
+        let Some(end) = (cursor..document.len()).find(|end| {
             cover_match(query, root, &document[cursor..=*end]).is_ok_and(|matched| matched.truth)
         }) else {
             break;
@@ -4180,167 +4262,6 @@ pub fn compare_vector(left: &str, right: &str) -> Ordering {
         })
 }
 
-#[derive(Clone, Copy)]
-enum CanonicalQueryNode<'a> {
-    Lexeme { raw: &'a [u8], prefix: bool },
-    Not(u16),
-    And(u16, u16),
-    Or(u16, u16),
-    Phrase(u16, u16, u16),
-}
-
-struct CanonicalQuery<'a> {
-    nodes: [CanonicalQueryNode<'a>; MAX_QUERY_NODES],
-    count: usize,
-    root: Option<u16>,
-}
-
-struct CanonicalQueryParser<'a> {
-    source: &'a [u8],
-    at: usize,
-    query: CanonicalQuery<'a>,
-}
-
-impl<'a> CanonicalQueryParser<'a> {
-    fn new(source: &'a str) -> Self {
-        Self {
-            source: source.as_bytes(),
-            at: 0,
-            query: CanonicalQuery {
-                nodes: [CanonicalQueryNode::Lexeme {
-                    raw: &[],
-                    prefix: false,
-                }; MAX_QUERY_NODES],
-                count: 0,
-                root: None,
-            },
-        }
-    }
-
-    fn skip(&mut self) {
-        while self.source.get(self.at) == Some(&b' ') {
-            self.at += 1;
-        }
-    }
-
-    fn take(&mut self, byte: u8) -> bool {
-        self.skip();
-        if self.source.get(self.at) == Some(&byte) {
-            self.at += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn push(&mut self, node: CanonicalQueryNode<'a>) -> u16 {
-        let index = self.query.count as u16;
-        self.query.nodes[self.query.count] = node;
-        self.query.count += 1;
-        index
-    }
-
-    fn parse(mut self) -> CanonicalQuery<'a> {
-        self.skip();
-        if self.at < self.source.len() {
-            self.query.root = Some(self.parse_or());
-        }
-        self.query
-    }
-
-    fn parse_or(&mut self) -> u16 {
-        let mut left = self.parse_and();
-        while self.take(b'|') {
-            let right = self.parse_and();
-            left = self.push(CanonicalQueryNode::Or(left, right));
-        }
-        left
-    }
-
-    fn parse_and(&mut self) -> u16 {
-        let mut left = self.parse_phrase();
-        while self.take(b'&') {
-            let right = self.parse_phrase();
-            left = self.push(CanonicalQueryNode::And(left, right));
-        }
-        left
-    }
-
-    fn parse_phrase(&mut self) -> u16 {
-        let mut left = self.parse_unary();
-        loop {
-            self.skip();
-            if self.source.get(self.at) != Some(&b'<') {
-                break;
-            }
-            self.at += 1;
-            let distance = if self.source.get(self.at..self.at + 2) == Some(&b"->"[..]) {
-                self.at += 2;
-                1
-            } else {
-                let mut distance = 0u16;
-                while let Some(byte @ b'0'..=b'9') = self.source.get(self.at).copied() {
-                    distance = distance * 10 + u16::from(byte - b'0');
-                    self.at += 1;
-                }
-                self.at += 1;
-                distance
-            };
-            let right = self.parse_unary();
-            left = self.push(CanonicalQueryNode::Phrase(left, right, distance));
-        }
-        left
-    }
-
-    fn parse_unary(&mut self) -> u16 {
-        if self.take(b'!') {
-            let child = self.parse_unary();
-            self.push(CanonicalQueryNode::Not(child))
-        } else {
-            self.parse_primary()
-        }
-    }
-
-    fn parse_primary(&mut self) -> u16 {
-        self.skip();
-        if self.take(b'(') {
-            let node = self.parse_or();
-            debug_assert!(self.take(b')'));
-            return node;
-        }
-        debug_assert_eq!(self.source[self.at], b'\'');
-        self.at += 1;
-        let start = self.at;
-        while self.at < self.source.len() {
-            if self.source[self.at] == b'\\' {
-                self.at += 2;
-            } else if self.source[self.at] == b'\'' {
-                break;
-            } else {
-                self.at += 1;
-            }
-        }
-        let lexeme = &self.source[start..self.at];
-        self.at += 1;
-        let mut prefix = false;
-        if self.source.get(self.at) == Some(&b':') {
-            self.at += 1;
-            while let Some(byte) = self.source.get(self.at).copied() {
-                match byte {
-                    b'*' => prefix = true,
-                    b'A'..=b'D' => {}
-                    _ => break,
-                }
-                self.at += 1;
-            }
-        }
-        self.push(CanonicalQueryNode::Lexeme {
-            raw: lexeme,
-            prefix,
-        })
-    }
-}
-
 fn legacy_crc32(raw: &[u8]) -> i32 {
     let mut crc = u32::MAX;
     for byte in (UnescapedBytes { raw, at: 0 }) {
@@ -4356,104 +4277,111 @@ fn legacy_crc32(raw: &[u8]) -> i32 {
     (crc ^ u32::MAX) as i32
 }
 
-fn query_storage_size(query: &CanonicalQuery<'_>) -> usize {
-    8 + query.count * 12
-        + query.nodes[..query.count]
-            .iter()
-            .map(|node| match node {
-                CanonicalQueryNode::Lexeme { raw, .. } => escaped_len(raw) + 1,
-                _ => 0,
-            })
-            .sum::<usize>()
+fn query_storage_size(source: &[u8]) -> usize {
+    let mut operand_bytes = 0usize;
+    let mut at = 0usize;
+    while at < source.len() {
+        if source[at] != b'\'' {
+            at += 1;
+            continue;
+        }
+        let raw = scan_quoted(source, &mut at);
+        operand_bytes += escaped_len(raw) + 1;
+    }
+    8 + canonical_query_node_count(source) * 12 + operand_bytes
 }
 
-fn compare_query_nodes(
-    left: &CanonicalQuery<'_>,
-    left_index: u16,
-    right: &CanonicalQuery<'_>,
-    right_index: u16,
-) -> Ordering {
-    let left_node = left.nodes[usize::from(left_index)];
-    let right_node = right.nodes[usize::from(right_index)];
-    let is_left_operator = !matches!(left_node, CanonicalQueryNode::Lexeme { .. });
-    let is_right_operator = !matches!(right_node, CanonicalQueryNode::Lexeme { .. });
+fn canonical_operator(expression: CanonicalExpression<'_>) -> u8 {
+    match expression {
+        CanonicalExpression::Lexeme { .. } => 0,
+        CanonicalExpression::Not(_) => 1,
+        CanonicalExpression::Binary { operator, .. } => operator,
+    }
+}
+
+fn compare_query_nodes(left: &[u8], right: &[u8]) -> Ordering {
+    let left_node = canonical_expression(left);
+    let right_node = canonical_expression(right);
+    let is_left_operator = !matches!(left_node, CanonicalExpression::Lexeme { .. });
+    let is_right_operator = !matches!(right_node, CanonicalExpression::Lexeme { .. });
     is_left_operator
         .cmp(&is_right_operator)
         .reverse()
         .then_with(|| match (left_node, right_node) {
             (
-                CanonicalQueryNode::Lexeme { raw: a, .. },
-                CanonicalQueryNode::Lexeme { raw: b, .. },
+                CanonicalExpression::Lexeme { raw: a, .. },
+                CanonicalExpression::Lexeme { raw: b, .. },
             ) => legacy_crc32(a)
                 .cmp(&legacy_crc32(b))
                 .reverse()
                 .then_with(|| compare_escaped(a, b)),
-            (CanonicalQueryNode::Not(a), CanonicalQueryNode::Not(b)) => {
-                compare_query_nodes(left, a, right, b)
-            }
-            (CanonicalQueryNode::And(al, ar), CanonicalQueryNode::And(bl, br))
-            | (CanonicalQueryNode::Or(al, ar), CanonicalQueryNode::Or(bl, br)) => {
-                compare_query_nodes(left, ar, right, br)
-                    .then_with(|| compare_query_nodes(left, al, right, bl))
-            }
-            (CanonicalQueryNode::Phrase(al, ar, ad), CanonicalQueryNode::Phrase(bl, br, bd)) => {
-                compare_query_nodes(left, ar, right, br)
-                    .then_with(|| compare_query_nodes(left, al, right, bl))
-                    .then_with(|| ad.cmp(&bd).reverse())
-            }
-            (a, b) => {
-                let operator = |node| match node {
-                    CanonicalQueryNode::Not(_) => 1u8,
-                    CanonicalQueryNode::And(..) => 2,
-                    CanonicalQueryNode::Or(..) => 3,
-                    CanonicalQueryNode::Phrase(..) => 4,
-                    CanonicalQueryNode::Lexeme { .. } => 0,
-                };
-                operator(a).cmp(&operator(b)).reverse()
-            }
+            (CanonicalExpression::Not(a), CanonicalExpression::Not(b)) => compare_query_nodes(a, b),
+            (
+                CanonicalExpression::Binary {
+                    operator: ao,
+                    distance: ad,
+                    left: al,
+                    right: ar,
+                },
+                CanonicalExpression::Binary {
+                    operator: bo,
+                    distance: bd,
+                    left: bl,
+                    right: br,
+                },
+            ) if ao == bo => compare_query_nodes(ar, br)
+                .then_with(|| compare_query_nodes(al, bl))
+                .then_with(|| {
+                    if ao == 4 {
+                        ad.cmp(&bd).reverse()
+                    } else {
+                        Ordering::Equal
+                    }
+                }),
+            (a, b) => canonical_operator(a).cmp(&canonical_operator(b)).reverse(),
         })
 }
 
 pub fn compare_query(left: &str, right: &str) -> Ordering {
-    let left = CanonicalQueryParser::new(left).parse();
-    let right = CanonicalQueryParser::new(right).parse();
-    left.count
-        .cmp(&right.count)
-        .then_with(|| query_storage_size(&left).cmp(&query_storage_size(&right)))
-        .then_with(|| match (left.root, right.root) {
-            (Some(a), Some(b)) => compare_query_nodes(&left, a, &right, b),
-            _ => Ordering::Equal,
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    canonical_query_node_count(left)
+        .cmp(&canonical_query_node_count(right))
+        .then_with(|| query_storage_size(left).cmp(&query_storage_size(right)))
+        .then_with(|| {
+            if left.is_empty() || right.is_empty() {
+                Ordering::Equal
+            } else {
+                compare_query_nodes(left, right)
+            }
         })
 }
 
-fn emit_query_hash_node(query: &CanonicalQuery<'_>, index: u16, emit: &mut impl FnMut(&[u8])) {
-    match query.nodes[usize::from(index)] {
-        CanonicalQueryNode::Lexeme { raw, .. } => {
+fn emit_query_hash_node(source: &[u8], emit: &mut impl FnMut(&[u8])) {
+    match canonical_expression(source) {
+        CanonicalExpression::Lexeme { raw, .. } => {
             emit(&[1]);
             for byte in (UnescapedBytes { raw, at: 0 }) {
                 emit(&[byte]);
             }
             emit(&[0]);
         }
-        CanonicalQueryNode::Not(child) => {
+        CanonicalExpression::Not(child) => {
             emit(&[2, 1]);
-            emit_query_hash_node(query, child, emit);
+            emit_query_hash_node(child, emit);
         }
-        CanonicalQueryNode::And(left, right) => {
-            emit(&[2, 2]);
-            emit_query_hash_node(query, right, emit);
-            emit_query_hash_node(query, left, emit);
-        }
-        CanonicalQueryNode::Or(left, right) => {
-            emit(&[2, 3]);
-            emit_query_hash_node(query, right, emit);
-            emit_query_hash_node(query, left, emit);
-        }
-        CanonicalQueryNode::Phrase(left, right, distance) => {
-            emit(&[2, 4]);
-            emit_query_hash_node(query, right, emit);
-            emit_query_hash_node(query, left, emit);
-            emit(&distance.to_le_bytes());
+        CanonicalExpression::Binary {
+            operator,
+            distance,
+            left,
+            right,
+        } => {
+            emit(&[2, operator]);
+            emit_query_hash_node(right, emit);
+            emit_query_hash_node(left, emit);
+            if operator == 4 {
+                emit(&distance.to_le_bytes());
+            }
         }
     }
 }
@@ -4470,40 +4398,48 @@ pub(crate) fn fold_query_lexemes<T: Copy>(
     use core::hash::Hasher as _;
 
     fn fold<T: Copy>(
-        query: &CanonicalQuery<'_>,
-        node: u16,
+        source: &[u8],
         lexeme: &mut impl FnMut(u64, bool) -> T,
         negated: T,
         conjunction: &mut impl FnMut(T, T) -> T,
         disjunction: &mut impl FnMut(T, T) -> T,
     ) -> T {
-        match query.nodes[usize::from(node)] {
-            CanonicalQueryNode::Lexeme { raw, prefix, .. } => {
+        match canonical_expression(source) {
+            CanonicalExpression::Lexeme { raw, prefix, .. } => {
                 let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
                 for byte in (UnescapedBytes { raw, at: 0 }) {
                     hasher.write_u8(byte);
                 }
                 lexeme(hasher.finish(), prefix)
             }
-            CanonicalQueryNode::Not(_) => negated,
-            CanonicalQueryNode::And(left, right) | CanonicalQueryNode::Phrase(left, right, _) => {
-                let left = fold(query, left, lexeme, negated, conjunction, disjunction);
-                let right = fold(query, right, lexeme, negated, conjunction, disjunction);
+            CanonicalExpression::Not(_) => negated,
+            CanonicalExpression::Binary {
+                operator: 2 | 4,
+                left,
+                right,
+                ..
+            } => {
+                let left = fold(left, lexeme, negated, conjunction, disjunction);
+                let right = fold(right, lexeme, negated, conjunction, disjunction);
                 conjunction(left, right)
             }
-            CanonicalQueryNode::Or(left, right) => {
-                let left = fold(query, left, lexeme, negated, conjunction, disjunction);
-                let right = fold(query, right, lexeme, negated, conjunction, disjunction);
+            CanonicalExpression::Binary {
+                operator: 3,
+                left,
+                right,
+                ..
+            } => {
+                let left = fold(left, lexeme, negated, conjunction, disjunction);
+                let right = fold(right, lexeme, negated, conjunction, disjunction);
                 disjunction(left, right)
             }
+            CanonicalExpression::Binary { .. } => unreachable!("canonical tsquery operator"),
         }
     }
 
-    let query = CanonicalQueryParser::new(source).parse();
-    query.root.map(|root| {
+    (!source.is_empty()).then(|| {
         fold(
-            &query,
-            root,
+            source.as_bytes(),
             &mut lexeme,
             negated,
             &mut conjunction,
@@ -4513,11 +4449,11 @@ pub(crate) fn fold_query_lexemes<T: Copy>(
 }
 
 pub fn emit_query_hash(source: &str, mut emit: impl FnMut(&[u8])) {
-    let query = CanonicalQueryParser::new(source).parse();
-    emit(&(query.count as u32).to_le_bytes());
-    emit(&(query_storage_size(&query) as u32).to_le_bytes());
-    if let Some(root) = query.root {
-        emit_query_hash_node(&query, root, &mut emit);
+    let source = source.as_bytes();
+    emit(&(canonical_query_node_count(source) as u32).to_le_bytes());
+    emit(&(query_storage_size(source) as u32).to_le_bytes());
+    if !source.is_empty() {
+        emit_query_hash_node(source, &mut emit);
     }
 }
 
@@ -4562,6 +4498,109 @@ mod tests {
         );
         let arena = arena();
         assert_eq!(decode_query_binary(&encoded, &arena).unwrap(), source);
+    }
+
+    #[test]
+    fn binary_lexemes_use_the_full_postgresql_field_width() {
+        let lexeme = vec![b'x'; MAX_WIRE_LEXEME_BYTES];
+        let mut vector = 1i32.to_be_bytes().to_vec();
+        vector.extend_from_slice(&lexeme);
+        vector.push(0);
+        vector.extend_from_slice(&0i16.to_be_bytes());
+
+        let mut query = 1i32.to_be_bytes().to_vec();
+        query.extend_from_slice(&[1, 0, 0]);
+        query.extend_from_slice(&lexeme);
+        query.push(0);
+
+        let arena = arena();
+        let vector = decode_vector_binary(&vector, &arena).unwrap();
+        let query = decode_query_binary(&query, &arena).unwrap();
+        assert_eq!(parse_vector(vector, &arena).unwrap().lexeme_count(), 1);
+        assert_eq!(parse_query(query, &arena).unwrap().nodes().len(), 1);
+
+        let text_lexeme = "x".repeat(MAX_TEXT_LEXEME_BYTES + 1);
+        assert!(canonical_vector(&text_lexeme, &arena).is_err());
+        assert!(canonical_query(&text_lexeme, &arena).is_err());
+    }
+
+    #[test]
+    fn statement_sized_full_text_values_cross_former_inline_limits() {
+        use core::fmt::Write as _;
+
+        let mut vector_source = String::new();
+        for index in 0..600 {
+            if index != 0 {
+                vector_source.push(' ');
+            }
+            write!(vector_source, "'word{index:04}':1,2,3,4").unwrap();
+        }
+        let arena = arena();
+        let vector = canonical_vector(&vector_source, &arena).unwrap();
+        let parsed = parse_vector(vector, &arena).unwrap();
+        assert_eq!(parsed.lexeme_count(), 600);
+        assert_eq!(rank_vector_length(&parsed), 2_400);
+        let mut vector_binary = Vec::new();
+        assert_eq!(
+            emit_vector_binary(vector, |bytes| vector_binary.extend_from_slice(bytes)),
+            vector_binary.len()
+        );
+
+        let mut query_terms = (0..300)
+            .map(|index| format!("'word{index:04}'"))
+            .collect::<Vec<_>>();
+        while query_terms.len() > 1 {
+            let mut combined = Vec::with_capacity(query_terms.len().div_ceil(2));
+            for pair in query_terms.chunks(2) {
+                combined.push(if let [left, right] = pair {
+                    format!("({left} & {right})")
+                } else {
+                    pair[0].clone()
+                });
+            }
+            query_terms = combined;
+        }
+        let query_source = query_terms.pop().unwrap();
+        let query = canonical_query(&query_source, &arena).unwrap();
+        assert_eq!(query_node_count(query, &arena).unwrap(), 599);
+        let mut query_binary = Vec::new();
+        assert_eq!(
+            emit_query_binary(query, |bytes| query_binary.extend_from_slice(bytes)),
+            query_binary.len()
+        );
+        let decoded = decode_query_binary(&query_binary, &arena).unwrap();
+        assert_eq!(decoded, query);
+        assert_eq!(compare_query(query, decoded), Ordering::Equal);
+
+        let grouped = canonical_query("(a | b) & (c | d)", &arena).unwrap();
+        let mut grouped_binary = Vec::new();
+        emit_query_binary(grouped, |bytes| grouped_binary.extend_from_slice(bytes));
+        assert_eq!(
+            decode_query_binary(&grouped_binary, &arena).unwrap(),
+            grouped
+        );
+    }
+
+    #[test]
+    fn vector_canonicalization_keeps_postgresql_position_boundary_per_lexeme() {
+        use core::fmt::Write as _;
+
+        let mut source = String::from("'word':");
+        for position in 1..=300 {
+            if position != 1 {
+                source.push(',');
+            }
+            write!(source, "{position}").unwrap();
+        }
+        let arena = arena();
+        let canonical = canonical_vector(&source, &arena).unwrap();
+        let parsed = parse_vector(canonical, &arena).unwrap();
+        let (_, positions) = parsed.lexeme(0).unwrap();
+        assert_eq!(positions.len(), MAX_LEXEME_POSITIONS);
+        assert_eq!(
+            positions.last().unwrap().number,
+            MAX_LEXEME_POSITIONS as u16
+        );
     }
 
     #[test]

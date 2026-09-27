@@ -275,6 +275,40 @@ fn srf_signature_error(name: &str) -> SqlError {
     )
 }
 
+pub(super) fn tsvector_unnest_values<'a>(
+    vector: &crate::sql::full_text::Vector<'a>,
+    index: usize,
+    arena: &'a Arena,
+) -> Result<[Datum<'a>; 3], SqlError> {
+    let (lexeme, positions) = vector.lexeme(index).expect("vector index");
+    let position_values = arena
+        .alloc_slice_with(positions.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    let weight_values = arena
+        .alloc_slice_with(positions.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (position_index, position) in positions.iter().enumerate() {
+        position_values[position_index] = Datum::Int2(position.number as i16);
+        weight_values[position_index] = Datum::Text(match position.weight {
+            3 => "A",
+            2 => "B",
+            1 => "C",
+            _ => "D",
+        });
+    }
+    Ok([
+        Datum::Text(lexeme),
+        Datum::Array {
+            element: crate::sql::types::ArrElem::Int2,
+            raw: crate::sql::array::build(position_values, arena)?,
+        },
+        Datum::Array {
+            element: crate::sql::types::ArrElem::Text,
+            raw: crate::sql::array::build(weight_values, arena)?,
+        },
+    ])
+}
+
 fn evaluate_publication_arguments<'a, R: ColumnLookup<'a>>(
     arguments: &'a [&'a Expr<'a>],
     variadic: bool,
@@ -1112,6 +1146,36 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 } else {
                     Datum::Xid8(transaction_id)
                 };
+            }
+            return Ok(values);
+        }
+        if name.eq_ignore_ascii_case("unnest")
+            && args.len() == 1
+            && crate::sql::eval::static_type_pub(args[0], row) == Some(ColType::TsVector)
+        {
+            let vector = match eval_full(args[0], arena, params, row, hooks)? {
+                Datum::TsVector(vector) => vector,
+                Datum::Null => return Ok(&[]),
+                _ => return Err(srf_signature_error(name)),
+            };
+            let parsed = crate::sql::full_text::parse_vector(vector.as_str(), arena)?;
+            let values = arena
+                .alloc_slice_with(parsed.lexeme_count(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (index, value) in values.iter_mut().enumerate() {
+                let row = tsvector_unnest_values(&parsed, index, arena)?;
+                let fields = arena
+                    .alloc_slice_with(3, |field| crate::sql::types::RecordField {
+                        name: ["lexeme", "positions", "weights"][field],
+                        type_oid: [
+                            crate::sql::types::oid::TEXT,
+                            crate::sql::types::ArrElem::Int2.array_oid(),
+                            crate::sql::types::ArrElem::Text.array_oid(),
+                        ][field],
+                        value: row[field],
+                    })
+                    .map_err(|_| arena_full())?;
+                *value = Datum::Record(fields);
             }
             return Ok(values);
         }
@@ -3841,10 +3905,14 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         }
         let query = crate::sql::parser::parse_query(source, arena)?;
         let routine_query = super::RoutineQuery::Select(query);
-        let mut words = [""; crate::sql::full_text::MAX_LEXEMES];
-        let mut documents = [0i32; crate::sql::full_text::MAX_LEXEMES];
-        let mut entries = [0i32; crate::sql::full_text::MAX_LEXEMES];
-        let mut count = 0usize;
+        #[derive(Clone, Copy)]
+        struct Statistic<'a> {
+            word: &'a str,
+            documents: i32,
+            entries: i32,
+        }
+        let mut statistics: crate::mem::arena::ArenaList<'_, Statistic<'_>> =
+            crate::mem::arena::ArenaList::new(arena);
         super::execute_routine_query(
             &routine_query,
             storage,
@@ -3883,49 +3951,43 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                     if occurrences == 0 {
                         continue;
                     }
-                    let slot = match words[..count]
+                    let slot = match statistics
+                        .as_slice()
                         .iter()
-                        .position(|candidate| *candidate == word)
+                        .position(|candidate| candidate.word == word)
                     {
                         Some(slot) => slot,
                         None => {
-                            if count == words.len() {
-                                return Err(sql_err!(
-                                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                    "ts_stat exceeds {} distinct lexemes",
-                                    words.len()
-                                ));
-                            }
-                            words[count] = arena.alloc_str(word).map_err(|_| arena_full())?;
-                            count += 1;
-                            count - 1
+                            statistics
+                                .push(Statistic {
+                                    word: arena.alloc_str(word).map_err(|_| arena_full())?,
+                                    documents: 0,
+                                    entries: 0,
+                                })
+                                .map_err(|_| arena_full())?;
+                            statistics.len() - 1
                         }
                     };
-                    documents[slot] = documents[slot].saturating_add(1);
-                    entries[slot] = entries[slot].saturating_add(occurrences);
+                    let statistic = &mut statistics.as_mut_slice()[slot];
+                    statistic.documents = statistic.documents.saturating_add(1);
+                    statistic.entries = statistic.entries.saturating_add(occurrences);
                 }
                 Ok(())
             },
         )?;
-        for left in 1..count {
-            let mut right = left;
-            while right > 0 && words[right - 1] < words[right] {
-                words.swap(right - 1, right);
-                documents.swap(right - 1, right);
-                entries.swap(right - 1, right);
-                right -= 1;
-            }
-        }
+        statistics
+            .as_mut_slice()
+            .sort_unstable_by(|left, right| right.word.cmp(left.word));
         const EMPTY: &[u8] = &[];
         let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
+            .alloc_slice_with(statistics.len(), |_| EMPTY)
             .map_err(|_| arena_full())?;
-        for (index, row) in rows.iter_mut().enumerate() {
+        for (statistic, row) in statistics.as_slice().iter().zip(rows.iter_mut()) {
             *row = crate::sql::exec::encode_projected_pub(
                 &[
-                    Datum::Text(words[index]),
-                    Datum::Int4(documents[index]),
-                    Datum::Int4(entries[index]),
+                    Datum::Text(statistic.word),
+                    Datum::Int4(statistic.documents),
+                    Datum::Int4(statistic.entries),
                 ],
                 arena,
             )?;
@@ -4006,12 +4068,12 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             Datum::Text(document) | Datum::Bpchar(document) => document,
             _ => return Err(srf_signature_error(tref.table)),
         };
-        let (tokens, count) = crate::sql::full_text::parse_document(document, arena)?;
+        let tokens = crate::sql::full_text::parse_document(document, arena)?;
         const EMPTY: &[u8] = &[];
         let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
+            .alloc_slice_with(tokens.len(), |_| EMPTY)
             .map_err(|_| arena_full())?;
-        for (token, row) in tokens[..count].iter().zip(rows.iter_mut()) {
+        for (token, row) in tokens.iter().zip(rows.iter_mut()) {
             let token_index = usize::from(token.kind.saturating_sub(1));
             let mapping_count = usize::from(mappings.counts[token_index]);
             let mut dictionaries =
@@ -4155,11 +4217,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             Datum::Text(document) | Datum::Bpchar(document) => document,
             _ => return Err(srf_signature_error(tref.table)),
         };
-        let (tokens, count) = crate::sql::full_text::parse_document(document, arena)?;
+        let tokens = crate::sql::full_text::parse_document(document, arena)?;
         let rows = arena
-            .alloc_slice_with(count, |_| EMPTY)
+            .alloc_slice_with(tokens.len(), |_| EMPTY)
             .map_err(|_| arena_full())?;
-        for (token, row) in tokens[..count].iter().zip(rows.iter_mut()) {
+        for (token, row) in tokens.iter().zip(rows.iter_mut()) {
             *row = crate::sql::exec::encode_projected_pub(
                 &[Datum::Int4(i32::from(token.kind)), Datum::Text(token.text)],
                 arena,
@@ -4705,29 +4767,7 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 .alloc_slice_with(parsed.lexeme_count(), |_| EMPTY)
                 .map_err(|_| arena_full())?;
             for (index, row) in rows.iter_mut().enumerate() {
-                let (lexeme, positions) = parsed.lexeme(index).expect("vector index");
-                let mut position_values = [Datum::Null; crate::sql::full_text::MAX_POSITIONS];
-                let mut weight_values = [Datum::Null; crate::sql::full_text::MAX_POSITIONS];
-                for (position_index, position) in positions.iter().enumerate() {
-                    position_values[position_index] = Datum::Int2(position.number as i16);
-                    weight_values[position_index] = Datum::Text(match position.weight {
-                        3 => "A",
-                        2 => "B",
-                        1 => "C",
-                        _ => "D",
-                    });
-                }
-                let values = [
-                    Datum::Text(lexeme),
-                    Datum::Array {
-                        element: crate::sql::types::ArrElem::Int2,
-                        raw: crate::sql::array::build(&position_values[..positions.len()], arena)?,
-                    },
-                    Datum::Array {
-                        element: crate::sql::types::ArrElem::Text,
-                        raw: crate::sql::array::build(&weight_values[..positions.len()], arena)?,
-                    },
-                ];
+                let values = tsvector_unnest_values(&parsed, index, arena)?;
                 *row = crate::sql::exec::encode_projected_pub(&values, arena)?;
             }
             return Ok(&*rows);

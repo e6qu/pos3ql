@@ -808,6 +808,25 @@ fn pax_column_demand_bounded(
             .is_none_or(|select| collect_select(select, scope, columns))
     }
 
+    fn collect_table_function_arguments(
+        table: &TableRef,
+        scope: &QueryScope,
+        columns: &mut PaxColumnDemand,
+    ) -> bool {
+        if let Some(arguments) = table.func_args
+            && arguments
+                .iter()
+                .any(|argument| !collect(argument, scope, columns))
+        {
+            return false;
+        }
+        table.rows_from.is_none_or(|functions| {
+            functions
+                .iter()
+                .all(|function| collect_table_function_arguments(function, scope, columns))
+        })
+    }
+
     fn collect_set(tree: &SetTree, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         match tree {
             SetTree::Select(select) => collect_select(select, scope, columns),
@@ -906,6 +925,14 @@ fn pax_column_demand_bounded(
             Ok(())
         });
         complete
+    }
+    if !collect_table_function_arguments(&from.base, scope, &mut columns)
+        || from
+            .joins
+            .iter()
+            .any(|join| !collect_table_function_arguments(&join.table, scope, &mut columns))
+    {
+        return None;
     }
     for expression in expressions {
         if !collect(expression, scope, &mut columns) {
@@ -4266,10 +4293,71 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
     params: &[Datum<'a>],
     outer: &C,
 ) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let arguments = tref.func_args.expect("table function");
+    let catalog = super::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        ..crate::sql::eval::NO_HOOKS
+    };
+    let base_width = width - usize::from(tref.with_ordinality);
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
+
+    if tref.table.eq_ignore_ascii_case("unnest")
+        && arguments.len() == 1
+        && crate::sql::eval::static_type_pub(arguments[0], outer) == Some(ColType::TsVector)
+    {
+        if base_width != 3 {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "tsvector unnest row width does not match its definition"
+            ));
+        }
+        let vector = match eval_full(arguments[0], arena, params, outer, &hooks)? {
+            Datum::TsVector(vector) => Some(vector),
+            Datum::Null => None,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "function unnest(...) does not exist"
+                ));
+            }
+        };
+        if let Some(vector) = vector {
+            let parsed = crate::sql::full_text::parse_vector(vector.as_str(), arena)?;
+            for index in 0..parsed.lexeme_count() {
+                let mark = arena.mark();
+                let row = super::srf::tsvector_unnest_values(&parsed, index, arena)?;
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                values[..3].copy_from_slice(&row);
+                if tref.with_ordinality {
+                    values[3] = Datum::Int8(index as i64 + 1);
+                }
+                storage
+                    .with_block_store(|blocks| {
+                        sorter.push_projected_by(
+                            blocks,
+                            width,
+                            |column| values[column],
+                            &mut compare,
+                        )
+                    })
+                    .expect("lateral function run has a block store")?;
+                // SAFETY: the row was encoded into the immutable run; the
+                // parsed vector was allocated before this mark and survives.
+                unsafe { arena.rewind_to(mark) };
+            }
+        }
+        return storage
+            .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+            .expect("lateral function run has a block store");
+    }
+
     let call = arena
         .alloc(Expr::Call {
             name: tref.table,
-            args: tref.func_args.expect("table function"),
+            args: arguments,
             argument_names: tref.func_argument_names,
             variadic: tref.func_variadic,
             star: false,
@@ -4279,16 +4367,7 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
             filter: None,
         })
         .map_err(|_| arena_full())?;
-    let catalog = super::storage_catalog(storage, arena, txid);
-    let hooks = EvalHooks {
-        catalog: Some(&catalog),
-        ..crate::sql::eval::NO_HOOKS
-    };
     let count = super::srf::srf_count(&*call, arena, params, outer, &hooks)?;
-    let base_width = width - usize::from(tref.with_ordinality);
-    let mut sorter = storage.external_sorter()?;
-    sorter.reset();
-    let mut compare = |_left: &[u8], _right: &[u8]| Ok(core::cmp::Ordering::Equal);
     for index in 1..=count {
         let mark = arena.mark();
         let row_hooks = EvalHooks {

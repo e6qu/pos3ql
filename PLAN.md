@@ -62,8 +62,7 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- durable 64-item constraint definition shapes; and
-- per-value `tsvector`/`tsquery` widths.
+- durable 64-item constraint definition shapes.
 
 Policy role lists now accept every configured catalog role plus `PUBLIC`.
 Startup-sized committed, transactional, and recovery images preserve stored
@@ -86,6 +85,20 @@ stream components without a per-value point array. Text and binary round trips,
 wide operators, GiST lookup, checkpoint publication, and empty-cache object
 recovery are qualified with 300-point values beyond the former 128-point and
 2 KiB text limits; the SQL boundary is compared with PostgreSQL.
+
+Full-text values now use statement-arena lists through parsing,
+canonicalization, matching, ranking, headline generation, set-returning
+functions, and binary receive. Binary send and index token extraction stream
+the canonical value without rebuilding a bounded tree. PostgreSQL's 1 MiB
+vector storage, 2,046-byte text lexeme, 2,047-byte binary lexeme, and
+256-position-per-lexeme boundaries remain explicit; query wire nodes and child
+offsets retain their 32-bit widths. Allocation-forbidden execution, binary
+round trips, GIN and GiST indexes, checkpoint publication, empty-cache object
+recovery, and a PostgreSQL 18.6 differential cover a 600-lexeme vector with
+2,400 positions and a balanced 599-node query beyond the former 512-item and
+2,048-total-position envelopes. The same vector is unnested after forced spill
+and empty-cache recovery so the external lateral path preserves its record
+shape and type identity.
 
 Grouping now follows PostgreSQL 18's target-list width of 1,664 distinct
 expressions, 4,096-set expanded-product limit, 12-element `CUBE` limit, and

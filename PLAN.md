@@ -62,7 +62,7 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- durable 64-item definition shapes, including constraints and enum labels; and
+- durable 64-item constraint definition shapes; and
 - per-value `tsvector`/`tsquery` and geometry widths.
 
 Policy role lists now accept every configured catalog role plus `PUBLIC`.
@@ -71,6 +71,11 @@ role order through `pg_policy`, WAL, checkpoints, rollback, and object-cold
 recovery; `pg_policies` sorts names like PostgreSQL's system view.
 The WAL reader retains the former 64-role record kind while new records carry a
 wide role count.
+Enum label sets now use startup-sized committed, transaction-private, and
+recovery images through `max_enum_labels_per_type` (default 256). Savepoint
+chains retain exact prior images, PostgreSQL's pre-commit safety rule uses the
+committed-member boundary without a 64-bit mask, and new WAL records carry a
+32-bit label count while the former one-byte record remains readable.
 Wide allocation-forbidden catalog checks also removed scalar subqueries' former
 one-row temporary object publication; their cardinality-bounded result now
 stays in the startup-sized external-sort chunk.

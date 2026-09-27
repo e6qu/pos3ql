@@ -21862,6 +21862,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     name,
                     labels,
+                    context.arena,
                     responder,
                 ),
                 Stmt::CreateComposite { name, fields } => super::exec::create_composite(
@@ -41214,15 +41215,26 @@ fn domain_depends_on(storage: &Storage, mut slot: usize, target: usize, txid: u3
 /// Builds an [`EnumSpec`] from a `CREATE TYPE ... AS ENUM` label list: rejects
 /// duplicates (42710) and over-long labels, and assigns each member a 1-based
 /// sort key (PostgreSQL's `enumsortorder`).
-fn build_enum_spec(labels: &[&str]) -> Result<crate::storage::EnumSpec, SqlError> {
-    if labels.len() > crate::storage::MAX_ENUM_LABELS {
+fn build_enum_spec<'a>(
+    labels: &[&str],
+    capacity: usize,
+    arena: &'a Arena,
+) -> Result<crate::storage::EnumSpec<'a>, SqlError> {
+    if labels.len() > capacity {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "an enum type may have at most {} labels",
-            crate::storage::MAX_ENUM_LABELS
+            capacity
         ));
     }
-    let mut members = [crate::storage::EnumMember::EMPTY; crate::storage::MAX_ENUM_LABELS];
+    let members = arena
+        .alloc_slice_with(labels.len(), |_| crate::storage::EnumMember::EMPTY)
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "enum definition exceeds the statement arena"
+            )
+        })?;
     for (i, &label) in labels.iter().enumerate() {
         if labels[..i].contains(&label) {
             return Err(sql_err!(
@@ -41236,10 +41248,7 @@ fn build_enum_spec(labels: &[&str]) -> Result<crate::storage::EnumSpec, SqlError
             sort: (i + 1) as f64,
         };
     }
-    Ok(crate::storage::EnumSpec {
-        members,
-        n_members: labels.len(),
-    })
+    Ok(crate::storage::EnumSpec { members })
 }
 
 pub fn create_enum(
@@ -41248,6 +41257,7 @@ pub fn create_enum(
     txn: &mut TxnState,
     name: &QualName,
     labels: &[&str],
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
@@ -41271,7 +41281,7 @@ pub fn create_enum(
             name.name
         ));
     }
-    let spec = match build_enum_spec(labels) {
+    let spec = match build_enum_spec(labels, storage.enum_label_capacity(), arena) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -41284,10 +41294,15 @@ pub fn create_enum(
         Err(e) => return sql_fail(e),
     };
     let lsn = storage.bump_lsn();
+    let definition = storage.enum_for(slot, txn.txid);
     if let Err(e) = wal.stage(
         txn.txid,
         lsn,
-        &WalOp::CreateEnum(storage.enum_for(slot, txn.txid)),
+        &WalOp::CreateEnum {
+            schema: definition.schema.as_str(),
+            name: definition.name.as_str(),
+            members: definition.members(),
+        },
     ) {
         storage.rollback_enum_create(slot);
         return sql_fail(e);
@@ -44028,6 +44043,8 @@ pub fn alter_type(
             after,
         } => {
             let current = storage.enum_for(slot, txn.txid);
+            let current_schema = current.schema;
+            let current_name = current.name;
             if current.sort_of(label).is_some() {
                 if *if_not_exists {
                     responder.notice(
@@ -44044,11 +44061,11 @@ pub fn alter_type(
                     label
                 ));
             }
-            if current.n_members >= crate::storage::MAX_ENUM_LABELS {
+            if current.members().len() >= storage.enum_label_capacity() {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
                     "an enum type may have at most {} labels",
-                    crate::storage::MAX_ENUM_LABELS
+                    storage.enum_label_capacity()
                 ));
             }
             if label.len() > 63 {
@@ -44058,22 +44075,44 @@ pub fn alter_type(
                     label
                 ));
             }
-            let mut altered = current;
-            let (sort, renumbered) =
-                match compute_add_value_sort(&mut altered, before.as_deref(), after.as_deref()) {
-                    Ok(s) => s,
-                    Err(e) => return sql_fail(e),
-                };
+            let altered = match arena.alloc_slice_with(current.members().len() + 1, |index| {
+                current
+                    .members()
+                    .get(index)
+                    .copied()
+                    .unwrap_or(crate::storage::EnumMember::EMPTY)
+            }) {
+                Ok(members) => members,
+                Err(_) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "enum alteration exceeds the statement arena"
+                    ));
+                }
+            };
+            let (sort, renumbered) = match compute_add_value_sort(
+                &mut altered[..current.members().len()],
+                before.as_deref(),
+                after.as_deref(),
+            ) {
+                Ok(s) => s,
+                Err(e) => return sql_fail(e),
+            };
             let new_label = match SqlName::parse(label) {
                 Ok(n) => n,
                 Err(e) => return sql_fail(e),
             };
-            altered.members[altered.n_members] = crate::storage::EnumMember {
+            altered[current.members().len()] = crate::storage::EnumMember {
                 label: new_label,
                 sort,
             };
-            altered.n_members += 1;
-            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
+            let prior = match storage.stage_enum_alter(
+                slot,
+                current_schema,
+                current_name,
+                altered,
+                txn.txid,
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -44083,7 +44122,7 @@ pub fn alter_type(
             }
             if renumbered
                 && let Err(error) =
-                    rewrite_enum_values(storage, txn, slot as u16, None, &altered, arena)
+                    rewrite_enum_values(storage, txn, slot as u16, None, altered, arena)
             {
                 storage.rollback_enum_alter(slot, prior);
                 return sql_fail(error);
@@ -44092,7 +44131,11 @@ pub fn alter_type(
             if let Err(e) = wal.stage(
                 txn.txid,
                 lsn,
-                &WalOp::CreateEnum(storage.enum_for(slot, txn.txid)),
+                &WalOp::CreateEnum {
+                    schema: current_schema.as_str(),
+                    name: current_name.as_str(),
+                    members: altered,
+                },
             ) {
                 storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
@@ -44107,6 +44150,8 @@ pub fn alter_type(
         }
         A::RenameTo(new_name) => {
             let current = storage.enum_for(slot, txn.txid);
+            let current_schema = current.schema;
+            let current_name = current.name;
             if current.name.as_str() == *new_name {
                 responder.command_complete("ALTER TYPE")?;
                 return sql_ok();
@@ -44131,19 +44176,27 @@ pub fn alter_type(
                 Ok(name) => name,
                 Err(e) => return sql_fail(e),
             };
-            let mut altered = current;
-            altered.name = renamed;
-            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
-                Ok(prior) => prior,
-                Err(error) => return sql_fail(error),
+            let members = match arena.alloc_slice_copy(current.members()) {
+                Ok(members) => members,
+                Err(_) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "enum alteration exceeds the statement arena"
+                    ));
+                }
             };
+            let prior =
+                match storage.stage_enum_alter(slot, current_schema, renamed, members, txn.txid) {
+                    Ok(prior) => prior,
+                    Err(error) => return sql_fail(error),
+                };
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(
                 txn.txid,
                 lsn,
                 &WalOp::RenameEnum {
-                    schema: current.schema.as_str(),
-                    old_name: current.name.as_str(),
+                    schema: current_schema.as_str(),
+                    old_name: current_name.as_str(),
                     new_name,
                 },
             ) {
@@ -44160,6 +44213,8 @@ pub fn alter_type(
         }
         A::SetSchema(new_schema) => {
             let current = storage.enum_for(slot, txn.txid);
+            let current_schema = current.schema;
+            let current_name = current.name;
             if storage.find_schema_visible(new_schema, txn.txid).is_none() {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_SCHEMA_NAME,
@@ -44197,21 +44252,29 @@ pub fn alter_type(
                     current.name.as_str()
                 ));
             }
-            let mut altered = current;
-            altered.schema = schema;
-            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
-                Ok(prior) => prior,
-                Err(error) => return sql_fail(error),
+            let members = match arena.alloc_slice_copy(current.members()) {
+                Ok(members) => members,
+                Err(_) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "enum alteration exceeds the statement arena"
+                    ));
+                }
             };
+            let prior =
+                match storage.stage_enum_alter(slot, schema, current_name, members, txn.txid) {
+                    Ok(prior) => prior,
+                    Err(error) => return sql_fail(error),
+                };
             let lsn = storage.bump_lsn();
             if let Err(error) = wal.stage(
                 txn.txid,
                 lsn,
                 &WalOp::AlterEnumIdentity {
-                    schema: current.schema.as_str(),
-                    name: current.name.as_str(),
+                    schema: current_schema.as_str(),
+                    name: current_name.as_str(),
                     new_schema: schema.as_str(),
-                    new_name: current.name.as_str(),
+                    new_name: current_name.as_str(),
                 },
             ) {
                 storage.rollback_enum_alter(slot, prior);
@@ -44227,6 +44290,8 @@ pub fn alter_type(
         }
         A::RenameValue { from, to } => {
             let current = storage.enum_for(slot, txn.txid);
+            let current_schema = current.schema;
+            let current_name = current.name;
             let Some(member_index) = current
                 .members()
                 .iter()
@@ -44249,9 +44314,23 @@ pub fn alter_type(
                 Ok(label) => label,
                 Err(e) => return sql_fail(e),
             };
-            let mut altered = current;
-            altered.members[member_index].label = renamed;
-            let prior = match storage.stage_enum_alter(slot, altered, txn.txid) {
+            let altered = match arena.alloc_slice_copy(current.members()) {
+                Ok(members) => members,
+                Err(_) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "enum alteration exceeds the statement arena"
+                    ));
+                }
+            };
+            altered[member_index].label = renamed;
+            let prior = match storage.stage_enum_alter(
+                slot,
+                current_schema,
+                current_name,
+                altered,
+                txn.txid,
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
@@ -44260,7 +44339,7 @@ pub fn alter_type(
                 txn,
                 slot as u16,
                 Some((from, renamed.as_str())),
-                &altered,
+                altered,
                 arena,
             ) {
                 storage.rollback_enum_alter(slot, prior);
@@ -44270,7 +44349,11 @@ pub fn alter_type(
             if let Err(e) = wal.stage(
                 txn.txid,
                 lsn,
-                &WalOp::CreateEnum(storage.enum_for(slot, txn.txid)),
+                &WalOp::CreateEnum {
+                    schema: current_schema.as_str(),
+                    name: current_name.as_str(),
+                    members: altered,
+                },
             ) {
                 storage.rollback_enum_alter(slot, prior);
                 return sql_fail(e);
@@ -45811,7 +45894,7 @@ fn rewrite_enum_values(
     txn: &mut TxnState,
     enum_slot: u16,
     rename: Option<(&str, &str)>,
-    definition: &crate::storage::EnumDef,
+    members: &[crate::storage::EnumMember],
     arena: &Arena,
 ) -> Result<(), SqlError> {
     for table_index in 0..storage.table_count() {
@@ -45874,8 +45957,10 @@ fn rewrite_enum_values(
                         let target_label = rename
                             .filter(|(from, _)| label == *from)
                             .map_or(label, |(_, to)| to);
-                        let target_sort = definition
-                            .sort_of(target_label)
+                        let target_sort = members
+                            .iter()
+                            .find(|member| member.label.as_str() == target_label)
+                            .map(|member| member.sort)
                             .expect("stored enum label remains in altered definition");
                         if target_label == label && target_sort == sort {
                             continue;
@@ -45908,8 +45993,10 @@ fn rewrite_enum_values(
                                 let target_label = rename
                                     .filter(|(from, _)| label == *from)
                                     .map_or(label, |(_, to)| to);
-                                let target_sort = definition
-                                    .sort_of(target_label)
+                                let target_sort = members
+                                    .iter()
+                                    .find(|member| member.label.as_str() == target_label)
+                                    .map(|member| member.sort)
                                     .expect("stored enum label remains in altered definition");
                                 if target_label == label && target_sort == sort {
                                     continue;
@@ -45956,28 +46043,23 @@ fn rewrite_enum_values(
 /// eventually exhaust float4 precision; at that point every existing member
 /// is renumbered to consecutive integers before the insertion is retried.
 fn compute_add_value_sort(
-    def: &mut crate::storage::EnumDef,
+    members: &mut [crate::storage::EnumMember],
     before: Option<&str>,
     after: Option<&str>,
 ) -> Result<(f64, bool), SqlError> {
     let neighbour = before.or(after);
     let Some(pivot) = neighbour else {
         // Append: one past the current maximum sort (or 1.0 for an empty enum).
-        let max = def
-            .members()
+        let max = members
             .iter()
             .map(|m| m.sort as f32)
             .fold(f32::NEG_INFINITY, f32::max);
         return Ok((
-            f64::from(if def.members().is_empty() {
-                1.0
-            } else {
-                max + 1.0
-            }),
+            f64::from(if members.is_empty() { 1.0 } else { max + 1.0 }),
             false,
         ));
     };
-    if def.sort_of(pivot).is_none() {
+    if !members.iter().any(|member| member.label.as_str() == pivot) {
         return Err(sql_err!(
             sqlstate::INVALID_PARAMETER_VALUE,
             "\"{}\" is not an existing enum label",
@@ -45986,21 +46068,23 @@ fn compute_add_value_sort(
     }
     let mut renumbered = false;
     loop {
-        let members = def.members();
-        let pivot_sort = def.sort_of(pivot).expect("pivot was validated") as f32;
-        let mut sorts = [0.0f32; crate::storage::MAX_ENUM_LABELS];
-        for (index, member) in members.iter().enumerate() {
-            sorts[index] = member.sort as f32;
-        }
-        sorts[..members.len()].sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let pos = sorts[..members.len()]
+        let pivot_sort = members
             .iter()
-            .position(|&sort| sort == pivot_sort)
-            .expect("pivot sort remains present");
+            .find(|member| member.label.as_str() == pivot)
+            .expect("pivot was validated")
+            .sort as f32;
         let adjacent = if before.is_some() {
-            pos.checked_sub(1).map(|index| sorts[index])
+            members
+                .iter()
+                .map(|member| member.sort as f32)
+                .filter(|sort| *sort < pivot_sort)
+                .max_by(|left, right| left.partial_cmp(right).unwrap())
         } else {
-            (pos + 1 < members.len()).then(|| sorts[pos + 1])
+            members
+                .iter()
+                .map(|member| member.sort as f32)
+                .filter(|sort| *sort > pivot_sort)
+                .min_by(|left, right| left.partial_cmp(right).unwrap())
         };
         let Some(adjacent) = adjacent else {
             let edge = if before.is_some() {
@@ -46015,18 +46099,19 @@ fn compute_add_value_sort(
             return Ok((f64::from(new_sort), renumbered));
         }
 
-        let mut order = [0usize; crate::storage::MAX_ENUM_LABELS];
-        for (index, entry) in order.iter_mut().take(def.n_members).enumerate() {
-            *entry = index;
+        const RANK_MARKER: u64 = 0x7ff8_0000_0000_0000;
+        for rank in 1..=members.len() {
+            // Temporary NaN payloads retain each rank while the remaining
+            // finite keys are selected, including keys below zero.
+            let member = members
+                .iter_mut()
+                .filter(|member| !member.sort.is_nan())
+                .min_by(|left, right| left.sort.partial_cmp(&right.sort).unwrap())
+                .expect("one finite enum sort key remains for each rank");
+            member.sort = f64::from_bits(RANK_MARKER | rank as u64);
         }
-        order[..def.n_members].sort_by(|left, right| {
-            def.members[*left]
-                .sort
-                .partial_cmp(&def.members[*right].sort)
-                .unwrap()
-        });
-        for (rank, member_index) in order[..def.n_members].iter().copied().enumerate() {
-            def.members[member_index].sort = (rank + 1) as f64;
+        for member in members.iter_mut() {
+            member.sort = (member.sort.to_bits() & !RANK_MARKER) as f64;
         }
         renumbered = true;
     }

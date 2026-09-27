@@ -123,7 +123,10 @@ fixed-allocation and object-cold tests exercise larger declared capacities.
   PostgreSQL's 100-input-argument limit. Executable routine results accept
   1,664 output columns; configuration settings and trigger arguments retain
   their documented 64-item definition bounds. Policy role lists accept the
-  complete startup-sized role catalog plus `PUBLIC`. `RETURNS TABLE`
+  complete startup-sized role catalog plus `PUBLIC`. Enum label sets use
+  `max_enum_labels_per_type` (default 256) across transactional catalogs, WAL,
+  checkpoints, and recovery; exhaustion is SQLSTATE 54000 before catalog
+  mutation. `RETURNS TABLE`
   catalog argument metadata keeps input and output shapes independent. Trigger
   arguments are zero-based and NULL when absent, matching PostgreSQL.
   Database and schema catalogs, connection counters, statistics, cloning, and

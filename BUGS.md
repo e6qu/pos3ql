@@ -6,6 +6,12 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The enum-label capacity audit found no external blocker. Enum member storage is
+now reserved from `max_enum_labels_per_type` for committed, transactional, and
+recovery images; savepoint rollback, unsafe new-value tracking, widened WAL,
+legacy WAL reading, checkpoint streaming, allocation-forbidden execution,
+database cloning, and empty-cache recovery are covered beyond the former
+64-label boundary.
 The resource-matched PostgreSQL baseline audit found no external blocker. Each
 backend run now retains both an unconstrained host-available control and a
 stock PostgreSQL 18 container capped to the CPU availability and exact fixed

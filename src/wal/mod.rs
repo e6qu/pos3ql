@@ -141,6 +141,9 @@ wal_record_kinds! {
 /// Policy role counts widened from one byte to the configured role catalog.
 /// Kind 69 remains decodable so existing journals retain their durable meaning.
     KIND_SET_POLICY_V2 = 146;
+/// Enum label counts widened from one byte to the startup-configured capacity.
+/// Kind 23 remains decodable so existing journals retain their durable meaning.
+    KIND_CREATE_ENUM_V2 = 147;
     KIND_SET_PUBLICATION_OWNER = 43;
     KIND_RENAME_PUBLICATION = 44;
     KIND_CREATE_ROUTINE = 45;
@@ -715,6 +718,66 @@ impl<'a> Iterator for WalPolicyRoleIter<'a> {
 }
 
 impl ExactSizeIterator for WalPolicyRoleIter<'_> {}
+
+pub(crate) fn apply_enum_payload(
+    storage: &mut crate::storage::Storage,
+    payload: &[u8],
+    wide_count: bool,
+) -> Result<(), SqlError> {
+    let mut at = 0usize;
+    let take_name = |at: &mut usize| -> Result<&str, SqlError> {
+        let length =
+            usize::from(*payload.get(*at).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload")
+            })?);
+        *at += 1;
+        let bytes = payload
+            .get(*at..*at + length)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload"))?;
+        *at += length;
+        core::str::from_utf8(bytes)
+            .map_err(|_| sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload"))
+    };
+    let name = crate::storage::SqlName::parse(take_name(&mut at)?)?;
+    let schema = crate::storage::SqlName::parse(take_name(&mut at)?)?;
+    let count = if wide_count {
+        let bytes: [u8; 4] = payload
+            .get(at..at + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload"))?;
+        at += 4;
+        u32::from_le_bytes(bytes) as usize
+    } else {
+        let count =
+            usize::from(*payload.get(at).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload")
+            })?);
+        at += 1;
+        count
+    };
+    let members = storage.enum_replay_members(count)?;
+    for member in members.iter_mut() {
+        let label = crate::storage::SqlName::parse(take_name(&mut at)?)?;
+        let sort = f64::from_le_bytes(
+            payload
+                .get(at..at + 8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "invalid enum journal payload")
+                })?,
+        );
+        at += 8;
+        *member = crate::storage::EnumMember { label, sort };
+    }
+    if at != payload.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid enum journal payload"
+        ));
+    }
+    storage.finish_enum_replay(schema, name, count)?;
+    Ok(())
+}
 
 #[derive(Debug)]
 #[expect(
@@ -1309,8 +1372,18 @@ pub(crate) enum WalOp<'a> {
     },
     /// CREATE TYPE ... AS ENUM (or ALTER TYPE ... ADD VALUE — journaled
     /// absolutely, so an ALTER replays as a redefinition). Carries the whole
-    /// definition inline, like [`WalOp::CreateDomain`].
-    CreateEnum(crate::storage::EnumDef),
+    /// definition as a borrowed startup-bounded member image.
+    CreateEnum {
+        schema: &'a str,
+        name: &'a str,
+        members: &'a [crate::storage::EnumMember],
+    },
+    /// A validated durable enum image, materialized in recovery scratch only
+    /// while applying it. `wide_count` distinguishes the u32 V2 count.
+    RestoreEnum {
+        payload: &'a [u8],
+        wide_count: bool,
+    },
     DropEnum {
         schema: &'a str,
         name: &'a str,
@@ -2416,7 +2489,13 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Comment { .. } => KIND_COMMENT,
         WalOp::CreateDomain(_) | WalOp::RestoreDomain(_) => KIND_CREATE_DOMAIN,
         WalOp::DropDomain { .. } => KIND_DROP_DOMAIN,
-        WalOp::CreateEnum(_) => KIND_CREATE_ENUM,
+        WalOp::CreateEnum { .. }
+        | WalOp::RestoreEnum {
+            wide_count: true, ..
+        } => KIND_CREATE_ENUM_V2,
+        WalOp::RestoreEnum {
+            wide_count: false, ..
+        } => KIND_CREATE_ENUM,
         WalOp::DropEnum { .. } => KIND_DROP_ENUM,
         WalOp::RenameEnum { .. } => KIND_RENAME_ENUM,
         WalOp::AlterEnumIdentity { .. } => KIND_ALTER_ENUM_IDENTITY,
@@ -3193,13 +3272,18 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         | WalOp::RestoreOperatorClass(payload) => payload.len(),
         WalOp::RestoreComposite { payload, .. } => payload.len(),
         WalOp::DropDomain { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::CreateEnum(def) => {
-            let mut n = 1 + def.name.as_str().len() + 1 + def.schema.as_str().len() + 1;
-            for m in def.members() {
+        WalOp::CreateEnum {
+            schema,
+            name,
+            members,
+        } => {
+            let mut n = 1 + name.len() + 1 + schema.len() + 4;
+            for m in *members {
                 n += 1 + m.label.as_str().len() + 8;
             }
             n
         }
+        WalOp::RestoreEnum { payload, .. } => payload.len(),
         WalOp::DropEnum { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::RenameEnum {
             schema,
@@ -5231,15 +5315,23 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::DropDomain { schema, name } => {
             name_bytes(buffer, name) && name_bytes(buffer, schema)
         }
-        WalOp::CreateEnum(def) => {
-            let mut ok = name_bytes(buffer, def.name.as_str())
-                && name_bytes(buffer, def.schema.as_str())
-                && buffer.append(&[def.n_members as u8]);
-            for m in def.members() {
+        WalOp::CreateEnum {
+            schema,
+            name,
+            members,
+        } => {
+            let Ok(count) = u32::try_from(members.len()) else {
+                return false;
+            };
+            let mut ok = name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&count.to_le_bytes());
+            for m in *members {
                 ok &= name_bytes(buffer, m.label.as_str()) && buffer.append(&m.sort.to_le_bytes());
             }
             ok
         }
+        WalOp::RestoreEnum { payload, .. } => buffer.append(payload),
         WalOp::DropEnum { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
         WalOp::RenameEnum {
             schema,
@@ -9238,35 +9330,31 @@ fn decode_op_inner<'a>(
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropDomain { schema, name })
         }),
-        KIND_CREATE_ENUM => decode_large_op(|| {
+        KIND_CREATE_ENUM | KIND_CREATE_ENUM_V2 => decode_large_op(|| {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            let n_members = *payload.get(at)? as usize;
-            at += 1;
-            if n_members > crate::storage::MAX_ENUM_LABELS {
-                return None;
-            }
-            let mut members = [crate::storage::EnumMember::EMPTY; crate::storage::MAX_ENUM_LABELS];
-            for member in members.iter_mut().take(n_members) {
+            SqlName::parse(name).ok()?;
+            SqlName::parse(schema).ok()?;
+            let wide_count = kind == KIND_CREATE_ENUM_V2;
+            let n_members = if wide_count {
+                let count = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                count as usize
+            } else {
+                let count = *payload.get(at)? as usize;
+                at += 1;
+                count
+            };
+            for _ in 0..n_members {
                 let label = take_name(&mut at)?;
-                let sort = f64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
+                SqlName::parse(label).ok()?;
+                let _sort = f64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
-                *member = crate::storage::EnumMember {
-                    label: SqlName::parse(label).ok()?,
-                    sort,
-                };
             }
-            (at == payload.len()).then_some(WalOp::CreateEnum(crate::storage::EnumDef {
-                database: crate::storage::DatabaseOid::POSTGRES,
-                created_at: 0,
-                schema: SqlName::parse(schema).ok()?,
-                name: SqlName::parse(name).ok()?,
-                ownership: crate::storage::Ownership::BOOTSTRAP,
-                members,
-                n_members,
-                pending_definition: None,
-                ddl_state: crate::storage::CatalogDdlState::Absent,
-            }))
+            (at == payload.len()).then_some(WalOp::RestoreEnum {
+                payload,
+                wide_count,
+            })
         }),
         KIND_DROP_ENUM => decode_large_op(|| {
             let name = take_name(&mut at)?;
@@ -12464,6 +12552,64 @@ mod tests {
             }
         ));
         assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
+    }
+
+    #[test]
+    fn enum_codec_widens_counts_and_retains_legacy_decode() {
+        let members = [
+            crate::storage::EnumMember {
+                label: crate::storage::SqlName::parse("first").unwrap(),
+                sort: 1.0,
+            },
+            crate::storage::EnumMember {
+                label: crate::storage::SqlName::parse("second").unwrap(),
+                sort: 2.0,
+            },
+        ];
+        let operation = WalOp::CreateEnum {
+            schema: "public",
+            name: "mood",
+            members: &members,
+        };
+        let mut bytes = [0; 4096];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        assert!(matches!(
+            decode_op(KIND_CREATE_ENUM_V2, payload),
+            Some(WalOp::RestoreEnum {
+                wide_count: true,
+                ..
+            })
+        ));
+        assert!(decode_op(KIND_CREATE_ENUM_V2, &payload[..payload.len() - 1]).is_none());
+
+        let mut legacy = [0; 256];
+        let mut at = 0;
+        for value in ["mood", "public"] {
+            legacy[at] = value.len() as u8;
+            at += 1;
+            legacy[at..at + value.len()].copy_from_slice(value.as_bytes());
+            at += value.len();
+        }
+        legacy[at] = members.len() as u8;
+        at += 1;
+        for member in members {
+            legacy[at] = member.label.as_str().len() as u8;
+            at += 1;
+            legacy[at..at + member.label.as_str().len()]
+                .copy_from_slice(member.label.as_str().as_bytes());
+            at += member.label.as_str().len();
+            legacy[at..at + 8].copy_from_slice(&member.sort.to_le_bytes());
+            at += 8;
+        }
+        crate::mem::guard::forbid_alloc(|| {
+            assert!(matches!(
+                decode_op(KIND_CREATE_ENUM, &legacy[..at]),
+                Some(WalOp::RestoreEnum {
+                    wide_count: false,
+                    ..
+                })
+            ));
+        });
     }
 
     #[test]

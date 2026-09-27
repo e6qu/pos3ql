@@ -98,6 +98,9 @@ pub struct Config {
     pub max_domains: usize,
     /// Fixed number of enum type catalog slots across all databases.
     pub max_enums: usize,
+    /// Labels retained for each enum type. Committed, transaction-private,
+    /// and recovery images are all reserved at startup.
+    pub max_enum_labels_per_type: usize,
     /// Fixed number of named composite type catalog slots across all databases.
     pub max_composites: usize,
     /// Fixed number of cluster-wide role catalog slots, including `postgres`.
@@ -363,6 +366,7 @@ impl Config {
             max_sequences: 64,
             max_domains: 32,
             max_enums: 32,
+            max_enum_labels_per_type: 256,
             max_composites: 32,
             max_roles: 64,
             max_role_memberships: 256,
@@ -693,6 +697,10 @@ impl Config {
                 }
                 "max_enums" => {
                     config.max_enums =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_enum_labels_per_type" => {
+                    config.max_enum_labels_per_type =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_composites" => {
@@ -1184,6 +1192,7 @@ impl Config {
             config.max_sequences,
             config.max_domains,
             config.max_enums,
+            config.max_enum_labels_per_type,
             config.max_composites,
             config.max_roles,
             config.max_role_memberships,
@@ -1277,6 +1286,7 @@ impl Config {
                 "max_analyze_per_transaction",
                 config.max_analyze_per_transaction,
             ),
+            ("max_enum_labels_per_type", config.max_enum_labels_per_type),
             ("deferred_trigger_bytes", config.deferred_trigger_bytes),
         ] {
             if capacity == 0 || capacity > u32::MAX as usize {
@@ -1322,6 +1332,7 @@ impl Config {
             ("max_sequences", config.max_sequences),
             ("max_domains", config.max_domains),
             ("max_enums", config.max_enums),
+            ("max_enum_labels_per_type", config.max_enum_labels_per_type),
             ("max_composites", config.max_composites),
             ("max_indexes", config.max_indexes),
             ("max_extended_statistics", config.max_extended_statistics),
@@ -1750,6 +1761,7 @@ max_schemas = 200
 max_sequences = 300
 max_domains = 301
 max_enums = 302
+max_enum_labels_per_type = 640
 max_composites = 303
 max_roles = 400
 max_role_memberships = 900
@@ -1788,6 +1800,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_sequences, 300);
         assert_eq!(c.max_domains, 301);
         assert_eq!(c.max_enums, 302);
+        assert_eq!(c.max_enum_labels_per_type, 640);
         assert_eq!(c.max_composites, 303);
         assert_eq!(c.max_roles, 400);
         assert_eq!(c.max_role_memberships, 900);
@@ -1965,6 +1978,7 @@ sql_arena_bytes = 4096
         assert!(Config::parse("max_sequences = 0\n").is_err());
         assert!(Config::parse("max_domains = 0\n").is_err());
         assert!(Config::parse("max_enums = 0\n").is_err());
+        assert!(Config::parse("max_enum_labels_per_type = 0\n").is_err());
         assert!(Config::parse("max_composites = 0\n").is_err());
         assert!(Config::parse("max_roles = 0\n").is_err());
         assert!(Config::parse("max_role_memberships = 0\n").is_err());

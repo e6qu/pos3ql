@@ -15043,6 +15043,7 @@ impl Engine {
                 txn,
                 name,
                 labels,
+                arena,
                 responder,
             ),
             Stmt::CreateComposite { name, fields } => exec::create_composite(
@@ -20428,22 +20429,25 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             )?;
             storage.commit_routine_identity(slot, 0);
         }
-        WalOp::CreateEnum(def) => {
-            // An ALTER ... ADD VALUE replays as a redefinition: redefine in
-            // place if the enum exists, else create it committed (txid 0).
-            let spec = crate::storage::EnumSpec {
-                members: def.members,
-                n_members: def.n_members,
-            };
-            if let Some(slot) = storage.enum_slot(def.schema.as_str(), def.name.as_str(), 0) {
-                let mut definition = storage.enum_for(slot, 0);
-                definition.members = spec.members;
-                definition.n_members = spec.n_members;
-                storage.stage_enum_alter(slot, definition, 0)?;
-                storage.commit_enum_alter(slot, 0);
-            } else {
-                storage.create_enum(def.schema, def.name, spec, 0)?;
-            }
+        WalOp::CreateEnum {
+            schema,
+            name,
+            members,
+        } => {
+            storage
+                .enum_replay_members(members.len())?
+                .copy_from_slice(members);
+            storage.finish_enum_replay(
+                crate::storage::SqlName::parse(schema)?,
+                crate::storage::SqlName::parse(name)?,
+                members.len(),
+            )?;
+        }
+        WalOp::RestoreEnum {
+            payload,
+            wide_count,
+        } => {
+            crate::wal::apply_enum_payload(storage, payload, wide_count)?;
         }
         WalOp::CreateComposite {
             slot,
@@ -20475,10 +20479,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     old_name
                 )
             })?;
-            let mut definition = storage.enum_for(slot, 0);
-            definition.name = crate::storage::SqlName::parse(new_name)?;
-            storage.stage_enum_alter(slot, definition, 0)?;
-            storage.commit_enum_alter(slot, 0);
+            let schema = storage.enum_for(slot, 0).schema;
+            storage.replay_enum_identity(
+                slot,
+                schema,
+                crate::storage::SqlName::parse(new_name)?,
+            )?;
         }
         WalOp::AlterEnumIdentity {
             schema,
@@ -20493,11 +20499,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     name
                 )
             })?;
-            let mut definition = storage.enum_for(slot, 0);
-            definition.schema = crate::storage::SqlName::parse(new_schema)?;
-            definition.name = crate::storage::SqlName::parse(new_name)?;
-            storage.stage_enum_alter(slot, definition, 0)?;
-            storage.commit_enum_alter(slot, 0);
+            storage.replay_enum_identity(
+                slot,
+                crate::storage::SqlName::parse(new_schema)?,
+                crate::storage::SqlName::parse(new_name)?,
+            )?;
         }
         WalOp::AlterDomainIdentity {
             schema,

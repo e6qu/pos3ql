@@ -3690,7 +3690,6 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         if !def.visible_to(self.txid) {
             return Ok(None);
         }
-        let def = def.definition_for(self.txid);
         let values = arena
             .alloc_slice_with(def.members().len(), |_| Datum::Null)
             .map_err(|_| arena_full())?;

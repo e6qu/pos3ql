@@ -3898,6 +3898,30 @@ fn policy_role_image_capacity(config: &Config) -> usize {
         .saturating_add(1)
 }
 
+fn pending_enum_definition_capacity(config: &Config) -> usize {
+    config
+        .max_enums
+        .saturating_mul(config.max_catalog_versions_per_object)
+        .min(catalog_transaction_capacity(config).saturating_mul(config.max_ddl_per_transaction))
+}
+
+fn enum_member_image_capacity(config: &Config) -> usize {
+    config
+        .max_enums
+        .saturating_add(pending_enum_definition_capacity(config))
+        .saturating_add(1)
+}
+
+pub(crate) fn enum_member_budget_bytes(config: &Config) -> usize {
+    enum_member_image_capacity(config)
+        .saturating_mul(config.max_enum_labels_per_type)
+        .saturating_mul(size_of::<EnumMember>())
+        .saturating_add(
+            pending_enum_definition_capacity(config)
+                .saturating_mul(size_of::<PendingEnumMemberSlot>()),
+        )
+}
+
 pub(crate) fn policy_role_budget_bytes(config: &Config) -> usize {
     policy_role_image_capacity(config)
         .saturating_mul(policy_roles_per_image(config))
@@ -8597,7 +8621,6 @@ pub struct DomainSpec {
 /// wider band, so the scalar identity is the limiting representation.
 pub(crate) const MAX_ENUM_CATALOG_SLOTS: usize =
     (crate::sql::types::oid::FIRST_TABLE_COMPOSITE - crate::sql::types::oid::FIRST_ENUM) as usize;
-pub(crate) const MAX_ENUM_LABELS: usize = 64;
 /// Composite slots fit between their synthesized scalar and array OID bands.
 pub(crate) const MAX_COMPOSITE_CATALOG_SLOTS: usize = (crate::sql::types::oid::FIRST_COMPOSITE_ARRAY
     - crate::sql::types::oid::FIRST_COMPOSITE)
@@ -8635,8 +8658,7 @@ pub struct EnumDef {
     pub schema: SqlName,
     pub name: SqlName,
     pub ownership: Ownership,
-    pub members: [EnumMember; MAX_ENUM_LABELS],
-    pub n_members: usize,
+    member_count: u32,
     pub(crate) pending_definition: Option<PendingEnumDefinition>,
     pub ddl_state: CatalogDdlState,
 }
@@ -8646,9 +8668,54 @@ pub(crate) struct PendingEnumDefinition {
     pub txid: u32,
     pub schema: SqlName,
     pub name: SqlName,
-    pub members: [EnumMember; MAX_ENUM_LABELS],
-    pub n_members: usize,
-    pub unsafe_member_bits: u64,
+    pub member_count: u32,
+    pub safe_member_count: u32,
+    pub member_slot: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingEnumMemberSlot {
+    used: bool,
+    previous: Option<u32>,
+    depth: u32,
+}
+
+impl PendingEnumMemberSlot {
+    const EMPTY: Self = Self {
+        used: false,
+        previous: None,
+        depth: 0,
+    };
+}
+
+/// One transaction-visible enum definition. Member storage belongs to the
+/// startup-sized catalog slab, so copying this view never copies label data.
+#[derive(Debug, Clone, Copy)]
+pub struct EnumDefinition<'a> {
+    pub(crate) database: DatabaseOid,
+    pub created_at: u64,
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub ownership: Ownership,
+    members: &'a [EnumMember],
+    pub ddl_state: CatalogDdlState,
+}
+
+impl EnumDefinition<'_> {
+    pub fn members(&self) -> &[EnumMember] {
+        self.members
+    }
+
+    pub fn sort_of(&self, label: &str) -> Option<f64> {
+        self.members
+            .iter()
+            .find(|member| member.label.as_str() == label)
+            .map(|member| member.sort)
+    }
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
 }
 
 impl EnumDef {
@@ -8658,8 +8725,7 @@ impl EnumDef {
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
         ownership: Ownership::BOOTSTRAP,
-        members: [EnumMember::EMPTY; MAX_ENUM_LABELS],
-        n_members: 0,
+        member_count: 0,
         pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
     };
@@ -8668,26 +8734,13 @@ impl EnumDef {
         self.ddl_state.visible_to(txid)
     }
 
-    pub fn members(&self) -> &[EnumMember] {
-        &self.members[..self.n_members]
-    }
-
-    /// The sort key of a label, or `None` if the label is not a member.
-    pub fn sort_of(&self, label: &str) -> Option<f64> {
-        self.members()
-            .iter()
-            .find(|m| m.label.as_str() == label)
-            .map(|m| m.sort)
-    }
-
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(*self, |pending| Self {
                 schema: pending.schema,
                 name: pending.name,
-                members: pending.members,
-                n_members: pending.n_members,
+                member_count: pending.member_count,
                 pending_definition: None,
                 ..*self
             })
@@ -8697,9 +8750,8 @@ impl EnumDef {
 /// The validated parameters of a `CREATE TYPE ... AS ENUM` / `ALTER TYPE`,
 /// computed by the executor and handed to storage (apart from `live`/`pending`).
 #[derive(Clone, Copy)]
-pub struct EnumSpec {
-    pub members: [EnumMember; MAX_ENUM_LABELS],
-    pub n_members: usize,
+pub struct EnumSpec<'a> {
+    pub members: &'a [EnumMember],
 }
 
 /// One validated attribute of a named composite. `user_type` preserves the
@@ -11709,6 +11761,11 @@ pub struct Storage {
     sequences: FixedVec<SequenceDef>,
     domains: FixedVec<DomainDef>,
     enums: FixedVec<EnumDef>,
+    enum_members: FixedVec<EnumMember>,
+    enum_members_per_image: usize,
+    pending_enum_members: FixedVec<PendingEnumMemberSlot>,
+    enum_member_pending_base: usize,
+    enum_member_replay_image: usize,
     composites: FixedVec<CompositeDef>,
     domain_graph_scratch: std::cell::RefCell<FixedVec<u8>>,
     indexes: FixedVec<IndexDef>,
@@ -15213,6 +15270,7 @@ impl Storage {
             + config.max_sequences * size_of::<SequenceDef>()
             + config.max_domains * size_of::<DomainDef>()
             + config.max_enums * size_of::<EnumDef>()
+            + enum_member_budget_bytes(config)
             + config.max_composites * size_of::<CompositeDef>()
             + config.max_domains * size_of::<u8>()
             + MAX_ACCESS_METHODS * size_of::<AccessMethodDef>()
@@ -15791,6 +15849,27 @@ impl Storage {
         for _ in 0..config.max_enums {
             enums.push(EnumDef::EMPTY).expect("sized to max_enums");
         }
+        let enum_members_per_image = config.max_enum_labels_per_type;
+        let enum_member_pending_base = config.max_enums;
+        let enum_member_replay_image = enum_member_image_capacity(config) - 1;
+        let enum_member_entries =
+            enum_member_image_capacity(config).saturating_mul(enum_members_per_image);
+        let mut enum_members = FixedVec::new(budget, "enum_members", enum_member_entries)?;
+        for _ in 0..enum_member_entries {
+            enum_members
+                .push(EnumMember::EMPTY)
+                .expect("sized to enum member capacity");
+        }
+        let mut pending_enum_members = FixedVec::new(
+            budget,
+            "pending_enum_members",
+            pending_enum_definition_capacity(config),
+        )?;
+        for _ in 0..pending_enum_definition_capacity(config) {
+            pending_enum_members
+                .push(PendingEnumMemberSlot::EMPTY)
+                .expect("sized to pending enum definition capacity");
+        }
         let mut composites = FixedVec::new(budget, "composites", config.max_composites)?;
         for _ in 0..config.max_composites {
             composites
@@ -16208,6 +16287,11 @@ impl Storage {
             sequences,
             domains,
             enums,
+            enum_members,
+            enum_members_per_image,
+            pending_enum_members,
+            enum_member_pending_base,
+            enum_member_replay_image,
             composites,
             domain_graph_scratch: std::cell::RefCell::new(domain_graph_scratch),
             indexes,
@@ -17374,6 +17458,11 @@ impl Storage {
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.enums[target_slot] = definition;
+                let count = definition.member_count as usize;
+                let source = source_slot * self.enum_members_per_image;
+                let target = target_slot * self.enum_members_per_image;
+                self.enum_members
+                    .copy_within(source..source + count, target);
             }
             for source_slot in 0..self.composites.len() {
                 let mut definition = self.composites[source_slot];
@@ -34006,12 +34095,15 @@ impl Storage {
 
     /// The definition of an enum named `name` (any schema) visible to `txid` —
     /// for resolving a column whose stored type identity is only the enum name.
-    pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<&EnumDef> {
-        self.enums.iter().find(|e| {
-            e.database == self.current_database
-                && e.visible_to(txid)
-                && e.definition_for(txid).name.as_str() == name
-        })
+    pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<EnumDefinition<'_>> {
+        self.enums
+            .iter()
+            .position(|enumeration| {
+                enumeration.database == self.current_database
+                    && enumeration.visible_to(txid)
+                    && enumeration.definition_for(txid).name.as_str() == name
+            })
+            .map(|slot| self.enum_for(slot, txid))
     }
 
     /// The slot of an enum named `name` (any schema) visible to `txid`.
@@ -34033,8 +34125,36 @@ impl Storage {
         })
     }
 
-    pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDef {
-        self.enums[slot].definition_for(txid)
+    fn enum_member_image(&self, image: usize, count: u32) -> &[EnumMember] {
+        let count = usize::try_from(count).expect("enum member count fits usize");
+        let start = image * self.enum_members_per_image;
+        &self.enum_members[start..start + count]
+    }
+
+    fn enum_members_for(&self, slot: usize, txid: u32) -> &[EnumMember] {
+        if let Some(pending) = self.enums[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+        {
+            return self.enum_member_image(
+                self.enum_member_pending_base + pending.member_slot as usize,
+                pending.member_count,
+            );
+        }
+        self.enum_member_image(slot, self.enums[slot].member_count)
+    }
+
+    pub(crate) fn enum_for(&self, slot: usize, txid: u32) -> EnumDefinition<'_> {
+        let definition = self.enums[slot].definition_for(txid);
+        EnumDefinition {
+            database: definition.database,
+            created_at: definition.created_at,
+            schema: definition.schema,
+            name: definition.name,
+            ownership: definition.ownership,
+            members: self.enum_members_for(slot, txid),
+            ddl_state: definition.ddl_state,
+        }
     }
 
     pub(crate) fn enum_count(&self) -> usize {
@@ -34060,10 +34180,13 @@ impl Storage {
         else {
             return false;
         };
-        pending.members[..pending.n_members]
-            .iter()
-            .position(|member| member.label.as_str() == label)
-            .is_some_and(|index| pending.unsafe_member_bits & (1u64 << index) != 0)
+        self.enum_member_image(
+            self.enum_member_pending_base + pending.member_slot as usize,
+            pending.member_count,
+        )
+        .iter()
+        .position(|member| member.label.as_str() == label)
+        .is_some_and(|index| index >= pending.safe_member_count as usize)
     }
 
     /// Committed enums carrying their slot indices, for the checkpoint,
@@ -34096,6 +34219,79 @@ impl Storage {
         None
     }
 
+    fn write_enum_member_image(
+        &mut self,
+        image: usize,
+        members: &[EnumMember],
+    ) -> Result<u32, SqlError> {
+        if members.len() > self.enum_members_per_image {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "an enum type may have at most {} labels",
+                self.enum_members_per_image
+            ));
+        }
+        let count = u32::try_from(members.len()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "enum label count exceeds durable representation"
+            )
+        })?;
+        let start = image * self.enum_members_per_image;
+        self.enum_members[start..start + members.len()].copy_from_slice(members);
+        Ok(count)
+    }
+
+    pub(crate) fn enum_label_capacity(&self) -> usize {
+        self.enum_members_per_image
+    }
+
+    pub(crate) fn enum_replay_members(
+        &mut self,
+        count: usize,
+    ) -> Result<&mut [EnumMember], SqlError> {
+        if count > self.enum_members_per_image {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "an enum type may have at most {} labels",
+                self.enum_members_per_image
+            ));
+        }
+        let start = self.enum_member_replay_image * self.enum_members_per_image;
+        Ok(&mut self.enum_members[start..start + count])
+    }
+
+    pub(crate) fn finish_enum_replay(
+        &mut self,
+        schema: SqlName,
+        name: SqlName,
+        count: usize,
+    ) -> Result<usize, SqlError> {
+        if count > self.enum_members_per_image {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "an enum type may have at most {} labels",
+                self.enum_members_per_image
+            ));
+        }
+        let slot = if let Some(slot) = self.enum_slot(schema.as_str(), name.as_str(), 0) {
+            slot
+        } else {
+            self.create_enum(schema, name, EnumSpec { members: &[] }, 0)?
+        };
+        let source = self.enum_member_replay_image * self.enum_members_per_image;
+        let target = slot * self.enum_members_per_image;
+        self.enum_members
+            .copy_within(source..source + count, target);
+        self.enums[slot].member_count = u32::try_from(count).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "enum label count exceeds durable representation"
+            )
+        })?;
+        Ok(slot)
+    }
+
     /// Registers an enum as an uncommitted CREATE owned by `txid` (or, for
     /// replay/checkpoint with `txid == 0`, committed directly). The caller has
     /// validated the labels and checked the name is free.
@@ -34103,7 +34299,7 @@ impl Storage {
         &mut self,
         schema: SqlName,
         name: SqlName,
-        spec: EnumSpec,
+        spec: EnumSpec<'_>,
         txid: u32,
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
@@ -34189,14 +34385,14 @@ impl Storage {
             class: AccessClass::Enum,
             slot: new as u16,
         });
+        let member_count = self.write_enum_member_image(new, spec.members)?;
         self.enums[new] = EnumDef {
             database: self.current_database,
             created_at: self.catalog_seq,
             schema,
             name,
             ownership,
-            members: spec.members,
-            n_members: spec.n_members,
+            member_count,
             pending_definition: None,
             ddl_state: if txid == 0 {
                 CatalogDdlState::Present
@@ -34210,7 +34406,9 @@ impl Storage {
     pub(crate) fn stage_enum_alter(
         &mut self,
         slot: usize,
-        definition: EnumDef,
+        schema: SqlName,
+        name: SqlName,
+        members: &[EnumMember],
         txid: u32,
     ) -> Result<Option<PendingEnumDefinition>, SqlError> {
         if let Some(blocker) = self
@@ -34220,9 +34418,9 @@ impl Storage {
             .find_map(|(other_slot, other)| {
                 (other_slot != slot
                     && other.database == self.current_database
-                    && (other.schema == definition.schema && other.name == definition.name
+                    && (other.schema == schema && other.name == name
                         || other.pending_definition.is_some_and(|pending| {
-                            pending.schema == definition.schema && pending.name == definition.name
+                            pending.schema == schema && pending.name == name
                         })))
                 .then(|| {
                     other
@@ -34234,63 +34432,96 @@ impl Storage {
                 .filter(|&owner| owner != txid)
             })
         {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
             (domain.database == self.current_database
-                && (domain.schema == definition.schema && domain.name == definition.name
+                && (domain.schema == schema && domain.name == name
                     || domain
                         .pending_definition
                         .and_then(|pending| pending.identity)
                         .is_some_and(|identity| {
-                            identity.schema == definition.schema && identity.name == definition.name
+                            identity.schema == schema && identity.name == name
                         })))
             .then_some(domain.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.enums.iter().enumerate().any(|(other_slot, other)| {
             other_slot != slot
                 && other.database == self.current_database
                 && other.visible_to(txid)
-                && other.definition_for(txid).schema == definition.schema
-                && other.definition_for(txid).name == definition.name
+                && other.definition_for(txid).schema == schema
+                && other.definition_for(txid).name == name
         }) || self.domains.iter().any(|domain| {
             domain.database == self.current_database
                 && domain.visible_to(txid)
-                && domain.definition_for(txid).schema == definition.schema
-                && domain.definition_for(txid).name == definition.name
+                && domain.definition_for(txid).schema == schema
+                && domain.definition_for(txid).name == name
         }) || self.composites.iter().any(|composite| {
             composite.database == self.current_database
                 && composite.visible_to(txid)
-                && composite.definition_for(txid).schema == definition.schema
-                && composite.definition_for(txid).name == definition.name
+                && composite.definition_for(txid).schema == schema
+                && composite.definition_for(txid).name == name
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
                 "type \"{}\" already exists",
-                definition.name.as_str()
+                name.as_str()
             ));
         }
-        let enumeration = &mut self.enums[slot];
-        if let Some(pending) = enumeration.pending_definition
+        if let Some(pending) = self.enums[slot].pending_definition
             && pending.txid != txid
         {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "type \"{}\" is being altered by another transaction",
-                enumeration.name.as_str()
+                self.enums[slot].name.as_str()
             ));
         }
-        let prior = enumeration.pending_definition;
-        enumeration.pending_definition = Some(PendingEnumDefinition {
+        let prior = self.enums[slot].pending_definition;
+        let previous = prior.map(|pending| pending.member_slot);
+        if previous.is_some_and(|previous| {
+            self.pending_enum_members[previous as usize].depth
+                >= self.max_catalog_versions_per_object
+        }) {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "enum type exceeds max_catalog_versions_per_object ({})",
+                self.max_catalog_versions_per_object
+            ));
+        }
+        let Some(member_slot) = self
+            .pending_enum_members
+            .iter()
+            .position(|entry| !entry.used)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "pending enum-definition pool is exhausted"
+            ));
+        };
+        let depth = previous.map_or(1, |previous| {
+            self.pending_enum_members[previous as usize].depth + 1
+        });
+        let member_count =
+            self.write_enum_member_image(self.enum_member_pending_base + member_slot, members)?;
+        self.pending_enum_members[member_slot] = PendingEnumMemberSlot {
+            used: true,
+            previous,
+            depth,
+        };
+        let safe_member_count = prior.map_or(self.enums[slot].member_count, |pending| {
+            pending.safe_member_count
+        });
+        self.enums[slot].pending_definition = Some(PendingEnumDefinition {
             txid,
-            schema: definition.schema,
-            name: definition.name,
-            members: definition.members,
-            n_members: definition.n_members,
-            unsafe_member_bits: prior.map_or(0, |pending| pending.unsafe_member_bits),
+            schema,
+            name,
+            member_count,
+            safe_member_count,
+            member_slot: member_slot as u32,
         });
         Ok(prior)
     }
@@ -34306,22 +34537,34 @@ impl Storage {
         }
         let pending = self.enums[slot]
             .pending_definition
-            .as_mut()
             .filter(|pending| pending.txid == txid)
             .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "enum alteration is not staged"))?;
-        let index = pending.members[..pending.n_members]
-            .iter()
-            .position(|member| member.label == label)
-            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "new enum label is not staged"))?;
-        pending.unsafe_member_bits |= 1u64 << index;
+        self.enum_member_image(
+            self.enum_member_pending_base + pending.member_slot as usize,
+            pending.member_count,
+        )
+        .iter()
+        .position(|member| member.label == label)
+        .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "new enum label is not staged"))?;
         Ok(())
     }
 
+    fn release_pending_enum_members(&mut self, slot: u32) -> Option<u32> {
+        let pending = self.pending_enum_members[slot as usize];
+        self.pending_enum_members[slot as usize] = PendingEnumMemberSlot::EMPTY;
+        pending.previous
+    }
+
+    fn clear_pending_enum_member_chain(&mut self, mut tail: Option<u32>) {
+        while let Some(slot) = tail {
+            tail = self.release_pending_enum_members(slot);
+        }
+    }
+
     pub(crate) fn commit_enum_alter(&mut self, slot: usize, txid: u32) {
-        if self.enums[slot]
+        if let Some(pending) = self.enums[slot]
             .pending_definition
             .filter(|pending| pending.txid == txid)
-            .is_some()
         {
             let definition = self.enums[slot].definition_for(txid);
             let previous = self.enums[slot];
@@ -34334,8 +34577,53 @@ impl Storage {
                     definition.name,
                 );
             }
+            let source = (self.enum_member_pending_base + pending.member_slot as usize)
+                * self.enum_members_per_image;
+            let target = slot * self.enum_members_per_image;
+            let count = pending.member_count as usize;
+            self.enum_members
+                .copy_within(source..source + count, target);
             self.enums[slot] = definition;
+            self.clear_pending_enum_member_chain(Some(pending.member_slot));
         }
+    }
+
+    pub(crate) fn replay_enum_identity(
+        &mut self,
+        slot: usize,
+        schema: SqlName,
+        name: SqlName,
+    ) -> Result<(), SqlError> {
+        if self.enums.iter().enumerate().any(|(other_slot, other)| {
+            other_slot != slot
+                && other.database == self.current_database
+                && other.visible_to(0)
+                && other.schema == schema
+                && other.name == name
+        }) || self.domains.iter().any(|domain| {
+            domain.database == self.current_database
+                && domain.visible_to(0)
+                && domain.schema == schema
+                && domain.name == name
+        }) || self.composites.iter().any(|composite| {
+            composite.database == self.current_database
+                && composite.visible_to(0)
+                && composite.schema == schema
+                && composite.name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "type \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        let previous = self.enums[slot];
+        if schema != previous.schema || name != previous.name {
+            self.move_enum_references(slot, previous.schema, previous.name, schema, name);
+            self.enums[slot].schema = schema;
+            self.enums[slot].name = name;
+        }
+        Ok(())
     }
 
     pub(crate) fn rollback_enum_alter(
@@ -34343,6 +34631,9 @@ impl Storage {
         slot: usize,
         prior: Option<PendingEnumDefinition>,
     ) {
+        if let Some(current) = self.enums[slot].pending_definition {
+            self.release_pending_enum_members(current.member_slot);
+        }
         self.enums[slot].pending_definition = prior;
     }
 
@@ -34486,6 +34777,11 @@ impl Storage {
     pub fn commit_enum_drop(&mut self, slot: usize) {
         let (schema, name) = (self.enums[slot].schema, self.enums[slot].name);
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+        let pending = self.enums[slot]
+            .pending_definition
+            .take()
+            .map(|pending| pending.member_slot);
+        self.clear_pending_enum_member_chain(pending);
         self.enums[slot].ddl_state = self.enums[slot].ddl_state.commit_drop();
     }
 
@@ -45682,6 +45978,7 @@ mod tests {
         config.max_sequences = 18;
         config.max_domains = 26;
         config.max_enums = 28;
+        config.max_enum_labels_per_type = 96;
         config.max_composites = 29;
         config.max_roles = 19;
         config.max_role_memberships = 20;
@@ -45749,6 +46046,15 @@ mod tests {
         assert_eq!(storage.domains.len(), 26);
         assert_eq!(storage.domain_graph_scratch.borrow().len(), 26);
         assert_eq!(storage.enums.len(), 28);
+        assert_eq!(storage.enum_members_per_image, 96);
+        assert_eq!(
+            storage.pending_enum_members.len(),
+            pending_enum_definition_capacity(&config)
+        );
+        assert_eq!(
+            storage.enum_members.len(),
+            enum_member_image_capacity(&config) * 96
+        );
         assert_eq!(storage.composites.len(), 29);
         assert_eq!(storage.roles.len(), 19);
         assert_eq!(storage.role_memberships.len(), 20);

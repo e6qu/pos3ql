@@ -130,6 +130,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   runtime slot, so identities above the former 32-entry ceiling survive sort,
   replay, and recovery. Accepted domain, enum, composite, table, and view
   capacities are checked against disjoint `pg_type` OID bands before serving.
+  Enum member images are independently startup-sized through
+  `max_enum_labels_per_type`; committed, savepoint-visible, WAL replay, and
+  checkpoint recovery paths share that capacity without an inline 64-label
+  shape.
 - Wide schema definitions no longer encounter narrower storage-only limits:
   table constraint kinds and domain checks use the parser's complete 64-item
   bounded list; tables, views, named composites, and record definition lists

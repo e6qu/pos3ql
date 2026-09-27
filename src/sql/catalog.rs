@@ -16005,12 +16005,11 @@ fn policy_command_name(command: PolicyCommandKind) -> &'static str {
     }
 }
 
-fn policy_role_oids<'a>(
-    roles: crate::storage::PolicyRoles,
-    arena: &'a Arena,
-) -> Result<Datum<'a>, SqlError> {
-    let mut values = [Datum::Null; crate::storage::MAX_POLICY_ROLES];
-    for (index, role) in roles.entries().iter().copied().enumerate() {
+fn policy_role_oids<'a>(roles: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let values = arena
+        .alloc_slice_with(roles.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (index, role) in roles.iter().copied().enumerate() {
         values[index] = Datum::Int4(if role == crate::storage::PUBLIC_ROLE {
             0
         } else {
@@ -16019,28 +16018,50 @@ fn policy_role_oids<'a>(
     }
     Ok(Datum::Array {
         element: super::types::ArrElem::Oid,
-        raw: super::array::build(&values[..roles.entries().len()], arena)?,
+        raw: super::array::build(values, arena)?,
     })
 }
 
 fn policy_role_names<'a>(
     storage: &Storage,
-    roles: crate::storage::PolicyRoles,
+    roles: &[u16],
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
-    let mut values = [Datum::Null; crate::storage::MAX_POLICY_ROLES];
-    for (index, role) in roles.entries().iter().copied().enumerate() {
-        values[index] = if role == crate::storage::PUBLIC_ROLE {
-            text("public", arena)?
-        } else {
+    let public_only = roles == [crate::storage::PUBLIC_ROLE];
+    let count = if public_only {
+        1
+    } else {
+        roles
+            .iter()
+            .filter(|role| **role != crate::storage::PUBLIC_ROLE)
+            .count()
+    };
+    let values = arena
+        .alloc_slice_with(count, |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    if public_only {
+        values[0] = text("public", arena)?;
+    } else {
+        for (index, role) in roles
+            .iter()
+            .copied()
+            .filter(|role| *role != crate::storage::PUBLIC_ROLE)
+            .enumerate()
+        {
             let name = storage.role_name(usize::from(role), txid);
-            text(name.as_str(), arena)?
-        };
+            values[index] = text(name.as_str(), arena)?;
+        }
+        // PostgreSQL's pg_policies view selects matching pg_authid rows with
+        // ORDER BY rolname; PUBLIC has no pg_authid row in a mixed list.
+        values.sort_unstable_by(|left, right| match (left, right) {
+            (Datum::Text(left), Datum::Text(right)) => left.cmp(right),
+            _ => unreachable!("policy role names are text"),
+        });
     }
     Ok(Datum::Array {
         element: super::types::ArrElem::Name,
-        raw: super::array::build(&values[..roles.entries().len()], arena)?,
+        raw: super::array::build(values, arena)?,
     })
 }
 
@@ -16739,7 +16760,7 @@ fn pg_policy<'a>(
         .alloc_slice_with(storage.policy_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0;
-    for (_, policy) in storage.policies_with_slots_visible_to(txid) {
+    for (slot, policy) in storage.policies_with_slots_visible_to(txid) {
         let policy_definition = policy.definition_for(txid);
         rows[count] = row(
             &[
@@ -16752,7 +16773,7 @@ fn pg_policy<'a>(
                     arena,
                 )?,
                 Datum::Bool(policy.permissive),
-                policy_role_oids(policy_definition.roles, arena)?,
+                policy_role_oids(storage.policy_roles(slot, txid), arena)?,
                 policy_definition
                     .using
                     .map(|source| text(source.as_str(), arena))
@@ -16781,7 +16802,7 @@ fn pg_policies<'a>(
         .alloc_slice_with(storage.policy_count(), |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut count = 0;
-    for (_, policy) in storage.policies_with_slots_visible_to(txid) {
+    for (slot, policy) in storage.policies_with_slots_visible_to(txid) {
         let table = storage.table_def(usize::from(policy.table), txid);
         let policy_definition = policy.definition_for(txid);
         rows[count] = row(
@@ -16797,7 +16818,7 @@ fn pg_policies<'a>(
                     },
                     arena,
                 )?,
-                policy_role_names(storage, policy_definition.roles, txid, arena)?,
+                policy_role_names(storage, storage.policy_roles(slot, txid), txid, arena)?,
                 text(policy_command_name(policy.command), arena)?,
                 policy_definition
                     .using

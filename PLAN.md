@@ -62,9 +62,18 @@ make a smaller accepted surface PostgreSQL-compatible at that width.
 
 The known narrower limits to resolve or justify are:
 
-- durable 64-item definition shapes, including constraints, enum labels, and
-  policy roles; and
+- durable 64-item definition shapes, including constraints and enum labels; and
 - per-value `tsvector`/`tsquery` and geometry widths.
+
+Policy role lists now accept every configured catalog role plus `PUBLIC`.
+Startup-sized committed, transactional, and recovery images preserve stored
+role order through `pg_policy`, WAL, checkpoints, rollback, and object-cold
+recovery; `pg_policies` sorts names like PostgreSQL's system view.
+The WAL reader retains the former 64-role record kind while new records carry a
+wide role count.
+Wide allocation-forbidden catalog checks also removed scalar subqueries' former
+one-row temporary object publication; their cardinality-bounded result now
+stays in the startup-sized external-sort chunk.
 
 Grouping now follows PostgreSQL 18's target-list width of 1,664 distinct
 expressions, 4,096-set expanded-product limit, 12-element `CUBE` limit, and
@@ -105,8 +114,8 @@ decodes maximum-width relation and tuple frames as validated borrowed wire
 views, keeping the decoded message size independent of the 1,600-column limit.
 CI preserves the complete library, curated PostgreSQL differential, and
 10,000-statement seeded fuzz suites in deterministic shards below the
-15-minute worker ceiling; the seeded sequence runs in four 2,500-statement
-quarters, and instrumented auxiliary phases have independent workers.
+15-minute worker ceiling; the seeded sequence and forced-spill corpus each run
+in five slices, and instrumented auxiliary phases have independent workers.
 
 Join range tables and accumulated `USING` merge state now use exact
 statement-arena slices rather than a 64-relation executor envelope. Compact

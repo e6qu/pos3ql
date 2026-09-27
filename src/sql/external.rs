@@ -353,7 +353,6 @@ impl ExternalSorter {
 
     /// Sorts a complete run in startup memory when no chunk has spilled.
     /// Callers must consume these rows before resetting or reusing the sorter.
-    #[cfg(test)]
     pub(crate) fn in_memory_rows(
         &mut self,
         compare: &mut impl FnMut(&[u8], &[u8]) -> Result<Ordering, SqlError>,
@@ -365,7 +364,6 @@ impl ExternalSorter {
         Ok(Some(self.row_count))
     }
 
-    #[cfg(test)]
     pub(crate) fn in_memory_row(&self, position: usize) -> &[u8] {
         let entry = &self.rows[position];
         let start = entry.offset as usize + ORDINAL_BYTES;

@@ -9637,7 +9637,6 @@ impl Checkpointer {
             let mut schema = StackStr::<130>::new();
             let mut table_name = StackStr::<130>::new();
             let mut name = StackStr::<130>::new();
-            let mut roles = StackStr::<{ crate::storage::MAX_POLICY_ROLES * 131 }>::new();
             let mut using = StackStr::<{ crate::storage::POLICY_EXPRESSION_MAX * 2 }>::new();
             let mut with_check = StackStr::<{ crate::storage::POLICY_EXPRESSION_MAX * 2 }>::new();
             for byte in table.schema.as_str().as_bytes() {
@@ -9649,17 +9648,7 @@ impl Checkpointer {
             for byte in policy.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
-            for role in definition.roles.entries() {
-                let role_name = if *role == crate::storage::PUBLIC_ROLE {
-                    crate::storage::SqlName::parse("public").expect("valid role name")
-                } else {
-                    storage.role_name(usize::from(*role), 0)
-                };
-                for byte in role_name.as_str().as_bytes() {
-                    let _ = write!(roles, "{byte:02x}");
-                }
-                let _ = roles.write_char(' ');
-            }
+            let roles = storage.policy_roles(slot, 0);
             if let Some(source) = definition.using {
                 for byte in source.as_str().as_bytes() {
                     let _ = write!(using, "{byte:02x}");
@@ -9673,15 +9662,15 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "pol {} {} {} {} {} {} {} {}{} {} {}",
+                    "pol {} {} {} {} {} {} {}{} {} {} {}",
                     policy.created_at,
                     policy.command.code(),
                     u8::from(policy.permissive),
                     schema.as_str(),
                     table_name.as_str(),
                     name.as_str(),
-                    definition.roles.entries().len(),
-                    roles.as_str(),
+                    roles.len(),
+                    ManifestPolicyRoles { storage, roles },
                     if definition.using.is_some() {
                         using.as_str()
                     } else {
@@ -13242,24 +13231,16 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
             .ok_or(CheckpointSetupError::Corrupt("policy name"))?,
     )?)?;
     let role_count: usize = parse_field(words.next(), "policy role count")?;
-    if role_count == 0 || role_count > crate::storage::MAX_POLICY_ROLES {
+    if role_count == 0 || role_count > storage.policy_role_capacity() {
         return Err(CheckpointSetupError::Corrupt("policy role count"));
     }
-    let mut role_slots = [crate::storage::PUBLIC_ROLE; crate::storage::MAX_POLICY_ROLES];
-    for role in &mut role_slots[..role_count] {
-        let role_name = decode_hex_name(
+    let mut roles = Vec::with_capacity(role_count);
+    for _ in 0..role_count {
+        roles.push(decode_hex_name(
             words
                 .next()
                 .ok_or(CheckpointSetupError::Corrupt("policy role"))?,
-        )?;
-        *role = if role_name.eq_ignore_ascii_case("public") {
-            crate::storage::PUBLIC_ROLE
-        } else {
-            storage
-                .find_role(&role_name)
-                .ok_or(CheckpointSetupError::Corrupt("policy role does not exist"))?
-                as u16
-        };
+        )?);
     }
     let expression = |value: Option<&str>| {
         let value = value.ok_or(CheckpointSetupError::Corrupt("policy expression"))?;
@@ -13284,18 +13265,14 @@ fn load_policy(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupE
     storage
         .restore_policy(
             created_at,
-            crate::storage::PolicySpec {
+            crate::storage::RecoveredPolicySpec {
                 name,
                 table,
                 command,
                 permissive,
-                definition: crate::storage::PolicyDefinition {
-                    roles: crate::storage::PolicyRoles::from_slice(&role_slots[..role_count])
-                        .map_err(|_| CheckpointSetupError::Corrupt("policy roles"))?,
-                    using,
-                    with_check,
-                },
+                definition: crate::storage::PolicyDefinition { using, with_check },
             },
+            roles.iter().map(String::as_str),
             dependencies,
         )
         .map_err(|error| {
@@ -14159,6 +14136,25 @@ struct ManifestDependencies<'a>(crate::storage::StoredQueryDependencyView<'a>);
 struct ManifestViewColumns(crate::storage::ViewColumns);
 
 struct ManifestName<'a>(&'a str);
+
+struct ManifestPolicyRoles<'a> {
+    storage: &'a Storage,
+    roles: &'a [u16],
+}
+
+impl core::fmt::Display for ManifestPolicyRoles<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for role in self.roles {
+            if *role == crate::storage::PUBLIC_ROLE {
+                write!(output, " {}", ManifestName("public"))?;
+            } else {
+                let name = self.storage.role_name(usize::from(*role), 0);
+                write!(output, " {}", ManifestName(name.as_str()))?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Older manifest records use a single zero for an absent optional name.
 struct ManifestZeroName<'a>(&'a str);

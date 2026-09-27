@@ -53775,6 +53775,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     use core::fmt::Write as _;
 
     const WIDTH: usize = crate::storage::MAX_DEFINITION_ITEMS;
+    const POLICY_ROLE_WIDTH: usize = 96;
     const ROUTINE_WIDTH: usize = crate::storage::MAX_ROUTINE_ARGUMENTS;
     const POLICIES: usize = 40;
     let mut config = test_config("wide-callable-policy");
@@ -53783,7 +53784,7 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     config.max_routines = 4;
     config.max_triggers = 1;
     config.max_policies = POLICIES;
-    config.max_roles = WIDTH + 2;
+    config.max_roles = POLICY_ROLE_WIDTH + 2;
     config.wal_buffer_bytes = 8 << 20;
     config.wal_upload_buffer_bytes = 8 << 20;
     config.checkpoint_manifest_bytes = 8 << 20;
@@ -53842,22 +53843,24 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
         "{}",
         String::from_utf8_lossy(&output)
     );
-    definition.clear();
-    for role in 0..WIDTH {
-        write!(definition, "CREATE ROLE wide_policy_role_{role};").unwrap();
+    for start in (0..=POLICY_ROLE_WIDTH).step_by(32) {
+        definition.clear();
+        for role in start..=(start + 31).min(POLICY_ROLE_WIDTH) {
+            write!(definition, "CREATE ROLE wide_policy_role_{role};").unwrap();
+        }
+        let output = run_with_arena_bytes(&mut engine, &mut budget, &definition, 8 << 20);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{start}: {}",
+            String::from_utf8_lossy(&output)
+        );
     }
-    let output = run_with_arena_bytes(&mut engine, &mut budget, &definition, 8 << 20);
-    assert!(
-        !message_types(&output).contains(&b'E'),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
     definition.clear();
     definition.push_str(
         "GRANT ALL ON wide_policy_target TO wide_policy_role_0;\
         CREATE POLICY wide_allow ON wide_policy_target TO ",
     );
-    for role in 0..WIDTH {
+    for role in 0..POLICY_ROLE_WIDTH {
         if role != 0 {
             definition.push(',');
         }
@@ -53910,18 +53913,6 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
             ),
             "54000",
         ),
-        // PostgreSQL deduplicates a policy's role list; exceeding the catalog
-        // boundary takes WIDTH + 1 DISTINCT roles.
-        (
-            format!(
-                "ALTER POLICY wide_allow ON wide_policy_target TO postgres,{}",
-                (0..WIDTH)
-                    .map(|index| format!("wide_policy_role_{index}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            "54000",
-        ),
     ] {
         let observed = run_with_arena_bytes(&mut engine, &mut budget, &overflow, 8 << 20);
         assert!(
@@ -53964,8 +53955,12 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
             "100|100",
         ),
         (
-            "SELECT cardinality(polroles) FROM pg_policy WHERE polname = 'wide_allow'",
-            "64",
+            "SELECT cardinality(polroles), polroles[1] = (SELECT oid FROM pg_roles WHERE rolname = 'wide_policy_role_0'), polroles[96] = (SELECT oid FROM pg_roles WHERE rolname = 'wide_policy_role_95') FROM pg_policy WHERE polname = 'wide_allow'",
+            "96|t|t",
+        ),
+        (
+            "SELECT cardinality(roles), roles[1], roles[96] FROM pg_policies WHERE policyname = 'wide_allow'",
+            "96|wide_policy_role_0|wide_policy_role_95",
         ),
         ("SELECT count(*) FROM pg_policy", "40"),
         (
@@ -54002,14 +53997,29 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
     let observed = run_with(
         &mut engine,
         &mut budget,
-        "BEGIN; ALTER POLICY wide_restrict_39 ON wide_policy_target USING (false); ROLLBACK;\
-         DROP POLICY wide_restrict_1 ON wide_policy_target",
+        &format!(
+            "BEGIN; ALTER POLICY wide_allow ON wide_policy_target TO public,postgres,{};\
+             SELECT cardinality(polroles) FROM pg_policy WHERE polname = 'wide_allow';\
+             ROLLBACK;\
+             ALTER POLICY wide_allow ON wide_policy_target TO {};\
+             BEGIN; ALTER POLICY wide_restrict_39 ON wide_policy_target USING (false); ROLLBACK;\
+             DROP POLICY wide_restrict_1 ON wide_policy_target",
+            (0..=POLICY_ROLE_WIDTH)
+                .map(|index| format!("wide_policy_role_{index}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            (0..=POLICY_ROLE_WIDTH)
+                .map(|index| format!("wide_policy_role_{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     );
     assert!(
         !message_types(&observed).contains(&b'E'),
         "{}",
         String::from_utf8_lossy(&observed)
     );
+    assert_eq!(data_rows(&observed), ["99"]);
     let observed = run_with(
         &mut engine,
         &mut budget,
@@ -54044,7 +54054,8 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
         &mut recovered,
         &mut cold_budget,
         "SELECT wide_arguments(); SELECT f0, f63 FROM wide_result(); SELECT wide_settings();\
-         SELECT cardinality(polroles) FROM pg_policy WHERE polname = 'wide_allow';\
+         SELECT cardinality(polroles), polroles[1] = (SELECT oid FROM pg_roles WHERE rolname = 'wide_policy_role_0'), polroles[97] = (SELECT oid FROM pg_roles WHERE rolname = 'wide_policy_role_96') FROM pg_policy WHERE polname = 'wide_allow';\
+         SELECT cardinality(roles), roles[1], roles[97] FROM pg_policies WHERE policyname = 'wide_allow';\
          SET ROLE wide_policy_role_0; SELECT count(*) FROM wide_policy_target; RESET ROLE;\
          INSERT INTO wide_policy_target VALUES (4);\
          SELECT n, first, last FROM wide_trigger_audit WHERE n = 64 LIMIT 1",
@@ -54056,7 +54067,8 @@ fn wide_routines_triggers_and_policy_catalog_survive_object_cold_recovery() {
             "2000000",
             "0|63",
             "wide_settings",
-            "64",
+            "97|t|t",
+            "97|wide_policy_role_0|wide_policy_role_96",
             "2",
             "64|argument_0|argument_63"
         ],
@@ -68843,7 +68855,7 @@ fn external_runs_use_object_storage_after_cold_cache(phase: ExternalRunPhase) {
         assert_eq!(
             data_rows(&scalar),
             ["2048"],
-            "LIMIT must stop an externally spooled scalar subquery before its cardinality check: {}",
+            "LIMIT must stop a scalar subquery before its cardinality check: {}",
             String::from_utf8_lossy(&scalar)
         );
     }

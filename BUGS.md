@@ -380,9 +380,26 @@ decoded tuple and relation messages embedded complete 1,600-column arrays.
 They now retain validated borrowed wire views and iterate without allocation,
 including at the maximum width. Instrumented exact, binary COPY, type,
 PostgreSQL regression, and sqllogictest phases now have independent workers.
-The deterministic fuzz sequence likewise runs in four 2,500-statement quarters
-after a 5,000-statement half matched PostgreSQL completely but reached the job
-ceiling during teardown.
+The deterministic fuzz sequence likewise runs in five 2,000-statement slices.
+The former 2,500-statement final slice reached the unchanged job ceiling before
+reporting its summary; the smaller slices preserve all 10,000 statements.
+The forced-spill corpus likewise runs in five complete file slices after one
+four-way slice reached the same ceiling without completing.
+The policy-role width audit found no external blocker. Policy targets now use
+startup-sized dense images bounded by the configured role catalog plus
+`PUBLIC`, including transaction-local ALTER versions and recovery scratch. WAL
+uses a new wide-count record while retaining the old reader, and checkpoint
+records stream role names without a fixed intermediate buffer. PostgreSQL 18.6
+differential coverage and allocation-forbidden catalog and enforcement checks
+cross the former 64-role boundary; journal replay, rollback, checkpoint, and
+object-cold recovery preserve the widened list. The wider PostgreSQL comparison
+also exposed `pg_policies.roles` insertion ordering; the view now sorts role
+names through allocation-free statement scratch like PostgreSQL's `pg_authid`
+subquery. The widened guarded catalog query also exposed scalar subqueries
+publishing their single buffered row as a temporary object. They now consume
+that row directly from the startup-sized external-sort chunk. Memory-plan
+regression coverage accounts for the role images alongside policy definitions
+and stored-query dependencies.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

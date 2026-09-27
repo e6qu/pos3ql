@@ -3886,6 +3886,24 @@ fn pending_stored_query_dependency_capacity(config: &Config) -> usize {
         .min(catalog_transaction_capacity(config).saturating_mul(config.max_ddl_per_transaction))
 }
 
+fn policy_roles_per_image(config: &Config) -> usize {
+    // PUBLIC can accompany every configured ordinary role.
+    config.max_roles.saturating_add(1)
+}
+
+fn policy_role_image_capacity(config: &Config) -> usize {
+    config
+        .max_policies
+        .saturating_add(pending_stored_query_dependency_capacity(config))
+        .saturating_add(1)
+}
+
+pub(crate) fn policy_role_budget_bytes(config: &Config) -> usize {
+    policy_role_image_capacity(config)
+        .saturating_mul(policy_roles_per_image(config))
+        .saturating_mul(size_of::<u16>())
+}
+
 pub(crate) fn pending_row_version_capacity(config: &Config) -> usize {
     catalog_transaction_capacity(config).saturating_mul(config.txn_rows)
 }
@@ -6008,7 +6026,6 @@ pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
 /// runtime allocation: its target and function are stable catalog slots.
 pub(crate) const TRIGGER_OID_BASE: i32 = 140_000;
 pub(crate) const POLICY_OID_BASE: i32 = 180_000;
-pub(crate) const MAX_POLICY_ROLES: usize = MAX_DEFINITION_ITEMS;
 pub(crate) const POLICY_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 
 pub(crate) fn trigger_oid(trigger: &TriggerDef) -> i32 {
@@ -8295,49 +8312,6 @@ impl PolicyCommandKind {
     }
 }
 
-/// Resolved policy roles. PUBLIC uses the catalog-wide sentinel; every other
-/// entry is a stable role slot, so role renames cannot stale policy behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PolicyRoles {
-    entries: [u16; MAX_POLICY_ROLES],
-    count: u8,
-}
-
-impl PolicyRoles {
-    pub(crate) const PUBLIC: Self = Self {
-        entries: [PUBLIC_ROLE; MAX_POLICY_ROLES],
-        count: 1,
-    };
-
-    pub(crate) fn from_slice(roles: &[u16]) -> Result<Self, SqlError> {
-        if roles.is_empty() || roles.len() > MAX_POLICY_ROLES {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "a policy can target between 1 and {} roles",
-                MAX_POLICY_ROLES
-            ));
-        }
-        let mut value = Self {
-            entries: [PUBLIC_ROLE; MAX_POLICY_ROLES],
-            count: roles.len() as u8,
-        };
-        value.entries[..roles.len()].copy_from_slice(roles);
-        Ok(value)
-    }
-
-    pub(crate) fn entries(&self) -> &[u16] {
-        &self.entries[..usize::from(self.count)]
-    }
-
-    pub(crate) fn applies_to(&self, storage: &Storage, role: usize, txid: u32) -> bool {
-        self.entries().iter().any(|target| {
-            *target == PUBLIC_ROLE
-                || usize::from(*target) == role
-                || storage.role_is_member_of(role, usize::from(*target), txid)
-        })
-    }
-}
-
 pub(crate) fn policy_expression(source: &str) -> Result<StackStr<POLICY_EXPRESSION_MAX>, SqlError> {
     let value = StackStr::from_str(source);
     if value.is_truncated() {
@@ -8352,7 +8326,6 @@ pub(crate) fn policy_expression(source: &str) -> Result<StackStr<POLICY_EXPRESSI
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PolicyDefinition {
-    pub(crate) roles: PolicyRoles,
     pub(crate) using: Option<StackStr<POLICY_EXPRESSION_MAX>>,
     pub(crate) with_check: Option<StackStr<POLICY_EXPRESSION_MAX>>,
 }
@@ -8361,6 +8334,7 @@ pub(crate) struct PolicyDefinition {
 pub(crate) struct PendingPolicyDefinition {
     pub(crate) txid: u32,
     pub(crate) definition: PolicyDefinition,
+    role_count: u32,
     dependency_slot: u32,
 }
 
@@ -8373,6 +8347,7 @@ pub(crate) struct PolicyDef {
     pub(crate) command: PolicyCommandKind,
     pub(crate) permissive: bool,
     pub(crate) definition: PolicyDefinition,
+    role_count: u32,
     pub(crate) pending_definition: Option<PendingPolicyDefinition>,
     pub(crate) ddl_state: CatalogDdlState,
 }
@@ -8386,10 +8361,10 @@ impl PolicyDef {
         command: PolicyCommandKind::All,
         permissive: true,
         definition: PolicyDefinition {
-            roles: PolicyRoles::PUBLIC,
             using: None,
             with_check: None,
         },
+        role_count: 1,
         pending_definition: None,
         ddl_state: CatalogDdlState::Absent,
     };
@@ -8406,7 +8381,17 @@ impl PolicyDef {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PolicySpec {
+pub(crate) struct PolicySpec<'a> {
+    pub(crate) name: SqlName,
+    pub(crate) table: usize,
+    pub(crate) command: PolicyCommandKind,
+    pub(crate) permissive: bool,
+    pub(crate) definition: PolicyDefinition,
+    pub(crate) roles: &'a [u16],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecoveredPolicySpec {
     pub(crate) name: SqlName,
     pub(crate) table: usize,
     pub(crate) command: PolicyCommandKind,
@@ -11706,6 +11691,10 @@ pub struct Storage {
     triggers: FixedVec<TriggerDef>,
     partition_trigger_states: FixedVec<PartitionTriggerState>,
     policies: FixedVec<PolicyDef>,
+    policy_roles: FixedVec<u16>,
+    policy_roles_per_image: usize,
+    policy_role_pending_base: usize,
+    policy_role_replay_image: usize,
     extended_statistics: FixedVec<ExtendedStatisticsDef>,
     pending_extended_statistics_data: FixedVec<PendingExtendedStatisticsDataSlot>,
     publications: FixedVec<PublicationDef>,
@@ -15177,6 +15166,7 @@ impl Storage {
             + config.max_triggers
                 * (size_of::<TriggerDef>() + config.max_tables * size_of::<PartitionTriggerState>())
             + config.max_policies * size_of::<PolicyDef>()
+            + policy_role_budget_bytes(config)
             + config.extended_statistics_capacity() * size_of::<ExtendedStatisticsDef>()
             + config.max_publications * size_of::<PublicationDef>()
             + config.max_materialized_views * size_of::<MatviewDef>()
@@ -15619,6 +15609,17 @@ impl Storage {
             policies
                 .push(PolicyDef::EMPTY)
                 .expect("sized to policy capacity");
+        }
+        let policy_roles_per_image = policy_roles_per_image(config);
+        let policy_role_pending_base = policy_capacity;
+        let policy_role_replay_image = policy_role_image_capacity(config) - 1;
+        let policy_role_entries =
+            policy_role_image_capacity(config).saturating_mul(policy_roles_per_image);
+        let mut policy_roles = FixedVec::new(budget, "policy_roles", policy_role_entries)?;
+        for _ in 0..policy_role_entries {
+            policy_roles
+                .push(PUBLIC_ROLE)
+                .expect("sized to policy role images");
         }
         let extended_statistics_capacity = config.extended_statistics_capacity();
         let mut extended_statistics =
@@ -16181,6 +16182,10 @@ impl Storage {
             triggers,
             partition_trigger_states,
             policies,
+            policy_roles,
+            policy_roles_per_image,
+            policy_role_pending_base,
+            policy_role_replay_image,
             extended_statistics,
             pending_extended_statistics_data,
             publications,
@@ -19934,13 +19939,7 @@ impl Storage {
             return Some(RoleObjectDependency::ColumnPrivilege);
         }
         self.policies_with_slots_visible_to(txid)
-            .any(|(_, policy)| {
-                policy
-                    .definition_for(txid)
-                    .roles
-                    .entries()
-                    .contains(&(role as u16))
-            })
+            .any(|(slot, _)| self.policy_roles(slot, txid).contains(&(role as u16)))
             .then_some(RoleObjectDependency::Policy)
     }
 
@@ -37841,6 +37840,56 @@ impl Storage {
         self.committed_dependencies(StoredQueryDependencyOwner::Policy(slot as u16))
     }
 
+    fn policy_role_image(&self, image: usize, count: u32) -> &[u16] {
+        let count = usize::try_from(count).expect("policy role count fits usize");
+        let start = image * self.policy_roles_per_image;
+        &self.policy_roles[start..start + count]
+    }
+
+    fn write_policy_role_image(&mut self, image: usize, roles: &[u16]) -> Result<u32, SqlError> {
+        if roles.is_empty() || roles.len() > self.policy_roles_per_image {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a policy can target between 1 and {} roles",
+                self.policy_roles_per_image
+            ));
+        }
+        let count = u32::try_from(roles.len()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "policy role count exceeds durable representation"
+            )
+        })?;
+        let start = image * self.policy_roles_per_image;
+        self.policy_roles[start..start + roles.len()].copy_from_slice(roles);
+        Ok(count)
+    }
+
+    pub(crate) fn policy_roles(&self, slot: usize, txid: u32) -> &[u16] {
+        if let Some(pending) = self.policies[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+        {
+            return self.policy_role_image(
+                self.policy_role_pending_base + pending.dependency_slot as usize,
+                pending.role_count,
+            );
+        }
+        self.policy_role_image(slot, self.policies[slot].role_count)
+    }
+
+    pub(crate) fn policy_role_capacity(&self) -> usize {
+        self.policy_roles_per_image
+    }
+
+    pub(crate) fn policy_applies_to_role(&self, slot: usize, role: usize, txid: u32) -> bool {
+        self.policy_roles(slot, txid).iter().any(|target| {
+            *target == PUBLIC_ROLE
+                || usize::from(*target) == role
+                || self.role_is_member_of(role, usize::from(*target), txid)
+        })
+    }
+
     pub(crate) fn policies_for_table(
         &self,
         table: usize,
@@ -37884,12 +37933,12 @@ impl Storage {
 
     pub(crate) fn create_policy(
         &mut self,
-        spec: PolicySpec,
+        spec: PolicySpec<'_>,
         dependencies: &StoredQueryDependencies,
         txid: u32,
     ) -> Result<usize, SqlError> {
         if spec.table >= self.tables.len()
-            || spec.definition.roles.entries().is_empty()
+            || spec.roles.is_empty()
             || (matches!(spec.command, PolicyCommandKind::Insert)
                 && spec.definition.using.is_some())
             || (matches!(
@@ -37923,6 +37972,7 @@ impl Storage {
                 self.policies.len()
             ));
         };
+        let role_count = self.write_policy_role_image(slot, spec.roles)?;
         self.catalog_seq += 1;
         self.policies[slot] = PolicyDef {
             database: self.current_database,
@@ -37937,6 +37987,7 @@ impl Storage {
             command: spec.command,
             permissive: spec.permissive,
             definition: spec.definition,
+            role_count,
             pending_definition: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
@@ -37951,6 +38002,7 @@ impl Storage {
         &mut self,
         slot: usize,
         definition: PolicyDefinition,
+        roles: &[u16],
         dependencies: &StoredQueryDependencies,
         txid: u32,
     ) -> Result<Option<PendingPolicyDefinition>, SqlError> {
@@ -37979,15 +38031,27 @@ impl Storage {
         let previous = prior
             .filter(|pending| pending.txid == txid)
             .map(|pending| pending.dependency_slot);
+        if roles.is_empty() || roles.len() > self.policy_roles_per_image {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a policy can target between 1 and {} roles",
+                self.policy_roles_per_image
+            ));
+        }
         let dependency_slot = self.allocate_pending_stored_query_dependencies(
             StoredQueryDependencyOwner::Policy(slot as u16),
             txid,
             previous,
             dependencies.view(),
         )?;
+        let role_count = self.write_policy_role_image(
+            self.policy_role_pending_base + dependency_slot as usize,
+            roles,
+        )?;
         self.policies[slot].pending_definition = Some(PendingPolicyDefinition {
             txid,
             definition,
+            role_count,
             dependency_slot,
         });
         Ok(prior)
@@ -38010,11 +38074,18 @@ impl Storage {
         if let Some(pending) = self.policies[slot].pending_definition
             && pending.txid == txid
         {
+            let source = (self.policy_role_pending_base + pending.dependency_slot as usize)
+                * self.policy_roles_per_image;
+            let target = slot * self.policy_roles_per_image;
+            let count = usize::try_from(pending.role_count).expect("policy role count fits usize");
+            self.policy_roles
+                .copy_within(source..source + count, target);
             self.commit_pending_dependencies(
                 StoredQueryDependencyOwner::Policy(slot as u16),
                 pending.dependency_slot,
             );
             self.policies[slot].definition = pending.definition;
+            self.policies[slot].role_count = pending.role_count;
             self.policies[slot].pending_definition = None;
         }
     }
@@ -38062,26 +38133,108 @@ impl Storage {
         }
     }
 
-    pub(crate) fn replay_set_policy(
+    pub(crate) fn replay_set_policy<'a>(
         &mut self,
-        spec: PolicySpec,
+        spec: RecoveredPolicySpec,
+        roles: impl ExactSizeIterator<Item = &'a str>,
         dependencies: StoredQueryDependencies,
-    ) -> Result<(), SqlError> {
-        if let Some(slot) = self.policy_slot_on(spec.table, spec.name.as_str(), 0) {
-            let policy = &mut self.policies[slot];
-            policy.command = spec.command;
-            policy.permissive = spec.permissive;
-            policy.definition = spec.definition;
-            policy.pending_definition = None;
-            self.write_committed_dependencies(
-                StoredQueryDependencyOwner::Policy(slot as u16),
-                dependencies.view(),
-            )?;
-            return Ok(());
+    ) -> Result<usize, SqlError> {
+        let role_count = roles.len();
+        if role_count == 0 || role_count > self.policy_roles_per_image {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a policy can target between 1 and {} roles",
+                self.policy_roles_per_image
+            ));
         }
-        let slot = self.create_policy(spec, &dependencies, 0)?;
-        self.commit_policy_create(slot);
-        Ok(())
+        let durable_role_count = u32::try_from(role_count).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "policy role count exceeds durable representation"
+            )
+        })?;
+        let scratch_start = self.policy_role_replay_image * self.policy_roles_per_image;
+        for (index, role) in roles.enumerate() {
+            let role = if role.eq_ignore_ascii_case("public") {
+                PUBLIC_ROLE
+            } else {
+                u16::try_from(self.find_role_visible(role, 0).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "recovered policy references unknown role \"{}\"",
+                        role
+                    )
+                })?)
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "role slot exceeds policy representation"
+                    )
+                })?
+            };
+            self.policy_roles[scratch_start + index] = role;
+        }
+        if spec.table >= self.tables.len()
+            || (matches!(spec.command, PolicyCommandKind::Insert)
+                && spec.definition.using.is_some())
+            || (matches!(
+                spec.command,
+                PolicyCommandKind::Select | PolicyCommandKind::Delete
+            ) && spec.definition.with_check.is_some())
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid recovered row-security policy definition"
+            ));
+        }
+        let slot = if let Some(slot) = self.policy_slot_on(spec.table, spec.name.as_str(), 0) {
+            slot
+        } else {
+            let Some(slot) = self
+                .policies
+                .iter()
+                .position(|policy| policy.ddl_state == CatalogDdlState::Absent)
+            else {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "row-security policy catalog is full (limit {})",
+                    self.policies.len()
+                ));
+            };
+            self.catalog_seq += 1;
+            self.policies[slot] = PolicyDef {
+                database: self.current_database,
+                created_at: self.catalog_seq,
+                name: spec.name,
+                table: u16::try_from(spec.table).map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "table slot exceeds policy catalog capacity"
+                    )
+                })?,
+                command: spec.command,
+                permissive: spec.permissive,
+                definition: spec.definition,
+                role_count: durable_role_count,
+                pending_definition: None,
+                ddl_state: CatalogDdlState::Present,
+            };
+            slot
+        };
+        let target = slot * self.policy_roles_per_image;
+        self.policy_roles
+            .copy_within(scratch_start..scratch_start + role_count, target);
+        let policy = &mut self.policies[slot];
+        policy.command = spec.command;
+        policy.permissive = spec.permissive;
+        policy.definition = spec.definition;
+        policy.role_count = durable_role_count;
+        policy.pending_definition = None;
+        self.write_committed_dependencies(
+            StoredQueryDependencyOwner::Policy(slot as u16),
+            dependencies.view(),
+        )?;
+        Ok(slot)
     }
 
     pub(crate) fn replay_drop_policy(&mut self, table: usize, name: &str) {
@@ -38091,16 +38244,14 @@ impl Storage {
         }
     }
 
-    pub(crate) fn restore_policy(
+    pub(crate) fn restore_policy<'a>(
         &mut self,
         created_at: u64,
-        spec: PolicySpec,
+        spec: RecoveredPolicySpec,
+        roles: impl ExactSizeIterator<Item = &'a str>,
         dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
-        self.replay_set_policy(spec, dependencies)?;
-        let slot = self
-            .policy_slot_on(spec.table, spec.name.as_str(), 0)
-            .expect("restored policy is installed");
+        let slot = self.replay_set_policy(spec, roles, dependencies)?;
         self.policies[slot].created_at = created_at;
         self.catalog_seq = self.catalog_seq.max(created_at);
         Ok(())
@@ -45626,6 +45777,15 @@ mod tests {
         assert_eq!(
             storage.stored_query_dependencies.len(),
             (committed_dependency_images + pending_stored_query_dependency_capacity(&config)) * 73
+        );
+        assert_eq!(storage.policy_roles_per_image, 20);
+        assert_eq!(
+            storage.policy_roles.len(),
+            policy_role_image_capacity(&config) * 20
+        );
+        assert_eq!(
+            storage.policy_role_replay_image,
+            policy_role_image_capacity(&config) - 1
         );
         assert_eq!(storage.casts.len(), 6);
         assert_eq!(storage.operators.len(), 7);

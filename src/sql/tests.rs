@@ -43742,7 +43742,7 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
     config.object_store_bucket = format!("catalog-comment-cold-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
 
-    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut budget = Budget::new((1 << 29) + (112 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_with(
         &mut engine,
@@ -43789,7 +43789,7 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
-    let mut cold_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut cold_budget = Budget::new((1 << 29) + (112 << 20));
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
     let output = run_with(
         &mut cold,
@@ -48694,6 +48694,32 @@ fn enum_float4_renumbering_and_new_value_safety() {
         ["L1", "L2"]
     );
 
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE negative_split_enum AS ENUM ('pivot', 'end'); \
+         ALTER TYPE negative_split_enum ADD VALUE 'anchor' BEFORE 'pivot'; \
+         ALTER TYPE negative_split_enum ADD VALUE 'lower' BEFORE 'anchor'",
+    );
+    for index in 1..=30 {
+        let statement =
+            format!("ALTER TYPE negative_split_enum ADD VALUE 'n{index}' BEFORE 'anchor'");
+        let output = run_with(&mut engine, &mut budget, &statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("ALTER TYPE"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_enum WHERE enumtypid = 'negative_split_enum'::regtype"
+        )),
+        ["34"]
+    );
+
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
     run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
     run_txn(
@@ -48718,6 +48744,179 @@ fn enum_float4_renumbering_and_new_value_safety() {
         "BEGIN; CREATE TYPE fresh_enum AS ENUM ('usable'); SELECT 'usable'::fresh_enum; ROLLBACK",
     );
     assert_eq!(data_rows(&created_in_transaction), ["usable"]);
+}
+
+#[test]
+fn configured_enum_label_capacity_is_transactional_and_survives_recovery() {
+    use core::fmt::Write as _;
+
+    const INITIAL_LABELS: usize = 96;
+    const FINAL_LABELS: usize = 110;
+
+    let mut config = test_config("enum-label-capacity");
+    config.max_enums = 2;
+    config.max_enum_labels_per_type = 128;
+    config.max_ddl_per_transaction = 16;
+    config.max_tables = 1;
+    config.checkpoint_manifest_bytes = 1 << 20;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_bucket = format!("enum-label-capacity-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+
+    let mut definition = String::from("CREATE TYPE wide_enum AS ENUM (");
+    for label in 0..INITIAL_LABELS {
+        if label != 0 {
+            definition.push(',');
+        }
+        write!(definition, "'label_{label}'").unwrap();
+    }
+    definition.push_str(
+        "); CREATE TABLE wide_enum_rows (value wide_enum); \
+        INSERT INTO wide_enum_rows VALUES ('label_0'), ('label_95');",
+    );
+
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &definition, 8 << 20);
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut transaction = TxnState::new_with_config(&mut budget, &config).unwrap();
+    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ALTER TYPE wide_enum ADD VALUE 'label_96'",
+    );
+    let unsafe_value = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "SELECT 'label_96'::wide_enum",
+    );
+    assert!(unsafe_value.contains("55P04"), "{unsafe_value}");
+    run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
+
+    run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ALTER TYPE wide_enum ADD VALUE 'label_96'; SAVEPOINT enum_width",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ALTER TYPE wide_enum ADD VALUE 'label_97'",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ROLLBACK TO SAVEPOINT enum_width; COMMIT",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'label_96'::wide_enum"
+        )),
+        ["label_96"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'label_97'::wide_enum"
+        ))
+        .contains("22P02")
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    // Local journal replay exercises the widened V2 record before a
+    // checkpoint replaces it with an object-store manifest.
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT count(*) FROM pg_enum WHERE enumtypid = 'wide_enum'::regtype"
+        )),
+        ["97"]
+    );
+    for label in 97..FINAL_LABELS {
+        let statement = format!("ALTER TYPE wide_enum ADD VALUE 'label_{label}'");
+        let output = run_with(&mut replayed, &mut replay_budget, &statement);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{label}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert!(replayed.checkpoint().unwrap());
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut cold_budget).unwrap();
+    let output = run_with_arena_bytes(
+        &mut recovered,
+        &mut cold_budget,
+        "SELECT count(*) FROM pg_enum WHERE enumtypid = 'wide_enum'::regtype; \
+         SELECT value FROM wide_enum_rows ORDER BY value",
+        8 << 20,
+    );
+    assert_eq!(data_rows(&output), ["110", "label_0", "label_95"]);
+    assert_eq!(
+        data_rows(&run_with_fixed_memory(
+            &mut recovered,
+            &cold_budget,
+            "SELECT 'label_109'::wide_enum",
+            1 << 20,
+        )),
+        ["label_109"]
+    );
+    for label in FINAL_LABELS..config.max_enum_labels_per_type {
+        let statement = format!("ALTER TYPE wide_enum ADD VALUE 'label_{label}'");
+        let output = run_with(&mut recovered, &mut cold_budget, &statement);
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{label}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let exhausted = run_with(
+        &mut recovered,
+        &mut cold_budget,
+        "ALTER TYPE wide_enum ADD VALUE 'label_128'",
+    );
+    assert!(
+        String::from_utf8_lossy(&exhausted).contains("54000"),
+        "{}",
+        String::from_utf8_lossy(&exhausted)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut cold_budget,
+            "SELECT count(*) FROM pg_enum WHERE enumtypid = 'wide_enum'::regtype"
+        )),
+        ["128"]
+    );
+
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -59182,7 +59381,7 @@ fn temporary_relation_ddl_never_enters_recovery_wal() {
     config.object_store_sim = true;
     config.object_store_bucket = format!("temporary-relation-wal-{}", std::process::id());
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
-    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut budget = Budget::new((1 << 29) + (112 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let output = run_as(
         &mut engine,
@@ -59256,7 +59455,7 @@ fn temporary_relation_ddl_never_enters_recovery_wal() {
     engine.commit_wal().unwrap();
     drop(engine);
 
-    let mut recovered_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut recovered_budget = Budget::new((1 << 29) + (112 << 20));
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
     let output = run_with(
         &mut recovered,

@@ -106,7 +106,9 @@ its own configuration and memory-plan charge.
 
 Database, schema, sequence, and user-defined type catalogs are independently
 sized by `max_databases`, `max_schemas`, `max_sequences`, `max_domains`,
-`max_enums`, and `max_composites`. Their session state, planner metadata,
+`max_enums`, and `max_composites`. `max_enum_labels_per_type` independently
+sizes each enum's committed, transaction-private, and recovery member images.
+Their session state, planner metadata,
 catalog rows, database cloning, WAL, checkpoints, and cold recovery use those
 declared capacities. Schema slots retain their explicit 255-slot on-disk
 representation limit; database slots retain their 65,535-slot limit; sequence

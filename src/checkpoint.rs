@@ -5599,12 +5599,13 @@ impl Checkpointer {
                     let schema = hexstr(words.next(), "enm schema missing")?;
                     let name = hexstr(words.next(), "enm name missing")?;
                     let n_members: usize = parse_field(words.next(), "enm nmembers")?;
-                    if n_members > crate::storage::MAX_ENUM_LABELS {
+                    if n_members > storage.enum_label_capacity() {
                         return Err(CheckpointSetupError::Corrupt("too many enum labels"));
                     }
-                    let mut members =
-                        [crate::storage::EnumMember::EMPTY; crate::storage::MAX_ENUM_LABELS];
-                    for member in members.iter_mut().take(n_members) {
+                    let members = storage.enum_replay_members(n_members).map_err(|error| {
+                        CheckpointSetupError::ObjectStore(error.message.as_str().to_string())
+                    })?;
+                    for member in members.iter_mut() {
                         let label = hexstr(words.next(), "enm label missing")?;
                         let sort_bits: u64 = parse_field(words.next(), "enm sort")?;
                         *member = crate::storage::EnumMember {
@@ -5612,9 +5613,8 @@ impl Checkpointer {
                             sort: f64::from_bits(sort_bits),
                         };
                     }
-                    let spec = crate::storage::EnumSpec { members, n_members };
                     storage
-                        .create_enum(sql_name(&schema)?, sql_name(&name)?, spec, 0)
+                        .finish_enum_replay(sql_name(&schema)?, sql_name(&name)?, n_members)
                         .map_err(|e| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest enum rejected: {}",
@@ -7750,30 +7750,33 @@ impl Checkpointer {
         // <sort-bits>]...`. Written before tables so an enum-typed column
         // resolves its type slot when its table is rebuilt on load. The sort
         // key is emitted as its exact f64 bit pattern.
-        for (_, e) in storage.checkpoint_enums() {
+        for (slot, e) in storage.checkpoint_enums() {
+            let definition = storage.enum_for(slot, 0);
             write_database_context(&mut self.manifest_buf, &mut database_context, e.database)?;
             use core::fmt::Write;
-            let mut line = StackStr::<10_240>::new();
-            let hex = |line: &mut StackStr<10_240>, s: &str| {
+            let hex = |output: &mut FixedBuf, s: &str| -> core::fmt::Result {
                 if s.is_empty() {
-                    let _ = write!(line, "0");
+                    write!(output, "0")?;
                 } else {
                     for b in s.as_bytes() {
-                        let _ = write!(line, "{b:02x}");
+                        write!(output, "{b:02x}")?;
                     }
                 }
+                Ok(())
             };
-            let _ = write!(line, "enm ");
-            hex(&mut line, e.schema.as_str());
-            let _ = write!(line, " ");
-            hex(&mut line, e.name.as_str());
-            let _ = write!(line, " {}", e.n_members);
-            for m in e.members() {
-                let _ = write!(line, " ");
-                hex(&mut line, m.label.as_str());
-                let _ = write!(line, " {}", m.sort.to_bits());
+            write!(&mut self.manifest_buf, "enm ").map_err(|_| manifest_full())?;
+            hex(&mut self.manifest_buf, e.schema.as_str()).map_err(|_| manifest_full())?;
+            write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
+            hex(&mut self.manifest_buf, e.name.as_str()).map_err(|_| manifest_full())?;
+            write!(&mut self.manifest_buf, " {}", definition.members().len())
+                .map_err(|_| manifest_full())?;
+            for m in definition.members() {
+                write!(&mut self.manifest_buf, " ").map_err(|_| manifest_full())?;
+                hex(&mut self.manifest_buf, m.label.as_str()).map_err(|_| manifest_full())?;
+                write!(&mut self.manifest_buf, " {}", m.sort.to_bits())
+                    .map_err(|_| manifest_full())?;
             }
-            write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
+            writeln!(&mut self.manifest_buf).map_err(|_| manifest_full())?;
         }
         // Named composites precede tables because composite columns rebind by
         // catalog identity while the table definitions are restored.
@@ -12543,14 +12546,16 @@ fn value_index_to_sql(error: impl core::fmt::Debug) -> SqlError {
     sql_err!(SQLSTATE_IO, "persistent value-index write: {:?}", error)
 }
 
+fn manifest_full() -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "checkpoint manifest is full; raise checkpoint_manifest_bytes"
+    )
+}
+
 fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Result<(), SqlError> {
     use core::fmt::Write;
-    writeln!(buffer, "{line}").map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "checkpoint manifest is full; raise checkpoint_manifest_bytes"
-        )
-    })
+    writeln!(buffer, "{line}").map_err(|_| manifest_full())
 }
 
 fn write_database_context(

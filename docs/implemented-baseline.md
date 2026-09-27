@@ -26,6 +26,16 @@ active production roadmap is [PLAN.md](../PLAN.md).
   compatibility. The command inventory records both executable behavior and
   deliberate typed rejection; it is not a claim that every PostgreSQL grammar
   production or server subsystem is implemented.
+- Full-text vectors and queries use statement memory through parsing,
+  canonicalization, operators, ranking, headlines, set-returning functions,
+  and binary receive. Streaming binary output and index token extraction avoid
+  a second per-value tree. PostgreSQL's 1 MiB vector storage, 2,046-byte text
+  lexeme, 2,047-byte binary lexeme, and 256-position-per-lexeme boundaries
+  remain explicit. A PostgreSQL 18.6 differential, allocation-forbidden
+  execution, binary round trips, GIN and GiST indexes, checkpoint publication,
+  and empty-cache recovery cover 600 vector lexemes, 2,400 positions, and a
+  balanced 599-node query. Forced-spill coverage unnests that durable vector
+  through the external lateral path.
 - Object-native btree, hash, BRIN, GiST, GIN, and SP-GiST access paths, including
   durable generations, transaction overlays, WAL, checkpoints, object-cold
   recovery, and the documented built-in operator families.

@@ -176,7 +176,10 @@ fn current_config(hooks: &EvalHooks<'_, '_>) -> Result<i32, SqlError> {
     })
 }
 
-fn text_array<'a>(value: Datum<'a>, out: &mut [&'a str; 512]) -> Result<Option<usize>, SqlError> {
+fn text_array<'a>(
+    value: Datum<'a>,
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<Option<&'a [&'a str]>, SqlError> {
     match value {
         Datum::Null => Ok(None),
         Datum::Array {
@@ -184,20 +187,20 @@ fn text_array<'a>(value: Datum<'a>, out: &mut [&'a str; 512]) -> Result<Option<u
             raw,
         } => {
             let count = crate::sql::array::len(raw);
-            if count > out.len() {
-                return Err(sql_err!(
+            let out = arena.alloc_slice_with(count, |_| "").map_err(|_| {
+                sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "text array is too large"
-                ));
-            }
-            for (index, slot) in out[..count].iter_mut().enumerate() {
+                    "text array exceeds the statement arena"
+                )
+            })?;
+            for (index, slot) in out.iter_mut().enumerate() {
                 *slot = match crate::sql::array::get(raw, ArrElem::Text, index) {
                     Some(Datum::Text(text)) => text,
                     Some(Datum::Null) | None => continue,
                     _ => unreachable!("text array invariant"),
                 };
             }
-            Ok(Some(count))
+            Ok(Some(out))
         }
         other => Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
@@ -503,13 +506,8 @@ pub(crate) fn dispatch<'a>(
                         ));
                     }
                 };
-                let mut selected = [""; 512];
                 let selected = if args.len() == 3 {
-                    let count = text_array(
-                        eval_full(args[2], arena, params, row, hooks)?,
-                        &mut selected,
-                    )?;
-                    count.map(|count| &selected[..count])
+                    text_array(eval_full(args[2], arena, params, row, hooks)?, arena)?
                 } else {
                     None
                 };
@@ -526,17 +524,17 @@ pub(crate) fn dispatch<'a>(
                     ));
                 };
                 let value = eval_full(args[1], arena, params, row, hooks)?;
-                let mut deleted = [""; 512];
-                let count = match value {
+                let scalar;
+                let deleted = match value {
                     Datum::Null => return Ok(Datum::Null),
                     Datum::Text(text) => {
-                        deleted[0] = text;
-                        1
+                        scalar = [text];
+                        &scalar[..]
                     }
-                    array => text_array(array, &mut deleted)?.unwrap_or(0),
+                    array => text_array(array, arena)?.unwrap_or(&[]),
                 };
                 Ok(Datum::TsVector(full_text::restore_vector(
-                    full_text::delete_lexemes(vector.as_str(), &deleted[..count], arena)?,
+                    full_text::delete_lexemes(vector.as_str(), deleted, arena)?,
                 )))
             }
             "ts_filter" => {
@@ -927,14 +925,13 @@ pub(crate) fn dispatch<'a>(
                     ));
                 };
                 let count = crate::sql::array::len(raw);
-                let mut lexemes = [""; 512];
-                if count > lexemes.len() {
-                    return Err(sql_err!(
+                let lexemes = arena.alloc_slice_with(count, |_| "").map_err(|_| {
+                    sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "lexeme array is too large"
-                    ));
-                }
-                for (index, lexeme) in lexemes[..count].iter_mut().enumerate() {
+                        "lexeme array exceeds the statement arena"
+                    )
+                })?;
+                for (index, lexeme) in lexemes.iter_mut().enumerate() {
                     *lexeme = match crate::sql::array::get(raw, ArrElem::Text, index) {
                         Some(Datum::Text(text)) => text,
                         Some(Datum::Null) | None => {
@@ -947,7 +944,7 @@ pub(crate) fn dispatch<'a>(
                     };
                 }
                 Ok(Datum::TsVector(full_text::restore_vector(
-                    full_text::array_to_vector(&lexemes[..count], arena)?,
+                    full_text::array_to_vector(lexemes, arena)?,
                 )))
             }
             "tsvector_to_array" => {
@@ -963,7 +960,14 @@ pub(crate) fn dispatch<'a>(
                     ));
                 };
                 let vector = full_text::parse_vector(source.as_str(), arena)?;
-                let mut values = [Datum::Null; 512];
+                let values = arena
+                    .alloc_slice_with(vector.lexeme_count(), |_| Datum::Null)
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "tsvector array exceeds the statement arena"
+                        )
+                    })?;
                 let mut count = 0usize;
                 let mut previous = None;
                 for index in 0..vector.lexeme_count() {

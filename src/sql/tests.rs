@@ -4298,6 +4298,141 @@ fn full_text_values_functions_operators_storage_and_generated_columns() {
 }
 
 #[test]
+fn full_text_values_use_statement_memory_beyond_former_inline_limits() {
+    use core::fmt::Write as _;
+
+    let mut vector = String::new();
+    let mut document = String::new();
+    for index in 0..600 {
+        if index != 0 {
+            vector.push(' ');
+            document.push(' ');
+        }
+        write!(vector, "word{index:04}:1,2,3,4").unwrap();
+        write!(document, "word{index:04}").unwrap();
+    }
+    let mut query_terms = (0..300)
+        .map(|index| format!("word{index:04}"))
+        .collect::<Vec<_>>();
+    while query_terms.len() > 1 {
+        let mut combined = Vec::with_capacity(query_terms.len().div_ceil(2));
+        for pair in query_terms.chunks(2) {
+            combined.push(if let [left, right] = pair {
+                format!("({left} & {right})")
+            } else {
+                pair[0].clone()
+            });
+        }
+        query_terms = combined;
+    }
+    let query = query_terms.pop().unwrap();
+    let sql = format!(
+        "SELECT length('{vector}'::tsvector), \
+                numnode('{query}'::tsquery), \
+                '{vector}'::tsvector @@ 'word0000 & word0599'::tsquery, \
+                ts_rank('{vector}'::tsvector, 'word0000 | word0599'::tsquery) > 0, \
+                cardinality(tsvector_to_array('{vector}'::tsvector)), \
+                length(ts_delete('{vector}'::tsvector, \
+                                 tsvector_to_array('{vector}'::tsvector))), \
+                (SELECT count(*) FROM unnest('{vector}'::tsvector)), \
+                position('<b>word0599</b>' in \
+                         ts_headline('simple', '{document}', 'word0599'::tsquery)) > 0"
+    );
+    let (mut engine, budget) = test_engine();
+    let output = run_with_fixed_memory(&mut engine, &budget, &sql, 32 << 20);
+    assert_eq!(
+        data_rows(&output),
+        ["600|599|t|t|600|0|600|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn wide_full_text_values_survive_indexes_checkpoint_and_object_cold_recovery() {
+    use core::fmt::Write as _;
+
+    let mut vector = String::new();
+    for index in 0..600 {
+        if index != 0 {
+            vector.push(' ');
+        }
+        write!(vector, "word{index:04}:1,2,3,4").unwrap();
+    }
+    let mut query_terms = (0..300)
+        .map(|index| format!("word{index:04}"))
+        .collect::<Vec<_>>();
+    while query_terms.len() > 1 {
+        let mut combined = Vec::with_capacity(query_terms.len().div_ceil(2));
+        for pair in query_terms.chunks(2) {
+            combined.push(if let [left, right] = pair {
+                format!("({left} & {right})")
+            } else {
+                pair[0].clone()
+            });
+        }
+        query_terms = combined;
+    }
+    let query = query_terms.pop().unwrap();
+    let mut config = test_config("wide-full-text-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("wide-full-text-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    {
+        let mut budget = Budget::new(test_engine_budget_bytes(1 << 29));
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = format!(
+            "CREATE TABLE durable_wide_full_text (id integer PRIMARY KEY, terms tsvector, query tsquery); \
+             INSERT INTO durable_wide_full_text VALUES \
+               (1, '{vector}'::tsvector, '{query}'::tsquery); \
+             CREATE INDEX durable_wide_full_text_gin \
+               ON durable_wide_full_text USING gin (terms); \
+             CREATE INDEX durable_wide_full_text_gist \
+               ON durable_wide_full_text USING gist (terms);"
+        );
+        let output = run_with(&mut engine, &mut budget, &setup);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 29));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with_fixed_memory(
+        &mut engine,
+        &budget,
+        "SELECT id, length(terms), numnode(query), terms @@ 'word0000 & word0599'::tsquery \
+           FROM durable_wide_full_text \
+          WHERE terms @@ 'word0599'::tsquery",
+        32 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|600|599|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*), min(cardinality(positions)), max(cardinality(positions)) \
+           FROM durable_wide_full_text, unnest(terms)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["600|4|4"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+}
+
+#[test]
 fn full_text_json_filters_and_session_configuration_match_postgresql() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

@@ -375,6 +375,11 @@ garbage collection, and empty-cache recovery. Construction and traversal
 remain fixed-memory; legacy key generations remain readable. Qualification
 covers three-level pruning, malformed encodings, PostgreSQL's fuzzy geometry
 and non-finite values, and cold reads across every spatial class.
+Path and polygon component lists are sized in statement memory rather than by a
+per-value point ceiling. Parsing, generated operators, text and binary wire
+values, index summaries, checkpoint publication, and empty-cache recovery are
+qualified with 300-point values under the runtime allocation guard and SQL
+differential comparison.
 Finite unfiltered GiST/SP-GiST `<-> point` limits use the same trees for
 ranked depth-first branch-and-bound traversal. Conservative point-to-box lower
 bounds order siblings and a fixed statement-arena max-heap retains only the

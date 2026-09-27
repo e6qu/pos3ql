@@ -39,6 +39,12 @@ table capacity across SQL, prepared transactions, durability, and pgoutput.
 The differential corpus checks these SQL semantics against PostgreSQL 18.6;
 fixed-allocation and object-cold tests exercise larger declared capacities.
 
+Geometric path and polygon point lists are bounded by statement memory. Their
+text and binary wire forms, constructors and operators, GiST lookup,
+checkpoint publication, and empty-cache recovery are qualified beyond the
+former 128-point implementation limit, including SQL comparison with
+PostgreSQL.
+
 - PostgreSQL heap layout, page identifiers, `ctid` semantics, HOT, vacuum's
   physical implementation, physical XLOG, physical streaming replication,
   hot standby, and binary-WAL tooling are not targets.

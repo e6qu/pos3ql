@@ -1,14 +1,9 @@
 //! PostgreSQL geometric text and binary values.
 
-use core::fmt::Write as _;
-
 use crate::mem::arena::Arena;
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::types::{GeometryKind, PgFloat8};
 use crate::sql_err;
-use crate::util::StackStr;
-
-const MAX_POINTS: usize = 128;
 pub(crate) const EPSILON: f64 = 1e-6;
 
 pub(crate) fn index_bounds(
@@ -27,23 +22,38 @@ pub(crate) fn index_bounds(
     ) {
         return Ok(SpatialBounds::Unbounded);
     }
-    let mut values = [0.0; MAX_POINTS * 2];
-    let (count, _) = read_values(kind, text, &mut values)?;
-    if values[..count].iter().any(|value| !value.is_finite()) {
-        return Ok(SpatialBounds::Unbounded);
+    let mut values = [0.0; 3];
+    let mut count = 0usize;
+    let mut bounds = SpatialBounds::Empty;
+    let mut x = None;
+    visit_values(kind, text, |value| {
+        if !value.is_finite() {
+            bounds = SpatialBounds::Unbounded;
+        }
+        if count < values.len() {
+            values[count] = value;
+        }
+        count += 1;
+        if kind != GeometryKind::Circle {
+            if let Some(x) = x.take() {
+                bounds = bounds.union(SpatialBounds::new(x, value, x, value));
+            } else {
+                x = Some(value);
+            }
+        }
+        Ok(())
+    })?;
+    if matches!(bounds, SpatialBounds::Unbounded) {
+        return Ok(bounds);
     }
     if kind == GeometryKind::Circle {
         let radius = values[2].abs();
-        return Ok(SpatialBounds::new(
+        bounds = SpatialBounds::new(
             values[0] - radius,
             values[1] - radius,
             values[0] + radius,
             values[1] + radius,
-        ));
-    }
-    let mut bounds = SpatialBounds::Empty;
-    for pair in values[..count].as_chunks::<2>().0 {
-        bounds = bounds.union(SpatialBounds::new(pair[0], pair[1], pair[0], pair[1]));
+        );
     }
     Ok(bounds)
 }
@@ -269,31 +279,22 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn push_point(
-    values: &mut [f64; MAX_POINTS * 2],
-    count: &mut usize,
-    point: (f64, f64),
-) -> Option<()> {
-    if *count + 2 > values.len() {
-        return None;
-    }
-    values[*count] = point.0;
-    values[*count + 1] = point.1;
-    *count += 2;
-    Some(())
-}
-
 /// Decodes one complete PostgreSQL geometric text value.  A shape-specific
 /// reader keeps punctuation meaningful: accepting the right numbers in the
 /// wrong delimiters would make malformed SQL values representable.
-fn read_values(
+fn visit_values(
     kind: GeometryKind,
     text: &str,
-    values: &mut [f64; MAX_POINTS * 2],
+    mut visit: impl FnMut(f64) -> Result<(), SqlError>,
 ) -> Result<(usize, bool), SqlError> {
     let mut reader = Reader::new(text);
     let mut count = 0;
-    let mut add = |point| push_point(values, &mut count, point).ok_or_else(|| bad(kind, text));
+    let mut add = |point: (f64, f64)| {
+        visit(point.0)?;
+        visit(point.1)?;
+        count += 2;
+        Ok(())
+    };
     let one_or_more_points = |reader: &mut Reader<'_>,
                               closing: u8,
                               min: usize,
@@ -377,7 +378,7 @@ fn read_values(
                 if !reader.take(b'>') {
                     return Err(bad(kind, text));
                 }
-                values[count] = radius;
+                visit(radius)?;
                 count += 1;
             } else {
                 add(reader.point().ok_or_else(|| bad(kind, text))?)?;
@@ -385,7 +386,7 @@ fn read_values(
                     return Err(bad(kind, text));
                 }
                 let radius = reader.number().ok_or_else(|| bad(kind, text))?;
-                values[count] = radius;
+                visit(radius)?;
                 count += 1;
             }
             false
@@ -411,7 +412,7 @@ fn read_values(
             if reader.take(b'{') {
                 for index in 0..3 {
                     let value = reader.number().ok_or_else(|| bad(kind, text))?;
-                    values[count] = value;
+                    visit(value)?;
                     count += 1;
                     if index != 2 && !reader.take(b',') {
                         return Err(bad(kind, text));
@@ -441,9 +442,9 @@ fn read_values(
                     let a = (second.1 - first.1) / (second.0 - first.0);
                     (a, -1.0, first.1 - a * first.0)
                 };
-                values[0] = a;
-                values[1] = b;
-                values[2] = c;
+                visit(a)?;
+                visit(b)?;
+                visit(c)?;
                 count = 3;
             }
             false
@@ -458,99 +459,197 @@ fn read_values(
 pub(crate) fn components(
     kind: GeometryKind,
     text: &str,
-    values: &mut [f64; MAX_POINTS * 2],
+    values: &mut [f64],
 ) -> Result<(usize, bool), SqlError> {
-    read_values(kind, text, values)
+    let mut count = 0usize;
+    let result = visit_values(kind, text, |value| {
+        let Some(output) = values.get_mut(count) else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "{} value exceeds the statement arena",
+                kind.name()
+            ));
+        };
+        *output = value;
+        count += 1;
+        Ok(())
+    })?;
+    debug_assert_eq!(count, result.0);
+    Ok(result)
 }
 
-fn point(out: &mut StackStr<2048>, x: f64, y: f64) {
-    let _ = write!(out, "({},{})", PgFloat8(x), PgFloat8(y));
+pub(crate) fn component_count(kind: GeometryKind, text: &str) -> Result<(usize, bool), SqlError> {
+    visit_values(kind, text, |_| Ok(()))
 }
 
-fn points(out: &mut StackStr<2048>, values: &[f64]) {
+fn value_too_wide(kind: GeometryKind) -> SqlError {
+    sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "{} value exceeds the statement arena",
+        kind.name()
+    )
+}
+
+struct GeometryText<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> GeometryText<'a> {
+    fn new(arena: &'a Arena, capacity: usize, kind: GeometryKind) -> Result<Self, SqlError> {
+        let bytes = arena
+            .alloc_slice_with(capacity, |_| 0)
+            .map_err(|_| value_too_wide(kind))?;
+        Ok(Self { bytes, len: 0 })
+    }
+
+    fn finish(self) -> &'a str {
+        unsafe { core::str::from_utf8_unchecked(&self.bytes[..self.len]) }
+    }
+}
+
+impl core::fmt::Write for GeometryText<'_> {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(core::fmt::Error)?;
+        let output = self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+        output.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct GeometryLength(usize);
+
+impl core::fmt::Write for GeometryLength {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        self.0 = self.0.checked_add(value.len()).ok_or(core::fmt::Error)?;
+        Ok(())
+    }
+}
+
+fn point(out: &mut impl core::fmt::Write, x: f64, y: f64) -> core::fmt::Result {
+    write!(out, "({},{})", PgFloat8(x), PgFloat8(y))
+}
+
+fn points(out: &mut impl core::fmt::Write, values: &[f64]) -> core::fmt::Result {
     for (index, pair) in values.as_chunks::<2>().0.iter().enumerate() {
         if index != 0 {
-            let _ = out.write_str(",");
+            out.write_str(",")?;
         }
-        point(out, pair[0], pair[1]);
+        point(out, pair[0], pair[1])?;
     }
+    Ok(())
 }
 
-/// Parses a PostgreSQL geometric literal and returns its canonical output text.
-pub fn parse<'a>(kind: GeometryKind, text: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    let mut values = [0.0; MAX_POINTS * 2];
-    let (count, closed) = read_values(kind, text.trim(), &mut values)?;
-    if kind == GeometryKind::Line && fp_zero(values[0]) && fp_zero(values[1]) {
-        return Err(bad(kind, text));
-    }
-    let text = text.trim();
-    let mut out = StackStr::<2048>::new();
+fn render_to(
+    kind: GeometryKind,
+    values: &[f64],
+    closed: bool,
+    out: &mut impl core::fmt::Write,
+) -> core::fmt::Result {
     match kind {
-        GeometryKind::Point if count == 2 => point(&mut out, values[0], values[1]),
-        GeometryKind::Line if count == 3 => {
-            let _ = write!(
-                out,
-                "{{{},{},{}}}",
-                PgFloat8(values[0]),
-                PgFloat8(values[1]),
-                PgFloat8(values[2])
-            );
+        GeometryKind::Point => point(out, values[0], values[1])?,
+        GeometryKind::Line => write!(
+            out,
+            "{{{},{},{}}}",
+            PgFloat8(values[0]),
+            PgFloat8(values[1]),
+            PgFloat8(values[2])
+        )?,
+        GeometryKind::Lseg => {
+            out.write_str("[")?;
+            point(out, values[0], values[1])?;
+            out.write_str(",")?;
+            point(out, values[2], values[3])?;
+            out.write_str("]")?;
         }
-        GeometryKind::Lseg if count == 4 => {
-            let _ = out.write_str("[");
-            point(&mut out, values[0], values[1]);
-            let _ = out.write_str(",");
-            point(&mut out, values[2], values[3]);
-            let _ = out.write_str("]");
-        }
-        GeometryKind::Box if count == 4 => {
+        GeometryKind::Box => {
             let high_x = pg_max(values[0], values[2]);
             let high_y = pg_max(values[1], values[3]);
             let low_x = pg_min(values[0], values[2]);
             let low_y = pg_min(values[1], values[3]);
-            point(&mut out, high_x, high_y);
-            let _ = out.write_str(",");
-            point(&mut out, low_x, low_y);
+            point(out, high_x, high_y)?;
+            out.write_str(",")?;
+            point(out, low_x, low_y)?;
         }
-        GeometryKind::Circle
-            if count == 3 && values[2].partial_cmp(&0.0) != Some(core::cmp::Ordering::Less) =>
-        {
-            let _ = out.write_str("<");
-            point(&mut out, values[0], values[1]);
-            let _ = write!(out, ",{}>", PgFloat8(values[2]));
+        GeometryKind::Circle => {
+            out.write_str("<")?;
+            point(out, values[0], values[1])?;
+            write!(out, ",{}>", PgFloat8(values[2]))?;
         }
-        GeometryKind::Path if count >= 2 && count % 2 == 0 => {
-            let _ = out.write_str(if closed { "(" } else { "[" });
-            points(&mut out, &values[..count]);
-            let _ = out.write_str(if closed { ")" } else { "]" });
+        GeometryKind::Path => {
+            out.write_str(if closed { "(" } else { "[" })?;
+            points(out, values)?;
+            out.write_str(if closed { ")" } else { "]" })?;
         }
-        GeometryKind::Polygon if count >= 2 && count % 2 == 0 => {
-            let _ = out.write_str("(");
-            points(&mut out, &values[..count]);
-            let _ = out.write_str(")");
+        GeometryKind::Polygon => {
+            out.write_str("(")?;
+            points(out, values)?;
+            out.write_str(")")?;
         }
-        _ => return Err(bad(kind, text)),
     }
-    arena.alloc_str(out.as_str()).map_err(|_| {
+    Ok(())
+}
+
+/// Parses a PostgreSQL geometric literal and returns its canonical output text.
+pub fn parse<'a>(kind: GeometryKind, text: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    let text = text.trim();
+    let (count, closed) = component_count(kind, text)?;
+    let values = arena.alloc_slice_with(count, |_| 0.0).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "{} value exceeds the statement arena",
             kind.name()
         )
-    })
+    })?;
+    components(kind, text, values)?;
+    if kind == GeometryKind::Line && fp_zero(values[0]) && fp_zero(values[1]) {
+        return Err(bad(kind, text));
+    }
+    render(kind, values, closed, arena)
+}
+
+/// Renders already validated components without imposing another point or
+/// text-width boundary. Callers use this for geometric operators that create
+/// a new value from an existing canonical value.
+pub(crate) fn render<'a>(
+    kind: GeometryKind,
+    values: &[f64],
+    closed: bool,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let count = values.len();
+    let valid = match kind {
+        GeometryKind::Point => count == 2,
+        GeometryKind::Line | GeometryKind::Circle => count == 3,
+        GeometryKind::Lseg | GeometryKind::Box => count == 4,
+        GeometryKind::Path | GeometryKind::Polygon => count >= 2 && count.is_multiple_of(2),
+    } && (kind != GeometryKind::Circle
+        || values[2].partial_cmp(&0.0) != Some(core::cmp::Ordering::Less));
+    if !valid {
+        return Err(bad(kind, ""));
+    }
+    let mut length = GeometryLength::default();
+    render_to(kind, values, closed, &mut length).map_err(|_| value_too_wide(kind))?;
+    let mut out = GeometryText::new(arena, length.0, kind)?;
+    render_to(kind, values, closed, &mut out).map_err(|_| value_too_wide(kind))?;
+    debug_assert_eq!(out.len, length.0);
+    Ok(out.finish())
 }
 
 /// Length of the PostgreSQL binary send representation of a canonical value.
 pub fn binary_len(kind: GeometryKind, text: &str) -> Result<usize, SqlError> {
-    let mut values = [0.0; MAX_POINTS * 2];
-    let (count, _) = read_values(kind, text, &mut values)?;
-    Ok(match kind {
-        GeometryKind::Point => 16,
-        GeometryKind::Line | GeometryKind::Circle => 24,
-        GeometryKind::Lseg | GeometryKind::Box => 32,
-        GeometryKind::Path => 5 + count * 8,
-        GeometryKind::Polygon => 4 + count * 8,
-    })
+    let (count, _) = component_count(kind, text)?;
+    match kind {
+        GeometryKind::Point => Ok(16),
+        GeometryKind::Line | GeometryKind::Circle => Ok(24),
+        GeometryKind::Lseg | GeometryKind::Box => Ok(32),
+        GeometryKind::Path | GeometryKind::Polygon => count
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(if kind == GeometryKind::Path { 5 } else { 4 }))
+            .ok_or_else(|| value_too_wide(kind)),
+    }
 }
 
 /// Emits the exact PostgreSQL binary send body for a canonical value.
@@ -559,19 +658,20 @@ pub fn emit_binary(
     text: &str,
     mut emit: impl FnMut(&[u8]),
 ) -> Result<(), SqlError> {
-    let mut values = [0.0; MAX_POINTS * 2];
-    let (count, closed) = read_values(kind, text, &mut values)?;
+    let (count, closed) = component_count(kind, text)?;
+    let points = i32::try_from(count / 2).map_err(|_| value_too_wide(kind))?;
     match kind {
         GeometryKind::Path => {
             emit(&[u8::from(closed)]);
-            emit(&((count / 2) as i32).to_be_bytes());
+            emit(&points.to_be_bytes());
         }
-        GeometryKind::Polygon => emit(&((count / 2) as i32).to_be_bytes()),
+        GeometryKind::Polygon => emit(&points.to_be_bytes()),
         _ => {}
     }
-    for value in &values[..count] {
+    visit_values(kind, text, |value| {
         emit(&value.to_be_bytes());
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -596,8 +696,12 @@ pub fn decode_binary<'a>(
                 return Err(bad_binary());
             }
             let points = i32::from_be_bytes(header[1..5].try_into().unwrap());
-            if !(1..=MAX_POINTS as i32).contains(&points) || bytes.len() != 5 + points as usize * 16
-            {
+            let expected = usize::try_from(points)
+                .ok()
+                .filter(|points| *points > 0)
+                .and_then(|points| points.checked_mul(16))
+                .and_then(|payload| payload.checked_add(5));
+            if expected != Some(bytes.len()) {
                 return Err(bad_binary());
             }
             (Some(header[0] != 0), &bytes[5..])
@@ -605,8 +709,12 @@ pub fn decode_binary<'a>(
         GeometryKind::Polygon => {
             let header = bytes.get(..4).ok_or_else(bad_binary)?;
             let points = i32::from_be_bytes(header.try_into().unwrap());
-            if !(1..=MAX_POINTS as i32).contains(&points) || bytes.len() != 4 + points as usize * 16
-            {
+            let expected = usize::try_from(points)
+                .ok()
+                .filter(|points| *points > 0)
+                .and_then(|points| points.checked_mul(16))
+                .and_then(|payload| payload.checked_add(4));
+            if expected != Some(bytes.len()) {
                 return Err(bad_binary());
             }
             (None, &bytes[4..])
@@ -624,61 +732,18 @@ pub fn decode_binary<'a>(
             (None, bytes)
         }
     };
-    let mut out = StackStr::<2048>::new();
-    let read = |at: usize| f64::from_be_bytes(payload[at..at + 8].try_into().unwrap());
-    match kind {
-        GeometryKind::Point => point(&mut out, read(0), read(8)),
-        GeometryKind::Line => {
-            let _ = write!(
-                out,
-                "{{{},{},{}}}",
-                PgFloat8(read(0)),
-                PgFloat8(read(8)),
-                PgFloat8(read(16))
-            );
-        }
-        GeometryKind::Lseg => {
-            let _ = out.write_str("[");
-            point(&mut out, read(0), read(8));
-            let _ = out.write_str(",");
-            point(&mut out, read(16), read(24));
-            let _ = out.write_str("]");
-        }
-        GeometryKind::Box => {
-            point(&mut out, read(0), read(8));
-            let _ = out.write_str(",");
-            point(&mut out, read(16), read(24));
-        }
-        GeometryKind::Circle => {
-            if read(16) < 0.0 {
-                return Err(bad_binary());
-            }
-            let _ = out.write_str("<");
-            point(&mut out, read(0), read(8));
-            let _ = write!(out, ",{}>", PgFloat8(read(16)));
-        }
-        GeometryKind::Path => {
-            let _ = out.write_str(if closed == Some(true) { "(" } else { "[" });
-            for at in (0..payload.len()).step_by(16) {
-                if at != 0 {
-                    let _ = out.write_str(",");
-                }
-                point(&mut out, read(at), read(at + 8));
-            }
-            let _ = out.write_str(if closed == Some(true) { ")" } else { "]" });
-        }
-        GeometryKind::Polygon => {
-            let _ = out.write_str("(");
-            for at in (0..payload.len()).step_by(16) {
-                if at != 0 {
-                    let _ = out.write_str(",");
-                }
-                point(&mut out, read(at), read(at + 8));
-            }
-            let _ = out.write_str(")");
-        }
+    let values = arena
+        .alloc_slice_with(payload.len() / 8, |_| 0.0)
+        .map_err(|_| value_too_wide(kind))?;
+    for (output, bytes) in values.iter_mut().zip(payload.as_chunks::<8>().0) {
+        *output = f64::from_be_bytes(*bytes);
     }
-    parse(kind, out.as_str(), arena)
+    if (kind == GeometryKind::Line && fp_zero(values[0]) && fp_zero(values[1]))
+        || (kind == GeometryKind::Circle && values[2] < 0.0)
+    {
+        return Err(bad_binary());
+    }
+    render(kind, values, closed.unwrap_or(false), arena)
 }
 
 #[cfg(test)]
@@ -686,6 +751,56 @@ mod tests {
     use super::*;
     use crate::sql::ast::BinaryOp;
     use crate::sql::types::Datum;
+
+    #[test]
+    fn wide_polygon_text_binary_and_bounds_use_statement_memory() {
+        use core::fmt::Write;
+
+        let mut source = String::from("(");
+        for point in 0..300 {
+            if point != 0 {
+                source.push(',');
+            }
+            write!(source, "({point},{})", point % 7).unwrap();
+        }
+        source.push(')');
+
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "wide geometry", 1 << 19).unwrap();
+        let canonical = crate::mem::guard::forbid_alloc(|| {
+            parse(GeometryKind::Polygon, &source, &arena).unwrap()
+        });
+        assert_eq!(
+            component_count(GeometryKind::Polygon, canonical).unwrap().0,
+            600
+        );
+        assert!(matches!(
+            index_bounds(Datum::Geometry {
+                kind: GeometryKind::Polygon,
+                text: canonical,
+            })
+            .unwrap(),
+            crate::store::SpatialBounds::Finite(_)
+        ));
+
+        let length = binary_len(GeometryKind::Polygon, canonical).unwrap();
+        assert_eq!(length, 4 + 300 * 16);
+        let mut binary = Vec::with_capacity(length);
+        crate::mem::guard::forbid_alloc(|| {
+            emit_binary(GeometryKind::Polygon, canonical, |bytes| {
+                binary.extend_from_slice(bytes);
+            })
+            .unwrap();
+        });
+        assert_eq!(binary.len(), length);
+
+        let mut decode_budget = crate::mem::Budget::new(1 << 20);
+        let decode_arena = Arena::new(&mut decode_budget, "wide geometry decode", 1 << 19).unwrap();
+        let decoded = crate::mem::guard::forbid_alloc(|| {
+            decode_binary(GeometryKind::Polygon, &binary, &decode_arena).unwrap()
+        });
+        assert_eq!(decoded, canonical);
+    }
 
     #[test]
     fn navigation_bounds_never_exclude_exact_geometric_operator_matches() {

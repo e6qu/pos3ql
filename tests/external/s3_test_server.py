@@ -269,9 +269,18 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         prefix = query.get("prefix", [""])[0]
         token = query.get("continuation-token", ["0"])[0]
         try:
-            offset = int(token)
-        except ValueError:
+            if ":" in token:
+                encoded_offset, encoded_after = token.split(":", 1)
+                offset = int(encoded_offset)
+                start_after = bytes.fromhex(encoded_after).decode()
+            else:
+                offset = int(token)
+                start_after = query.get("start-after", [""])[0]
+            max_keys = int(query.get("max-keys", [str(self.page_size)])[0])
+        except (UnicodeDecodeError, ValueError):
             return self.error(400, "InvalidToken", "invalid continuation token")
+        if offset < 0 or max_keys < 1:
+            return self.error(400, "InvalidArgument", "invalid list bound")
         directory = self.root / self.bucket
         keys = [] if not directory.exists() else sorted(
             str(path.relative_to(directory))
@@ -279,7 +288,10 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
             if path.is_file()
         )
         keys = [key for key in keys if key.startswith(prefix)]
-        page = keys[offset : offset + self.page_size]
+        if start_after:
+            keys = [key for key in keys if key > start_after]
+        page_limit = min(self.page_size, max_keys)
+        page = keys[offset : offset + page_limit]
         next_offset = offset + len(page)
         truncated = next_offset < len(keys)
         contents = "".join(
@@ -287,7 +299,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
             for key in page
         )
         next_token = (
-            f"<NextContinuationToken>{next_offset}</NextContinuationToken>"
+            f"<NextContinuationToken>{next_offset}:{start_after.encode().hex()}</NextContinuationToken>"
             if truncated
             else ""
         )

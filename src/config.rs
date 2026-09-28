@@ -258,7 +258,7 @@ pub struct Config {
     /// Content-addressed block identities retained by one checkpoint garbage
     /// collection keep-set.
     pub checkpoint_live_blocks: usize,
-    /// Obsolete object identities staged by one garbage collection scan.
+    /// Object identities staged by one garbage collection or backup-export scan.
     pub checkpoint_garbage_batch_objects: usize,
     /// DELETE requests issued by one paced maintenance beat.
     pub checkpoint_delete_objects_per_beat: usize,

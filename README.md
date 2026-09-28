@@ -19,12 +19,13 @@ pos3ql is a PostgreSQL-compatible database engine in Rust. SQL and the PostgreSQ
 
 With object storage enabled, the server groups transactions completed in one reactor turn—including statements resumed after lock and object-read waits—publishes their immutable journal bytes, then advances a CAS commit head before releasing success responses. Checkpoints publish immutable table state through a separate CAS manifest. Recovery follows the commit head beyond that manifest; local disk is a cache. [The benchmark suite](docs/performance.md) measures request shape, cache tiers, checkpoint interference, large-catalog lookup, and logical read-replica scaling against PostgreSQL 18. It covers fixture, MinIO, and SeaweedFS runs and supports independently operated S3-compatible services, each paired with host-available and resource-matched PostgreSQL controls.
 
-Offline `--backup`, `--restore`, and `--delete-backup` operations manage named,
-checkpoint-consistent recovery points in the configured object-store prefix.
-Checkpoint garbage collection retains their block graphs and commit history;
-restore clears the local journal and block cache before recovering the named
-state. See [backup and restore](docs/backup-restore.md) for the commands,
-retention limits, and current same-prefix boundary.
+Offline `--backup`, `--restore`, `--export-backup`, and `--delete-backup`
+operations manage named, checkpoint-consistent recovery points. Checkpoint
+garbage collection retains their block graphs and commit history; export copies
+one into an empty independently configured object-store prefix, and restore
+clears local caches before recovering the named state. See
+[backup and restore](docs/backup-restore.md) for the commands and retention
+limits.
 
 ## Status
 
@@ -252,9 +253,9 @@ the complete serialized catalog image at startup and reports named exhaustion
 before publication. `checkpoint_commit_batches`, `checkpoint_live_blocks`,
 `checkpoint_merge_entries`, and `max_backups` independently size cold-recovery
 ordering, the union of live block graphs, one SST-pair merge, and named recovery
-points. `checkpoint_garbage_batch_objects`
-sizes one staged garbage scan without imposing a ceiling on accumulated
-obsolete objects; `checkpoint_delete_objects_per_beat` limits commit, legacy
+points. `checkpoint_garbage_batch_objects` sizes one staged garbage or
+backup-export namespace scan without imposing a ceiling on accumulated
+objects; `checkpoint_delete_objects_per_beat` limits commit, legacy
 SST, and block DELETE requests in one maintenance beat.
 Successful explicit checkpoints drain every batch. These reservations are
 charged before serving, and configured exhaustion names the responsible bound.

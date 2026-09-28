@@ -12,6 +12,7 @@ they never select a guessed decoder.
 | Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v14. |
 | Checkpoint manifest | `pos3ql-manifest-v14` | yes | yes | Current format. |
 | Backup completion | `pos3ql-backup-v1` | yes | yes | Checksums the retained manifest and commit head. |
+| Backup export marker | `pos3ql-export-v1` | yes | yes | Pending and completion records make an independent-prefix copy restartable. |
 | Published row SST | `v2` | yes | no | Compatible generations remain readable and are replaced when sliced or merged. |
 | Published row SST | `v3` | yes | no | Compatible packed PAX generations remain readable. |
 | Published row SST | `v4` | yes | yes | Current packed format: PAX full slices and row-packed deltas. |
@@ -33,6 +34,14 @@ LSN and CRC32C checksums for both roots. Restore rejects a missing, unknown, or
 mismatched completion record. The backup manifest itself is the retention pin,
 so an interrupted creation cannot expose a restorable name or lose blocks that
 its partial state may reference.
+
+An independent-prefix copy publishes `pos3ql-export-v1` as a pending marker
+before copying immutable objects. A retry must match the backup name and root
+checksums in that marker. Startup refuses the destination until both live roots
+and the destination local-cache reset are complete. An `export-complete` record
+with the same body is published before `export-pending` is removed, so a lost
+final response can be adopted while the published roots still match, without
+treating the populated prefix as a new export destination.
 
 Block headers also carry a typed block identity. A row SST format defines the
 allowed index-entry shape and block types together. A recognized block type in

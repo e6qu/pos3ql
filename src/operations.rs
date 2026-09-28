@@ -5,11 +5,15 @@ use crate::mem::Budget;
 use crate::sql::Engine;
 
 fn operation_budget(config: &Config) -> Budget {
+    Budget::new(operation_budget_bytes(config))
+}
+
+fn operation_budget_bytes(config: &Config) -> usize {
     let plan = config.memory_plan(
         crate::server::Server::budget_bytes(config),
         Engine::extra_budget_bytes(config),
     );
-    Budget::new(plan.total())
+    plan.total()
 }
 
 fn require_object_store(config: &Config) -> Result<(), String> {
@@ -39,6 +43,19 @@ pub fn restore_backup(config: &Config, name: &str) -> Result<u64, String> {
     let mut budget = operation_budget(config);
     crate::checkpoint::restore_backup(config, &mut budget, name)
         .map_err(|error| format!("restore failed: {error}"))
+}
+
+/// Copies a named backup and its durable object graph into an empty destination
+/// prefix, then publishes that recovery point as the destination's live state.
+/// Run while no process is using either configured prefix.
+pub fn export_backup(source: &Config, destination: &Config, name: &str) -> Result<u64, String> {
+    require_object_store(source)?;
+    require_object_store(destination)?;
+    let mut budget = Budget::new(
+        operation_budget_bytes(source).saturating_add(operation_budget_bytes(destination)),
+    );
+    crate::checkpoint::export_backup(source, destination, &mut budget, name)
+        .map_err(|error| format!("backup export failed: {error}"))
 }
 
 /// Removes a named backup's retention pin. Run while no server process is

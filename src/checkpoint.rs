@@ -32,8 +32,11 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const RESTORE_PENDING_KEY: &str = "restore-pending";
+const EXPORT_PENDING_KEY: &str = "export-pending";
+const EXPORT_COMPLETE_KEY: &str = "export-complete";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
 const BACKUP_HEADER: &str = "pos3ql-backup-v1";
+const EXPORT_HEADER: &str = "pos3ql-export-v1";
 const BACKUP_NAME_BYTES: usize = 63;
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -2201,17 +2204,22 @@ impl Checkpointer {
     /// into storage. Returns the manifest LSN — the WAL replay floor.
     /// Startup only (allocates freely while parsing).
     pub(crate) fn load_into(&mut self, storage: &mut Storage) -> Result<u64, CheckpointSetupError> {
-        match self.client.get(RESTORE_PENDING_KEY, None) {
-            Ok(_) => {
-                return Err(CheckpointSetupError::Corrupt(
-                    "restore-pending exists; rerun the offline restore operation",
-                ));
-            }
-            Err(error) if error.is_not_found() => {}
-            Err(error) => {
-                return Err(CheckpointSetupError::ObjectStore(format!(
-                    "load restore-pending: {error}"
-                )));
+        for (key, operation) in [
+            (RESTORE_PENDING_KEY, "restore"),
+            (EXPORT_PENDING_KEY, "backup export"),
+        ] {
+            match self.client.get(key, None) {
+                Ok(_) => {
+                    return Err(CheckpointSetupError::ObjectStore(format!(
+                        "{key} exists; rerun the offline {operation} operation"
+                    )));
+                }
+                Err(error) if error.is_not_found() => {}
+                Err(error) => {
+                    return Err(CheckpointSetupError::ObjectStore(format!(
+                        "load {key}: {error}"
+                    )));
+                }
             }
         }
         let floor = match self.client.get(MANIFEST_KEY, None) {
@@ -13047,6 +13055,82 @@ impl std::fmt::Display for CheckpointSetupError {
 
 impl std::error::Error for CheckpointSetupError {}
 
+struct BackupRoots {
+    floor: u64,
+    manifest_crc: u32,
+    head_crc: u32,
+    manifest: FixedBuf,
+    head: FixedBuf,
+}
+
+fn load_backup_roots(
+    client: &mut ObjectStore,
+    budget: &mut Budget,
+    config: &Config,
+    name: &str,
+) -> Result<BackupRoots, CheckpointSetupError> {
+    validate_backup_name(name)
+        .map_err(|message| CheckpointSetupError::ObjectStore(message.to_string()))?;
+    let mut head =
+        FixedBuf::new(budget, "backup root", 128).map_err(CheckpointSetupError::Budget)?;
+    let complete_key = stack_format!(128, "backups/{name}/complete");
+    read_object_into(
+        client,
+        complete_key.as_str(),
+        &mut head,
+        "backup completion record",
+    )?;
+    let (floor, manifest_crc, head_crc) =
+        parse_backup_complete(head.readable()).map_err(CheckpointSetupError::Corrupt)?;
+
+    let mut manifest = FixedBuf::new(budget, "backup manifest", config.checkpoint_manifest_bytes)
+        .map_err(CheckpointSetupError::Budget)?;
+    let manifest_key = stack_format!(128, "backups/{name}/manifest");
+    read_object_into(
+        client,
+        manifest_key.as_str(),
+        &mut manifest,
+        "checkpoint_manifest_bytes",
+    )?;
+    if manifest_lsn(manifest.readable()).map_err(CheckpointSetupError::Corrupt)? != floor
+        || crate::wal::crc32c::crc32c(manifest.readable()) != manifest_crc
+    {
+        return Err(CheckpointSetupError::Corrupt(
+            "backup manifest does not match its completion record",
+        ));
+    }
+
+    let head_key = stack_format!(128, "backups/{name}/commit-head");
+    read_object_into(
+        client,
+        head_key.as_str(),
+        &mut head,
+        "backup root format bound",
+    )?;
+    if head.len() > 96 {
+        return Err(CheckpointSetupError::Corrupt(
+            "backup commit-head exceeds its format bound",
+        ));
+    }
+    core::str::from_utf8(head.readable())
+        .map_err(|_| CheckpointSetupError::Corrupt("backup commit-head is not UTF-8"))?;
+    if crate::wal::crc32c::crc32c(head.readable()) != head_crc {
+        return Err(CheckpointSetupError::Corrupt(
+            "backup commit-head does not match its completion record",
+        ));
+    }
+    if !head.is_empty() {
+        parse_commit_head(head.readable()).map_err(CheckpointSetupError::Corrupt)?;
+    }
+    Ok(BackupRoots {
+        floor,
+        manifest_crc,
+        head_crc,
+        manifest,
+        head,
+    })
+}
+
 /// Atomically recoverable offline root replacement. The durable pending marker
 /// is removed only after both object roots and every authoritative local-cache
 /// file have been replaced. Normal startup refuses to cross that marker.
@@ -13064,53 +13148,7 @@ pub(crate) fn restore_backup(
     }
     let mut client = ObjectStore::new(config, budget)
         .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
-    let complete_key = stack_format!(128, "backups/{name}/complete");
-    client
-        .get(complete_key.as_str(), None)
-        .map_err(|error| CheckpointSetupError::ObjectStore(format!("load backup: {error}")))?;
-    let (floor, manifest_crc, head_crc) =
-        parse_backup_complete(client.body_bytes()).map_err(CheckpointSetupError::Corrupt)?;
-
-    let mut manifest = FixedBuf::new(budget, "restore manifest", config.checkpoint_manifest_bytes)
-        .map_err(CheckpointSetupError::Budget)?;
-    let manifest_key = stack_format!(128, "backups/{name}/manifest");
-    client.get(manifest_key.as_str(), None).map_err(|error| {
-        CheckpointSetupError::ObjectStore(format!("load backup manifest: {error}"))
-    })?;
-    if !manifest.append(client.body_bytes()) {
-        return Err(CheckpointSetupError::ObjectStore(
-            "backup manifest exceeds checkpoint_manifest_bytes".to_string(),
-        ));
-    }
-    if manifest_lsn(manifest.readable()).map_err(CheckpointSetupError::Corrupt)? != floor
-        || crate::wal::crc32c::crc32c(manifest.readable()) != manifest_crc
-    {
-        return Err(CheckpointSetupError::Corrupt(
-            "backup manifest does not match its completion record",
-        ));
-    }
-
-    let head_key = stack_format!(128, "backups/{name}/commit-head");
-    client.get(head_key.as_str(), None).map_err(|error| {
-        CheckpointSetupError::ObjectStore(format!("load backup commit-head: {error}"))
-    })?;
-    let mut head = StackStr::<96>::new();
-    use core::fmt::Write as _;
-    write!(
-        head,
-        "{}",
-        core::str::from_utf8(client.body_bytes())
-            .map_err(|_| CheckpointSetupError::Corrupt("backup commit-head is not UTF-8"))?
-    )
-    .map_err(|_| CheckpointSetupError::Corrupt("backup commit-head exceeds its format bound"))?;
-    if crate::wal::crc32c::crc32c(head.as_str().as_bytes()) != head_crc {
-        return Err(CheckpointSetupError::Corrupt(
-            "backup commit-head does not match its completion record",
-        ));
-    }
-    if !head.is_empty() {
-        parse_commit_head(head.as_str().as_bytes()).map_err(CheckpointSetupError::Corrupt)?;
-    }
+    let roots = load_backup_roots(&mut client, budget, config, name)?;
 
     let pending = stack_format!(128, "{BACKUP_HEADER}\nname {name}\nend\n");
     match client.put(
@@ -13136,19 +13174,395 @@ pub(crate) fn restore_backup(
         }
     }
 
-    replace_root(&mut client, MANIFEST_KEY, manifest.readable())?;
-    if head.is_empty() {
+    replace_root(&mut client, MANIFEST_KEY, roots.manifest.readable())?;
+    if roots.head.is_empty() {
         client.delete(COMMIT_HEAD_KEY).map_err(|error| {
             CheckpointSetupError::ObjectStore(format!("clear commit-head: {error}"))
         })?;
     } else {
-        replace_root(&mut client, COMMIT_HEAD_KEY, head.as_str().as_bytes())?;
+        replace_root(&mut client, COMMIT_HEAD_KEY, roots.head.readable())?;
     }
     clear_local_cache(&config.data_dir)?;
     client
         .delete(RESTORE_PENDING_KEY)
         .map_err(|error| CheckpointSetupError::ObjectStore(format!("complete restore: {error}")))?;
-    Ok(floor)
+    Ok(roots.floor)
+}
+
+/// Copies one named recovery point into an empty, independently configured
+/// object-store prefix and publishes it as that prefix's live database. The
+/// marker makes every partial copy restartable and blocks normal startup.
+pub(crate) fn export_backup(
+    source_config: &Config,
+    destination_config: &Config,
+    budget: &mut Budget,
+    name: &str,
+) -> Result<u64, CheckpointSetupError> {
+    validate_backup_name(name)
+        .map_err(|message| CheckpointSetupError::ObjectStore(message.to_string()))?;
+    if !source_config.object_store_on || !destination_config.object_store_on {
+        return Err(CheckpointSetupError::ObjectStore(
+            "backup export requires object_store = on for source and destination".to_string(),
+        ));
+    }
+    if data_dirs_match(&source_config.data_dir, &destination_config.data_dir) {
+        return Err(CheckpointSetupError::ObjectStore(
+            "backup export requires a distinct destination data_dir".to_string(),
+        ));
+    }
+
+    let mut source = ObjectStore::new(source_config, budget)
+        .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
+    let mut destination = ObjectStore::new(destination_config, budget)
+        .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
+    let roots = load_backup_roots(&mut source, budget, source_config, name)?;
+    if roots.manifest.len() > destination_config.checkpoint_manifest_bytes {
+        return Err(CheckpointSetupError::ObjectStore(format!(
+            "backup manifest exceeds destination checkpoint_manifest_bytes ({})",
+            destination_config.checkpoint_manifest_bytes
+        )));
+    }
+    let marker = stack_format!(
+        192,
+        "{EXPORT_HEADER}\nname {name}\nmanifest_crc {:08x}\nhead_crc {:08x}\nend\n",
+        roots.manifest_crc,
+        roots.head_crc
+    );
+    if begin_export(&mut destination, marker.as_str().as_bytes())? {
+        if !export_roots_match(&mut destination, &roots)? {
+            return Err(CheckpointSetupError::ObjectStore(
+                "completed backup export destination has advanced from the exported roots"
+                    .to_string(),
+            ));
+        }
+        clear_local_cache(&destination_config.data_dir)?;
+        destination.delete(EXPORT_PENDING_KEY).map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("complete backup export: {error}"))
+        })?;
+        return Ok(roots.floor);
+    }
+
+    let copy_capacity = source_config
+        .wal_buffer_bytes
+        .max(source_config.wal_upload_buffer_bytes)
+        .max(source_config.extension_script_bytes)
+        .max(crate::store::BLOCK_SIZE)
+        .max(source_config.checkpoint_manifest_bytes);
+    let mut copy = FixedBuf::new(budget, "backup export object", copy_capacity)
+        .map_err(CheckpointSetupError::Budget)?;
+    let mut keys = Vec::with_capacity(source_config.checkpoint_garbage_batch_objects);
+    for suffix in ["commit-head", "manifest", "complete"] {
+        let key = stack_format!(128, "backups/{name}/{suffix}");
+        copy_immutable_object(&mut source, &mut destination, key.as_str(), &mut copy)?;
+    }
+    copy_object_prefix(
+        &mut source,
+        &mut destination,
+        "blocks/",
+        &mut keys,
+        &mut copy,
+    )?;
+    copy_object_prefix(
+        &mut source,
+        &mut destination,
+        "commits/",
+        &mut keys,
+        &mut copy,
+    )?;
+    copy_object_prefix(
+        &mut source,
+        &mut destination,
+        "extensions/meta/",
+        &mut keys,
+        &mut copy,
+    )?;
+    copy_object_prefix(
+        &mut source,
+        &mut destination,
+        "extensions/sql/",
+        &mut keys,
+        &mut copy,
+    )?;
+
+    replace_root(&mut destination, MANIFEST_KEY, roots.manifest.readable())?;
+    if roots.head.is_empty() {
+        destination.delete(COMMIT_HEAD_KEY).map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("clear destination commit-head: {error}"))
+        })?;
+    } else {
+        replace_root(&mut destination, COMMIT_HEAD_KEY, roots.head.readable())?;
+    }
+    clear_local_cache(&destination_config.data_dir)?;
+    publish_export_complete(&mut destination, marker.as_str().as_bytes())?;
+    destination.delete(EXPORT_PENDING_KEY).map_err(|error| {
+        CheckpointSetupError::ObjectStore(format!("complete backup export: {error}"))
+    })?;
+    Ok(roots.floor)
+}
+
+fn data_dirs_match(source: &str, destination: &str) -> bool {
+    if std::path::Path::new(source) == std::path::Path::new(destination) {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(source),
+        std::fs::canonicalize(destination),
+    ) {
+        (Ok(source), Ok(destination)) => source == destination,
+        _ => false,
+    }
+}
+
+fn begin_export(
+    destination: &mut ObjectStore,
+    marker: &[u8],
+) -> Result<bool, CheckpointSetupError> {
+    let complete = matching_marker(destination, EXPORT_COMPLETE_KEY, marker)?;
+    if complete == Some(false) {
+        return Err(CheckpointSetupError::ObjectStore(
+            "another backup export completed in the destination".to_string(),
+        ));
+    }
+    match matching_marker(destination, EXPORT_PENDING_KEY, marker)? {
+        Some(matches) => {
+            if !matches {
+                return Err(CheckpointSetupError::ObjectStore(
+                    "another backup export is pending in the destination".to_string(),
+                ));
+            }
+            return Ok(complete == Some(true));
+        }
+        None if complete == Some(true) => return Ok(true),
+        None => {}
+    }
+    let mut occupied = false;
+    destination
+        .list_batch("", "", 1, |_| occupied = true)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("inspect export destination: {error}"))
+        })?;
+    if occupied {
+        return Err(CheckpointSetupError::ObjectStore(
+            "backup export destination prefix is not empty".to_string(),
+        ));
+    }
+    destination
+        .put(EXPORT_PENDING_KEY, marker, Precondition::IfNoneMatchAny)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("publish export-pending: {error}"))
+        })?;
+    Ok(false)
+}
+
+fn matching_marker(
+    client: &mut ObjectStore,
+    key: &str,
+    expected: &[u8],
+) -> Result<Option<bool>, CheckpointSetupError> {
+    match client.get(
+        key,
+        Some(ByteRange::new(0, 0).expect("one-byte marker probe")),
+    ) {
+        Ok(_) => object_matches(client, key, expected).map(Some),
+        Err(ObjectError::Status { code: 416, .. }) => Ok(Some(false)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
+            "load destination {key}: {error}"
+        ))),
+    }
+}
+
+fn export_roots_match(
+    destination: &mut ObjectStore,
+    roots: &BackupRoots,
+) -> Result<bool, CheckpointSetupError> {
+    if !object_matches(destination, MANIFEST_KEY, roots.manifest.readable())? {
+        return Ok(false);
+    }
+    if !roots.head.is_empty() {
+        return object_matches(destination, COMMIT_HEAD_KEY, roots.head.readable());
+    }
+    match destination.get(
+        COMMIT_HEAD_KEY,
+        Some(ByteRange::new(0, 0).expect("one-byte root probe")),
+    ) {
+        Err(error) if error.is_not_found() => Ok(true),
+        Ok(_) | Err(ObjectError::Status { code: 416, .. }) => Ok(false),
+        Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
+            "verify backup export commit-head: {error}"
+        ))),
+    }
+}
+
+fn publish_export_complete(
+    destination: &mut ObjectStore,
+    marker: &[u8],
+) -> Result<(), CheckpointSetupError> {
+    match destination.put(EXPORT_COMPLETE_KEY, marker, Precondition::IfNoneMatchAny) {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_precondition_failed() => {
+            if object_matches(destination, EXPORT_COMPLETE_KEY, marker)? {
+                Ok(())
+            } else {
+                Err(CheckpointSetupError::ObjectStore(
+                    "another backup export completed in the destination".to_string(),
+                ))
+            }
+        }
+        Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
+            "publish export-complete: {error}"
+        ))),
+    }
+}
+
+fn copy_object_prefix(
+    source: &mut ObjectStore,
+    destination: &mut ObjectStore,
+    prefix: &str,
+    keys: &mut Vec<StackStr<{ crate::object_store::MAX_OBJECT_KEY_BYTES }>>,
+    copy: &mut FixedBuf,
+) -> Result<(), CheckpointSetupError> {
+    let mut after = StackStr::<{ crate::object_store::MAX_OBJECT_KEY_BYTES }>::new();
+    loop {
+        keys.clear();
+        source
+            .list_batch(prefix, after.as_str(), keys.capacity(), |key| {
+                keys.push(StackStr::from_str(key));
+            })
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!("list backup export {prefix}: {error}"))
+            })?;
+        if keys.is_empty() {
+            break;
+        }
+        for key in keys.iter() {
+            if key.is_truncated() {
+                return Err(CheckpointSetupError::ObjectStore(
+                    "backup export object key exceeds the S3 key limit".to_string(),
+                ));
+            }
+            copy_immutable_object(source, destination, key.as_str(), copy)?;
+        }
+        after = *keys.last().expect("nonempty export batch");
+    }
+    Ok(())
+}
+
+fn copy_immutable_object(
+    source: &mut ObjectStore,
+    destination: &mut ObjectStore,
+    key: &str,
+    copy: &mut FixedBuf,
+) -> Result<(), CheckpointSetupError> {
+    read_object_into(source, key, copy, "backup export object buffer")?;
+    match destination.put(key, copy.readable(), Precondition::IfNoneMatchAny) {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_precondition_failed() => {
+            if object_matches(destination, key, copy.readable())? {
+                Ok(())
+            } else {
+                Err(CheckpointSetupError::ObjectStore(format!(
+                    "immutable backup export collision at {key}"
+                )))
+            }
+        }
+        Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
+            "write backup export object {key}: {error}"
+        ))),
+    }
+}
+
+fn read_object_into(
+    client: &mut ObjectStore,
+    key: &str,
+    out: &mut FixedBuf,
+    limit: &'static str,
+) -> Result<(), CheckpointSetupError> {
+    out.clear();
+    let window = client.response_capacity();
+    if window == 0 {
+        return Err(CheckpointSetupError::ObjectStore(
+            "object_store_response_bytes must be greater than zero".to_string(),
+        ));
+    }
+    let mut offset = 0u64;
+    loop {
+        let last = offset.checked_add(window as u64 - 1).ok_or_else(|| {
+            CheckpointSetupError::ObjectStore(format!("object {key} is too large"))
+        })?;
+        match client.get(
+            key,
+            Some(ByteRange::new(offset, last).expect("nonempty export range")),
+        ) {
+            Ok(_) => {}
+            Err(ObjectError::Status { code: 416, .. }) => break,
+            Err(error) => {
+                return Err(CheckpointSetupError::ObjectStore(format!(
+                    "read object {key}: {error}"
+                )));
+            }
+        }
+        let bytes = client.body_bytes();
+        if bytes.is_empty() {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "read object {key}: empty successful range response"
+            )));
+        }
+        if !out.append(bytes) {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "object {key} exceeds {limit} ({})",
+                out.capacity()
+            )));
+        }
+        offset += bytes.len() as u64;
+        if bytes.len() < window {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn object_matches(
+    client: &mut ObjectStore,
+    key: &str,
+    expected: &[u8],
+) -> Result<bool, CheckpointSetupError> {
+    if client.response_capacity() == 0 {
+        return Err(CheckpointSetupError::ObjectStore(
+            "object_store_response_bytes must be greater than zero".to_string(),
+        ));
+    }
+    let mut offset = 0usize;
+    while offset < expected.len() {
+        let last = offset
+            .saturating_add(client.response_capacity())
+            .min(expected.len())
+            - 1;
+        let result = client
+            .get(
+                key,
+                Some(ByteRange::new(offset as u64, last as u64).expect("ordered compare range")),
+            )
+            .map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "verify backup export object {key}: {error}"
+                ))
+            })?;
+        if result.len != last + 1 - offset || client.body_bytes() != &expected[offset..=last] {
+            return Ok(false);
+        }
+        offset = last + 1;
+    }
+    match client.get(
+        key,
+        Some(ByteRange::new(offset as u64, offset as u64).expect("one-byte compare range")),
+    ) {
+        Err(ObjectError::Status { code: 416, .. }) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
+            "verify backup export object length {key}: {error}"
+        ))),
+    }
 }
 
 fn replace_root(

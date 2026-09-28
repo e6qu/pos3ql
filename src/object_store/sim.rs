@@ -350,6 +350,37 @@ impl SimClient {
         }
         Ok(count)
     }
+
+    pub(crate) fn list_batch(
+        &mut self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+        mut each: impl FnMut(&str),
+    ) -> Result<usize, Error> {
+        if limit == 0 || (!after.is_empty() && !after.starts_with(prefix)) {
+            return Err(Error::Protocol("invalid bounded list range"));
+        }
+        let full_prefix = self.full_key(prefix)?;
+        let full_after = self.full_key(after)?;
+        let mut bucket = self.namespace.borrow_mut();
+        bucket.operation_gate()?;
+        #[cfg(test)]
+        {
+            bucket.list_count += 1;
+        }
+        let mut count = 0usize;
+        for object in &bucket.objects {
+            if object.key.starts_with(full_prefix.as_str())
+                && object.key.as_str() > full_after.as_str()
+                && count < limit
+            {
+                each(&object.key[self.key_prefix.len()..]);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 fn status(code: u16, message: &str) -> Error {

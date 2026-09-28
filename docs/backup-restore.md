@@ -12,6 +12,8 @@ use the same prefix.
 ```sh
 pos3ql --config /path/to/pos3ql.conf --backup before-upgrade
 pos3ql --config /path/to/pos3ql.conf --restore before-upgrade
+pos3ql --config /path/to/source.conf --export-backup before-upgrade \
+  --destination-config /path/to/destination.conf
 pos3ql --config /path/to/pos3ql.conf --delete-backup before-upgrade
 ```
 
@@ -42,8 +44,31 @@ forming a new history from the restored point.
 retention pin last. Later checkpoint maintenance may then reclaim objects used
 only by that backup.
 
-These named backups share the database's bucket and prefix. They protect a
-historical point from ordinary checkpoint cleanup and support exact restore,
-but they do not protect against loss or deletion of that object-store prefix.
-Independent-prefix export and recovery to a target between named checkpoints
-remain in [PLAN.md](../PLAN.md).
+`--export-backup` copies the named roots and the immutable block, retained
+commit, and durable extension-package namespaces into the destination
+configuration's empty prefix.
+The source and destination may use different S3-compatible endpoints, buckets,
+credentials, or prefixes. The destination `data_dir` must also be distinct.
+Its startup capacities must accommodate the exported database; export checks
+the manifest byte bound before creating the destination marker.
+The command publishes the named point as the destination's live database and
+retains the named backup there. Object bodies stream through a fixed buffer in
+ranged reads, independent of the configured response window. Extra immutable
+source objects may be copied; ordinary destination checkpoint maintenance
+reclaims objects outside the exported live and backup roots.
+
+Export writes `export-pending` before the first copied object. Normal startup
+refuses that destination until the same export command finishes. A retry scans
+the source in fixed `checkpoint_garbage_batch_objects` batches and adopts only
+byte-identical destination objects. It publishes the live manifest and commit
+head after every immutable object is present, clears the destination's local
+journal and block cache, writes an `export-complete` receipt, and removes the
+pending marker last. The receipt lets a retry adopt a completed publication if
+the final response was lost, provided its live roots have not advanced. The
+destination prefix must be empty on the first attempt; this prevents an export
+from silently replacing an existing database.
+
+Same-prefix named backups protect historical points from ordinary checkpoint
+cleanup. Independent exports also protect against loss of the source prefix.
+Recovery to a target between named checkpoints remains in
+[PLAN.md](../PLAN.md).

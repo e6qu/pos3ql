@@ -715,6 +715,30 @@ fn json_populate_record_uses_table_rowtype_fields() {
 fn wide_schema_catalog_oid_bands_are_disjoint_at_declared_capacities() {
     use crate::storage::{MAX_TABLE_TYPE_OID_SLOTS, MAX_VALUE_ENFORCERS};
     crate::mem::guard::forbid_alloc(|| {
+        assert_eq!(
+            catalog::foreign_key_constraint_oid(0, 0),
+            catalog::FIRST_FK_OID
+        );
+        assert_eq!(
+            catalog::check_constraint_oid(0, 0),
+            catalog::FIRST_CHECK_OID
+        );
+        assert_eq!(
+            catalog::domain_check_constraint_oid(0, 0),
+            catalog::FIRST_DOMAIN_CHECK_OID
+        );
+        assert_eq!(
+            catalog::foreign_key_constraint_oid(1, 0),
+            catalog::foreign_key_constraint_oid(0, crate::storage::MAX_FKEYS - 1) + 1
+        );
+        assert_eq!(
+            catalog::check_constraint_oid(1, 0),
+            catalog::check_constraint_oid(0, crate::storage::MAX_CHECKS - 1) + 1
+        );
+        assert_eq!(
+            catalog::domain_check_constraint_oid(1, 0),
+            catalog::domain_check_constraint_oid(0, crate::storage::MAX_DOMAIN_CHECKS - 1) + 1
+        );
         for table in 0..MAX_TABLE_TYPE_OID_SLOTS - 1 {
             assert!(
                 catalog::index_oid(table, MAX_VALUE_ENFORCERS - 1)

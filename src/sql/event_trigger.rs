@@ -118,7 +118,7 @@ pub(crate) fn capture_before<'a>(
             }
             let reference = detached_constraint(
                 child,
-                catalog::FIRST_FK_OID + child_slot as i32 * 64 + foreign_key_index as i32,
+                catalog::foreign_key_constraint_oid(child_slot, foreign_key_index),
                 foreign_key.name.as_str(),
             );
             if dependent_drops
@@ -529,9 +529,7 @@ impl EventObjectRef {
                 .map_err(|_| graph_full())?;
                 let mut object = base_object(
                     catalog::PG_CONSTRAINT_OID,
-                    catalog::FIRST_DOMAIN_CHECK_OID
-                        + domain_slot as i32 * crate::storage::MAX_DOMAIN_CHECKS as i32
-                        + constraint_slot as i32,
+                    catalog::domain_check_constraint_oid(domain_slot, constraint_slot),
                     "domain constraint",
                     Some(domain.schema.as_str()),
                     None,
@@ -2579,10 +2577,7 @@ fn existing_catalog_object(
                         .iter()
                         .enumerate()
                         .find_map(|(constraint, _)| {
-                            (catalog::FIRST_DOMAIN_CHECK_OID
-                                + domain as i32 * crate::storage::MAX_DOMAIN_CHECKS as i32
-                                + constraint as i32
-                                == object_id)
+                            (catalog::domain_check_constraint_oid(domain, constraint) == object_id)
                                 .then_some((domain, constraint))
                         })
                 })
@@ -3263,13 +3258,7 @@ fn push_alter_table_drops(
                     push_drop_once(
                         output,
                         count,
-                        detached_constraint(
-                            old,
-                            catalog::FIRST_CHECK_OID
-                                + slot as i32 * crate::storage::MAX_CHECKS as i32
-                                + index as i32,
-                            *name,
-                        ),
+                        detached_constraint(old, catalog::check_constraint_oid(slot, index), *name),
                         true,
                         false,
                     )?;
@@ -3283,7 +3272,7 @@ fn push_alter_table_drops(
                         count,
                         detached_constraint(
                             old,
-                            catalog::FIRST_FK_OID + slot as i32 * 64 + index as i32,
+                            catalog::foreign_key_constraint_oid(slot, index),
                             *name,
                         ),
                         true,
@@ -3407,9 +3396,7 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::FIRST_CHECK_OID
-                        + slot as i32 * crate::storage::MAX_CHECKS as i32
-                        + index as i32,
+                    catalog::check_constraint_oid(slot, index),
                     check.name.as_str(),
                 ),
                 false,
@@ -3424,7 +3411,7 @@ fn push_alter_table_drops(
                 count,
                 detached_constraint(
                     old,
-                    catalog::FIRST_FK_OID + slot as i32 * 64 + index as i32,
+                    catalog::foreign_key_constraint_oid(slot, index),
                     foreign_key.name.as_str(),
                 ),
                 false,
@@ -3639,9 +3626,7 @@ fn push_table_drop_dependents(
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: catalog::FIRST_CHECK_OID
-                    + slot as i32 * crate::storage::MAX_CHECKS as i32
-                    + index as i32,
+                oid: catalog::check_constraint_oid(slot, index),
                 name: StackStr::from_str(check.name.as_str()),
             },
             false,
@@ -3670,7 +3655,7 @@ fn push_table_drop_dependents(
             count,
             EventObjectRef::TableConstraint {
                 table: table_ref,
-                oid: catalog::FIRST_FK_OID + slot as i32 * 64 + index as i32,
+                oid: catalog::foreign_key_constraint_oid(slot, index),
                 name: StackStr::from_str(foreign_key.name.as_str()),
             },
             false,

@@ -266,10 +266,10 @@ impl PublicationFilters {
     }
 }
 
-/// Durable per-object definition lists (constraints, routine arguments, enum
-/// labels, partition bounds, and their kin) carry at most this many inline
-/// items. Wider DDL parses successfully and is then rejected loudly at
-/// definition time; scaling these per-object durable shapes is separate work.
+/// Durable per-object definition lists that still use the manifest v14 inline
+/// shape carry at most this many items. Constraint positions also determine
+/// stable catalog and trigger OIDs, so changing this stride requires a durable
+/// format and OID migration. Wider DDL is rejected before catalog mutation.
 pub(crate) const MAX_DEFINITION_ITEMS: usize = 64;
 /// Nested row-state walk cursors (spill-merge recursion during DML) lease
 /// from this startup-sized pool.

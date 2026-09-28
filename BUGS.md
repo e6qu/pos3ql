@@ -6,6 +6,12 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The durable constraint-shape audit found no fixable defect within manifest v14.
+Table and domain constraint positions are stable catalog and referential-trigger
+OID identities, so widening their 64-entry stride needs the format and OID
+migration required by PLAN.md. Duplicate OID arithmetic now uses shared
+constructors, and accepted, rejected, checkpoint, and object-cold boundaries
+remain covered.
 The geometric-value width audit found no external blocker. Path and polygon
 parsing, generated values, operators, binary wire bodies, and spatial index
 summaries now use exact statement memory or streaming traversal. A 300-point
@@ -394,8 +400,9 @@ PostgreSQL regression, and sqllogictest phases now have independent workers.
 The deterministic fuzz sequence likewise runs in five 2,000-statement slices.
 The former 2,500-statement final slice reached the unchanged job ceiling before
 reporting its summary; the smaller slices preserve all 10,000 statements.
-The forced-spill corpus likewise runs in five complete file slices after one
-four-way slice reached the same ceiling without completing.
+The forced-spill corpus now runs in six complete file slices. Five slices were
+no longer enough after the constraint-width corpus joined the suite; the old
+final slice reached the same ceiling without completing.
 The policy-role width audit found no external blocker. Policy targets now use
 startup-sized dense images bounded by the configured role catalog plus
 `PUBLIC`, including transaction-local ALTER versions and recovery scratch. WAL

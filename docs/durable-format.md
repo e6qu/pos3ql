@@ -66,6 +66,14 @@ generations. New row slices and pair merges write v4 PAX; new deltas write v4
 packed rows. A clean older generation may remain reachable indefinitely, so
 online replacement does not by itself justify removing its reader.
 
+The reader and writer identities above are executable declarations. A test
+compares those declarations with this matrix, so adding or removing an identity
+requires updating both in the same change. The v13 compatibility path publishes
+an actual legacy manifest, destroys both local cache tiers, recovers its v4 row
+generation, publishes v14 after a later commit, destroys the caches again, and
+recovers both generations. This qualifies the stated online upgrade instead of
+only testing the header parser.
+
 ## Incompatible and offline changes
 
 Reader support cannot be removed until an offline migration exists and proves

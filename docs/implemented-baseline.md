@@ -15,7 +15,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   Manifest v13 upgrades to v14 on the next checkpoint; direct v2 and packed PAX
   v3 row generations coexist with packed v4 generations. New full slices and
   merges write v4 PAX; deltas write v4 compressed row groups. Unknown identities
-  fail startup. The compatibility and migration contract is recorded in
+  fail startup. The executable identity declarations are checked against the
+  documented matrix. A v13 publication fixture qualifies empty-cache recovery,
+  the next-checkpoint v14 upgrade, and a second empty-cache recovery across the
+  upgrade. The compatibility and migration contract is recorded in
   [durable-format.md](durable-format.md).
 - A bounded S3-compatible client covering conditional writes, full and ranged
   reads, paginated listing, deletion, opaque entity tags, TLS, signing, retry

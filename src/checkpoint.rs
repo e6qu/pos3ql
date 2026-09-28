@@ -31,7 +31,10 @@ use crate::wal::crc32c::Crc32c;
 
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
+const RESTORE_PENDING_KEY: &str = "restore-pending";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
+const BACKUP_HEADER: &str = "pos3ql-backup-v1";
+const BACKUP_NAME_BYTES: usize = 63;
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
@@ -775,6 +778,8 @@ pub(crate) struct Checkpointer {
     slice_scratch: SlotList,
     /// Pre-reserved scratch for cold commit replay and object deletion batches.
     commit_scratch: Vec<StackStr<64>>,
+    backup_scratch: Vec<StackStr<BACKUP_NAME_BYTES>>,
+    backup_roster_loaded: bool,
     garbage_scratch: Vec<StackStr<64>>,
     delete_objects_per_beat: usize,
     commit_prune_loaded: bool,
@@ -955,6 +960,7 @@ impl Checkpointer {
             + config.checkpoint_garbage_batch_objects
                 * (core::mem::size_of::<StackStr<80>>() + core::mem::size_of::<StackStr<64>>())
             + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
+            + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
             + manifest_capacity
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
@@ -1525,6 +1531,8 @@ impl Checkpointer {
             prev_scratch,
             slice_scratch: SlotList::new(config.max_spill_generations_per_table),
             commit_scratch: Vec::with_capacity(config.checkpoint_commit_batches),
+            backup_scratch: Vec::with_capacity(config.max_backups),
+            backup_roster_loaded: false,
             garbage_scratch: Vec::with_capacity(config.checkpoint_garbage_batch_objects),
             delete_objects_per_beat: config.checkpoint_delete_objects_per_beat,
             commit_prune_loaded: false,
@@ -1755,6 +1763,124 @@ impl Checkpointer {
         }
     }
 
+    /// Creates one immutable, named recovery point from the roots published by
+    /// the preceding explicit checkpoint. The manifest object is the retention
+    /// pin: garbage collection honors it even if the final completion marker
+    /// is interrupted, while restore accepts only a complete backup.
+    pub(crate) fn preflight_backup(&mut self, name: &str) -> Result<(), SqlError> {
+        validate_backup_name(name)
+            .map_err(|message| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "{message}"))?;
+        let prefix = stack_format!(96, "backups/{name}/");
+        let mut exists = false;
+        self.client
+            .list(prefix.as_str(), |_| exists = true)
+            .map_err(object_store_to_sql)?;
+        if exists {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "backup \"{}\" already exists or has an incomplete creation",
+                name
+            ));
+        }
+        self.load_backup_names()?;
+        if self.backup_scratch.len() == self.backup_scratch.capacity() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "backup roster exceeds max_backups ({})",
+                self.backup_scratch.capacity()
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_backup(&mut self, name: &str) -> Result<u64, SqlError> {
+        self.preflight_backup(name)?;
+
+        self.client
+            .get(MANIFEST_KEY, None)
+            .map_err(object_store_to_sql)?;
+        self.manifest_buf.clear();
+        if !self.manifest_buf.append(self.client.body_bytes()) {
+            return Err(manifest_full());
+        }
+        let floor = manifest_lsn(self.manifest_buf.readable())
+            .map_err(|message| sql_err!(SQLSTATE_IO, "backup manifest: {message}"))?;
+        let manifest_crc = crate::wal::crc32c::crc32c(self.manifest_buf.readable());
+
+        let mut head = StackStr::<96>::new();
+        match self.client.get(COMMIT_HEAD_KEY, None) {
+            Ok(_) => {
+                use core::fmt::Write as _;
+                write!(
+                    head,
+                    "{}",
+                    core::str::from_utf8(self.client.body_bytes())
+                        .map_err(|_| sql_err!(SQLSTATE_IO, "commit-head is not UTF-8"))?
+                )
+                .map_err(|_| sql_err!(SQLSTATE_IO, "commit-head exceeds its format bound"))?;
+                parse_commit_head(head.as_str().as_bytes())
+                    .map_err(|message| sql_err!(SQLSTATE_IO, "{message}"))?;
+            }
+            Err(error) if error.is_not_found() => {}
+            Err(error) => return Err(object_store_to_sql(error)),
+        }
+        let head_crc = crate::wal::crc32c::crc32c(head.as_str().as_bytes());
+        // From the first durable write onward, a failed creation may leave a
+        // manifest retention pin. Force the next collector to rediscover it.
+        self.backup_roster_loaded = false;
+        let head_key = stack_format!(128, "backups/{name}/commit-head");
+        self.put_immutable(head_key.as_str(), head.as_str().as_bytes())?;
+        let manifest_key = stack_format!(128, "backups/{name}/manifest");
+        match self.client.put(
+            manifest_key.as_str(),
+            self.manifest_buf.readable(),
+            Precondition::IfNoneMatchAny,
+        ) {
+            Ok(_) => {}
+            Err(error) => return Err(object_store_to_sql(error)),
+        }
+        let complete_key = stack_format!(128, "backups/{name}/complete");
+        let complete = stack_format!(
+            160,
+            "{BACKUP_HEADER}\nlsn {floor}\nmanifest_crc {manifest_crc:08x}\nhead_crc {head_crc:08x}\nend\n"
+        );
+        self.put_immutable(complete_key.as_str(), complete.as_str().as_bytes())?;
+        Ok(floor)
+    }
+
+    pub(crate) fn delete_backup(&mut self, name: &str) -> Result<bool, SqlError> {
+        validate_backup_name(name)
+            .map_err(|message| sql_err!(sqlstate::INVALID_PARAMETER_VALUE, "{message}"))?;
+        match self.client.get(RESTORE_PENDING_KEY, None) {
+            Ok(_) => {
+                return Err(sql_err!(
+                    sqlstate::OBJECT_IN_USE,
+                    "cannot delete a backup while restore-pending exists"
+                ));
+            }
+            Err(error) if error.is_not_found() => {}
+            Err(error) => return Err(object_store_to_sql(error)),
+        }
+        let prefix = stack_format!(96, "backups/{name}/");
+        let mut exists = false;
+        self.client
+            .list(prefix.as_str(), |_| exists = true)
+            .map_err(object_store_to_sql)?;
+        if !exists {
+            return Ok(false);
+        }
+        // Deletion removes the manifest last. Any interrupted attempt must be
+        // rediscovered before the next retention decision.
+        self.backup_roster_loaded = false;
+        for suffix in ["complete", "commit-head", "manifest"] {
+            let key = stack_format!(128, "backups/{name}/{suffix}");
+            self.client
+                .delete(key.as_str())
+                .map_err(object_store_to_sql)?;
+        }
+        Ok(true)
+    }
+
     /// Downloads and replays commit batches with records past `floor`, in
     /// ascending order, feeding each record to `apply`. The caller merges
     /// these with the local journal's records by LSN before applying:
@@ -1907,6 +2033,68 @@ impl Checkpointer {
         );
     }
 
+    fn load_backup_names(&mut self) -> Result<(), SqlError> {
+        self.backup_roster_loaded = false;
+        self.backup_scratch.clear();
+        let names = &mut self.backup_scratch;
+        let mut overflow = false;
+        self.client
+            .list("backups/", |key| {
+                let Some(name) = key
+                    .strip_prefix("backups/")
+                    .and_then(|rest| rest.strip_suffix("/manifest"))
+                else {
+                    return;
+                };
+                if validate_backup_name(name).is_err() {
+                    overflow = true;
+                    return;
+                }
+                if names.len() == names.capacity() {
+                    overflow = true;
+                } else {
+                    names.push(StackStr::from_str(name));
+                }
+            })
+            .map_err(object_store_to_sql)?;
+        self.backup_scratch
+            .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        self.backup_scratch
+            .dedup_by(|left, right| left.as_str() == right.as_str());
+        if overflow {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "backup roster exceeds max_backups ({}) or contains an invalid backup name",
+                self.backup_scratch.capacity()
+            ));
+        }
+        self.backup_roster_loaded = true;
+        Ok(())
+    }
+
+    fn ensure_backup_names_loaded(&mut self) -> Result<(), SqlError> {
+        if !self.backup_roster_loaded {
+            self.load_backup_names()?;
+        }
+        Ok(())
+    }
+
+    fn oldest_backup_lsn(&mut self) -> Result<Option<u64>, SqlError> {
+        self.ensure_backup_names_loaded()?;
+        let mut oldest: Option<u64> = None;
+        for index in 0..self.backup_scratch.len() {
+            let name = self.backup_scratch[index];
+            let key = stack_format!(128, "backups/{}/manifest", name.as_str());
+            self.client
+                .get(key.as_str(), None)
+                .map_err(object_store_to_sql)?;
+            let floor = manifest_commit_retention_floor(self.client.body_bytes())
+                .map_err(|message| sql_err!(SQLSTATE_IO, "backup manifest: {message}"))?;
+            oldest = Some(oldest.map_or(floor, |current| current.min(floor)));
+        }
+        Ok(oldest)
+    }
+
     /// Deletes at most one configured batch of commit objects. The newest
     /// covered batch and its descriptor remain because that batch may
     /// straddle the recovery boundary. Returns true once no older objects
@@ -1922,6 +2110,9 @@ impl Checkpointer {
         // dispatch beats remove small groups. This bounds foreground DELETEs
         // without rebuilding the namespace view for every group.
         if !self.commit_prune_loaded {
+            let up_to_lsn = self
+                .oldest_backup_lsn()?
+                .map_or(up_to_lsn, |backup_floor| up_to_lsn.min(backup_floor));
             self.garbage_scratch.clear();
             let mut boundary = StackStr::<64>::new();
             self.client
@@ -2010,6 +2201,19 @@ impl Checkpointer {
     /// into storage. Returns the manifest LSN — the WAL replay floor.
     /// Startup only (allocates freely while parsing).
     pub(crate) fn load_into(&mut self, storage: &mut Storage) -> Result<u64, CheckpointSetupError> {
+        match self.client.get(RESTORE_PENDING_KEY, None) {
+            Ok(_) => {
+                return Err(CheckpointSetupError::Corrupt(
+                    "restore-pending exists; rerun the offline restore operation",
+                ));
+            }
+            Err(error) if error.is_not_found() => {}
+            Err(error) => {
+                return Err(CheckpointSetupError::ObjectStore(format!(
+                    "load restore-pending: {error}"
+                )));
+            }
+        }
         let floor = match self.client.get(MANIFEST_KEY, None) {
             Ok(r) => {
                 self.manifest_etag = Some(r.etag);
@@ -12183,6 +12387,7 @@ impl Checkpointer {
             #[cfg(feature = "checkpoint-profile")]
             let keep_before = self.blocks.borrow().io_stats();
             self.roster_scratch.clear();
+            self.ensure_backup_names_loaded()?;
             self.sst_arena.reset();
             let scratch = self
                 .sst_arena
@@ -12269,6 +12474,23 @@ impl Checkpointer {
                         ));
                     }
                 }
+            }
+            for index in 0..self.backup_scratch.len() {
+                let name = self.backup_scratch[index];
+                let key = stack_format!(128, "backups/{}/manifest", name.as_str());
+                self.client
+                    .get(key.as_str(), None)
+                    .map_err(object_store_to_sql)?;
+                self.manifest_buf.clear();
+                if !self.manifest_buf.append(self.client.body_bytes()) {
+                    return Err(manifest_full());
+                }
+                retain_manifest_blocks(
+                    &self.blocks,
+                    &mut self.roster_scratch,
+                    scratch,
+                    self.manifest_buf.readable(),
+                )?;
             }
             // Listing may visit many obsolete objects. Sort the fixed keep-set
             // once so each membership probe is logarithmic rather than scanning
@@ -12536,6 +12758,172 @@ fn parse_dsst_handle<'a>(
     }))
 }
 
+fn manifest_lsn(bytes: &[u8]) -> Result<u64, &'static str> {
+    let text = core::str::from_utf8(bytes).map_err(|_| "manifest is not UTF-8")?;
+    let mut lines = text.lines();
+    ManifestFormat::parse(lines.next()).map_err(|_| "bad manifest header")?;
+    let mut found = None;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("lsn ") {
+            if found.is_some() {
+                return Err("duplicate manifest LSN");
+            }
+            found = Some(value.parse().map_err(|_| "bad manifest LSN")?);
+        }
+    }
+    found.ok_or("manifest LSN missing")
+}
+
+fn manifest_commit_retention_floor(bytes: &[u8]) -> Result<u64, &'static str> {
+    let mut floor = manifest_lsn(bytes)?;
+    let text = core::str::from_utf8(bytes).map_err(|_| "manifest is not UTF-8")?;
+    for line in text.lines().skip(1) {
+        let mut words = line.split(' ');
+        match words.next() {
+            Some("ptx") => {
+                words
+                    .next()
+                    .ok_or("prepared transaction identity missing")?;
+                let first_lsn: u64 = words
+                    .next()
+                    .and_then(|word| word.parse().ok())
+                    .filter(|lsn| *lsn != 0)
+                    .ok_or("prepared transaction first LSN is invalid")?;
+                floor = floor.min(first_lsn.saturating_sub(1));
+            }
+            Some("rslot") => {
+                words.next().ok_or("replication slot name missing")?;
+                let restart_lsn: u64 = words
+                    .next()
+                    .and_then(|word| word.parse().ok())
+                    .ok_or("replication slot restart LSN is invalid")?;
+                floor = floor.min(restart_lsn);
+            }
+            _ => {}
+        }
+    }
+    Ok(floor)
+}
+
+fn retain_block(keep: &mut Vec<(BlockId, Option<BlockType>)>, id: BlockId) -> Result<(), SqlError> {
+    if keep.len() == keep.capacity() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+            keep.capacity()
+        ));
+    }
+    keep.push((id, None));
+    Ok(())
+}
+
+fn retain_manifest_blocks(
+    blocks: &std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>>,
+    keep: &mut Vec<(BlockId, Option<BlockType>)>,
+    scratch: &mut [u8],
+    bytes: &[u8],
+) -> Result<(), SqlError> {
+    let text = core::str::from_utf8(bytes)
+        .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest is not UTF-8"))?;
+    let mut lines = text.lines();
+    let format = ManifestFormat::parse(lines.next())
+        .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest has an unknown format"))?;
+    for line in lines {
+        let mut words = line.split(' ');
+        match words.next() {
+            Some("dsst") => {
+                for _ in 0..4 {
+                    words.next().ok_or_else(|| {
+                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst")
+                    })?;
+                }
+                words
+                    .next()
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                words
+                    .next()
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                let roster = words
+                    .next()
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed dsst"))?;
+                if roster == "-" {
+                    continue;
+                }
+                let roster = parse_block_id(roster)
+                    .map_err(|_| sql_err!(SQLSTATE_IO, "backup manifest has a bad dsst roster"))?;
+                retain_block(keep, roster)?;
+                let n = blocks
+                    .borrow_mut()
+                    .get(&roster, scratch)
+                    .map(|(n, _)| n)
+                    .map_err(|error| {
+                        sql_err!(SQLSTATE_IO, "backup row roster read: {:?}", error)
+                    })?;
+                for id_bytes in scratch[..n].chunks(32) {
+                    if id_bytes.len() != 32 {
+                        return Err(sql_err!(
+                            SQLSTATE_IO,
+                            "backup row roster is not a multiple of 32 bytes"
+                        ));
+                    }
+                    let mut id = [0; 32];
+                    id.copy_from_slice(id_bytes);
+                    retain_block(keep, BlockId(id))?;
+                }
+            }
+            Some("vix") => {
+                words
+                    .next()
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                let column_count: usize = words
+                    .next()
+                    .and_then(|word| word.parse().ok())
+                    .filter(|count| *count != 0 && *count <= crate::storage::MAX_INDEX_COLS)
+                    .ok_or_else(|| {
+                        sql_err!(SQLSTATE_IO, "backup manifest has a bad vix column count")
+                    })?;
+                for _ in 0..column_count {
+                    words.next().ok_or_else(|| {
+                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix")
+                    })?;
+                }
+                words
+                    .next()
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))?;
+                if format.has_value_index_identity() {
+                    words.next().ok_or_else(|| {
+                        sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix")
+                    })?;
+                }
+                let roster = words
+                    .next()
+                    .ok_or_else(|| sql_err!(SQLSTATE_IO, "backup manifest has a malformed vix"))
+                    .and_then(|word| {
+                        parse_block_id(word).map_err(|_| {
+                            sql_err!(SQLSTATE_IO, "backup manifest has a bad vix roster")
+                        })
+                    })?;
+                let complete = crate::store::walk_value_roster(
+                    &mut *blocks.borrow_mut(),
+                    roster,
+                    scratch,
+                    |id, _| retain_block(keep, id).is_ok(),
+                )
+                .map_err(|error| sql_err!(SQLSTATE_IO, "backup value-index roster: {:?}", error))?;
+                if !complete {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "block garbage collection keep-set exceeds checkpoint_live_blocks ({})",
+                        keep.capacity()
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn sst_to_sql(e: crate::store::SstError) -> SqlError {
     match e {
         crate::store::SstError::Store(crate::store::StoreError::NotReady) => {
@@ -12658,6 +13046,207 @@ impl std::fmt::Display for CheckpointSetupError {
 }
 
 impl std::error::Error for CheckpointSetupError {}
+
+/// Atomically recoverable offline root replacement. The durable pending marker
+/// is removed only after both object roots and every authoritative local-cache
+/// file have been replaced. Normal startup refuses to cross that marker.
+pub(crate) fn restore_backup(
+    config: &Config,
+    budget: &mut Budget,
+    name: &str,
+) -> Result<u64, CheckpointSetupError> {
+    validate_backup_name(name)
+        .map_err(|message| CheckpointSetupError::ObjectStore(message.to_string()))?;
+    if !config.object_store_on {
+        return Err(CheckpointSetupError::ObjectStore(
+            "backup restore requires object_store = on".to_string(),
+        ));
+    }
+    let mut client = ObjectStore::new(config, budget)
+        .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
+    let complete_key = stack_format!(128, "backups/{name}/complete");
+    client
+        .get(complete_key.as_str(), None)
+        .map_err(|error| CheckpointSetupError::ObjectStore(format!("load backup: {error}")))?;
+    let (floor, manifest_crc, head_crc) =
+        parse_backup_complete(client.body_bytes()).map_err(CheckpointSetupError::Corrupt)?;
+
+    let mut manifest = FixedBuf::new(budget, "restore manifest", config.checkpoint_manifest_bytes)
+        .map_err(CheckpointSetupError::Budget)?;
+    let manifest_key = stack_format!(128, "backups/{name}/manifest");
+    client.get(manifest_key.as_str(), None).map_err(|error| {
+        CheckpointSetupError::ObjectStore(format!("load backup manifest: {error}"))
+    })?;
+    if !manifest.append(client.body_bytes()) {
+        return Err(CheckpointSetupError::ObjectStore(
+            "backup manifest exceeds checkpoint_manifest_bytes".to_string(),
+        ));
+    }
+    if manifest_lsn(manifest.readable()).map_err(CheckpointSetupError::Corrupt)? != floor
+        || crate::wal::crc32c::crc32c(manifest.readable()) != manifest_crc
+    {
+        return Err(CheckpointSetupError::Corrupt(
+            "backup manifest does not match its completion record",
+        ));
+    }
+
+    let head_key = stack_format!(128, "backups/{name}/commit-head");
+    client.get(head_key.as_str(), None).map_err(|error| {
+        CheckpointSetupError::ObjectStore(format!("load backup commit-head: {error}"))
+    })?;
+    let mut head = StackStr::<96>::new();
+    use core::fmt::Write as _;
+    write!(
+        head,
+        "{}",
+        core::str::from_utf8(client.body_bytes())
+            .map_err(|_| CheckpointSetupError::Corrupt("backup commit-head is not UTF-8"))?
+    )
+    .map_err(|_| CheckpointSetupError::Corrupt("backup commit-head exceeds its format bound"))?;
+    if crate::wal::crc32c::crc32c(head.as_str().as_bytes()) != head_crc {
+        return Err(CheckpointSetupError::Corrupt(
+            "backup commit-head does not match its completion record",
+        ));
+    }
+    if !head.is_empty() {
+        parse_commit_head(head.as_str().as_bytes()).map_err(CheckpointSetupError::Corrupt)?;
+    }
+
+    let pending = stack_format!(128, "{BACKUP_HEADER}\nname {name}\nend\n");
+    match client.put(
+        RESTORE_PENDING_KEY,
+        pending.as_str().as_bytes(),
+        Precondition::IfNoneMatchAny,
+    ) {
+        Ok(_) => {}
+        Err(error) if error.is_precondition_failed() => {
+            client.get(RESTORE_PENDING_KEY, None).map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!("load restore-pending: {error}"))
+            })?;
+            if client.body_bytes() != pending.as_str().as_bytes() {
+                return Err(CheckpointSetupError::ObjectStore(
+                    "another backup restore is pending".to_string(),
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "publish restore-pending: {error}"
+            )));
+        }
+    }
+
+    replace_root(&mut client, MANIFEST_KEY, manifest.readable())?;
+    if head.is_empty() {
+        client.delete(COMMIT_HEAD_KEY).map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("clear commit-head: {error}"))
+        })?;
+    } else {
+        replace_root(&mut client, COMMIT_HEAD_KEY, head.as_str().as_bytes())?;
+    }
+    clear_local_cache(&config.data_dir)?;
+    client
+        .delete(RESTORE_PENDING_KEY)
+        .map_err(|error| CheckpointSetupError::ObjectStore(format!("complete restore: {error}")))?;
+    Ok(floor)
+}
+
+fn replace_root(
+    client: &mut ObjectStore,
+    key: &str,
+    bytes: &[u8],
+) -> Result<(), CheckpointSetupError> {
+    let current = match client.get(key, None) {
+        Ok(result) => Some(result.etag),
+        Err(error) if error.is_not_found() => None,
+        Err(error) => {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "load {key} for restore: {error}"
+            )));
+        }
+    };
+    let condition = current
+        .as_ref()
+        .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
+    client.put(key, bytes, condition).map_err(|error| {
+        let detail = if error.is_precondition_failed() {
+            "root changed during offline restore; stop every writer and retry".to_string()
+        } else {
+            format!("replace {key}: {error}")
+        };
+        CheckpointSetupError::ObjectStore(detail)
+    })?;
+    Ok(())
+}
+
+fn clear_local_cache(data_dir: &str) -> Result<(), CheckpointSetupError> {
+    let directory = std::path::Path::new(data_dir);
+    std::fs::create_dir_all(directory).map_err(|error| {
+        CheckpointSetupError::ObjectStore(format!("create data directory for restore: {error}"))
+    })?;
+    for name in ["journal.wal", "block-cache", "clean.shutdown"] {
+        let path = directory.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CheckpointSetupError::ObjectStore(format!(
+                    "remove local cache '{}': {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "sync restored data directory '{}': {error}",
+                directory.display()
+            ))
+        })
+}
+
+fn parse_backup_complete(bytes: &[u8]) -> Result<(u64, u32, u32), &'static str> {
+    let text = core::str::from_utf8(bytes).map_err(|_| "backup completion is not UTF-8")?;
+    let mut lines = text.lines();
+    if lines.next() != Some(BACKUP_HEADER) {
+        return Err("bad backup completion header");
+    }
+    let floor = lines
+        .next()
+        .and_then(|line| line.strip_prefix("lsn "))
+        .and_then(|value| value.parse().ok())
+        .ok_or("bad backup completion LSN")?;
+    let manifest_crc = lines
+        .next()
+        .and_then(|line| line.strip_prefix("manifest_crc "))
+        .and_then(|value| u32::from_str_radix(value, 16).ok())
+        .ok_or("bad backup manifest checksum")?;
+    let head_crc = lines
+        .next()
+        .and_then(|line| line.strip_prefix("head_crc "))
+        .and_then(|value| u32::from_str_radix(value, 16).ok())
+        .ok_or("bad backup commit-head checksum")?;
+    if lines.next() != Some("end") || lines.next().is_some() {
+        return Err("bad backup completion terminator");
+    }
+    Ok((floor, manifest_crc, head_crc))
+}
+
+fn validate_backup_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.len() > BACKUP_NAME_BYTES {
+        return Err("backup name must contain between 1 and 63 bytes");
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || matches!(name, "." | "..")
+    {
+        return Err("backup name may contain only ASCII letters, digits, '.', '_', and '-'");
+    }
+    Ok(())
+}
 
 fn parse_commit_head(bytes: &[u8]) -> Result<(u64, CommitBatchId), &'static str> {
     let text = core::str::from_utf8(bytes).map_err(|_| "commit-head is not UTF-8")?;
@@ -14876,6 +15465,13 @@ mod stored_dependency_tests {
             core::mem::size_of::<StackStr<64>>()
         );
 
+        let mut backups = base.clone();
+        backups.max_backups += 1;
+        assert_eq!(
+            Checkpointer::budget_bytes(&backups) - base_bytes,
+            core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
+        );
+
         let mut live_blocks = base.clone();
         live_blocks.checkpoint_live_blocks += 1;
         assert_eq!(
@@ -14954,6 +15550,16 @@ mod stored_dependency_tests {
         assert!(ManifestFormat::parse(Some("pos3ql-manifest-v12")).is_err());
         assert!(ManifestFormat::parse(Some("pos3ql-manifest-v15")).is_err());
         assert!(ManifestFormat::parse(None).is_err());
+    }
+
+    #[test]
+    fn backup_commit_floor_includes_prepared_transactions_and_logical_slots() {
+        let manifest = b"pos3ql-manifest-v14\nlsn 100\nptx 7 41 50 0 5 706f737467726573 78\nrslot 736c6f74 60 70 0\nend\n";
+        assert_eq!(manifest_lsn(manifest).unwrap(), 100);
+        assert_eq!(manifest_commit_retention_floor(manifest).unwrap(), 40);
+
+        let slot_only = b"pos3ql-manifest-v14\nlsn 100\nrslot 736c6f74 60 70 0\nend\n";
+        assert_eq!(manifest_commit_retention_floor(slot_only).unwrap(), 60);
     }
 
     #[test]

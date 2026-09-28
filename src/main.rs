@@ -34,7 +34,28 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let config = load_config()?;
+    let (config, operation) = load_config()?;
+    match operation {
+        Operation::Serve => {}
+        Operation::Backup(name) => {
+            let lsn = pos3ql::operations::create_backup(&config, &name)?;
+            println!("backup {name} created at LSN {lsn}");
+            return Ok(());
+        }
+        Operation::Restore(name) => {
+            let lsn = pos3ql::operations::restore_backup(&config, &name)?;
+            println!("backup {name} restored at LSN {lsn}");
+            return Ok(());
+        }
+        Operation::DeleteBackup(name) => {
+            if pos3ql::operations::delete_backup(&config, &name)? {
+                println!("backup {name} deleted");
+            } else {
+                return Err(format!("backup '{name}' does not exist"));
+            }
+            return Ok(());
+        }
+    }
     let server_bytes = Server::budget_bytes(&config);
     let plan = config.memory_plan(
         server_bytes,
@@ -92,9 +113,17 @@ fn run() -> Result<(), String> {
     })
 }
 
-fn load_config() -> Result<Config, String> {
+enum Operation {
+    Serve,
+    Backup(String),
+    Restore(String),
+    DeleteBackup(String),
+}
+
+fn load_config() -> Result<(Config, Operation), String> {
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<String> = None;
+    let mut operation = Operation::Serve;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
@@ -103,14 +132,29 @@ fn load_config() -> Result<Config, String> {
                     .ok_or_else(|| "--config requires a path".to_string())?;
                 config_path = Some(path);
             }
+            "--backup" | "--restore" | "--delete-backup" => {
+                if !matches!(operation, Operation::Serve) {
+                    return Err("only one backup operation may be requested".to_string());
+                }
+                let name = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires a name"))?;
+                operation = match arg.as_str() {
+                    "--backup" => Operation::Backup(name),
+                    "--restore" => Operation::Restore(name),
+                    _ => Operation::DeleteBackup(name),
+                };
+            }
             "--help" | "-h" => {
-                println!("usage: pos3ql [--config <path>]");
+                println!(
+                    "usage: pos3ql [--config <path>] [--backup <name> | --restore <name> | --delete-backup <name>]"
+                );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument '{other}' (see --help)")),
         }
     }
-    match config_path {
+    let config = match config_path {
         Some(path) => {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read config '{path}': {e}"))?;
@@ -120,5 +164,6 @@ fn load_config() -> Result<Config, String> {
             eprintln!("pos3ql: no --config given, using development defaults");
             Ok(Config::default_dev())
         }
-    }
+    }?;
+    Ok((config, operation))
 }

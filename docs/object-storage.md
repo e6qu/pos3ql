@@ -86,6 +86,13 @@ between statements, while an explicit checkpoint returns only after all listed
 obsolete objects are deleted. Live-set or recovery-chain exhaustion fails with
 the corresponding configuration name and never weakens retention.
 
+Named backups use the same operations and prefix. A retained backup manifest
+adds its reachable block graph to the live set and lowers the commit-pruning
+floor to include prepared transactions and logical slots. `max_backups` bounds
+the startup name roster, while
+`checkpoint_live_blocks` still bounds the union of current, in-progress, and
+backup-reachable blocks. Capacity exhaustion stops cleanup before deletion.
+
 ## Qualification
 
 Required CI has three independent layers:

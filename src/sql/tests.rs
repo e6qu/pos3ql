@@ -67426,8 +67426,8 @@ fn automatic_checkpoint_deletes_at_most_one_configured_object_per_beat() {
     assert_eq!(remaining, 0);
     assert!(beats > 1, "maintenance was not paced across dispatch beats");
     assert_eq!(
-        maintenance_lists, 4,
-        "commit pruning scans twice; legacy and block garbage scan once each"
+        maintenance_lists, 5,
+        "backup retention scans once; commit pruning twice; legacy and block garbage once each"
     );
 
     drop(engine);
@@ -69650,6 +69650,148 @@ fn v13_manifest_upgrades_through_empty_cache_recovery_body() {
             "SELECT id, value FROM format_rows ORDER BY id"
         )),
         ["1|from-v13", "2|from-v14"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn named_backup_restores_an_older_point_through_empty_local_caches() {
+    let result = std::thread::Builder::new()
+        .name("named-backup-restore".to_string())
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+        .spawn(named_backup_restores_an_older_point_through_empty_local_caches_body)
+        .expect("spawn named backup test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn named_backup_restores_an_older_point_through_empty_local_caches_body() {
+    let mut config = test_config("named-backup-restore");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("named-backup-restore-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.max_backups = 1;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 91);
+
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let invalid = engine.create_backup("../escape").unwrap_err();
+    assert_eq!(invalid.sqlstate.as_str(), "22023");
+    let before = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recovery_point (id integer PRIMARY KEY, value text); \
+         INSERT INTO recovery_point VALUES (1, 'before')",
+    );
+    assert!(!message_types(&before).contains(&b'E'));
+    let backup_lsn = engine.create_backup("before-change").unwrap();
+    assert!(backup_lsn > 0);
+    let duplicate = engine.create_backup("before-change").unwrap_err();
+    assert_eq!(duplicate.sqlstate.as_str(), "42710");
+
+    let after = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE recovery_point SET value = 'after' WHERE id = 1; \
+         INSERT INTO recovery_point VALUES (2, 'later')",
+    );
+    assert!(!message_types(&after).contains(&b'E'));
+    assert!(engine.checkpoint().unwrap());
+    let full = engine.create_backup("second").unwrap_err();
+    assert_eq!(full.sqlstate.as_str(), "54000");
+    let mut second_objects = 0;
+    engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .list("backups/second/", |_| second_objects += 1)
+        .unwrap();
+    assert_eq!(second_objects, 0, "capacity fails before backup writes");
+    drop(engine);
+
+    let extension_dir = std::path::Path::new(&config.data_dir).join("extensions");
+    std::fs::create_dir_all(&extension_dir).unwrap();
+    let extension_file = extension_dir.join("operator-kept.txt");
+    std::fs::write(&extension_file, b"keep").unwrap();
+    let fail_from = namespace.borrow().op_count + 7;
+    namespace.borrow_mut().faults.fail_from_op = Some(fail_from);
+    let mut interrupted_budget = Budget::new(32 << 20);
+    let interrupted =
+        crate::checkpoint::restore_backup(&config, &mut interrupted_budget, "before-change")
+            .unwrap_err();
+    assert!(interrupted.to_string().contains("simulated outage"));
+    namespace.borrow_mut().faults.fail_from_op = None;
+    let pending_key = format!("{}restore-pending", config.object_store_prefix);
+    assert!(namespace.borrow().object_bytes(&pending_key).is_some());
+    let mut blocked_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let blocked = match Engine::new(&config, &mut blocked_budget) {
+        Ok(_) => panic!("normal startup must refuse an interrupted restore"),
+        Err(error) => error,
+    };
+    assert!(blocked.to_string().contains("restore-pending"));
+
+    let mut restore_budget = Budget::new(32 << 20);
+    assert_eq!(
+        crate::checkpoint::restore_backup(&config, &mut restore_budget, "before-change").unwrap(),
+        backup_lsn
+    );
+    assert!(
+        extension_file.exists(),
+        "restore must preserve operator files"
+    );
+    assert!(
+        !std::path::Path::new(&config.data_dir)
+            .join("journal.wal")
+            .exists()
+    );
+    assert!(
+        !std::path::Path::new(&config.data_dir)
+            .join("block-cache")
+            .exists()
+    );
+
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut restored = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restored,
+            &mut budget,
+            "SELECT id, value FROM recovery_point ORDER BY id"
+        )),
+        ["1|before"]
+    );
+    let branched = run_with(
+        &mut restored,
+        &mut budget,
+        "INSERT INTO recovery_point VALUES (3, 'branched')",
+    );
+    assert!(!message_types(&branched).contains(&b'E'));
+    assert!(restored.checkpoint().unwrap());
+    assert!(restored.delete_backup("before-change").unwrap());
+    assert!(!restored.delete_backup("before-change").unwrap());
+    drop(restored);
+
+    std::fs::remove_file(&extension_file).unwrap();
+    std::fs::remove_dir(&extension_dir).unwrap();
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id, value FROM recovery_point ORDER BY id"
+        )),
+        ["1|before", "3|branched"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);

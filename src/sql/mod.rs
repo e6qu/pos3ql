@@ -8128,6 +8128,31 @@ impl Engine {
         }
     }
 
+    pub(crate) fn create_backup(&mut self, name: &str) -> Result<u64, SqlError> {
+        let Some(checkpointer) = self.ckpt.as_mut() else {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "backup requires object_store = on"
+            ));
+        };
+        checkpointer.preflight_backup(name)?;
+        self.checkpoint()?;
+        self.ckpt
+            .as_mut()
+            .expect("checked above")
+            .create_backup(name)
+    }
+
+    pub(crate) fn delete_backup(&mut self, name: &str) -> Result<bool, SqlError> {
+        let Some(checkpointer) = self.ckpt.as_mut() else {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "backup deletion requires object_store = on"
+            ));
+        };
+        checkpointer.delete_backup(name)
+    }
+
     /// The journal and heap bookkeeping owed once a manifest has published:
     /// everything at or below `lsn` is bucket-durable, so the local journal
     /// restarts and the heap compacts (spilling under memory pressure).

@@ -16,6 +16,7 @@ pub(crate) mod crypto;
 pub mod io;
 pub mod mem;
 pub mod object_store;
+pub mod operations;
 pub(crate) mod pem;
 pub mod pg;
 pub(crate) mod prng;

@@ -93,6 +93,15 @@ the startup name roster, while
 `checkpoint_live_blocks` still bounds the union of current, in-progress, and
 backup-reachable blocks. Capacity exhaustion stops cleanup before deletion.
 
+Independent backup export opens the source and destination through the same
+provider-neutral contract. It scans immutable block, commit, and durable
+extension-package objects once in fixed `checkpoint_garbage_batch_objects`
+batches, streams each body through bounded ranged GETs, and copies it only
+through conditional PUT. An `export-pending` destination marker prevents startup from
+observing a partial namespace; live roots publish after the copy and the marker
+is removed after the destination cache reset and a matching `export-complete`
+receipt. The first attempt requires an empty destination prefix.
+
 ## Qualification
 
 Required CI has three independent layers:

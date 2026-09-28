@@ -27,6 +27,7 @@
 - **block**: fixed-size, checksummed, content-addressed storage unit.
 - **block store**: provider-neutral internal interface over object storage and cache tiers; it is not a network protocol or deployable storage service.
 - **backup**: a named, checkpoint-consistent manifest and commit-head image whose reachable blocks and commit history are retained until deletion.
+- **backup export**: a restartable copy of one named backup and its durable object graph into an empty independently configured object-store prefix.
 - **checkpoint**: immutable SST publication through a compare-and-swap manifest.
 - **cold start**: recovery with RAM and local disk caches absent.
 - **declared type identity**: the schema-qualified type visible in catalog, parameter, and replication metadata; distinct from an executor value type.

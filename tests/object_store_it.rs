@@ -420,6 +420,15 @@ fn put_get_range_list_cas_delete() {
     assert!(keys.contains(&cas_key), "{keys:?}");
     assert!(page_keys.iter().all(|page_key| keys.contains(page_key)));
     assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "{keys:?}");
+    let mut batch = Vec::new();
+    assert_eq!(
+        c.list_batch(&prefix, &page_keys[3], 3, |listed| {
+            batch.push(listed.to_string())
+        })
+        .unwrap(),
+        3
+    );
+    assert_eq!(batch, page_keys[4..7]);
 
     // DELETE; a second delete is idempotent; GET now 404s.
     c.delete(&key).unwrap();

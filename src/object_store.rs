@@ -333,6 +333,20 @@ impl Client {
         }
     }
 
+    /// Lists at most `limit` logical keys strictly after `after`.
+    pub(crate) fn list_batch(
+        &mut self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+        each: impl FnMut(&str),
+    ) -> Result<usize, Error> {
+        match self {
+            Self::S3(client) => client.list_batch(prefix, after, limit, each),
+            Self::Simulator(client) => client.list_batch(prefix, after, limit, each),
+        }
+    }
+
     pub(crate) fn pending_get_fd(&self) -> Option<std::os::fd::RawFd> {
         match self {
             Self::S3(client) => client.pending_fd(),
@@ -452,6 +466,16 @@ mod tests {
         assert_eq!(returned, 2);
         assert_eq!(listed[0].as_str(), "prefix/a");
         assert_eq!(listed[1].as_str(), "prefix/b");
+        let mut next = StackStr::<32>::new();
+        assert_eq!(
+            client
+                .list_batch("prefix/", "prefix/a", 1, |key| {
+                    next = StackStr::from_str(key);
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(next.as_str(), "prefix/b");
 
         client.delete("prefix/a").unwrap();
         assert!(client.get("prefix/a", None).unwrap_err().is_not_found());

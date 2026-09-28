@@ -6,6 +6,18 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The independent-prefix backup-export audit found no external blocker. Export
+uses the provider-neutral object contract for both configurations, copies in a
+fixed namespace batch and fixed object buffer, and adopts only byte-identical
+immutable objects on retry. The audit caught backup-root reads that assumed a
+whole manifest fit one response and an omitted durable extension-package
+namespace; ranged root reads and complete immutable namespace copying close
+both gaps. Durable pending and completion records block partial startup and
+make a lost final response adoptable; interruption after a copied object,
+retry, a bounded forward namespace scan, a multi-range copy, complete source
+loss, durable extension execution, backup deletion, a new destination branch,
+and empty-cache recovery are covered. Exact LSN and timestamp targets remain
+planned work in PLAN.md.
 The named-backup audit found no external blocker. Backup manifests now pin
 their complete row and value-index block graphs; prepared-transaction and
 logical-slot positions lower the oldest backup replay floor used by commit

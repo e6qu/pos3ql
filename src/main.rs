@@ -47,6 +47,15 @@ fn run() -> Result<(), String> {
             println!("backup {name} restored at LSN {lsn}");
             return Ok(());
         }
+        Operation::ExportBackup {
+            name,
+            destination_config,
+        } => {
+            let destination = load_config_file(&destination_config)?;
+            let lsn = pos3ql::operations::export_backup(&config, &destination, &name)?;
+            println!("backup {name} exported at LSN {lsn}");
+            return Ok(());
+        }
         Operation::DeleteBackup(name) => {
             if pos3ql::operations::delete_backup(&config, &name)? {
                 println!("backup {name} deleted");
@@ -117,12 +126,17 @@ enum Operation {
     Serve,
     Backup(String),
     Restore(String),
+    ExportBackup {
+        name: String,
+        destination_config: String,
+    },
     DeleteBackup(String),
 }
 
 fn load_config() -> Result<(Config, Operation), String> {
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<String> = None;
+    let mut destination_config_path: Option<String> = None;
     let mut operation = Operation::Serve;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -132,7 +146,7 @@ fn load_config() -> Result<(Config, Operation), String> {
                     .ok_or_else(|| "--config requires a path".to_string())?;
                 config_path = Some(path);
             }
-            "--backup" | "--restore" | "--delete-backup" => {
+            "--backup" | "--restore" | "--export-backup" | "--delete-backup" => {
                 if !matches!(operation, Operation::Serve) {
                     return Err("only one backup operation may be requested".to_string());
                 }
@@ -142,28 +156,61 @@ fn load_config() -> Result<(Config, Operation), String> {
                 operation = match arg.as_str() {
                     "--backup" => Operation::Backup(name),
                     "--restore" => Operation::Restore(name),
+                    "--export-backup" => Operation::ExportBackup {
+                        name,
+                        destination_config: String::new(),
+                    },
                     _ => Operation::DeleteBackup(name),
                 };
             }
+            "--destination-config" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| "--destination-config requires a path".to_string())?;
+                if destination_config_path.replace(path).is_some() {
+                    return Err("--destination-config may be specified only once".to_string());
+                }
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: pos3ql [--config <path>] [--backup <name> | --restore <name> | --delete-backup <name>]"
+                    "usage: pos3ql [--config <path>] [--backup <name> | --restore <name> | --export-backup <name> --destination-config <path> | --delete-backup <name>]"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument '{other}' (see --help)")),
         }
     }
-    let config = match config_path {
-        Some(path) => {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read config '{path}': {e}"))?;
-            Config::parse(&text).map_err(|e| format!("{path}: {e}"))
+    operation = match (operation, destination_config_path) {
+        (
+            Operation::ExportBackup {
+                name,
+                destination_config: _,
+            },
+            Some(destination_config),
+        ) => Operation::ExportBackup {
+            name,
+            destination_config,
+        },
+        (Operation::ExportBackup { .. }, None) => {
+            return Err("--export-backup requires --destination-config".to_string());
         }
+        (_, Some(_)) => {
+            return Err("--destination-config requires --export-backup".to_string());
+        }
+        (operation, None) => operation,
+    };
+    let config = match config_path {
+        Some(path) => load_config_file(&path),
         None => {
             eprintln!("pos3ql: no --config given, using development defaults");
             Ok(Config::default_dev())
         }
     }?;
     Ok((config, operation))
+}
+
+fn load_config_file(path: &str) -> Result<Config, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read config '{path}': {error}"))?;
+    Config::parse(&text).map_err(|error| format!("{path}: {error}"))
 }

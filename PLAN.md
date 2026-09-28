@@ -54,11 +54,13 @@ defined by the contract before its writer can ship.
 Offline named backups now retain checksummed manifest and commit-head roots in
 the configured object-store prefix. Garbage collection includes every backup
 block graph and keeps commit history from the oldest required backup replay
-floor. Restore uses
-a durable pending marker, clears local caches, and can branch new durable
-history from the restored checkpoint. The fixed `max_backups` roster bounds
-retention bookkeeping. These recovery points still share the live prefix;
-independent-prefix copies and targets between named checkpoints remain open.
+floor. Restore uses a durable pending marker, clears local caches, and can
+branch new durable history from the restored checkpoint. The fixed
+`max_backups` roster bounds retention bookkeeping. A restartable export copies
+a named point and its immutable block, commit, and extension-package objects
+into an empty independently configured prefix, publishes it as that prefix's
+live state, and recovers after complete source loss. Recovery targets between
+named checkpoints remain open.
 
 This is not yet a production-complete topology: one process serializes query
 execution; writer fencing, promotion, backup and point-in-time recovery,
@@ -213,10 +215,10 @@ the client-visible boundary and rejected before partial effects.
 
 ### Durable operations and availability
 
-- Export named backups to an independently operated prefix and recover to an
-  exact retained LSN or timestamp between named checkpoints. Qualify interrupted
-  export and restore, empty local caches, retained commit history, deletion,
-  and a new durable history branch after recovery.
+- Recover to an exact retained LSN or timestamp between named checkpoints.
+  Preserve transaction boundaries while deriving the target commit head, and
+  qualify empty local caches, retained commit history, deletion, and a new
+  durable history branch after recovery.
 - Add single-writer ownership and fencing before promotion or failover. Prove
   that an old writer cannot publish after ownership changes, including delayed
   object requests and restart races. Multiple writable processes on one prefix

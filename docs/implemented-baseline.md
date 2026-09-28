@@ -13,7 +13,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   restartable; restore clears the local journal and block cache, preserves
   operator files, accepts a new history branch, and recovers again through
   empty caches. `max_backups` fixes the startup roster. Independent-prefix
-  export and targets between named checkpoints remain production work.
+  export copies the named roots plus immutable block, commit, and durable
+  extension-package namespaces into an empty destination, resumes through a
+  durable pending marker, and recovers after complete source loss. Targets
+  between named checkpoints remain production work.
 - Manifest v14 retains 64 table constraints per modeled kind and 64 domain
   checks. The complete accepted width is qualified through catalogs, WAL,
   checkpoints, empty-cache recovery, and PostgreSQL differential execution;

@@ -69799,6 +69799,241 @@ fn named_backup_restores_an_older_point_through_empty_local_caches_body() {
 }
 
 #[test]
+fn named_backup_exports_to_an_independent_prefix_and_resumes_after_outage() {
+    let result = std::thread::Builder::new()
+        .name("named-backup-export".to_string())
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+        .spawn(named_backup_exports_to_an_independent_prefix_and_resumes_after_outage_body)
+        .expect("spawn named backup export test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn named_backup_exports_to_an_independent_prefix_and_resumes_after_outage_body() {
+    let mut source = test_config("named-backup-export-source");
+    source.object_store_on = true;
+    source.object_store_sim = true;
+    source.object_store_bucket = format!("named-backup-export-source-{}", std::process::id());
+    source.object_store_response_bytes = 1 << 20;
+    source.wal_upload = true;
+    source.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&source.object_store_bucket);
+    let source_namespace =
+        crate::object_store::sim::open_namespace(&source.object_store_bucket, 113);
+    let extension_root = std::path::Path::new(&source.data_dir).join("extensions");
+    let extension_directory = extension_root.join("extension");
+    std::fs::create_dir_all(&extension_directory).unwrap();
+    std::fs::write(
+        extension_directory.join("export_ext.control"),
+        "default_version = '1.0'\nrelocatable = true\nsuperuser = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        extension_directory.join("export_ext--1.0.sql"),
+        "CREATE TABLE export_extension_values (value text);\n",
+    )
+    .unwrap();
+    source.extension_control_path = extension_root.to_str().unwrap().to_string();
+
+    let mut destination = test_config("named-backup-export-destination");
+    destination.object_store_on = true;
+    destination.object_store_sim = true;
+    destination.object_store_bucket =
+        format!("named-backup-export-destination-{}", std::process::id());
+    destination.object_store_response_bytes = 1 << 20;
+    destination.wal_upload = true;
+    destination.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&destination.object_store_bucket);
+    let destination_namespace =
+        crate::object_store::sim::open_namespace(&destination.object_store_bucket, 127);
+
+    let mut source_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut source_engine = Engine::new(&source, &mut source_budget).unwrap();
+    let before = run_with(
+        &mut source_engine,
+        &mut source_budget,
+        "CREATE TABLE exported_point (id integer PRIMARY KEY, value text); \
+         INSERT INTO exported_point VALUES (1, 'before')",
+    );
+    assert!(!message_types(&before).contains(&b'E'));
+    let backup_lsn = source_engine.create_backup("independent").unwrap();
+    let later = run_with(
+        &mut source_engine,
+        &mut source_budget,
+        "UPDATE exported_point SET value = 'later' WHERE id = 1; \
+         INSERT INTO exported_point VALUES (2, 'source-only')",
+    );
+    assert!(!message_types(&later).contains(&b'E'));
+    assert!(source_engine.checkpoint().unwrap());
+    let large_export_object = vec![0x5a; 512 << 10];
+    source_engine
+        .ckpt
+        .as_mut()
+        .unwrap()
+        .client
+        .put(
+            "commits/export-large-orphan",
+            &large_export_object,
+            crate::object_store::Precondition::IfNoneMatchAny,
+        )
+        .unwrap();
+    drop(source_engine);
+
+    let manifest_len = source_namespace
+        .borrow()
+        .object_bytes("backups/independent/manifest")
+        .unwrap()
+        .len();
+    let response_bytes = (manifest_len / 2).max(128);
+    assert!(manifest_len > response_bytes);
+    let mut export_source = source.clone();
+    export_source.object_store_response_bytes = response_bytes;
+    export_source.checkpoint_garbage_batch_objects = 1;
+    let mut export_destination = destination.clone();
+    export_destination.object_store_response_bytes = response_bytes;
+    let fail_from = destination_namespace.borrow().op_count + 5;
+    destination_namespace.borrow_mut().faults.fail_from_op = Some(fail_from);
+    let mut export_budget = Budget::new(64 << 20);
+    let interrupted = crate::checkpoint::export_backup(
+        &export_source,
+        &export_destination,
+        &mut export_budget,
+        "independent",
+    )
+    .unwrap_err();
+    assert!(interrupted.to_string().contains("simulated outage"));
+    destination_namespace.borrow_mut().faults.fail_from_op = None;
+    assert!(
+        destination_namespace
+            .borrow()
+            .object_bytes("export-pending")
+            .is_some()
+    );
+    assert!(
+        destination_namespace
+            .borrow()
+            .object_bytes("backups/independent/commit-head")
+            .is_some()
+    );
+    let mut blocked_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let blocked = match Engine::new(&destination, &mut blocked_budget) {
+        Ok(_) => panic!("normal startup must refuse an interrupted backup export"),
+        Err(error) => error,
+    };
+    assert!(blocked.to_string().contains("export-pending"));
+
+    let mut export_budget = Budget::new(64 << 20);
+    assert_eq!(
+        crate::checkpoint::export_backup(
+            &export_source,
+            &export_destination,
+            &mut export_budget,
+            "independent",
+        )
+        .unwrap(),
+        backup_lsn
+    );
+    assert_eq!(
+        destination_namespace
+            .borrow()
+            .object_bytes("commits/export-large-orphan"),
+        Some(large_export_object.as_slice())
+    );
+    let completion = destination_namespace
+        .borrow()
+        .object_bytes("export-complete")
+        .unwrap()
+        .to_vec();
+    let mut marker_budget = Budget::new(8 << 20);
+    let mut marker_client =
+        crate::object_store::Client::new(&export_destination, &mut marker_budget).unwrap();
+    marker_client
+        .put(
+            "export-pending",
+            &completion,
+            crate::object_store::Precondition::IfNoneMatchAny,
+        )
+        .unwrap();
+    drop(marker_client);
+    let mut completion_budget = Budget::new(64 << 20);
+    assert_eq!(
+        crate::checkpoint::export_backup(
+            &export_source,
+            &export_destination,
+            &mut completion_budget,
+            "independent",
+        )
+        .unwrap(),
+        backup_lsn
+    );
+    assert!(
+        destination_namespace
+            .borrow()
+            .object_bytes("export-pending")
+            .is_none()
+    );
+    drop(source_namespace);
+    crate::object_store::sim::drop_namespace(&source.object_store_bucket);
+    std::fs::remove_dir_all(&source.data_dir).unwrap();
+
+    let mut destination_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut exported = Engine::new(&destination, &mut destination_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut exported,
+            &mut destination_budget,
+            "SELECT id, value FROM exported_point ORDER BY id"
+        )),
+        ["1|before"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut exported,
+            &mut destination_budget,
+            "SELECT name, default_version FROM pg_available_extensions \
+               WHERE name = 'export_ext'"
+        )),
+        ["export_ext|1.0"]
+    );
+    let branch = run_with(
+        &mut exported,
+        &mut destination_budget,
+        "CREATE EXTENSION export_ext; \
+         INSERT INTO export_extension_values VALUES ('durable-package'); \
+         INSERT INTO exported_point VALUES (3, 'destination-branch')",
+    );
+    assert!(!message_types(&branch).contains(&b'E'));
+    assert!(exported.checkpoint().unwrap());
+    assert!(exported.delete_backup("independent").unwrap());
+    drop(exported);
+
+    std::fs::remove_dir_all(&destination.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut recovered = Engine::new(&destination, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, value FROM exported_point ORDER BY id"
+        )),
+        ["1|before", "3|destination-branch"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT value FROM export_extension_values"
+        )),
+        ["durable-package"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&destination.object_store_bucket);
+    std::fs::remove_dir_all(&destination.data_dir).unwrap();
+}
+
+#[test]
 fn cold_start_then_commit_then_crash_recovers_every_record() {
     let result = std::thread::Builder::new()
         .name("cold-wal-recovery".to_string())

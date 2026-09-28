@@ -27,6 +27,7 @@ use super::signature_v4::{SigningInput, format_timestamp, sign, signed_headers, 
 type S3Error = Error;
 
 const MAX_ATTEMPTS: u32 = 3;
+const LIST_MAX_KEYS: usize = 1000;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -623,13 +624,40 @@ impl S3Client {
     }
 
     /// Lists all logical keys under `prefix` through paginated ListObjectsV2.
-    pub fn list(&mut self, prefix: &str, mut each: impl FnMut(&str)) -> Result<usize, S3Error> {
-        if self.key_prefix.len() + prefix.len() > MAX_OBJECT_KEY_BYTES {
+    pub fn list(&mut self, prefix: &str, each: impl FnMut(&str)) -> Result<usize, S3Error> {
+        self.list_inner(prefix, "", None, each)
+    }
+
+    /// Lists a bounded, forward-only page of logical keys.
+    pub fn list_batch(
+        &mut self,
+        prefix: &str,
+        after: &str,
+        limit: usize,
+        each: impl FnMut(&str),
+    ) -> Result<usize, S3Error> {
+        if limit == 0 || (!after.is_empty() && !after.starts_with(prefix)) {
+            return Err(S3Error::Protocol("invalid bounded list range"));
+        }
+        self.list_inner(prefix, after, Some(limit), each)
+    }
+
+    fn list_inner(
+        &mut self,
+        prefix: &str,
+        after: &str,
+        limit: Option<usize>,
+        mut each: impl FnMut(&str),
+    ) -> Result<usize, S3Error> {
+        if self.key_prefix.len() + prefix.len() > MAX_OBJECT_KEY_BYTES
+            || self.key_prefix.len() + after.len() > MAX_OBJECT_KEY_BYTES
+        {
             return Err(S3Error::Protocol("list prefix exceeds S3 key limit"));
         }
         let mut count = 0;
         let mut continuation: Option<StackStr<1024>> = None;
-        let mut last_key: Option<StackStr<1024>> = None;
+        let mut last_key =
+            (!after.is_empty()).then(|| StackStr::<MAX_OBJECT_KEY_BYTES>::from_str(after));
         loop {
             let mut query = StackStr::<6400>::new();
             {
@@ -639,9 +667,18 @@ impl S3Client {
                     let _ = uri_encode(&mut query, token.as_str(), false);
                     let _ = query.write_char('&');
                 }
-                let _ = query.write_str("encoding-type=url&list-type=2&prefix=");
+                let _ = query.write_str("encoding-type=url&list-type=2");
+                if let Some(limit) = limit {
+                    let _ = write!(query, "&max-keys={}", (limit - count).min(LIST_MAX_KEYS));
+                }
+                let _ = query.write_str("&prefix=");
                 let _ = uri_encode(&mut query, &self.key_prefix, false);
                 let _ = uri_encode(&mut query, prefix, false);
+                if continuation.is_none() && !after.is_empty() {
+                    let _ = query.write_str("&start-after=");
+                    let _ = uri_encode(&mut query, &self.key_prefix, false);
+                    let _ = uri_encode(&mut query, after, false);
+                }
             }
             if query.is_truncated() {
                 return Err(S3Error::Protocol("list query overflow"));
@@ -682,6 +719,9 @@ impl S3Client {
                 {
                     return Err(S3Error::Protocol("listed keys are not strictly ordered"));
                 }
+                if limit.is_some_and(|limit| count == limit) {
+                    return Ok(count);
+                }
                 each(logical);
                 last_key = Some(StackStr::from_str(logical));
                 count += 1;
@@ -690,6 +730,9 @@ impl S3Client {
                     .ok_or(S3Error::Protocol("unterminated list key"))?
                     + 6;
                 rest = &rest[after..];
+            }
+            if limit.is_some_and(|limit| count == limit) {
+                return Ok(count);
             }
             if !truncated {
                 return Ok(count);
@@ -1981,6 +2024,49 @@ mod tests {
             2
         );
         assert_eq!(keys, ["p/a", "p/b"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_list_starts_after_the_last_consumed_key() {
+        fn response(xml: &str) -> &'static str {
+            Box::leak(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+                    xml.len(),
+                    xml
+                )
+                .into_boxed_str(),
+            )
+        }
+        let first = response(
+            "<ListBucketResult><IsTruncated>true</IsTruncated>\
+             <Contents><Key>p%2Fb</Key></Contents>\
+             <NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
+        );
+        let second = response(
+            "<ListBucketResult><IsTruncated>false</IsTruncated>\
+             <Contents><Key>p%2Fc</Key></Contents></ListBucketResult>",
+        );
+        let (port, server) = mock_server_sequence(vec![first, second], |page, head| {
+            let request = if page == 0 {
+                "GET /testbucket?encoding-type=url&list-type=2&max-keys=2&prefix=p%2F&start-after=p%2Fa HTTP/1.1"
+            } else {
+                "GET /testbucket?continuation-token=next&encoding-type=url&list-type=2&max-keys=1&prefix=p%2F HTTP/1.1"
+            };
+            assert!(head.contains(request));
+        });
+        let config = test_config(port);
+        let mut budget = Budget::new(1 << 20);
+        let mut client = S3Client::new(&config, &mut budget).unwrap();
+        let mut keys = Vec::new();
+        assert_eq!(
+            client
+                .list_batch("p/", "p/a", 2, |listed| keys.push(listed.to_string()))
+                .unwrap(),
+            2
+        );
+        assert_eq!(keys, ["p/b", "p/c"]);
         server.join().unwrap();
     }
 

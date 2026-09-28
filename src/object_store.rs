@@ -385,9 +385,8 @@ impl Client {
     }
 }
 
-/// Stable process-writer identity derived from the durable bucket and local
-/// journal identity. Ambiguous manifest CAS recovery uses this to distinguish
-/// its own lost response from another writer's publish.
+/// Stable database-system identity used by logical replication. Publication
+/// fencing uses a separate random process incarnation.
 pub(crate) fn writer_id(config: &Config) -> u64 {
     use crate::wal::crc32c::Crc32c;
 
@@ -482,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_identity_covers_endpoint_bucket_prefix_and_journal() {
+    fn replication_system_identity_covers_endpoint_bucket_prefix_and_journal() {
         let base = Config::default_dev();
         let baseline = writer_id(&base);
         for mutate in [

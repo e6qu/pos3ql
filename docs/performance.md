@@ -22,9 +22,10 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
 - Logical publications and subscriptions build independently durable read
   copies. They are asynchronous logical replicas, not transparent
   shared-storage replicas.
-- Several writable processes on one object prefix remain unsupported. Writer
-  fencing, ownership leases, automatic failover, and a read-only
-  shared-snapshot protocol do not exist.
+- One writer incarnation owns an object prefix at a time. Starting another
+  process promotes it through the durable writer fence and causes later
+  publishes by the displaced process to fail. Ownership leases, automatic
+  failure detection, and a read-only shared-snapshot protocol do not exist.
 - Eligible two-source equi-joins use a bounded hash build for physical tables,
   synthesized catalogs, and derived tables, including external runs. NULL keys,
   duplicate matches, residual ON predicates, and LEFT JOIN preservation share
@@ -501,6 +502,6 @@ startup-sized. Deletion is paced across batches rather than capped at one batch,
 and live-block membership probes use a sorted fixed buffer instead of a linear
 scan per listed object.
 Multi-core execution must preserve fixed memory, MVCC, lock ordering, group
-publication order, and explicit backpressure. Writer fencing and promotion
-safety must exist before any failover benchmark or active-active claim is
-meaningful.
+publication order, and explicit backpressure. Automatic failure detection and
+replica promotion policy must exist before any failover benchmark is
+meaningful; active-active writing remains outside the single-writer protocol.

@@ -5,6 +5,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
 
 - Object-native commit publication, checkpoints, crash recovery, and recovery
   with empty RAM and disk caches.
+- A durable writer fence serializes promotion with commit-head and manifest
+  publication. Startup uses a fresh random process incarnation, transitions
+  ownership, conditionally bumps both mutable roots, and only then becomes the
+  active writer. Stale root ETags reject delayed requests from the displaced
+  process; interrupted promotion and restart races are restartable.
 - Offline named backups retain checksummed manifest and commit-head roots in
   the configured object-store prefix. Checkpoint garbage collection walks all
   retained row and value-index block graphs and keeps commit batches from the

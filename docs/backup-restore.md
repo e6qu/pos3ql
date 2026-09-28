@@ -5,9 +5,10 @@ configured object-store prefix. The operation copies the published manifest
 and commit head under `backups/<name>/` and publishes a checksummed completion
 record last.
 
-Run every backup operation with the server stopped. Writer fencing is still a
-roadmap item, so the command cannot evict or fence a process that continues to
-use the same prefix.
+Each backup operation that opens the database promotes its own writer
+incarnation. A running server on the same prefix is fenced and its next durable
+publish fails with SQLSTATE `40001`. Coordinate these commands with traffic to
+avoid disrupting clients; restart the intended server after the operation.
 
 ```sh
 pos3ql --config /path/to/pos3ql.conf --backup before-upgrade
@@ -38,7 +39,8 @@ pin even though restore rejects it without the completion record.
 `--restore` replaces the live manifest and commit head with the named roots.
 A durable `restore-pending` marker makes the two-root replacement recoverable:
 ordinary server startup refuses the prefix until the offline restore command
-finishes. Before removing the marker, restore deletes `journal.wal`,
+finishes. Restore publishes that marker before promotion, then verifies writer
+ownership before each root replacement. Before removing the marker, restore deletes `journal.wal`,
 `block-cache`, and `clean.shutdown`, forcing recovery from object storage.
 Other operator-managed files below `data_dir`, including extension packages,
 are preserved. A successful restore can accept new commits and checkpoints,

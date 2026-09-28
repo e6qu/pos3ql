@@ -15,6 +15,166 @@ use crate::mem::budget::{Budget, BudgetError};
 use crate::object_store::http::S3Client;
 use crate::util::StackStr;
 
+pub(crate) const ACCESS_KEY_BYTES: usize = 128;
+pub(crate) const SECRET_KEY_BYTES: usize = 124;
+pub(crate) const SESSION_TOKEN_BYTES: usize = 2048;
+pub(crate) const CREDENTIAL_FILE_BYTES: usize = 4096;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Credentials {
+    access_key: StackStr<ACCESS_KEY_BYTES>,
+    secret_key: StackStr<SECRET_KEY_BYTES>,
+    session_token: StackStr<SESSION_TOKEN_BYTES>,
+}
+
+impl Credentials {
+    pub(crate) fn new(
+        access_key: &str,
+        secret_key: &str,
+        session_token: &str,
+    ) -> Result<Self, &'static str> {
+        if access_key.is_empty()
+            || access_key.len() > ACCESS_KEY_BYTES
+            || access_key.contains(['/', ','])
+            || !header_value(access_key)
+        {
+            return Err("bad object_store_access_key");
+        }
+        if secret_key.is_empty() || secret_key.len() > SECRET_KEY_BYTES {
+            return Err("bad object_store_secret_key");
+        }
+        if session_token.len() > SESSION_TOKEN_BYTES
+            || (!session_token.is_empty() && !header_value(session_token))
+        {
+            return Err("bad object_store_session_token");
+        }
+        Ok(Self {
+            access_key: StackStr::from_str(access_key),
+            secret_key: StackStr::from_str(secret_key),
+            session_token: StackStr::from_str(session_token),
+        })
+    }
+
+    pub(crate) fn from_config(config: &Config) -> Result<Self, &'static str> {
+        Self::new(
+            &config.object_store_access_key,
+            &config.object_store_secret_key,
+            &config.object_store_session_token,
+        )
+    }
+
+    pub(crate) fn access_key(&self) -> &str {
+        self.access_key.as_str()
+    }
+
+    pub(crate) fn secret_key(&self) -> &str {
+        self.secret_key.as_str()
+    }
+
+    pub(crate) fn session_token(&self) -> &str {
+        self.session_token.as_str()
+    }
+}
+
+fn header_value(value: &str) -> bool {
+    value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CredentialFileError(StackStr<256>);
+
+impl std::fmt::Display for CredentialFileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0.as_str())
+    }
+}
+
+impl std::error::Error for CredentialFileError {}
+
+pub(crate) fn load_credentials_file(path: &str) -> Result<Credentials, CredentialFileError> {
+    use core::fmt::Write as _;
+    use std::io::Read as _;
+
+    let fail = |message: &str| CredentialFileError(StackStr::from_str(message));
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        let mut message = StackStr::<256>::new();
+        let _ = write!(message, "cannot open object-store credential file: {error}");
+        CredentialFileError(message)
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        let mut message = StackStr::<256>::new();
+        let _ = write!(
+            message,
+            "cannot inspect object-store credential file: {error}"
+        );
+        CredentialFileError(message)
+    })?;
+    if !metadata.is_file() {
+        return Err(fail("object-store credential path is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.mode() & 0o077 != 0 {
+            return Err(fail(
+                "object-store credential file must not grant group or other permissions",
+            ));
+        }
+    }
+
+    let mut bytes = [0u8; CREDENTIAL_FILE_BYTES + 1];
+    let mut length = 0usize;
+    loop {
+        if length == bytes.len() {
+            return Err(fail("object-store credential file exceeds 4096 bytes"));
+        }
+        match file.read(&mut bytes[length..]) {
+            Ok(0) => break,
+            Ok(count) => length += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                let mut message = StackStr::<256>::new();
+                let _ = write!(message, "cannot read object-store credential file: {error}");
+                return Err(CredentialFileError(message));
+            }
+        }
+    }
+    let text = core::str::from_utf8(&bytes[..length])
+        .map_err(|_| fail("object-store credential file is not UTF-8"))?;
+    parse_credentials_file(text).map_err(fail)
+}
+
+fn parse_credentials_file(text: &str) -> Result<Credentials, &'static str> {
+    let mut access_key = None;
+    let mut secret_key = None;
+    let mut session_token = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = line
+            .split_once('=')
+            .ok_or("credential line must be name = value")?;
+        let name = name.trim();
+        let value = value.trim();
+        let destination = match name {
+            "access_key" => &mut access_key,
+            "secret_key" => &mut secret_key,
+            "session_token" => &mut session_token,
+            _ => return Err("unknown object-store credential name"),
+        };
+        if destination.replace(value).is_some() {
+            return Err("duplicate object-store credential name");
+        }
+    }
+    Credentials::new(
+        access_key.ok_or("object-store credential file requires access_key")?,
+        secret_key.ok_or("object-store credential file requires secret_key")?,
+        session_token.unwrap_or(""),
+    )
+}
+
 /// S3 object keys are at most 1,024 bytes. Both concrete clients enforce the
 /// same provider-neutral boundary before issuing or simulating an operation.
 pub(crate) const MAX_OBJECT_KEY_BYTES: usize = 1024;
@@ -284,6 +444,19 @@ impl Client {
         }
     }
 
+    pub(crate) fn replace_credentials(&mut self, credentials: Credentials) {
+        if let Self::S3(client) = self {
+            client.replace_credentials(credentials);
+        }
+    }
+
+    pub(crate) fn credentials(&self) -> Option<Credentials> {
+        match self {
+            Self::S3(client) => Some(client.credentials()),
+            Self::Simulator(_) => None,
+        }
+    }
+
     pub(crate) fn put(
         &mut self,
         key: &str,
@@ -406,6 +579,62 @@ pub(crate) fn writer_id(config: &Config) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_file_is_strict_and_allocation_free_to_load() {
+        let path = std::env::temp_dir().join(format!(
+            "pos3ql-credentials-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &path,
+            b"# rotated atomically\naccess_key = next-access\nsecret_key = next-secret\nsession_token = next-token\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let credentials = crate::mem::guard::forbid_alloc(|| {
+            load_credentials_file(path.to_str().unwrap()).unwrap()
+        });
+        assert_eq!(credentials.access_key(), "next-access");
+        assert_eq!(credentials.secret_key(), "next-secret");
+        assert_eq!(credentials.session_token(), "next-token");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                load_credentials_file(path.to_str().unwrap())
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("group or other permissions")
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn credential_file_rejects_ambiguous_and_unsafe_input() {
+        assert_eq!(
+            parse_credentials_file("access_key=a\naccess_key=b\nsecret_key=s\n")
+                .err()
+                .unwrap(),
+            "duplicate object-store credential name"
+        );
+        assert_eq!(
+            parse_credentials_file("access_key=a\nsecret_key=s\nunexpected=value\n")
+                .err()
+                .unwrap(),
+            "unknown object-store credential name"
+        );
+        assert!(Credentials::new("bad/key", "secret", "").is_err());
+        assert!(Credentials::new("access", "secret", "bad\nheader").is_err());
+    }
 
     fn simulated() -> Client {
         let mut config = Config::default_dev();

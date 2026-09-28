@@ -63,6 +63,24 @@ STLS_PORT=$(select_port "${POS3QL_TLS_PORT:-}" 15520 15540) || exit 1
 WORK=$(mktemp -d /tmp/pos3ql-external.XXXXXX)
 PASS=0
 FAIL=0
+SERVER_CREDENTIALS_FILE="$WORK/object-store-credentials"
+POS3QL_CREDENTIALS_FILE="$WORK/pos3ql-credentials"
+
+write_credentials() { # <path> <access key> <secret key> [session token]
+  local path=$1 access=$2 secret=$3 token=${4:-}
+  local temporary="${path}.tmp"
+  umask 077
+  {
+    printf 'access_key = %s\n' "$access"
+    printf 'secret_key = %s\n' "$secret"
+    [[ -n "$token" ]] && printf 'session_token = %s\n' "$token"
+  } > "$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$path"
+}
+
+write_credentials "$SERVER_CREDENTIALS_FILE" "$S3_TEST_ACCESS_KEY" "$S3_TEST_SECRET_KEY"
+write_credentials "$POS3QL_CREDENTIALS_FILE" "$S3_TEST_ACCESS_KEY" "$S3_TEST_SECRET_KEY"
 
 # The suite is sharded on CI so no job runs past its time budget:
 # POS3QL_RUN_GROUPS selects a comma-separated subset of the step groups
@@ -174,7 +192,8 @@ ok "build"
 step "start S3-compatible test server"
 python3 "$EXT/s3_test_server.py" --root "$WORK/object-store" --port "$S3_TEST_PORT" \
   --bucket "$S3_TEST_BUCKET" --region "$S3_TEST_REGION" \
-  --access-key "$S3_TEST_ACCESS_KEY" --secret-key "$S3_TEST_SECRET_KEY" --page-size 7 \
+  --access-key "$S3_TEST_ACCESS_KEY" --secret-key "$S3_TEST_SECRET_KEY" \
+  --credentials-file "$SERVER_CREDENTIALS_FILE" --page-size 7 \
   > "$WORK/object-store.log" 2>&1 &
 S3_TEST_PID=$!
 for _ in {1..50}; do
@@ -210,8 +229,7 @@ object_store_endpoint = 127.0.0.1:${S3_TEST_PORT}
 object_store_bucket = ${S3_TEST_BUCKET}
 object_store_prefix = ${object_prefix}
 object_store_region = ${S3_TEST_REGION}
-object_store_access_key = ${S3_TEST_ACCESS_KEY}
-object_store_secret_key = ${S3_TEST_SECRET_KEY}
+object_store_credentials_file = ${POS3QL_CREDENTIALS_FILE}
 wal_upload = on
 wal_upload_sync = on
 sql_arena_bytes = 32MiB
@@ -249,6 +267,58 @@ if POS3QL_PORT=$PG_PORT POS3QL_OPERATIONS_PORT=$OPERATIONS_PORT \
 else
   bad "operational HTTP endpoints"
   cat "$WORK/operations.out"
+fi
+
+step "atomic object-store credential rotation"
+ROTATED_ACCESS=pos3ql-rotated-access
+ROTATED_SECRET=pos3ql-rotated-secret
+write_credentials "$POS3QL_CREDENTIALS_FILE" "$ROTATED_ACCESS" "$ROTATED_SECRET"
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
+  -c "SELECT pg_reload_conf()" >/dev/null
+for _ in {1..50}; do
+  [[ $(curl --silent --output /dev/null --write-out '%{http_code}' \
+      "http://127.0.0.1:${OPERATIONS_PORT}/readyz") == 503 ]] && break
+  sleep 0.05
+done
+failed_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
+if [[ "$failed_metrics" == *"pos3ql_object_store_credential_reload_failures_total 1"* ]]; then
+  ok "invalid candidate retained old credentials and made readiness explicit"
+else
+  bad "credential candidate failure was not observable"
+fi
+
+write_credentials "$SERVER_CREDENTIALS_FILE" "$ROTATED_ACCESS" "$ROTATED_SECRET"
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
+  -c "SELECT pg_reload_conf()" >/dev/null
+for _ in {1..50}; do
+  [[ $(curl --silent --output /dev/null --write-out '%{http_code}' \
+      "http://127.0.0.1:${OPERATIONS_PORT}/readyz") == 200 ]] && break
+  sleep 0.05
+done
+rotated_metrics=$(curl --fail --silent "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
+if [[ "$rotated_metrics" == *"pos3ql_object_store_credential_reload_successes_total 1"* ]] \
+  && "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
+       -c "CREATE TABLE credential_rotation (id int); INSERT INTO credential_rotation VALUES (1); CHECKPOINT"; then
+  ok "new credentials validated, installed and used for durable work"
+else
+  bad "credential rotation did not complete"
+fi
+
+# Restore the fixture identity used by the rest of this broad external suite.
+write_credentials "$SERVER_CREDENTIALS_FILE" "$S3_TEST_ACCESS_KEY" "$S3_TEST_SECRET_KEY"
+write_credentials "$POS3QL_CREDENTIALS_FILE" "$S3_TEST_ACCESS_KEY" "$S3_TEST_SECRET_KEY"
+kill -HUP "$SERVER_PID"
+for _ in {1..50}; do
+  restored_metrics=$(curl --fail --silent \
+    "http://127.0.0.1:${OPERATIONS_PORT}/metrics")
+  [[ "$restored_metrics" == *"pos3ql_object_store_credential_reload_successes_total 2"* ]] \
+    && break
+  sleep 0.05
+done
+if [[ "$restored_metrics" == *"pos3ql_object_store_credential_reload_successes_total 2"* ]]; then
+  ok "SIGHUP reloaded the restored credentials"
+else
+  bad "SIGHUP credential reload was not observable"
 fi
 
 restart_main_server() { # <fixture name>

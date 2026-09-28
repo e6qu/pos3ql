@@ -291,6 +291,8 @@ pub struct Config {
     pub object_store_secret_key: String,
     /// Optional temporary-credential session token.
     pub object_store_session_token: String,
+    /// Owner-only file reloaded for allocation-free credential rotation.
+    pub object_store_credentials_file: String,
     /// Standard S3 bucket addressing used for every request.
     pub object_store_addressing: ObjectStoreAddressing,
     /// Request/response head assembly buffer.
@@ -461,6 +463,7 @@ impl Config {
             object_store_access_key: String::new(),
             object_store_secret_key: String::new(),
             object_store_session_token: String::new(),
+            object_store_credentials_file: String::new(),
             object_store_addressing: ObjectStoreAddressing::Path,
             object_store_head_bytes: 16 * KIB,
             object_store_response_bytes: 4 * MIB,
@@ -477,6 +480,39 @@ impl Config {
             collation_scratch_bytes: 256 * KIB,
             #[cfg(test)]
             test_data_dir_cleanup: None,
+        }
+    }
+
+    /// Loads an owner-only credential file before runtime allocation freezes.
+    /// The path remains configured so the server can atomically reload it.
+    pub fn resolve_object_store_credentials(&mut self) -> Result<(), String> {
+        if !self.object_store_on
+            || self.object_store_sim
+            || self.object_store_credentials_file.is_empty()
+        {
+            return Ok(());
+        }
+        let credentials =
+            crate::object_store::load_credentials_file(&self.object_store_credentials_file)
+                .map_err(|error| error.to_string())?;
+        self.object_store_access_key = credentials.access_key().to_string();
+        self.object_store_secret_key = credentials.secret_key().to_string();
+        self.object_store_session_token = credentials.session_token().to_string();
+        Ok(())
+    }
+
+    pub fn clear_object_store_credentials(&mut self) {
+        for value in [
+            &mut self.object_store_access_key,
+            &mut self.object_store_secret_key,
+            &mut self.object_store_session_token,
+        ] {
+            // Zero is valid UTF-8. Volatile writes keep the scrub observable
+            // even though the String is released immediately afterwards.
+            for byte in unsafe { value.as_mut_vec() } {
+                unsafe { core::ptr::write_volatile(byte, 0) };
+            }
+            value.clear();
         }
     }
 
@@ -988,6 +1024,9 @@ impl Config {
                 "object_store_session_token" => {
                     config.object_store_session_token = value.to_string()
                 }
+                "object_store_credentials_file" => {
+                    config.object_store_credentials_file = value.to_string()
+                }
                 "object_store_addressing" => {
                     config.object_store_addressing = match value {
                         "path" => ObjectStoreAddressing::Path,
@@ -1127,19 +1166,51 @@ impl Config {
                 for (name, value) in [
                     ("object_store_bucket", config.object_store_bucket.as_str()),
                     ("object_store_region", config.object_store_region.as_str()),
-                    (
-                        "object_store_access_key",
-                        config.object_store_access_key.as_str(),
-                    ),
-                    (
-                        "object_store_secret_key",
-                        config.object_store_secret_key.as_str(),
-                    ),
                 ] {
                     if value.is_empty() {
                         return Err(ConfigError::at(
                             0,
                             format!("object_store = on requires {name}"),
+                        ));
+                    }
+                }
+                if config.object_store_credentials_file.is_empty() {
+                    for (name, value) in [
+                        (
+                            "object_store_access_key",
+                            config.object_store_access_key.as_str(),
+                        ),
+                        (
+                            "object_store_secret_key",
+                            config.object_store_secret_key.as_str(),
+                        ),
+                    ] {
+                        if value.is_empty() {
+                            return Err(ConfigError::at(
+                                0,
+                                format!(
+                                    "object_store = on requires {name} or object_store_credentials_file"
+                                ),
+                            ));
+                        }
+                    }
+                } else {
+                    if config.object_store_credentials_file.len()
+                        > crate::object_store::CREDENTIAL_FILE_BYTES
+                    {
+                        return Err(ConfigError::at(
+                            0,
+                            "object_store_credentials_file exceeds 4096 bytes".to_string(),
+                        ));
+                    }
+                    if !config.object_store_access_key.is_empty()
+                        || !config.object_store_secret_key.is_empty()
+                        || !config.object_store_session_token.is_empty()
+                    {
+                        return Err(ConfigError::at(
+                            0,
+                            "object_store_credentials_file cannot be combined with inline object-store credentials"
+                                .to_string(),
                         ));
                     }
                 }
@@ -1913,6 +1984,23 @@ sql_arena_bytes = 4096
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn credential_file_excludes_inline_object_store_secrets() {
+        let file = Config::parse(
+            "object_store = on\nobject_store_bucket = bucket\nobject_store_region = region\nobject_store_credentials_file = /run/credentials/pos3ql\n",
+        )
+        .unwrap();
+        assert_eq!(
+            file.object_store_credentials_file,
+            "/run/credentials/pos3ql"
+        );
+        let mixed = Config::parse(
+            "object_store = on\nobject_store_bucket = bucket\nobject_store_region = region\nobject_store_credentials_file = /run/credentials/pos3ql\nobject_store_access_key = access\n",
+        )
+        .unwrap_err();
+        assert!(mixed.message.contains("cannot be combined"));
     }
 
     #[test]

@@ -508,6 +508,10 @@ cargo run --release -- --config examples/dev.conf
 psql -h 127.0.0.1 -p 5433 -U you
 ```
 
+Versioned Linux release archives include a checksum, starter configuration,
+systemd unit, and operator documentation. See the
+[installation guide](packaging/README.md).
+
 ## Project documents
 
 - [PLAN.md](PLAN.md) — completion roadmap

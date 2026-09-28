@@ -12,6 +12,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Build and install-test release archive
+        run: |
+          tools/package-release.sh "$RUNNER_TEMP/dist"
+          tools/test-release-package.sh "$RUNNER_TEMP"/dist/pos3ql-*.tar.gz
+
+      - name: Upload release-package evidence
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-package
+          path: ${{ runner.temp }}/dist/
+
   build-and-check:
     runs-on: ubuntu-latest
     timeout-minutes: 15

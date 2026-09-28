@@ -37,7 +37,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let (config, operation) = load_config()?;
+    let (mut config, operation) = load_config()?;
+    config.resolve_object_store_credentials()?;
     pos3ql::logging::configure(config.log_format);
     match operation {
         Operation::Serve => {}
@@ -63,8 +64,11 @@ fn run() -> Result<(), String> {
             name,
             destination_config,
         } => {
-            let destination = load_config_file(&destination_config)?;
-            let lsn = pos3ql::operations::export_backup(&config, &destination, &name)?;
+            let mut destination = load_config_file(&destination_config)?;
+            destination.resolve_object_store_credentials()?;
+            let result = pos3ql::operations::export_backup(&config, &destination, &name);
+            destination.clear_object_store_credentials();
+            let lsn = result?;
             println!("backup {name} exported at LSN {lsn}");
             return Ok(());
         }
@@ -140,9 +144,15 @@ fn run() -> Result<(), String> {
         } else {
             0
         };
+    let log_format = config.log_format;
+    // Object-store credentials have been copied into fixed client storage.
+    // Release the startup configuration before freezing the allocator so its
+    // secret-bearing Strings do not remain resident for the process lifetime.
+    config.clear_object_store_credentials();
+    drop(config);
     mem::guard::set_tls_budget(tls_budget as u64);
     mem::guard::freeze();
-    if config.log_format == LogFormat::Json {
+    if log_format == LogFormat::Json {
         pos3ql::logging::info_args(
             "startup_complete",
             format_args!(

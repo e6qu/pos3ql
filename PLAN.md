@@ -72,10 +72,12 @@ next publication with SQLSTATE `40001`; delayed root requests and interrupted
 or competing restarts are covered. Legacy unfenced prefixes promote in place.
 
 This is not yet a production-complete topology: one process serializes query
-execution; automatic failure detection, secure credential rotation, packaging,
-and representative long-run performance evidence remain open. A separately
-bounded operational listener now exposes health, readiness, metrics, and
-capacity, with structured logs and a controlled-replacement runbook.
+execution; automatic failure detection and representative long-run performance
+evidence remain open. A separately bounded operational listener exposes health,
+readiness, metrics, and capacity, with structured logs and a
+controlled-replacement runbook. Object-store credentials rotate through a
+validated owner-only file, and tagged releases produce an install-tested Linux
+archive with checksums and service files.
 
 ## Remaining production work
 
@@ -231,9 +233,22 @@ memory. Durable readiness validates current writer-fence ownership through the
 provider-neutral object client as well as observed publication health;
 liveness remains a local event-loop probe.
 
-- Add secure credential rotation and release packaging. Exercise operator
-  recovery paths end to end, including automatic failure detection and
-  controlled promotion of a replacement process.
+Object-store credentials can come from a strict owner-only file. `SIGHUP` and
+`pg_reload_conf()` parse a candidate into fixed buffers and conditionally renew
+the writer fence before every root and block client adopts it. Failure retains
+the installed credential, makes readiness false, and records a secret-free log
+and metric. The external suite covers rejected and successful candidates,
+durable work after old-credential revocation, and rotation back by signal.
+
+Tagged releases build a locked Linux x86-64 executable, deterministic tarball,
+and SHA-256 file. The archive contains a starter configuration, hardened
+systemd unit, license, and operator documentation. Pull-request and tag CI
+extract the archive, execute the packaged binary, start it from the packaged
+configuration, probe liveness, and verify graceful shutdown.
+
+- Exercise the remaining operator recovery paths end to end, including
+  automatic failure detection and controlled promotion of a replacement
+  process.
 
 ### Concurrent execution
 

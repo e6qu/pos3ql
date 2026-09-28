@@ -467,6 +467,13 @@ publishing their single buffered row as a temporary object. They now consume
 that row directly from the startup-sized external-sort chunk. Memory-plan
 regression coverage accounts for the role images alongside policy definitions
 and stored-query dependencies.
+The credential-rotation and release-package audit found no external blocker.
+Object-store credentials now reload from an owner-only bounded file only after
+the candidate renews the current writer fence; failures retain the installed
+credential and make readiness, logs, and metrics explicit. The external suite
+rotates through rejection, old-credential revocation, durable checkpoint work,
+and SIGHUP restoration. Tagged Linux archives are checksummed and exercised
+from extraction through startup, liveness, and graceful shutdown in CI.
 The full-text value-width audit found no external blocker. Vector lexemes,
 positions, query nodes, ranking operands, headline words, and set-returning
 state now use statement memory, while binary output and index folding stream

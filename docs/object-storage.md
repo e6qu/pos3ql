@@ -79,9 +79,19 @@ Implementation refactors must not change the profile.
 The direct client uses HTTP over TLS, S3 virtual-hosted or path-style bucket
 addressing, and S3 Signature Version 4 as the shared request-signing
 protocol. Configuration supplies an endpoint, region/signing scope, bucket,
-access key, secret key, and optional temporary session token. Credential
-discovery through a vendor SDK, instance metadata service, or provider control
-plane is outside the engine.
+and either direct credentials or an owner-only `object_store_credentials_file`.
+The file contains strict `access_key`, `secret_key`, and optional
+`session_token` entries. Credential discovery through a vendor SDK, instance
+metadata service, or provider control plane is outside the engine.
+
+The server can reload the file after atomic replacement through `SIGHUP` or
+`pg_reload_conf()`. It parses into fixed buffers, rejects unsafe permissions,
+validates the candidate by conditionally renewing the live writer fence, and
+only then installs it in every root, write, and read client. A failed candidate
+leaves the prior credentials installed, marks readiness false, increments the
+failure metric, and logs an error without secret material. Operators must keep
+old and new credentials valid during the validation window and revoke the old
+credential after readiness returns.
 
 Request slots, signing state, retry state, response headers, XML list/error
 decoding, and page buffers are fixed at startup. Retries are limited to typed

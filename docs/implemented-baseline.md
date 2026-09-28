@@ -10,6 +10,13 @@ active production roadmap is [PLAN.md](../PLAN.md).
   ownership, conditionally bumps both mutable roots, and only then becomes the
   active writer. Stale root ETags reject delayed requests from the displaced
   process; interrupted promotion and restart races are restartable.
+- Owner-only object-store credential files reload through `SIGHUP` or
+  `pg_reload_conf()` without runtime allocation. Candidate credentials renew
+  the live writer fence before installation across all object clients; failure
+  retains the installed credential while readiness, metrics, and secret-free
+  logs expose the rejected rotation. Tagged releases produce a checksummed,
+  install-tested Linux archive with the executable, starter configuration,
+  systemd unit, license, and operator documentation.
 - Offline named backups retain checksummed manifest and commit-head roots in
   the configured object-store prefix. Checkpoint garbage collection walks all
   retained row and value-index block graphs and keeps commit batches from the

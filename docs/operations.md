@@ -25,7 +25,7 @@ runtime memory.
 | `/readyz` | 200 | Startup completed, durable progress is healthy, and the process still owns the writer fence. |
 | `/readyz` | 503 | WAL or checkpoint progress failed, the object store is unavailable, or another process owns the writer fence. |
 | `/metrics` | 200 | Prometheus text metrics for current readiness, connections, WAL, row memory, checkpoint pressure, cache traffic, and immutable-block object requests. |
-| `/capacity` | 200 | JSON containing current use and startup limits for memory, connections, WAL, the row heap, caches, catalogs, prepared transactions, and replication. |
+| `/capacity` | 200 | JSON containing current use and startup limits for memory, connections, WAL, the row heap, caches, catalogs, prepared transactions, replication, and whether credential rotation is configured. |
 
 Only `GET` with HTTP/1.0 or HTTP/1.1 is accepted. Unknown paths and methods
 fail explicitly. Responses disable caching and close the connection.
@@ -45,6 +45,8 @@ are:
 
 - `pos3ql_up == 0`: the process or operational listener is unreachable.
 - `pos3ql_ready == 0`: stop routing new work and inspect publication errors.
+- `pos3ql_object_store_credential_reload_failures_total` increases: correct
+  the candidate credential file and reload it before routing resumes.
 - PostgreSQL connections approaching `pos3ql_postgres_connection_capacity`:
   raise the startup limit or reduce client concurrency.
 - WAL or row-heap use approaching its capacity: inspect checkpoint progress
@@ -62,6 +64,45 @@ commit-batch, LIST, DELETE, and storage-service-internal requests.
 emits one JSON object per line with `timestamp_unix_ms`, `level`, `event`, and
 `message`. Runtime formatting uses fixed stack buffers after memory freezes.
 Database credentials and object-store secret material are not logged.
+
+## Object-store credential rotation
+
+Prefer `object_store_credentials_file` over inline credential settings. The
+file must be a regular UTF-8 file no larger than 4 KiB and must grant no group
+or other permissions. Its format is:
+
+```text
+access_key = example-access
+secret_key = example-secret
+session_token = optional-temporary-token
+```
+
+Rotate without interrupting durable work:
+
+1. Grant the replacement credential access to the configured bucket and
+   prefix while the current credential remains valid.
+2. Write the complete replacement file beside the configured path with mode
+   `0600`, then rename it over the configured path atomically.
+3. Send `SIGHUP` to the server or execute `SELECT pg_reload_conf()`.
+4. Wait for `/readyz` to return 200 and for
+   `pos3ql_object_store_credential_reload_successes_total` to increase.
+5. Revoke the prior credential and confirm durable writes and checkpoints
+   continue.
+
+The candidate is parsed without runtime allocation and tested by a conditional
+writer-fence renewal before any client adopts it. Invalid permissions, syntax,
+authentication, connectivity, or lost writer ownership retain the installed
+credential, make readiness return 503, increment the failure counter, and emit
+an error without credential values. Correct the file and reload again.
+
+## Release archive
+
+Tagged releases publish a versioned Linux x86-64 archive and adjacent SHA-256
+file. The archive contains the executable, starter configuration, systemd unit,
+license, roadmap, and operator documentation. CI extracts the same archive,
+runs its executable, starts it from the packaged configuration, probes
+`/livez`, and verifies graceful shutdown. Installation steps are in
+[`packaging/README.md`](../packaging/README.md).
 
 ## Controlled replacement
 

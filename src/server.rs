@@ -30,6 +30,7 @@ const OPERATIONS_RESPONSE_BYTES: usize = 16 * 1024;
 
 /// Set by the signal handler; the loop drains and exits when it sees this.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Write end of the self-pipe, written by the signal handler to wake the
 /// reactor. -1 until installed.
 static SHUTDOWN_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
@@ -40,6 +41,17 @@ extern "C" fn on_signal(_sig: libc::c_int) {
     if fd >= 0 {
         let byte = [1u8];
         // Async-signal-safe: a single write of one byte.
+        unsafe {
+            libc::write(fd, byte.as_ptr().cast(), 1);
+        }
+    }
+}
+
+extern "C" fn on_reload_signal(_sig: libc::c_int) {
+    RELOAD_REQUESTED.store(true, Ordering::SeqCst);
+    let fd = SHUTDOWN_PIPE_WRITE.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = [2u8];
         unsafe {
             libc::write(fd, byte.as_ptr().cast(), 1);
         }
@@ -74,6 +86,8 @@ pub struct Server {
     memory_reserved_bytes: usize,
     durability_ready: bool,
     ownership_ready: bool,
+    credentials_ready: bool,
+    credentials_file: crate::util::StackStr<{ crate::object_store::CREDENTIAL_FILE_BYTES }>,
 }
 
 struct Slot {
@@ -97,6 +111,8 @@ struct OperationsMetrics {
     postgres_closed: u64,
     http_requests: u64,
     http_errors: u64,
+    credential_reload_successes: u64,
+    credential_reload_failures: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -115,6 +131,7 @@ struct CapacityLimits {
     replication_slots: usize,
     subscriptions: usize,
     object_store: bool,
+    credential_rotation: bool,
     tls_budget_bytes: usize,
 }
 
@@ -721,13 +738,17 @@ impl Server {
         reactor
             .register_read_oneshot(pipe_fds[0], SHUTDOWN_TOKEN)
             .map_err(|e| ServerSetupError::Io("register shutdown pipe", e))?;
-        // Install handlers for SIGTERM and SIGINT.
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        RELOAD_REQUESTED.store(false, Ordering::SeqCst);
+        // Install handlers for SIGTERM, SIGINT, and credential reload.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = on_signal as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
             libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+            sa.sa_sigaction = on_reload_signal as *const () as usize;
+            libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
         }
 
         let mode = match config.auth.as_str() {
@@ -822,6 +843,7 @@ impl Server {
                 replication_slots: config.max_replication_slots,
                 subscriptions: config.max_subscriptions,
                 object_store: config.object_store_on,
+                credential_rotation: !config.object_store_credentials_file.is_empty(),
                 tls_budget_bytes: config.tls_pool_bytes
                     + Self::extra_tls_pool_bytes(config)
                     + if config.tls_on {
@@ -833,6 +855,10 @@ impl Server {
             memory_reserved_bytes,
             durability_ready: true,
             ownership_ready: true,
+            credentials_ready: true,
+            credentials_file: crate::util::StackStr::from_str(
+                &config.object_store_credentials_file,
+            ),
         })
     }
 
@@ -953,6 +979,11 @@ impl Server {
                 self.process_committed_side_effects();
                 self.pump_replication_streams();
                 self.reconcile_subscriptions()?;
+            }
+            if RELOAD_REQUESTED.swap(false, Ordering::SeqCst)
+                || self.engine.take_object_store_credentials_reload()
+            {
+                self.reload_object_store_credentials();
             }
             self.close_expired_terminations();
             self.engine
@@ -2434,12 +2465,12 @@ impl Server {
                 } else {
                     self.operations_metrics.http_errors =
                         self.operations_metrics.http_errors.saturating_add(1);
-                    self.queue_operations_response(
-                        index,
-                        503,
-                        "application/json",
-                        "{\"status\":\"not_ready\",\"reason\":\"durable_progress_unavailable\"}\n",
-                    );
+                    let body = if !self.credentials_ready {
+                        "{\"status\":\"not_ready\",\"reason\":\"object_store_credentials_unavailable\"}\n"
+                    } else {
+                        "{\"status\":\"not_ready\",\"reason\":\"durable_progress_unavailable\"}\n"
+                    };
+                    self.queue_operations_response(index, 503, "application/json", body);
                 }
             }
             OperationsEndpoint::Metrics => {
@@ -2474,7 +2505,58 @@ impl Server {
     }
 
     fn ready(&self) -> bool {
-        self.durability_ready && self.ownership_ready
+        self.durability_ready && self.ownership_ready && self.credentials_ready
+    }
+
+    fn reload_object_store_credentials(&mut self) {
+        if self.credentials_file.is_empty() {
+            return;
+        }
+        if self.engine.object_store_reads_busy() {
+            RELOAD_REQUESTED.store(true, Ordering::SeqCst);
+            return;
+        }
+        let credentials =
+            match crate::object_store::load_credentials_file(self.credentials_file.as_str()) {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    self.credentials_ready = false;
+                    self.operations_metrics.credential_reload_failures = self
+                        .operations_metrics
+                        .credential_reload_failures
+                        .saturating_add(1);
+                    crate::logging::error_args(
+                        "object_store_credentials_reload_failed",
+                        format_args!("{error}"),
+                    );
+                    return;
+                }
+            };
+        match self.engine.rotate_object_store_credentials(credentials) {
+            Ok(()) => {
+                self.credentials_ready = true;
+                self.ownership_ready = true;
+                self.operations_metrics.credential_reload_successes = self
+                    .operations_metrics
+                    .credential_reload_successes
+                    .saturating_add(1);
+                crate::logging::info(
+                    "object_store_credentials_reloaded",
+                    "object-store credentials validated and installed",
+                );
+            }
+            Err(_) => {
+                self.credentials_ready = false;
+                self.operations_metrics.credential_reload_failures = self
+                    .operations_metrics
+                    .credential_reload_failures
+                    .saturating_add(1);
+                crate::logging::error(
+                    "object_store_credentials_reload_failed",
+                    "candidate failed writer-fence validation; installed credentials retained",
+                );
+            }
+        }
     }
 
     fn refresh_writer_readiness(&mut self) {
@@ -2516,6 +2598,10 @@ pos3ql_postgres_connections_closed_total {}\n\
 pos3ql_operational_http_requests_total {}\n\
 # TYPE pos3ql_operational_http_errors_total counter\n\
 pos3ql_operational_http_errors_total {}\n\
+# TYPE pos3ql_object_store_credential_reload_successes_total counter\n\
+pos3ql_object_store_credential_reload_successes_total {}\n\
+# TYPE pos3ql_object_store_credential_reload_failures_total counter\n\
+pos3ql_object_store_credential_reload_failures_total {}\n\
 # TYPE pos3ql_wal_used_bytes gauge\n\
 pos3ql_wal_used_bytes {}\n\
 # TYPE pos3ql_core_memory_budget_bytes gauge\n\
@@ -2555,6 +2641,8 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
             self.operations_metrics.postgres_closed,
             self.operations_metrics.http_requests,
             self.operations_metrics.http_errors,
+            self.operations_metrics.credential_reload_successes,
+            self.operations_metrics.credential_reload_failures,
             snapshot.wal_used_bytes,
             self.memory_reserved_bytes,
             self.capacity_limits.tls_budget_bytes,
@@ -2581,7 +2669,7 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
         let operations_used = limits.operations_connections - self.operations_free.len();
         let _ = writeln!(
             out,
-            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{}}}",
+            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{},\"credential_rotation\":{}}}",
             self.memory_reserved_bytes,
             limits.tls_budget_bytes,
             limits.postgres_connections,
@@ -2602,6 +2690,7 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
             limits.replication_slots,
             limits.subscriptions,
             limits.object_store,
+            limits.credential_rotation,
         );
     }
 

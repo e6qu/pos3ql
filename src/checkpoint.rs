@@ -1810,6 +1810,34 @@ impl Checkpointer {
         Ok(())
     }
 
+    pub(crate) fn rotate_credentials(
+        &mut self,
+        credentials: crate::object_store::Credentials,
+    ) -> Result<(), SqlError> {
+        if self.blocks.borrow().async_reads_busy() {
+            return Err(sql_err!(
+                SQLSTATE_IO,
+                "object-store credential rotation is waiting for active reads"
+            ));
+        }
+        let previous = self.client.credentials().ok_or_else(|| {
+            sql_err!(
+                SQLSTATE_IO,
+                "object-store credential rotation is unavailable for the simulator"
+            )
+        })?;
+        self.client.replace_credentials(credentials);
+        if let Err(error) = self.assert_writer() {
+            self.client.replace_credentials(previous);
+            return Err(error);
+        }
+        self.blocks
+            .borrow_mut()
+            .base_mut()
+            .replace_credentials(credentials);
+        Ok(())
+    }
+
     /// Publishes one immutable committed journal batch, keyed by its first
     /// LSN.  The local journal is a cache; cold recovery obtains this tail
     /// from object storage after loading the manifest.

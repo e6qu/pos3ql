@@ -17,7 +17,7 @@ use crate::crypto::sha256::{HexDigest, sha256};
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
 use crate::object_store::{
-    ByteRange, EntityTag, Error, GetResult, MAX_OBJECT_KEY_BYTES, Precondition,
+    ByteRange, Credentials, EntityTag, Error, GetResult, MAX_OBJECT_KEY_BYTES, Precondition,
 };
 use crate::stack_format;
 use crate::util::StackStr;
@@ -151,9 +151,7 @@ pub struct S3Client {
     bucket: String,
     key_prefix: String,
     region: String,
-    access_key: String,
-    secret_key: String,
-    session_token: String,
+    credentials: Credentials,
     addressing: ObjectStoreAddressing,
     stream: Option<tls::Transport>,
     /// TLS client state when object-store TLS is on (built at startup).
@@ -204,10 +202,6 @@ fn system_clock() -> i64 {
         .as_secs() as i64
 }
 
-fn header_value(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
-}
-
 fn valid_bucket(bucket: &str) -> bool {
     let bytes = bucket.as_bytes();
     (3..=63).contains(&bytes.len())
@@ -235,27 +229,21 @@ impl S3Client {
                 "must be a 3..=63 byte DNS-compatible S3 bucket name",
             ));
         }
-        if !header_value(&config.object_store_region)
+        if config.object_store_region.is_empty()
+            || !config
+                .object_store_region
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
             || config.object_store_region.len() > 64
             || config.object_store_region.contains('/')
         {
             return Err(S3SetupError::Region);
         }
-        if !header_value(&config.object_store_access_key)
-            || config.object_store_access_key.len() > 128
-            || config.object_store_access_key.contains(['/', ','])
-        {
-            return Err(S3SetupError::AccessKey);
-        }
-        if config.object_store_secret_key.is_empty() || config.object_store_secret_key.len() > 124 {
-            return Err(S3SetupError::SecretKey);
-        }
-        if (!config.object_store_session_token.is_empty()
-            && !header_value(&config.object_store_session_token))
-            || config.object_store_session_token.len() > 2048
-        {
-            return Err(S3SetupError::SessionToken);
-        }
+        let credentials = Credentials::from_config(config).map_err(|error| match error {
+            "bad object_store_access_key" => S3SetupError::AccessKey,
+            "bad object_store_secret_key" => S3SetupError::SecretKey,
+            _ => S3SetupError::SessionToken,
+        })?;
         let endpoint =
             Endpoint::parse(&config.object_store_endpoint).map_err(S3SetupError::Endpoint)?;
         let (host_header, tls_host) = match config.object_store_addressing {
@@ -298,9 +286,7 @@ impl S3Client {
             bucket: config.object_store_bucket.clone(),
             key_prefix: config.object_store_prefix.clone(),
             region: config.object_store_region.clone(),
-            access_key: config.object_store_access_key.clone(),
-            secret_key: config.object_store_secret_key.clone(),
-            session_token: config.object_store_session_token.clone(),
+            credentials,
             addressing: config.object_store_addressing,
             stream: None,
             tls_context: if config.object_store_tls {
@@ -321,6 +307,16 @@ impl S3Client {
             pending: None,
             async_gets: false,
         })
+    }
+
+    pub(crate) fn replace_credentials(&mut self, credentials: Credentials) {
+        self.stream = None;
+        self.pending = None;
+        self.credentials = credentials;
+    }
+
+    pub(crate) fn credentials(&self) -> Credentials {
+        self.credentials
     }
 
     #[cfg(test)]
@@ -873,15 +869,15 @@ impl S3Client {
             ("host", self.host_header.as_str()),
             ("x-amz-content-sha256", payload_hash),
             ("x-amz-date", timestamp.as_str()),
-            ("x-amz-security-token", self.session_token.as_str()),
+            ("x-amz-security-token", self.credentials.session_token()),
         ];
-        let signed = if self.session_token.is_empty() {
+        let signed = if self.credentials.session_token().is_empty() {
             &base_headers[..]
         } else {
             &token_headers[..]
         };
         let signature = sign(
-            &self.secret_key,
+            self.credentials.secret_key(),
             &SigningInput {
                 method,
                 uri: uri.as_str(),
@@ -910,11 +906,11 @@ impl S3Client {
             full(write!(head, " HTTP/1.1\r\nhost: {}\r\n", self.host_header))?;
             full(write!(head, "x-amz-content-sha256: {payload_hash}\r\n"))?;
             full(write!(head, "x-amz-date: {}\r\n", timestamp.as_str()))?;
-            if !self.session_token.is_empty() {
+            if !self.credentials.session_token().is_empty() {
                 full(write!(
                     head,
                     "x-amz-security-token: {}\r\n",
-                    self.session_token
+                    self.credentials.session_token()
                 ))?;
             }
             match precondition {
@@ -938,7 +934,7 @@ impl S3Client {
             full(write!(
                 head,
                 "authorization: AWS4-HMAC-SHA256 Credential={}/{}/{}/s3/aws4_request, SignedHeaders={}, Signature={}\r\n\r\n",
-                self.access_key,
+                self.credentials.access_key(),
                 &timestamp.as_str()[..8],
                 self.region,
                 signed_names.as_str(),

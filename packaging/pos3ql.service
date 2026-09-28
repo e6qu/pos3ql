@@ -1,0 +1,22 @@
+[Unit]
+Description=pos3ql object-storage PostgreSQL-compatible database
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pos3ql
+Group=pos3ql
+ExecStart=/usr/local/bin/pos3ql --config /etc/pos3ql/pos3ql.conf
+Restart=on-failure
+RestartSec=5s
+StateDirectory=pos3ql
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

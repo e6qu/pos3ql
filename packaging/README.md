@@ -6,9 +6,12 @@ adjacent SHA-256 file before installation.
 ```sh
 sha256sum --check pos3ql-*.tar.gz.sha256
 sudo install -m 0755 bin/pos3ql /usr/local/bin/pos3ql
+sudo install -d -m 0755 /usr/local/libexec/pos3ql
+sudo install -m 0755 libexec/pos3ql/failover-monitor /usr/local/libexec/pos3ql/failover-monitor
 sudo install -d -m 0750 -o pos3ql -g pos3ql /etc/pos3ql /var/lib/pos3ql
 sudo install -m 0640 -o root -g pos3ql etc/pos3ql/pos3ql.conf /etc/pos3ql/pos3ql.conf
 sudo install -m 0644 lib/systemd/system/pos3ql.service /etc/systemd/system/pos3ql.service
+sudo install -m 0644 lib/systemd/system/pos3ql-failover.service /etc/systemd/system/pos3ql-failover.service
 ```
 
 Create the `pos3ql` system user before installation. Configure object storage,
@@ -23,3 +26,12 @@ curl --fail http://127.0.0.1:9187/readyz
 
 See `share/doc/pos3ql/operations.md` for probes, credential rotation, alerts,
 and controlled replacement.
+
+On one passive candidate for a durable object prefix, copy
+`etc/pos3ql/pos3ql-failover.conf.example` to
+`/etc/pos3ql/pos3ql-failover.conf`, set the primary and candidate readiness
+URLs, and keep `pos3ql.service` disabled. Enable `pos3ql-failover.service`
+instead. After the configured consecutive-failure threshold, the monitor
+starts the candidate once and waits for fence-validating readiness. Follow the
+failover procedure in `share/doc/pos3ql/operations.md`; use one promotion
+authority for each prefix.

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: pos3ql-failover-monitor \
+  --primary-ready-url URL --candidate-ready-url URL \
+  [--failure-threshold COUNT] [--probe-interval-seconds SECONDS] \
+  [--probe-timeout-seconds SECONDS] [--promotion-timeout-seconds SECONDS] \
+  [--lock-directory PATH] -- COMMAND [ARG...]
+EOF
+}
+
+primary_url=""
+candidate_url=""
+failure_threshold=3
+probe_interval=5
+probe_timeout=2
+promotion_timeout=120
+lock_directory=/run/pos3ql/failover-monitor.lock
+
+while (($#)); do
+  case "$1" in
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --primary-ready-url)
+      (($# >= 2)) || { usage; exit 2; }
+      primary_url=$2
+      shift 2
+      ;;
+    --candidate-ready-url)
+      (($# >= 2)) || { usage; exit 2; }
+      candidate_url=$2
+      shift 2
+      ;;
+    --failure-threshold)
+      (($# >= 2)) || { usage; exit 2; }
+      failure_threshold=$2
+      shift 2
+      ;;
+    --probe-interval-seconds)
+      (($# >= 2)) || { usage; exit 2; }
+      probe_interval=$2
+      shift 2
+      ;;
+    --probe-timeout-seconds)
+      (($# >= 2)) || { usage; exit 2; }
+      probe_timeout=$2
+      shift 2
+      ;;
+    --promotion-timeout-seconds)
+      (($# >= 2)) || { usage; exit 2; }
+      promotion_timeout=$2
+      shift 2
+      ;;
+    --lock-directory)
+      (($# >= 2)) || { usage; exit 2; }
+      lock_directory=$2
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+[[ "$primary_url" =~ ^http://[^/]+/readyz$ ]] || {
+  echo "primary readiness URL must be an http:// URL ending in /readyz" >&2
+  exit 2
+}
+[[ "$candidate_url" =~ ^http://[^/]+/readyz$ ]] || {
+  echo "candidate readiness URL must be an http:// URL ending in /readyz" >&2
+  exit 2
+}
+[[ "$primary_url" != "$candidate_url" ]] || {
+  echo "primary and candidate readiness URLs must differ" >&2
+  exit 2
+}
+for setting in "$failure_threshold" "$probe_interval" "$probe_timeout" \
+  "$promotion_timeout"; do
+  [[ "$setting" =~ ^[1-9][0-9]*$ ]] || {
+    echo "failover counts and timeouts must be positive integers" >&2
+    exit 2
+  }
+done
+[[ "$lock_directory" == /* ]] || {
+  echo "failover lock directory must be an absolute path" >&2
+  exit 2
+}
+(($# > 0)) || { usage; exit 2; }
+command -v curl >/dev/null || {
+  echo "curl is required" >&2
+  exit 2
+}
+
+if ! mkdir "$lock_directory" 2>/dev/null; then
+  echo "could not acquire failover lock directory: $lock_directory" >&2
+  exit 1
+fi
+# shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
+cleanup() {
+  rmdir "$lock_directory" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+probe() {
+  curl --fail --silent --show-error --output /dev/null \
+    --connect-timeout "$probe_timeout" --max-time "$probe_timeout" "$1"
+}
+
+failures=0
+while true; do
+  if probe "$primary_url"; then
+    failures=0
+  else
+    failures=$((failures + 1))
+    printf 'pos3ql-failover event=primary_probe_failed consecutive_failures=%d threshold=%d\n' \
+      "$failures" "$failure_threshold" >&2
+    if ((failures >= failure_threshold)); then
+      # Confirm once more at the decision boundary. A recovered primary does
+      # not needlessly lose ownership because its last failure consumed the
+      # threshold immediately before this command.
+      if probe "$primary_url"; then
+        failures=0
+        printf '%s\n' 'pos3ql-failover event=primary_recovered_before_promotion' >&2
+      else
+        break
+      fi
+    fi
+  fi
+  sleep "$probe_interval"
+done
+
+printf 'pos3ql-failover event=promotion_started\n' >&2
+if ! "$@"; then
+  printf 'pos3ql-failover event=promotion_command_failed\n' >&2
+  exit 1
+fi
+
+deadline=$((SECONDS + promotion_timeout))
+while ((SECONDS < deadline)); do
+  if probe "$candidate_url"; then
+    printf 'pos3ql-failover event=promotion_complete\n' >&2
+    exit 0
+  fi
+  sleep "$probe_interval"
+done
+
+printf 'pos3ql-failover event=candidate_readiness_timeout timeout_seconds=%d\n' \
+  "$promotion_timeout" >&2
+exit 1

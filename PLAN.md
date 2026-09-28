@@ -66,16 +66,18 @@ new durable branch after backup deletion.
 
 Single-writer ownership now uses a durable process-incarnation fence shared by
 commit-head and manifest publication. Startup promotes a fresh random token by
-first transitioning ownership, then conditionally invalidating both root
-generations, and only then becoming active. The displaced process fails its
-next publication with SQLSTATE `40001`; delayed root requests and interrupted
-or competing restarts are covered. Legacy unfenced prefixes promote in place.
+first transitioning ownership, then retagging both mutable roots with that
+token, and only then becoming active. This changes content-derived ETags as
+well as version-derived ETags. The displaced process fails its next publication
+with SQLSTATE `40001`; delayed root requests and interrupted or competing
+restarts are covered. Legacy unfenced prefixes promote in place.
 
 This is not yet a production-complete topology: one process serializes query
-execution; automatic failure detection and representative long-run performance
-evidence remain open. A separately bounded operational listener exposes health,
-readiness, metrics, and capacity, with structured logs and a
-controlled-replacement runbook. Object-store credentials rotate through a
+execution, and representative long-run performance evidence remains open. A
+separately bounded operational listener exposes health, readiness, metrics, and
+capacity, with structured logs and a controlled-replacement runbook. Release
+packages include a single-authority passive-candidate monitor for automatic
+failure detection and promotion. Object-store credentials rotate through a
 validated owner-only file, and tagged releases produce an install-tested Linux
 archive with checksums and service files.
 
@@ -241,14 +243,19 @@ and metric. The external suite covers rejected and successful candidates,
 durable work after old-credential revocation, and rotation back by signal.
 
 Tagged releases build a locked Linux x86-64 executable, deterministic tarball,
-and SHA-256 file. The archive contains a starter configuration, hardened
-systemd unit, license, and operator documentation. Pull-request and tag CI
-extract the archive, execute the packaged binary, start it from the packaged
-configuration, probe liveness, and verify graceful shutdown.
+and SHA-256 file. The archive contains starter configurations, hardened systemd
+units, the failover monitor, license, and operator documentation. Pull-request
+and tag CI extract the archive, execute the packaged binary, probe liveness,
+exercise automatic promotion and writer fencing, and verify graceful shutdown.
 
-- Exercise the remaining operator recovery paths end to end, including
-  automatic failure detection and controlled promotion of a replacement
-  process.
+A packaged monitor now observes one primary from one passive candidate,
+requires consecutive bounded readiness failures plus final confirmation, and
+runs one fixed promotion command. Candidate readiness proves durable ownership.
+End-to-end qualification pauses a live primary, promotes from the same object
+prefix, recovers durable data with empty local caches, resumes the displaced
+process, and verifies readiness failure plus SQLSTATE `40001` on its connected
+client. Cacheless object reads remain synchronous so a restartable statement
+cannot repeatedly discard its only completed network response.
 
 ### Concurrent execution
 

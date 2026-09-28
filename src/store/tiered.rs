@@ -337,7 +337,12 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
     fn enable_async_gets(&mut self) {
         match self {
             TieredStore::WithRam(cache) => cache.enable_async_gets(),
-            TieredStore::WithoutRam(layer) => layer.enable_async_gets(),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.enable_async_gets(),
+            // Restartable execution needs a completed block to survive the
+            // retry that follows `NotReady`. With no cache tier, consuming a
+            // completed response and restarting would fetch the same first
+            // block forever. Run the provider request synchronously instead.
+            TieredStore::WithoutRam(Layer::Base(_)) => {}
         }
     }
 
@@ -351,7 +356,8 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
     fn async_gets_enabled(&self) -> bool {
         match self {
             TieredStore::WithRam(cache) => cache.async_gets_enabled(),
-            TieredStore::WithoutRam(layer) => layer.async_gets_enabled(),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.async_gets_enabled(),
+            TieredStore::WithoutRam(Layer::Base(_)) => false,
         }
     }
 
@@ -376,42 +382,48 @@ impl<S: BlockStore> BlockStore for TieredStore<S> {
     fn async_read_slots(&self) -> usize {
         match self {
             TieredStore::WithRam(cache) => cache.async_read_slots(),
-            TieredStore::WithoutRam(layer) => layer.async_read_slots(),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.async_read_slots(),
+            TieredStore::WithoutRam(Layer::Base(_)) => 0,
         }
     }
 
     fn async_reads_busy(&self) -> bool {
         match self {
             TieredStore::WithRam(cache) => cache.async_reads_busy(),
-            TieredStore::WithoutRam(layer) => layer.async_reads_busy(),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.async_reads_busy(),
+            TieredStore::WithoutRam(Layer::Base(_)) => false,
         }
     }
 
     fn pending_read_fd(&self, slot: usize) -> Option<std::os::fd::RawFd> {
         match self {
             TieredStore::WithRam(cache) => cache.pending_read_fd(slot),
-            TieredStore::WithoutRam(layer) => layer.pending_read_fd(slot),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.pending_read_fd(slot),
+            TieredStore::WithoutRam(Layer::Base(_)) => None,
         }
     }
 
     fn advance_pending_read(&mut self, slot: usize) -> Result<bool, super::StoreError> {
         match self {
             TieredStore::WithRam(cache) => cache.advance_pending_read(slot),
-            TieredStore::WithoutRam(layer) => layer.advance_pending_read(slot),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.advance_pending_read(slot),
+            TieredStore::WithoutRam(Layer::Base(_)) => Ok(false),
         }
     }
 
     fn next_hedge_deadline(&self) -> Option<std::time::Instant> {
         match self {
             TieredStore::WithRam(cache) => cache.next_hedge_deadline(),
-            TieredStore::WithoutRam(layer) => layer.next_hedge_deadline(),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.next_hedge_deadline(),
+            TieredStore::WithoutRam(Layer::Base(_)) => None,
         }
     }
 
     fn issue_due_hedges(&mut self, now: std::time::Instant) {
         match self {
             TieredStore::WithRam(cache) => cache.issue_due_hedges(now),
-            TieredStore::WithoutRam(layer) => layer.issue_due_hedges(now),
+            TieredStore::WithoutRam(Layer::Disk(cache)) => cache.issue_due_hedges(now),
+            TieredStore::WithoutRam(Layer::Base(_)) => {}
         }
     }
 

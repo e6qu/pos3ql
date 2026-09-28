@@ -31,11 +31,12 @@ objects, throttling, transient transport failure, authentication failure, and
 malformed responses remain distinct typed outcomes.
 
 The `writer-fence` object is the ownership serialization point. Promotion
-publishes a transition by CAS, conditionally rewrites both mutable roots, and
-activates the new random process incarnation by CAS. Commit-head and manifest
-writers retain their root ETags; a conflict may be adopted or retried only
-after the process proves that it still owns the active fence. The ordering
-makes a delayed old request either visible to the promoting process before it
+publishes a transition by CAS, conditionally rewrites both mutable roots with
+the new random process incarnation, and activates that incarnation by CAS.
+Token-bearing empty roots cover a prefix without published state. Commit-head
+and manifest writers retain their root ETags; a conflict may be adopted or
+retried only after the process proves that it still owns the active fence. This
+makes a delayed old request visible to the promoting process before it
 rewrites that root or stale after the rewrite. Immutable batches and blocks
 written by a displaced process remain harmless orphans when root publication
 fails.

@@ -32,7 +32,7 @@ An optional, separately bounded HTTP listener provides liveness, readiness,
 Prometheus metrics, and JSON capacity reporting without consuming PostgreSQL
 connection slots. Runtime logs can use text or JSON Lines. See the
 [operations runbook](docs/operations.md) for configuration, endpoint semantics,
-alerts, and controlled replacement.
+alerts, automatic failure detection, and controlled replacement.
 
 ## Status
 

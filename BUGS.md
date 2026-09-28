@@ -6,6 +6,14 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The single-writer fencing audit found no external blocker. A random process
+incarnation is promoted through one durable fence; the transition precedes
+conditional rewrites of both mutable roots, and activation follows them. A
+root conflict can be adopted or retried only after revalidating the active
+fence. Tests cover a displaced writer, delayed requests carrying both stale
+root ETags, successor publication, interrupted promotion recovery, and another
+restart race. Restore and export publish their restart markers before
+promotion and verify ownership before each live-root replacement.
 The point-in-time recovery audit found no external blocker. Current commit
 records carry PostgreSQL-epoch commit time while legacy forms remain readable.
 Recovery validates that the live descriptor chain descends from the named

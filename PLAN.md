@@ -64,8 +64,15 @@ derive a validated whole-transaction head from retained history, resume through
 a target-bound durable marker, recover with empty local caches, and permit a
 new durable branch after backup deletion.
 
+Single-writer ownership now uses a durable process-incarnation fence shared by
+commit-head and manifest publication. Startup promotes a fresh random token by
+first transitioning ownership, then conditionally invalidating both root
+generations, and only then becoming active. The displaced process fails its
+next publication with SQLSTATE `40001`; delayed root requests and interrupted
+or competing restarts are covered. Legacy unfenced prefixes promote in place.
+
 This is not yet a production-complete topology: one process serializes query
-execution; writer fencing, promotion, operational interfaces, and
+execution; automatic failure detection, operational interfaces, and
 representative long-run performance evidence remain open.
 
 ## Remaining production work
@@ -216,13 +223,10 @@ the client-visible boundary and rejected before partial effects.
 
 ### Durable operations and availability
 
-- Add single-writer ownership and fencing before promotion or failover. Prove
-  that an old writer cannot publish after ownership changes, including delayed
-  object requests and restart races. Multiple writable processes on one prefix
-  remain unsupported until this gate passes.
 - Provide health and readiness reporting, metrics, structured logs, capacity
   reporting, secure credential rotation, packaging, and operational runbooks.
-  Exercise operator recovery paths end to end.
+  Exercise operator recovery paths end to end, including failure detection and
+  controlled promotion of a replacement process.
 
 ### Concurrent execution
 
@@ -631,9 +635,8 @@ The production roadmap is complete when:
   implementation boundary, and every accepted configuration survives
   checkpoint and object-cold recovery at its declared capacities without
   truncation or post-startup allocation;
-- format migration, writer fencing, promotion, monitoring, credential
-  rotation, packaging, and runbooks pass
-  end-to-end operational tests;
+- format migration, monitoring, credential rotation, packaging, and runbooks
+  pass end-to-end operational tests;
 - concurrent execution scales across the supported worker range while
   preserving MVCC, durability, fixed memory, and backpressure; and
 - published representative benchmarks substantiate the latency, throughput,

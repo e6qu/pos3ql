@@ -11,6 +11,10 @@ they never select a guessed decoder.
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v14. |
 | Checkpoint manifest | `pos3ql-manifest-v14` | yes | yes | Current format. |
+| Empty checkpoint root | `pos3ql-empty-manifest-v1` | yes | yes | Fences an as-yet unpublished manifest root. |
+| Commit head | `pos3ql-commit-head-v1` | yes | yes | Names the immutable commit chain and the publishing process incarnation. |
+| Empty commit root | `pos3ql-empty-commit-head-v1` | yes | yes | Fences an as-yet unpublished commit root. |
+| Writer fence | `pos3ql-writer-fence-v1` | yes | yes | Serializes promotion and mutable-root publication. |
 | Backup completion | `pos3ql-backup-v1` | yes | no | Named-point and LSN restore remain readable; no backup creation timestamp is available. |
 | Backup completion | `pos3ql-backup-v2` | yes | yes | Checksums both roots and anchors timestamp recovery after backup creation. |
 | Point-in-time restore marker | `pos3ql-point-in-time-restore-v1` | yes | yes | Binds the backup, manifest checksum, resolved LSN, and commit head during root replacement. |
@@ -45,6 +49,32 @@ Recovery may write an immutable prefix of a multi-transaction commit batch.
 Its identity is the CRC32C of the exact prefix and its descriptor preserves the
 original predecessor, so the published head ends only at a validated whole
 transaction.
+
+Every process creates a random 128-bit writer incarnation at startup. It first
+CAS-publishes a transitioning `pos3ql-writer-fence-v1` record, conditionally
+rewrites both mutable roots to invalidate their prior ETags, and then CASes the
+fence to active. Missing roots receive explicit empty identities, so a delayed
+create-only request is fenced as well. Commit and checkpoint publication use
+the root ETag loaded by that process; after a conflict they must prove that
+their process token still owns the active fence before adopting or retrying a
+write. A successor changes the fence before touching either root, then advances
+both root ETags before it can become active. The final active CAS is the
+ownership-transfer point; a failed or starved transition grants no new owner.
+Thus a request begun before
+promotion either lands and is preserved by the successor's rewrite, or arrives
+later with a stale ETag and
+fails. An interrupted transition is taken over and completed by the next
+startup.
+
+Commit-head v1 readers accept both legacy 64-bit writer labels and current
+128-bit process tokens. A prefix without `writer-fence` is promoted in place;
+its existing manifest and commit head remain byte-identical. Binaries that
+predate writer fencing must be stopped before this first promotion and must not
+subsequently open the prefix, because they do not participate in the fence.
+The current manifest writer line is 16 bytes wider than its legacy form and is
+charged to the existing `checkpoint_manifest_bytes` reservation. The mutable
+root promotion scratch adds one fixed 128-byte startup allocation; publication
+does not allocate after the runtime memory freeze.
 
 An independent-prefix copy publishes `pos3ql-export-v1` as a pending marker
 before copying immutable objects. A retry must match the backup name and root

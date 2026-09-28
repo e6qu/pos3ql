@@ -31,10 +31,14 @@ use crate::wal::crc32c::Crc32c;
 
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
+const WRITER_FENCE_KEY: &str = "writer-fence";
 const RESTORE_PENDING_KEY: &str = "restore-pending";
 const EXPORT_PENDING_KEY: &str = "export-pending";
 const EXPORT_COMPLETE_KEY: &str = "export-complete";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
+const EMPTY_MANIFEST: &[u8] = b"pos3ql-empty-manifest-v1\nend\n";
+const EMPTY_COMMIT_HEAD: &[u8] = b"pos3ql-empty-commit-head-v1\nend\n";
+const WRITER_FENCE_HEADER: &str = "pos3ql-writer-fence-v1";
 const BACKUP_HEADER_V1: &str = "pos3ql-backup-v1";
 const BACKUP_HEADER: &str = "pos3ql-backup-v2";
 const EXPORT_HEADER: &str = "pos3ql-export-v1";
@@ -43,6 +47,58 @@ const BACKUP_NAME_BYTES: usize = 63;
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
 const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn | key/payload lengths
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WriterToken(u128);
+
+struct WriterFence {
+    token: WriterToken,
+    etag: EntityTag,
+}
+
+fn new_writer_token() -> std::io::Result<WriterToken> {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let token = u128::from_ne_bytes(bytes);
+    if token == 0 {
+        return Err(std::io::Error::other("random writer token was zero"));
+    }
+    Ok(WriterToken(token))
+}
+
+fn writer_fence_record(state: &str, token: WriterToken) -> StackStr<96> {
+    stack_format!(
+        96,
+        "{WRITER_FENCE_HEADER}\nstate {state}\nwriter {:032x}\nend\n",
+        token.0
+    )
+}
+
+fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str> {
+    let text = core::str::from_utf8(bytes).map_err(|_| "writer fence is not UTF-8")?;
+    let mut lines = text.lines();
+    if lines.next() != Some(WRITER_FENCE_HEADER) {
+        return Err("bad writer fence header");
+    }
+    let state = lines
+        .next()
+        .and_then(|line| line.strip_prefix("state "))
+        .filter(|state| matches!(*state, "active" | "transition"))
+        .ok_or("bad writer fence state")?;
+    let token = lines
+        .next()
+        .and_then(|line| line.strip_prefix("writer "))
+        .and_then(|word| u128::from_str_radix(word, 16).ok())
+        .filter(|token| *token != 0)
+        .map(WriterToken)
+        .ok_or("bad writer fence token")?;
+    if lines.next() != Some("end") || lines.next().is_some() {
+        return Err("bad writer fence terminator");
+    }
+    Ok((state, token))
+}
 
 /// Manifest readers are deliberately explicit. A supported legacy manifest is
 /// rewritten as the current format by the next successful checkpoint.
@@ -766,11 +822,13 @@ pub(crate) struct Checkpointer {
     doomed_blocks: Vec<StackStr<80>>,
     manifest_buf: FixedBuf,
     manifest_etag: Option<EntityTag>,
+    manifest_present: bool,
     manifest_lsn: u64,
     /// CAS-published root of the immutable commit-batch chain.  A batch PUT
     /// alone is intentionally not recoverable until this pointer advances.
     commit_head_etag: Option<EntityTag>,
     commit_head: Option<CommitBatchId>,
+    root_buf: FixedBuf,
     /// Per-slot SST from the last published manifest; clean tables reuse
     /// these handles (delta checkpoints). Capacity is reserved at startup so
     /// the post-freeze checkpoint path never allocates.
@@ -851,15 +909,11 @@ pub(crate) struct Checkpointer {
     /// under-reported); remembered per slot so the scheduler stops
     /// proposing a merge that cannot be scheduled.
     merge_overflow: Vec<Option<(BlockId, BlockId)>>,
-    /// This database's writer identity, stamped into every manifest it
-    /// publishes (`writer <hex>`). Deterministic from the node's identity
-    /// (bucket, key prefix, data directory), so every incarnation of the
-    /// same node shares it and two nodes pointed at one bucket do not. Its
-    /// job is disambiguating a failed compare-and-swap: a manifest carrying
-    /// our id was our own PUT whose response was lost — adopt its etag and
-    /// republish; any other id is a genuine second writer, which stays a
-    /// loud error.
-    writer_id: u64,
+    /// A fresh process incarnation. The durable writer fence and both mutable
+    /// roots carry this token, so an ambiguous response cannot be mistaken
+    /// for a displaced process's write.
+    writer_token: WriterToken,
+    writer_fence_etag: Option<EntityTag>,
     /// Legacy output exists only to qualify an actual old-format upgrade.
     /// Production always writes [`ManifestFormat::CURRENT`].
     #[cfg(test)]
@@ -967,6 +1021,7 @@ impl Checkpointer {
             + config.checkpoint_commit_batches * core::mem::size_of::<StackStr<64>>()
             + config.max_backups * core::mem::size_of::<StackStr<BACKUP_NAME_BYTES>>()
             + manifest_capacity
+            + 128
             + crate::store::BLOCK_SIZE
             + SST_ARENA_BYTES
             + MERGE_SOURCE_SCRATCH_BYTES
@@ -1529,9 +1584,12 @@ impl Checkpointer {
             manifest_buf: FixedBuf::new(budget, "manifest_buf", manifest_capacity)
                 .map_err(CheckpointSetupError::Budget)?,
             manifest_etag: None,
+            manifest_present: false,
             manifest_lsn: 0,
             commit_head_etag: None,
             commit_head: None,
+            root_buf: FixedBuf::new(budget, "mutable_root_buf", 128)
+                .map_err(CheckpointSetupError::Budget)?,
             prev_ssts,
             prev_scratch,
             slice_scratch: SlotList::new(config.max_spill_generations_per_table),
@@ -1579,7 +1637,10 @@ impl Checkpointer {
             merge_done: vec![None; table_capacity],
             merge_turn: false,
             merge_overflow: vec![None; table_capacity],
-            writer_id: crate::object_store::writer_id(config),
+            writer_token: new_writer_token().map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
+            })?,
+            writer_fence_etag: None,
             #[cfg(test)]
             manifest_write_format: ManifestFormat::CURRENT,
         })
@@ -1588,6 +1649,15 @@ impl Checkpointer {
     #[cfg(test)]
     pub(crate) fn write_v13_manifest_for_test(&mut self) {
         self.manifest_write_format = ManifestFormat::V13;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_etags_for_test(&self) -> (EntityTag, EntityTag) {
+        (
+            self.manifest_etag.expect("writer loaded a manifest root"),
+            self.commit_head_etag
+                .expect("writer loaded a commit-head root"),
+        )
     }
 
     /// The shared block stack, for the storage layer's spilled-row reader.
@@ -1678,6 +1748,54 @@ impl Checkpointer {
         self.blocks.borrow_mut().issue_due_hedges(now);
     }
 
+    fn claim_writer(&mut self) -> Result<(), CheckpointSetupError> {
+        let fence = promote_writer(
+            &mut self.client,
+            self.writer_token,
+            &mut self.manifest_buf,
+            &mut self.root_buf,
+        )?;
+        self.writer_fence_etag = Some(fence.etag);
+        Ok(())
+    }
+
+    fn assert_writer(&mut self) -> Result<(), SqlError> {
+        let etag = self.writer_fence_etag.as_ref().ok_or_else(|| {
+            sql_err!(
+                SQLSTATE_CAS,
+                "writer ownership was not acquired during startup"
+            )
+        })?;
+        let active = writer_fence_record("active", self.writer_token);
+        match self.client.put(
+            WRITER_FENCE_KEY,
+            active.as_str().as_bytes(),
+            Precondition::IfMatch(etag),
+        ) {
+            Ok(etag) => {
+                self.writer_fence_etag = Some(etag);
+                Ok(())
+            }
+            Err(error) => {
+                let refreshed = self.client.get(WRITER_FENCE_KEY, None);
+                if let Ok(result) = refreshed
+                    && self.client.body_bytes() == active.as_str().as_bytes()
+                {
+                    self.writer_fence_etag = Some(result.etag);
+                    return Ok(());
+                }
+                if error.is_precondition_failed() {
+                    Err(sql_err!(
+                        SQLSTATE_CAS,
+                        "writer was fenced by a newer process"
+                    ))
+                } else {
+                    Err(sql_err!(SQLSTATE_CAS, "verify writer ownership: {}", error))
+                }
+            }
+        }
+    }
+
     /// Publishes one immutable committed journal batch, keyed by its first
     /// LSN.  The local journal is a cache; cold recovery obtains this tail
     /// from object storage after loading the manifest.
@@ -1711,11 +1829,11 @@ impl Checkpointer {
         .expect("commit descriptor fits its fixed buffer");
         self.put_immutable(descriptor_key.as_str(), descriptor.as_str().as_bytes())?;
 
-        let mut head = StackStr::<80>::new();
+        let mut head = StackStr::<128>::new();
         write!(
             head,
-            "{}\nwriter {:016x}\nfirst {}\ndigest {:08x}\nend\n",
-            COMMIT_HEAD_HEADER, self.writer_id, batch.first_lsn, batch.digest
+            "{}\nwriter {:032x}\nfirst {}\ndigest {:08x}\nend\n",
+            COMMIT_HEAD_HEADER, self.writer_token.0, batch.first_lsn, batch.digest
         )
         .expect("commit head fits its fixed buffer");
         let precondition = match &self.commit_head_etag {
@@ -1728,19 +1846,26 @@ impl Checkpointer {
         {
             Ok(etag) => etag,
             Err(error) if error.is_precondition_failed() => {
+                self.assert_writer()?;
                 let refreshed = self
                     .client
                     .get(COMMIT_HEAD_KEY, None)
                     .map_err(object_store_to_sql)?;
                 let (writer, published) = parse_commit_head(self.client.body_bytes())
                     .map_err(|message| sql_err!(SQLSTATE_CAS, "{message}"))?;
-                if writer != self.writer_id || published != batch {
+                if writer != self.writer_token || published != batch {
                     return Err(sql_err!(
                         SQLSTATE_CAS,
-                        "commit-head compare-and-swap failed: another writer owns this bucket"
+                        "commit-head compare-and-swap failed after writer fencing"
                     ));
                 }
-                refreshed.etag
+                self.client
+                    .put(
+                        COMMIT_HEAD_KEY,
+                        head.as_str().as_bytes(),
+                        Precondition::IfMatch(&refreshed.etag),
+                    )
+                    .map_err(object_store_to_sql)?
             }
             Err(error) => return Err(object_store_to_sql(error)),
         };
@@ -1812,8 +1937,9 @@ impl Checkpointer {
             .map_err(|message| sql_err!(SQLSTATE_IO, "backup manifest: {message}"))?;
         let manifest_crc = crate::wal::crc32c::crc32c(self.manifest_buf.readable());
 
-        let mut head = StackStr::<96>::new();
+        let mut head = StackStr::<128>::new();
         match self.client.get(COMMIT_HEAD_KEY, None) {
+            Ok(_) if self.client.body_bytes() == EMPTY_COMMIT_HEAD => {}
             Ok(_) => {
                 use core::fmt::Write as _;
                 write!(
@@ -2225,13 +2351,20 @@ impl Checkpointer {
                 }
             }
         }
+        self.claim_writer()?;
         let floor = match self.client.get(MANIFEST_KEY, None) {
             Ok(r) => {
                 self.manifest_etag = Some(r.etag);
-                let text = core::str::from_utf8(self.client.body_bytes())
-                    .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
-                    .to_string();
-                self.load_manifest_text(storage, &text)?
+                if self.client.body_bytes() == EMPTY_MANIFEST {
+                    self.manifest_present = false;
+                    0
+                } else {
+                    self.manifest_present = true;
+                    let text = core::str::from_utf8(self.client.body_bytes())
+                        .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?
+                        .to_string();
+                    self.load_manifest_text(storage, &text)?
+                }
             }
             Err(e) if e.is_not_found() => 0,
             Err(e) => {
@@ -2243,9 +2376,26 @@ impl Checkpointer {
         match self.client.get(COMMIT_HEAD_KEY, None) {
             Ok(result) => {
                 self.commit_head_etag = Some(result.etag);
-                let (_, batch) = parse_commit_head(self.client.body_bytes())
-                    .map_err(CheckpointSetupError::Corrupt)?;
-                self.commit_head = Some(batch);
+                if self.client.body_bytes() == EMPTY_COMMIT_HEAD {
+                    self.commit_head = None;
+                    let mut has_orphaned_batches = false;
+                    self.client
+                        .list("commits/", |_| has_orphaned_batches = true)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "list orphaned commit batches: {error}"
+                            ))
+                        })?;
+                    if has_orphaned_batches {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "commit batches exist without a commit-head",
+                        ));
+                    }
+                } else {
+                    let (_, batch) = parse_commit_head(self.client.body_bytes())
+                        .map_err(CheckpointSetupError::Corrupt)?;
+                    self.commit_head = Some(batch);
+                }
             }
             Err(error) if error.is_not_found() => {
                 let mut has_orphaned_batches = false;
@@ -7013,8 +7163,8 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, &mut pending_def)?;
                     saw_end = true;
                 }
-                // The writer identity is CAS bookkeeping (see `writer_id`),
-                // not state; the loader has no use for it.
+                // The process token is publication bookkeeping, not database
+                // state; the durable writer fence validates it separately.
                 Some("writer") => {}
                 Some("") | None => {}
                 Some(other) => {
@@ -7384,7 +7534,7 @@ impl Checkpointer {
         let value_index_due = self.value_index_schedule_pending(storage);
         let sweep_due = self.sweeping
             || storage.lsn() != self.manifest_lsn
-            || self.manifest_etag.is_none()
+            || !self.manifest_present
             || self.merge_done.iter().any(Option::is_some)
             || value_index_due
             || storage.statistics_dirty();
@@ -7584,7 +7734,7 @@ impl Checkpointer {
         }
         write_manifest(
             &mut self.manifest_buf,
-            format_args!("writer {:016x}", self.writer_id),
+            format_args!("writer {:032x}", self.writer_token.0),
         )?;
         let mut database_context = None;
 
@@ -10768,7 +10918,9 @@ impl Checkpointer {
         }
         write_manifest(&mut self.manifest_buf, "end")?;
 
-        // Publish via CAS.
+        // Promotion bumps both root ETags before activating the successor.
+        // A conflict is retried only after the process proves it still owns
+        // the writer fence.
         let precondition = match &self.manifest_etag {
             Some(etag) => Precondition::IfMatch(etag),
             None => Precondition::IfNoneMatchAny,
@@ -10788,13 +10940,14 @@ impl Checkpointer {
                 // its etag and republish the current state over it. Any
                 // other identity is a genuine second writer, which stays a
                 // loud error rather than a clobber.
+                self.assert_writer()?;
                 let refreshed = self
                     .client
                     .get(MANIFEST_KEY, None)
                     .map_err(object_store_to_sql)?;
                 let ours = {
                     let body = self.client.body_bytes();
-                    let expect = crate::stack_format!(40, "writer {:016x}", self.writer_id);
+                    let expect = crate::stack_format!(48, "writer {:032x}", self.writer_token.0);
                     core::str::from_utf8(body)
                         .ok()
                         .is_some_and(|text| text.lines().any(|l| l == expect.as_str()))
@@ -10802,7 +10955,7 @@ impl Checkpointer {
                 if !ours {
                     return Err(sql_err!(
                         SQLSTATE_CAS,
-                        "manifest compare-and-swap failed: another writer owns this bucket"
+                        "manifest compare-and-swap failed after writer fencing"
                     ));
                 }
                 self.client
@@ -10816,6 +10969,7 @@ impl Checkpointer {
             Err(e) => return Err(object_store_to_sql(e)),
         };
         self.manifest_etag = Some(etag);
+        self.manifest_present = true;
         self.manifest_lsn = lsn;
         std::mem::swap(&mut self.prev_ssts, &mut self.prev_scratch);
         // The manifest is durable: install the new spill lists (a collapse
@@ -13124,7 +13278,7 @@ fn load_backup_roots(
         &mut head,
         "backup root format bound",
     )?;
-    if head.len() > 96 {
+    if head.len() > 128 {
         return Err(CheckpointSetupError::Corrupt(
             "backup commit-head exceeds its format bound",
         ));
@@ -13241,19 +13395,45 @@ pub(crate) fn restore_backup_to(
         }
     }
 
-    replace_root(&mut client, MANIFEST_KEY, roots.manifest.readable())?;
+    let token = new_writer_token().map_err(|error| {
+        CheckpointSetupError::ObjectStore(format!("create writer token: {error}"))
+    })?;
+    let mut fence_manifest = FixedBuf::new(
+        budget,
+        "restore writer-fence manifest",
+        config.checkpoint_manifest_bytes,
+    )
+    .map_err(CheckpointSetupError::Budget)?;
+    let mut fence_head = FixedBuf::new(budget, "restore writer-fence head", 128)
+        .map_err(CheckpointSetupError::Budget)?;
+    let mut fence = promote_writer(&mut client, token, &mut fence_manifest, &mut fence_head)?;
+
+    replace_root(
+        &mut client,
+        &mut fence,
+        MANIFEST_KEY,
+        roots.manifest.readable(),
+    )?;
     match (target_head, target) {
         (None, _) => {
-            client.delete(COMMIT_HEAD_KEY).map_err(|error| {
-                CheckpointSetupError::ObjectStore(format!("clear commit-head: {error}"))
-            })?;
+            replace_root(&mut client, &mut fence, COMMIT_HEAD_KEY, EMPTY_COMMIT_HEAD)?;
         }
         (Some(_), RecoveryTarget::Backup) => {
-            replace_root(&mut client, COMMIT_HEAD_KEY, roots.head.readable())?;
+            replace_root(
+                &mut client,
+                &mut fence,
+                COMMIT_HEAD_KEY,
+                roots.head.readable(),
+            )?;
         }
         (Some(target_head), _) => {
-            let head = format_commit_head(crate::object_store::writer_id(config), target_head);
-            replace_root(&mut client, COMMIT_HEAD_KEY, head.as_str().as_bytes())?;
+            let head = format_commit_head(token, target_head);
+            replace_root(
+                &mut client,
+                &mut fence,
+                COMMIT_HEAD_KEY,
+                head.as_str().as_bytes(),
+            )?;
         }
     }
     clear_local_cache(&config.data_dir)?;
@@ -13305,6 +13485,7 @@ fn select_recovery_head(
     }
 
     let live_head = match client.get(COMMIT_HEAD_KEY, None) {
+        Ok(_) if client.body_bytes() == EMPTY_COMMIT_HEAD => None,
         Ok(_) => Some(
             parse_commit_head(client.body_bytes())
                 .map_err(CheckpointSetupError::Corrupt)?
@@ -13507,11 +13688,12 @@ fn select_batch_prefix(
     Ok(selected)
 }
 
-fn format_commit_head(writer: u64, batch: CommitBatchId) -> StackStr<80> {
+fn format_commit_head(writer: WriterToken, batch: CommitBatchId) -> StackStr<128> {
     stack_format!(
-        80,
-        "{}\nwriter {writer:016x}\nfirst {}\ndigest {:08x}\nend\n",
+        128,
+        "{}\nwriter {:032x}\nfirst {}\ndigest {:08x}\nend\n",
         COMMIT_HEAD_HEADER,
+        writer.0,
         batch.first_lsn,
         batch.digest
     )
@@ -13634,13 +13816,44 @@ pub(crate) fn export_backup(
         &mut copy,
     )?;
 
-    replace_root(&mut destination, MANIFEST_KEY, roots.manifest.readable())?;
+    let token = new_writer_token().map_err(|error| {
+        CheckpointSetupError::ObjectStore(format!("create destination writer token: {error}"))
+    })?;
+    let mut fence_manifest = FixedBuf::new(
+        budget,
+        "export writer-fence manifest",
+        destination_config.checkpoint_manifest_bytes,
+    )
+    .map_err(CheckpointSetupError::Budget)?;
+    let mut fence_head = FixedBuf::new(budget, "export writer-fence head", 128)
+        .map_err(CheckpointSetupError::Budget)?;
+    let mut fence = promote_writer(
+        &mut destination,
+        token,
+        &mut fence_manifest,
+        &mut fence_head,
+    )?;
+
+    replace_root(
+        &mut destination,
+        &mut fence,
+        MANIFEST_KEY,
+        roots.manifest.readable(),
+    )?;
     if roots.head.is_empty() {
-        destination.delete(COMMIT_HEAD_KEY).map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!("clear destination commit-head: {error}"))
-        })?;
+        replace_root(
+            &mut destination,
+            &mut fence,
+            COMMIT_HEAD_KEY,
+            EMPTY_COMMIT_HEAD,
+        )?;
     } else {
-        replace_root(&mut destination, COMMIT_HEAD_KEY, roots.head.readable())?;
+        replace_root(
+            &mut destination,
+            &mut fence,
+            COMMIT_HEAD_KEY,
+            roots.head.readable(),
+        )?;
     }
     clear_local_cache(&destination_config.data_dir)?;
     publish_export_complete(&mut destination, marker.as_str().as_bytes())?;
@@ -13737,7 +13950,8 @@ fn export_roots_match(
         Some(ByteRange::new(0, 0).expect("one-byte root probe")),
     ) {
         Err(error) if error.is_not_found() => Ok(true),
-        Ok(_) | Err(ObjectError::Status { code: 416, .. }) => Ok(false),
+        Ok(_) => object_matches(destination, COMMIT_HEAD_KEY, EMPTY_COMMIT_HEAD),
+        Err(ObjectError::Status { code: 416, .. }) => Ok(false),
         Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
             "verify backup export commit-head: {error}"
         ))),
@@ -13915,11 +14129,196 @@ fn object_matches(
     }
 }
 
+fn promote_writer(
+    client: &mut ObjectStore,
+    token: WriterToken,
+    manifest: &mut FixedBuf,
+    head: &mut FixedBuf,
+) -> Result<WriterFence, CheckpointSetupError> {
+    let current = match client.get(WRITER_FENCE_KEY, None) {
+        Ok(result) => {
+            parse_writer_fence(client.body_bytes()).map_err(CheckpointSetupError::Corrupt)?;
+            Some(result.etag)
+        }
+        Err(error) if error.is_not_found() => None,
+        Err(error) => {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "load writer fence: {error}"
+            )));
+        }
+    };
+    let transition = writer_fence_record("transition", token);
+    let condition = current
+        .as_ref()
+        .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
+    let transition_etag = put_fence_record(client, transition.as_str().as_bytes(), condition)?;
+
+    fence_mutable_root(client, MANIFEST_KEY, EMPTY_MANIFEST, manifest)?;
+    fence_mutable_root(client, COMMIT_HEAD_KEY, EMPTY_COMMIT_HEAD, head)?;
+
+    let active = writer_fence_record("active", token);
+    let etag = put_fence_record(
+        client,
+        active.as_str().as_bytes(),
+        Precondition::IfMatch(&transition_etag),
+    )?;
+    Ok(WriterFence { token, etag })
+}
+
+fn put_fence_record(
+    client: &mut ObjectStore,
+    body: &[u8],
+    condition: Precondition<'_>,
+) -> Result<EntityTag, CheckpointSetupError> {
+    match client.put(WRITER_FENCE_KEY, body, condition) {
+        Ok(etag) => Ok(etag),
+        Err(error) => match client.get(WRITER_FENCE_KEY, None) {
+            Ok(result) if client.body_bytes() == body => Ok(result.etag),
+            Ok(_) | Err(ObjectError::Status { code: 404, .. }) => {
+                Err(CheckpointSetupError::ObjectStore(
+                    "writer ownership changed during promotion".to_string(),
+                ))
+            }
+            Err(refresh) => Err(CheckpointSetupError::ObjectStore(format!(
+                "promote writer: {error}; verify writer fence: {refresh}"
+            ))),
+        },
+    }
+}
+
+fn assert_writer_fence(
+    client: &mut ObjectStore,
+    fence: &mut WriterFence,
+) -> Result<(), CheckpointSetupError> {
+    let active = writer_fence_record("active", fence.token);
+    match client.put(
+        WRITER_FENCE_KEY,
+        active.as_str().as_bytes(),
+        Precondition::IfMatch(&fence.etag),
+    ) {
+        Ok(etag) => {
+            fence.etag = etag;
+            Ok(())
+        }
+        Err(error) => match client.get(WRITER_FENCE_KEY, None) {
+            Ok(result) if client.body_bytes() == active.as_str().as_bytes() => {
+                fence.etag = result.etag;
+                Ok(())
+            }
+            Ok(_) | Err(ObjectError::Status { code: 404, .. }) => {
+                Err(CheckpointSetupError::ObjectStore(
+                    "writer was fenced by a newer process".to_string(),
+                ))
+            }
+            Err(refresh) => Err(CheckpointSetupError::ObjectStore(format!(
+                "verify writer ownership: {error}; refresh writer fence: {refresh}"
+            ))),
+        },
+    }
+}
+
+fn fence_mutable_root(
+    client: &mut ObjectStore,
+    key: &str,
+    empty: &[u8],
+    scratch: &mut FixedBuf,
+) -> Result<EntityTag, CheckpointSetupError> {
+    for _ in 0..16 {
+        let current = read_mutable_root(client, key, scratch)?;
+        let (body, condition, expected) = match current.as_ref() {
+            Some(etag) => (scratch.readable(), Precondition::IfMatch(etag), Some(*etag)),
+            None => (empty, Precondition::IfNoneMatchAny, None),
+        };
+        match client.put(key, body, condition) {
+            Ok(etag) => return Ok(etag),
+            Err(error) => {
+                let refreshed = read_mutable_root(client, key, scratch)?;
+                if let Some(etag) = refreshed
+                    && expected.is_none_or(|expected| expected != etag)
+                {
+                    return Ok(etag);
+                }
+                if !error.is_precondition_failed() {
+                    return Err(CheckpointSetupError::ObjectStore(format!(
+                        "fence {key}: {error}"
+                    )));
+                }
+            }
+        }
+    }
+    Err(CheckpointSetupError::ObjectStore(format!(
+        "{key} kept changing during writer promotion"
+    )))
+}
+
+fn read_mutable_root(
+    client: &mut ObjectStore,
+    key: &str,
+    out: &mut FixedBuf,
+) -> Result<Option<EntityTag>, CheckpointSetupError> {
+    out.clear();
+    let window = client.response_capacity();
+    if window == 0 {
+        return Err(CheckpointSetupError::ObjectStore(
+            "object_store_response_bytes must be greater than zero".to_string(),
+        ));
+    }
+    let mut offset = 0u64;
+    let mut etag = None;
+    let mut restarts = 0u8;
+    loop {
+        let last = offset
+            .checked_add(window as u64 - 1)
+            .ok_or_else(|| CheckpointSetupError::ObjectStore(format!("{key} is too large")))?;
+        match client.get(
+            key,
+            Some(ByteRange::new(offset, last).expect("nonempty mutable-root range")),
+        ) {
+            Ok(result) => {
+                if etag.is_some_and(|first| first != result.etag) {
+                    restarts += 1;
+                    if restarts == 16 {
+                        return Err(CheckpointSetupError::ObjectStore(format!(
+                            "{key} kept changing while it was read for writer promotion"
+                        )));
+                    }
+                    out.clear();
+                    offset = 0;
+                    etag = None;
+                    continue;
+                }
+                etag = Some(result.etag);
+            }
+            Err(ObjectError::Status { code: 416, .. }) if etag.is_some() => break,
+            Err(error) if error.is_not_found() && etag.is_none() => return Ok(None),
+            Err(error) => {
+                return Err(CheckpointSetupError::ObjectStore(format!(
+                    "read {key} for writer promotion: {error}"
+                )));
+            }
+        }
+        let bytes = client.body_bytes();
+        if bytes.is_empty() || !out.append(bytes) {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "{key} exceeds its configured root buffer ({})",
+                out.capacity()
+            )));
+        }
+        offset += bytes.len() as u64;
+        if bytes.len() < window {
+            break;
+        }
+    }
+    Ok(etag)
+}
+
 fn replace_root(
     client: &mut ObjectStore,
+    fence: &mut WriterFence,
     key: &str,
     bytes: &[u8],
 ) -> Result<(), CheckpointSetupError> {
+    assert_writer_fence(client, fence)?;
     let current = match client.get(key, None) {
         Ok(result) => Some(result.etag),
         Err(error) if error.is_not_found() => None,
@@ -13934,7 +14333,7 @@ fn replace_root(
         .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
     client.put(key, bytes, condition).map_err(|error| {
         let detail = if error.is_precondition_failed() {
-            "root changed during offline restore; stop every writer and retry".to_string()
+            "writer ownership changed during durable root replacement; retry".to_string()
         } else {
             format!("replace {key}: {error}")
         };
@@ -14025,7 +14424,7 @@ fn validate_backup_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn parse_commit_head(bytes: &[u8]) -> Result<(u64, CommitBatchId), &'static str> {
+fn parse_commit_head(bytes: &[u8]) -> Result<(WriterToken, CommitBatchId), &'static str> {
     let text = core::str::from_utf8(bytes).map_err(|_| "commit-head is not UTF-8")?;
     let mut lines = text.lines();
     if lines.next() != Some(COMMIT_HEAD_HEADER) {
@@ -14034,7 +14433,9 @@ fn parse_commit_head(bytes: &[u8]) -> Result<(u64, CommitBatchId), &'static str>
     let writer = lines
         .next()
         .and_then(|line| line.strip_prefix("writer "))
-        .and_then(|word| u64::from_str_radix(word, 16).ok())
+        .and_then(|word| u128::from_str_radix(word, 16).ok())
+        .filter(|writer| *writer != 0)
+        .map(WriterToken)
         .ok_or("bad commit-head writer")?;
     let first_lsn = lines
         .next()
@@ -16505,6 +16906,46 @@ mod stored_dependency_tests {
                 b"pos3ql-commit-head-v1\nfirst 42\ndigest 00aabbcc\nprevious 0 00112233\nend\n"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn writer_fence_and_commit_head_parse_at_their_versioned_boundaries() {
+        let token = WriterToken(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff);
+        let active = writer_fence_record("active", token);
+        assert_eq!(
+            parse_writer_fence(active.as_str().as_bytes()).unwrap(),
+            ("active", token)
+        );
+        assert!(
+            parse_writer_fence(
+                b"pos3ql-writer-fence-v1\nstate unknown\nwriter 00112233445566778899aabbccddeeff\nend\n"
+            )
+            .is_err()
+        );
+
+        let legacy =
+            b"pos3ql-commit-head-v1\nwriter 0011223344556677\nfirst 42\ndigest 00aabbcc\nend\n";
+        assert_eq!(
+            parse_commit_head(legacy).unwrap(),
+            (
+                WriterToken(0x0011_2233_4455_6677),
+                CommitBatchId {
+                    first_lsn: 42,
+                    digest: 0x00aa_bbcc,
+                }
+            )
+        );
+        let current = format_commit_head(
+            token,
+            CommitBatchId {
+                first_lsn: 42,
+                digest: 0x00aa_bbcc,
+            },
+        );
+        assert_eq!(
+            parse_commit_head(current.as_str().as_bytes()).unwrap().0,
+            token
         );
     }
 

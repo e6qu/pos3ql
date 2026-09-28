@@ -59400,7 +59400,11 @@ fn temporary_rows_spill_locally_without_object_publication() {
     let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 0);
     let mut budget = Budget::new((1 << 29) + (96 << 20));
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    assert_eq!(namespace.borrow().object_count(), 0);
+    let ownership_objects = namespace.borrow().object_count();
+    assert!(
+        ownership_objects > 0,
+        "startup must publish writer ownership"
+    );
 
     let created = run_as(
         &mut engine,
@@ -59439,7 +59443,7 @@ fn temporary_rows_spill_locally_without_object_publication() {
     assert!(engine.temporary_spiller.as_ref().unwrap().block_count() > 0);
     assert_eq!(
         namespace.borrow().object_count(),
-        0,
+        ownership_objects,
         "temporary row spill must not create durable objects"
     );
     assert_eq!(
@@ -69654,6 +69658,115 @@ fn v13_manifest_upgrades_through_empty_cache_recovery_body() {
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_bucket);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn writer_promotion_fences_old_and_delayed_publications() {
+    let result = std::thread::Builder::new()
+        .name("writer-fencing".to_string())
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+        .spawn(writer_promotion_fences_old_and_delayed_publications_body)
+        .expect("spawn writer fencing test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn writer_promotion_fences_old_and_delayed_publications_body() {
+    let mut first_config = test_config("writer-fencing-first");
+    first_config.object_store_on = true;
+    first_config.object_store_sim = true;
+    first_config.object_store_bucket = format!("writer-fencing-{}", std::process::id());
+    first_config.object_store_response_bytes = 1 << 20;
+    first_config.wal_upload = true;
+    first_config.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&first_config.object_store_bucket);
+
+    let mut first_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut first = Engine::new(&first_config, &mut first_budget).unwrap();
+    let setup = run_with(
+        &mut first,
+        &mut first_budget,
+        "CREATE TABLE fenced_values (id integer PRIMARY KEY); \
+         INSERT INTO fenced_values VALUES (1)",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    assert!(first.checkpoint().unwrap());
+    let (stale_manifest, stale_head) = first.ckpt.as_ref().unwrap().root_etags_for_test();
+
+    let mut second_config = first_config.clone();
+    second_config.data_dir = format!("{}-successor", first_config.data_dir);
+    let mut second_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut second = Engine::new(&second_config, &mut second_budget).unwrap();
+
+    let old_client = &mut first.ckpt.as_mut().unwrap().client;
+    assert!(
+        old_client
+            .put(
+                crate::checkpoint::MANIFEST_KEY,
+                b"delayed old manifest",
+                crate::object_store::Precondition::IfMatch(&stale_manifest),
+            )
+            .unwrap_err()
+            .is_precondition_failed()
+    );
+    assert!(
+        old_client
+            .put(
+                "commit-head",
+                b"delayed old commit head",
+                crate::object_store::Precondition::IfMatch(&stale_head),
+            )
+            .unwrap_err()
+            .is_precondition_failed()
+    );
+    let displaced = run_with(
+        &mut first,
+        &mut first_budget,
+        "INSERT INTO fenced_values VALUES (2)",
+    );
+    assert_eq!(message_types(&displaced).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&displaced).contains("40001"));
+
+    let successor = run_with(
+        &mut second,
+        &mut second_budget,
+        "INSERT INTO fenced_values VALUES (2)",
+    );
+    assert!(!message_types(&successor).contains(&b'E'));
+    drop(first);
+
+    let mut third_config = first_config.clone();
+    third_config.data_dir = format!("{}-restart", first_config.data_dir);
+    let mut third_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut third = Engine::new(&third_config, &mut third_budget).unwrap();
+    let restart_loser = run_with(
+        &mut second,
+        &mut second_budget,
+        "INSERT INTO fenced_values VALUES (3)",
+    );
+    assert_eq!(message_types(&restart_loser).last(), Some(&b'E'));
+    assert!(String::from_utf8_lossy(&restart_loser).contains("40001"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut third,
+            &mut third_budget,
+            "SELECT id FROM fenced_values ORDER BY id"
+        )),
+        ["1", "2"]
+    );
+
+    drop(second);
+    drop(third);
+    crate::object_store::sim::drop_namespace(&first_config.object_store_bucket);
+    for data_dir in [
+        first_config.data_dir,
+        second_config.data_dir,
+        third_config.data_dir,
+    ] {
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
 }
 
 #[test]

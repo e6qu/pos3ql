@@ -35,6 +35,7 @@
 - **durable mode**: `object_store = on`; acknowledgement requires commit-batch publication.
 - **manifest**: compare-and-swap root naming the current immutable storage state.
 - **MVCC**: visibility by transaction and commit LSN.
+- **promotion**: transfer of durable write ownership to a fresh process incarnation by compare-and-swap.
 - **PAX**: column-oriented row groups inside an SST, allowing selective column reads.
 - **physical-demand proof**: the columns a query path may read from a physical row.
 - **S3-compatible API**: the qualified HTTP data-plane subset implemented by MinIO and compatible object stores; it does not imply a vendor SDK, vendor control plane, or provider-specific implementation.
@@ -42,3 +43,4 @@
 - **SST**: immutable sorted table of versioned rows, index, filter, and roster blocks.
 - **VOPR**: deterministic simulation that injects faults from a reproducible seed.
 - **WAL**: checksummed local journal encoding used for recovery and logical replication; it is not PostgreSQL physical XLOG.
+- **writer fence**: durable ownership record that prevents an older process incarnation from publishing either mutable root after promotion.

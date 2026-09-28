@@ -30,6 +30,16 @@ MD5 digest or infer its shape from the provider. Conditional failure, missing
 objects, throttling, transient transport failure, authentication failure, and
 malformed responses remain distinct typed outcomes.
 
+The `writer-fence` object is the ownership serialization point. Promotion
+publishes a transition by CAS, conditionally rewrites both mutable roots, and
+activates the new random process incarnation by CAS. Commit-head and manifest
+writers retain their root ETags; a conflict may be adopted or retried only
+after the process proves that it still owns the active fence. The ordering
+makes a delayed old request either visible to the promoting process before it
+rewrites that root or stale after the rewrite. Immutable batches and blocks
+written by a displaced process remain harmless orphans when root publication
+fails.
+
 Profile v1 accepts S3's 1,024-byte object-key limit, opaque continuation tokens
 up to 1,024 bytes, and strong quoted ETags up to 80 bytes. Exceeding a fixed
 profile bound fails before I/O or while decoding; it never truncates a key,

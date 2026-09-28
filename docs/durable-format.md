@@ -11,7 +11,9 @@ they never select a guessed decoder.
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v14. |
 | Checkpoint manifest | `pos3ql-manifest-v14` | yes | yes | Current format. |
-| Backup completion | `pos3ql-backup-v1` | yes | yes | Checksums the retained manifest and commit head. |
+| Backup completion | `pos3ql-backup-v1` | yes | no | Named-point and LSN restore remain readable; no backup creation timestamp is available. |
+| Backup completion | `pos3ql-backup-v2` | yes | yes | Checksums both roots and anchors timestamp recovery after backup creation. |
+| Point-in-time restore marker | `pos3ql-point-in-time-restore-v1` | yes | yes | Binds the backup, manifest checksum, resolved LSN, and commit head during root replacement. |
 | Backup export marker | `pos3ql-export-v1` | yes | yes | Pending and completion records make an independent-prefix copy restartable. |
 | Published row SST | `v2` | yes | no | Compatible generations remain readable and are replaced when sliced or merged. |
 | Published row SST | `v3` | yes | no | Compatible packed PAX generations remain readable. |
@@ -29,11 +31,20 @@ index-entry grammar from block contents or collapse the identity into an
 unrelated flag.
 
 A named backup stores an exact manifest and commit-head image, then publishes
-its `pos3ql-backup-v1` completion record last. The record carries the manifest
-LSN and CRC32C checksums for both roots. Restore rejects a missing, unknown, or
-mismatched completion record. The backup manifest itself is the retention pin,
-so an interrupted creation cannot expose a restorable name or lose blocks that
-its partial state may reference.
+its completion record last. Version 2 adds the backup creation timestamp to
+the manifest LSN and CRC32C checksums for both roots. Restore rejects a missing,
+unknown, or mismatched completion record. The backup manifest itself is the
+retention pin, so an interrupted creation cannot expose a restorable name or
+lose blocks that its partial state may reference.
+
+Current commit boundary records append PostgreSQL-epoch commit microseconds to
+the transaction identity fields. Readers retain the empty, identity-only, and
+identity-plus-assignment legacy forms. LSN recovery can use legacy records;
+timestamp recovery rejects a legacy boundary whose time cannot be known.
+Recovery may write an immutable prefix of a multi-transaction commit batch.
+Its identity is the CRC32C of the exact prefix and its descriptor preserves the
+original predecessor, so the published head ends only at a validated whole
+transaction.
 
 An independent-prefix copy publishes `pos3ql-export-v1` as a pending marker
 before copying immutable objects. A retry must match the backup name and root

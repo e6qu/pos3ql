@@ -1120,6 +1120,10 @@ pub(crate) enum WalOp<'a> {
     Commit {
         transaction_id: u32,
         assigned_transaction_identity: bool,
+        /// PostgreSQL-epoch microseconds at durable commit. Legacy records
+        /// decode as `None`; point-in-time recovery rejects an ambiguous
+        /// timestamp target rather than guessing.
+        committed_at: Option<i64>,
     },
     /// Terminates a durable batch without making its preceding operations
     /// visible. The batch remains addressable by `gid` until a later typed
@@ -1959,6 +1963,7 @@ impl Wal {
             + encoded_payload_len(&WalOp::Commit {
                 transaction_id: 0,
                 assigned_transaction_identity: false,
+                committed_at: Some(0),
             })
     }
 
@@ -2035,6 +2040,7 @@ impl Wal {
             &WalOp::Commit {
                 transaction_id,
                 assigned_transaction_identity,
+                committed_at: Some(crate::sql::datetime::now_micros()),
             },
             None,
         )
@@ -3007,7 +3013,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             name,
         } => 1 + schema.len() + 1 + table.len() + 1 + name.len(),
-        WalOp::Commit { .. } => 5,
+        WalOp::Commit { committed_at, .. } => 5 + usize::from(committed_at.is_some()) * 8,
         WalOp::PrepareTransaction { gid, .. } => 4 + 2 + 4 + 8 + 1 + gid.len(),
         WalOp::PreparedLocks { encoded, .. } => 4 + 4 + encoded.len(),
         WalOp::CommitPrepared { gid } | WalOp::RollbackPrepared { gid } => 1 + gid.len(),
@@ -4810,9 +4816,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::Commit {
             transaction_id,
             assigned_transaction_identity,
+            committed_at,
         } => {
             buffer.append(&transaction_id.to_le_bytes())
                 && buffer.append(&[u8::from(*assigned_transaction_identity)])
+                && committed_at.is_none_or(|value| buffer.append(&value.to_le_bytes()))
         }
         WalOp::PrepareTransaction {
             transaction_id,
@@ -8502,20 +8510,26 @@ fn decode_op_inner<'a>(
         KIND_COMMIT if payload.is_empty() => Some(WalOp::Commit {
             transaction_id: 0,
             assigned_transaction_identity: false,
+            committed_at: None,
         }),
         KIND_COMMIT => decode_large_op(|| {
             let transaction_id = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
-            let assigned_transaction_identity = match payload.get(4..) {
+            let (assigned_transaction_identity, committed_at) = match payload.get(4..) {
                 // Commit records written before transaction introspection had
                 // no client-visible full-XID state to recover.
-                Some([]) => false,
-                Some([0]) => false,
-                Some([1]) => true,
+                Some([]) => (false, None),
+                Some([0]) => (false, None),
+                Some([1]) => (true, None),
+                Some(tail @ [0 | 1, ..]) if tail.len() == 9 => (
+                    tail[0] != 0,
+                    Some(i64::from_le_bytes(tail[1..].try_into().ok()?)),
+                ),
                 _ => return None,
             };
             Some(WalOp::Commit {
                 transaction_id,
                 assigned_transaction_identity,
+                committed_at,
             })
         }),
         KIND_PREPARE_TRANSACTION => decode_large_op(|| {
@@ -12728,6 +12742,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 1,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -12824,6 +12839,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 1,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -13953,6 +13969,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 1,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -14065,6 +14082,7 @@ mod tests {
             &WalOp::Commit {
                 transaction_id: 2,
                 assigned_transaction_identity: false,
+                committed_at: None,
             },
         )
         .unwrap();
@@ -14104,6 +14122,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 1,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -14929,6 +14948,39 @@ mod tests {
     }
 
     #[test]
+    fn commit_timestamp_extends_the_backward_readable_commit_record() {
+        let mut legacy = 7_u32.to_le_bytes().to_vec();
+        legacy.push(1);
+        assert!(matches!(
+            decode_op(KIND_COMMIT, &legacy),
+            Some(WalOp::Commit {
+                transaction_id: 7,
+                assigned_transaction_identity: true,
+                committed_at: None,
+            })
+        ));
+
+        let mut budget = Budget::new(128);
+        let mut current = FixedBuf::new(&mut budget, "commit timestamp WAL", 64).unwrap();
+        assert!(append_payload(
+            &mut current,
+            &WalOp::Commit {
+                transaction_id: 9,
+                assigned_transaction_identity: false,
+                committed_at: Some(820_497_600_123_456),
+            }
+        ));
+        assert!(matches!(
+            decode_op(KIND_COMMIT, current.readable()),
+            Some(WalOp::Commit {
+                transaction_id: 9,
+                assigned_transaction_identity: false,
+                committed_at: Some(820_497_600_123_456),
+            })
+        ));
+    }
+
+    #[test]
     fn corrupt_record_discards_its_transaction_without_hiding_a_prior_commit() {
         let dir = temp_dir("corrupt");
         let config = test_config(&dir);
@@ -14951,6 +15003,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 1,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -14972,6 +15025,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 2,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -14992,6 +15046,7 @@ mod tests {
             + encoded_payload_len(&WalOp::Commit {
                 transaction_id: 1,
                 assigned_transaction_identity: false,
+                committed_at: None,
             });
         bytes[record_len + commit_len + record_len + HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
@@ -15031,6 +15086,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 1,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -15069,6 +15125,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 1,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();
@@ -15102,6 +15159,7 @@ mod tests {
                 &WalOp::Commit {
                     transaction_id: 2,
                     assigned_transaction_identity: false,
+                    committed_at: None,
                 },
             )
             .unwrap();

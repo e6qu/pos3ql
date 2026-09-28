@@ -69799,6 +69799,171 @@ fn named_backup_restores_an_older_point_through_empty_local_caches_body() {
 }
 
 #[test]
+fn named_backup_recovers_to_retained_lsn_and_timestamp_boundaries() {
+    let result = std::thread::Builder::new()
+        .name("point-in-time-restore".to_string())
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+        .spawn(named_backup_recovers_to_retained_lsn_and_timestamp_boundaries_body)
+        .expect("spawn point-in-time restore test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn named_backup_recovers_to_retained_lsn_and_timestamp_boundaries_body() {
+    let mut config = test_config("point-in-time-restore");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("point-in-time-restore-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.max_backups = 1;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 109);
+
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recovery_timeline (id integer PRIMARY KEY, value text); \
+         INSERT INTO recovery_timeline VALUES (1, 'backup')",
+    );
+    assert!(!message_types(&setup).contains(&b'E'));
+    let backup_lsn = engine.create_backup("timeline").unwrap();
+
+    stage_without_publication(
+        &mut engine,
+        &mut budget,
+        "UPDATE recovery_timeline SET value = 'target' WHERE id = 1",
+    );
+    let target_lsn = engine.storage.lsn();
+    assert!(target_lsn > backup_lsn);
+    let target_time = crate::sql::datetime::now_micros();
+    while crate::sql::datetime::now_micros() <= target_time {
+        std::hint::spin_loop();
+    }
+    stage_without_publication(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO recovery_timeline VALUES (2, 'too-late')",
+    );
+    let later_lsn = engine.storage.lsn();
+    assert!(later_lsn > target_lsn);
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut invalid_budget = Budget::new(64 << 20);
+    let invalid = crate::checkpoint::restore_backup_to(
+        &config,
+        &mut invalid_budget,
+        "timeline",
+        crate::checkpoint::RecoveryTarget::Lsn(target_lsn - 1),
+    )
+    .unwrap_err();
+    assert!(invalid.to_string().contains("transaction boundary"));
+    assert!(
+        namespace.borrow().object_bytes("restore-pending").is_none(),
+        "target validation must finish before publishing restore-pending"
+    );
+
+    let fail_from = namespace.borrow().op_count + 10;
+    namespace.borrow_mut().faults.fail_from_op = Some(fail_from);
+    let mut interrupted_budget = Budget::new(64 << 20);
+    let interrupted = crate::checkpoint::restore_backup_to(
+        &config,
+        &mut interrupted_budget,
+        "timeline",
+        crate::checkpoint::RecoveryTarget::Time(target_time),
+    )
+    .unwrap_err();
+    assert!(interrupted.to_string().contains("simulated outage"));
+    namespace.borrow_mut().faults.fail_from_op = None;
+    assert!(
+        namespace.borrow().object_bytes("restore-pending").is_some(),
+        "an interrupted target restore must retain its durable marker"
+    );
+
+    let mut restore_budget = Budget::new(64 << 20);
+    assert_eq!(
+        crate::checkpoint::restore_backup_to(
+            &config,
+            &mut restore_budget,
+            "timeline",
+            crate::checkpoint::RecoveryTarget::Time(target_time),
+        )
+        .unwrap(),
+        target_lsn
+    );
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, value FROM recovery_timeline ORDER BY id"
+        )),
+        ["1|target"]
+    );
+    let later_branch = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "INSERT INTO recovery_timeline VALUES (3, 'discard-me')",
+    );
+    assert!(!message_types(&later_branch).contains(&b'E'));
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+
+    let target_text = format!(
+        "{:X}/{:X}",
+        target_lsn >> 32,
+        target_lsn & u64::from(u32::MAX)
+    );
+    assert_eq!(
+        crate::operations::restore_backup_to_lsn(&config, "timeline", &target_text).unwrap(),
+        target_lsn
+    );
+    let mut branch_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut branch = Engine::new(&config, &mut branch_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut branch,
+            &mut branch_budget,
+            "SELECT id, value FROM recovery_timeline ORDER BY id"
+        )),
+        ["1|target"]
+    );
+    let branch_write = run_with(
+        &mut branch,
+        &mut branch_budget,
+        "INSERT INTO recovery_timeline VALUES (4, 'kept-branch')",
+    );
+    assert!(!message_types(&branch_write).contains(&b'E'));
+    assert!(branch.checkpoint().unwrap());
+    assert!(branch.delete_backup("timeline").unwrap());
+    drop(branch);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut final_budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_engine,
+            &mut final_budget,
+            "SELECT id, value FROM recovery_timeline ORDER BY id"
+        )),
+        ["1|target", "4|kept-branch"]
+    );
+    drop(final_engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn named_backup_exports_to_an_independent_prefix_and_resumes_after_outage() {
     let result = std::thread::Builder::new()
         .name("named-backup-export".to_string())

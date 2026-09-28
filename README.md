@@ -23,7 +23,8 @@ Offline `--backup`, `--restore`, `--export-backup`, and `--delete-backup`
 operations manage named, checkpoint-consistent recovery points. Checkpoint
 garbage collection retains their block graphs and commit history; export copies
 one into an empty independently configured object-store prefix, and restore
-clears local caches before recovering the named state. See
+can select the named state or an exact retained transaction boundary by LSN or
+timestamp before clearing local caches. See
 [backup and restore](docs/backup-restore.md) for the commands and retention
 limits.
 

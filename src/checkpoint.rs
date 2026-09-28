@@ -35,8 +35,10 @@ const RESTORE_PENDING_KEY: &str = "restore-pending";
 const EXPORT_PENDING_KEY: &str = "export-pending";
 const EXPORT_COMPLETE_KEY: &str = "export-complete";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const BACKUP_HEADER: &str = "pos3ql-backup-v1";
+const BACKUP_HEADER_V1: &str = "pos3ql-backup-v1";
+const BACKUP_HEADER: &str = "pos3ql-backup-v2";
 const EXPORT_HEADER: &str = "pos3ql-export-v1";
+const POINT_IN_TIME_RESTORE_HEADER: &str = "pos3ql-point-in-time-restore-v1";
 const BACKUP_NAME_BYTES: usize = 63;
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -1843,9 +1845,10 @@ impl Checkpointer {
             Err(error) => return Err(object_store_to_sql(error)),
         }
         let complete_key = stack_format!(128, "backups/{name}/complete");
+        let created_at = crate::sql::datetime::now_micros();
         let complete = stack_format!(
-            160,
-            "{BACKUP_HEADER}\nlsn {floor}\nmanifest_crc {manifest_crc:08x}\nhead_crc {head_crc:08x}\nend\n"
+            192,
+            "{BACKUP_HEADER}\nlsn {floor}\ncreated_at {created_at}\nmanifest_crc {manifest_crc:08x}\nhead_crc {head_crc:08x}\nend\n"
         );
         self.put_immutable(complete_key.as_str(), complete.as_str().as_bytes())?;
         Ok(floor)
@@ -13057,10 +13060,24 @@ impl std::error::Error for CheckpointSetupError {}
 
 struct BackupRoots {
     floor: u64,
+    created_at: Option<i64>,
     manifest_crc: u32,
     head_crc: u32,
     manifest: FixedBuf,
     head: FixedBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryTarget {
+    Backup,
+    Lsn(u64),
+    Time(i64),
+}
+
+#[derive(Clone, Copy)]
+struct CommitChainEntry {
+    id: CommitBatchId,
+    previous: Option<CommitBatchId>,
 }
 
 fn load_backup_roots(
@@ -13080,7 +13097,7 @@ fn load_backup_roots(
         &mut head,
         "backup completion record",
     )?;
-    let (floor, manifest_crc, head_crc) =
+    let (floor, created_at, manifest_crc, head_crc) =
         parse_backup_complete(head.readable()).map_err(CheckpointSetupError::Corrupt)?;
 
     let mut manifest = FixedBuf::new(budget, "backup manifest", config.checkpoint_manifest_bytes)
@@ -13124,6 +13141,7 @@ fn load_backup_roots(
     }
     Ok(BackupRoots {
         floor,
+        created_at,
         manifest_crc,
         head_crc,
         manifest,
@@ -13139,6 +13157,15 @@ pub(crate) fn restore_backup(
     budget: &mut Budget,
     name: &str,
 ) -> Result<u64, CheckpointSetupError> {
+    restore_backup_to(config, budget, name, RecoveryTarget::Backup)
+}
+
+pub(crate) fn restore_backup_to(
+    config: &Config,
+    budget: &mut Budget,
+    name: &str,
+    target: RecoveryTarget,
+) -> Result<u64, CheckpointSetupError> {
     validate_backup_name(name)
         .map_err(|message| CheckpointSetupError::ObjectStore(message.to_string()))?;
     if !config.object_store_on {
@@ -13150,7 +13177,47 @@ pub(crate) fn restore_backup(
         .map_err(|error| CheckpointSetupError::ObjectStore(error.to_string()))?;
     let roots = load_backup_roots(&mut client, budget, config, name)?;
 
-    let pending = stack_format!(128, "{BACKUP_HEADER}\nname {name}\nend\n");
+    let (target_lsn, target_head) = match target {
+        RecoveryTarget::Backup => {
+            let head = if roots.head.is_empty() {
+                None
+            } else {
+                Some(
+                    parse_commit_head(roots.head.readable())
+                        .map_err(CheckpointSetupError::Corrupt)?
+                        .1,
+                )
+            };
+            (roots.floor, head)
+        }
+        RecoveryTarget::Lsn(lsn) => select_recovery_head(
+            &mut client,
+            budget,
+            config,
+            &roots,
+            RecoveryTarget::Lsn(lsn),
+        )?,
+        RecoveryTarget::Time(time) => select_recovery_head(
+            &mut client,
+            budget,
+            config,
+            &roots,
+            RecoveryTarget::Time(time),
+        )?,
+    };
+
+    let pending = match target {
+        RecoveryTarget::Backup => stack_format!(256, "{BACKUP_HEADER_V1}\nname {name}\nend\n"),
+        _ => {
+            let (first_lsn, digest) =
+                target_head.map_or((0, 0), |head| (head.first_lsn, head.digest));
+            stack_format!(
+                256,
+                "{POINT_IN_TIME_RESTORE_HEADER}\nname {name}\nlsn {target_lsn}\nhead {first_lsn} {digest:08x}\nmanifest_crc {:08x}\nend\n",
+                roots.manifest_crc
+            )
+        }
+    };
     match client.put(
         RESTORE_PENDING_KEY,
         pending.as_str().as_bytes(),
@@ -13175,18 +13242,301 @@ pub(crate) fn restore_backup(
     }
 
     replace_root(&mut client, MANIFEST_KEY, roots.manifest.readable())?;
-    if roots.head.is_empty() {
-        client.delete(COMMIT_HEAD_KEY).map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!("clear commit-head: {error}"))
-        })?;
-    } else {
-        replace_root(&mut client, COMMIT_HEAD_KEY, roots.head.readable())?;
+    match (target_head, target) {
+        (None, _) => {
+            client.delete(COMMIT_HEAD_KEY).map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!("clear commit-head: {error}"))
+            })?;
+        }
+        (Some(_), RecoveryTarget::Backup) => {
+            replace_root(&mut client, COMMIT_HEAD_KEY, roots.head.readable())?;
+        }
+        (Some(target_head), _) => {
+            let head = format_commit_head(crate::object_store::writer_id(config), target_head);
+            replace_root(&mut client, COMMIT_HEAD_KEY, head.as_str().as_bytes())?;
+        }
     }
     clear_local_cache(&config.data_dir)?;
     client
         .delete(RESTORE_PENDING_KEY)
         .map_err(|error| CheckpointSetupError::ObjectStore(format!("complete restore: {error}")))?;
-    Ok(roots.floor)
+    Ok(target_lsn)
+}
+
+fn select_recovery_head(
+    client: &mut ObjectStore,
+    budget: &mut Budget,
+    config: &Config,
+    roots: &BackupRoots,
+    target: RecoveryTarget,
+) -> Result<(u64, Option<CommitBatchId>), CheckpointSetupError> {
+    if let RecoveryTarget::Lsn(lsn) = target
+        && lsn < roots.floor
+    {
+        return Err(CheckpointSetupError::ObjectStore(format!(
+            "recovery target LSN {lsn} precedes backup LSN {}",
+            roots.floor
+        )));
+    }
+    if let RecoveryTarget::Time(time) = target {
+        let Some(created_at) = roots.created_at else {
+            return Err(CheckpointSetupError::ObjectStore(
+                "timestamp recovery requires a backup created with commit timestamps".to_string(),
+            ));
+        };
+        if time < created_at {
+            return Err(CheckpointSetupError::ObjectStore(
+                "recovery target time precedes the named backup".to_string(),
+            ));
+        }
+    }
+
+    let backup_head = if roots.head.is_empty() {
+        None
+    } else {
+        Some(
+            parse_commit_head(roots.head.readable())
+                .map_err(CheckpointSetupError::Corrupt)?
+                .1,
+        )
+    };
+    if matches!(target, RecoveryTarget::Lsn(lsn) if lsn == roots.floor) {
+        return Ok((roots.floor, backup_head));
+    }
+
+    let live_head = match client.get(COMMIT_HEAD_KEY, None) {
+        Ok(_) => Some(
+            parse_commit_head(client.body_bytes())
+                .map_err(CheckpointSetupError::Corrupt)?
+                .1,
+        ),
+        Err(error) if error.is_not_found() => None,
+        Err(error) => {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "load live commit-head for recovery: {error}"
+            )));
+        }
+    };
+    let mut chain = Vec::with_capacity(config.checkpoint_commit_batches);
+    let mut current = live_head;
+    while current != backup_head {
+        let Some(id) = current else {
+            return Err(CheckpointSetupError::ObjectStore(
+                "live commit history does not descend from the named backup".to_string(),
+            ));
+        };
+        if chain.len() == chain.capacity() {
+            return Err(CheckpointSetupError::ObjectStore(format!(
+                "commit-head chain exceeds checkpoint_commit_batches ({})",
+                chain.capacity()
+            )));
+        }
+        let key = stack_format!(72, "commits/{:020}-{:08x}.head", id.first_lsn, id.digest);
+        client.get(key.as_str(), None).map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("load recovery commit descriptor: {error}"))
+        })?;
+        let (described, previous) =
+            parse_commit_descriptor(client.body_bytes()).map_err(CheckpointSetupError::Corrupt)?;
+        if described != id {
+            return Err(CheckpointSetupError::Corrupt(
+                "commit descriptor does not match its head",
+            ));
+        }
+        if id.first_lsn <= roots.floor {
+            return Err(CheckpointSetupError::ObjectStore(
+                "live commit history does not descend from the named backup".to_string(),
+            ));
+        }
+        chain.push(CommitChainEntry { id, previous });
+        current = previous;
+    }
+
+    let mut batch = FixedBuf::new(
+        budget,
+        "recovery commit batch",
+        config.wal_buffer_bytes.max(config.wal_upload_buffer_bytes),
+    )
+    .map_err(CheckpointSetupError::Budget)?;
+    let mut selected_head = backup_head;
+    let mut selected_lsn = roots.floor;
+    for entry in chain.iter().rev() {
+        let key = stack_format!(
+            72,
+            "commits/{:020}-{:08x}.batch",
+            entry.id.first_lsn,
+            entry.id.digest
+        );
+        read_object_into(client, key.as_str(), &mut batch, "wal_buffer_bytes")?;
+        if CommitBatchId::from_bytes(entry.id.first_lsn, batch.readable()) != entry.id {
+            return Err(CheckpointSetupError::Corrupt(
+                "commit batch does not match its digest",
+            ));
+        }
+        let mut at = 0usize;
+        let mut previous_lsn = 0u64;
+        let mut last_boundary = 0usize;
+        let mut selected_boundary_lsn = 0u64;
+        let mut selected_boundary_end = 0usize;
+        while at < batch.len() {
+            let bytes = batch.readable();
+            if bytes.len() - at < crate::wal::HEADER_LEN {
+                return Err(CheckpointSetupError::Corrupt(
+                    "commit batch ends inside a WAL header",
+                ));
+            }
+            let payload_len =
+                u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let total = crate::wal::HEADER_LEN
+                .checked_add(payload_len)
+                .filter(|total| at + total <= bytes.len())
+                .ok_or(CheckpointSetupError::Corrupt(
+                    "commit batch ends inside a WAL record",
+                ))?;
+            let lsn = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap());
+            if (at == 0 && lsn != entry.id.first_lsn)
+                || (previous_lsn != 0 && lsn <= previous_lsn)
+                || crate::wal::crc32c::crc32c(&bytes[at + 4..at + total])
+                    != u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+            {
+                return Err(CheckpointSetupError::Corrupt(
+                    "commit batch has invalid WAL framing",
+                ));
+            }
+            previous_lsn = lsn;
+            let operation = crate::wal::decode_record(&bytes[at + 16..at + total]).ok_or(
+                CheckpointSetupError::Corrupt("commit batch contains an unknown WAL record"),
+            )?;
+            let (boundary, boundary_time) = match operation {
+                crate::wal::WalOp::Commit { committed_at, .. } => (true, committed_at),
+                crate::wal::WalOp::PrepareTransaction { prepared_at, .. } => {
+                    (true, Some(prepared_at))
+                }
+                _ => (false, None),
+            };
+            at += total;
+            if !boundary {
+                continue;
+            }
+            last_boundary = at;
+            match target {
+                RecoveryTarget::Lsn(wanted) if lsn == wanted => {
+                    let head = select_batch_prefix(client, entry, &batch, at)?;
+                    return Ok((lsn, Some(head)));
+                }
+                RecoveryTarget::Lsn(wanted) if lsn > wanted => {
+                    return Err(CheckpointSetupError::ObjectStore(format!(
+                        "recovery target LSN {wanted} is not a retained transaction boundary"
+                    )));
+                }
+                RecoveryTarget::Time(wanted) => {
+                    let boundary_time = boundary_time.ok_or_else(|| {
+                        CheckpointSetupError::ObjectStore(format!(
+                            "commit at LSN {lsn} has no timestamp; use an LSN target"
+                        ))
+                    })?;
+                    if boundary_time > wanted {
+                        if selected_boundary_end != 0 {
+                            let head =
+                                select_batch_prefix(client, entry, &batch, selected_boundary_end)?;
+                            return Ok((selected_boundary_lsn, Some(head)));
+                        }
+                        return Ok((selected_lsn, selected_head));
+                    }
+                    selected_boundary_lsn = lsn;
+                    selected_boundary_end = at;
+                }
+                _ => {}
+            }
+        }
+        if last_boundary != batch.len() {
+            return Err(CheckpointSetupError::Corrupt(
+                "commit batch ends inside a transaction",
+            ));
+        }
+        selected_head = Some(entry.id);
+        selected_lsn = previous_lsn;
+    }
+    match target {
+        RecoveryTarget::Lsn(wanted) => Err(CheckpointSetupError::ObjectStore(format!(
+            "recovery target LSN {wanted} is newer than the retained commit history"
+        ))),
+        RecoveryTarget::Time(_) => Ok((selected_lsn, selected_head)),
+        RecoveryTarget::Backup => unreachable!("backup target is resolved without history"),
+    }
+}
+
+fn select_batch_prefix(
+    client: &mut ObjectStore,
+    entry: &CommitChainEntry,
+    batch: &FixedBuf,
+    end: usize,
+) -> Result<CommitBatchId, CheckpointSetupError> {
+    if end == batch.len() {
+        return Ok(entry.id);
+    }
+    let bytes = &batch.readable()[..end];
+    let selected = CommitBatchId::from_bytes(entry.id.first_lsn, bytes);
+    let batch_key = stack_format!(
+        72,
+        "commits/{:020}-{:08x}.batch",
+        selected.first_lsn,
+        selected.digest
+    );
+    put_immutable_object(client, batch_key.as_str(), bytes)?;
+    let descriptor_key = stack_format!(
+        72,
+        "commits/{:020}-{:08x}.head",
+        selected.first_lsn,
+        selected.digest
+    );
+    let previous = entry.previous.unwrap_or(CommitBatchId::EMPTY);
+    let descriptor = stack_format!(
+        96,
+        "{}\nfirst {}\ndigest {:08x}\nprevious {} {:08x}\nend\n",
+        COMMIT_HEAD_HEADER,
+        selected.first_lsn,
+        selected.digest,
+        previous.first_lsn,
+        previous.digest
+    );
+    put_immutable_object(
+        client,
+        descriptor_key.as_str(),
+        descriptor.as_str().as_bytes(),
+    )?;
+    Ok(selected)
+}
+
+fn format_commit_head(writer: u64, batch: CommitBatchId) -> StackStr<80> {
+    stack_format!(
+        80,
+        "{}\nwriter {writer:016x}\nfirst {}\ndigest {:08x}\nend\n",
+        COMMIT_HEAD_HEADER,
+        batch.first_lsn,
+        batch.digest
+    )
+}
+
+fn put_immutable_object(
+    client: &mut ObjectStore,
+    key: &str,
+    bytes: &[u8],
+) -> Result<(), CheckpointSetupError> {
+    match client.put(key, bytes, Precondition::IfNoneMatchAny) {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_precondition_failed() => {
+            if object_matches(client, key, bytes)? {
+                Ok(())
+            } else {
+                Err(CheckpointSetupError::ObjectStore(format!(
+                    "immutable recovery object collision at {key}"
+                )))
+            }
+        }
+        Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
+            "write recovery object {key}: {error}"
+        ))),
+    }
 }
 
 /// Copies one named recovery point into an empty, independently configured
@@ -13621,17 +13971,30 @@ fn clear_local_cache(data_dir: &str) -> Result<(), CheckpointSetupError> {
         })
 }
 
-fn parse_backup_complete(bytes: &[u8]) -> Result<(u64, u32, u32), &'static str> {
+fn parse_backup_complete(bytes: &[u8]) -> Result<(u64, Option<i64>, u32, u32), &'static str> {
     let text = core::str::from_utf8(bytes).map_err(|_| "backup completion is not UTF-8")?;
     let mut lines = text.lines();
-    if lines.next() != Some(BACKUP_HEADER) {
-        return Err("bad backup completion header");
-    }
+    let version = match lines.next() {
+        Some(header) if header == BACKUP_HEADER_V1 => 1,
+        Some(header) if header == BACKUP_HEADER => 2,
+        _ => return Err("bad backup completion header"),
+    };
     let floor = lines
         .next()
         .and_then(|line| line.strip_prefix("lsn "))
         .and_then(|value| value.parse().ok())
         .ok_or("bad backup completion LSN")?;
+    let created_at = if version == 2 {
+        Some(
+            lines
+                .next()
+                .and_then(|line| line.strip_prefix("created_at "))
+                .and_then(|value| value.parse().ok())
+                .ok_or("bad backup creation timestamp")?,
+        )
+    } else {
+        None
+    };
     let manifest_crc = lines
         .next()
         .and_then(|line| line.strip_prefix("manifest_crc "))
@@ -13645,7 +14008,7 @@ fn parse_backup_complete(bytes: &[u8]) -> Result<(u64, u32, u32), &'static str> 
     if lines.next() != Some("end") || lines.next().is_some() {
         return Err("bad backup completion terminator");
     }
-    Ok((floor, manifest_crc, head_crc))
+    Ok((floor, created_at, manifest_crc, head_crc))
 }
 
 fn validate_backup_name(name: &str) -> Result<(), &'static str> {
@@ -16115,6 +16478,7 @@ mod stored_dependency_tests {
             Some(crate::wal::WalOp::Commit {
                 transaction_id: 9,
                 assigned_transaction_identity: false,
+                ..
             })
         ));
     }
@@ -16141,6 +16505,24 @@ mod stored_dependency_tests {
                 b"pos3ql-commit-head-v1\nfirst 42\ndigest 00aabbcc\nprevious 0 00112233\nend\n"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn backup_completion_reads_v1_and_writes_timestamped_v2_shape() {
+        assert_eq!(
+            parse_backup_complete(
+                b"pos3ql-backup-v1\nlsn 42\nmanifest_crc 00aabbcc\nhead_crc 00112233\nend\n"
+            )
+            .unwrap(),
+            (42, None, 0x00aa_bbcc, 0x0011_2233)
+        );
+        assert_eq!(
+            parse_backup_complete(
+                b"pos3ql-backup-v2\nlsn 42\ncreated_at 820497600123456\nmanifest_crc 00aabbcc\nhead_crc 00112233\nend\n"
+            )
+            .unwrap(),
+            (42, Some(820_497_600_123_456), 0x00aa_bbcc, 0x0011_2233)
         );
     }
 }

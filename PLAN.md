@@ -59,13 +59,14 @@ branch new durable history from the restored checkpoint. The fixed
 `max_backups` roster bounds retention bookkeeping. A restartable export copies
 a named point and its immutable block, commit, and extension-package objects
 into an empty independently configured prefix, publishes it as that prefix's
-live state, and recovers after complete source loss. Recovery targets between
-named checkpoints remain open.
+live state, and recovers after complete source loss. LSN and timestamp recovery
+derive a validated whole-transaction head from retained history, resume through
+a target-bound durable marker, recover with empty local caches, and permit a
+new durable branch after backup deletion.
 
 This is not yet a production-complete topology: one process serializes query
-execution; writer fencing, promotion, backup and point-in-time recovery,
-operational interfaces, and representative long-run performance evidence
-remain open.
+execution; writer fencing, promotion, operational interfaces, and
+representative long-run performance evidence remain open.
 
 ## Remaining production work
 
@@ -215,10 +216,6 @@ the client-visible boundary and rejected before partial effects.
 
 ### Durable operations and availability
 
-- Recover to an exact retained LSN or timestamp between named checkpoints.
-  Preserve transaction boundaries while deriving the target commit head, and
-  qualify empty local caches, retained commit history, deletion, and a new
-  durable history branch after recovery.
 - Add single-writer ownership and fencing before promotion or failover. Prove
   that an old writer cannot publish after ownership changes, including delayed
   object requests and restart races. Multiple writable processes on one prefix
@@ -634,8 +631,8 @@ The production roadmap is complete when:
   implementation boundary, and every accepted configuration survives
   checkpoint and object-cold recovery at its declared capacities without
   truncation or post-startup allocation;
-- backup and point-in-time recovery, format migration, writer fencing,
-  promotion, monitoring, credential rotation, packaging, and runbooks pass
+- format migration, writer fencing, promotion, monitoring, credential
+  rotation, packaging, and runbooks pass
   end-to-end operational tests;
 - concurrent execution scales across the supported worker range while
   preserving MVCC, durability, fixed memory, and backpressure; and

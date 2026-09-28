@@ -36,6 +36,8 @@ const RESTORE_PENDING_KEY: &str = "restore-pending";
 const EXPORT_PENDING_KEY: &str = "export-pending";
 const EXPORT_COMPLETE_KEY: &str = "export-complete";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
+const EMPTY_MANIFEST_HEADER: &str = "pos3ql-empty-manifest-v1";
+const EMPTY_COMMIT_HEAD_HEADER: &str = "pos3ql-empty-commit-head-v1";
 const EMPTY_MANIFEST: &[u8] = b"pos3ql-empty-manifest-v1\nend\n";
 const EMPTY_COMMIT_HEAD: &[u8] = b"pos3ql-empty-commit-head-v1\nend\n";
 const WRITER_FENCE_HEADER: &str = "pos3ql-writer-fence-v1";
@@ -74,6 +76,70 @@ fn writer_fence_record(state: &str, token: WriterToken) -> StackStr<96> {
         "{WRITER_FENCE_HEADER}\nstate {state}\nwriter {:032x}\nend\n",
         token.0
     )
+}
+
+fn empty_manifest_record(token: WriterToken) -> StackStr<96> {
+    stack_format!(96, "{EMPTY_MANIFEST_HEADER}\nw {:032x}\nend\n", token.0)
+}
+
+fn empty_commit_head_record(token: WriterToken) -> StackStr<128> {
+    stack_format!(128, "{EMPTY_COMMIT_HEAD_HEADER}\nw {:032x}\nend\n", token.0)
+}
+
+fn parse_empty_root(
+    bytes: &[u8],
+    legacy: &[u8],
+    header: &'static str,
+) -> Result<Option<WriterToken>, &'static str> {
+    if bytes == legacy {
+        return Ok(None);
+    }
+    let text = core::str::from_utf8(bytes).map_err(|_| "empty root is not UTF-8")?;
+    let mut lines = text.lines();
+    if lines.next() != Some(header) {
+        return Err("different root format");
+    }
+    let token = lines
+        .next()
+        .and_then(|line| line.strip_prefix("w "))
+        .and_then(|word| u128::from_str_radix(word, 16).ok())
+        .filter(|token| *token != 0)
+        .map(WriterToken)
+        .ok_or("bad empty-root writer")?;
+    if lines.next() != Some("end") || lines.next().is_some() {
+        return Err("bad empty-root terminator");
+    }
+    Ok(Some(token))
+}
+
+fn empty_manifest_writer(bytes: &[u8]) -> Result<Option<WriterToken>, &'static str> {
+    parse_empty_root(bytes, EMPTY_MANIFEST, EMPTY_MANIFEST_HEADER)
+}
+
+fn empty_commit_head_writer(bytes: &[u8]) -> Result<Option<WriterToken>, &'static str> {
+    parse_empty_root(bytes, EMPTY_COMMIT_HEAD, EMPTY_COMMIT_HEAD_HEADER)
+}
+
+fn is_empty_manifest(bytes: &[u8]) -> Result<bool, &'static str> {
+    if bytes == EMPTY_MANIFEST {
+        return Ok(true);
+    }
+    if bytes.starts_with(EMPTY_MANIFEST_HEADER.as_bytes()) {
+        empty_manifest_writer(bytes)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn is_empty_commit_head(bytes: &[u8]) -> Result<bool, &'static str> {
+    if bytes == EMPTY_COMMIT_HEAD {
+        return Ok(true);
+    }
+    if bytes.starts_with(EMPTY_COMMIT_HEAD_HEADER.as_bytes()) {
+        empty_commit_head_writer(bytes)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn parse_writer_fence(bytes: &[u8]) -> Result<(&str, WriterToken), &'static str> {
@@ -1981,18 +2047,21 @@ impl Checkpointer {
 
         let mut head = StackStr::<128>::new();
         match self.client.get(COMMIT_HEAD_KEY, None) {
-            Ok(_) if self.client.body_bytes() == EMPTY_COMMIT_HEAD => {}
             Ok(_) => {
-                use core::fmt::Write as _;
-                write!(
-                    head,
-                    "{}",
-                    core::str::from_utf8(self.client.body_bytes())
-                        .map_err(|_| sql_err!(SQLSTATE_IO, "commit-head is not UTF-8"))?
-                )
-                .map_err(|_| sql_err!(SQLSTATE_IO, "commit-head exceeds its format bound"))?;
-                parse_commit_head(head.as_str().as_bytes())
-                    .map_err(|message| sql_err!(SQLSTATE_IO, "{message}"))?;
+                if !is_empty_commit_head(self.client.body_bytes())
+                    .map_err(|message| sql_err!(SQLSTATE_IO, "{message}"))?
+                {
+                    use core::fmt::Write as _;
+                    write!(
+                        head,
+                        "{}",
+                        core::str::from_utf8(self.client.body_bytes())
+                            .map_err(|_| sql_err!(SQLSTATE_IO, "commit-head is not UTF-8"))?
+                    )
+                    .map_err(|_| sql_err!(SQLSTATE_IO, "commit-head exceeds its format bound"))?;
+                    parse_commit_head(head.as_str().as_bytes())
+                        .map_err(|message| sql_err!(SQLSTATE_IO, "{message}"))?;
+                }
             }
             Err(error) if error.is_not_found() => {}
             Err(error) => return Err(object_store_to_sql(error)),
@@ -2397,7 +2466,9 @@ impl Checkpointer {
         let floor = match self.client.get(MANIFEST_KEY, None) {
             Ok(r) => {
                 self.manifest_etag = Some(r.etag);
-                if self.client.body_bytes() == EMPTY_MANIFEST {
+                if is_empty_manifest(self.client.body_bytes())
+                    .map_err(CheckpointSetupError::Corrupt)?
+                {
                     self.manifest_present = false;
                     0
                 } else {
@@ -2418,7 +2489,9 @@ impl Checkpointer {
         match self.client.get(COMMIT_HEAD_KEY, None) {
             Ok(result) => {
                 self.commit_head_etag = Some(result.etag);
-                if self.client.body_bytes() == EMPTY_COMMIT_HEAD {
+                if is_empty_commit_head(self.client.body_bytes())
+                    .map_err(CheckpointSetupError::Corrupt)?
+                {
                     self.commit_head = None;
                     let mut has_orphaned_batches = false;
                     self.client
@@ -13527,12 +13600,17 @@ fn select_recovery_head(
     }
 
     let live_head = match client.get(COMMIT_HEAD_KEY, None) {
-        Ok(_) if client.body_bytes() == EMPTY_COMMIT_HEAD => None,
-        Ok(_) => Some(
-            parse_commit_head(client.body_bytes())
-                .map_err(CheckpointSetupError::Corrupt)?
-                .1,
-        ),
+        Ok(_) => {
+            if is_empty_commit_head(client.body_bytes()).map_err(CheckpointSetupError::Corrupt)? {
+                None
+            } else {
+                Some(
+                    parse_commit_head(client.body_bytes())
+                        .map_err(CheckpointSetupError::Corrupt)?
+                        .1,
+                )
+            }
+        }
         Err(error) if error.is_not_found() => None,
         Err(error) => {
             return Err(CheckpointSetupError::ObjectStore(format!(
@@ -13992,7 +14070,14 @@ fn export_roots_match(
         Some(ByteRange::new(0, 0).expect("one-byte root probe")),
     ) {
         Err(error) if error.is_not_found() => Ok(true),
-        Ok(_) => object_matches(destination, COMMIT_HEAD_KEY, EMPTY_COMMIT_HEAD),
+        Ok(_) => {
+            destination.get(COMMIT_HEAD_KEY, None).map_err(|error| {
+                CheckpointSetupError::ObjectStore(format!(
+                    "verify backup export commit-head: {error}"
+                ))
+            })?;
+            is_empty_commit_head(destination.body_bytes()).map_err(CheckpointSetupError::Corrupt)
+        }
         Err(ObjectError::Status { code: 416, .. }) => Ok(false),
         Err(error) => Err(CheckpointSetupError::ObjectStore(format!(
             "verify backup export commit-head: {error}"
@@ -14195,8 +14280,14 @@ fn promote_writer(
         .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
     let transition_etag = put_fence_record(client, transition.as_str().as_bytes(), condition)?;
 
-    fence_mutable_root(client, MANIFEST_KEY, EMPTY_MANIFEST, manifest)?;
-    fence_mutable_root(client, COMMIT_HEAD_KEY, EMPTY_COMMIT_HEAD, head)?;
+    fence_mutable_root(client, MANIFEST_KEY, manifest, token, MutableRoot::Manifest)?;
+    fence_mutable_root(
+        client,
+        COMMIT_HEAD_KEY,
+        head,
+        token,
+        MutableRoot::CommitHead,
+    )?;
 
     let active = writer_fence_record("active", token);
     let etag = put_fence_record(
@@ -14259,28 +14350,190 @@ fn assert_writer_fence(
     }
 }
 
+#[derive(Clone, Copy)]
+enum MutableRoot {
+    Manifest,
+    CommitHead,
+}
+
+fn manifest_writer(bytes: &[u8]) -> Option<WriterToken> {
+    let text = core::str::from_utf8(bytes).ok()?;
+    let mut found = None;
+    for line in text.lines() {
+        let Some(word) = line.strip_prefix("writer ") else {
+            continue;
+        };
+        let token = u128::from_str_radix(word, 16)
+            .ok()
+            .filter(|token| *token != 0)
+            .map(WriterToken)?;
+        if found.replace(token).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+fn root_writer(root: MutableRoot, bytes: &[u8]) -> Option<WriterToken> {
+    match root {
+        MutableRoot::Manifest => {
+            if bytes.starts_with(EMPTY_MANIFEST_HEADER.as_bytes()) {
+                empty_manifest_writer(bytes).ok().flatten()
+            } else {
+                manifest_writer(bytes)
+            }
+        }
+        MutableRoot::CommitHead => {
+            if bytes.starts_with(EMPTY_COMMIT_HEAD_HEADER.as_bytes()) {
+                empty_commit_head_writer(bytes).ok().flatten()
+            } else {
+                parse_commit_head(bytes).ok().map(|(writer, _)| writer)
+            }
+        }
+    }
+}
+
+fn replace_buffer_range(
+    buffer: &mut FixedBuf,
+    start: usize,
+    end: usize,
+    replacement: &[u8],
+) -> Result<(), CheckpointSetupError> {
+    let old_len = buffer.len();
+    if start > end || end > old_len {
+        return Err(CheckpointSetupError::Corrupt(
+            "invalid mutable-root writer range",
+        ));
+    }
+    let removed = end - start;
+    if replacement.len() > removed {
+        let added = replacement.len() - removed;
+        if buffer.writable().len() < added {
+            return Err(CheckpointSetupError::Corrupt(
+                "mutable root lacks space for writer fencing",
+            ));
+        }
+        buffer.advance(added);
+        buffer.filled_mut().copy_within(end..old_len, end + added);
+    } else if replacement.len() < removed {
+        let reduced = removed - replacement.len();
+        buffer.filled_mut().copy_within(end..old_len, end - reduced);
+        buffer.truncate_to(old_len - reduced);
+    }
+    buffer.filled_mut()[start..start + replacement.len()].copy_from_slice(replacement);
+    Ok(())
+}
+
+fn retag_manifest_root(
+    manifest: &mut FixedBuf,
+    token: WriterToken,
+) -> Result<(), CheckpointSetupError> {
+    if manifest.is_empty()
+        || is_empty_manifest(manifest.readable()).map_err(CheckpointSetupError::Corrupt)?
+    {
+        let empty = empty_manifest_record(token);
+        manifest.clear();
+        if !manifest.append(empty.as_str().as_bytes()) {
+            return Err(CheckpointSetupError::Corrupt(
+                "empty manifest exceeds its root buffer",
+            ));
+        }
+        return Ok(());
+    }
+
+    let text = core::str::from_utf8(manifest.readable())
+        .map_err(|_| CheckpointSetupError::Corrupt("manifest is not UTF-8"))?;
+    ManifestFormat::parse(text.lines().next())?;
+    if !text.ends_with("end\n") {
+        return Err(CheckpointSetupError::Corrupt(
+            "manifest has no final terminator",
+        ));
+    }
+    let mut writer_range = None;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if let Some(word) = content.strip_prefix("writer ") {
+            if writer_range.is_some()
+                || word.len() != 32
+                || u128::from_str_radix(word, 16)
+                    .ok()
+                    .filter(|v| *v != 0)
+                    .is_none()
+            {
+                return Err(CheckpointSetupError::Corrupt(
+                    "manifest has an invalid writer identity",
+                ));
+            }
+            writer_range = Some((offset, offset + content.len()));
+        }
+        offset += line.len();
+    }
+    let writer = stack_format!(48, "writer {:032x}", token.0);
+    match writer_range {
+        Some((start, end)) => {
+            replace_buffer_range(manifest, start, end, writer.as_str().as_bytes())
+        }
+        None => {
+            let line = stack_format!(48, "writer {:032x}\n", token.0);
+            let end = manifest.len() - b"end\n".len();
+            replace_buffer_range(manifest, end, end, line.as_str().as_bytes())
+        }
+    }
+}
+
+fn retag_commit_head_root(
+    head: &mut FixedBuf,
+    token: WriterToken,
+) -> Result<(), CheckpointSetupError> {
+    let replacement = if head.is_empty()
+        || is_empty_commit_head(head.readable()).map_err(CheckpointSetupError::Corrupt)?
+    {
+        empty_commit_head_record(token)
+    } else {
+        let (_, batch) =
+            parse_commit_head(head.readable()).map_err(CheckpointSetupError::Corrupt)?;
+        format_commit_head(token, batch)
+    };
+    head.clear();
+    if !head.append(replacement.as_str().as_bytes()) {
+        return Err(CheckpointSetupError::Corrupt(
+            "commit-head exceeds its root buffer",
+        ));
+    }
+    Ok(())
+}
+
 fn fence_mutable_root(
     client: &mut ObjectStore,
     key: &str,
-    empty: &[u8],
     scratch: &mut FixedBuf,
+    token: WriterToken,
+    root: MutableRoot,
 ) -> Result<EntityTag, CheckpointSetupError> {
     for _ in 0..16 {
         let current = read_mutable_root(client, key, scratch)?;
-        let (body, condition, expected) = match current.as_ref() {
-            Some(etag) => (scratch.readable(), Precondition::IfMatch(etag), Some(*etag)),
-            None => (empty, Precondition::IfNoneMatchAny, None),
-        };
-        match client.put(key, body, condition) {
+        match root {
+            MutableRoot::Manifest => retag_manifest_root(scratch, token)?,
+            MutableRoot::CommitHead => retag_commit_head_root(scratch, token)?,
+        }
+        let condition = current
+            .as_ref()
+            .map_or(Precondition::IfNoneMatchAny, Precondition::IfMatch);
+        match client.put(key, scratch.readable(), condition) {
             Ok(etag) => return Ok(etag),
             Err(error) => {
                 let refreshed = read_mutable_root(client, key, scratch)?;
                 if let Some(etag) = refreshed
-                    && expected.is_none_or(|expected| expected != etag)
+                    && root_writer(root, scratch.readable()) == Some(token)
                 {
                     return Ok(etag);
                 }
-                if !error.is_precondition_failed() {
+                if !error.is_precondition_failed()
+                    || current
+                        .as_ref()
+                        .is_some_and(|expected| refreshed == Some(*expected))
+                {
                     return Err(CheckpointSetupError::ObjectStore(format!(
                         "fence {key}: {error}"
                     )));
@@ -16988,6 +17241,56 @@ mod stored_dependency_tests {
         assert_eq!(
             parse_commit_head(current.as_str().as_bytes()).unwrap().0,
             token
+        );
+    }
+
+    #[test]
+    fn promotion_retags_mutable_roots_even_when_etags_follow_content() {
+        let old = WriterToken(1);
+        let replacement = WriterToken(2);
+        assert_eq!(empty_manifest_record(replacement).len(), 64);
+        let mut budget = Budget::new(4096);
+        let mut manifest = FixedBuf::new(&mut budget, "manifest", 1024).unwrap();
+        manifest
+            .append(
+                b"pos3ql-manifest-v14\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nwriter 00000000000000000000000000000001\nend\n",
+            );
+        let before = manifest.readable().to_vec();
+        retag_manifest_root(&mut manifest, replacement).unwrap();
+        assert_ne!(manifest.readable(), before);
+        assert_eq!(manifest_writer(manifest.readable()), Some(replacement));
+
+        let mut legacy = FixedBuf::new(&mut budget, "legacy manifest", 1024).unwrap();
+        legacy
+            .append(
+                b"pos3ql-manifest-v13\nlsn 7\nnext_rowid 2\nlatest_transaction_id 1\nnext_lo_oid -\nend\n",
+            );
+        retag_manifest_root(&mut legacy, replacement).unwrap();
+        assert_eq!(manifest_writer(legacy.readable()), Some(replacement));
+
+        let mut head = FixedBuf::new(&mut budget, "commit head", 128).unwrap();
+        head.append(
+            format_commit_head(
+                old,
+                CommitBatchId {
+                    first_lsn: 8,
+                    digest: 9,
+                },
+            )
+            .as_str()
+            .as_bytes(),
+        );
+        let before = head.readable().to_vec();
+        retag_commit_head_root(&mut head, replacement).unwrap();
+        assert_ne!(head.readable(), before);
+        assert_eq!(parse_commit_head(head.readable()).unwrap().0, replacement);
+
+        head.clear();
+        head.append(EMPTY_COMMIT_HEAD);
+        retag_commit_head_root(&mut head, replacement).unwrap();
+        assert_eq!(
+            empty_commit_head_writer(head.readable()),
+            Ok(Some(replacement))
         );
     }
 

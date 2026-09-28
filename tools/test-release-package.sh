@@ -16,8 +16,11 @@ trap cleanup EXIT
 tar -xzf "$ARCHIVE" -C "$WORK"
 PACKAGE=$(find "$WORK" -mindepth 1 -maxdepth 1 -type d -name 'pos3ql-*')
 [[ -x "$PACKAGE/bin/pos3ql" ]]
+[[ -x "$PACKAGE/libexec/pos3ql/failover-monitor" ]]
 [[ -f "$PACKAGE/etc/pos3ql/pos3ql.conf" ]]
+[[ -f "$PACKAGE/etc/pos3ql/pos3ql-failover.conf.example" ]]
 [[ -f "$PACKAGE/lib/systemd/system/pos3ql.service" ]]
+[[ -f "$PACKAGE/lib/systemd/system/pos3ql-failover.service" ]]
 [[ -f "$PACKAGE/share/doc/pos3ql/operations.md" ]]
 "$PACKAGE/bin/pos3ql" --help | grep -q '^usage: pos3ql'
 
@@ -45,3 +48,7 @@ kill "$SERVER_PID"
 wait "$SERVER_PID"
 SERVER_PID=""
 grep -q 'shutdown complete' "$WORK/server.log"
+
+"$(dirname "$0")/test-failover.sh" \
+  "$PACKAGE/bin/pos3ql" "$PACKAGE/libexec/pos3ql/failover-monitor" \
+  "$PACKAGE/etc/pos3ql/pos3ql.conf"

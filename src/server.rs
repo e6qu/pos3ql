@@ -484,6 +484,16 @@ impl From<BudgetError> for ServerSetupError {
 }
 
 impl Server {
+    fn block_read_slots(config: &Config) -> usize {
+        let plan =
+            crate::store::StackPlan::resolve(config.block_cache_bytes, config.disk_cache_bytes);
+        if config.object_store_on && (plan.ram.units > 0 || plan.disk.units > 0) {
+            config.object_store_get_slots
+        } else {
+            0
+        }
+    }
+
     /// Bytes reserved directly by the server around the separately budgeted
     /// per-connection buffers and engine storage.
     pub fn budget_bytes(config: &Config) -> usize {
@@ -493,11 +503,7 @@ impl Server {
         } else {
             config.operations_max_connections
         };
-        let block_reads = if config.object_store_on {
-            config.object_store_get_slots
-        } else {
-            0
-        };
+        let block_reads = Self::block_read_slots(config);
         Reactor::budget_bytes(
             connections
                 + 2
@@ -559,11 +565,7 @@ impl Server {
             Some(listener)
         };
 
-        let block_read_slots = if config.object_store_on {
-            config.object_store_get_slots
-        } else {
-            0
-        };
+        let block_read_slots = Self::block_read_slots(config);
         #[allow(
             unused_mut,
             reason = "the Linux epoll backend records fixed read/write interest"
@@ -3285,5 +3287,21 @@ mod tests {
             Server::budget_bytes(&enabled) - Server::budget_bytes(&disabled),
             expected
         );
+    }
+
+    #[test]
+    fn cacheless_object_storage_uses_synchronous_block_reads() {
+        let mut config = crate::config::Config::default_dev();
+        config.object_store_on = true;
+        config.object_store_get_slots = 7;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        assert_eq!(Server::block_read_slots(&config), 0);
+
+        config.block_cache_bytes = crate::store::MAX_PAYLOAD;
+        assert_eq!(Server::block_read_slots(&config), 7);
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+        assert_eq!(Server::block_read_slots(&config), 7);
     }
 }

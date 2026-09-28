@@ -127,3 +127,40 @@ For recovery from a named backup or a point in retained history, follow
 [backup and restore](backup-restore.md). Those commands are offline operations
 and promote their own writer incarnation, so no server may continue using the
 same prefix.
+
+## Automatic failure detection and promotion
+
+The release archive includes `libexec/pos3ql/failover-monitor`, an example
+configuration, and `pos3ql-failover.service`. Run the service on one passive
+candidate for a durable object prefix. Keep that host's `pos3ql.service`
+disabled because starting the database is the promotion action.
+
+The monitor probes the primary's `/readyz` endpoint with bounded connect and
+request timeouts. It requires the configured number of consecutive failures
+and one final confirmation failure, then runs its argument-vector promotion
+command exactly once. It does not evaluate a shell command. A lock directory
+prevents a second local monitor from promoting concurrently. The systemd unit
+starts `pos3ql.service`, waits for the candidate's `/readyz`, and remains
+active after success. A failed start or readiness timeout leaves the unit
+failed for operator inspection instead of retrying promotion indefinitely.
+
+Configure the passive candidate:
+
+1. Install the same release and configure the same bucket, prefix, durable
+   credentials, and capacity envelope with separate local cache storage.
+2. Copy `pos3ql-failover.conf.example` to
+   `/etc/pos3ql/pos3ql-failover.conf`. Set a remotely reachable primary
+   readiness URL and the candidate's loopback readiness URL.
+3. Confirm `pos3ql.service` is disabled and stopped on the passive host.
+4. Enable and start `pos3ql-failover.service`, then monitor its journal.
+5. Route clients only to a process whose `/readyz` returns 200. After
+   promotion, provision and arm a new passive candidate.
+
+A loss of connectivity from the monitor to the primary intentionally triggers
+promotion after the threshold. Use one monitor authority per prefix and place
+it on the same failure-observation path as client routing. Object storage
+remains the ownership authority: promotion rewrites both mutable roots with the
+candidate's process incarnation before activating its writer fence. A resumed
+primary therefore reports 503 and its next durable publication fails with
+SQLSTATE `40001`, including when the storage service derives identical ETags
+from identical content.

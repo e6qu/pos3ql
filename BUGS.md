@@ -483,6 +483,18 @@ execution, binary round trips, GIN and GiST indexes, checkpoint publication,
 empty-cache recovery, and PostgreSQL 18.6 differential coverage cross the
 former 512-item and 2,048-total-position limits. Forced-spill coverage also
 unnests the durable vector through the external lateral path.
+The automatic-failover audit found no external blocker. The S3 fixture's
+content-derived ETags exposed mutable-root promotion rewriting identical bytes,
+which let a displaced process retain a usable commit-head precondition until
+the candidate published again. Promotion now embeds the new process token in
+both roots before activation. The packaged zero-cache configuration also
+exposed restartable asynchronous reads repeatedly consuming and refetching the
+same completed block; a cacheless stack now uses synchronous provider reads.
+The token-bearing empty manifest retains the existing 64-byte minimum
+manifest capacity through its compact writer field.
+The release-package scenario pauses a primary, automatically starts a
+candidate, verifies empty-cache recovery, resumes the old connected session,
+and observes SQLSTATE `40001` before clean shutdown.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

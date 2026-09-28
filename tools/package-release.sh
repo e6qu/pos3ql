@@ -14,12 +14,19 @@ NAME="pos3ql-v${VERSION}-${TARGET}"
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/pos3ql-package.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$OUTPUT" "$STAGE/$NAME/bin" "$STAGE/$NAME/etc/pos3ql" \
-  "$STAGE/$NAME/lib/systemd/system" "$STAGE/$NAME/share/doc/pos3ql"
+  "$STAGE/$NAME/lib/systemd/system" "$STAGE/$NAME/libexec/pos3ql" \
+  "$STAGE/$NAME/share/doc/pos3ql"
 
 install -m 0755 "$BINARY" "$STAGE/$NAME/bin/pos3ql"
+install -m 0755 "$ROOT/packaging/pos3ql-failover-monitor" \
+  "$STAGE/$NAME/libexec/pos3ql/failover-monitor"
 install -m 0644 "$ROOT/packaging/pos3ql.conf" "$STAGE/$NAME/etc/pos3ql/pos3ql.conf"
+install -m 0644 "$ROOT/packaging/pos3ql-failover.conf" \
+  "$STAGE/$NAME/etc/pos3ql/pos3ql-failover.conf.example"
 install -m 0644 "$ROOT/packaging/pos3ql.service" \
   "$STAGE/$NAME/lib/systemd/system/pos3ql.service"
+install -m 0644 "$ROOT/packaging/pos3ql-failover.service" \
+  "$STAGE/$NAME/lib/systemd/system/pos3ql-failover.service"
 install -m 0644 "$ROOT/packaging/README.md" "$STAGE/$NAME/README.md"
 install -m 0644 "$ROOT/LICENSE" "$ROOT/README.md" "$ROOT/PLAN.md" \
   "$ROOT/docs/operations.md" "$ROOT/docs/object-storage.md" \

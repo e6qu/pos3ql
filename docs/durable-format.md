@@ -52,16 +52,17 @@ transaction.
 
 Every process creates a random 128-bit writer incarnation at startup. It first
 CAS-publishes a transitioning `pos3ql-writer-fence-v1` record, conditionally
-rewrites both mutable roots to invalidate their prior ETags, and then CASes the
-fence to active. Missing roots receive explicit empty identities, so a delayed
-create-only request is fenced as well. Commit and checkpoint publication use
-the root ETag loaded by that process; after a conflict they must prove that
-their process token still owns the active fence before adopting or retrying a
-write. A successor changes the fence before touching either root, then advances
-both root ETags before it can become active. The final active CAS is the
-ownership-transfer point; a failed or starved transition grants no new owner.
-Thus a request begun before
-promotion either lands and is preserved by the successor's rewrite, or arrives
+rewrites both mutable roots with its process token, and then CASes the fence to
+active. Missing roots receive token-bearing empty identities. Existing
+manifest and commit-head roots are retagged, so their strong ETags change even
+when the provider derives an ETag from object content. Commit and checkpoint
+publication use the root ETag loaded by that process; after a conflict they
+must prove that their process token still owns the active fence before adopting
+or retrying a write. A successor changes the fence before touching either root,
+then advances both root ETags before it can become active. The final active CAS
+is the ownership-transfer point; a failed or starved transition grants no new
+owner. Thus a request begun before promotion either lands and is preserved by
+the successor's rewrite, or arrives
 later with a stale ETag and
 fails. An interrupted transition is taken over and completed by the next
 startup.

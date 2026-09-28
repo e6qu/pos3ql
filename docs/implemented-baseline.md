@@ -7,9 +7,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   with empty RAM and disk caches.
 - A durable writer fence serializes promotion with commit-head and manifest
   publication. Startup uses a fresh random process incarnation, transitions
-  ownership, conditionally bumps both mutable roots, and only then becomes the
-  active writer. Stale root ETags reject delayed requests from the displaced
-  process; interrupted promotion and restart races are restartable.
+  ownership, retags both mutable roots with that incarnation, and only then
+  becomes the active writer. Content-derived and version-derived ETags both
+  reject delayed requests from the displaced process; interrupted promotion
+  and restart races are restartable.
 - Owner-only object-store credential files reload through `SIGHUP` or
   `pg_reload_conf()` without runtime allocation. Candidate credentials renew
   the live writer fence before installation across all object clients; failure
@@ -86,6 +87,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   observed durable-publication health.
   Text and JSON Lines runtime logs remain allocation-free after startup, and
   the operations runbook defines alerts and controlled writer replacement.
+- Release packages include a single-authority failover monitor. Consecutive
+  readiness failures trigger one candidate start, candidate readiness proves
+  writer-fence ownership, and a resumed primary rejects durable publication.
+  Promotion retags both mutable roots with the new process incarnation, which
+  also fences providers whose ETags are derived from object content.
 - Checkpoint, merge, pending-install, and temporary-spill bookkeeping sized from
   the configured physical-table capacity rather than a 1,024-slot ceiling.
   Above-boundary tables, dropped identities, fresh replacement slots, repeated

@@ -1,0 +1,24 @@
+[Unit]
+Description=pos3ql passive-candidate failure detector
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/pos3ql/pos3ql-failover.conf
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/pos3ql/pos3ql-failover.conf
+ExecStart=/usr/local/libexec/pos3ql/failover-monitor --primary-ready-url ${POS3QL_PRIMARY_READY_URL} --candidate-ready-url ${POS3QL_CANDIDATE_READY_URL} --failure-threshold ${POS3QL_FAILURE_THRESHOLD} --probe-interval-seconds ${POS3QL_PROBE_INTERVAL_SECONDS} --probe-timeout-seconds ${POS3QL_PROBE_TIMEOUT_SECONDS} --promotion-timeout-seconds ${POS3QL_PROMOTION_TIMEOUT_SECONDS} -- /usr/bin/systemctl start pos3ql.service
+RemainAfterExit=yes
+RuntimeDirectory=pos3ql
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

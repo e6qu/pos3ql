@@ -13,10 +13,23 @@ pub enum ObjectStoreAddressing {
     VirtualHosted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Address the PostgreSQL wire listener binds to.
     pub listen_addr: String,
+    /// Address for the optional unauthenticated operational HTTP listener.
+    /// Empty disables it; operators should keep it on a private interface.
+    pub operations_listen_addr: String,
+    /// Fixed number of operational HTTP connection slots.
+    pub operations_max_connections: usize,
+    /// Runtime log encoding.
+    pub log_format: LogFormat,
     /// Directory for the journal and the local object cache.
     pub data_dir: String,
     /// Fixed number of client connection slots.
@@ -335,6 +348,9 @@ impl Config {
     pub fn default_dev() -> Self {
         Self {
             listen_addr: "127.0.0.1:5433".to_string(),
+            operations_listen_addr: String::new(),
+            operations_max_connections: 4,
+            log_format: LogFormat::Text,
             data_dir: "./data".to_string(),
             max_connections: 64,
             auth: "trust".to_string(),
@@ -513,6 +529,23 @@ impl Config {
             seen.push(canonical_key.to_string());
             match canonical_key {
                 "listen_addr" => config.listen_addr = value.to_string(),
+                "operations_listen_addr" => config.operations_listen_addr = value.to_string(),
+                "operations_max_connections" => {
+                    config.operations_max_connections =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "log_format" => {
+                    config.log_format = match value {
+                        "text" => LogFormat::Text,
+                        "json" => LogFormat::Json,
+                        other => {
+                            return Err(ConfigError::at(
+                                line_no,
+                                format!("log_format must be text or json, got '{other}'"),
+                            ));
+                        }
+                    }
+                }
                 "data_dir" => config.data_dir = value.to_string(),
                 "max_connections" => {
                     config.max_connections =
@@ -1111,6 +1144,13 @@ impl Config {
                     }
                 }
             }
+        }
+        if !config.operations_listen_addr.is_empty() && config.operations_max_connections == 0 {
+            return Err(ConfigError::at(
+                0,
+                "operations_max_connections must be at least 1 when the operational listener is enabled"
+                    .to_string(),
+            ));
         }
         // Server TLS needs a certificate and a key: refuse a half-configured
         // toggle rather than silently accept plaintext.
@@ -1853,6 +1893,25 @@ sql_arena_bytes = 4096
         assert_eq!(
             error.message,
             "checkpoint_manifest_bytes must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn operational_listener_and_log_format_are_strict() {
+        let config = Config::parse(
+            "operations_listen_addr = 127.0.0.1:9187\noperations_max_connections = 7\nlog_format = json\n",
+        )
+        .unwrap();
+        assert_eq!(config.operations_listen_addr, "127.0.0.1:9187");
+        assert_eq!(config.operations_max_connections, 7);
+        assert_eq!(config.log_format, LogFormat::Json);
+
+        assert!(Config::parse("log_format = yaml\n").is_err());
+        assert!(
+            Config::parse(
+                "operations_listen_addr = 127.0.0.1:9187\noperations_max_connections = 0\n"
+            )
+            .is_err()
         );
     }
 

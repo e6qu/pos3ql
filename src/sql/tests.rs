@@ -69699,6 +69699,8 @@ fn writer_promotion_fences_old_and_delayed_publications_body() {
     second_config.data_dir = format!("{}-successor", first_config.data_dir);
     let mut second_budget = Budget::new(test_engine_budget_bytes(1 << 28));
     let mut second = Engine::new(&second_config, &mut second_budget).unwrap();
+    assert!(first.verify_writer_ownership().is_err());
+    assert!(second.verify_writer_ownership().is_ok());
 
     let old_client = &mut first.ckpt.as_mut().unwrap().client;
     assert!(
@@ -69741,6 +69743,8 @@ fn writer_promotion_fences_old_and_delayed_publications_body() {
     third_config.data_dir = format!("{}-restart", first_config.data_dir);
     let mut third_budget = Budget::new(test_engine_budget_bytes(1 << 28));
     let mut third = Engine::new(&third_config, &mut third_budget).unwrap();
+    assert!(second.verify_writer_ownership().is_err());
+    assert!(third.verify_writer_ownership().is_ok());
     let restart_loser = run_with(
         &mut second,
         &mut second_budget,

@@ -72,8 +72,10 @@ next publication with SQLSTATE `40001`; delayed root requests and interrupted
 or competing restarts are covered. Legacy unfenced prefixes promote in place.
 
 This is not yet a production-complete topology: one process serializes query
-execution; automatic failure detection, operational interfaces, and
-representative long-run performance evidence remain open.
+execution; automatic failure detection, secure credential rotation, packaging,
+and representative long-run performance evidence remain open. A separately
+bounded operational listener now exposes health, readiness, metrics, and
+capacity, with structured logs and a controlled-replacement runbook.
 
 ## Remaining production work
 
@@ -223,9 +225,14 @@ the client-visible boundary and rejected before partial effects.
 
 ### Durable operations and availability
 
-- Provide health and readiness reporting, metrics, structured logs, capacity
-  reporting, secure credential rotation, packaging, and operational runbooks.
-  Exercise operator recovery paths end to end, including failure detection and
+Health and readiness endpoints, Prometheus metrics, JSON capacity reporting,
+text or JSON Lines logs, and the initial operations runbook use startup-bounded
+memory. Durable readiness validates current writer-fence ownership through the
+provider-neutral object client as well as observed publication health;
+liveness remains a local event-loop probe.
+
+- Add secure credential rotation and release packaging. Exercise operator
+  recovery paths end to end, including automatic failure detection and
   controlled promotion of a replacement process.
 
 ### Concurrent execution

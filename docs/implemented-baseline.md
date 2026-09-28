@@ -15,8 +15,11 @@ active production roadmap is [PLAN.md](../PLAN.md).
   empty caches. `max_backups` fixes the startup roster. Independent-prefix
   export copies the named roots plus immutable block, commit, and durable
   extension-package namespaces into an empty destination, resumes through a
-  durable pending marker, and recovers after complete source loss. Targets
-  between named checkpoints remain production work.
+  durable pending marker, and recovers after complete source loss. Offline LSN
+  and timestamp targets validate retained commit history and derive a head at
+  a whole transaction boundary, including an immutable prefix when a target
+  falls inside a batch. Interrupted operation, empty-cache recovery, deletion,
+  and a new durable history branch are qualified.
 - Manifest v14 retains 64 table constraints per modeled kind and 64 domain
   checks. The complete accepted width is qualified through catalogs, WAL,
   checkpoints, empty-cache recovery, and PostgreSQL differential execution;

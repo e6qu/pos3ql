@@ -12,6 +12,10 @@ use the same prefix.
 ```sh
 pos3ql --config /path/to/pos3ql.conf --backup before-upgrade
 pos3ql --config /path/to/pos3ql.conf --restore before-upgrade
+pos3ql --config /path/to/pos3ql.conf --restore before-upgrade \
+  --recovery-target-lsn 0/16B6C50
+pos3ql --config /path/to/pos3ql.conf --restore before-upgrade \
+  --recovery-target-time '2026-09-28 14:30:00+00'
 pos3ql --config /path/to/source.conf --export-backup before-upgrade \
   --destination-config /path/to/destination.conf
 pos3ql --config /path/to/pos3ql.conf --delete-backup before-upgrade
@@ -39,6 +43,24 @@ finishes. Before removing the marker, restore deletes `journal.wal`,
 Other operator-managed files below `data_dir`, including extension packages,
 are preserved. A successful restore can accept new commits and checkpoints,
 forming a new history from the restored point.
+
+`--recovery-target-lsn` replays retained history after the named point through
+the exact `pg_lsn` transaction boundary. A record LSN inside a transaction,
+an LSN before the backup, and an LSN newer than the retained branch are
+rejected. `--recovery-target-time` selects the last transaction committed at
+or before the supplied PostgreSQL `timestamptz`; include `Z` or a numeric
+offset in operational commands. Timestamp recovery requires a backup written
+with the current `pos3ql-backup-v2` completion record. Older v1 backups remain
+restorable by their named point or an exact LSN.
+
+Recovery validates the retained descriptor chain, immutable batch checksum,
+WAL framing, and commit timestamps before publishing `restore-pending`. If the
+chosen boundary falls inside a batch, the command publishes a checksummed
+immutable prefix linked to the same predecessor. The marker binds the backup,
+manifest, resolved LSN, and target head, so a retry cannot adopt another
+target. The live commit chain must still descend from the named backup; an
+earlier restore that created a different branch makes its discarded future
+unavailable.
 
 `--delete-backup` removes the completion record first and the manifest
 retention pin last. Later checkpoint maintenance may then reclaim objects used
@@ -68,7 +90,6 @@ the final response was lost, provided its live roots have not advanced. The
 destination prefix must be empty on the first attempt; this prevents an export
 from silently replacing an existing database.
 
-Same-prefix named backups protect historical points from ordinary checkpoint
-cleanup. Independent exports also protect against loss of the source prefix.
-Recovery to a target between named checkpoints remains in
-[PLAN.md](../PLAN.md).
+Same-prefix named backups protect historical points and the commit history
+needed for LSN and timestamp recovery from ordinary checkpoint cleanup.
+Independent exports also protect against loss of the source prefix.

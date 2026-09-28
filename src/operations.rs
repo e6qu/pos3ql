@@ -45,6 +45,37 @@ pub fn restore_backup(config: &Config, name: &str) -> Result<u64, String> {
         .map_err(|error| format!("restore failed: {error}"))
 }
 
+/// Restores a named backup and retained whole transactions through `target`.
+pub fn restore_backup_to_lsn(config: &Config, name: &str, target: &str) -> Result<u64, String> {
+    require_object_store(config)?;
+    let target = crate::sql::lsn::parse(target)
+        .map_err(|error| format!("invalid recovery target LSN: {}", error.message.as_str()))?;
+    let mut budget = operation_budget(config);
+    crate::checkpoint::restore_backup_to(
+        config,
+        &mut budget,
+        name,
+        crate::checkpoint::RecoveryTarget::Lsn(target),
+    )
+    .map_err(|error| format!("restore failed: {error}"))
+}
+
+/// Restores through the last retained transaction committed at or before the
+/// PostgreSQL `timestamptz` value in `target`.
+pub fn restore_backup_to_time(config: &Config, name: &str, target: &str) -> Result<u64, String> {
+    require_object_store(config)?;
+    let target = crate::sql::datetime::parse_timestamp(target, true)
+        .map_err(|error| format!("invalid recovery target time: {}", error.message.as_str()))?;
+    let mut budget = operation_budget(config);
+    crate::checkpoint::restore_backup_to(
+        config,
+        &mut budget,
+        name,
+        crate::checkpoint::RecoveryTarget::Time(target),
+    )
+    .map_err(|error| format!("restore failed: {error}"))
+}
+
 /// Copies a named backup and its durable object graph into an empty destination
 /// prefix, then publishes that recovery point as the destination's live state.
 /// Run while no process is using either configured prefix.

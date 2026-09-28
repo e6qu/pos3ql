@@ -18734,6 +18734,7 @@ fn replay_transaction_batches(
             WalOp::Commit {
                 transaction_id,
                 assigned_transaction_identity,
+                ..
             } => {
                 if *lsn > apply_floor {
                     storage.observe_transaction_identity(u64::from(transaction_id));

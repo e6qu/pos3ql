@@ -42,8 +42,16 @@ fn run() -> Result<(), String> {
             println!("backup {name} created at LSN {lsn}");
             return Ok(());
         }
-        Operation::Restore(name) => {
-            let lsn = pos3ql::operations::restore_backup(&config, &name)?;
+        Operation::Restore { name, target } => {
+            let lsn = match target {
+                RestoreTarget::Backup => pos3ql::operations::restore_backup(&config, &name),
+                RestoreTarget::Lsn(value) => {
+                    pos3ql::operations::restore_backup_to_lsn(&config, &name, &value)
+                }
+                RestoreTarget::Time(value) => {
+                    pos3ql::operations::restore_backup_to_time(&config, &name, &value)
+                }
+            }?;
             println!("backup {name} restored at LSN {lsn}");
             return Ok(());
         }
@@ -125,7 +133,10 @@ fn run() -> Result<(), String> {
 enum Operation {
     Serve,
     Backup(String),
-    Restore(String),
+    Restore {
+        name: String,
+        target: RestoreTarget,
+    },
     ExportBackup {
         name: String,
         destination_config: String,
@@ -133,10 +144,18 @@ enum Operation {
     DeleteBackup(String),
 }
 
+enum RestoreTarget {
+    Backup,
+    Lsn(String),
+    Time(String),
+}
+
 fn load_config() -> Result<(Config, Operation), String> {
     let mut args = std::env::args().skip(1);
     let mut config_path: Option<String> = None;
     let mut destination_config_path: Option<String> = None;
+    let mut recovery_target_lsn: Option<String> = None;
+    let mut recovery_target_time: Option<String> = None;
     let mut operation = Operation::Serve;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -155,7 +174,10 @@ fn load_config() -> Result<(Config, Operation), String> {
                     .ok_or_else(|| format!("{arg} requires a name"))?;
                 operation = match arg.as_str() {
                     "--backup" => Operation::Backup(name),
-                    "--restore" => Operation::Restore(name),
+                    "--restore" => Operation::Restore {
+                        name,
+                        target: RestoreTarget::Backup,
+                    },
                     "--export-backup" => Operation::ExportBackup {
                         name,
                         destination_config: String::new(),
@@ -171,9 +193,25 @@ fn load_config() -> Result<(Config, Operation), String> {
                     return Err("--destination-config may be specified only once".to_string());
                 }
             }
+            "--recovery-target-lsn" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--recovery-target-lsn requires a pg_lsn".to_string())?;
+                if recovery_target_lsn.replace(value).is_some() {
+                    return Err("--recovery-target-lsn may be specified only once".to_string());
+                }
+            }
+            "--recovery-target-time" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--recovery-target-time requires a timestamp".to_string())?;
+                if recovery_target_time.replace(value).is_some() {
+                    return Err("--recovery-target-time may be specified only once".to_string());
+                }
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: pos3ql [--config <path>] [--backup <name> | --restore <name> | --export-backup <name> --destination-config <path> | --delete-backup <name>]"
+                    "usage: pos3ql [--config <path>] [--backup <name> | --restore <name> [--recovery-target-lsn <pg_lsn> | --recovery-target-time <timestamptz>] | --export-backup <name> --destination-config <path> | --delete-backup <name>]"
                 );
                 std::process::exit(0);
             }
@@ -198,6 +236,26 @@ fn load_config() -> Result<(Config, Operation), String> {
             return Err("--destination-config requires --export-backup".to_string());
         }
         (operation, None) => operation,
+    };
+    operation = match (operation, recovery_target_lsn, recovery_target_time) {
+        (Operation::Restore { name, .. }, Some(value), None) => Operation::Restore {
+            name,
+            target: RestoreTarget::Lsn(value),
+        },
+        (Operation::Restore { name, .. }, None, Some(value)) => Operation::Restore {
+            name,
+            target: RestoreTarget::Time(value),
+        },
+        (Operation::Restore { .. }, Some(_), Some(_)) => {
+            return Err("only one recovery target may be specified".to_string());
+        }
+        (_, Some(_), _) => {
+            return Err("--recovery-target-lsn requires --restore".to_string());
+        }
+        (_, _, Some(_)) => {
+            return Err("--recovery-target-time requires --restore".to_string());
+        }
+        (operation, None, None) => operation,
     };
     let config = match config_path {
         Some(path) => load_config_file(&path),

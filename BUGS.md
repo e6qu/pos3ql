@@ -6,6 +6,14 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The point-in-time recovery audit found no external blocker. Current commit
+records carry PostgreSQL-epoch commit time while legacy forms remain readable.
+Recovery validates that the live descriptor chain descends from the named
+backup, verifies immutable batch checksums and WAL framing, and publishes only
+a whole-transaction head. A target within one uploaded batch gets a checksummed
+prefix with the original predecessor. Invalid LSNs fail before the durable
+marker; interruption, retry, timestamp and exact-LSN selection, empty local
+caches, deletion, and a new durable branch are covered.
 The independent-prefix backup-export audit found no external blocker. Export
 uses the provider-neutral object contract for both configurations, copies in a
 fixed namespace batch and fixed object buffer, and adopts only byte-identical
@@ -16,15 +24,14 @@ both gaps. Durable pending and completion records block partial startup and
 make a lost final response adoptable; interruption after a copied object,
 retry, a bounded forward namespace scan, a multi-range copy, complete source
 loss, durable extension execution, backup deletion, a new destination branch,
-and empty-cache recovery are covered. Exact LSN and timestamp targets remain
-planned work in PLAN.md.
+and empty-cache recovery are covered.
 The named-backup audit found no external blocker. Backup manifests now pin
 their complete row and value-index block graphs; prepared-transaction and
 logical-slot positions lower the oldest backup replay floor used by commit
 pruning. A checksummed completion record, durable restore marker,
 local-cache removal, later checkpoints, deletion, and a new post-restore branch
 are covered through empty-cache recovery. Independent-prefix export and
-between-checkpoint recovery targets remain planned work in PLAN.md.
+between-checkpoint recovery targets are now part of the implemented baseline.
 The durable-format contract audit found no external blocker. Manifest and row
 SST reader and writer identities now come from complete executable sets whose
 membership is checked against the documented matrix. An actual v13 manifest

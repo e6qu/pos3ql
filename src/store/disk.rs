@@ -70,6 +70,10 @@ pub(crate) struct DiskCache<S: BlockStore> {
 }
 
 impl<S: BlockStore> DiskCache<S> {
+    pub(crate) fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
     /// Opens (creating if absent) a cache file of `slot_count` slots at `path`.
     /// The file is preallocated to its full size, as the journal is, so a slot
     /// write is only ever an overwrite and never extends the file.

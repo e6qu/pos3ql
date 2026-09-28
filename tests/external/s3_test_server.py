@@ -33,6 +33,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
     access_key = None
     secret_key = None
     session_token = None
+    credentials_file = None
     page_size = 1000
     mutation_lock = threading.Lock()
     metrics_lock = threading.Lock()
@@ -118,6 +119,20 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         return '"' + hashlib.sha256(data).hexdigest() + '"'
 
     def authenticate(self, body):
+        access_key = self.access_key
+        secret_key = self.secret_key
+        session_token = self.session_token
+        if self.credentials_file is not None:
+            values = {}
+            for raw in self.credentials_file.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                name, value = line.split("=", 1)
+                values[name.strip()] = value.strip()
+            access_key = values["access_key"]
+            secret_key = values["secret_key"]
+            session_token = values.get("session_token") or None
         authorization = self.headers.get("authorization", "")
         prefix = "AWS4-HMAC-SHA256 "
         if not authorization.startswith(prefix):
@@ -131,7 +146,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         if set(fields) != {"Credential", "SignedHeaders", "Signature"}:
             raise PermissionError("wrong authorization fields")
         credential = fields.get("Credential", "").split("/")
-        if len(credential) != 5 or credential[0] != self.access_key:
+        if len(credential) != 5 or credential[0] != access_key:
             raise PermissionError("wrong access key")
         date, region, service, terminal = credential[1:]
         if region != self.region or service != "s3" or terminal != "aws4_request":
@@ -142,15 +157,15 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
         payload_hash = hashlib.sha256(body).hexdigest()
         if self.headers.get("x-amz-content-sha256") != payload_hash:
             raise PermissionError("wrong payload hash")
-        if self.session_token is not None:
-            if self.headers.get("x-amz-security-token") != self.session_token:
+        if session_token is not None:
+            if self.headers.get("x-amz-security-token") != session_token:
                 raise PermissionError("wrong session token")
         elif self.headers.get("x-amz-security-token") is not None:
             raise PermissionError("unexpected session token")
 
         signed_names = fields.get("SignedHeaders", "").split(";")
         required_signed = ["host", "x-amz-content-sha256", "x-amz-date"]
-        if self.session_token is not None:
+        if session_token is not None:
             required_signed.append("x-amz-security-token")
         if signed_names != required_signed:
             raise PermissionError("wrong signed-header set or order")
@@ -184,7 +199,7 @@ class S3TestServer(http.server.BaseHTTPRequestHandler):
             ]
         )
         expected = hmac.new(
-            signing_key(self.secret_key, date, region),
+            signing_key(secret_key, date, region),
             string_to_sign.encode(),
             hashlib.sha256,
         ).hexdigest()
@@ -343,6 +358,7 @@ def main():
     parser.add_argument("--access-key", required=True)
     parser.add_argument("--secret-key", required=True)
     parser.add_argument("--session-token")
+    parser.add_argument("--credentials-file")
     parser.add_argument("--page-size", type=int, default=1000)
     parser.add_argument("--metrics-file")
     parser.add_argument("--latency-ms", type=float, default=0.0)
@@ -353,6 +369,8 @@ def main():
     S3TestServer.access_key = args.access_key
     S3TestServer.secret_key = args.secret_key
     S3TestServer.session_token = args.session_token
+    if args.credentials_file:
+        S3TestServer.credentials_file = pathlib.Path(args.credentials_file).resolve()
     S3TestServer.page_size = args.page_size
     S3TestServer.latency_seconds = args.latency_ms / 1000.0
     if args.metrics_file:

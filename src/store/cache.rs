@@ -60,6 +60,10 @@ pub(crate) struct BlockCache<S: BlockStore> {
 }
 
 impl<S: BlockStore> BlockCache<S> {
+    pub(crate) fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
     /// Reserves `frame_count` frames. The budget is drawn once here, so the
     /// cache's size is decided at startup and never afterwards.
     pub(crate) fn new(

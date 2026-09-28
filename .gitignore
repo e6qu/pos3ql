@@ -1,4 +1,5 @@
 /target
+/dist/
 
 # Python bytecode cache and virtualenv for external test scripts (fuzz_diff.py
 # needs psycopg; the venv is a local dev artifact, never committed).

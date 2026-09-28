@@ -195,6 +195,14 @@ impl OwnedObjectStore {
         })
     }
 
+    pub(crate) fn replace_credentials(&mut self, credentials: crate::object_store::Credentials) {
+        self.write_client.replace_credentials(credentials);
+        for slot in self.slots.as_mut_slice() {
+            debug_assert!(slot.pending_id.is_none());
+            slot.client.replace_credentials(credentials);
+        }
+    }
+
     fn enable_async_gets(&mut self) {
         for slot in self.slots.as_mut_slice() {
             slot.client.enable_async_gets();

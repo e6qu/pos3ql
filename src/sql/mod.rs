@@ -268,6 +268,7 @@ pub struct Engine {
     database_connections: FixedVec<u16>,
     active_system_settings: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS],
     system_settings_reloaded: bool,
+    object_store_credentials_reload_requested: bool,
     discard_protocol_state: bool,
     clean_shutdown_path: std::path::PathBuf,
     #[cfg(test)]
@@ -322,6 +323,7 @@ impl Drop for ConfigurationReloadScope {
         let engine = unsafe { &mut *self.engine };
         let guc = unsafe { &*self.guc };
         engine.reload_system_settings();
+        engine.object_store_credentials_reload_requested = true;
         engine
             .apply_system_settings(guc)
             .expect("stored system settings were validated before publication");
@@ -2720,6 +2722,10 @@ impl Engine {
         core::mem::take(&mut self.system_settings_reloaded)
     }
 
+    pub(crate) fn take_object_store_credentials_reload(&mut self) -> bool {
+        core::mem::take(&mut self.object_store_credentials_reload_requested)
+    }
+
     pub(crate) fn role_can_connect(&self, role: u16) -> bool {
         self.storage
             .has_current_database_connect_privilege(role as usize, 0)
@@ -3164,6 +3170,7 @@ impl Engine {
             database_connections,
             active_system_settings,
             system_settings_reloaded: false,
+            object_store_credentials_reload_requested: false,
             discard_protocol_state: false,
             clean_shutdown_path,
             #[cfg(test)]
@@ -7158,6 +7165,16 @@ impl Engine {
         }
     }
 
+    pub(crate) fn rotate_object_store_credentials(
+        &mut self,
+        credentials: crate::object_store::Credentials,
+    ) -> Result<(), SqlError> {
+        match self.ckpt.as_mut() {
+            Some(checkpointer) => checkpointer.rotate_credentials(credentials),
+            None => Ok(()),
+        }
+    }
+
     /// Whether success responses must remain buffered until commit-batch
     /// publication completes.
     pub(crate) const fn publication_required(&self) -> bool {
@@ -7241,6 +7258,10 @@ impl Engine {
         self.ckpt
             .as_ref()
             .is_some_and(crate::checkpoint::Checkpointer::block_reads_busy)
+    }
+
+    pub(crate) fn object_store_reads_busy(&self) -> bool {
+        self.block_reads_pending()
     }
 
     /// Advances a pending block read. A completed read or a terminal failure

@@ -30,6 +30,12 @@ pub fn error(event: &str, message: &str) {
     write_event("error", event, message);
 }
 
+pub fn error_args(event: &str, arguments: core::fmt::Arguments<'_>) {
+    let mut message = StackStr::<2048>::new();
+    let _ = message.write_fmt(arguments);
+    write_event("error", event, message.as_str());
+}
+
 fn write_event(level: &str, event: &str, message: &str) {
     let mut line = StackStr::<16384>::new();
     if JSON.load(Ordering::Relaxed) {

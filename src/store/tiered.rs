@@ -117,6 +117,15 @@ pub(crate) enum Layer<S: BlockStore> {
     Disk(DiskCache<S>),
 }
 
+impl<S: BlockStore> Layer<S> {
+    fn base_mut(&mut self) -> &mut S {
+        match self {
+            Self::Base(store) => store,
+            Self::Disk(cache) => cache.inner_mut(),
+        }
+    }
+}
+
 impl<S: BlockStore> BlockStore for Layer<S> {
     fn put(
         &mut self,
@@ -263,6 +272,15 @@ impl<S: BlockStore> BlockStore for Layer<S> {
 pub(crate) enum TieredStore<S: BlockStore> {
     WithRam(BlockCache<Layer<S>>),
     WithoutRam(Layer<S>),
+}
+
+impl<S: BlockStore> TieredStore<S> {
+    pub(crate) fn base_mut(&mut self) -> &mut S {
+        match self {
+            Self::WithRam(cache) => cache.inner_mut().base_mut(),
+            Self::WithoutRam(layer) => layer.base_mut(),
+        }
+    }
 }
 
 impl<S: BlockStore> BlockStore for TieredStore<S> {

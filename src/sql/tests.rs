@@ -7,6 +7,38 @@
 use super::*;
 
 #[test]
+fn query_workspaces_are_startup_bounded_and_isolated() {
+    let mut config = Config::default_dev();
+    config.query_workspace_slots = 3;
+    config.work_arena_bytes = 256;
+    let mut one = config.clone();
+    one.query_workspace_slots = 1;
+    assert_eq!(
+        Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
+        2 * (config.work_arena_bytes + core::mem::size_of::<Arena>())
+    );
+    let bytes =
+        config.query_workspace_slots * (config.work_arena_bytes + core::mem::size_of::<Arena>());
+    let mut budget = Budget::new(bytes);
+    let mut workspaces = QueryWorkspaces::new(&config, &mut budget).unwrap();
+    assert_eq!(budget.remaining(), 0);
+
+    workspaces.select_for_connection(1);
+    workspaces.alloc_slice_with(7, |_| 1u8).unwrap();
+    let first_used = workspaces.used();
+    assert!(first_used >= 7);
+
+    workspaces.select_for_connection(2);
+    assert_eq!(workspaces.used(), 0);
+    workspaces.alloc_slice_with(19, |_| 2u8).unwrap();
+
+    workspaces.select_for_connection(1);
+    assert_eq!(workspaces.used(), first_used);
+    workspaces.select_for_connection(4);
+    assert_eq!(workspaces.used(), first_used);
+}
+
+#[test]
 fn wide_join_trees_execute_without_allocation() {
     let result = std::thread::Builder::new()
         .name("join-capacity".into())

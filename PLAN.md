@@ -265,6 +265,14 @@ and publication order through explicit backpressure. Demonstrate useful
 one-through-N core scaling for read-only, write-heavy, and mixed workloads
 without post-startup allocation or weaker durability.
 
+The global execution arena is now a startup-bounded set selected by stable
+connection identity. `query_workspace_slots` charges every `work_arena_bytes`
+reservation in the memory plan, rejects zero or more slots than connection
+capacity, and exposes the configured count through metrics and capacity JSON.
+The current reactor still serializes statement execution. Moving execution
+onto those private slots must retain the existing transaction retry, object I/O
+parking, group publication, and response barriers before any scaling claim.
+
 ### Performance qualification
 
 The [256-row](benchmarks/baselines/2026-09-20-postgresql18-local-apfs/README.md)

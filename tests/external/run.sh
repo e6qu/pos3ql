@@ -222,6 +222,7 @@ operations_listen_addr = 127.0.0.1:${OPERATIONS_PORT}
 operations_max_connections = 4
 data_dir = ${WORK}/${data_name}
 max_connections = 8
+query_workspace_slots = 2
 memtable_bytes = 16MiB
 wal_bytes = 16MiB
 object_store = on
@@ -261,6 +262,7 @@ ok "server up (pid $SERVER_PID)"
 
 step "operational health, readiness, metrics and capacity"
 if POS3QL_PORT=$PG_PORT POS3QL_OPERATIONS_PORT=$OPERATIONS_PORT \
+    POS3QL_EXPECTED_QUERY_WORKSPACES=2 \
     python3 "$EXT/operations_probe.py" \
     > "$WORK/operations.out" 2>&1; then
   ok "operational HTTP endpoints"

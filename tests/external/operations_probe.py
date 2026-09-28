@@ -10,6 +10,7 @@ import time
 PORT = int(os.environ["POS3QL_OPERATIONS_PORT"])
 DATABASE_PORT = int(os.environ["POS3QL_PORT"])
 POSTGRES_CONNECTIONS = int(os.environ.get("POS3QL_EXPECTED_CONNECTIONS", "8"))
+QUERY_WORKSPACES = int(os.environ.get("POS3QL_EXPECTED_QUERY_WORKSPACES", "1"))
 OBJECT_STORE = os.environ.get("POS3QL_EXPECTED_OBJECT_STORE", "on") == "on"
 
 
@@ -51,6 +52,7 @@ for sample in [
     "pos3ql_up 1",
     "pos3ql_ready 1",
     f"pos3ql_postgres_connection_capacity {POSTGRES_CONNECTIONS}",
+    f"pos3ql_query_workspace_capacity {QUERY_WORKSPACES}",
     "pos3ql_wal_capacity_bytes",
     "pos3ql_row_heap_capacity_bytes",
     "pos3ql_block_object_gets_total",
@@ -61,6 +63,7 @@ status, body = request("GET", "/capacity")
 capacity = json.loads(body)
 assert status == 200
 assert capacity["postgres_connections"]["limit"] == POSTGRES_CONNECTIONS
+assert capacity["query_workspace_slots"]["limit"] == QUERY_WORKSPACES
 assert capacity["operational_connections"]["limit"] == 4
 assert capacity["object_store"] is OBJECT_STORE
 assert capacity["memory"]["core_budget_bytes"] > 0

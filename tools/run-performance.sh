@@ -260,6 +260,7 @@ listen_addr = 127.0.0.1:$port
 data_dir = $data
 auth = trust
 max_connections = $MAX_CONNECTIONS
+query_workspace_slots = 1
 conn_recv_buffer_bytes = 64 KiB
 conn_send_buffer_bytes = 64 KiB
 sql_arena_bytes = 2 MiB

@@ -118,6 +118,7 @@ struct OperationsMetrics {
 #[derive(Clone, Copy)]
 struct CapacityLimits {
     postgres_connections: usize,
+    query_workspace_slots: usize,
     operations_connections: usize,
     block_cache_bytes: usize,
     disk_cache_bytes: usize,
@@ -832,6 +833,7 @@ impl Server {
             operations_metrics: OperationsMetrics::default(),
             capacity_limits: CapacityLimits {
                 postgres_connections: max_conns,
+                query_workspace_slots: config.query_workspace_slots,
                 operations_connections,
                 block_cache_bytes: config.block_cache_bytes,
                 disk_cache_bytes: config.disk_cache_bytes,
@@ -1127,6 +1129,7 @@ impl Server {
             // Stale event for a slot that was already recycled.
             return;
         }
+        self.engine.select_query_workspace(slot.conn.id());
         if readable && !publication_ready {
             // Match the per-connection barrier's prior behavior: no command
             // is allowed to run behind an unpublished local commit.
@@ -1261,6 +1264,7 @@ impl Server {
                 }
                 {
                     let slot = &mut self.slots[index];
+                    self.engine.select_query_workspace(slot.conn.id());
                     self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 }
                 if self.slots[index].conn.terminate_by_administrator() {
@@ -1277,7 +1281,11 @@ impl Server {
             .slots
             .iter()
             .position(|slot| request.matches(slot.conn.id(), &self.cancel_key))
-            && self.slots[index].conn.cancel_parked(&mut self.engine)
+            && {
+                self.engine
+                    .select_query_workspace(self.slots[index].conn.id());
+                self.slots[index].conn.cancel_parked(&mut self.engine)
+            }
         {
             self.sync_write_interest(index);
         }
@@ -1299,6 +1307,7 @@ impl Server {
             if terminate {
                 {
                     let slot = &mut self.slots[index];
+                    self.engine.select_query_workspace(slot.conn.id());
                     self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 }
                 if self.slots[index].conn.terminate_by_administrator() {
@@ -2292,6 +2301,7 @@ impl Server {
         // I/O-interest failure, notification overflow, or replication close
         // cannot strand transaction state or locks.
         let slot = &mut self.slots[index];
+        self.engine.select_query_workspace(slot.conn.id());
         self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
         self.slots[index].conn.stop_replication(&mut self.engine);
         self.engine.drop_connection(self.slots[index].conn.id());
@@ -2588,6 +2598,8 @@ pos3ql_lsn {}\n\
 pos3ql_postgres_connections {postgres_active}\n\
 # TYPE pos3ql_postgres_connection_capacity gauge\n\
 pos3ql_postgres_connection_capacity {}\n\
+# TYPE pos3ql_query_workspace_capacity gauge\n\
+pos3ql_query_workspace_capacity {}\n\
 # TYPE pos3ql_operational_connections gauge\n\
 pos3ql_operational_connections {operations_active}\n\
 # TYPE pos3ql_postgres_connections_accepted_total counter\n\
@@ -2638,6 +2650,7 @@ pos3ql_block_object_read_seconds_total {:.6}\n\
 pos3ql_block_object_prefetch_saturated_total {}\n",
             snapshot.lsn,
             self.capacity_limits.postgres_connections,
+            self.capacity_limits.query_workspace_slots,
             self.operations_metrics.postgres_accepted,
             self.operations_metrics.postgres_refused,
             self.operations_metrics.postgres_closed,
@@ -2671,10 +2684,11 @@ pos3ql_block_object_prefetch_saturated_total {}\n",
         let operations_used = limits.operations_connections - self.operations_free.len();
         let _ = writeln!(
             out,
-            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{},\"credential_rotation\":{}}}",
+            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"query_workspace_slots\":{{\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{},\"credential_rotation\":{}}}",
             self.memory_reserved_bytes,
             limits.tls_budget_bytes,
             limits.postgres_connections,
+            limits.query_workspace_slots,
             limits.operations_connections,
             snapshot.wal_used_bytes,
             snapshot.wal_capacity_bytes,

@@ -5,6 +5,15 @@ active production roadmap is [PLAN.md](../PLAN.md).
 
 - Object-native commit publication, checkpoints, crash recovery, and recovery
   with empty RAM and disk caches.
+- Offline named backups retain checksummed manifest and commit-head roots in
+  the configured object-store prefix. Checkpoint garbage collection walks all
+  retained row and value-index block graphs and keeps commit batches from the
+  oldest required backup replay floor, including prepared transactions and
+  logical replication slots. A durable pending marker makes two-root restore
+  restartable; restore clears the local journal and block cache, preserves
+  operator files, accepts a new history branch, and recovers again through
+  empty caches. `max_backups` fixes the startup roster. Independent-prefix
+  export and targets between named checkpoints remain production work.
 - Manifest v14 retains 64 table constraints per modeled kind and 64 domain
   checks. The complete accepted width is qualified through catalogs, WAL,
   checkpoints, empty-cache recovery, and PostgreSQL differential execution;

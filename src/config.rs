@@ -253,6 +253,8 @@ pub struct Config {
     /// Commit-batch identities retained while cold recovery walks the durable
     /// head chain into ascending replay order.
     pub checkpoint_commit_batches: usize,
+    /// Named checkpoint-consistent backups retained in object storage.
+    pub max_backups: usize,
     /// Content-addressed block identities retained by one checkpoint garbage
     /// collection keep-set.
     pub checkpoint_live_blocks: usize,
@@ -431,6 +433,7 @@ impl Config {
             wal_upload_buffer_bytes: 8 * MIB,
             checkpoint_manifest_bytes: 256 * KIB,
             checkpoint_commit_batches: 4096,
+            max_backups: 16,
             checkpoint_live_blocks: 64 * 1024,
             checkpoint_garbage_batch_objects: 4096,
             checkpoint_delete_objects_per_beat: 16,
@@ -909,6 +912,10 @@ impl Config {
                     config.checkpoint_commit_batches =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "max_backups" => {
+                    config.max_backups =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
                 "checkpoint_live_blocks" => {
                     config.checkpoint_live_blocks =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
@@ -1144,6 +1151,7 @@ impl Config {
                 "checkpoint_commit_batches",
                 config.checkpoint_commit_batches,
             ),
+            ("max_backups", config.max_backups),
             ("checkpoint_live_blocks", config.checkpoint_live_blocks),
             (
                 "checkpoint_garbage_batch_objects",
@@ -1776,6 +1784,7 @@ memtable_bytes = 16MiB   # small for tests
 temporary_spill_bytes = 32MiB
 checkpoint_manifest_bytes = 2MiB
 checkpoint_commit_batches = 7000
+max_backups = 23
 checkpoint_live_blocks = 8000
 checkpoint_garbage_batch_objects = 3
 checkpoint_delete_objects_per_beat = 2
@@ -1815,6 +1824,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.temporary_spill_bytes, 32 * MIB);
         assert_eq!(c.checkpoint_manifest_bytes, 2 * MIB);
         assert_eq!(c.checkpoint_commit_batches, 7000);
+        assert_eq!(c.max_backups, 23);
         assert_eq!(c.checkpoint_live_blocks, 8000);
         assert_eq!(c.checkpoint_garbage_batch_objects, 3);
         assert_eq!(c.checkpoint_delete_objects_per_beat, 2);
@@ -1850,6 +1860,7 @@ sql_arena_bytes = 4096
     fn checkpoint_maintenance_capacities_must_be_nonzero() {
         for name in [
             "checkpoint_commit_batches",
+            "max_backups",
             "checkpoint_live_blocks",
             "checkpoint_garbage_batch_objects",
             "checkpoint_delete_objects_per_beat",

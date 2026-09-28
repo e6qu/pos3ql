@@ -51,6 +51,15 @@ mixed v2, v3, and v4 row generations remain readable. Unknown identities stop
 startup, and an incompatible change requires the offline migration procedure
 defined by the contract before its writer can ship.
 
+Offline named backups now retain checksummed manifest and commit-head roots in
+the configured object-store prefix. Garbage collection includes every backup
+block graph and keeps commit history from the oldest required backup replay
+floor. Restore uses
+a durable pending marker, clears local caches, and can branch new durable
+history from the restored checkpoint. The fixed `max_backups` roster bounds
+retention bookkeeping. These recovery points still share the live prefix;
+independent-prefix copies and targets between named checkpoints remain open.
+
 This is not yet a production-complete topology: one process serializes query
 execution; writer fencing, promotion, backup and point-in-time recovery,
 operational interfaces, and representative long-run performance evidence
@@ -204,8 +213,10 @@ the client-visible boundary and rejected before partial effects.
 
 ### Durable operations and availability
 
-- Implement backup, restore, and point-in-time recovery; test restore into empty
-  local caches across checkpoints and retained commit history.
+- Export named backups to an independently operated prefix and recover to an
+  exact retained LSN or timestamp between named checkpoints. Qualify interrupted
+  export and restore, empty local caches, retained commit history, deletion,
+  and a new durable history branch after recovery.
 - Add single-writer ownership and fencing before promotion or failover. Prove
   that an old writer cannot publish after ownership changes, including delayed
   object requests and restart races. Multiple writable processes on one prefix

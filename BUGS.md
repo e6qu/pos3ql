@@ -6,6 +6,13 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The named-backup audit found no external blocker. Backup manifests now pin
+their complete row and value-index block graphs; prepared-transaction and
+logical-slot positions lower the oldest backup replay floor used by commit
+pruning. A checksummed completion record, durable restore marker,
+local-cache removal, later checkpoints, deletion, and a new post-restore branch
+are covered through empty-cache recovery. Independent-prefix export and
+between-checkpoint recovery targets remain planned work in PLAN.md.
 The durable-format contract audit found no external blocker. Manifest and row
 SST reader and writer identities now come from complete executable sets whose
 membership is checked against the documented matrix. An actual v13 manifest

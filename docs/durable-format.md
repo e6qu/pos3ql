@@ -11,6 +11,7 @@ they never select a guessed decoder.
 |---|---|---:|---:|---|
 | Checkpoint manifest | `pos3ql-manifest-v13` | yes | no | The next successful checkpoint publishes v14. |
 | Checkpoint manifest | `pos3ql-manifest-v14` | yes | yes | Current format. |
+| Backup completion | `pos3ql-backup-v1` | yes | yes | Checksums the retained manifest and commit head. |
 | Published row SST | `v2` | yes | no | Compatible generations remain readable and are replaced when sliced or merged. |
 | Published row SST | `v3` | yes | no | Compatible packed PAX generations remain readable. |
 | Published row SST | `v4` | yes | yes | Current packed format: PAX full slices and row-packed deltas. |
@@ -25,6 +26,13 @@ separate PAX descriptor and column-container write per group. The in-memory
 handle retains this identity as `RowSstFormat`; index traversal cannot infer an
 index-entry grammar from block contents or collapse the identity into an
 unrelated flag.
+
+A named backup stores an exact manifest and commit-head image, then publishes
+its `pos3ql-backup-v1` completion record last. The record carries the manifest
+LSN and CRC32C checksums for both roots. Restore rejects a missing, unknown, or
+mismatched completion record. The backup manifest itself is the retention pin,
+so an interrupted creation cannot expose a restorable name or lose blocks that
+its partial state may reference.
 
 Block headers also carry a typed block identity. A row SST format defines the
 allowed index-entry shape and block types together. A recognized block type in

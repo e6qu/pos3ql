@@ -39,13 +39,15 @@ const VALUE_SORT_ENTRY_HEADER: usize = 8 + 8 + 8 + 4 + 4; // hash | rowid | lsn 
 /// Manifest readers are deliberately explicit. A supported legacy manifest is
 /// rewritten as the current format by the next successful checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum ManifestFormat {
-    V13,
-    V14,
+    V13 = 0,
+    V14 = 1,
 }
 
 impl ManifestFormat {
     const CURRENT: Self = Self::V14;
+    const SUPPORTED: [Self; Self::CURRENT as usize + 1] = [Self::V13, Self::V14];
 
     const fn header(self) -> &'static str {
         match self {
@@ -55,11 +57,11 @@ impl ManifestFormat {
     }
 
     fn parse(header: Option<&str>) -> Result<Self, CheckpointSetupError> {
-        match header {
-            Some("pos3ql-manifest-v13") => Ok(Self::V13),
-            Some("pos3ql-manifest-v14") => Ok(Self::V14),
-            _ => Err(CheckpointSetupError::Corrupt("bad manifest header")),
-        }
+        Self::SUPPORTED
+            .iter()
+            .copied()
+            .find(|format| Some(format.header()) == header)
+            .ok_or(CheckpointSetupError::Corrupt("bad manifest header"))
     }
 
     const fn has_value_index_identity(self) -> bool {
@@ -848,6 +850,10 @@ pub(crate) struct Checkpointer {
     /// republish; any other id is a genuine second writer, which stays a
     /// loud error.
     writer_id: u64,
+    /// Legacy output exists only to qualify an actual old-format upgrade.
+    /// Production always writes [`ManifestFormat::CURRENT`].
+    #[cfg(test)]
+    manifest_write_format: ManifestFormat,
 }
 
 /// One beat's outcome: nothing to publish, a slice written, or the manifest
@@ -1561,7 +1567,14 @@ impl Checkpointer {
             merge_turn: false,
             merge_overflow: vec![None; table_capacity],
             writer_id: crate::object_store::writer_id(config),
+            #[cfg(test)]
+            manifest_write_format: ManifestFormat::CURRENT,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_v13_manifest_for_test(&mut self) {
+        self.manifest_write_format = ManifestFormat::V13;
     }
 
     /// The shared block stack, for the storage layer's spilled-row reader.
@@ -7316,7 +7329,11 @@ impl Checkpointer {
         // Delta bookkeeping collects the new per-slot references into
         // pre-reserved scratch so this post-freeze path never allocates.
         self.manifest_buf.clear();
-        write_manifest(&mut self.manifest_buf, ManifestFormat::CURRENT.header())?;
+        #[cfg(test)]
+        let manifest_format = self.manifest_write_format;
+        #[cfg(not(test))]
+        let manifest_format = ManifestFormat::CURRENT;
+        write_manifest(&mut self.manifest_buf, manifest_format.header())?;
         write_manifest(&mut self.manifest_buf, format_args!("lsn {lsn}"))?;
         write_manifest(
             &mut self.manifest_buf,
@@ -8280,20 +8297,33 @@ impl Checkpointer {
                 }
                 let mut roster = [0u8; 64];
                 handle.roster.write_key(&mut roster);
-                write_manifest(
-                    &mut self.manifest_buf,
-                    format_args!(
-                        "vix {slot} {n_columns} {}{include_mask} {} {} {} {}",
-                        column_text.as_str(),
-                        index_created_at.map_or_else(
-                            || StackStr::<32>::from_str("-"),
-                            |identity| stack_format!(32, "{identity}"),
+                if manifest_format.has_value_index_identity() {
+                    write_manifest(
+                        &mut self.manifest_buf,
+                        format_args!(
+                            "vix {slot} {n_columns} {}{include_mask} {} {} {} {}",
+                            column_text.as_str(),
+                            index_created_at.map_or_else(
+                                || StackStr::<32>::from_str("-"),
+                                |identity| stack_format!(32, "{identity}"),
+                            ),
+                            core::str::from_utf8(&roster).expect("hex"),
+                            handle.entries,
+                            handle.published_lsn,
                         ),
-                        core::str::from_utf8(&roster).expect("hex"),
-                        handle.entries,
-                        handle.published_lsn,
-                    ),
-                )?;
+                    )?;
+                } else {
+                    write_manifest(
+                        &mut self.manifest_buf,
+                        format_args!(
+                            "vix {slot} {n_columns} {}{include_mask} {} {} {}",
+                            column_text.as_str(),
+                            core::str::from_utf8(&roster).expect("hex"),
+                            handle.entries,
+                            handle.published_lsn,
+                        ),
+                    )?;
+                }
             }
         }
         for (statistics_slot, statistics) in storage.checkpoint_extended_statistics() {
@@ -14924,6 +14954,53 @@ mod stored_dependency_tests {
         assert!(ManifestFormat::parse(Some("pos3ql-manifest-v12")).is_err());
         assert!(ManifestFormat::parse(Some("pos3ql-manifest-v15")).is_err());
         assert!(ManifestFormat::parse(None).is_err());
+    }
+
+    #[test]
+    fn durable_format_documentation_matches_the_executable_matrix() {
+        let document = include_str!("../docs/durable-format.md");
+        let manifest_rows = document
+            .lines()
+            .filter(|line| line.starts_with("| Checkpoint manifest |"))
+            .collect::<Vec<_>>();
+        let row_sst_rows = document
+            .lines()
+            .filter(|line| line.starts_with("| Published row SST |"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(manifest_rows.len(), ManifestFormat::SUPPORTED.len());
+        for format in ManifestFormat::SUPPORTED {
+            let writable = if format == ManifestFormat::CURRENT {
+                "yes"
+            } else {
+                "no"
+            };
+            let prefix = format!(
+                "| Checkpoint manifest | `{}` | yes | {writable} |",
+                format.header()
+            );
+            assert!(
+                manifest_rows.iter().any(|row| row.starts_with(&prefix)),
+                "durable format matrix lacks {prefix}"
+            );
+        }
+
+        assert_eq!(row_sst_rows.len(), RowSstFormat::SUPPORTED.len());
+        for format in RowSstFormat::SUPPORTED {
+            let writable = if format == RowSstFormat::CURRENT {
+                "yes"
+            } else {
+                "no"
+            };
+            let prefix = format!(
+                "| Published row SST | `{}` | yes | {writable} |",
+                format.manifest_id()
+            );
+            assert!(
+                row_sst_rows.iter().any(|row| row.starts_with(&prefix)),
+                "durable format matrix lacks {prefix}"
+            );
+        }
     }
 
     #[test]

@@ -44,10 +44,17 @@ unfiltered geometric nearest-neighbor workloads have bounded immutable-object
 navigation with warm and object-cold qualification. Predicates that cannot be
 pruned conservatively still use complete exact evaluation.
 
+The durable-format contract declares the complete readable and writable
+manifest and row SST identity sets in code and documentation. Manifest v13
+recovers through empty caches and upgrades to v14 on the next checkpoint;
+mixed v2, v3, and v4 row generations remain readable. Unknown identities stop
+startup, and an incompatible change requires the offline migration procedure
+defined by the contract before its writer can ship.
+
 This is not yet a production-complete topology: one process serializes query
 execution; writer fencing, promotion, backup and point-in-time recovery,
-durable-format migration rules, operational interfaces, and representative
-long-run performance evidence remain open.
+operational interfaces, and representative long-run performance evidence
+remain open.
 
 ## Remaining production work
 
@@ -197,8 +204,6 @@ the client-visible boundary and rejected before partial effects.
 
 ### Durable operations and availability
 
-- Define durable-format versions, compatibility rules, and online or offline
-  migration procedures before changing persisted representations.
 - Implement backup, restore, and point-in-time recovery; test restore into empty
   local caches across checkpoints and retained commit history.
 - Add single-writer ownership and fencing before promotion or failover. Prove

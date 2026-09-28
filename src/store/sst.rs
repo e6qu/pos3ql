@@ -30,17 +30,22 @@ use super::{BlockId, BlockStore, BlockType, MAX_PAYLOAD, StoreError};
 /// Durable row SST layouts accepted by this reader. The identity stays on the
 /// handle so every index descent uses the layout named by the manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub(crate) enum RowSstFormat {
     /// Direct data blocks named by v2 sparse-index entries.
-    DirectV2,
+    DirectV2 = 0,
     /// PAX extents named through packed v3 sparse-index entries.
-    PackedPaxV3,
+    PackedPaxV3 = 1,
     /// Packed v4 sparse-index entries naming either row blocks or PAX
     /// descriptors. Small deltas use row blocks; full slices use PAX.
-    PackedV4,
+    PackedV4 = 2,
 }
 
 impl RowSstFormat {
+    pub(crate) const CURRENT: Self = Self::PackedV4;
+    pub(crate) const SUPPORTED: [Self; Self::CURRENT as usize + 1] =
+        [Self::DirectV2, Self::PackedPaxV3, Self::PackedV4];
+
     pub(crate) const fn manifest_id(self) -> &'static str {
         match self {
             Self::DirectV2 => "v2",
@@ -49,13 +54,11 @@ impl RowSstFormat {
         }
     }
 
-    pub(crate) const fn from_manifest_id(id: &str) -> Option<Self> {
-        match id.as_bytes() {
-            b"v2" => Some(Self::DirectV2),
-            b"v3" => Some(Self::PackedPaxV3),
-            b"v4" => Some(Self::PackedV4),
-            _ => None,
-        }
+    pub(crate) fn from_manifest_id(id: &str) -> Option<Self> {
+        Self::SUPPORTED
+            .iter()
+            .copied()
+            .find(|format| format.manifest_id() == id)
     }
 
     pub(crate) const fn uses_packed_references(self) -> bool {
@@ -1084,7 +1087,7 @@ impl SstWriter {
             filter,
             roster,
             format: if self.packed_references() {
-                RowSstFormat::PackedV4
+                RowSstFormat::CURRENT
             } else {
                 RowSstFormat::DirectV2
             },

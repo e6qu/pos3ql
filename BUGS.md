@@ -6,6 +6,11 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The durable-format contract audit found no external blocker. Manifest and row
+SST reader and writer identities now come from complete executable sets whose
+membership is checked against the documented matrix. An actual v13 manifest
+recovers from empty caches, upgrades through a v14 checkpoint, and recovers
+again from empty caches, closing the former parser-only migration evidence.
 The durable constraint-shape audit found no fixable defect within manifest v14.
 Table and domain constraint positions are stable catalog and referential-trigger
 OID identities, so widening their 64-entry stride needs the format and OID

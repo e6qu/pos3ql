@@ -103,6 +103,13 @@ impl SimNamespace {
         self.objects.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn object_bytes(&self, key: &str) -> Option<&[u8]> {
+        self.find(key)
+            .ok()
+            .map(|at| self.objects[at].bytes.as_slice())
+    }
+
     fn find(&self, key: &str) -> Result<usize, usize> {
         self.objects.binary_search_by(|o| o.key.as_str().cmp(key))
     }

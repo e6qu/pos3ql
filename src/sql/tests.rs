@@ -69560,6 +69560,103 @@ fn failed_upload_is_reconciled_at_startup_so_observed_rows_survive_body() {
 }
 
 #[test]
+fn v13_manifest_upgrades_through_empty_cache_recovery() {
+    let result = std::thread::Builder::new()
+        .name("manifest-v13-upgrade".to_string())
+        .stack_size(crate::sql::exec::QUERY_STACK_BYTES)
+        .spawn(v13_manifest_upgrades_through_empty_cache_recovery_body)
+        .expect("spawn manifest upgrade test")
+        .join();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn v13_manifest_upgrades_through_empty_cache_recovery_body() {
+    let mut config = test_config("manifest-v13-upgrade");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_bucket = format!("manifest-v13-upgrade-{}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_bucket, 13);
+    let manifest_key = format!(
+        "{}{}",
+        config.object_store_prefix,
+        crate::checkpoint::MANIFEST_KEY
+    );
+
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE format_rows (id integer UNIQUE, value text); \
+         INSERT INTO format_rows VALUES (1, 'from-v13')",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    engine
+        .ckpt
+        .as_mut()
+        .expect("object-store checkpointer")
+        .write_v13_manifest_for_test();
+    assert!(engine.checkpoint().unwrap());
+    assert!(
+        namespace
+            .borrow()
+            .object_bytes(&manifest_key)
+            .is_some_and(|bytes| {
+                bytes.starts_with(b"pos3ql-manifest-v13\n")
+                    && bytes.windows(b" v4\n".len()).any(|part| part == b" v4\n")
+            }),
+        "fixture checkpoint must publish a v13 manifest over a v4 row generation"
+    );
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut upgraded = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut upgraded,
+            &mut budget,
+            "SELECT id, value FROM format_rows"
+        )),
+        ["1|from-v13"]
+    );
+    let inserted = run_with(
+        &mut upgraded,
+        &mut budget,
+        "INSERT INTO format_rows VALUES (2, 'from-v14')",
+    );
+    assert!(!String::from_utf8_lossy(&inserted).contains("ERROR"));
+    assert!(upgraded.checkpoint().unwrap());
+    assert!(
+        namespace
+            .borrow()
+            .object_bytes(&manifest_key)
+            .is_some_and(|bytes| bytes.starts_with(b"pos3ql-manifest-v14\n")),
+        "the first successful checkpoint must replace v13 with the current format"
+    );
+    drop(upgraded);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id, value FROM format_rows ORDER BY id"
+        )),
+        ["1|from-v13", "2|from-v14"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_bucket);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn cold_start_then_commit_then_crash_recovers_every_record() {
     let result = std::thread::Builder::new()
         .name("cold-wal-recovery".to_string())

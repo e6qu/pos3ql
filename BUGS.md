@@ -6,6 +6,16 @@ defects belong in the implementation that discovers them; planned engineering
 work and architecture limits belong in [PLAN.md](PLAN.md).
 
 There are currently no defects that meet this file's inclusion criteria.
+The operational-interface audit found no external blocker. A separately
+bounded listener now serves liveness, writer-fence-validated durable readiness,
+Prometheus metrics, and JSON capacity without consuming PostgreSQL connection
+slots or allocating after startup. JSON Lines logging shares the allocation-free
+runtime diagnostic path. Strict configuration and HTTP parsing, fixed response bounds,
+and the controlled-replacement runbook define the operator boundary. A small
+valid configuration exposed that the memory plan omitted the fixed LISTEN and
+NOTIFY registry and outbox; their exact bytes are now charged before startup.
+Active failure detection, credential rotation, packaging, and end-to-end recovery
+drills remain planned work in PLAN.md.
 The single-writer fencing audit found no external blocker. A random process
 incarnation is promoted through one durable fence; the transition precedes
 conditional rewrites of both mutable roots, and activation follows them. A

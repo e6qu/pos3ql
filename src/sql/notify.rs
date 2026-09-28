@@ -128,6 +128,11 @@ pub struct NotifyState {
 }
 
 impl NotifyState {
+    pub const fn budget_bytes(max_listeners: usize, outbox_capacity: usize) -> usize {
+        max_listeners * core::mem::size_of::<(i32, Channel)>()
+            + outbox_capacity * core::mem::size_of::<Notification>()
+    }
+
     pub fn new(
         budget: &mut Budget,
         max_listeners: usize,
@@ -234,6 +239,14 @@ mod tests {
     fn state() -> NotifyState {
         let mut budget = Budget::new(1 << 20);
         NotifyState::new(&mut budget, 16, 16).unwrap()
+    }
+
+    #[test]
+    fn budget_matches_fixed_registry_and_outbox_draws() {
+        let bytes = NotifyState::budget_bytes(7, 11);
+        let mut budget = Budget::new(bytes);
+        NotifyState::new(&mut budget, 7, 11).unwrap();
+        assert_eq!(budget.remaining(), 0);
     }
 
     #[test]

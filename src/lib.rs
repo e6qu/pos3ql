@@ -14,6 +14,7 @@ pub(crate) mod checkpoint;
 pub mod config;
 pub(crate) mod crypto;
 pub mod io;
+pub mod logging;
 pub mod mem;
 pub mod object_store;
 pub mod operations;

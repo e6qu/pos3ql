@@ -28,6 +28,12 @@ timestamp before clearing local caches. See
 [backup and restore](docs/backup-restore.md) for the commands and retention
 limits.
 
+An optional, separately bounded HTTP listener provides liveness, readiness,
+Prometheus metrics, and JSON capacity reporting without consuming PostgreSQL
+connection slots. Runtime logs can use text or JSON Lines. See the
+[operations runbook](docs/operations.md) for configuration, endpoint semantics,
+alerts, and controlled replacement.
+
 ## Status
 
 The single-node server supports PostgreSQL v3.0/3.2, TLS, authentication, DDL/DML, transactions and savepoints, row/table locks, full transaction IDs and snapshots, views, materialized views, modeled indexes, sequences, domains, enums, PostgreSQL large objects, full-text search, SQL functions (scalar, `SETOF`, and `TABLE`, including mutable and nested calls), CTEs, joins, windows, COPY, PostgreSQL 18 SQL/JSON and SQL/XML, PostgreSQL 18-interoperable logical-replication publishing and bounded subscription bootstrap/apply, and PostgreSQL catalog introspection used by common clients and dump/restore tools. [The PostgreSQL 18 matrix](docs/postgresql-18-compatibility.md) distinguishes implemented behavior, explicit architecture boundaries, and non-goals.
@@ -509,6 +515,7 @@ psql -h 127.0.0.1 -p 5433 -U you
 - [docs/terminology.md](docs/terminology.md) — naming and glossary
 - [docs/object-storage.md](docs/object-storage.md) — direct S3-compatible durability boundary
 - [docs/backup-restore.md](docs/backup-restore.md) — named recovery points and offline restore
+- [docs/operations.md](docs/operations.md) — probes, metrics, capacity, logs, and replacement runbook
 - [docs/durable-format.md](docs/durable-format.md) — manifest and row SST compatibility and migration rules
 - [docs/postgresql-18-compatibility.md](docs/postgresql-18-compatibility.md) — implemented PostgreSQL 18 and explicit non-goals
 - [docs/performance.md](docs/performance.md) — current single-process and replica scaling boundary

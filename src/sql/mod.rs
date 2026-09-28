@@ -274,6 +274,17 @@ pub struct Engine {
     _test_data_dir_cleanup: Option<std::sync::Arc<crate::config::TestDataDirCleanup>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct OperationalSnapshot {
+    pub(crate) lsn: u64,
+    pub(crate) wal_used_bytes: u64,
+    pub(crate) wal_capacity_bytes: u64,
+    pub(crate) row_heap_used_bytes: usize,
+    pub(crate) row_heap_capacity_bytes: usize,
+    pub(crate) block_io: crate::store::BlockIoStats,
+    pub(crate) checkpoint_pending: bool,
+}
+
 pub(crate) struct CursorStatementContext<'a, 'response> {
     pub arena: &'a Arena,
     pub params: &'a [Datum<'a>],
@@ -2034,6 +2045,18 @@ fn cursor_result_too_large() -> SqlError {
 }
 
 impl Engine {
+    pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {
+        OperationalSnapshot {
+            lsn: self.storage.lsn(),
+            wal_used_bytes: self.wal.used_bytes(),
+            wal_capacity_bytes: self.wal.capacity_bytes(),
+            row_heap_used_bytes: self.storage.heap.used(),
+            row_heap_capacity_bytes: self.storage.heap.capacity(),
+            block_io: self.storage.block_io_stats(),
+            checkpoint_pending: self.checkpoint_work_pending(),
+        }
+    }
+
     pub(crate) fn subscription_cleanup_runtime(
         &self,
         slot: usize,
@@ -2800,6 +2823,10 @@ impl Engine {
             + config.max_connections as usize * size_of::<(i32, u64)>()
             + config.max_roles * size_of::<u16>()
             + config.max_databases * size_of::<u16>()
+            + notify::NotifyState::budget_bytes(
+                config.max_connections as usize * notify::CHANNELS_PER_CONN,
+                notify::OUTBOX,
+            )
             + config.max_ddl_per_transaction.saturating_mul(
                 size_of::<(usize, bool)>() + size_of::<usize>() + size_of::<PendingTruncate>(),
             )
@@ -7120,6 +7147,17 @@ impl Engine {
         self.upload_wal_batch()
     }
 
+    pub(crate) fn durable_retry_pending(&self) -> bool {
+        self.wal_upload && self.wal.pending_batch_bytes() != 0
+    }
+
+    pub(crate) fn verify_writer_ownership(&mut self) -> Result<(), SqlError> {
+        match self.ckpt.as_mut() {
+            Some(checkpointer) => checkpointer.verify_writer(),
+            None => Ok(()),
+        }
+    }
+
     /// Whether success responses must remain buffered until commit-batch
     /// publication completes.
     pub(crate) const fn publication_required(&self) -> bool {
@@ -8492,7 +8530,7 @@ impl Engine {
         if let Err(error) = self.retry_pending_wal_upload() {
             let message = stack_format!(
                 512,
-                "pos3ql: auto-checkpoint failed ({}): {}\n",
+                "auto-checkpoint failed ({}): {}\n",
                 error.sqlstate,
                 error.message.as_str()
             );
@@ -8505,7 +8543,7 @@ impl Engine {
                 Err(e) => {
                     let message = stack_format!(
                         512,
-                        "pos3ql: post-checkpoint bookkeeping failed ({}): {}\n",
+                        "post-checkpoint bookkeeping failed ({}): {}\n",
                         e.sqlstate,
                         e.message.as_str()
                     );
@@ -8524,7 +8562,7 @@ impl Engine {
                 Err(error) => {
                     let message = stack_format!(
                         512,
-                        "pos3ql: temporary spill failed ({}): {}\n",
+                        "temporary spill failed ({}): {}\n",
                         error.sqlstate,
                         error.message.as_str()
                     );
@@ -8540,7 +8578,7 @@ impl Engine {
             if let Err(error) = self.storage.compact_heap(&mut self.compact_scratch) {
                 let message = stack_format!(
                     512,
-                    "pos3ql: temporary spill cleanup failed ({}): {}\n",
+                    "temporary spill cleanup failed ({}): {}\n",
                     error.sqlstate,
                     error.message.as_str()
                 );
@@ -8590,7 +8628,7 @@ impl Engine {
                 if let Err(e) = self.finish_post_publish_cleanup() {
                     let message = stack_format!(
                         512,
-                        "pos3ql: post-checkpoint bookkeeping failed ({}): {}\n",
+                        "post-checkpoint bookkeeping failed ({}): {}\n",
                         e.sqlstate,
                         e.message.as_str()
                     );
@@ -8603,7 +8641,7 @@ impl Engine {
             Err(e) => {
                 let message = stack_format!(
                     512,
-                    "pos3ql: auto-checkpoint failed ({}): {}\n",
+                    "auto-checkpoint failed ({}): {}\n",
                     e.sqlstate,
                     e.message.as_str()
                 );

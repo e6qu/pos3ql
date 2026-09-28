@@ -761,7 +761,7 @@ impl TemporarySpiller {
         if let Err(error) = self.reclaim(storage) {
             let message = stack_format!(
                 512,
-                "pos3ql: temporary spill cleanup failed ({}): {}\n",
+                "temporary spill cleanup failed ({}): {}\n",
                 error.sqlstate,
                 error.message.as_str()
             );
@@ -1794,6 +1794,20 @@ impl Checkpointer {
                 }
             }
         }
+    }
+
+    pub(crate) fn verify_writer(&mut self) -> Result<(), SqlError> {
+        let active = writer_fence_record("active", self.writer_token);
+        self.client
+            .get(WRITER_FENCE_KEY, None)
+            .map_err(|error| sql_err!(SQLSTATE_CAS, "verify writer ownership: {}", error))?;
+        if self.client.body_bytes() != active.as_str().as_bytes() {
+            return Err(sql_err!(
+                SQLSTATE_CAS,
+                "writer was fenced by a newer process"
+            ));
+        }
+        Ok(())
     }
 
     /// Publishes one immutable committed journal batch, keyed by its first

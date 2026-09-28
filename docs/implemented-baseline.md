@@ -73,6 +73,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
 - Fixed-startup memory accounting, deterministic fault simulation, differential
   tests, vendored PostgreSQL regression slices, SQLLogicTest corpora, driver
   probes, and performance-smoke checks.
+- A separately bounded operational HTTP listener serves liveness and readiness
+  probes, Prometheus metrics, and JSON capacity state without consuming SQL
+  connection slots. Readiness validates current writer-fence ownership and
+  observed durable-publication health.
+  Text and JSON Lines runtime logs remain allocation-free after startup, and
+  the operations runbook defines alerts and controlled writer replacement.
 - Checkpoint, merge, pending-install, and temporary-spill bookkeeping sized from
   the configured physical-table capacity rather than a 1,024-slot ceiling.
   Above-boundary tables, dropped identities, fresh replacement slots, repeated

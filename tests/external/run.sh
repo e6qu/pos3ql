@@ -35,6 +35,7 @@ S3_TEST_REGION=test-region
 S3_TEST_ACCESS_KEY=pos3ql-test-access
 S3_TEST_SECRET_KEY=pos3ql-test-secret
 PG_PORT=$(select_port "${POS3QL_PG_PORT:-}" 15433 15463) || exit 1
+OPERATIONS_PORT=$(select_port "${POS3QL_OPERATIONS_PORT:-}" 19340 19360) || exit 1
 TORTURE_PG_PORT=$(select_port "${POS3QL_TORTURE_PG_PORT:-}" 15470 15490) || exit 1
 # An externally managed publisher is an explicit fixture. When configured, its
 # listener must already exist; otherwise this harness starts a local publisher.
@@ -198,6 +199,8 @@ write_main_config() { # <object prefix> [data directory name]
   local data_name=${2:-data}
   cat > "$WORK/server.conf" <<EOF
 listen_addr = 127.0.0.1:${PG_PORT}
+operations_listen_addr = 127.0.0.1:${OPERATIONS_PORT}
+operations_max_connections = 4
 data_dir = ${WORK}/${data_name}
 max_connections = 8
 memtable_bytes = 16MiB
@@ -237,6 +240,16 @@ write_main_config "run-$$/"
 start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
 ok "server up (pid $SERVER_PID)"
+
+step "operational health, readiness, metrics and capacity"
+if POS3QL_PORT=$PG_PORT POS3QL_OPERATIONS_PORT=$OPERATIONS_PORT \
+    python3 "$EXT/operations_probe.py" \
+    > "$WORK/operations.out" 2>&1; then
+  ok "operational HTTP endpoints"
+else
+  bad "operational HTTP endpoints"
+  cat "$WORK/operations.out"
+fi
 
 restart_main_server() { # <fixture name>
   local fixture=$1

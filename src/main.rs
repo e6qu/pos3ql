@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use pos3ql::config::{Config, FmtBytes};
+use pos3ql::config::{Config, FmtBytes, LogFormat};
 use pos3ql::mem;
 use pos3ql::server::Server;
 
@@ -18,16 +18,19 @@ fn main() -> ExitCode {
         Ok(worker) => match worker.join() {
             Ok(Ok(())) => ExitCode::SUCCESS,
             Ok(Err(message)) => {
-                eprintln!("pos3ql: {message}");
+                pos3ql::logging::error("process", &message);
                 ExitCode::FAILURE
             }
             Err(_) => {
-                eprintln!("pos3ql: server thread panicked");
+                pos3ql::logging::error("process", "server thread panicked");
                 ExitCode::FAILURE
             }
         },
         Err(error) => {
-            eprintln!("pos3ql: could not start server thread: {error}");
+            pos3ql::logging::error(
+                "process",
+                &format!("could not start server thread: {error}"),
+            );
             ExitCode::FAILURE
         }
     }
@@ -35,6 +38,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let (config, operation) = load_config()?;
+    pos3ql::logging::configure(config.log_format);
     match operation {
         Operation::Serve => {}
         Operation::Backup(name) => {
@@ -79,18 +83,40 @@ fn run() -> Result<(), String> {
         pos3ql::sql::Engine::extra_budget_bytes(&config),
     );
 
-    println!("pos3ql starting");
-    println!("  listen_addr  {}", config.listen_addr);
-    println!("  data_dir     {}", config.data_dir);
-    println!("{plan}");
-    println!(
-        "  disk cache   {:>12} (disk, not RAM)",
-        FmtBytes(config.disk_cache_bytes)
-    );
-    println!(
-        "  temp spill   {:>12} (local ephemeral disk)",
-        FmtBytes(config.temporary_spill_bytes)
-    );
+    if config.log_format == LogFormat::Json {
+        pos3ql::logging::info(
+            "startup",
+            &format!(
+                "listen_addr={} operations_listen_addr={} data_dir={} core_memory_budget_bytes={} disk_cache_bytes={} temporary_spill_bytes={}",
+                config.listen_addr,
+                if config.operations_listen_addr.is_empty() {
+                    "disabled"
+                } else {
+                    config.operations_listen_addr.as_str()
+                },
+                config.data_dir,
+                plan.total(),
+                config.disk_cache_bytes,
+                config.temporary_spill_bytes,
+            ),
+        );
+    } else {
+        println!("pos3ql starting");
+        println!("  listen_addr  {}", config.listen_addr);
+        if !config.operations_listen_addr.is_empty() {
+            println!("  operations   {}", config.operations_listen_addr);
+        }
+        println!("  data_dir     {}", config.data_dir);
+        println!("{plan}");
+        println!(
+            "  disk cache   {:>12} (disk, not RAM)",
+            FmtBytes(config.disk_cache_bytes)
+        );
+        println!(
+            "  temp spill   {:>12} (local ephemeral disk)",
+            FmtBytes(config.temporary_spill_bytes)
+        );
+    }
 
     if config.object_store_sim {
         return Err(
@@ -116,11 +142,23 @@ fn run() -> Result<(), String> {
         };
     mem::guard::set_tls_budget(tls_budget as u64);
     mem::guard::freeze();
-    println!(
-        "startup complete: memory frozen ({} of {} budget drawn); accepting connections",
-        FmtBytes(budget.used()),
-        FmtBytes(budget.total()),
-    );
+    if config.log_format == LogFormat::Json {
+        pos3ql::logging::info_args(
+            "startup_complete",
+            format_args!(
+                "memory_drawn_bytes={} core_memory_budget_bytes={} tls_memory_budget_bytes={} accepting_connections=true",
+                budget.used(),
+                budget.total(),
+                tls_budget,
+            ),
+        );
+    } else {
+        println!(
+            "startup complete: memory frozen ({} of {} budget drawn); accepting connections",
+            FmtBytes(budget.used()),
+            FmtBytes(budget.total()),
+        );
+    }
     server.run().map_err(|e| {
         format!(
             "event loop failed: kind={:?} os_error={:?}",
@@ -260,7 +298,10 @@ fn load_config() -> Result<(Config, Operation), String> {
     let config = match config_path {
         Some(path) => load_config_file(&path),
         None => {
-            eprintln!("pos3ql: no --config given, using development defaults");
+            pos3ql::logging::warn(
+                "configuration",
+                "no --config given, using development defaults",
+            );
             Ok(Config::default_dev())
         }
     }?;

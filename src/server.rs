@@ -1,6 +1,7 @@
 //! The single-threaded server: one reactor, a fixed array of connection
 //! slots whose buffers are allocated once at startup, and the query engine.
 
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
@@ -22,6 +23,10 @@ const BLOCK_IO_TOKEN: u64 = u64::MAX - 2;
 /// First token reserved for outbound logical-subscription workers.  The
 /// bounded subscription count is checked against this disjoint range at setup.
 const SUBSCRIPTION_TOKEN_BASE: u64 = u64::MAX - 1_000_000;
+const OPERATIONS_LISTENER_TOKEN: u64 = u64::MAX - 2_000_000;
+const OPERATIONS_TOKEN_BASE: u64 = 1 << 63;
+const OPERATIONS_REQUEST_BYTES: usize = 2048;
+const OPERATIONS_RESPONSE_BYTES: usize = 16 * 1024;
 
 /// Set by the signal handler; the loop drains and exits when it sees this.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -61,6 +66,14 @@ pub struct Server {
     /// One registered socket per fixed durable-block GET slot.
     block_read_fds: FixedVec<Option<i32>>,
     subscriptions: FixedVec<SubscriptionWorker>,
+    operations_listener: Option<TcpListener>,
+    operations_slots: FixedVec<OperationsSlot>,
+    operations_free: FixedVec<u32>,
+    operations_metrics: OperationsMetrics,
+    capacity_limits: CapacityLimits,
+    memory_reserved_bytes: usize,
+    durability_ready: bool,
+    ownership_ready: bool,
 }
 
 struct Slot {
@@ -69,6 +82,40 @@ struct Slot {
     want_read: bool,
     want_write: bool,
     pending_response: Option<PendingResponse>,
+}
+
+struct OperationsSlot {
+    stream: Option<TcpStream>,
+    request: crate::mem::buffer::FixedBuf,
+    response: crate::mem::buffer::FixedBuf,
+}
+
+#[derive(Default)]
+struct OperationsMetrics {
+    postgres_accepted: u64,
+    postgres_refused: u64,
+    postgres_closed: u64,
+    http_requests: u64,
+    http_errors: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CapacityLimits {
+    postgres_connections: usize,
+    operations_connections: usize,
+    block_cache_bytes: usize,
+    disk_cache_bytes: usize,
+    temporary_spill_bytes: usize,
+    tables: usize,
+    indexes: usize,
+    databases: usize,
+    schemas: usize,
+    roles: usize,
+    prepared_transactions: usize,
+    replication_slots: usize,
+    subscriptions: usize,
+    object_store: bool,
+    tls_budget_bytes: usize,
 }
 
 struct SubscriptionWorker {
@@ -424,14 +471,30 @@ impl Server {
     /// per-connection buffers and engine storage.
     pub fn budget_bytes(config: &Config) -> usize {
         let connections = config.max_connections as usize;
+        let operations_connections = if config.operations_listen_addr.is_empty() {
+            0
+        } else {
+            config.operations_max_connections
+        };
         let block_reads = if config.object_store_on {
             config.object_store_get_slots
         } else {
             0
         };
-        Reactor::budget_bytes(connections + 2 + block_reads + 2 * config.max_subscriptions)
-            + 128
+        Reactor::budget_bytes(
+            connections
+                + 2
+                + block_reads
+                + 2 * config.max_subscriptions
+                + usize::from(operations_connections != 0)
+                + operations_connections,
+        ) + 128
             + connections * (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>())
+            + operations_connections
+                * (core::mem::size_of::<OperationsSlot>()
+                    + core::mem::size_of::<u32>()
+                    + OPERATIONS_REQUEST_BYTES
+                    + OPERATIONS_RESPONSE_BYTES)
             + block_reads * core::mem::size_of::<Option<i32>>()
             + Self::extra_budget_bytes(config)
     }
@@ -458,11 +521,26 @@ impl Server {
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, ServerSetupError> {
         let max_conns = config.max_connections as usize;
+        let operations_connections = if config.operations_listen_addr.is_empty() {
+            0
+        } else {
+            config.operations_max_connections
+        };
         let listener = bind_listener(&config.listen_addr)
             .map_err(|e| ServerSetupError::Io("bind listen_addr", e))?;
         listener
             .set_nonblocking(true)
             .map_err(|e| ServerSetupError::Io("set listener nonblocking", e))?;
+        let operations_listener = if config.operations_listen_addr.is_empty() {
+            None
+        } else {
+            let listener = bind_listener(&config.operations_listen_addr)
+                .map_err(|e| ServerSetupError::Io("bind operations_listen_addr", e))?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| ServerSetupError::Io("set operations listener nonblocking", e))?;
+            Some(listener)
+        };
 
         let block_read_slots = if config.object_store_on {
             config.object_store_get_slots
@@ -475,7 +553,12 @@ impl Server {
         )]
         let mut reactor = Reactor::new(
             budget,
-            max_conns + 2 + block_read_slots + 2 * config.max_subscriptions,
+            max_conns
+                + 2
+                + block_read_slots
+                + 2 * config.max_subscriptions
+                + usize::from(operations_listener.is_some())
+                + operations_connections,
         )
         .map_err(|e| match e {
             crate::io::reactor::ReactorSetupError::Budget(b) => ServerSetupError::Budget(b),
@@ -486,12 +569,21 @@ impl Server {
         reactor
             .register_read(listener.as_raw_fd(), LISTENER_TOKEN)
             .map_err(|e| ServerSetupError::Io("register listener", e))?;
+        if let Some(listener) = &operations_listener {
+            reactor
+                .register_read(listener.as_raw_fd(), OPERATIONS_LISTENER_TOKEN)
+                .map_err(|e| ServerSetupError::Io("register operations listener", e))?;
+        }
 
         let mut slots = FixedVec::new(budget, "conn_slots", max_conns)?;
         let mut free = FixedVec::new(budget, "conn_free_list", max_conns)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
         let mut subscriptions =
             FixedVec::new(budget, "subscription_workers", config.max_subscriptions)?;
+        let mut operations_slots =
+            FixedVec::new(budget, "operations_slots", operations_connections)?;
+        let mut operations_free =
+            FixedVec::new(budget, "operations_free_list", operations_connections)?;
         let subscription_tls =
             crate::object_store::tls::build_client_config(&config.subscription_tls_ca_file)
                 .map_err(|error| {
@@ -578,6 +670,26 @@ impl Server {
                     cleanup: None,
                 })
                 .expect("sized to max_subscriptions");
+        }
+        for index in (0..operations_connections as u32).rev() {
+            operations_slots
+                .push(OperationsSlot {
+                    stream: None,
+                    request: crate::mem::buffer::FixedBuf::new(
+                        budget,
+                        "operations_request",
+                        OPERATIONS_REQUEST_BYTES,
+                    )?,
+                    response: crate::mem::buffer::FixedBuf::new(
+                        budget,
+                        "operations_response",
+                        OPERATIONS_RESPONSE_BYTES,
+                    )?,
+                })
+                .expect("sized to operations_max_connections");
+            operations_free
+                .push(index)
+                .expect("sized to operations_max_connections");
         }
 
         let mut cancel_key = [0u8; 16];
@@ -676,6 +788,7 @@ impl Server {
             None
         };
 
+        let memory_reserved_bytes = budget.total();
         Ok(Self {
             reactor,
             listener,
@@ -690,6 +803,36 @@ impl Server {
             shutdown_read: pipe_fds[0],
             block_read_fds,
             subscriptions,
+            operations_listener,
+            operations_slots,
+            operations_free,
+            operations_metrics: OperationsMetrics::default(),
+            capacity_limits: CapacityLimits {
+                postgres_connections: max_conns,
+                operations_connections,
+                block_cache_bytes: config.block_cache_bytes,
+                disk_cache_bytes: config.disk_cache_bytes,
+                temporary_spill_bytes: config.temporary_spill_bytes,
+                tables: config.max_tables,
+                indexes: config.max_indexes,
+                databases: config.max_databases,
+                schemas: config.max_schemas,
+                roles: config.max_roles,
+                prepared_transactions: config.max_prepared_transactions,
+                replication_slots: config.max_replication_slots,
+                subscriptions: config.max_subscriptions,
+                object_store: config.object_store_on,
+                tls_budget_bytes: config.tls_pool_bytes
+                    + Self::extra_tls_pool_bytes(config)
+                    + if config.tls_on {
+                        config.max_connections as usize * crate::pg::tls::SERVER_SESSION_BYTES
+                    } else {
+                        0
+                    },
+            },
+            memory_reserved_bytes,
+            durability_ready: true,
+            ownership_ready: true,
         })
     }
 
@@ -748,7 +891,19 @@ impl Server {
             // before another statement can observe the local-only commit.
             // All readable connections in this poll then share the one
             // publication barrier at the end of the turn.
-            let publication_ready = self.engine.commit_wal().is_ok();
+            let retrying_durable_publication = self.engine.durable_retry_pending();
+            let publication_ready = match self.engine.commit_wal() {
+                Ok(()) => {
+                    if retrying_durable_publication {
+                        self.durability_ready = true;
+                    }
+                    true
+                }
+                Err(_) => {
+                    self.durability_ready = false;
+                    false
+                }
+            };
             let mut completed_block_read = false;
             for i in 0..n {
                 let event = self.reactor.event(i);
@@ -761,6 +916,8 @@ impl Server {
                     {}
                 } else if event.token == LISTENER_TOKEN {
                     self.accept_pending();
+                } else if event.token == OPERATIONS_LISTENER_TOKEN {
+                    self.accept_operations_pending();
                 } else if let Some(slot) = self.block_slot(event.token) {
                     completed_block_read |= self.advance_block_io(slot)?;
                 } else if let Some((subscription, sql)) = self.subscription_slot(event.token) {
@@ -772,6 +929,8 @@ impl Server {
                             event.writable,
                         )?;
                     }
+                } else if let Some(slot) = self.operations_slot(event.token) {
+                    self.dispatch_operations(slot, event.readable, event.writable);
                 } else {
                     self.dispatch(
                         event.token,
@@ -812,9 +971,14 @@ impl Server {
             // pressure requires publication before dispatch resumes; bucket
             // errors back off.
             if self.engine.checkpoint_work_pending() || (had_responses && responses_durable) {
+                let checkpoint_was_pending = self.engine.checkpoint_work_pending();
                 beat_backoff = if self.engine.maybe_checkpoint() {
+                    if checkpoint_was_pending {
+                        self.durability_ready = true;
+                    }
                     Duration::ZERO
                 } else {
+                    self.durability_ready = false;
                     Duration::from_secs(1)
                 };
             }
@@ -828,10 +992,18 @@ impl Server {
     /// must not allocate — messages go to stderr via raw writes.
     fn shutdown(&mut self) {
         stderr_line(
-            b"pos3ql: shutdown requested, draining
+            b"shutdown requested, draining
 ",
         );
         let _ = self.reactor.deregister(self.listener.as_raw_fd());
+        if let Some(listener) = &self.operations_listener {
+            let _ = self.reactor.deregister(listener.as_raw_fd());
+        }
+        for index in 0..self.operations_slots.len() {
+            if self.operations_slots[index].stream.is_some() {
+                self.release_operations(index);
+            }
+        }
         for i in 0..self.slots.len() {
             if self.slots[i].conn.is_open() {
                 self.release(i);
@@ -840,24 +1012,24 @@ impl Server {
         if self.engine.checkpoint_enabled() {
             match self.engine.checkpoint() {
                 Ok(true) => stderr_line(
-                    b"pos3ql: final checkpoint written
+                    b"final checkpoint written
 ",
                 ),
                 Ok(false) => {}
                 Err(_) => stderr_line(
-                    b"pos3ql: final checkpoint failed; journal is durable
+                    b"final checkpoint failed; journal is durable
 ",
                 ),
             }
         }
         // Ensure the journal is durable even if no checkpoint ran.
         if self.engine.commit_wal().is_err() {
-            stderr_line(b"pos3ql: final WAL upload failed\n");
+            stderr_line(b"final WAL upload failed\n");
         } else if self.engine.mark_clean_shutdown().is_err() {
-            stderr_line(b"pos3ql: clean shutdown marker failed\n");
+            stderr_line(b"clean shutdown marker failed\n");
         }
         stderr_line(
-            b"pos3ql: shutdown complete
+            b"shutdown complete
 ",
         );
     }
@@ -883,6 +1055,8 @@ impl Server {
         }
         let _ = stream.set_nodelay(true);
         let Some(index) = self.free.pop() else {
+            self.operations_metrics.postgres_refused =
+                self.operations_metrics.postgres_refused.saturating_add(1);
             // Best-effort refusal; the startup response is small enough
             // that a fresh socket buffer will take it without blocking.
             use std::io::Write;
@@ -891,6 +1065,8 @@ impl Server {
             let _ = s.write(&bytes[..*n]);
             return;
         };
+        self.operations_metrics.postgres_accepted =
+            self.operations_metrics.postgres_accepted.saturating_add(1);
         let slot = &mut self.slots[index as usize];
         let id = self.next_conn_id;
         self.next_conn_id = self.next_conn_id.wrapping_add(1).max(1);
@@ -965,7 +1141,13 @@ impl Server {
         if !had_responses {
             return (false, true);
         }
+        let retrying_durable_publication = self.engine.durable_retry_pending();
         let publication_error = self.engine.commit_wal().err();
+        if publication_error.is_some() {
+            self.durability_ready = false;
+        } else if retrying_durable_publication {
+            self.durability_ready = true;
+        }
         for index in 0..self.slots.len() {
             let Some(pending) = self.slots[index].pending_response.take() else {
                 continue;
@@ -2101,6 +2283,8 @@ impl Server {
         self.free
             .push(index as u32)
             .expect("released slot cannot exceed capacity");
+        self.operations_metrics.postgres_closed =
+            self.operations_metrics.postgres_closed.saturating_add(1);
     }
 
     fn pump_replication_streams(&mut self) {
@@ -2115,8 +2299,461 @@ impl Server {
         }
     }
 
+    fn accept_operations_pending(&mut self) {
+        loop {
+            let accepted = {
+                let Some(listener) = &self.operations_listener else {
+                    return;
+                };
+                listener.accept()
+            };
+            match accepted {
+                Ok((stream, _)) => self.admit_operations(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    log_io("accept operational connection", &error);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn admit_operations(&mut self, mut stream: TcpStream) {
+        if let Err(error) = stream.set_nonblocking(true) {
+            log_io("set operational connection nonblocking", &error);
+            return;
+        }
+        let _ = stream.set_nodelay(true);
+        let Some(index) = self.operations_free.pop() else {
+            let _ = stream.write(
+                b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            );
+            self.operations_metrics.http_errors =
+                self.operations_metrics.http_errors.saturating_add(1);
+            return;
+        };
+        let fd = stream.as_raw_fd();
+        let slot = &mut self.operations_slots[index as usize];
+        slot.request.clear();
+        slot.response.clear();
+        slot.stream = Some(stream);
+        if let Err(error) = self
+            .reactor
+            .register_read(fd, Self::operations_token(index as usize))
+        {
+            log_io("register operational connection", &error);
+            self.release_operations(index as usize);
+        }
+    }
+
+    fn dispatch_operations(&mut self, index: usize, readable: bool, writable: bool) {
+        if index >= self.operations_slots.len() || self.operations_slots[index].stream.is_none() {
+            return;
+        }
+        if readable && self.operations_slots[index].response.is_empty() {
+            self.read_operations(index);
+        }
+        if writable
+            && index < self.operations_slots.len()
+            && self.operations_slots[index].stream.is_some()
+            && !self.operations_slots[index].response.is_empty()
+        {
+            self.write_operations(index);
+        }
+    }
+
+    fn read_operations(&mut self, index: usize) {
+        let read = {
+            let slot = &mut self.operations_slots[index];
+            if slot.request.writable().is_empty() {
+                self.queue_operations_error(index, 431, "request headers exceed 2048 bytes\n");
+                return;
+            }
+            let stream = slot.stream.as_mut().expect("open operational slot");
+            stream.read(slot.request.writable())
+        };
+        match read {
+            Ok(0) => self.release_operations(index),
+            Ok(bytes) => {
+                self.operations_slots[index].request.advance(bytes);
+                match parse_operations_request(self.operations_slots[index].request.readable()) {
+                    Ok(Some(endpoint)) => self.answer_operations(index, endpoint),
+                    Ok(None) => {
+                        if self.operations_slots[index].request.len()
+                            == self.operations_slots[index].request.capacity()
+                        {
+                            self.queue_operations_error(
+                                index,
+                                431,
+                                "request headers exceed 2048 bytes\n",
+                            );
+                        }
+                    }
+                    Err(HttpRequestError::Method) => {
+                        self.queue_operations_error(index, 405, "only GET is supported\n")
+                    }
+                    Err(HttpRequestError::Target) => {
+                        self.queue_operations_error(index, 404, "unknown operational endpoint\n")
+                    }
+                    Err(HttpRequestError::Syntax) => {
+                        self.queue_operations_error(index, 400, "malformed HTTP request\n")
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                log_io("read operational request", &error);
+                self.release_operations(index);
+            }
+        }
+    }
+
+    fn answer_operations(&mut self, index: usize, endpoint: OperationsEndpoint) {
+        self.operations_metrics.http_requests =
+            self.operations_metrics.http_requests.saturating_add(1);
+        match endpoint {
+            OperationsEndpoint::Live => {
+                self.queue_operations_response(
+                    index,
+                    200,
+                    "application/json",
+                    "{\"status\":\"live\"}\n",
+                );
+            }
+            OperationsEndpoint::Ready => {
+                self.refresh_writer_readiness();
+                if self.ready() {
+                    self.queue_operations_response(
+                        index,
+                        200,
+                        "application/json",
+                        "{\"status\":\"ready\"}\n",
+                    );
+                } else {
+                    self.operations_metrics.http_errors =
+                        self.operations_metrics.http_errors.saturating_add(1);
+                    self.queue_operations_response(
+                        index,
+                        503,
+                        "application/json",
+                        "{\"status\":\"not_ready\",\"reason\":\"durable_progress_unavailable\"}\n",
+                    );
+                }
+            }
+            OperationsEndpoint::Metrics => {
+                self.refresh_writer_readiness();
+                let mut body = crate::util::StackStr::<12000>::new();
+                self.render_metrics(&mut body);
+                if body.is_truncated() {
+                    self.queue_operations_error(index, 500, "metrics response exceeded capacity\n");
+                } else {
+                    self.queue_operations_response(
+                        index,
+                        200,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                        body.as_str(),
+                    );
+                }
+            }
+            OperationsEndpoint::Capacity => {
+                let mut body = crate::util::StackStr::<4096>::new();
+                self.render_capacity(&mut body);
+                if body.is_truncated() {
+                    self.queue_operations_error(
+                        index,
+                        500,
+                        "capacity response exceeded capacity\n",
+                    );
+                } else {
+                    self.queue_operations_response(index, 200, "application/json", body.as_str());
+                }
+            }
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.durability_ready && self.ownership_ready
+    }
+
+    fn refresh_writer_readiness(&mut self) {
+        self.ownership_ready = self.engine.verify_writer_ownership().is_ok();
+    }
+
+    fn render_metrics(&self, out: &mut crate::util::StackStr<12000>) {
+        use core::fmt::Write as _;
+        let snapshot = self.engine.operational_snapshot();
+        let postgres_active = self.capacity_limits.postgres_connections - self.free.len();
+        let operations_active =
+            self.capacity_limits.operations_connections - self.operations_free.len();
+        let ready = u8::from(self.ready());
+        let pending = u8::from(snapshot.checkpoint_pending);
+        let io = snapshot.block_io;
+        let _ = write!(
+            out,
+            "# HELP pos3ql_up Whether the process event loop is serving requests.\n\
+# TYPE pos3ql_up gauge\n\
+pos3ql_up 1\n\
+# HELP pos3ql_ready Whether the process can acknowledge durable work.\n\
+# TYPE pos3ql_ready gauge\n\
+pos3ql_ready {ready}\n\
+# TYPE pos3ql_lsn gauge\n\
+pos3ql_lsn {}\n\
+# TYPE pos3ql_postgres_connections gauge\n\
+pos3ql_postgres_connections {postgres_active}\n\
+# TYPE pos3ql_postgres_connection_capacity gauge\n\
+pos3ql_postgres_connection_capacity {}\n\
+# TYPE pos3ql_operational_connections gauge\n\
+pos3ql_operational_connections {operations_active}\n\
+# TYPE pos3ql_postgres_connections_accepted_total counter\n\
+pos3ql_postgres_connections_accepted_total {}\n\
+# TYPE pos3ql_postgres_connections_refused_total counter\n\
+pos3ql_postgres_connections_refused_total {}\n\
+# TYPE pos3ql_postgres_connections_closed_total counter\n\
+pos3ql_postgres_connections_closed_total {}\n\
+# TYPE pos3ql_operational_http_requests_total counter\n\
+pos3ql_operational_http_requests_total {}\n\
+# TYPE pos3ql_operational_http_errors_total counter\n\
+pos3ql_operational_http_errors_total {}\n\
+# TYPE pos3ql_wal_used_bytes gauge\n\
+pos3ql_wal_used_bytes {}\n\
+# TYPE pos3ql_core_memory_budget_bytes gauge\n\
+pos3ql_core_memory_budget_bytes {}\n\
+# TYPE pos3ql_tls_memory_budget_bytes gauge\n\
+pos3ql_tls_memory_budget_bytes {}\n\
+# TYPE pos3ql_wal_capacity_bytes gauge\n\
+pos3ql_wal_capacity_bytes {}\n\
+# TYPE pos3ql_row_heap_used_bytes gauge\n\
+pos3ql_row_heap_used_bytes {}\n\
+# TYPE pos3ql_row_heap_capacity_bytes gauge\n\
+pos3ql_row_heap_capacity_bytes {}\n\
+# TYPE pos3ql_checkpoint_pending gauge\n\
+pos3ql_checkpoint_pending {pending}\n\
+# TYPE pos3ql_block_cache_hits_total counter\n\
+pos3ql_block_cache_hits_total {}\n\
+# TYPE pos3ql_block_cache_misses_total counter\n\
+pos3ql_block_cache_misses_total {}\n\
+# TYPE pos3ql_disk_cache_hits_total counter\n\
+pos3ql_disk_cache_hits_total {}\n\
+# TYPE pos3ql_disk_cache_misses_total counter\n\
+pos3ql_disk_cache_misses_total {}\n\
+# TYPE pos3ql_block_object_gets_total counter\n\
+pos3ql_block_object_gets_total {}\n\
+# TYPE pos3ql_block_object_puts_total counter\n\
+pos3ql_block_object_puts_total {}\n\
+# TYPE pos3ql_block_object_read_bytes_total counter\n\
+pos3ql_block_object_read_bytes_total {}\n\
+# TYPE pos3ql_block_object_read_seconds_total counter\n\
+pos3ql_block_object_read_seconds_total {:.6}\n\
+# TYPE pos3ql_block_object_prefetch_saturated_total counter\n\
+pos3ql_block_object_prefetch_saturated_total {}\n",
+            snapshot.lsn,
+            self.capacity_limits.postgres_connections,
+            self.operations_metrics.postgres_accepted,
+            self.operations_metrics.postgres_refused,
+            self.operations_metrics.postgres_closed,
+            self.operations_metrics.http_requests,
+            self.operations_metrics.http_errors,
+            snapshot.wal_used_bytes,
+            self.memory_reserved_bytes,
+            self.capacity_limits.tls_budget_bytes,
+            snapshot.wal_capacity_bytes,
+            snapshot.row_heap_used_bytes,
+            snapshot.row_heap_capacity_bytes,
+            io.ram_hits,
+            io.ram_misses,
+            io.disk_hits,
+            io.disk_misses,
+            io.object_gets,
+            io.object_puts,
+            io.object_read_bytes,
+            io.object_read_micros as f64 / 1_000_000.0,
+            io.object_prefetch_saturated,
+        );
+    }
+
+    fn render_capacity(&self, out: &mut crate::util::StackStr<4096>) {
+        use core::fmt::Write as _;
+        let snapshot = self.engine.operational_snapshot();
+        let limits = self.capacity_limits;
+        let postgres_used = limits.postgres_connections - self.free.len();
+        let operations_used = limits.operations_connections - self.operations_free.len();
+        let _ = writeln!(
+            out,
+            "{{\"memory\":{{\"core_budget_bytes\":{},\"tls_budget_bytes\":{}}},\"postgres_connections\":{{\"used\":{postgres_used},\"limit\":{}}},\"operational_connections\":{{\"used\":{operations_used},\"limit\":{}}},\"wal_bytes\":{{\"used\":{},\"limit\":{}}},\"row_heap_bytes\":{{\"used\":{},\"limit\":{}}},\"cache_bytes\":{{\"memory_limit\":{},\"disk_limit\":{}}},\"temporary_spill_bytes\":{{\"limit\":{}}},\"catalog_limits\":{{\"tables\":{},\"indexes\":{},\"databases\":{},\"schemas\":{},\"roles\":{}}},\"prepared_transaction_limit\":{},\"replication_slot_limit\":{},\"subscription_limit\":{},\"object_store\":{}}}",
+            self.memory_reserved_bytes,
+            limits.tls_budget_bytes,
+            limits.postgres_connections,
+            limits.operations_connections,
+            snapshot.wal_used_bytes,
+            snapshot.wal_capacity_bytes,
+            snapshot.row_heap_used_bytes,
+            snapshot.row_heap_capacity_bytes,
+            limits.block_cache_bytes,
+            limits.disk_cache_bytes,
+            limits.temporary_spill_bytes,
+            limits.tables,
+            limits.indexes,
+            limits.databases,
+            limits.schemas,
+            limits.roles,
+            limits.prepared_transactions,
+            limits.replication_slots,
+            limits.subscriptions,
+            limits.object_store,
+        );
+    }
+
+    fn queue_operations_error(&mut self, index: usize, status: u16, message: &str) {
+        self.operations_metrics.http_requests =
+            self.operations_metrics.http_requests.saturating_add(1);
+        self.operations_metrics.http_errors = self.operations_metrics.http_errors.saturating_add(1);
+        self.queue_operations_response(index, status, "text/plain; charset=utf-8", message);
+    }
+
+    fn queue_operations_response(
+        &mut self,
+        index: usize,
+        status: u16,
+        content_type: &str,
+        body: &str,
+    ) {
+        use core::fmt::Write as _;
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            405 => "Method Not Allowed",
+            431 => "Request Header Fields Too Large",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Error",
+        };
+        let slot = &mut self.operations_slots[index];
+        slot.request.clear();
+        slot.response.clear();
+        let rendered = write!(
+            slot.response,
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        )
+        .is_ok();
+        if !rendered {
+            slot.response.clear();
+            let _ = slot.response.append(
+                b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            );
+        }
+        let fd = slot
+            .stream
+            .as_ref()
+            .expect("open operational slot")
+            .as_raw_fd();
+        let token = Self::operations_token(index);
+        if self.reactor.set_read_interest(fd, token, false).is_err()
+            || self.reactor.set_write_interest(fd, token, true).is_err()
+        {
+            self.release_operations(index);
+        }
+    }
+
+    fn write_operations(&mut self, index: usize) {
+        let written = {
+            let slot = &mut self.operations_slots[index];
+            let stream = slot.stream.as_mut().expect("open operational slot");
+            stream.write(slot.response.readable())
+        };
+        match written {
+            Ok(0) => self.release_operations(index),
+            Ok(bytes) => {
+                self.operations_slots[index].response.consume(bytes);
+                if self.operations_slots[index].response.is_empty() {
+                    self.release_operations(index);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                log_io("write operational response", &error);
+                self.release_operations(index);
+            }
+        }
+    }
+
+    fn release_operations(&mut self, index: usize) {
+        let slot = &mut self.operations_slots[index];
+        if let Some(stream) = slot.stream.take() {
+            let _ = self.reactor.deregister(stream.as_raw_fd());
+        }
+        slot.request.clear();
+        slot.response.clear();
+        self.operations_free
+            .push(index as u32)
+            .expect("released operational slot cannot exceed capacity");
+    }
+
+    fn operations_slot(&self, token: u64) -> Option<usize> {
+        let slot = token.checked_sub(OPERATIONS_TOKEN_BASE)? as usize;
+        (slot < self.operations_slots.len()).then_some(slot)
+    }
+
+    fn operations_token(slot: usize) -> u64 {
+        OPERATIONS_TOKEN_BASE + slot as u64
+    }
+
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
+    }
+
+    pub fn operations_local_addr(&self) -> Option<std::io::Result<std::net::SocketAddr>> {
+        self.operations_listener
+            .as_ref()
+            .map(TcpListener::local_addr)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationsEndpoint {
+    Live,
+    Ready,
+    Metrics,
+    Capacity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpRequestError {
+    Method,
+    Target,
+    Syntax,
+}
+
+fn parse_operations_request(
+    request: &[u8],
+) -> Result<Option<OperationsEndpoint>, HttpRequestError> {
+    if !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        return Ok(None);
+    }
+    let line_end = request
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or(HttpRequestError::Syntax)?;
+    let mut fields = request[..line_end].split(|byte| *byte == b' ');
+    let method = fields.next().ok_or(HttpRequestError::Syntax)?;
+    let target = fields.next().ok_or(HttpRequestError::Syntax)?;
+    let version = fields.next().ok_or(HttpRequestError::Syntax)?;
+    if fields.next().is_some() || !matches!(version, b"HTTP/1.0" | b"HTTP/1.1") {
+        return Err(HttpRequestError::Syntax);
+    }
+    if method != b"GET" {
+        return Err(HttpRequestError::Method);
+    }
+    match target {
+        b"/healthz" | b"/livez" => Ok(Some(OperationsEndpoint::Live)),
+        b"/readyz" => Ok(Some(OperationsEndpoint::Ready)),
+        b"/metrics" => Ok(Some(OperationsEndpoint::Metrics)),
+        b"/capacity" => Ok(Some(OperationsEndpoint::Capacity)),
+        _ => Err(HttpRequestError::Target),
     }
 }
 
@@ -2245,9 +2882,8 @@ fn bind_socket_address(address: SocketAddr) -> std::io::Result<TcpListener> {
 
 /// Allocation-free stderr write for the post-freeze shutdown path.
 fn stderr_line(msg: &[u8]) {
-    unsafe {
-        libc::write(2, msg.as_ptr().cast(), msg.len());
-    }
+    let message = core::str::from_utf8(msg).unwrap_or("invalid UTF-8 log message");
+    crate::logging::info("server", message.trim_end());
 }
 
 fn token_for(index: u32, generation: u32) -> u64 {
@@ -2261,11 +2897,11 @@ fn log_io(context: &str, e: &std::io::Error) {
     let mut message = crate::util::StackStr::<256>::new();
     let _ = writeln!(
         message,
-        "pos3ql: {context}: kind={:?} os_error={:?}",
+        "{context}: kind={:?} os_error={:?}",
         e.kind(),
         e.raw_os_error()
     );
-    stderr_line(message.as_str().as_bytes());
+    crate::logging::error("io", message.as_str().trim_end());
 }
 
 fn log_subscription_error(
@@ -2276,12 +2912,12 @@ fn log_subscription_error(
     let mut message = crate::util::StackStr::<512>::new();
     let _ = writeln!(
         message,
-        "pos3ql: subscription {} apply failed [{}]: {}",
+        "subscription {} apply failed [{}]: {}",
         name.as_ref().map_or("<unknown>", |name| name.as_str()),
         error.sqlstate,
         error.message.as_str()
     );
-    stderr_line(message.as_str().as_bytes());
+    crate::logging::error("subscription_apply", message.as_str().trim_end());
 }
 
 fn log_subscription_client_error(
@@ -2294,7 +2930,7 @@ fn log_subscription_client_error(
         crate::pg::replication_client::ClientError::Publisher(error) => {
             let _ = writeln!(
                 message,
-                "pos3ql: subscription {} publisher failed [{}]: {}",
+                "subscription {} publisher failed [{}]: {}",
                 name.as_ref().map_or("<unknown>", |name| name.as_str()),
                 error.sqlstate,
                 error.message.as_str()
@@ -2303,7 +2939,7 @@ fn log_subscription_client_error(
         crate::pg::replication_client::ClientError::Io(error) => {
             let _ = writeln!(
                 message,
-                "pos3ql: subscription {} transport failed: kind={:?} os_error={:?}",
+                "subscription {} transport failed: kind={:?} os_error={:?}",
                 name.as_ref().map_or("<unknown>", |name| name.as_str()),
                 error.kind(),
                 error.raw_os_error()
@@ -2312,13 +2948,13 @@ fn log_subscription_client_error(
         _ => {
             let _ = writeln!(
                 message,
-                "pos3ql: subscription {} protocol failed: {:?}",
+                "subscription {} protocol failed: {:?}",
                 name.as_ref().map_or("<unknown>", |name| name.as_str()),
                 error
             );
         }
     }
-    stderr_line(message.as_str().as_bytes());
+    crate::logging::error("subscription_client", message.as_str().trim_end());
 }
 
 #[cfg(test)]
@@ -2327,7 +2963,9 @@ mod tests {
     use std::net::TcpStream;
 
     use super::{
-        SubscriptionBinding, SubscriptionBootstrapStage, SubscriptionBootstrapWork, bind_listener,
+        HttpRequestError, OPERATIONS_REQUEST_BYTES, OPERATIONS_RESPONSE_BYTES, OperationsEndpoint,
+        OperationsSlot, Server, SubscriptionBinding, SubscriptionBootstrapStage,
+        SubscriptionBootstrapWork, bind_listener, parse_operations_request,
     };
 
     fn discovery_row<'a>(
@@ -2504,5 +3142,59 @@ mod tests {
 
         let replacement = bind_listener(&address.to_string()).unwrap();
         assert_eq!(replacement.local_addr().unwrap(), address);
+    }
+
+    #[test]
+    fn operational_http_parser_waits_for_headers_and_accepts_exact_get_targets() {
+        assert_eq!(
+            parse_operations_request(b"GET /readyz HTTP/1.1\r\n"),
+            Ok(None)
+        );
+        for (target, endpoint) in [
+            ("/healthz", OperationsEndpoint::Live),
+            ("/livez", OperationsEndpoint::Live),
+            ("/readyz", OperationsEndpoint::Ready),
+            ("/metrics", OperationsEndpoint::Metrics),
+            ("/capacity", OperationsEndpoint::Capacity),
+        ] {
+            let request = format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            assert_eq!(
+                parse_operations_request(request.as_bytes()),
+                Ok(Some(endpoint))
+            );
+        }
+    }
+
+    #[test]
+    fn operational_http_parser_rejects_unsupported_requests_loudly() {
+        assert_eq!(
+            parse_operations_request(b"POST /readyz HTTP/1.1\r\n\r\n"),
+            Err(HttpRequestError::Method)
+        );
+        assert_eq!(
+            parse_operations_request(b"GET /unknown HTTP/1.1\r\n\r\n"),
+            Err(HttpRequestError::Target)
+        );
+        assert_eq!(
+            parse_operations_request(b"GET /readyz HTTP/2\r\n\r\n"),
+            Err(HttpRequestError::Syntax)
+        );
+    }
+
+    #[test]
+    fn operational_listener_memory_is_charged_exactly() {
+        let disabled = crate::config::Config::default_dev();
+        let mut enabled = disabled.clone();
+        enabled.operations_listen_addr = "127.0.0.1:0".to_string();
+        enabled.operations_max_connections = 7;
+        let expected = crate::io::reactor::Reactor::budget_bytes(8)
+            + 7 * (core::mem::size_of::<OperationsSlot>()
+                + core::mem::size_of::<u32>()
+                + OPERATIONS_REQUEST_BYTES
+                + OPERATIONS_RESPONSE_BYTES);
+        assert_eq!(
+            Server::budget_bytes(&enabled) - Server::budget_bytes(&disabled),
+            expected
+        );
     }
 }

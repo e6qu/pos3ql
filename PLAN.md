@@ -265,18 +265,19 @@ and publication order through explicit backpressure. Demonstrate useful
 one-through-N core scaling for read-only, write-heavy, and mixed workloads
 without post-startup allocation or weaker durability.
 
-The global execution arena is now a startup-bounded set selected by stable
-connection identity. `query_workspace_slots` charges every `work_arena_bytes`
+The global execution arena and mutable DML row-selection scratch are now
+startup-bounded sets selected together by stable connection identity.
+`query_workspace_slots` charges every `work_arena_bytes` and `table_rows`
 reservation in the memory plan, rejects zero or more slots than connection
 capacity, and exposes the configured count through metrics and capacity JSON.
 Streamed COPY transition rows are connection private, and logical subscription
 bootstrap workers own the same fixed state independently. Interleaved client
 streams therefore cannot clear or mix the row set observed by statement-level
 transition triggers; every buffer is charged from `txn_rows` at startup.
-The current reactor still serializes statement execution. Moving execution
-onto those private slots still requires worker-private ordinary DML scratch and
-must retain the existing transaction retry, object I/O parking, group
-publication, and response barriers before any scaling claim.
+Logical subscription apply and bootstrap COPY execution use the worker's own
+arena and DML scratch rather than a client workspace. The current reactor still
+serializes statement execution. Parallel dispatch must retain transaction
+retry, object I/O parking, group publication, and response barriers.
 
 ### Performance qualification
 

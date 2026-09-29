@@ -507,6 +507,12 @@ buffer, with direct engine and real-driver interleaving regressions.
 Coverage also exposed a raw-wire catalog probe whose single oversized request
 could exceed the socket response deadline under instrumentation. Its object
 setup, comments, reads, and cleanup now use bounded protocol exchanges.
+The ordinary DML workspace audit found the mutable physical-row selection
+buffer was still engine global. Client execution now selects an independently
+allocated, exactly charged buffer with the same stable mapping as its query
+arena; repeated and colliding identities retain the documented slot mapping.
+Logical subscription apply and bootstrap COPY use their worker-owned arena and
+buffer.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

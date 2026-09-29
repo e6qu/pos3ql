@@ -34,8 +34,8 @@ pub struct Config {
     pub data_dir: String,
     /// Fixed number of client connection slots.
     pub max_connections: u32,
-    /// Startup-reserved query execution workspaces. Connections are mapped
-    /// deterministically onto these slots; one is the current serialized
+    /// Startup-reserved query arenas and DML scratch buffers. Connections are
+    /// mapped deterministically onto these slots; one is the current serialized
     /// execution topology, while larger values reserve private state for the
     /// configured slot range.
     pub query_workspace_slots: usize,

@@ -329,13 +329,15 @@ impl SubscriptionApply {
         let setup = engine.subscription_copy_setup(schema, table, columns, self.txn.txid)?;
         self.copy_transition_scratch.clear();
         self.trigger_response.clear();
+        self.trigger_scratch.clear();
         let mut responder = Responder::new(&mut self.trigger_response);
-        engine.copy_start(
+        engine.subscription_copy_start(
             &setup,
             &mut self.txn,
             self.guc.seq_session(),
             &self.arena,
             &mut responder,
+            &mut self.trigger_scratch,
         )?;
         Ok(setup)
     }
@@ -353,11 +355,12 @@ impl SubscriptionApply {
             .copy_row_line(
                 setup,
                 line,
-                crate::sql::CopyRowContext::new(
+                crate::sql::CopyRowContext::for_subscription_worker(
                     &mut self.txn,
                     self.guc.seq_session(),
                     &self.arena,
                     &mut responder,
+                    &mut self.trigger_scratch,
                     &mut self.copy_transition_scratch,
                 ),
             )
@@ -379,11 +382,12 @@ impl SubscriptionApply {
             .copy_row_binary(
                 setup,
                 row,
-                crate::sql::CopyRowContext::new(
+                crate::sql::CopyRowContext::for_subscription_worker(
                     &mut self.txn,
                     self.guc.seq_session(),
                     &self.arena,
                     &mut responder,
+                    &mut self.trigger_scratch,
                     &mut self.copy_transition_scratch,
                 ),
             )
@@ -399,12 +403,16 @@ impl SubscriptionApply {
     ) -> Result<(), SqlError> {
         self.trigger_response.clear();
         let mut responder = Responder::new(&mut self.trigger_response);
-        let result = engine.copy_finish(
+        let result = engine.subscription_copy_finish(
             setup,
             &mut self.txn,
             &self.guc,
             &mut responder,
-            &self.copy_transition_scratch,
+            crate::sql::SubscriptionCopyWorkspace::new(
+                &mut self.arena,
+                &mut self.trigger_scratch,
+                &self.copy_transition_scratch,
+            ),
         );
         self.copy_transition_scratch.clear();
         result

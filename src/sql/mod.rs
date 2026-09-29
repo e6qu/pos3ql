@@ -205,6 +205,47 @@ struct QueryWorkspaces {
     active: usize,
 }
 
+struct DmlWorkspaces {
+    slots: FixedVec<exec::DmlScratch>,
+    active: usize,
+}
+
+impl DmlWorkspaces {
+    fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        let mut slots =
+            FixedVec::new(budget, "query_dml_workspaces", config.query_workspace_slots)?;
+        for _ in 0..config.query_workspace_slots {
+            slots
+                .push(FixedVec::new(
+                    budget,
+                    "query_dml_scratch",
+                    config.table_rows,
+                )?)
+                .expect("sized to query_workspace_slots");
+        }
+        Ok(Self { slots, active: 0 })
+    }
+
+    fn select_for_connection(&mut self, connection: i32) {
+        let connection = usize::try_from(connection).unwrap_or(0);
+        self.active = connection % self.slots.len();
+    }
+}
+
+impl core::ops::Deref for DmlWorkspaces {
+    type Target = exec::DmlScratch;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slots[self.active]
+    }
+}
+
+impl core::ops::DerefMut for DmlWorkspaces {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slots[self.active]
+    }
+}
+
 impl QueryWorkspaces {
     fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let mut slots = FixedVec::new(budget, "query_workspaces", config.query_workspace_slots)?;
@@ -261,10 +302,10 @@ pub struct Engine {
     wal_seg_buf: Vec<u8>,
     /// Scratch for sorting SST entries at checkpoint.
     scratch: FixedVec<(u64, RowHome)>,
-    /// Mutable physical-row identities selected by DML. Kept separate from
-    /// checkpoint sort entries because a logical partitioned relation needs
-    /// its leaf owner alongside the row identifier.
-    dml_scratch: exec::DmlScratch,
+    /// Startup-bounded slot-private physical-row identities selected by DML.
+    /// Kept separate from checkpoint sort entries because a logical
+    /// partitioned relation needs its leaf owner alongside the row identifier.
+    dml_scratch: DmlWorkspaces,
     /// Scratch for heap compaction: every live row image across tables.
     compact_scratch: FixedVec<(u32, u64, crate::storage::RowHeapImage, RowLoc)>,
     /// Startup-bounded slot-private execution arenas. The reactor still
@@ -336,7 +377,33 @@ pub struct CopyRowContext<'a, 'response> {
     seq_session: &'a guc::SeqSession,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
+    dml_scratch: CopyDmlScratch<'a>,
     transition_rows: &'a mut exec::DmlScratch,
+}
+
+enum CopyDmlScratch<'a> {
+    ActiveWorkspace,
+    SubscriptionWorker(&'a mut exec::DmlScratch),
+}
+
+pub(crate) struct SubscriptionCopyWorkspace<'a> {
+    arena: &'a mut Arena,
+    dml_scratch: &'a mut exec::DmlScratch,
+    transition_rows: &'a exec::DmlScratch,
+}
+
+impl<'a> SubscriptionCopyWorkspace<'a> {
+    pub(crate) fn new(
+        arena: &'a mut Arena,
+        dml_scratch: &'a mut exec::DmlScratch,
+        transition_rows: &'a exec::DmlScratch,
+    ) -> Self {
+        Self {
+            arena,
+            dml_scratch,
+            transition_rows,
+        }
+    }
 }
 
 impl<'a, 'response> CopyRowContext<'a, 'response> {
@@ -352,6 +419,25 @@ impl<'a, 'response> CopyRowContext<'a, 'response> {
             seq_session,
             arena,
             responder,
+            dml_scratch: CopyDmlScratch::ActiveWorkspace,
+            transition_rows,
+        }
+    }
+
+    pub(crate) fn for_subscription_worker(
+        txn: &'a mut TxnState,
+        seq_session: &'a guc::SeqSession,
+        arena: &'a Arena,
+        responder: &'a mut Responder<'response>,
+        dml_scratch: &'a mut exec::DmlScratch,
+        transition_rows: &'a mut exec::DmlScratch,
+    ) -> Self {
+        Self {
+            txn,
+            seq_session,
+            arena,
+            responder,
+            dml_scratch: CopyDmlScratch::SubscriptionWorker(dml_scratch),
             transition_rows,
         }
     }
@@ -2114,6 +2200,7 @@ impl Engine {
     /// outside the ordinary statement execution methods.
     pub(crate) fn select_query_workspace(&mut self, connection: i32) {
         self.work.select_for_connection(connection);
+        self.dml_scratch.select_for_connection(connection);
     }
 
     pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {
@@ -2884,7 +2971,13 @@ impl Engine {
     pub fn extra_budget_bytes(config: &Config) -> usize {
         Storage::extra_budget_bytes(config)
             + exec::record_shape_pool_bytes(config.max_composites)
-            + config.table_rows * size_of::<exec::PhysicalRow>()
+            + config.query_workspace_slots.saturating_mul(
+                size_of::<exec::DmlScratch>().saturating_add(
+                    config
+                        .table_rows
+                        .saturating_mul(size_of::<exec::PhysicalRow>()),
+                ),
+            )
             + crate::storage::row_heap_image_capacity(config).saturating_mul(size_of::<(
                 u32,
                 u64,
@@ -3186,7 +3279,7 @@ impl Engine {
             wal_upload: config.wal_upload && config.object_store_on,
             wal_seg_buf: Vec::with_capacity(upload_buf),
             scratch: FixedVec::new(budget, "scan_scratch", config.table_rows)?,
-            dml_scratch: FixedVec::new(budget, "dml_scratch", config.table_rows)?,
+            dml_scratch: DmlWorkspaces::new(config, budget)?,
             compact_scratch: FixedVec::new(
                 budget,
                 "compact_scratch",
@@ -6615,7 +6708,7 @@ impl Engine {
             arena,
             guc.seq_session(),
             responder,
-            &mut self.dml_scratch,
+            &mut *self.dml_scratch,
             boundary,
         )
     }
@@ -8465,6 +8558,10 @@ impl Engine {
         line: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let scratch = match context.dml_scratch {
+            CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
+            CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
+        };
         exec::copy_row(
             &mut self.storage,
             context.txn,
@@ -8473,7 +8570,7 @@ impl Engine {
             line,
             context.arena,
             context.responder,
-            &mut self.dml_scratch,
+            scratch,
             context.transition_rows,
         )
     }
@@ -8496,6 +8593,10 @@ impl Engine {
         row: &[u8],
         context: CopyRowContext<'_, '_>,
     ) -> Result<exec::CopyRowOutcome, SqlError> {
+        let scratch = match context.dml_scratch {
+            CopyDmlScratch::ActiveWorkspace => &mut *self.dml_scratch,
+            CopyDmlScratch::SubscriptionWorker(scratch) => scratch,
+        };
         exec::copy_row_binary(
             &mut self.storage,
             context.txn,
@@ -8504,7 +8605,7 @@ impl Engine {
             row,
             context.arena,
             context.responder,
-            &mut self.dml_scratch,
+            scratch,
             context.transition_rows,
         )
     }
@@ -8517,15 +8618,47 @@ impl Engine {
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
-        exec::copy_statement_begin(
+        Self::copy_start_with_scratch(
             &mut self.storage,
-            txn,
             setup,
+            txn,
             seq_session,
             arena,
             responder,
             &mut self.dml_scratch,
         )
+    }
+
+    pub(crate) fn subscription_copy_start(
+        &mut self,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        seq_session: &guc::SeqSession,
+        arena: &Arena,
+        responder: &mut Responder,
+        scratch: &mut exec::DmlScratch,
+    ) -> Result<(), SqlError> {
+        Self::copy_start_with_scratch(
+            &mut self.storage,
+            setup,
+            txn,
+            seq_session,
+            arena,
+            responder,
+            scratch,
+        )
+    }
+
+    fn copy_start_with_scratch(
+        storage: &mut Storage,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        seq_session: &guc::SeqSession,
+        arena: &Arena,
+        responder: &mut Responder,
+        scratch: &mut exec::DmlScratch,
+    ) -> Result<(), SqlError> {
+        exec::copy_statement_begin(storage, txn, setup, seq_session, arena, responder, scratch)
     }
 
     pub(crate) fn subscription_copy_setup(
@@ -8550,30 +8683,82 @@ impl Engine {
         inserted: &exec::DmlScratch,
     ) -> Result<(), SqlError> {
         self.work.reset();
-        exec::copy_statement_end(
+        Self::copy_finish_with_scratch(
             &mut self.storage,
-            txn,
-            setup,
-            guc.seq_session(),
             &self.work,
+            setup,
+            txn,
+            guc,
             responder,
             &mut self.dml_scratch,
             inserted,
         )?;
-        exec::constraints::validate_deferred_constraints(&self.storage, txn, true, &self.work)?;
-        exec::fire_constraint_triggers(
-            &mut self.storage,
-            txn,
-            &self.work,
-            guc.seq_session(),
-            responder,
-            &mut self.dml_scratch,
-            exec::TriggerQueueBoundary::Statement,
-        )?;
-        txn.compact_completed_constraints();
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
+        Ok(())
+    }
+
+    pub(crate) fn subscription_copy_finish(
+        &mut self,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+        workspace: SubscriptionCopyWorkspace<'_>,
+    ) -> Result<(), SqlError> {
+        workspace.arena.reset();
+        Self::copy_finish_with_scratch(
+            &mut self.storage,
+            workspace.arena,
+            setup,
+            txn,
+            guc,
+            responder,
+            workspace.dml_scratch,
+            workspace.transition_rows,
+        )?;
+        if txn.mode == TxnMode::Implicit {
+            return self.commit_txn(txn, guc);
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "COPY completion binds its statement state and caller-owned fixed scratch"
+    )]
+    fn copy_finish_with_scratch(
+        storage: &mut Storage,
+        arena: &Arena,
+        setup: &exec::CopySetup,
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+        scratch: &mut exec::DmlScratch,
+        inserted: &exec::DmlScratch,
+    ) -> Result<(), SqlError> {
+        exec::copy_statement_end(
+            storage,
+            txn,
+            setup,
+            guc.seq_session(),
+            arena,
+            responder,
+            scratch,
+            inserted,
+        )?;
+        exec::constraints::validate_deferred_constraints(storage, txn, true, arena)?;
+        exec::fire_constraint_triggers(
+            storage,
+            txn,
+            arena,
+            guc.seq_session(),
+            responder,
+            scratch,
+            exec::TriggerQueueBoundary::Statement,
+        )?;
+        txn.compact_completed_constraints();
         Ok(())
     }
 

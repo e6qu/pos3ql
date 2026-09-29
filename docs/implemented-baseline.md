@@ -92,10 +92,12 @@ active production roadmap is [PLAN.md](../PLAN.md).
   writer-fence ownership, and a resumed primary rejects durable publication.
   Promotion retags both mutable roots with the new process incarnation, which
   also fences providers whose ETags are derived from object content.
-- Query execution work arenas are startup-bounded by
-  `query_workspace_slots`, charged exactly in the fixed memory plan, selected
-  by stable connection identity, and reported by the operational listener.
-  Statement execution remains serialized while worker dispatch is developed.
+- Query execution arenas and ordinary DML row-selection scratch are
+  startup-bounded by `query_workspace_slots`, charged exactly in the fixed
+  memory plan, selected together by stable connection identity, and reported
+  by the operational listener. Statement execution remains serialized while
+  worker dispatch is developed. Logical subscription apply and bootstrap COPY
+  use the subscription worker's fixed arena and DML scratch independently.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

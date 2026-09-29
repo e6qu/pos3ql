@@ -515,7 +515,10 @@ mapping with a startup-bounded owner and FIFO-waiter roster. Release,
 disconnect, and reactor-interest failure hand the exact slot to the oldest live
 waiter without allowing two owners to alias it.
 Logical subscription apply and bootstrap COPY use their worker-owned arena and
-buffer.
+buffer. The backend-identity audit also removed Storage's shared mutable
+connection selector. Each leased workspace retains its connection identity and
+publishes it in fixed thread-local execution context; isolation and exact
+memory accounting are covered across workspace and operating-system threads.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -272,17 +272,22 @@ reservation in the memory plan, rejects zero or more slots than connection
 capacity, and exposes configured, active, and waiting counts through metrics
 and capacity JSON. Lease ownership and its FIFO wait roster are themselves
 charged exactly at startup; disconnect and failed-interest paths hand a slot to
-the oldest live waiter without aliasing its arena or DML scratch.
+the oldest live waiter without aliasing its arena or DML scratch. Backend
+identity now belongs to the leased workspace and is republished through fixed
+thread-local execution context when the workspace is selected. Storage no
+longer carries a shared mutable connection selector, so temporary schemas,
+advisory locks, backend statistics, signals, and LISTEN state cannot inherit
+another worker's backend identity.
 Streamed COPY transition rows are connection private, and logical subscription
 bootstrap workers own the same fixed state independently. Interleaved client
 streams therefore cannot clear or mix the row set observed by statement-level
 transition triggers; every buffer is charged from `txn_rows` at startup.
 Logical subscription apply and bootstrap COPY execution use the worker's own
 arena and DML scratch rather than a client workspace. The synchronous reactor
-currently releases each lease when its dispatch call returns. Parallel
-dispatch must retain a lease through worker completion while preserving
-transaction retry, object I/O parking, group publication, and response
-barriers.
+currently releases each lease when its dispatch call returns. Database
+selection is still engine global. Parallel dispatch must make it worker private
+and retain a lease through worker completion while preserving transaction
+retry, object I/O parking, group publication, and response barriers.
 
 ### Performance qualification
 

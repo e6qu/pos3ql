@@ -266,18 +266,23 @@ one-through-N core scaling for read-only, write-heavy, and mixed workloads
 without post-startup allocation or weaker durability.
 
 The global execution arena and mutable DML row-selection scratch are now
-startup-bounded sets selected together by stable connection identity.
+startup-bounded sets selected together through exclusive dispatcher leases.
 `query_workspace_slots` charges every `work_arena_bytes` and `table_rows`
 reservation in the memory plan, rejects zero or more slots than connection
-capacity, and exposes the configured count through metrics and capacity JSON.
+capacity, and exposes configured, active, and waiting counts through metrics
+and capacity JSON. Lease ownership and its FIFO wait roster are themselves
+charged exactly at startup; disconnect and failed-interest paths hand a slot to
+the oldest live waiter without aliasing its arena or DML scratch.
 Streamed COPY transition rows are connection private, and logical subscription
 bootstrap workers own the same fixed state independently. Interleaved client
 streams therefore cannot clear or mix the row set observed by statement-level
 transition triggers; every buffer is charged from `txn_rows` at startup.
 Logical subscription apply and bootstrap COPY execution use the worker's own
-arena and DML scratch rather than a client workspace. The current reactor still
-serializes statement execution. Parallel dispatch must retain transaction
-retry, object I/O parking, group publication, and response barriers.
+arena and DML scratch rather than a client workspace. The synchronous reactor
+currently releases each lease when its dispatch call returns. Parallel
+dispatch must retain a lease through worker completion while preserving
+transaction retry, object I/O parking, group publication, and response
+barriers.
 
 ### Performance qualification
 

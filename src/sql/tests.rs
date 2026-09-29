@@ -25,25 +25,25 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     let mut workspaces = QueryWorkspaces::new(&config, &mut budget).unwrap();
     assert_eq!(budget.remaining(), 0);
 
-    workspaces.select_for_connection(1);
+    workspaces.select(QueryWorkspaceId::from_index(0));
     workspaces.alloc_slice_with(7, |_| 1u8).unwrap();
     let first_used = workspaces.used();
     assert!(first_used >= 7);
 
-    workspaces.select_for_connection(2);
+    workspaces.select(QueryWorkspaceId::from_index(1));
     assert_eq!(workspaces.used(), 0);
     workspaces.alloc_slice_with(19, |_| 2u8).unwrap();
 
-    workspaces.select_for_connection(1);
+    workspaces.select(QueryWorkspaceId::from_index(0));
     assert_eq!(workspaces.used(), first_used);
-    workspaces.select_for_connection(4);
-    assert_eq!(workspaces.used(), first_used);
+    workspaces.select(QueryWorkspaceId::from_index(2));
+    assert_eq!(workspaces.used(), 0);
 
     let mut budget = Budget::new(config.query_workspace_slots * dml_workspace_bytes);
     let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget).unwrap();
     assert_eq!(budget.remaining(), 0);
 
-    dml_workspaces.select_for_connection(1);
+    dml_workspaces.select(QueryWorkspaceId::from_index(0));
     dml_workspaces
         .push(exec::PhysicalRow::Local {
             table_index: 1,
@@ -58,12 +58,12 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     assert_eq!(dml_workspaces.len(), 1);
     assert_eq!(dml_workspaces.capacity(), config.table_rows);
 
-    dml_workspaces.select_for_connection(2);
+    dml_workspaces.select(QueryWorkspaceId::from_index(1));
     assert!(dml_workspaces.is_empty());
-    dml_workspaces.select_for_connection(1);
+    dml_workspaces.select(QueryWorkspaceId::from_index(0));
     assert_eq!(dml_workspaces.len(), 1);
-    dml_workspaces.select_for_connection(4);
-    assert_eq!(dml_workspaces.len(), 1);
+    dml_workspaces.select(QueryWorkspaceId::from_index(2));
+    assert!(dml_workspaces.is_empty());
 }
 
 #[test]

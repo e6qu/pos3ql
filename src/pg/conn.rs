@@ -3239,7 +3239,7 @@ impl Conn {
             let result = if paged {
                 portal.result.clear();
                 let mut responder = Responder::for_execute(&mut portal.result, rfmt);
-                engine.execute_extended(
+                engine.execute_extended_selected(
                     text,
                     &self.arena,
                     params,
@@ -3254,7 +3254,7 @@ impl Conn {
                 )
             } else {
                 let mut responder = Responder::for_execute(&mut self.send, rfmt);
-                engine.execute_extended(
+                engine.execute_extended_selected(
                     text,
                     &self.arena,
                     params,
@@ -3495,7 +3495,7 @@ impl Conn {
                     responder = responder.with_flush(fd);
                 }
             }
-            engine.execute_simple_from(
+            engine.execute_simple_from_selected(
                 text,
                 self.resume_statement,
                 &self.arena,

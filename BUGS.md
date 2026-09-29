@@ -496,8 +496,8 @@ The release-package scenario pauses a primary, automatically starts a
 candidate, verifies empty-cache recovery, resumes the old connected session,
 and observes SQLSTATE `40001` before clean shutdown.
 The query-workspace audit found no external blocker. The former single arena is
-now an exact startup-sized slot set with stable connection selection; zero and
-over-connection configurations fail before startup. Allocation-free slot
+now an exact startup-sized slot set with exclusive dispatcher selection; zero
+and over-connection configurations fail before startup. Allocation-free slot
 isolation, memory-plan charging, and operational capacity reporting are covered.
 The COPY concurrency audit found no external blocker. Streamed statement
 transition rows formerly lived in one engine-global buffer, so interleaved
@@ -509,8 +509,11 @@ could exceed the socket response deadline under instrumentation. Its object
 setup, comments, reads, and cleanup now use bounded protocol exchanges.
 The ordinary DML workspace audit found the mutable physical-row selection
 buffer was still engine global. Client execution now selects an independently
-allocated, exactly charged buffer with the same stable mapping as its query
-arena; repeated and colliding identities retain the documented slot mapping.
+allocated, exactly charged buffer with the same exclusive lease as its query
+arena. The follow-up dispatch audit replaced collision-prone connection modulo
+mapping with a startup-bounded owner and FIFO-waiter roster. Release,
+disconnect, and reactor-interest failure hand the exact slot to the oldest live
+waiter without allowing two owners to alias it.
 Logical subscription apply and bootstrap COPY use their worker-owned arena and
 buffer.
 

@@ -24,8 +24,8 @@ runtime memory.
 | `/livez` or `/healthz` | 200 | The event loop accepted and answered the request. |
 | `/readyz` | 200 | Startup completed, durable progress is healthy, and the process still owns the writer fence. |
 | `/readyz` | 503 | WAL or checkpoint progress failed, the object store is unavailable, or another process owns the writer fence. |
-| `/metrics` | 200 | Prometheus text metrics for current readiness, connections, query workspace capacity, WAL, row memory, checkpoint pressure, cache traffic, and immutable-block object requests. |
-| `/capacity` | 200 | JSON containing current use and startup limits for memory, connections, query workspaces, WAL, the row heap, caches, catalogs, prepared transactions, replication, and whether credential rotation is configured. |
+| `/metrics` | 200 | Prometheus text metrics for current readiness, connections, query workspace capacity, active leases and waiters, WAL, row memory, checkpoint pressure, cache traffic, and immutable-block object requests. |
+| `/capacity` | 200 | JSON containing current use, waiting work and startup limits for memory, connections, query workspaces, WAL, the row heap, caches, catalogs, prepared transactions, replication, and whether credential rotation is configured. |
 
 Only `GET` with HTTP/1.0 or HTTP/1.1 is accepted. Unknown paths and methods
 fail explicitly. Responses disable caching and close the connection.

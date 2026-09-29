@@ -205,6 +205,22 @@ struct QueryWorkspaces {
     active: usize,
 }
 
+/// Index of one startup-reserved query workspace. The server leases these
+/// identities explicitly so two dispatch workers cannot select the same arena
+/// or DML scratch through a coincidental connection-id mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QueryWorkspaceId(usize);
+
+impl QueryWorkspaceId {
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+}
+
 struct DmlWorkspaces {
     slots: FixedVec<exec::DmlScratch>,
     active: usize,
@@ -226,9 +242,9 @@ impl DmlWorkspaces {
         Ok(Self { slots, active: 0 })
     }
 
-    fn select_for_connection(&mut self, connection: i32) {
-        let connection = usize::try_from(connection).unwrap_or(0);
-        self.active = connection % self.slots.len();
+    fn select(&mut self, workspace: QueryWorkspaceId) {
+        assert!(workspace.index() < self.slots.len());
+        self.active = workspace.index();
     }
 }
 
@@ -261,9 +277,14 @@ impl QueryWorkspaces {
         Ok(Self { slots, active: 0 })
     }
 
-    fn select_for_connection(&mut self, connection: i32) {
+    fn select(&mut self, workspace: QueryWorkspaceId) {
+        assert!(workspace.index() < self.slots.len());
+        self.active = workspace.index();
+    }
+
+    fn for_connection(&self, connection: i32) -> QueryWorkspaceId {
         let connection = usize::try_from(connection).unwrap_or(0);
-        self.active = connection % self.slots.len();
+        QueryWorkspaceId(connection % self.slots.len())
     }
 }
 
@@ -2195,12 +2216,10 @@ fn cursor_result_too_large() -> SqlError {
 }
 
 impl Engine {
-    /// Selects the startup-reserved query workspace assigned to one client.
-    /// Protocol continuations such as COPY and connection teardown enter
-    /// outside the ordinary statement execution methods.
-    pub(crate) fn select_query_workspace(&mut self, connection: i32) {
-        self.work.select_for_connection(connection);
-        self.dml_scratch.select_for_connection(connection);
+    /// Selects one exclusively leased startup-reserved query workspace.
+    pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
+        self.work.select(workspace);
+        self.dml_scratch.select(workspace);
     }
 
     pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {
@@ -8967,7 +8986,36 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
-        self.select_query_workspace(conn_id);
+        let workspace = self.work.for_connection(conn_id);
+        self.select_query_workspace(workspace);
+        self.execute_simple_from_selected(
+            text,
+            resume_statement,
+            arena,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+            conn_id,
+            lock_timeout_expired,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_simple_from_selected(
+        &mut self,
+        text: &str,
+        resume_statement: usize,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+        conn_id: i32,
+        lock_timeout_expired: bool,
+    ) -> Result<ExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
         self.storage.set_current_connection_id(conn_id);
         let mut parser = match Parser::new(text, arena) {
@@ -9195,8 +9243,39 @@ impl Engine {
         conn_id: i32,
         lock_timeout_expired: bool,
     ) -> Result<ExtendedExecutionStatus, WireFull> {
+        let workspace = self.work.for_connection(conn_id);
+        self.select_query_workspace(workspace);
+        self.execute_extended_selected(
+            text,
+            arena,
+            params,
+            parameter_type_oids,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            responder,
+            conn_id,
+            lock_timeout_expired,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_extended_selected(
+        &mut self,
+        text: &str,
+        arena: &Arena,
+        params: &[Datum],
+        parameter_type_oids: &[i32],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+        conn_id: i32,
+        lock_timeout_expired: bool,
+    ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
-        self.select_query_workspace(conn_id);
         self.current_conn_id = conn_id;
         self.storage.set_current_connection_id(conn_id);
         let mut parser = match Parser::new(text, arena) {

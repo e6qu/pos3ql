@@ -522,6 +522,10 @@ memory accounting are covered across workspace and operating-system threads.
 The database-selector audit extended that boundary through catalog access and
 WAL staging. It also found that a database without its required public schema
 could leave a failed selection active; failure now restores the prior database.
+The workspace-selector audit found that the arena and DML sets still carried
+one shared active index after their session identities became worker private.
+Both now resolve one typed thread-local lease identity; slot and operating-system
+thread isolation cover arena, DML scratch, backend, and database selection.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

@@ -79,6 +79,8 @@ std::thread_local! {
     static EXECUTION_CONNECTION_ID: core::cell::Cell<i32> = const { core::cell::Cell::new(0) };
     static EXECUTION_DATABASE_OID: core::cell::Cell<crate::storage::DatabaseOid> =
         const { core::cell::Cell::new(crate::storage::DatabaseOid::POSTGRES) };
+    static EXECUTION_QUERY_WORKSPACE: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
 }
 
 pub(crate) fn set_execution_connection_id(connection_id: i32) {
@@ -227,7 +229,6 @@ pub(crate) struct ReplicationEmission<'a> {
 
 struct QueryWorkspaces {
     slots: FixedVec<QueryWorkspace>,
-    active: usize,
 }
 
 struct QueryWorkspace {
@@ -252,9 +253,16 @@ impl QueryWorkspaceId {
     }
 }
 
+fn set_execution_query_workspace(workspace: QueryWorkspaceId) {
+    EXECUTION_QUERY_WORKSPACE.with(|active| active.set(workspace.index()));
+}
+
+fn execution_query_workspace() -> QueryWorkspaceId {
+    QueryWorkspaceId::from_index(EXECUTION_QUERY_WORKSPACE.with(core::cell::Cell::get))
+}
+
 struct DmlWorkspaces {
     slots: FixedVec<exec::DmlScratch>,
-    active: usize,
 }
 
 impl DmlWorkspaces {
@@ -270,12 +278,7 @@ impl DmlWorkspaces {
                 )?)
                 .expect("sized to query_workspace_slots");
         }
-        Ok(Self { slots, active: 0 })
-    }
-
-    fn select(&mut self, workspace: QueryWorkspaceId) {
-        assert!(workspace.index() < self.slots.len());
-        self.active = workspace.index();
+        Ok(Self { slots })
     }
 }
 
@@ -283,18 +286,19 @@ impl core::ops::Deref for DmlWorkspaces {
     type Target = exec::DmlScratch;
 
     fn deref(&self) -> &Self::Target {
-        &self.slots[self.active]
+        &self.slots[execution_query_workspace().index()]
     }
 }
 
 impl core::ops::DerefMut for DmlWorkspaces {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.slots[self.active]
+        &mut self.slots[execution_query_workspace().index()]
     }
 }
 
 impl QueryWorkspaces {
     fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        set_execution_query_workspace(QueryWorkspaceId::from_index(0));
         let mut slots = FixedVec::new(budget, "query_workspaces", config.query_workspace_slots)?;
         for _ in 0..config.query_workspace_slots {
             slots
@@ -305,14 +309,14 @@ impl QueryWorkspaces {
                 })
                 .expect("sized to query_workspace_slots");
         }
-        Ok(Self { slots, active: 0 })
+        Ok(Self { slots })
     }
 
-    fn select(&mut self, workspace: QueryWorkspaceId) {
+    fn select(&self, workspace: QueryWorkspaceId) {
         assert!(workspace.index() < self.slots.len());
-        self.active = workspace.index();
-        set_execution_connection_id(self.slots[self.active].connection_id);
-        set_execution_database_oid(self.slots[self.active].database_oid);
+        set_execution_query_workspace(workspace);
+        set_execution_connection_id(self.slots[workspace.index()].connection_id);
+        set_execution_database_oid(self.slots[workspace.index()].database_oid);
     }
 
     fn for_connection(&self, connection: i32) -> QueryWorkspaceId {
@@ -321,21 +325,21 @@ impl QueryWorkspaces {
     }
 
     fn bind_connection(&mut self, connection_id: i32) {
-        self.slots[self.active].connection_id = connection_id;
+        self.slots[execution_query_workspace().index()].connection_id = connection_id;
         set_execution_connection_id(connection_id);
     }
 
     fn connection_id(&self) -> i32 {
-        self.slots[self.active].connection_id
+        self.slots[execution_query_workspace().index()].connection_id
     }
 
     fn bind_database_oid(&mut self, database: crate::storage::DatabaseOid) {
-        self.slots[self.active].database_oid = database;
+        self.slots[execution_query_workspace().index()].database_oid = database;
         set_execution_database_oid(database);
     }
 
     fn database_oid(&self) -> crate::storage::DatabaseOid {
-        self.slots[self.active].database_oid
+        self.slots[execution_query_workspace().index()].database_oid
     }
 }
 
@@ -343,13 +347,13 @@ impl core::ops::Deref for QueryWorkspaces {
     type Target = Arena;
 
     fn deref(&self) -> &Self::Target {
-        &self.slots[self.active].arena
+        &self.slots[execution_query_workspace().index()].arena
     }
 }
 
 impl core::ops::DerefMut for QueryWorkspaces {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.slots[self.active].arena
+        &mut self.slots[execution_query_workspace().index()].arena
     }
 }
 
@@ -2266,7 +2270,6 @@ impl Engine {
     /// Selects one exclusively leased startup-reserved query workspace.
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
         self.work.select(workspace);
-        self.dml_scratch.select(workspace);
         self.wal.select_database(self.work.database_oid());
     }
 

@@ -100,9 +100,10 @@ active production roadmap is [PLAN.md](../PLAN.md).
   waiters. Each workspace retains backend identity and republishes it through
   fixed thread-local execution context, removing Storage's shared connection
   selector. Database identity follows the same boundary for catalog access and
-  WAL staging. Statement execution remains serialized while dispatch moves to
-  workers. Logical subscription apply and bootstrap COPY use the subscription
-  worker's fixed arena and DML scratch independently.
+  WAL staging. Arena and DML access resolve a typed worker-local lease identity
+  instead of shared active indexes. Statement execution remains serialized
+  while dispatch moves to workers. Logical subscription apply and bootstrap
+  COPY use the subscription worker's fixed arena and DML scratch independently.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

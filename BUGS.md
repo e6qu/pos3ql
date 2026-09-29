@@ -564,6 +564,14 @@ execution state, is published at each statement boundary, and is swapped and
 restored locally for nested view and schema execution. Cross-thread isolation,
 ordinary path resolution, durable stored-query identity, and live engine
 transfer retain direct coverage.
+The transaction-visibility audit found that Storage also carried one mutable
+command snapshot and one durable commit snapshot. A worker lowering visibility
+for a data-modifying common table expression or pinning a repeatable-read
+statement could therefore change the row, SST, and durable index generations
+seen by another worker. Both snapshots now form one fixed thread-local
+visibility context initialized and published at statement boundaries.
+Cross-thread isolation, command-history visibility, repeatable reads, and cold
+recovery retain direct coverage.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

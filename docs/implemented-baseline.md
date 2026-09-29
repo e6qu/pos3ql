@@ -105,9 +105,14 @@ active production roadmap is [PLAN.md](../PLAN.md).
   that releases the exact workspace lease and retains backend and database
   identity for response cleanup after the shared durability barrier. Transport
   release and cross-session cancellation restore the target identity at their
-  choke points. Statement execution remains serialized while dispatch moves to
-  fixed workers. Logical subscription apply and bootstrap COPY use the
-  subscription worker's fixed arena and DML scratch independently.
+  choke points. Readable work and parked retries enter an exactly charged FIFO
+  bounded by `query_workspace_slots`; queued jobs retain their exclusive lease
+  and suspend socket reads until typed completion. The reactor currently drains
+  that queue serially, in queued chunks under capacity pressure, while retaining
+  the turn's responses for one group publication. Shared engine ownership is
+  still being prepared for fixed workers. Logical subscription apply and
+  bootstrap COPY use the subscription worker's fixed arena and DML scratch
+  independently.
 - Streamed COPY transition rows are retained in fixed connection-private and
   subscription-worker-private buffers. Interleaved streams preserve the exact
   row set for statement transition triggers without runtime allocation.

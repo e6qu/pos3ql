@@ -536,6 +536,17 @@ cross-session cancellation could inherit the most recently dispatched
 session's thread-local context. Connection release and cancellation now restore
 the target identity at their choke points. Parked retries use the same typed
 completion path.
+The dispatch-queue audit found no bounded handoff between reactor readiness and
+engine execution. Readable work and parked retries now share an exactly charged
+FIFO sized to the workspace count. A queued dispatch owns its workspace and a
+connection-slot in-flight bit until completion; read interest is suspended so
+separate kqueue read and write events cannot process or close the same slot
+while its job is queued. FIFO wraparound, allocation-free operation, and exact
+memory accounting are covered. Performance qualification found that initially
+draining only at the end of a reactor turn capped group commit width at the
+workspace count and amplified concurrent commit PUTs. Capacity pressure now
+drains queued scheduler chunks while retaining their responses for the turn's
+single publication barrier.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

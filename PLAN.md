@@ -294,9 +294,19 @@ lease and backend and database identity. The reactor validates and releases the
 lease when engine work completes, retains only the session identity through the
 shared publication barrier, and restores it before response cleanup. Connection
 release and cross-session cancellation also restore the target identity at
-their choke points. Parallel dispatch must move engine execution to fixed
-workers and return the same typed completions to the reactor while preserving
-transaction retry, object I/O parking, group publication, and response barriers.
+their choke points. Readable work and parked retries now enter one allocation-
+free FIFO whose capacity is exactly `query_workspace_slots`. Enqueue removes
+socket read interest, records one slot-owned in-flight state, and retains the
+exclusive workspace until the reactor drains the job into its typed completion.
+This prevents separate read and write readiness events from racing one queued
+dispatch. When one reactor turn has more ready connections than workspaces, it
+drains queued scheduler chunks but retains every response for the turn's single
+publication barrier. Queue capacity therefore does not reduce group commit
+width. Engine execution remains reactor-serialized because catalog, cache,
+lock, foreign transport, and statistics ownership is not thread safe. Parallel
+dispatch must replace the local queue drain with fixed workers and make that
+shared engine state safe while preserving transaction retry, object I/O
+parking, group publication, and response barriers.
 
 ### Performance qualification
 

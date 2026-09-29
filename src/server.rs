@@ -64,6 +64,7 @@ pub struct Server {
     slots: FixedVec<Slot>,
     free: FixedVec<u32>,
     query_workspaces: QueryWorkspaceLeases,
+    query_dispatches: QueryDispatchQueue,
     engine: Engine,
     /// Random key sent in BackendKeyData (16 bytes; protocol 3.0 gets the
     /// first 4). A matching CancelRequest interrupts a parked statement.
@@ -96,6 +97,7 @@ struct Slot {
     generation: u32,
     want_read: bool,
     want_write: bool,
+    query_dispatch_pending: bool,
     pending_response: Option<PendingQueryResponse>,
 }
 
@@ -108,6 +110,74 @@ struct QueryDispatchCompletion {
     identity: ExecutionIdentity,
     response: PendingResponse,
     cancel_request: Option<CancelRequest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueryDispatch {
+    owner: usize,
+    generation: u32,
+    workspace: QueryWorkspaceId,
+    kind: QueryDispatchKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryDispatchKind {
+    Readable,
+    Retry {
+        lock_generation: u64,
+        retry_io_waiters: bool,
+    },
+}
+
+/// Startup-bounded FIFO between reactor readiness and engine execution.
+struct QueryDispatchQueue {
+    slots: FixedVec<Option<QueryDispatch>>,
+    head: usize,
+    len: usize,
+}
+
+impl QueryDispatchQueue {
+    fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
+        let mut slots = FixedVec::new(budget, "query_dispatch_queue", capacity)?;
+        for _ in 0..capacity {
+            slots.push(None).expect("sized to query_workspace_slots");
+        }
+        Ok(Self {
+            slots,
+            head: 0,
+            len: 0,
+        })
+    }
+
+    const fn budget_bytes(capacity: usize) -> usize {
+        capacity * core::mem::size_of::<Option<QueryDispatch>>()
+    }
+
+    fn push(&mut self, dispatch: QueryDispatch) {
+        assert!(
+            self.len < self.slots.len(),
+            "query dispatch queue exhausted despite exclusive workspace leases"
+        );
+        let tail = (self.head + self.len) % self.slots.len();
+        assert!(self.slots[tail].replace(dispatch).is_none());
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<QueryDispatch> {
+        if self.len == 0 {
+            return None;
+        }
+        let dispatch = self.slots[self.head]
+            .take()
+            .expect("occupied query dispatch queue slot");
+        self.head = (self.head + 1) % self.slots.len();
+        self.len -= 1;
+        Some(dispatch)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 /// A response waiting at the shared publication barrier after its statement
@@ -651,6 +721,7 @@ impl Server {
         ) + 128
             + connections * (core::mem::size_of::<Slot>() + core::mem::size_of::<u32>())
             + QueryWorkspaceLeases::budget_bytes(config.query_workspace_slots, connections)
+            + QueryDispatchQueue::budget_bytes(config.query_workspace_slots)
             + operations_connections
                 * (core::mem::size_of::<OperationsSlot>()
                     + core::mem::size_of::<u32>()
@@ -736,6 +807,7 @@ impl Server {
         let mut free = FixedVec::new(budget, "conn_free_list", max_conns)?;
         let query_workspaces =
             QueryWorkspaceLeases::new(budget, config.query_workspace_slots, max_conns)?;
+        let query_dispatches = QueryDispatchQueue::new(budget, config.query_workspace_slots)?;
         let mut block_read_fds = FixedVec::new(budget, "block_read_fds", block_read_slots)?;
         let mut subscriptions =
             FixedVec::new(budget, "subscription_workers", config.max_subscriptions)?;
@@ -760,6 +832,7 @@ impl Server {
                     generation: 0,
                     want_read: false,
                     want_write: false,
+                    query_dispatch_pending: false,
                     pending_response: None,
                 })
                 .expect("sized to max_conns");
@@ -958,6 +1031,7 @@ impl Server {
             slots,
             free,
             query_workspaces,
+            query_dispatches,
             engine,
             cancel_key,
             next_conn_id: 1,
@@ -1110,6 +1184,7 @@ impl Server {
                     );
                 }
             }
+            self.drain_query_dispatches();
             if publication_ready {
                 if completed_block_read {
                     self.wake_io_waiters();
@@ -1269,6 +1344,14 @@ impl Server {
             // Stale event for a slot that was already recycled.
             return;
         }
+        if slot.query_dispatch_pending {
+            return;
+        }
+        if readable && !slot.want_read {
+            // Read interest was removed when this slot entered the dispatch
+            // queue or workspace wait roster. Ignore an already-returned event.
+            return;
+        }
         if readable && !publication_ready {
             // Match the per-connection barrier's prior behavior: no command
             // is allowed to run behind an unpublished local commit.
@@ -1276,27 +1359,32 @@ impl Server {
             return;
         }
         if readable {
-            let Some(workspace) = self.query_workspaces.acquire(index) else {
-                self.park_for_query_workspace(index);
-                return;
+            let workspace = match self.query_workspaces.acquire(index) {
+                Some(workspace) => workspace,
+                None if self.query_dispatches.len() != 0 => {
+                    // Drain the queued scheduler chunk, but leave every response
+                    // buffered for the one end-of-turn publication barrier.
+                    self.drain_query_dispatches();
+                    let Some(workspace) = self.query_workspaces.acquire(index) else {
+                        self.park_for_query_workspace(index);
+                        return;
+                    };
+                    workspace
+                }
+                None => {
+                    self.park_for_query_workspace(index);
+                    return;
+                }
             };
-            self.engine.select_query_workspace(workspace);
-            let slot = &mut self.slots[index];
-            let response = slot.conn.on_readable(
-                &mut self.engine,
-                &self.cancel_key,
-                &self.auth,
-                self.tls_config.as_ref(),
-            );
-            let completion = QueryDispatchCompletion {
+            if !self.suspend_query_read(index, "queue query dispatch") {
+                return;
+            }
+            self.enqueue_query_dispatch(QueryDispatch {
                 owner: index,
                 generation,
                 workspace,
-                identity: self.engine.execution_identity(),
-                response,
-                cancel_request: slot.conn.take_cancel_request(),
-            };
-            self.complete_query_execution(completion);
+                kind: QueryDispatchKind::Readable,
+            });
             return;
         }
         let slot = &mut self.slots[index];
@@ -1309,18 +1397,77 @@ impl Server {
     }
 
     fn park_for_query_workspace(&mut self, index: usize) {
+        let _ = self.suspend_query_read(index, "park for query workspace");
+    }
+
+    fn suspend_query_read(&mut self, index: usize, context: &'static str) -> bool {
         let slot = &mut self.slots[index];
         if !slot.want_read {
-            return;
+            return false;
         }
         let fd = slot.conn.stream().as_raw_fd();
         let token = token_for(index as u32, slot.generation);
         match self.reactor.set_read_interest(fd, token, false) {
-            Ok(()) => slot.want_read = false,
-            Err(error) => {
-                log_io("park for query workspace", &error);
-                self.release(index);
+            Ok(()) => {
+                slot.want_read = false;
+                true
             }
+            Err(error) => {
+                log_io(context, &error);
+                self.release(index);
+                false
+            }
+        }
+    }
+
+    fn enqueue_query_dispatch(&mut self, dispatch: QueryDispatch) {
+        let slot = &mut self.slots[dispatch.owner];
+        assert_eq!(slot.generation, dispatch.generation);
+        assert!(!slot.query_dispatch_pending);
+        slot.query_dispatch_pending = true;
+        self.query_dispatches.push(dispatch);
+    }
+
+    fn drain_query_dispatches(&mut self) {
+        while let Some(dispatch) = self.query_dispatches.pop() {
+            assert!(dispatch.owner < self.slots.len());
+            assert_eq!(
+                self.slots[dispatch.owner].generation, dispatch.generation,
+                "queued query dispatch cannot outlive its connection generation"
+            );
+            assert!(self.slots[dispatch.owner].conn.is_open());
+            assert!(self.slots[dispatch.owner].query_dispatch_pending);
+            self.engine.select_query_workspace(dispatch.workspace);
+            let response = match dispatch.kind {
+                QueryDispatchKind::Readable => Some(self.slots[dispatch.owner].conn.on_readable(
+                    &mut self.engine,
+                    &self.cancel_key,
+                    &self.auth,
+                    self.tls_config.as_ref(),
+                )),
+                QueryDispatchKind::Retry {
+                    lock_generation,
+                    retry_io_waiters,
+                } => self.slots[dispatch.owner].conn.retry_parked(
+                    &mut self.engine,
+                    lock_generation,
+                    retry_io_waiters,
+                ),
+            };
+            let Some(response) = response else {
+                self.slots[dispatch.owner].query_dispatch_pending = false;
+                self.release_query_workspace(dispatch.owner, dispatch.workspace);
+                continue;
+            };
+            let completion = QueryDispatchCompletion {
+                owner: dispatch.owner,
+                generation: dispatch.generation,
+                workspace: dispatch.workspace,
+                identity: self.engine.execution_identity(),
+                response,
+                cancel_request: self.slots[dispatch.owner].conn.take_cancel_request(),
+            };
+            self.complete_query_execution(completion);
         }
     }
 
@@ -1333,6 +1480,8 @@ impl Server {
     /// here, while the response retains only the session identity required by
     /// later publication and transport completion.
     fn complete_query_execution(&mut self, completion: QueryDispatchCompletion) {
+        assert!(self.slots[completion.owner].query_dispatch_pending);
+        self.slots[completion.owner].query_dispatch_pending = false;
         self.release_query_workspace(completion.owner, completion.workspace);
         if self.slots[completion.owner].generation != completion.generation
             || !self.slots[completion.owner].conn.is_open()
@@ -2443,29 +2592,28 @@ impl Server {
                 {
                     continue;
                 }
-                let Some(workspace) = self.query_workspaces.try_acquire(index) else {
-                    continue;
+                let workspace = match self.query_workspaces.try_acquire(index) {
+                    Some(workspace) => workspace,
+                    None if self.query_dispatches.len() != 0 => {
+                        self.drain_query_dispatches();
+                        let Some(workspace) = self.query_workspaces.try_acquire(index) else {
+                            continue;
+                        };
+                        workspace
+                    }
+                    None => continue,
                 };
-                self.engine.select_query_workspace(workspace);
-                let response = self.slots[index].conn.retry_parked(
-                    &mut self.engine,
-                    generation,
-                    retry_io_waiters,
-                );
-                if let Some(response) = response {
-                    let completion = QueryDispatchCompletion {
-                        owner: index,
-                        generation: self.slots[index].generation,
-                        workspace,
-                        identity: self.engine.execution_identity(),
-                        response,
-                        cancel_request: None,
-                    };
-                    self.complete_query_execution(completion);
-                } else {
-                    self.release_query_workspace(index, workspace);
-                }
+                self.enqueue_query_dispatch(QueryDispatch {
+                    owner: index,
+                    generation: self.slots[index].generation,
+                    workspace,
+                    kind: QueryDispatchKind::Retry {
+                        lock_generation: generation,
+                        retry_io_waiters,
+                    },
+                });
             }
+            self.drain_query_dispatches();
             if self.engine.lock_generation() == generation {
                 break;
             }
@@ -2546,6 +2694,10 @@ impl Server {
         // Every transport exit reaches this choke point. Roll back here so an
         // I/O-interest failure, notification overflow, or replication close
         // cannot strand transaction state or locks.
+        assert!(
+            !self.slots[index].query_dispatch_pending,
+            "connection release must wait for its queued query dispatch"
+        );
         self.engine
             .restore_execution_identity(self.slots[index].conn.execution_identity());
         let workspace_handoff = self.query_workspaces.cancel(index);
@@ -2570,6 +2722,7 @@ impl Server {
         slot.generation = slot.generation.wrapping_add(1);
         slot.want_read = false;
         slot.want_write = false;
+        slot.query_dispatch_pending = false;
         slot.pending_response = None;
         self.free
             .push(index as u32)
@@ -3326,9 +3479,9 @@ mod tests {
 
     use super::{
         HttpRequestError, OPERATIONS_REQUEST_BYTES, OPERATIONS_RESPONSE_BYTES, OperationsEndpoint,
-        OperationsSlot, QueryWorkspaceLeases, Server, SubscriptionBinding,
-        SubscriptionBootstrapStage, SubscriptionBootstrapWork, bind_listener,
-        parse_operations_request,
+        OperationsSlot, QueryDispatch, QueryDispatchKind, QueryDispatchQueue, QueryWorkspaceLeases,
+        Server, SubscriptionBinding, SubscriptionBootstrapStage, SubscriptionBootstrapWork,
+        bind_listener, parse_operations_request,
     };
 
     fn discovery_row<'a>(
@@ -3600,8 +3753,47 @@ mod tests {
         larger.query_workspace_slots = 5;
         assert_eq!(
             Server::budget_bytes(&larger) - Server::budget_bytes(&smaller),
-            4 * core::mem::size_of::<Option<usize>>()
+            4 * (core::mem::size_of::<Option<usize>>()
+                + core::mem::size_of::<Option<QueryDispatch>>())
         );
+    }
+
+    #[test]
+    fn query_dispatch_queue_is_bounded_allocation_free_and_fifo() {
+        let bytes = QueryDispatchQueue::budget_bytes(3);
+        let mut budget = crate::mem::budget::Budget::new(bytes);
+        let mut queue = QueryDispatchQueue::new(&mut budget, 3).unwrap();
+        assert_eq!(budget.remaining(), 0);
+
+        let dispatch = |owner, generation, workspace, kind| QueryDispatch {
+            owner,
+            generation,
+            workspace: crate::sql::QueryWorkspaceId::from_index(workspace),
+            kind,
+        };
+        let first = dispatch(1, 11, 0, QueryDispatchKind::Readable);
+        let second = dispatch(
+            2,
+            12,
+            1,
+            QueryDispatchKind::Retry {
+                lock_generation: 7,
+                retry_io_waiters: false,
+            },
+        );
+        let third = dispatch(3, 13, 2, QueryDispatchKind::Readable);
+        let wrapped = dispatch(4, 14, 0, QueryDispatchKind::Readable);
+        crate::mem::guard::forbid_alloc(|| {
+            queue.push(first);
+            queue.push(second);
+            queue.push(third);
+            assert_eq!(queue.pop(), Some(first));
+            queue.push(wrapped);
+            assert_eq!(queue.pop(), Some(second));
+            assert_eq!(queue.pop(), Some(third));
+            assert_eq!(queue.pop(), Some(wrapped));
+            assert_eq!(queue.pop(), None);
+        });
     }
 
     #[test]

@@ -526,6 +526,16 @@ The workspace-selector audit found that the arena and DML sets still carried
 one shared active index after their session identities became worker private.
 Both now resolve one typed thread-local lease identity; slot and operating-system
 thread isolation cover arena, DML scratch, backend, and database selection.
+The dispatch-completion audit found no typed boundary between engine return and
+reactor response handling. Readable dispatch and parked retry now return one
+completion with the exact lease and a snapshot of backend and database
+identity. The reactor validates and releases that lease at engine completion,
+preserving group publication width, then restores the snapshot before later
+response cleanup. The audit also found that response failure, disconnect, and
+cross-session cancellation could inherit the most recently dispatched
+session's thread-local context. Connection release and cancellation now restore
+the target identity at their choke points. Parked retries use the same typed
+completion path.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

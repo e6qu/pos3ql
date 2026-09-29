@@ -73,10 +73,12 @@ use crate::storage::{ColumnMeta, ColumnSet, RowHome, RowLoc, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 std::thread_local! {
-    /// Backend identity for the worker currently executing SQL. A leased query
-    /// workspace republishes its identity whenever it is selected, so storage
-    /// helpers never depend on a process-wide mutable selector.
+    /// Session identity for the worker currently executing SQL. A leased query
+    /// workspace republishes it whenever selected, so storage and WAL helpers
+    /// never depend on process-wide mutable selectors.
     static EXECUTION_CONNECTION_ID: core::cell::Cell<i32> = const { core::cell::Cell::new(0) };
+    static EXECUTION_DATABASE_OID: core::cell::Cell<crate::storage::DatabaseOid> =
+        const { core::cell::Cell::new(crate::storage::DatabaseOid::POSTGRES) };
 }
 
 pub(crate) fn set_execution_connection_id(connection_id: i32) {
@@ -85,6 +87,14 @@ pub(crate) fn set_execution_connection_id(connection_id: i32) {
 
 pub(crate) fn execution_connection_id() -> i32 {
     EXECUTION_CONNECTION_ID.with(core::cell::Cell::get)
+}
+
+pub(crate) fn set_execution_database_oid(database: crate::storage::DatabaseOid) {
+    EXECUTION_DATABASE_OID.with(|current| current.set(database));
+}
+
+pub(crate) fn execution_database_oid() -> crate::storage::DatabaseOid {
+    EXECUTION_DATABASE_OID.with(core::cell::Cell::get)
 }
 
 use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
@@ -223,6 +233,7 @@ struct QueryWorkspaces {
 struct QueryWorkspace {
     arena: Arena,
     connection_id: i32,
+    database_oid: crate::storage::DatabaseOid,
 }
 
 /// Index of one startup-reserved query workspace. The server leases these
@@ -290,6 +301,7 @@ impl QueryWorkspaces {
                 .push(QueryWorkspace {
                     arena: Arena::new(budget, "query_workspace_arena", config.work_arena_bytes)?,
                     connection_id: 0,
+                    database_oid: crate::storage::DatabaseOid::POSTGRES,
                 })
                 .expect("sized to query_workspace_slots");
         }
@@ -300,6 +312,7 @@ impl QueryWorkspaces {
         assert!(workspace.index() < self.slots.len());
         self.active = workspace.index();
         set_execution_connection_id(self.slots[self.active].connection_id);
+        set_execution_database_oid(self.slots[self.active].database_oid);
     }
 
     fn for_connection(&self, connection: i32) -> QueryWorkspaceId {
@@ -314,6 +327,15 @@ impl QueryWorkspaces {
 
     fn connection_id(&self) -> i32 {
         self.slots[self.active].connection_id
+    }
+
+    fn bind_database_oid(&mut self, database: crate::storage::DatabaseOid) {
+        self.slots[self.active].database_oid = database;
+        set_execution_database_oid(database);
+    }
+
+    fn database_oid(&self) -> crate::storage::DatabaseOid {
+        self.slots[self.active].database_oid
     }
 }
 
@@ -2245,6 +2267,7 @@ impl Engine {
     pub(crate) fn select_query_workspace(&mut self, workspace: QueryWorkspaceId) {
         self.work.select(workspace);
         self.dml_scratch.select(workspace);
+        self.wal.select_database(self.work.database_oid());
     }
 
     pub(crate) fn operational_snapshot(&self) -> OperationalSnapshot {
@@ -2454,10 +2477,16 @@ impl Engine {
     /// Opens the local transaction that will receive one publisher commit.
     /// The worker uses the ordinary engine transaction and durability path;
     /// replication cannot create a second, weaker write path.
-    pub fn begin_subscription_apply(&mut self, txn: &mut TxnState, guc: &GucState) {
+    pub(crate) fn begin_subscription_apply(
+        &mut self,
+        database: crate::storage::DatabaseOid,
+        txn: &mut TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
         // Apply workers have transaction identities but no frontend/backend
-        // process identity. Do not inherit whichever client the single-threaded
-        // engine happened to dispatch most recently.
+        // process identity. Publish their durable database before opening the
+        // local transaction instead of inheriting a reactor thread's context.
+        self.select_database(database)?;
         self.work.bind_connection(0);
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         txn.replication_apply = true;
@@ -2466,6 +2495,7 @@ impl Engine {
         // statements.  Each later row operation must therefore see every
         // earlier local change from that same remote commit.
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
+        Ok(())
     }
 
     pub(crate) fn begin_subscription_relation_refresh(
@@ -2863,6 +2893,7 @@ impl Engine {
         database: crate::storage::DatabaseOid,
     ) -> Result<(), SqlError> {
         self.storage.select_database(database)?;
+        self.work.bind_database_oid(database);
         self.wal.select_database(database);
         Ok(())
     }

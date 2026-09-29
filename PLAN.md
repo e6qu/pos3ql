@@ -277,16 +277,18 @@ identity now belongs to the leased workspace and is republished through fixed
 thread-local execution context when the workspace is selected. Storage no
 longer carries a shared mutable connection selector, so temporary schemas,
 advisory locks, backend statistics, signals, and LISTEN state cannot inherit
-another worker's backend identity.
+another worker's backend identity. Database identity now follows the same
+workspace and thread-local boundary. Storage and WAL no longer carry mutable
+database selectors, and selecting a leased workspace republishes its database
+before catalog access or transaction WAL staging.
 Streamed COPY transition rows are connection private, and logical subscription
 bootstrap workers own the same fixed state independently. Interleaved client
 streams therefore cannot clear or mix the row set observed by statement-level
 transition triggers; every buffer is charged from `txn_rows` at startup.
 Logical subscription apply and bootstrap COPY execution use the worker's own
 arena and DML scratch rather than a client workspace. The synchronous reactor
-currently releases each lease when its dispatch call returns. Database
-selection is still engine global. Parallel dispatch must make it worker private
-and retain a lease through worker completion while preserving transaction
+currently releases each lease when its dispatch call returns. Parallel dispatch
+must retain a lease through worker completion while preserving transaction
 retry, object I/O parking, group publication, and response barriers.
 
 ### Performance qualification

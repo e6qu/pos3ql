@@ -29,23 +29,33 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
 
     workspaces.select(QueryWorkspaceId::from_index(0));
     workspaces.bind_connection(41);
+    workspaces.bind_database_oid(crate::storage::DatabaseOid::parse(16_384).unwrap());
     workspaces.alloc_slice_with(7, |_| 1u8).unwrap();
     let first_used = workspaces.used();
     assert!(first_used >= 7);
 
     workspaces.select(QueryWorkspaceId::from_index(1));
     workspaces.bind_connection(73);
+    workspaces.bind_database_oid(crate::storage::DatabaseOid::parse(16_385).unwrap());
     assert_eq!(workspaces.used(), 0);
     workspaces.alloc_slice_with(19, |_| 2u8).unwrap();
 
     workspaces.select(QueryWorkspaceId::from_index(0));
     assert_eq!(workspaces.used(), first_used);
     assert_eq!(workspaces.connection_id(), 41);
+    assert_eq!(workspaces.database_oid().get(), 16_384);
+    assert_eq!(execution_database_oid().get(), 16_384);
     workspaces.select(QueryWorkspaceId::from_index(1));
     assert_eq!(workspaces.connection_id(), 73);
+    assert_eq!(workspaces.database_oid().get(), 16_385);
+    assert_eq!(execution_database_oid().get(), 16_385);
     workspaces.select(QueryWorkspaceId::from_index(2));
     assert_eq!(workspaces.used(), 0);
     assert_eq!(workspaces.connection_id(), 0);
+    assert_eq!(
+        workspaces.database_oid(),
+        crate::storage::DatabaseOid::POSTGRES
+    );
 
     let mut budget = Budget::new(config.query_workspace_slots * dml_workspace_bytes);
     let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget).unwrap();
@@ -75,17 +85,56 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
 }
 
 #[test]
-fn execution_connection_identity_is_thread_private() {
+fn execution_identity_is_thread_private() {
     set_execution_connection_id(41);
+    set_execution_database_oid(crate::storage::DatabaseOid::parse(16_384).unwrap());
     std::thread::spawn(|| {
         assert_eq!(execution_connection_id(), 0);
+        assert_eq!(
+            execution_database_oid(),
+            crate::storage::DatabaseOid::POSTGRES
+        );
         set_execution_connection_id(73);
+        set_execution_database_oid(crate::storage::DatabaseOid::parse(16_385).unwrap());
         assert_eq!(execution_connection_id(), 73);
+        assert_eq!(execution_database_oid().get(), 16_385);
     })
     .join()
     .unwrap();
     assert_eq!(execution_connection_id(), 41);
+    assert_eq!(execution_database_oid().get(), 16_384);
     set_execution_connection_id(0);
+    set_execution_database_oid(crate::storage::DatabaseOid::POSTGRES);
+}
+
+#[test]
+fn failed_database_selection_restores_workspace_context() {
+    let config = test_config("failed-database-selection");
+    let mut budget = Budget::new(test_engine_budget_bytes(1 << 28));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let template = engine
+        .storage
+        .database_slot("template1", 0)
+        .map(|slot| engine.storage.database(slot).oid)
+        .unwrap();
+
+    engine.select_database(template).unwrap();
+    let dropped = run_with(&mut engine, &mut budget, "DROP SCHEMA public CASCADE");
+    assert!(!message_types(&dropped).contains(&b'E'));
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+
+    let error = engine.select_database(template).unwrap_err();
+    assert_eq!(error.sqlstate, eval::sqlstate::INVALID_SCHEMA_NAME);
+    assert_eq!(
+        engine.storage.current_database_oid(),
+        crate::storage::DatabaseOid::POSTGRES
+    );
+    assert_eq!(
+        engine.work.database_oid(),
+        crate::storage::DatabaseOid::POSTGRES
+    );
 }
 
 #[test]
@@ -63212,7 +63261,9 @@ fn subscription_enablement_has_one_transactional_catalog_owner() {
         .0;
     let guc = GucState::new();
     let mut first = TxnState::new(&mut budget, config.txn_rows).unwrap();
-    engine.begin_subscription_apply(&mut first, &guc);
+    engine
+        .begin_subscription_apply(crate::storage::DatabaseOid::POSTGRES, &mut first, &guc)
+        .unwrap();
     assert!(matches!(
         engine
             .storage
@@ -63221,7 +63272,9 @@ fn subscription_enablement_has_one_transactional_catalog_owner() {
         crate::storage::SubscriptionEnabledChange::Changed { prior: None }
     ));
     let mut second = TxnState::new(&mut budget, config.txn_rows).unwrap();
-    engine.begin_subscription_apply(&mut second, &guc);
+    engine
+        .begin_subscription_apply(crate::storage::DatabaseOid::POSTGRES, &mut second, &guc)
+        .unwrap();
     let error = engine
         .storage
         .set_subscription_enabled(slot, true, second.txid)
@@ -63255,7 +63308,9 @@ fn subscription_progress_is_transactional_durable_and_idempotent() {
     let guc = GucState::new();
     let mut txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
     let stream = engine.subscription_stream("apply_changes").unwrap();
-    engine.begin_subscription_apply(&mut txn, &guc);
+    engine
+        .begin_subscription_apply(crate::storage::DatabaseOid::POSTGRES, &mut txn, &guc)
+        .unwrap();
     assert!(
         engine
             .stage_subscription_advance(&mut txn, stream, 41)
@@ -63271,7 +63326,9 @@ fn subscription_progress_is_transactional_durable_and_idempotent() {
             .confirmed_lsn,
         41
     );
-    engine.begin_subscription_apply(&mut txn, &guc);
+    engine
+        .begin_subscription_apply(crate::storage::DatabaseOid::POSTGRES, &mut txn, &guc)
+        .unwrap();
     assert!(
         !engine
             .stage_subscription_advance(&mut txn, stream, 41)
@@ -63317,7 +63374,9 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
     let guc = GucState::new();
     let mut txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
 
-    engine.begin_subscription_apply(&mut txn, &guc);
+    engine
+        .begin_subscription_apply(crate::storage::DatabaseOid::POSTGRES, &mut txn, &guc)
+        .unwrap();
     txn.mode = TxnMode::Explicit;
     engine
         .begin_subscription_relation_refresh(&mut txn, stream)
@@ -63336,7 +63395,9 @@ fn subscription_relation_refresh_is_atomic_and_checkpointed() {
     );
     engine.rollback_txn(&mut txn, &guc);
 
-    engine.begin_subscription_apply(&mut txn, &guc);
+    engine
+        .begin_subscription_apply(crate::storage::DatabaseOid::POSTGRES, &mut txn, &guc)
+        .unwrap();
     txn.mode = TxnMode::Explicit;
     engine
         .begin_subscription_relation_refresh(&mut txn, stream)
@@ -63596,7 +63657,9 @@ fn replaced_subscription_stream_cannot_acknowledge_an_old_remote_transaction() {
 
     let guc = GucState::new();
     let mut txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
-    engine.begin_subscription_apply(&mut txn, &guc);
+    engine
+        .begin_subscription_apply(crate::storage::DatabaseOid::POSTGRES, &mut txn, &guc)
+        .unwrap();
     let error = engine
         .stage_subscription_advance(&mut txn, old_stream, 41)
         .unwrap_err();

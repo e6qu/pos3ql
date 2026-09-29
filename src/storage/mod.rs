@@ -5468,6 +5468,10 @@ impl SubscriptionStream {
         self.slot
     }
 
+    pub(crate) fn database_oid(self) -> DatabaseOid {
+        self.database
+    }
+
     pub(crate) fn name(self) -> SqlName {
         self.name
     }
@@ -9385,6 +9389,10 @@ impl DatabaseOid {
     }
 }
 
+fn current_database() -> DatabaseOid {
+    crate::sql::execution_database_oid()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DatabaseEncoding {
     Utf8,
@@ -11773,7 +11781,6 @@ pub struct Storage {
     brin_unsummarized_ranges: std::cell::RefCell<FixedVec<u64>>,
     brin_unsummarized_ranges_per_index: usize,
     databases: FixedVec<DatabaseDef>,
-    current_database: DatabaseOid,
     backends: std::cell::RefCell<FixedVec<BackendActivity>>,
     backend_signals: std::cell::RefCell<FixedVec<BackendSignal>>,
     relation_cumulative_statistics: std::cell::RefCell<FixedVec<RelationCumulativeStatistics>>,
@@ -13165,7 +13172,7 @@ impl Storage {
                 database.tup_deleted = database.tup_deleted.saturating_add(n_tup_del);
             }
         }
-        if let Some(database_slot) = self.database_slot_by_oid(self.current_database, 0) {
+        if let Some(database_slot) = self.database_slot_by_oid(current_database(), 0) {
             let database = &mut databases[database_slot];
             if committed {
                 database.xact_commit = database.xact_commit.saturating_add(1);
@@ -13194,7 +13201,7 @@ impl Storage {
         let mut cumulative = self.function_cumulative_statistics.borrow_mut();
         let slot = cumulative
             .iter()
-            .position(|entry| entry.database == self.current_database && entry.oid == oid)
+            .position(|entry| entry.database == current_database() && entry.oid == oid)
             .expect("function statistics were reserved before recording");
         let entry = &mut cumulative[slot];
         entry.calls = entry.calls.saturating_add(1);
@@ -13239,13 +13246,13 @@ impl Storage {
         let mut cumulative = self.function_cumulative_statistics.borrow_mut();
         if cumulative
             .iter()
-            .any(|entry| entry.database == self.current_database && entry.oid == oid)
+            .any(|entry| entry.database == current_database() && entry.oid == oid)
         {
             return Ok(());
         }
         cumulative
             .push(FunctionCumulativeStatistics {
-                database: self.current_database,
+                database: current_database(),
                 oid,
                 calls: 0,
                 total_time_micros: 0,
@@ -13266,7 +13273,7 @@ impl Storage {
         self.function_cumulative_statistics
             .borrow()
             .iter()
-            .find(|entry| entry.database == self.current_database && entry.oid == oid)
+            .find(|entry| entry.database == current_database() && entry.oid == oid)
             .copied()
     }
 
@@ -13280,7 +13287,7 @@ impl Storage {
             .iter()
             .find(|entry| entry.txid == txid && entry.oid == oid)
             .map(|entry| FunctionCumulativeStatistics {
-                database: self.current_database,
+                database: current_database(),
                 oid,
                 calls: entry.calls,
                 total_time_micros: entry.total_time_micros,
@@ -13292,7 +13299,7 @@ impl Storage {
         let mut statistics = self.function_cumulative_statistics.borrow_mut();
         if let Some(position) = statistics
             .iter()
-            .position(|entry| entry.database == self.current_database && entry.oid == oid)
+            .position(|entry| entry.database == current_database() && entry.oid == oid)
         {
             statistics.swap_remove(position);
         }
@@ -13411,13 +13418,13 @@ impl Storage {
 
     pub(crate) fn reset_current_database_statistics(&self) {
         let now = crate::sql::datetime::now_micros();
-        if let Some(slot) = self.database_slot_by_oid(self.current_database, 0) {
-            let mut reset = DatabaseCumulativeStatistics::empty(self.current_database);
+        if let Some(slot) = self.database_slot_by_oid(current_database(), 0) {
+            let mut reset = DatabaseCumulativeStatistics::empty(current_database());
             reset.stats_reset = Some(now);
             self.database_cumulative_statistics.borrow_mut()[slot] = reset;
         }
         for (slot, table) in self.tables.iter().enumerate() {
-            if table.database == self.current_database {
+            if table.database == current_database() {
                 self.relation_cumulative_statistics.borrow_mut()[slot] =
                     RelationCumulativeStatistics::EMPTY;
             }
@@ -13425,7 +13432,7 @@ impl Storage {
         let mut indexes = self.index_cumulative_statistics.borrow_mut();
         let mut position = 0usize;
         while position < indexes.len() {
-            if indexes[position].database == self.current_database {
+            if indexes[position].database == current_database() {
                 indexes.swap_remove(position);
             } else {
                 position += 1;
@@ -13434,7 +13441,7 @@ impl Storage {
         let mut functions = self.function_cumulative_statistics.borrow_mut();
         let mut position = 0usize;
         while position < functions.len() {
-            if functions[position].database == self.current_database {
+            if functions[position].database == current_database() {
                 functions.swap_remove(position);
             } else {
                 position += 1;
@@ -13495,7 +13502,7 @@ impl Storage {
     }
 
     pub(crate) fn record_deadlock(&self) {
-        if let Some(slot) = self.database_slot_by_oid(self.current_database, 0) {
+        if let Some(slot) = self.database_slot_by_oid(current_database(), 0) {
             let statistics = &mut self.database_cumulative_statistics.borrow_mut()[slot];
             statistics.deadlocks = statistics.deadlocks.saturating_add(1);
         }
@@ -13886,7 +13893,7 @@ impl Storage {
             return;
         };
         for slot in 0..self.views.len() {
-            if self.views[slot].database == self.current_database
+            if self.views[slot].database == current_database()
                 && self.views[slot].ddl_state == CatalogDdlState::Present
                 && self.views[slot].persistence == RelationPersistence::Temporary
                 && self.views[slot].schema == schema
@@ -13896,7 +13903,7 @@ impl Storage {
             }
         }
         for slot in 0..self.table_count() {
-            if self.tables[slot].database != self.current_database
+            if self.tables[slot].database != current_database()
                 || !self.tables[slot].live
                 || self.tables[slot].def.persistence != RelationPersistence::Temporary
                 || self.tables[slot].def.schema != schema
@@ -13909,7 +13916,7 @@ impl Storage {
             self.commit_drop(slot);
         }
         for slot in 0..self.sequences.len() {
-            if self.sequences[slot].database == self.current_database
+            if self.sequences[slot].database == current_database()
                 && self.sequences[slot].ddl_state == CatalogDdlState::Present
                 && self.sequences[slot].persistence == RelationPersistence::Temporary
                 && self.sequences[slot].schema == schema
@@ -13925,7 +13932,7 @@ impl Storage {
             return Ok(());
         };
         for slot in 0..self.table_count() {
-            if self.tables[slot].database != self.current_database
+            if self.tables[slot].database != current_database()
                 || !self.tables[slot].live
                 || self.tables[slot].def.persistence != RelationPersistence::Temporary
                 || self.tables[slot].def.schema != schema
@@ -14088,7 +14095,7 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignDataWrapperDefinition)> {
-        self.foreign.wrapper(self.current_database, name, txid)
+        self.foreign.wrapper(current_database(), name, txid)
     }
 
     pub(crate) fn foreign_wrapper_by_slot(
@@ -14096,8 +14103,7 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> Option<foreign::ForeignDataWrapperDefinition> {
-        self.foreign
-            .wrapper_by_slot(self.current_database, slot, txid)
+        self.foreign.wrapper_by_slot(current_database(), slot, txid)
     }
 
     pub(crate) fn foreign_server(
@@ -14105,7 +14111,7 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignServerDefinition)> {
-        self.foreign.server(self.current_database, name, txid)
+        self.foreign.server(current_database(), name, txid)
     }
 
     pub(crate) fn foreign_server_by_slot(
@@ -14113,8 +14119,7 @@ impl Storage {
         slot: usize,
         txid: u32,
     ) -> Option<foreign::ForeignServerDefinition> {
-        self.foreign
-            .server_by_slot(self.current_database, slot, txid)
+        self.foreign.server_by_slot(current_database(), slot, txid)
     }
 
     pub(crate) fn foreign_user_mapping(
@@ -14123,8 +14128,7 @@ impl Storage {
         user: foreign::ForeignMappingUser,
         txid: u32,
     ) -> Option<(usize, foreign::UserMappingDefinition)> {
-        self.foreign
-            .mapping(self.current_database, server, user, txid)
+        self.foreign.mapping(current_database(), server, user, txid)
     }
 
     pub(crate) fn foreign_table(
@@ -14132,7 +14136,7 @@ impl Storage {
         table: u16,
         txid: u32,
     ) -> Option<(usize, foreign::ForeignTableDefinition)> {
-        self.foreign.table(self.current_database, table, txid)
+        self.foreign.table(current_database(), table, txid)
     }
 
     pub(crate) fn foreign_wrappers(
@@ -14144,7 +14148,7 @@ impl Storage {
             &foreign::ForeignCatalogEntry<foreign::ForeignDataWrapperDefinition>,
         ),
     > {
-        self.foreign.wrappers(self.current_database, txid)
+        self.foreign.wrappers(current_database(), txid)
     }
 
     pub(crate) fn foreign_servers(
@@ -14156,7 +14160,7 @@ impl Storage {
             &foreign::ForeignCatalogEntry<foreign::ForeignServerDefinition>,
         ),
     > {
-        self.foreign.servers(self.current_database, txid)
+        self.foreign.servers(current_database(), txid)
     }
 
     pub(crate) fn foreign_user_mappings(
@@ -14168,7 +14172,7 @@ impl Storage {
             &foreign::ForeignCatalogEntry<foreign::UserMappingDefinition>,
         ),
     > {
-        self.foreign.mappings(self.current_database, txid)
+        self.foreign.mappings(current_database(), txid)
     }
 
     pub(crate) fn foreign_tables(
@@ -14180,7 +14184,7 @@ impl Storage {
             &foreign::ForeignCatalogEntry<foreign::ForeignTableDefinition>,
         ),
     > {
-        self.foreign.tables(self.current_database, txid)
+        self.foreign.tables(current_database(), txid)
     }
 
     pub(crate) fn checkpoint_foreign_wrappers(
@@ -14278,7 +14282,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .restore_wrapper(slot, self.current_database, created_at, definition, owner)
+            .restore_wrapper(slot, current_database(), created_at, definition, owner)
     }
 
     pub(crate) fn restore_foreign_server(
@@ -14290,7 +14294,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .restore_server(slot, self.current_database, created_at, definition, owner)
+            .restore_server(slot, current_database(), created_at, definition, owner)
     }
 
     pub(crate) fn restore_foreign_user_mapping(
@@ -14301,7 +14305,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .restore_mapping(slot, self.current_database, created_at, definition)
+            .restore_mapping(slot, current_database(), created_at, definition)
     }
 
     pub(crate) fn restore_foreign_table_binding(
@@ -14312,7 +14316,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .restore_table(slot, self.current_database, created_at, definition)
+            .restore_table(slot, current_database(), created_at, definition)
     }
 
     pub(crate) fn replay_set_foreign_wrapper(
@@ -14324,7 +14328,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .replay_set_wrapper(slot, self.current_database, created_at, owner, definition)
+            .replay_set_wrapper(slot, current_database(), created_at, owner, definition)
     }
 
     pub(crate) fn replay_set_foreign_server(
@@ -14336,7 +14340,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .replay_set_server(slot, self.current_database, created_at, owner, definition)
+            .replay_set_server(slot, current_database(), created_at, owner, definition)
     }
 
     pub(crate) fn replay_set_foreign_user_mapping(
@@ -14347,7 +14351,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .replay_set_mapping(slot, self.current_database, created_at, definition)
+            .replay_set_mapping(slot, current_database(), created_at, definition)
     }
 
     pub(crate) fn replay_set_foreign_table(
@@ -14358,7 +14362,7 @@ impl Storage {
     ) -> Result<(), SqlError> {
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.foreign
-            .replay_set_table(slot, self.current_database, created_at, definition)
+            .replay_set_table(slot, current_database(), created_at, definition)
     }
 
     pub(crate) fn first_foreign_server_for_wrapper(
@@ -14367,7 +14371,7 @@ impl Storage {
         txid: u32,
     ) -> Option<(usize, foreign::ForeignServerDefinition)> {
         self.foreign
-            .first_server_for_wrapper(self.current_database, wrapper, txid)
+            .first_server_for_wrapper(current_database(), wrapper, txid)
     }
 
     pub(crate) fn first_user_mapping_for_server(
@@ -14376,7 +14380,7 @@ impl Storage {
         txid: u32,
     ) -> Option<(usize, foreign::UserMappingDefinition)> {
         self.foreign
-            .first_mapping_for_server(self.current_database, server, txid)
+            .first_mapping_for_server(current_database(), server, txid)
     }
 
     pub(crate) fn first_foreign_table_for_server(
@@ -14385,12 +14389,12 @@ impl Storage {
         txid: u32,
     ) -> Option<(usize, foreign::ForeignTableDefinition)> {
         self.foreign
-            .first_table_for_server(self.current_database, server, txid)
+            .first_table_for_server(current_database(), server, txid)
     }
 
     pub(crate) fn has_foreign_table_for_wrapper(&self, wrapper: u16, txid: u32) -> bool {
         self.foreign
-            .has_table_for_wrapper(self.current_database, wrapper, txid)
+            .has_table_for_wrapper(current_database(), wrapper, txid)
     }
 
     pub(crate) fn create_foreign_wrapper(
@@ -14400,7 +14404,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         let slot = self.foreign.create_wrapper(
-            self.current_database,
+            current_database(),
             self.catalog_seq,
             definition,
             self.initial_ownership(txid),
@@ -14420,7 +14424,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         let slot = self.foreign.create_server(
-            self.current_database,
+            current_database(),
             self.catalog_seq,
             definition,
             self.initial_ownership(txid),
@@ -14440,7 +14444,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         self.foreign
-            .create_mapping(self.current_database, self.catalog_seq, definition, txid)
+            .create_mapping(current_database(), self.catalog_seq, definition, txid)
     }
 
     pub(crate) fn create_foreign_table_binding(
@@ -14450,7 +14454,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         self.foreign.create_table(
-            self.current_database,
+            current_database(),
             self.catalog_seq,
             definition,
             self.initial_ownership(txid),
@@ -14912,7 +14916,7 @@ impl Storage {
         let slot = match dependency.class {
             DependencyClass::Table => self.find_visible(schema, name, txid),
             DependencyClass::View => self.views.iter().position(|view| {
-                view.database == self.current_database
+                view.database == current_database()
                     && view.visible_to(txid)
                     && view.schema_for(txid).as_str() == schema
                     && view.name_for(txid).as_str() == name
@@ -14934,7 +14938,7 @@ impl Storage {
                 self.collations
                     .get(slot)
                     .is_some_and(|collation| {
-                        collation.database == self.current_database && collation.visible_to(txid)
+                        collation.database == current_database() && collation.visible_to(txid)
                     })
                     .then_some(slot)
             }),
@@ -14998,8 +15002,7 @@ impl Storage {
 
     fn rebind_all_stored_query_dependencies_to(&mut self, txid: u32) -> Result<(), SqlError> {
         for slot in 0..self.rules.len() {
-            if self.rules[slot].database == self.current_database
-                && self.rules[slot].visible_to(txid)
+            if self.rules[slot].database == current_database() && self.rules[slot].visible_to(txid)
             {
                 let owner = StoredQueryDependencyOwner::Rule(slot as u16);
                 self.rebind_stored_query_dependency_image(
@@ -15009,7 +15012,7 @@ impl Storage {
             }
         }
         for slot in 0..self.matviews.len() {
-            if self.matviews[slot].database == self.current_database
+            if self.matviews[slot].database == current_database()
                 && self.matviews[slot].visible_to(txid)
             {
                 let image = self.matview_dependency_image(slot);
@@ -15017,7 +15020,7 @@ impl Storage {
             }
         }
         for slot in 0..self.policies.len() {
-            if self.policies[slot].database == self.current_database
+            if self.policies[slot].database == current_database()
                 && self.policies[slot].visible_to(txid)
             {
                 let owner = StoredQueryDependencyOwner::Policy(slot as u16);
@@ -15028,7 +15031,7 @@ impl Storage {
             }
         }
         for slot in 0..self.routines.len() {
-            if self.routines[slot].database == self.current_database
+            if self.routines[slot].database == current_database()
                 && self.routines[slot].visible_to(txid)
             {
                 let owner = StoredQueryDependencyOwner::Routine(slot as u16);
@@ -15319,6 +15322,7 @@ impl Storage {
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
+        crate::sql::set_execution_database_oid(DatabaseOid::POSTGRES);
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
         let foreign = foreign::ForeignCatalog::new(config, budget)?;
         let table_capacity = table_slot_capacity(config);
@@ -16294,7 +16298,6 @@ impl Storage {
             brin_unsummarized_ranges: std::cell::RefCell::new(brin_unsummarized_ranges),
             brin_unsummarized_ranges_per_index: config.max_brin_unsummarized_ranges_per_index,
             databases,
-            current_database: DatabaseOid::POSTGRES,
             backends,
             backend_signals,
             relation_cumulative_statistics: std::cell::RefCell::new(relation_cumulative_statistics),
@@ -16937,7 +16940,7 @@ impl Storage {
                 .collations
                 .get(usize::from(slot))
                 .filter(|definition| {
-                    definition.database == self.current_database
+                    definition.database == current_database()
                         && definition.ddl_state != CatalogDdlState::Absent
                 })
                 .map(|definition| definition.definition.behavior)
@@ -17019,7 +17022,7 @@ impl Storage {
                 .collations
                 .get(usize::from(slot))
                 .filter(|definition| {
-                    definition.database == self.current_database
+                    definition.database == current_database()
                         && definition.ddl_state != CatalogDdlState::Absent
                 })
                 .map(|definition| definition.definition.behavior == CollationBehavior::Database)
@@ -17049,7 +17052,7 @@ impl Storage {
     /// replay and the durable image.
     pub fn find_schema(&self, name: &str) -> Option<usize> {
         self.schemas.iter().position(|schema| {
-            schema.database == self.current_database
+            schema.database == current_database()
                 && schema.ddl_state == CatalogDdlState::Present
                 && schema.name.as_str() == name
         })
@@ -17059,7 +17062,7 @@ impl Storage {
     /// CREATE/DROP and every committed schema.
     pub fn find_schema_visible(&self, name: &str, txid: u32) -> Option<usize> {
         self.schemas.iter().position(|n| {
-            n.database == self.current_database && n.visible_to(txid) && n.name.as_str() == name
+            n.database == current_database() && n.visible_to(txid) && n.name.as_str() == name
         })
     }
 
@@ -17154,14 +17157,16 @@ impl Storage {
                 database.get()
             ));
         }
-        self.current_database = database;
-        let public = self.find_schema("public").ok_or_else(|| {
-            sql_err!(
+        let prior = current_database();
+        crate::sql::set_execution_database_oid(database);
+        let Some(public) = self.find_schema("public") else {
+            crate::sql::set_execution_database_oid(prior);
+            return Err(sql_err!(
                 sqlstate::INVALID_SCHEMA_NAME,
                 "database with OID {} has no public schema",
                 database.get()
-            )
-        })?;
+            ));
+        };
         let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
         entries[1] = PathEntry::Schema(public as u16);
         self.path = PathContext {
@@ -17183,18 +17188,18 @@ impl Storage {
                 database.get()
             ));
         }
-        self.current_database = database;
+        crate::sql::set_execution_database_oid(database);
         Ok(())
     }
 
     pub(crate) fn current_database_oid(&self) -> DatabaseOid {
-        self.current_database
+        current_database()
     }
 
     pub(crate) fn current_database_name(&self, txid: u32) -> SqlName {
         self.databases
             .iter()
-            .find(|database| database.oid == self.current_database && database.visible_to(txid))
+            .find(|database| database.oid == current_database() && database.visible_to(txid))
             .map(|database| database.definition_for(txid).name)
             .expect("selected database is visible")
     }
@@ -17327,8 +17332,8 @@ impl Storage {
         target: DatabaseOid,
         txid: u32,
     ) -> Result<(), SqlError> {
-        let prior_database = self.current_database;
-        self.current_database = target;
+        let prior_database = current_database();
+        crate::sql::set_execution_database_oid(target);
         let result = (|| {
             // Catalog collation identities are one byte. Configuration rejects
             // capacities above the representable range before allocation.
@@ -18413,7 +18418,7 @@ impl Storage {
             self.rebind_all_stored_query_dependencies_to(txid)?;
             Ok(())
         })();
-        self.current_database = prior_database;
+        crate::sql::set_execution_database_oid(prior_database);
         result
     }
 
@@ -18786,7 +18791,7 @@ impl Storage {
     }
 
     fn current_database_slot(&self, txid: u32) -> usize {
-        self.database_slot_by_oid(self.current_database, txid)
+        self.database_slot_by_oid(current_database(), txid)
             .expect("selected database remains visible for the statement")
     }
 
@@ -18956,7 +18961,7 @@ impl Storage {
 
     pub(crate) fn large_object_slot(&self, oid: LargeObjectOid, txid: u32) -> Option<usize> {
         self.large_objects.iter().position(|object| {
-            object.database == self.current_database && object.oid == oid && object.visible_to(txid)
+            object.database == current_database() && object.oid == oid && object.visible_to(txid)
         })
     }
 
@@ -18969,7 +18974,7 @@ impl Storage {
             .copied()
             .enumerate()
             .filter(move |(_, object)| {
-                object.database == self.current_database && object.visible_to(txid)
+                object.database == current_database() && object.visible_to(txid)
             })
     }
 
@@ -19016,7 +19021,7 @@ impl Storage {
                         .checked_add(1)
                         .and_then(LargeObjectOid::parse);
                     if !self.large_objects.iter().any(|object| {
-                        object.database == self.current_database
+                        object.database == current_database()
                             && object.ddl_state != CatalogDdlState::Absent
                             && object.oid == candidate
                     }) {
@@ -19032,7 +19037,7 @@ impl Storage {
             }
         };
         if let Some(owner) = self.large_objects.iter().find_map(|object| {
-            (object.database == self.current_database && object.oid == oid)
+            (object.database == current_database() && object.oid == oid)
                 .then_some(object.ddl_state.pending_txid()?)
                 .filter(|owner| *owner != txid)
         }) {
@@ -19055,7 +19060,7 @@ impl Storage {
         });
         self.catalog_seq += 1;
         self.large_objects[slot] = LargeObjectDef {
-            database: self.current_database,
+            database: current_database(),
             oid,
             ownership: self.initial_ownership(txid),
             created_at: self.catalog_seq,
@@ -19192,7 +19197,7 @@ impl Storage {
         let slot = match class {
             AccessClass::Table => self.find_visible(schema, name, txid),
             AccessClass::View => self.views.iter().position(|view| {
-                view.database == self.current_database
+                view.database == current_database()
                     && view.visible_to(txid)
                     && view.schema_for(txid).as_str() == schema
                     && view.name_for(txid).as_str() == name
@@ -19203,13 +19208,13 @@ impl Storage {
             AccessClass::Domain => self.domain_slot(schema, name, txid),
             AccessClass::Enum => self.enum_slot(schema, name, txid),
             AccessClass::Index => self.indexes.iter().position(|index| {
-                index.database == self.current_database
+                index.database == current_database()
                     && index.visible_to(txid)
                     && index.schema.as_str() == schema
                     && index.name_for(txid).as_str() == name
             }),
             AccessClass::Routine => self.routines.iter().position(|routine| {
-                routine.database == self.current_database
+                routine.database == current_database()
                     && routine.visible_to(txid)
                     && routine.schema_for(txid).as_str() == schema
                     && routine.name_for(txid).as_str() == name
@@ -19415,7 +19420,7 @@ impl Storage {
 
     fn access_object_in_current_database(&self, object: AccessObject) -> bool {
         self.access_object_database(object)
-            .is_none_or(|database| database == self.current_database)
+            .is_none_or(|database| database == current_database())
     }
 
     pub(crate) fn access_object_database(&self, object: AccessObject) -> Option<DatabaseOid> {
@@ -20669,7 +20674,7 @@ impl Storage {
         self.default_acl_entries
             .iter()
             .find(|entry| {
-                entry.database == self.current_database
+                entry.database == current_database()
                     && entry.owner == owner
                     && entry.schema == schema
                     && entry.class == class
@@ -20714,7 +20719,7 @@ impl Storage {
             .default_acl_entries
             .iter()
             .position(|entry| {
-                entry.database == self.current_database
+                entry.database == current_database()
                     && entry.owner == owner
                     && entry.schema == schema
                     && entry.class == class
@@ -20729,7 +20734,7 @@ impl Storage {
         if slot == self.default_acl_entries.len() {
             self.default_acl_entries
                 .push(DefaultAclEntry {
-                    database: self.current_database,
+                    database: current_database(),
                     owner,
                     schema,
                     class,
@@ -20748,7 +20753,7 @@ impl Storage {
                 })?;
         } else if self.default_acl_entries[slot].owner == PUBLIC_ROLE {
             let entry = &mut self.default_acl_entries[slot];
-            entry.database = self.current_database;
+            entry.database = current_database();
             entry.owner = owner;
             entry.schema = schema;
             entry.class = class;
@@ -20790,7 +20795,7 @@ impl Storage {
         self.default_acl_entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.database == self.current_database)
+            .filter(|(_, entry)| entry.database == current_database())
     }
 
     pub(crate) fn commit_default_acl(&mut self, slot: usize, txid: u32) {
@@ -22348,14 +22353,14 @@ impl Storage {
     /// output.
     pub fn live_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
         self.schemas.iter().enumerate().filter(|(_, schema)| {
-            schema.database == self.current_database && schema.ddl_state == CatalogDdlState::Present
+            schema.database == current_database() && schema.ddl_state == CatalogDdlState::Present
         })
     }
 
     /// Schemas visible to `txid`, for catalog output inside a transaction.
     pub fn visible_schemas(&self, txid: u32) -> impl Iterator<Item = (usize, &SchemaDef)> {
         self.schemas.iter().enumerate().filter(move |(_, schema)| {
-            schema.database == self.current_database && schema.visible_to(txid)
+            schema.database == current_database() && schema.visible_to(txid)
         })
     }
 
@@ -22366,7 +22371,7 @@ impl Storage {
             class,
             CommentClass::Tablespace | CommentClass::Database | CommentClass::Role
         ))
-        .then_some(self.current_database)
+        .then_some(current_database())
     }
 
     fn comment_identity_uses_subid(class: CommentClass) -> bool {
@@ -22417,7 +22422,7 @@ impl Storage {
                 && comment.live.is_some()
                 && comment
                     .database
-                    .is_none_or(|database| database == self.current_database)
+                    .is_none_or(|database| database == current_database())
         })
     }
 
@@ -22431,7 +22436,7 @@ impl Storage {
         self.comments.iter().filter_map(move |c| {
             if !c.used
                 || c.database
-                    .is_some_and(|database| database != self.current_database)
+                    .is_some_and(|database| database != current_database())
             {
                 return None;
             }
@@ -22482,7 +22487,7 @@ impl Storage {
         new_name: SqlName,
         txid: u32,
     ) -> Option<(usize, Option<PendingCommentIdentity>)> {
-        let database = Some(self.current_database);
+        let database = Some(current_database());
         let slot = self.comments.iter().position(|comment| {
             comment.matches_to(
                 database,
@@ -22520,7 +22525,7 @@ impl Storage {
     ) {
         for comment in self.comments.iter_mut().filter(|comment| {
             comment.matches_to(
-                Some(self.current_database),
+                Some(current_database()),
                 CommentClass::Trigger,
                 "",
                 old_name.as_str(),
@@ -22545,7 +22550,7 @@ impl Storage {
         new_name: SqlName,
         txid: u32,
     ) {
-        let database = Some(self.current_database);
+        let database = Some(current_database());
         for comment in self.comments.iter_mut().filter(|comment| {
             comment.used
                 && comment.database == database
@@ -22573,7 +22578,7 @@ impl Storage {
         old_name: SqlName,
         txid: u32,
     ) {
-        let database = Some(self.current_database);
+        let database = Some(current_database());
         for comment in self.comments.iter_mut().filter(|comment| {
             comment.used
                 && comment.database == database
@@ -22604,7 +22609,7 @@ impl Storage {
         if old_schema == new_schema && old_name == new_name {
             return;
         }
-        let database = Some(self.current_database);
+        let database = Some(current_database());
         for comment in self.comments.iter_mut().filter(|comment| {
             comment.used
                 && comment.database == database
@@ -22838,7 +22843,7 @@ impl Storage {
             ));
         }
         if let Some(owner) = self.schemas.iter().find_map(|schema| {
-            (schema.database == self.current_database && schema.name.as_str() == name.as_str())
+            (schema.database == current_database() && schema.name.as_str() == name.as_str())
                 .then_some(schema.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
@@ -22874,7 +22879,7 @@ impl Storage {
             slot: slot as u16,
         });
         self.schemas[slot] = SchemaDef {
-            database: self.current_database,
+            database: current_database(),
             name,
             ownership,
             ddl_state,
@@ -22932,7 +22937,7 @@ impl Storage {
         }
         if self.schemas.iter().enumerate().any(|(other, schema)| {
             other != slot
-                && schema.database == self.current_database
+                && schema.database == current_database()
                 && schema.ddl_state != CatalogDdlState::Absent
                 && schema.name == name
         }) {
@@ -22948,7 +22953,7 @@ impl Storage {
         // catalog identity, so a fixed-capacity path never leaves a partial
         // rename behind.
         for rule in self.rules.iter().filter(|rule| {
-            rule.database == self.current_database && rule.ddl_state != CatalogDdlState::Absent
+            rule.database == current_database() && rule.ddl_state != CatalogDdlState::Absent
         }) {
             let mut path = rule.definition.creation_path;
             rename_schema_path(&mut path, prior, name)?;
@@ -22962,7 +22967,7 @@ impl Storage {
             }
         }
         for definition in self.routines.iter().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             let mut path = definition.creation_path;
@@ -22977,7 +22982,7 @@ impl Storage {
             }
         }
         for definition in self.matviews.iter().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             let mut path = definition.creation_path;
@@ -22987,8 +22992,7 @@ impl Storage {
         }
         for table_slot in 0..self.tables.len() {
             let table = &self.tables[table_slot];
-            if table.database != self.current_database
-                || (!table.live && table.pending_ddl.is_none())
+            if table.database != current_database() || (!table.live && table.pending_ddl.is_none())
             {
                 continue;
             }
@@ -23003,7 +23007,7 @@ impl Storage {
             }
         }
         for definition in self.domains.iter().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             if let Some(default) = definition.default_expr {
@@ -23016,7 +23020,7 @@ impl Storage {
             }
         }
         for definition in self.indexes.iter().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             for expression in definition.expressions.iter().flatten() {
@@ -23032,7 +23036,7 @@ impl Storage {
         self.schemas[slot].name = name;
 
         for table_slot in 0..self.tables.len() {
-            if self.tables[table_slot].database != self.current_database {
+            if self.tables[table_slot].database != current_database() {
                 continue;
             }
             let table = &mut self.tables[table_slot];
@@ -23065,7 +23069,7 @@ impl Storage {
         }
 
         for definition in self.views.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.schema, prior, name);
@@ -23074,7 +23078,7 @@ impl Storage {
             }
         }
         for definition in self.sequences.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.schema, prior, name);
@@ -23095,7 +23099,7 @@ impl Storage {
             }
         }
         for definition in self.indexes.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.schema, prior, name);
@@ -23107,7 +23111,7 @@ impl Storage {
             }
         }
         for definition in self.domains.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.schema, prior, name);
@@ -23126,7 +23130,7 @@ impl Storage {
             }
         }
         for definition in self.enums.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.schema, prior, name);
@@ -23135,7 +23139,7 @@ impl Storage {
             }
         }
         for definition in self.composites.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.schema, prior, name);
@@ -23150,7 +23154,7 @@ impl Storage {
             }
         }
         for definition in self.routines.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.schema, prior, name);
@@ -23203,7 +23207,7 @@ impl Storage {
             }
         }
         for definition in self.collations.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.definition.schema, prior, name);
@@ -23212,7 +23216,7 @@ impl Storage {
             }
         }
         for definition in self.conversions.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.definition.schema, prior, name);
@@ -23221,7 +23225,7 @@ impl Storage {
             }
         }
         for definition in self.text_search_objects.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             if definition.definition.schema() == prior {
@@ -23234,7 +23238,7 @@ impl Storage {
             }
         }
         for definition in self.operators.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.definition.schema, prior, name);
@@ -23243,7 +23247,7 @@ impl Storage {
             }
         }
         for definition in self.operator_families.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.definition.schema, prior, name);
@@ -23252,7 +23256,7 @@ impl Storage {
             }
         }
         for definition in self.operator_classes.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.definition.schema, prior, name);
@@ -23261,7 +23265,7 @@ impl Storage {
             }
         }
         for definition in self.extended_statistics.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_name(&mut definition.mutable.schema, prior, name);
@@ -23271,7 +23275,7 @@ impl Storage {
         }
 
         for definition in self.rules.iter_mut().filter(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
         }) {
             rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
@@ -23282,7 +23286,7 @@ impl Storage {
             }
         }
         for definition in self.matviews.iter_mut() {
-            if definition.database == self.current_database
+            if definition.database == current_database()
                 && definition.ddl_state != CatalogDdlState::Absent
             {
                 rename_schema_path(&mut definition.creation_path, prior, name)?;
@@ -23290,7 +23294,7 @@ impl Storage {
             }
         }
         for slot in 0..self.rules.len() {
-            if self.rules[slot].database == self.current_database
+            if self.rules[slot].database == current_database()
                 && self.rules[slot].ddl_state != CatalogDdlState::Absent
             {
                 rename_dependency_schema(
@@ -23301,7 +23305,7 @@ impl Storage {
             }
         }
         for slot in 0..self.matviews.len() {
-            if self.matviews[slot].database == self.current_database
+            if self.matviews[slot].database == current_database()
                 && self.matviews[slot].ddl_state != CatalogDdlState::Absent
             {
                 let image = self.matview_dependency_image(slot);
@@ -23310,7 +23314,7 @@ impl Storage {
             }
         }
         for slot in 0..self.policies.len() {
-            if self.policies[slot].database == self.current_database
+            if self.policies[slot].database == current_database()
                 && self.policies[slot].ddl_state != CatalogDdlState::Absent
             {
                 rename_dependency_schema(
@@ -23323,7 +23327,7 @@ impl Storage {
             }
         }
         for slot in 0..self.routines.len() {
-            if self.routines[slot].database == self.current_database
+            if self.routines[slot].database == current_database()
                 && self.routines[slot].ddl_state != CatalogDdlState::Absent
             {
                 rename_dependency_schema(
@@ -23341,7 +23345,7 @@ impl Storage {
             }
         }
         for comment in self.comments.iter_mut() {
-            if comment.used && comment.database == Some(self.current_database) {
+            if comment.used && comment.database == Some(current_database()) {
                 if comment.class == CommentClass::Schema && comment.name == prior {
                     comment.name = name;
                 }
@@ -23366,13 +23370,13 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, extension)| {
-                extension.database == self.current_database && extension.visible_to(txid)
+                extension.database == current_database() && extension.visible_to(txid)
             })
     }
 
     pub(crate) fn extension_slot(&self, name: &str, txid: u32) -> Option<usize> {
         self.extensions.iter().position(|extension| {
-            extension.database == self.current_database
+            extension.database == current_database()
                 && extension.visible_to(txid)
                 && extension.name.as_str() == name
         })
@@ -23401,7 +23405,7 @@ impl Storage {
             ));
         }
         if let Some(owner) = self.extensions.iter().find_map(|extension| {
-            (extension.database == self.current_database && extension.name == name)
+            (extension.database == current_database() && extension.name == name)
                 .then_some(extension.ddl_state.pending_txid()?)
                 .filter(|owner| *owner != txid)
         }) {
@@ -23425,7 +23429,7 @@ impl Storage {
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         let created_at = self.catalog_seq;
         self.extensions[slot] = ExtensionDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             name,
             namespace: namespace as u16,
@@ -23449,7 +23453,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         if let Some(slot) = self.extension_slot(name.as_str(), 0) {
             self.extensions[slot] = ExtensionDef {
-                database: self.current_database,
+                database: current_database(),
                 created_at,
                 name,
                 namespace: namespace as u16,
@@ -23476,7 +23480,7 @@ impl Storage {
                 )
             })?;
         self.extensions[slot] = ExtensionDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             name,
             namespace: namespace as u16,
@@ -24130,7 +24134,7 @@ impl Storage {
             return Some(ResolvedRelation::Table(t));
         }
         let view = self.views.iter().position(|v| {
-            v.database == self.current_database
+            v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
                 && v.name_for(txid).as_str() == name
@@ -24164,7 +24168,7 @@ impl Storage {
             return Some(StoredRelKind::Sequence);
         }
         if self.indexes.iter().any(|i| {
-            i.database == self.current_database
+            i.database == current_database()
                 && i.visible_to(txid)
                 && i.schema.as_str() == schema
                 && i.name_for(txid).as_str() == name
@@ -24273,7 +24277,7 @@ impl Storage {
     pub fn live_tables(&self) -> impl Iterator<Item = (usize, &Table)> {
         self.tables.iter().enumerate().filter(|(slot, table)| {
             *slot != self.large_object_page_table()
-                && table.database == self.current_database
+                && table.database == current_database()
                 && table.live
         })
     }
@@ -29786,7 +29790,7 @@ impl Storage {
     /// replay and any context that operates on the durable image.
     pub fn find_table(&self, schema: &str, name: &str) -> Option<usize> {
         self.tables.iter().take(self.table_count()).position(|t| {
-            t.database == self.current_database
+            t.database == current_database()
                 && t.live
                 && t.def.schema.as_str() == schema
                 && t.def.name.as_str() == name
@@ -29802,7 +29806,7 @@ impl Storage {
             .take(self.table_count())
             .enumerate()
             .position(|(index, table)| {
-                table.database == self.current_database
+                table.database == current_database()
                     && table.visible_to(txid)
                     && self.table_def(index, txid).schema.as_str() == schema
                     && self.table_def(index, txid).name.as_str() == name
@@ -29814,7 +29818,7 @@ impl Storage {
     }
 
     pub(crate) fn table_slot_visible_to(&self, index: usize, txid: u32) -> bool {
-        self.tables[index].database == self.current_database && self.tables[index].visible_to(txid)
+        self.tables[index].database == current_database() && self.tables[index].visible_to(txid)
     }
 
     pub fn table_mut(&mut self, index: usize) -> &mut Table {
@@ -30021,7 +30025,7 @@ impl Storage {
     fn commit_constraint_comment_identities(&mut self, table: usize, txid: u32) {
         for comment in self.comments.iter_mut().filter(|comment| {
             comment.used
-                && comment.database == Some(self.current_database)
+                && comment.database == Some(current_database())
                 && comment.class == CommentClass::Constraint
                 && comment.subid == table as u32
                 && comment
@@ -30074,7 +30078,7 @@ impl Storage {
         self.reset_implicit_index_statistics(slot);
         self.clear_table_rows(slot);
         let table = &mut self.tables[slot];
-        table.database = self.current_database;
+        table.database = current_database();
         table.def = def;
         table.ownership = ownership;
         table.created_at = stamp;
@@ -30403,7 +30407,7 @@ impl Storage {
             creating: false,
         });
         for rule in self.rules.iter_mut().filter(|rule| {
-            rule.database == self.current_database
+            rule.database == current_database()
                 && rule.visible_to(txid)
                 && rule.definition_for(txid).target == RuleTarget::Table(index as u16)
         }) {
@@ -30456,7 +30460,7 @@ impl Storage {
     pub fn rollback_drop(&mut self, index: usize) {
         self.tables[index].pending_ddl = None;
         for rule in self.rules.iter_mut().filter(|rule| {
-            rule.database == self.current_database
+            rule.database == current_database()
                 && rule.definition.target == RuleTarget::Table(index as u16)
                 && matches!(rule.ddl_state, CatalogDdlState::PendingDrop { .. })
         }) {
@@ -30467,29 +30471,30 @@ impl Storage {
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
         self.views.iter().any(|view| {
-            view.database == self.current_database && view.ddl_state != CatalogDdlState::Absent
+            view.database == current_database() && view.ddl_state != CatalogDdlState::Absent
         })
     }
 
     /// Committed views as (name, SELECT text), for checkpoint serialization.
     pub fn live_views(&self) -> impl Iterator<Item = &ViewDef> {
         self.views.iter().filter(|view| {
-            view.database == self.current_database && view.ddl_state == CatalogDdlState::Present
+            view.database == current_database() && view.ddl_state == CatalogDdlState::Present
         })
     }
 
     /// Committed views with their slot indices, for OID assignment.
     pub fn views_with_slots(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
         self.views.iter().enumerate().filter(|(_, view)| {
-            view.database == self.current_database && view.ddl_state == CatalogDdlState::Present
+            view.database == current_database() && view.ddl_state == CatalogDdlState::Present
         })
     }
 
     /// Views visible to `txid`, including the transaction's own DDL.
     pub(crate) fn views_visible_to(&self, txid: u32) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views.iter().enumerate().filter(move |(_, view)| {
-            view.database == self.current_database && view.visible_to(txid)
-        })
+        self.views
+            .iter()
+            .enumerate()
+            .filter(move |(_, view)| view.database == current_database() && view.visible_to(txid))
     }
 
     pub(crate) fn view(&self, slot: usize) -> &ViewDef {
@@ -30497,7 +30502,7 @@ impl Storage {
     }
 
     pub(crate) fn view_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.views[slot].database == self.current_database && self.views[slot].visible_to(txid)
+        self.views[slot].database == current_database() && self.views[slot].visible_to(txid)
     }
 
     pub(crate) fn view_dependencies(&self, slot: usize) -> StoredQueryDependencyView<'_> {
@@ -30544,7 +30549,7 @@ impl Storage {
     /// Committed publications for catalog visibility and replication setup.
     pub fn live_publications(&self) -> impl Iterator<Item = &PublicationDef> {
         self.publications.iter().filter(|publication| {
-            publication.database == self.current_database
+            publication.database == current_database()
                 && publication.ddl_state == CatalogDdlState::Present
         })
     }
@@ -30554,7 +30559,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(|(_, publication)| {
-                publication.database == self.current_database
+                publication.database == current_database()
                     && publication.ddl_state == CatalogDdlState::Present
             })
     }
@@ -30571,7 +30576,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, publication)| {
-                publication.database == self.current_database && publication.visible_to(txid)
+                publication.database == current_database() && publication.visible_to(txid)
             })
     }
 
@@ -30590,7 +30595,7 @@ impl Storage {
             .iter()
             .enumerate()
             .find_map(|(slot, publication)| {
-                (publication.database == self.current_database
+                (publication.database == current_database()
                     && publication.visible_to(txid)
                     && publication.name_for(txid).as_str() == name)
                     .then_some((slot, publication.definition_for(txid)))
@@ -30645,7 +30650,7 @@ impl Storage {
             .enumerate()
             .any(|(other_slot, publication)| {
                 other_slot != slot
-                    && publication.database == self.current_database
+                    && publication.database == current_database()
                     && publication.visible_to(txid)
                     && publication.name_for(txid) == name
             })
@@ -30661,7 +30666,7 @@ impl Storage {
                 .iter()
                 .enumerate()
                 .find_map(|(other_slot, publication)| {
-                    (other_slot != slot && publication.database == self.current_database)
+                    (other_slot != slot && publication.database == current_database())
                         .then_some(publication.pending_name)
                         .flatten()
                         .filter(|pending| pending.name == name && pending.txid != txid)
@@ -30710,7 +30715,7 @@ impl Storage {
     ) -> Option<(SqlName, PublicationDefinition)> {
         self.publications.iter().find_map(|publication| {
             let definition = publication.definition_for(txid);
-            (publication.database == self.current_database
+            (publication.database == current_database()
                 && publication.visible_to(txid)
                 && definition.schemas[..definition.schema_count].contains(&schema))
             .then_some((publication.name_for(txid), definition))
@@ -30766,7 +30771,7 @@ impl Storage {
             ));
         };
         self.replication_slots[index] = ReplicationSlotDef {
-            database: self.current_database,
+            database: current_database(),
             name: name.sql_name(),
             restart_lsn,
             confirmed_flush_lsn: restart_lsn,
@@ -30784,7 +30789,7 @@ impl Storage {
 
     pub(crate) fn replication_slot(&self, name: &str) -> Option<&ReplicationSlotDef> {
         self.replication_slots.iter().find(|slot| {
-            slot.database == self.current_database && slot.live && slot.name.as_str() == name
+            slot.database == current_database() && slot.live && slot.name.as_str() == name
         })
     }
 
@@ -30797,7 +30802,7 @@ impl Storage {
             .replication_slots
             .iter_mut()
             .find(|slot| {
-                slot.database == self.current_database && slot.live && slot.name == name.sql_name()
+                slot.database == current_database() && slot.live && slot.name == name.sql_name()
             })
             .ok_or_else(|| {
                 sql_err!(
@@ -30823,7 +30828,7 @@ impl Storage {
         self.replication_slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| slot.database == self.current_database && slot.live)
+            .filter(|(_, slot)| slot.database == current_database() && slot.live)
     }
 
     pub(crate) fn replication_slot_capacity(&self) -> usize {
@@ -30858,7 +30863,7 @@ impl Storage {
 
     pub(crate) fn drop_replication_slot(&mut self, name: &str) -> Result<(), SqlError> {
         let Some(slot) = self.replication_slots.iter_mut().find(|slot| {
-            slot.database == self.current_database && slot.live && slot.name.as_str() == name
+            slot.database == current_database() && slot.live && slot.name.as_str() == name
         }) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -30874,7 +30879,7 @@ impl Storage {
             ));
         }
         *slot = ReplicationSlotDef {
-            database: self.current_database,
+            database: current_database(),
             name: SqlName::EMPTY,
             restart_lsn: 0,
             confirmed_flush_lsn: 0,
@@ -30994,7 +30999,7 @@ impl Storage {
             ));
         }
         for slot in self.replication_slots.iter_mut().filter(|slot| {
-            slot.database == self.current_database
+            slot.database == current_database()
                 && slot.live
                 && name.is_none_or(|name| slot.name.as_str() == name)
         }) {
@@ -31024,7 +31029,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, subscription)| {
-                subscription.database == self.current_database && subscription.visible_to(txid)
+                subscription.database == current_database() && subscription.visible_to(txid)
             })
     }
 
@@ -31035,7 +31040,7 @@ impl Storage {
         reset_at: i64,
     ) {
         for (index, subscription) in self.subscriptions.iter_mut().enumerate() {
-            if subscription.database == self.current_database
+            if subscription.database == current_database()
                 && subscription.visible_to(txid)
                 && slot.is_none_or(|slot| slot == index)
             {
@@ -31057,7 +31062,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(|(_, subscription)| {
-                subscription.database == self.current_database
+                subscription.database == current_database()
                     && (subscription.ddl_state == CatalogDdlState::Present
                         || subscription.cleanup != SubscriptionCleanup::None)
             })
@@ -31118,7 +31123,7 @@ impl Storage {
             ));
         }
         if self.subscriptions.iter().any(|subscription| {
-            subscription.database == self.current_database
+            subscription.database == current_database()
                 && subscription.visible_to(txid)
                 && subscription.name_for(txid) == spec.name
         }) {
@@ -31142,7 +31147,7 @@ impl Storage {
         publications[..spec.publications.len()].copy_from_slice(spec.publications);
         self.catalog_seq += 1;
         self.subscriptions[slot] = SubscriptionDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition_generation: 1,
             name: spec.name,
@@ -31179,7 +31184,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         let Some(slot) = self.subscriptions.iter().position(|subscription| {
-            subscription.database == self.current_database
+            subscription.database == current_database()
                 && subscription.visible_to(txid)
                 && subscription.name_for(txid).as_str() == name
         }) else {
@@ -31286,7 +31291,7 @@ impl Storage {
             .enumerate()
             .any(|(other, subscription)| {
                 other != slot
-                    && subscription.database == self.current_database
+                    && subscription.database == current_database()
                     && subscription.visible_to(txid)
                     && subscription.name_for(txid) == name
             })
@@ -31581,8 +31586,8 @@ impl Storage {
                 "subscription worker slot is invalid"
             )
         })?;
-        if subscription.database != self.current_database
-            || stream.database != self.current_database
+        if subscription.database != current_database()
+            || stream.database != current_database()
             || !subscription.visible_to(0)
             || subscription.created_at != stream.created_at()
             || subscription.definition_generation != stream.definition_generation()
@@ -31620,7 +31625,7 @@ impl Storage {
         self.subscriptions
             .get(slot)
             .filter(|subscription| {
-                subscription.database == self.current_database && subscription.visible_to(txid)
+                subscription.database == current_database() && subscription.visible_to(txid)
             })
             .map(|subscription| SubscriptionStream {
                 database: subscription.database,
@@ -31641,8 +31646,8 @@ impl Storage {
             .subscriptions
             .get(stream.slot)
             .filter(|subscription| {
-                stream.database == self.current_database
-                    && subscription.database == self.current_database
+                stream.database == current_database()
+                    && subscription.database == current_database()
                     && subscription.visible_to(txid)
                     && subscription.created_at == stream.created_at
                     && subscription.definition_generation == stream.definition_generation
@@ -31673,8 +31678,8 @@ impl Storage {
             .get_mut(advance.stream.slot)
             .filter(|subscription| {
                 subscription.ddl_state == CatalogDdlState::Present
-                    && subscription.database == self.current_database
-                    && advance.stream.database == self.current_database
+                    && subscription.database == current_database()
+                    && advance.stream.database == current_database()
                     && subscription.created_at == advance.stream.created_at
                     && subscription.definition_generation == advance.stream.definition_generation
                     && subscription.name == advance.stream.name
@@ -31702,8 +31707,8 @@ impl Storage {
         self.subscriptions
             .get(stream.slot)
             .filter(|subscription| {
-                stream.database == self.current_database
-                    && subscription.database == self.current_database
+                stream.database == current_database()
+                    && subscription.database == current_database()
                     && subscription.visible_to(txid)
                     && subscription.created_at == stream.created_at
                     && subscription.definition_generation == stream.definition_generation
@@ -31904,15 +31909,14 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.database == self.current_database
-                && publication.name_for(txid) == spec.name)
+            (publication.database == current_database() && publication.name_for(txid) == spec.name)
                 .then_some(publication.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
         }
         if self.publications.iter().any(|publication| {
-            publication.database == self.current_database
+            publication.database == current_database()
                 && publication.visible_to(txid)
                 && publication.name_for(txid) == spec.name
         }) {
@@ -31923,7 +31927,7 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.database == self.current_database)
+            (publication.database == current_database())
                 .then_some(publication.pending_name)
                 .flatten()
                 .filter(|pending| pending.name == spec.name && pending.txid != txid)
@@ -31955,7 +31959,7 @@ impl Storage {
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
         self.catalog_seq += 1;
         self.publications[slot] = PublicationDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             name: spec.name,
             pending_name: None,
@@ -31982,7 +31986,7 @@ impl Storage {
 
     pub fn drop_publication(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
         let Some(slot) = self.publications.iter().position(|publication| {
-            publication.database == self.current_database
+            publication.database == current_database()
                 && publication.visible_to(txid)
                 && publication.name_for(txid).as_str() == name
         }) else {
@@ -32025,7 +32029,7 @@ impl Storage {
             ));
         }
         let Some(slot) = self.publications.iter().position(|publication| {
-            publication.database == self.current_database
+            publication.database == current_database()
                 && publication.visible_to(txid)
                 && publication.name_for(txid).as_str() == name
         }) else {
@@ -32093,7 +32097,7 @@ impl Storage {
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<&ViewDef> {
         self.views.iter().find(|v| {
-            v.database == self.current_database
+            v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
                 && v.name_for(txid).as_str() == name
@@ -32105,15 +32109,14 @@ impl Storage {
 
     /// Committed materialized views, for checkpoint serialization.
     pub fn live_matviews(&self) -> impl Iterator<Item = &MatviewDef> {
-        self.matviews.iter().filter(|m| {
-            m.database == self.current_database && m.ddl_state == CatalogDdlState::Present
-        })
+        self.matviews
+            .iter()
+            .filter(|m| m.database == current_database() && m.ddl_state == CatalogDdlState::Present)
     }
 
     pub fn matviews_with_slots(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
         self.matviews.iter().enumerate().filter(|(_, matview)| {
-            matview.database == self.current_database
-                && matview.ddl_state == CatalogDdlState::Present
+            matview.database == current_database() && matview.ddl_state == CatalogDdlState::Present
         })
     }
 
@@ -32126,7 +32129,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, matview)| {
-                matview.database == self.current_database && matview.visible_to(txid)
+                matview.database == current_database() && matview.visible_to(txid)
             })
     }
 
@@ -32145,7 +32148,7 @@ impl Storage {
 
     pub fn find_matview(&self, schema: &str, name: &str, txid: u32) -> Option<&MatviewDef> {
         self.matviews.iter().find(|m| {
-            m.database == self.current_database
+            m.database == current_database()
                 && m.visible_to(txid)
                 && self.table_slot_visible_to(usize::from(m.backing_table), txid)
                 && {
@@ -32159,7 +32162,7 @@ impl Storage {
     /// (REFRESH marks it populated).
     pub fn matview_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.matviews.iter().position(|m| {
-            m.database == self.current_database
+            m.database == current_database()
                 && m.visible_to(txid)
                 && self.table_slot_visible_to(usize::from(m.backing_table), txid)
                 && {
@@ -32175,7 +32178,7 @@ impl Storage {
 
     pub(crate) fn matview_slot_for_table(&self, table: usize, txid: u32) -> Option<usize> {
         self.matviews.iter().position(|matview| {
-            matview.database == self.current_database
+            matview.database == current_database()
                 && matview.visible_to(txid)
                 && usize::from(matview.backing_table) == table
         })
@@ -32203,7 +32206,7 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
-            (m.database == self.current_database
+            (m.database == current_database()
                 && m.ddl_state != CatalogDdlState::Absent
                 && m.backing_table == backing_table as u16)
                 .then_some(m.ddl_state.pending_txid()?)
@@ -32231,7 +32234,7 @@ impl Storage {
         let dependency_count = self.write_dependency_image(image, query.dependencies.view())?;
         self.catalog_seq += 1;
         self.matviews[new] = MatviewDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             backing_table: backing_table as u16,
             sql: query.sql,
@@ -32251,7 +32254,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
-            (m.database == self.current_database && m.ddl_state != CatalogDdlState::Absent && {
+            (m.database == current_database() && m.ddl_state != CatalogDdlState::Absent && {
                 let table = self.table_def(usize::from(m.backing_table), txid);
                 table.schema.as_str() == schema && table.name.as_str() == name
             })
@@ -32261,7 +32264,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.matviews.iter().position(|m| {
-            m.database == self.current_database && m.visible_to(txid) && {
+            m.database == current_database() && m.visible_to(txid) && {
                 let table = self.table_def(usize::from(m.backing_table), txid);
                 table.schema.as_str() == schema && table.name.as_str() == name
             }
@@ -32309,14 +32312,14 @@ impl Storage {
 
     pub fn live_sequences(&self) -> impl Iterator<Item = &SequenceDef> {
         self.sequences.iter().filter(|sequence| {
-            sequence.database == self.current_database
+            sequence.database == current_database()
                 && sequence.ddl_state == CatalogDdlState::Present
         })
     }
 
     pub fn sequences_with_slots(&self) -> impl Iterator<Item = (usize, &SequenceDef)> {
         self.sequences.iter().enumerate().filter(|(_, sequence)| {
-            sequence.database == self.current_database
+            sequence.database == current_database()
                 && sequence.ddl_state == CatalogDdlState::Present
         })
     }
@@ -32330,14 +32333,13 @@ impl Storage {
     }
 
     pub(crate) fn sequence_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.sequences[slot].database == self.current_database
-            && self.sequences[slot].visible_to(txid)
+        self.sequences[slot].database == current_database() && self.sequences[slot].visible_to(txid)
     }
 
     pub fn find_sequence(&self, schema: &str, name: &str, txid: u32) -> Option<&SequenceDef> {
         self.sequences.iter().find(|s| {
             let definition = s.definition_for(txid);
-            s.database == self.current_database
+            s.database == current_database()
                 && s.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
@@ -32347,7 +32349,7 @@ impl Storage {
     pub fn sequence_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         let slot = self.sequences.iter().position(|s| {
             let definition = s.definition_for(txid);
-            s.database == self.current_database
+            s.database == current_database()
                 && s.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
@@ -32368,7 +32370,7 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         let direct = self.sequences.iter().position(|sequence| {
-            sequence.database == self.current_database
+            sequence.database == current_database()
                 && sequence.visible_to(txid)
                 && matches!(
                     sequence.definition_for(txid).generator_for,
@@ -32406,7 +32408,7 @@ impl Storage {
                     .then_some(committed.columns()[index].name)
             })?;
         self.sequences.iter().position(|sequence| {
-            sequence.database == self.current_database
+            sequence.database == current_database()
                 && sequence.visible_to(txid)
                 && matches!(
                     sequence.definition_for(txid).generator_for,
@@ -32478,7 +32480,7 @@ impl Storage {
         } = create;
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
-            (s.database == self.current_database
+            (s.database == current_database()
                 && s.schema.as_str() == schema.as_str()
                 && s.name.as_str() == name.as_str())
             .then_some(s.ddl_state.pending_txid()?)
@@ -32504,7 +32506,7 @@ impl Storage {
         });
         self.catalog_seq += 1;
         self.sequences[new] = SequenceDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             cache_generation: 0,
             schema,
@@ -32899,7 +32901,7 @@ impl Storage {
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
             let definition = s.definition_for(txid);
-            (s.database == self.current_database
+            (s.database == current_database()
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name)
                 .then_some(s.ddl_state.pending_txid()?)
@@ -32909,7 +32911,7 @@ impl Storage {
         }
         let Some(i) = self.sequences.iter().position(|s| {
             let definition = s.definition_for(txid);
-            s.database == self.current_database
+            s.database == current_database()
                 && s.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
@@ -32944,7 +32946,7 @@ impl Storage {
     /// without marking dirty (replay must not re-journal).
     pub fn apply_sequence_advance(&mut self, schema: &str, name: &str, last: i64, is_called: bool) {
         if let Some(i) = self.sequences.iter().position(|s| {
-            s.database == self.current_database
+            s.database == current_database()
                 && s.ddl_state != CatalogDdlState::Absent
                 && s.schema.as_str() == schema
                 && s.name.as_str() == name
@@ -32974,7 +32976,7 @@ impl Storage {
         if let Some(schema) = qualifier {
             return self.domains.iter().position(|d| {
                 let definition = d.definition_for(txid);
-                d.database == self.current_database
+                d.database == current_database()
                     && d.visible_to(txid)
                     && definition.schema.as_str() == schema
                     && definition.name.as_str() == name
@@ -32985,7 +32987,7 @@ impl Storage {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.domains.iter().position(|d| {
                     let definition = d.definition_for(txid);
-                    d.database == self.current_database
+                    d.database == current_database()
                         && d.visible_to(txid)
                         && definition.schema.as_str() == schema.as_str()
                         && definition.name.as_str() == name
@@ -33014,7 +33016,7 @@ impl Storage {
         self.domains
             .iter()
             .position(|domain| {
-                domain.database == self.current_database
+                domain.database == current_database()
                     && domain.visible_to(txid)
                     && domain.definition_for(txid).name.as_str() == name
             })
@@ -33025,7 +33027,7 @@ impl Storage {
     pub fn domain_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.domains.iter().position(|d| {
             let definition = d.definition_for(txid);
-            d.database == self.current_database
+            d.database == current_database()
                 && d.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
@@ -33043,7 +33045,7 @@ impl Storage {
     ) -> Option<usize> {
         self.domain_slot(schema, name, txid).or_else(|| {
             self.domains.iter().position(|domain| {
-                domain.database == self.current_database
+                domain.database == current_database()
                     && domain.visible_to(txid)
                     && domain.schema.as_str() == schema
                     && domain.name.as_str() == name
@@ -33223,14 +33225,14 @@ impl Storage {
     }
 
     pub(crate) fn domain_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.domains[slot].database == self.current_database && self.domains[slot].visible_to(txid)
+        self.domains[slot].database == current_database() && self.domains[slot].visible_to(txid)
     }
 
     /// Committed domains carrying their slot indices, for the checkpoint and
     /// `pg_type`.
     pub fn live_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
         self.domains.iter().enumerate().filter(|(_, d)| {
-            d.database == self.current_database && d.ddl_state == CatalogDdlState::Present
+            d.database == current_database() && d.ddl_state == CatalogDdlState::Present
         })
     }
 
@@ -33240,7 +33242,7 @@ impl Storage {
         for table in self
             .tables
             .iter()
-            .filter(|t| t.database == self.current_database && t.live)
+            .filter(|t| t.database == current_database() && t.live)
         {
             for col in table.def.columns() {
                 if col.user_type.is_some_and(|identity| {
@@ -33290,7 +33292,7 @@ impl Storage {
                 ColType::Enum(slot)
                     if slot != ColType::ENUM_SLOT_UNRESOLVED
                         && (slot as usize) < self.enums.len()
-                        && self.enums[slot as usize].database == self.current_database
+                        && self.enums[slot as usize].database == current_database()
                         && self.enum_for(slot as usize, txid).visible_to(txid) =>
                 {
                     // WAL preserves the catalog slot. Its spelling can be stale
@@ -33321,7 +33323,7 @@ impl Storage {
                 ColType::Composite(slot)
                     if slot != ColType::COMPOSITE_SLOT_UNRESOLVED
                         && (slot as usize) < self.composites.len()
-                        && self.composites[slot as usize].database == self.current_database
+                        && self.composites[slot as usize].database == current_database()
                         && self.composite_for(slot as usize, txid).visible_to(txid) =>
                 {
                     // See the enum case: slot identity is durable; names are a
@@ -33361,7 +33363,7 @@ impl Storage {
         }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.database == self.current_database
+            (d.database == current_database()
                 && (d.schema == schema && d.name == name
                     || d.pending_definition
                         .and_then(|pending| pending.identity)
@@ -33379,7 +33381,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            (e.database == self.current_database
+            (e.database == current_database()
                 && (e.schema == schema && e.name == name
                     || e.pending_definition
                         .is_some_and(|pending| pending.schema == schema && pending.name == name)))
@@ -33394,7 +33396,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.composites.iter().find_map(|composite| {
-            (composite.database == self.current_database
+            (composite.database == current_database()
                 && (composite.schema == schema && composite.name == name
                     || composite
                         .pending_definition
@@ -33411,7 +33413,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.domains.iter().any(|domain| {
-            domain.database == self.current_database
+            domain.database == current_database()
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == schema
                 && domain.definition_for(txid).name == name
@@ -33423,7 +33425,7 @@ impl Storage {
             ));
         }
         if self.enums.iter().any(|e| {
-            e.database == self.current_database
+            e.database == current_database()
                 && e.visible_to(txid)
                 && e.definition_for(txid).schema == schema
                 && e.definition_for(txid).name == name
@@ -33435,7 +33437,7 @@ impl Storage {
             ));
         }
         if self.composites.iter().any(|composite| {
-            composite.database == self.current_database
+            composite.database == current_database()
                 && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
                 && composite.definition_for(txid).name == name
@@ -33464,7 +33466,7 @@ impl Storage {
             slot: new as u16,
         });
         self.domains[new] = DomainDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             schema,
             name,
@@ -33498,7 +33500,7 @@ impl Storage {
     }
 
     fn rebind_domain_base_types_to(&mut self, txid: u32) -> Result<(), SqlError> {
-        let current_database = self.current_database;
+        let current_database = current_database();
         let domains = &mut self.domains;
         let enums = &self.enums;
         let composites = &self.composites;
@@ -33665,7 +33667,7 @@ impl Storage {
 
     fn rebind_user_type_declarations_to(&mut self, txid: u32) -> Result<(), SqlError> {
         for table in 0..self.tables.len() {
-            if self.tables[table].database != self.current_database
+            if self.tables[table].database != current_database()
                 || !self.tables[table].visible_to(txid)
             {
                 continue;
@@ -33675,7 +33677,7 @@ impl Storage {
             self.tables[table].def = definition;
         }
         for composite in 0..self.composites.len() {
-            if self.composites[composite].database != self.current_database
+            if self.composites[composite].database != current_database()
                 || !self.composites[composite].visible_to(txid)
             {
                 continue;
@@ -33759,7 +33761,7 @@ impl Storage {
             ))
         }
         for slot in 0..self.routines.len() {
-            if self.routines[slot].database != self.current_database
+            if self.routines[slot].database != current_database()
                 || !self.routines[slot].visible_to(txid)
             {
                 continue;
@@ -33853,7 +33855,7 @@ impl Storage {
             .find_map(|(other_slot, domain)| {
                 let definition = domain.definition_for(txid);
                 (other_slot != slot
-                    && domain.database == self.current_database
+                    && domain.database == current_database()
                     && definition.schema == schema
                     && definition.name == name)
                     .then(|| {
@@ -33870,12 +33872,12 @@ impl Storage {
         }
         if self.domains.iter().enumerate().any(|(other_slot, domain)| {
             other_slot != slot
-                && domain.database == self.current_database
+                && domain.database == current_database()
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == schema
                 && domain.definition_for(txid).name == name
         }) || self.enums.iter().any(|enumeration| {
-            enumeration.database == self.current_database
+            enumeration.database == current_database()
                 && enumeration.visible_to(txid)
                 && enumeration.schema == schema
                 && enumeration.definition_for(txid).name == name
@@ -34008,7 +34010,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.database == self.current_database
+            (d.database == current_database()
                 && d.schema.as_str() == schema
                 && d.name.as_str() == name)
                 .then_some(d.ddl_state.pending_txid()?)
@@ -34017,7 +34019,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.domains.iter().position(|d| {
-            d.database == self.current_database
+            d.database == current_database()
                 && d.visible_to(txid)
                 && d.schema.as_str() == schema
                 && d.name.as_str() == name
@@ -34055,7 +34057,7 @@ impl Storage {
     fn find_enum_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
         if let Some(schema) = qualifier {
             return self.enums.iter().position(|e| {
-                e.database == self.current_database
+                e.database == current_database()
                     && e.visible_to(txid)
                     && e.definition_for(txid).schema.as_str() == schema
                     && e.definition_for(txid).name.as_str() == name
@@ -34065,7 +34067,7 @@ impl Storage {
             if let PathEntry::Schema(slot) = entry {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.enums.iter().position(|e| {
-                    e.database == self.current_database
+                    e.database == current_database()
                         && e.visible_to(txid)
                         && e.definition_for(txid).schema.as_str() == schema.as_str()
                         && e.definition_for(txid).name.as_str() == name
@@ -34093,7 +34095,7 @@ impl Storage {
         self.enums
             .iter()
             .position(|enumeration| {
-                enumeration.database == self.current_database
+                enumeration.database == current_database()
                     && enumeration.visible_to(txid)
                     && enumeration.definition_for(txid).name.as_str() == name
             })
@@ -34103,7 +34105,7 @@ impl Storage {
     /// The slot of an enum named `name` (any schema) visible to `txid`.
     pub fn enum_slot_by_name(&self, name: &str, txid: u32) -> Option<usize> {
         self.enums.iter().position(|e| {
-            e.database == self.current_database
+            e.database == current_database()
                 && e.visible_to(txid)
                 && e.definition_for(txid).name.as_str() == name
         })
@@ -34112,7 +34114,7 @@ impl Storage {
     /// The enum named `(schema, name)` visible to `txid`, by slot.
     pub fn enum_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.enums.iter().position(|e| {
-            e.database == self.current_database
+            e.database == current_database()
                 && e.visible_to(txid)
                 && e.definition_for(txid).schema.as_str() == schema
                 && e.definition_for(txid).name.as_str() == name
@@ -34156,7 +34158,7 @@ impl Storage {
     }
 
     pub(crate) fn enum_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.enums[slot].database == self.current_database && self.enums[slot].visible_to(txid)
+        self.enums[slot].database == current_database() && self.enums[slot].visible_to(txid)
     }
 
     /// Whether `label` was added to a pre-existing enum by this transaction.
@@ -34187,7 +34189,7 @@ impl Storage {
     /// `pg_type` and `pg_enum`.
     pub fn live_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
         self.enums.iter().enumerate().filter(|(_, e)| {
-            e.database == self.current_database && e.ddl_state == CatalogDdlState::Present
+            e.database == current_database() && e.ddl_state == CatalogDdlState::Present
         })
     }
 
@@ -34197,7 +34199,7 @@ impl Storage {
         for table in self
             .tables
             .iter()
-            .filter(|t| t.database == self.current_database && t.live)
+            .filter(|t| t.database == current_database() && t.live)
         {
             for col in table.def.columns() {
                 if matches!(col.ctype, ColType::Enum(s) if s as usize == slot)
@@ -34298,7 +34300,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            let same_name = e.database == self.current_database
+            let same_name = e.database == current_database()
                 && (e.schema == schema && e.name == name
                     || e.pending_definition
                         .is_some_and(|pending| pending.schema == schema && pending.name == name));
@@ -34314,7 +34316,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.enums.iter().any(|e| {
-            e.database == self.current_database
+            e.database == current_database()
                 && e.visible_to(txid)
                 && e.definition_for(txid).schema == schema
                 && e.definition_for(txid).name == name
@@ -34326,7 +34328,7 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.database == self.current_database
+            (d.database == current_database()
                 && (d.schema == schema && d.name == name
                     || d.pending_definition
                         .and_then(|pending| pending.identity)
@@ -34339,7 +34341,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.domains.iter().any(|d| {
-            d.database == self.current_database
+            d.database == current_database()
                 && d.visible_to(txid)
                 && d.definition_for(txid).schema == schema
                 && d.definition_for(txid).name == name
@@ -34351,7 +34353,7 @@ impl Storage {
             ));
         }
         if self.composites.iter().any(|composite| {
-            composite.database == self.current_database
+            composite.database == current_database()
                 && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
                 && composite.definition_for(txid).name == name
@@ -34381,7 +34383,7 @@ impl Storage {
         });
         let member_count = self.write_enum_member_image(new, spec.members)?;
         self.enums[new] = EnumDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             schema,
             name,
@@ -34411,7 +34413,7 @@ impl Storage {
             .enumerate()
             .find_map(|(other_slot, other)| {
                 (other_slot != slot
-                    && other.database == self.current_database
+                    && other.database == current_database()
                     && (other.schema == schema && other.name == name
                         || other.pending_definition.is_some_and(|pending| {
                             pending.schema == schema && pending.name == name
@@ -34429,7 +34431,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.database == self.current_database
+            (domain.database == current_database()
                 && (domain.schema == schema && domain.name == name
                     || domain
                         .pending_definition
@@ -34444,17 +34446,17 @@ impl Storage {
         }
         if self.enums.iter().enumerate().any(|(other_slot, other)| {
             other_slot != slot
-                && other.database == self.current_database
+                && other.database == current_database()
                 && other.visible_to(txid)
                 && other.definition_for(txid).schema == schema
                 && other.definition_for(txid).name == name
         }) || self.domains.iter().any(|domain| {
-            domain.database == self.current_database
+            domain.database == current_database()
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == schema
                 && domain.definition_for(txid).name == name
         }) || self.composites.iter().any(|composite| {
-            composite.database == self.current_database
+            composite.database == current_database()
                 && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
                 && composite.definition_for(txid).name == name
@@ -34590,17 +34592,17 @@ impl Storage {
     ) -> Result<(), SqlError> {
         if self.enums.iter().enumerate().any(|(other_slot, other)| {
             other_slot != slot
-                && other.database == self.current_database
+                && other.database == current_database()
                 && other.visible_to(0)
                 && other.schema == schema
                 && other.name == name
         }) || self.domains.iter().any(|domain| {
-            domain.database == self.current_database
+            domain.database == current_database()
                 && domain.visible_to(0)
                 && domain.schema == schema
                 && domain.name == name
         }) || self.composites.iter().any(|composite| {
-            composite.database == self.current_database
+            composite.database == current_database()
                 && composite.visible_to(0)
                 && composite.schema == schema
                 && composite.name == name
@@ -34815,7 +34817,7 @@ impl Storage {
 
     pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.composites.iter().position(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.visible_to(txid)
                 && definition.definition_for(txid).schema.as_str() == schema
                 && definition.definition_for(txid).name.as_str() == name
@@ -34880,7 +34882,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(|(_, definition)| {
-                definition.database == self.current_database
+                definition.database == current_database()
                     && definition.ddl_state == CatalogDdlState::Present
             })
     }
@@ -34897,13 +34899,13 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, definition)| {
-                definition.database == self.current_database && definition.visible_to(txid)
+                definition.database == current_database() && definition.visible_to(txid)
             })
             .map(move |(slot, definition)| (slot, definition.definition_for(txid)))
     }
 
     pub(crate) fn composite_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.composites[slot].database == self.current_database
+        self.composites[slot].database == current_database()
             && self.composites[slot].visible_to(txid)
     }
 
@@ -34914,7 +34916,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<PendingCompositeDefinition>, SqlError> {
         if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
-            (enumeration.database == self.current_database
+            (enumeration.database == current_database()
                 && (enumeration.schema == definition.schema && enumeration.name == definition.name
                     || enumeration.pending_definition.is_some_and(|pending| {
                         pending.schema == definition.schema && pending.name == definition.name
@@ -34931,7 +34933,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.database == self.current_database
+            (domain.database == current_database()
                 && (domain.schema == definition.schema && domain.name == definition.name
                     || domain
                         .pending_definition
@@ -34950,7 +34952,7 @@ impl Storage {
             .enumerate()
             .find_map(|(other_slot, other)| {
                 (other_slot != slot
-                    && other.database == self.current_database
+                    && other.database == current_database()
                     && (other.schema == definition.schema && other.name == definition.name
                         || other.pending_definition.is_some_and(|pending| {
                             pending.schema == definition.schema && pending.name == definition.name
@@ -34968,12 +34970,12 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         if self.enums.iter().any(|enumeration| {
-            enumeration.database == self.current_database
+            enumeration.database == current_database()
                 && enumeration.visible_to(txid)
                 && enumeration.definition_for(txid).schema == definition.schema
                 && enumeration.definition_for(txid).name == definition.name
         }) || self.domains.iter().any(|domain| {
-            domain.database == self.current_database
+            domain.database == current_database()
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == definition.schema
                 && domain.definition_for(txid).name == definition.name
@@ -34983,7 +34985,7 @@ impl Storage {
             .enumerate()
             .any(|(other_slot, other)| {
                 other_slot != slot
-                    && other.database == self.current_database
+                    && other.database == current_database()
                     && other.visible_to(txid)
                     && other.definition_for(txid).schema == definition.schema
                     && other.definition_for(txid).name == definition.name
@@ -35288,7 +35290,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.database == self.current_database
+            (domain.database == current_database()
                 && (domain.schema == schema && domain.name == name
                     || domain
                         .pending_definition
@@ -35308,7 +35310,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
-            (enumeration.database == self.current_database
+            (enumeration.database == current_database()
                 && (enumeration.schema == schema && enumeration.name == name
                     || enumeration
                         .pending_definition
@@ -35325,7 +35327,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.composites.iter().find_map(|composite| {
-            (composite.database == self.current_database
+            (composite.database == current_database()
                 && (composite.schema == schema && composite.name == name
                     || composite
                         .pending_definition
@@ -35453,7 +35455,7 @@ impl Storage {
             slot: slot as u16,
         });
         self.composites[slot] = CompositeDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             schema,
             name,
@@ -35481,7 +35483,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.composites.iter().find_map(|definition| {
-            (definition.database == self.current_database
+            (definition.database == current_database()
                 && definition.schema.as_str() == schema
                 && (definition.name.as_str() == name
                     || definition
@@ -35499,7 +35501,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(slot) = self.composites.iter().position(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.definition_for(txid).name.as_str() == name
@@ -35551,7 +35553,7 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.views.iter().find_map(|v| {
-            (v.database == self.current_database
+            (v.database == current_database()
                 && v.schema_for(txid).as_str() == schema.as_str()
                 && v.name.as_str() == name.as_str())
             .then_some(v.ddl_state.pending_txid()?)
@@ -35560,7 +35562,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let existing = self.views.iter().position(|v| {
-            v.database == self.current_database
+            v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema.as_str()
                 && v.name.as_str() == name.as_str()
@@ -35593,7 +35595,7 @@ impl Storage {
         });
         self.catalog_seq += 1;
         self.views[new] = ViewDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             schema,
             name,
@@ -35701,7 +35703,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.views.iter().find_map(|v| {
-            (v.database == self.current_database
+            (v.database == current_database()
                 && v.schema_for(txid).as_str() == schema
                 && v.name.as_str() == name)
                 .then_some(v.ddl_state.pending_txid()?)
@@ -35710,7 +35712,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.views.iter().position(|v| {
-            v.database == self.current_database
+            v.database == current_database()
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
                 && v.name.as_str() == name
@@ -35726,7 +35728,7 @@ impl Storage {
     fn pending_drop_view(&mut self, slot: usize, txid: u32) {
         self.views[slot].ddl_state = self.views[slot].ddl_state.drop_by(txid);
         for rule in self.rules.iter_mut().filter(|rule| {
-            rule.database == self.current_database
+            rule.database == current_database()
                 && rule.visible_to(txid)
                 && rule.definition_for(txid).target == RuleTarget::View(slot as u16)
         }) {
@@ -35774,7 +35776,7 @@ impl Storage {
         if moved_rule {
             for comment in self.comments.iter_mut().filter(|comment| {
                 comment.used
-                    && comment.database == Some(self.current_database)
+                    && comment.database == Some(current_database())
                     && comment.class == CommentClass::Rule
                     && comment.subid == old_rule_subid
             }) {
@@ -35786,7 +35788,7 @@ impl Storage {
         let new_trigger_target = TriggerTarget::View(to as u16);
         let mut moved_trigger = false;
         for trigger in self.triggers.iter_mut().filter(|trigger| {
-            trigger.database == self.current_database
+            trigger.database == current_database()
                 && trigger.ddl_state != CatalogDdlState::Absent
                 && trigger.target == old_trigger_target
         }) {
@@ -35798,7 +35800,7 @@ impl Storage {
             let new_subid = new_trigger_target.comment_subid();
             for comment in self.comments.iter_mut().filter(|comment| {
                 comment.used
-                    && comment.database == Some(self.current_database)
+                    && comment.database == Some(current_database())
                     && comment.class == CommentClass::Trigger
                     && comment.subid == old_subid
             }) {
@@ -36120,7 +36122,7 @@ impl Storage {
     /// the drop rolled back to a savepoint) reverts to pending-create.
     pub fn rollback_view_drop(&mut self, slot: usize, txid: u32) {
         for rule in self.rules.iter_mut().filter(|rule| {
-            rule.database == self.current_database
+            rule.database == current_database()
                 && rule.definition.target == RuleTarget::View(slot as u16)
                 && matches!(rule.ddl_state, CatalogDdlState::PendingDrop { txid: owner } if owner == txid)
         }) {
@@ -36135,8 +36137,7 @@ impl Storage {
     }
 
     pub(crate) fn routine_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
-        self.routines[slot].database == self.current_database
-            && self.routines[slot].visible_to(txid)
+        self.routines[slot].database == current_database() && self.routines[slot].visible_to(txid)
     }
 
     pub(crate) fn routine(&self, slot: usize) -> &RoutineDef {
@@ -36152,7 +36153,7 @@ impl Storage {
 
     pub(crate) fn routine_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
         self.routines.iter().position(|routine| {
-            routine.database == self.current_database
+            routine.database == current_database()
                 && routine.visible_to(txid)
                 && routine_oid(routine) == oid
         })
@@ -36240,7 +36241,7 @@ impl Storage {
                 .enumerate()
                 .filter_map(|(slot, routine)| {
                     let definition = routine.definition_for(txid);
-                    if routine.database != self.current_database
+                    if routine.database != current_database()
                         || !routine.visible_to(txid)
                         || !kind.accepts(definition.kind)
                         || definition.schema_for(txid).as_str() != schema
@@ -36494,7 +36495,7 @@ impl Storage {
             let mut found = None;
             for (slot, stored) in self.routines.iter().enumerate() {
                 let routine = stored.definition_for(txid);
-                if stored.database != self.current_database
+                if stored.database != current_database()
                     || !stored.visible_to(txid)
                     || !matches!(
                         routine.kind,
@@ -36719,7 +36720,7 @@ impl Storage {
     ) -> bool {
         let matches = |schema: &str, routine_name: &str| {
             self.routines.iter().any(|routine| {
-                routine.database == self.current_database
+                routine.database == current_database()
                     && routine.visible_to(txid)
                     && accepts(routine.kind_for(txid), routine.attributes_for(txid))
                     && routine.accepts_input_arity_for(arity, txid)
@@ -36849,7 +36850,7 @@ impl Storage {
                 .enumerate()
                 .filter_map(|(slot, routine)| {
                     let definition = routine.definition_for(txid);
-                    (routine.database == self.current_database
+                    (routine.database == current_database()
                         && routine.visible_to(txid)
                         && definition.schema_for(txid).as_str() == schema
                         && definition.name_for(txid).as_str() == routine_name
@@ -36896,7 +36897,7 @@ impl Storage {
             let mut found = None;
             for stored in self.routines.iter() {
                 let routine = stored.definition_for(txid);
-                if stored.database != self.current_database
+                if stored.database != current_database()
                     || !stored.visible_to(txid)
                     || !matches!(routine.kind, RoutineKind::Procedure)
                     || routine.schema_for(txid).as_str() != schema
@@ -37075,7 +37076,7 @@ impl Storage {
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             let definition = routine.definition_for(txid);
-            routine.database == self.current_database
+            routine.database == current_database()
                 && routine.visible_to(txid)
                 && kind.accepts(definition.kind)
                 && definition.schema_for(txid).as_str() == schema
@@ -37099,7 +37100,7 @@ impl Storage {
         let exact =
             self.routines.iter().position(|routine| {
                 let definition = routine.definition_for(txid);
-                routine.database == self.current_database
+                routine.database == current_database()
                     && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
@@ -37118,7 +37119,7 @@ impl Storage {
             .enumerate()
             .filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
-                (routine.database == self.current_database
+                (routine.database == current_database()
                     && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
@@ -37146,7 +37147,7 @@ impl Storage {
             .enumerate()
             .filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
-                (routine.database == self.current_database
+                (routine.database == current_database()
                     && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
@@ -37181,7 +37182,7 @@ impl Storage {
     ) -> Option<usize> {
         let matches = |routine: &RoutineDef, implicit: bool, polymorphic: bool| {
             let definition = routine.definition_for(txid);
-            if routine.database != self.current_database
+            if routine.database != current_database()
                 || !routine.visible_to(txid)
                 || !call_kind.accepts(definition.kind)
                 || definition.schema_for(txid).as_str() != schema
@@ -37382,27 +37383,29 @@ impl Storage {
         if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + self.domain_count() as i32).contains(&type_oid) {
             let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN).ok()?;
             let domain = self.domain_for(slot, txid);
-            return (domain.database == self.current_database && domain.visible_to(txid))
-                .then_some(RoutineResult {
+            return (domain.database == current_database() && domain.visible_to(txid)).then_some(
+                RoutineResult {
                     ctype: domain.base,
                     user_type: identity(domain.schema, domain.name),
-                });
+                },
+            );
         }
         if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + self.domain_count() as i32)
             .contains(&type_oid)
         {
             let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN_ARRAY).ok()?;
             let domain = self.domain_for(slot, txid);
-            return (domain.database == self.current_database && domain.visible_to(txid))
-                .then_some(RoutineResult {
+            return (domain.database == current_database() && domain.visible_to(txid)).then_some(
+                RoutineResult {
                     ctype: ColType::Array(ArrElem::domain(slot as u16, domain.base)?),
                     user_type: identity(domain.schema, domain.name),
-                });
+                },
+            );
         }
         if (oid::FIRST_ENUM..oid::FIRST_ENUM + self.enum_count() as i32).contains(&type_oid) {
             let slot = usize::try_from(type_oid - oid::FIRST_ENUM).ok()?;
             let enumeration = self.enum_for(slot, txid);
-            return (enumeration.database == self.current_database && enumeration.visible_to(txid))
+            return (enumeration.database == current_database() && enumeration.visible_to(txid))
                 .then_some(RoutineResult {
                     ctype: ColType::Enum(slot as u16),
                     user_type: identity(enumeration.schema, enumeration.name),
@@ -37413,7 +37416,7 @@ impl Storage {
         {
             let slot = usize::try_from(type_oid - oid::FIRST_ENUM_ARRAY).ok()?;
             let enumeration = self.enum_for(slot, txid);
-            return (enumeration.database == self.current_database && enumeration.visible_to(txid))
+            return (enumeration.database == current_database() && enumeration.visible_to(txid))
                 .then_some(RoutineResult {
                     ctype: ColType::Array(ArrElem::Enum(slot as u16)),
                     user_type: identity(enumeration.schema, enumeration.name),
@@ -37424,7 +37427,7 @@ impl Storage {
         {
             let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE).ok()?;
             let composite = self.composite_for(slot, txid);
-            return (composite.database == self.current_database && composite.visible_to(txid))
+            return (composite.database == current_database() && composite.visible_to(txid))
                 .then_some(RoutineResult {
                     ctype: ColType::Composite(slot as u16),
                     user_type: identity(composite.schema, composite.name),
@@ -37435,7 +37438,7 @@ impl Storage {
         {
             let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE_ARRAY).ok()?;
             let composite = self.composite_for(slot, txid);
-            return (composite.database == self.current_database && composite.visible_to(txid))
+            return (composite.database == current_database() && composite.visible_to(txid))
                 .then_some(RoutineResult {
                     ctype: ColType::Array(ArrElem::Composite(slot as u16)),
                     user_type: identity(composite.schema, composite.name),
@@ -37575,7 +37578,7 @@ impl Storage {
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             let definition = routine.definition_for(txid);
-            routine.database == self.current_database
+            routine.database == current_database()
                 && routine.visible_to(txid)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
@@ -37597,7 +37600,7 @@ impl Storage {
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             let definition = routine.definition_for(txid);
-            routine.database == self.current_database
+            routine.database == current_database()
                 && routine.visible_to(txid)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
@@ -37622,7 +37625,7 @@ impl Storage {
     ) -> Result<Option<usize>, ()> {
         let mut found = None;
         for (slot, routine) in self.routines.iter().enumerate() {
-            if routine.database != self.current_database
+            if routine.database != current_database()
                 || !routine.visible_to(txid)
                 || routine.schema_for(txid).as_str() != schema
                 || routine.name_for(txid).as_str() != name
@@ -37651,7 +37654,7 @@ impl Storage {
         }
         if self.routines.iter().enumerate().any(|(other, candidate)| {
             other != slot
-                && candidate.database == self.current_database
+                && candidate.database == current_database()
                 && candidate.visible_to(txid)
                 && candidate.schema_for(txid) == schema
                 && candidate.name_for(txid) == name
@@ -37887,7 +37890,7 @@ impl Storage {
         }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.routines.iter().find_map(|routine| {
-            (routine.database == self.current_database
+            (routine.database == current_database()
                 && routine.schema_for(txid) == schema
                 && routine.name_for(txid) == name
                 && routine.argument_count == argument_count
@@ -37903,7 +37906,7 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.routines.iter().any(|routine| {
-            routine.database == self.current_database
+            routine.database == current_database()
                 && routine.visible_to(txid)
                 && routine.schema_for(txid) == schema
                 && routine.name_for(txid) == name
@@ -37947,7 +37950,7 @@ impl Storage {
             }
         };
         self.routines[slot] = RoutineDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             schema,
             name,
@@ -38186,7 +38189,7 @@ impl Storage {
         txid: u32,
     ) -> impl Iterator<Item = (usize, &PolicyDef)> {
         self.policies.iter().enumerate().filter(move |(_, policy)| {
-            policy.database == self.current_database
+            policy.database == current_database()
                 && policy.visible_to(txid)
                 && usize::from(policy.table) == table
         })
@@ -38197,7 +38200,7 @@ impl Storage {
         txid: u32,
     ) -> impl Iterator<Item = (usize, &PolicyDef)> {
         self.policies.iter().enumerate().filter(move |(_, policy)| {
-            policy.database == self.current_database && policy.visible_to(txid)
+            policy.database == current_database() && policy.visible_to(txid)
         })
     }
 
@@ -38265,7 +38268,7 @@ impl Storage {
         let role_count = self.write_policy_role_image(slot, spec.roles)?;
         self.catalog_seq += 1;
         self.policies[slot] = PolicyDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             name: spec.name,
             table: u16::try_from(spec.table).map_err(|_| {
@@ -38493,7 +38496,7 @@ impl Storage {
             };
             self.catalog_seq += 1;
             self.policies[slot] = PolicyDef {
-                database: self.current_database,
+                database: current_database(),
                 created_at: self.catalog_seq,
                 name: spec.name,
                 table: u16::try_from(spec.table).map_err(|_| {
@@ -38556,7 +38559,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.database == self.current_database
+                trigger.database == current_database()
                     && trigger.visible_to(txid)
                     && trigger.target == TriggerTarget::Table(table as u16)
             })
@@ -38572,7 +38575,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.database == self.current_database
+                trigger.database == current_database()
                     && trigger.visible_to(txid)
                     && trigger.target == TriggerTarget::View(view as u16)
             })
@@ -38597,7 +38600,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.database == self.current_database
+                trigger.database == current_database()
                     && trigger.visible_to(txid)
                     && trigger.target == target
             })
@@ -38610,7 +38613,7 @@ impl Storage {
         txid: u32,
     ) -> Option<TriggerDef> {
         let trigger = self.triggers.get(slot)?;
-        (trigger.database == self.current_database
+        (trigger.database == current_database()
             && trigger.visible_to(txid)
             && trigger.target == target)
             .then(|| trigger.effective_to(txid))
@@ -38624,7 +38627,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.database == self.current_database && trigger.visible_to(txid)
+                trigger.database == current_database() && trigger.visible_to(txid)
             })
             .map(move |(slot, trigger)| (slot, trigger.effective_to(txid)))
     }
@@ -38842,7 +38845,7 @@ impl Storage {
         )?;
         self.catalog_seq = created_at;
         self.triggers[slot] = TriggerDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             name: spec.name,
             target: spec.target,
@@ -39052,7 +39055,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.triggers[slot] = TriggerDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             name: spec.name,
             target: spec.target,
@@ -39238,7 +39241,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, statistics)| {
-                statistics.database == self.current_database && statistics.visible_to(txid)
+                statistics.database == current_database() && statistics.visible_to(txid)
             })
     }
 
@@ -39259,7 +39262,7 @@ impl Storage {
     ) -> Option<usize> {
         self.extended_statistics.iter().position(|statistics| {
             let definition = statistics.definition_for(txid);
-            statistics.database == self.current_database
+            statistics.database == current_database()
                 && statistics.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
@@ -39342,7 +39345,7 @@ impl Storage {
             spec.created_at
         };
         self.extended_statistics[slot] = ExtendedStatisticsDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             table: spec.table,
             mutable: ExtendedStatisticsMutableDefinition {
@@ -39711,7 +39714,7 @@ impl Storage {
 
     pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         let slot = self.indexes.iter().position(|index| {
-            index.database == self.current_database
+            index.database == current_database()
                 && index.visible_to(txid)
                 && index.schema.as_str() == schema
                 && index.name_for(txid).as_str() == name
@@ -39871,7 +39874,7 @@ impl Storage {
             MAX_INDEX_OID_GENERATION,
             "index",
         )?;
-        def.database = self.current_database;
+        def.database = current_database();
         self.require_schema_create(def.schema.as_str(), txid)?;
         match def.method {
             crate::sql::ast::IndexAccessMethod::Btree => {
@@ -40073,7 +40076,7 @@ impl Storage {
         }
         if def.mutable.clustered
             && self.indexes.iter().any(|index| {
-                index.database == self.current_database
+                index.database == current_database()
                     && index.visible_to(txid)
                     && index.schema == def.schema
                     && index.table == def.table
@@ -40087,7 +40090,7 @@ impl Storage {
         }
         if def.mutable.replica_identity
             && self.indexes.iter().any(|index| {
-                index.database == self.current_database
+                index.database == current_database()
                     && index.visible_to(txid)
                     && index.schema == def.schema
                     && index.table == def.table
@@ -40100,7 +40103,7 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
-            (index.database == self.current_database
+            (index.database == current_database()
                 && index.schema.as_str() == def.schema.as_str()
                 && index.name_for(txid).as_str() == def.name.as_str())
             .then_some(index.ddl_state.pending_txid()?)
@@ -40281,7 +40284,7 @@ impl Storage {
             let index = self.indexes[slot];
             if self.indexes.iter().enumerate().any(|(other_slot, other)| {
                 other_slot != slot
-                    && other.database == self.current_database
+                    && other.database == current_database()
                     && other.visible_to(txid)
                     && other.schema == index.schema
                     && other.table == index.table
@@ -40297,7 +40300,7 @@ impl Storage {
             let index = self.indexes[slot];
             if self.indexes.iter().enumerate().any(|(other_slot, other)| {
                 other_slot != slot
-                    && other.database == self.current_database
+                    && other.database == current_database()
                     && other.visible_to(txid)
                     && other.schema == index.schema
                     && other.table == index.table
@@ -40339,7 +40342,7 @@ impl Storage {
     /// [`Self::rollback_indexes_for`].
     pub fn drop_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for i in 0..self.indexes.len() {
-            if self.indexes[i].database == self.current_database
+            if self.indexes[i].database == current_database()
                 && self.indexes[i].visible_to(txid)
                 && self.indexes[i].schema.as_str() == schema
                 && self.indexes[i].table.as_str() == table
@@ -40353,7 +40356,7 @@ impl Storage {
     /// from its DROP TABLE) into the committed catalog.
     pub fn commit_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for slot in 0..self.indexes.len() {
-            if self.indexes[slot].database == self.current_database
+            if self.indexes[slot].database == current_database()
                 && self.indexes[slot].schema.as_str() == schema
                 && self.indexes[slot].table.as_str() == table
                 && self.indexes[slot].ddl_state == (CatalogDdlState::PendingDrop { txid })
@@ -40369,7 +40372,7 @@ impl Storage {
     /// back DROP TABLE): committed indexes become visible again.
     pub fn rollback_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for x in self.indexes.iter_mut() {
-            if x.database == self.current_database
+            if x.database == current_database()
                 && x.schema.as_str() == schema
                 && x.table.as_str() == table
                 && x.ddl_state == (CatalogDdlState::PendingDrop { txid })
@@ -40389,7 +40392,7 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
-            (index.database == self.current_database
+            (index.database == current_database()
                 && index.schema.as_str() == schema
                 && index.name_for(txid).as_str() == name)
                 .then_some(index.ddl_state.pending_txid()?)
@@ -40477,7 +40480,7 @@ impl Storage {
             .iter()
             .copied()
             .filter(move |x| {
-                x.database == self.current_database
+                x.database == current_database()
                     && x.visible_to(txid)
                     && ((x.schema.as_str() == schema && x.table.as_str() == table)
                         || committed_binding.is_some_and(|(old_schema, old_table)| {
@@ -40499,7 +40502,7 @@ impl Storage {
     /// All committed indexes, for checkpoint serialization.
     pub fn live_indexes(&self) -> impl Iterator<Item = &IndexDef> {
         self.indexes.iter().filter(|index| {
-            index.database == self.current_database && index.ddl_state == CatalogDdlState::Present
+            index.database == current_database() && index.ddl_state == CatalogDdlState::Present
         })
     }
 
@@ -40512,7 +40515,7 @@ impl Storage {
         self.indexes
             .get(slot)
             .copied()
-            .filter(|index| index.database == self.current_database)
+            .filter(|index| index.database == current_database())
             .map(|index| self.project_index_binding(index, txid))
     }
 
@@ -40520,7 +40523,7 @@ impl Storage {
         self.indexes
             .get(slot)
             .copied()
-            .filter(|index| index.database == self.current_database && index.visible_to(txid))
+            .filter(|index| index.database == current_database() && index.visible_to(txid))
             .map(|index| self.project_index_binding(index, txid))
     }
 
@@ -40592,7 +40595,7 @@ impl Storage {
             return Some(TableAccessMethod::Heap);
         }
         self.access_methods.iter().find_map(|method| {
-            (method.database == self.current_database
+            (method.database == current_database()
                 && method.visible_to(txid)
                 && method.definition.name.as_str() == name)
                 .then(|| TableAccessMethod::Catalog(method.oid()))
@@ -40607,7 +40610,7 @@ impl Storage {
         match method {
             TableAccessMethod::Heap => SqlName::parse("heap").ok(),
             TableAccessMethod::Catalog(oid) => self.access_methods.iter().find_map(|candidate| {
-                (candidate.database == self.current_database
+                (candidate.database == current_database()
                     && candidate.visible_to(txid)
                     && candidate.oid() == oid)
                     .then_some(candidate.definition.name)
@@ -40617,7 +40620,7 @@ impl Storage {
 
     pub(crate) fn access_method_slot(&self, name: &str, txid: u32) -> Option<usize> {
         self.access_methods.iter().position(|method| {
-            method.database == self.current_database
+            method.database == current_database()
                 && method.visible_to(txid)
                 && method.definition.name.as_str() == name
         })
@@ -40625,7 +40628,7 @@ impl Storage {
 
     pub(crate) fn access_method_oid_at(&self, slot: usize) -> Option<i32> {
         self.access_methods.get(slot).and_then(|method| {
-            if method.database == self.current_database && method.created_at != 0 {
+            if method.database == current_database() && method.created_at != 0 {
                 Some(method.oid().get())
             } else {
                 None
@@ -40635,7 +40638,7 @@ impl Storage {
 
     pub(crate) fn access_method_name_by_oid(&self, oid: i32) -> Option<&str> {
         self.access_methods.iter().find_map(|method| {
-            if method.database == self.current_database
+            if method.database == current_database()
                 && method.created_at != 0
                 && method.oid().get() == oid
             {
@@ -40654,7 +40657,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, method)| {
-                method.database == self.current_database && method.visible_to(txid)
+                method.database == current_database() && method.visible_to(txid)
             })
     }
 
@@ -40713,7 +40716,7 @@ impl Storage {
             created_at
         };
         self.access_methods[slot] = AccessMethodDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -42341,7 +42344,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, definition)| {
-                definition.database == self.current_database && definition.visible_to(txid)
+                definition.database == current_database() && definition.visible_to(txid)
             })
     }
 
@@ -42352,7 +42355,7 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.casts.iter().position(|definition| {
-            definition.database == self.current_database
+            definition.database == current_database()
                 && definition.visible_to(txid)
                 && definition.source == source
                 && definition.target == target
@@ -42602,7 +42605,7 @@ impl Storage {
         }
         self.validate_cast_definition(
             CastDef {
-                database: self.current_database,
+                database: current_database(),
                 created_at: 0,
                 source,
                 target,
@@ -42637,7 +42640,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.casts[slot] = CastDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             source,
             target,
@@ -42714,7 +42717,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, operator)| {
-                operator.database == self.current_database && operator.visible_to(txid)
+                operator.database == current_database() && operator.visible_to(txid)
             })
             .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
     }
@@ -42731,7 +42734,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, collation)| {
-                collation.database == self.current_database && collation.visible_to(txid)
+                collation.database == current_database() && collation.visible_to(txid)
             })
             .map(move |(slot, collation)| (slot, collation.definition_for(txid)))
     }
@@ -42748,7 +42751,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, conversion)| {
-                conversion.database == self.current_database && conversion.visible_to(txid)
+                conversion.database == current_database() && conversion.visible_to(txid)
             })
             .map(move |(slot, conversion)| (slot, conversion.definition_for(txid)))
     }
@@ -42765,7 +42768,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, object)| {
-                object.database == self.current_database && object.visible_to(txid)
+                object.database == current_database() && object.visible_to(txid)
             })
             .map(move |(slot, object)| (slot, object.definition_for(txid)))
     }
@@ -42967,7 +42970,7 @@ impl Storage {
             })?;
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         self.collations[slot] = CollationDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -43020,7 +43023,7 @@ impl Storage {
             })?;
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         self.conversions[slot] = ConversionDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -43077,7 +43080,7 @@ impl Storage {
         definition.set_oid(base + slot as i32);
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         self.text_search_objects[slot] = TextSearchDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -43241,7 +43244,7 @@ impl Storage {
             .enumerate()
             .any(|(other, candidate)| {
                 other != slot
-                    && candidate.database == self.current_database
+                    && candidate.database == current_database()
                     && candidate.ddl_state != CatalogDdlState::Absent
                     && candidate.definition.kind() == definition.kind()
                     && candidate.definition.schema() == definition.schema()
@@ -43276,7 +43279,7 @@ impl Storage {
         }
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.text_search_objects[slot] = TextSearchDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,
@@ -43538,7 +43541,7 @@ impl Storage {
             .enumerate()
             .any(|(other, candidate)| {
                 other != slot
-                    && candidate.database == self.current_database
+                    && candidate.database == current_database()
                     && candidate.ddl_state != CatalogDdlState::Absent
                     && candidate.definition.schema == definition.schema
                     && candidate.definition.name == definition.name
@@ -43576,7 +43579,7 @@ impl Storage {
         );
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.collations[slot] = CollationDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,
@@ -43610,7 +43613,7 @@ impl Storage {
             .enumerate()
             .any(|(other, candidate)| {
                 other != slot
-                    && candidate.database == self.current_database
+                    && candidate.database == current_database()
                     && candidate.ddl_state != CatalogDdlState::Absent
                     && candidate.definition.schema == definition.schema
                     && candidate.definition.name == definition.name
@@ -43634,7 +43637,7 @@ impl Storage {
         }
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.conversions[slot] = ConversionDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,
@@ -43658,7 +43661,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.database == self.current_database && trigger.visible_to(txid)
+                trigger.database == current_database() && trigger.visible_to(txid)
             })
             .map(move |(slot, trigger)| (slot, trigger.definition_for(txid)))
     }
@@ -43690,7 +43693,7 @@ impl Storage {
         let routine = self
             .routines
             .get(usize::from(definition.function))
-            .filter(|routine| routine.database == self.current_database && routine.visible_to(txid))
+            .filter(|routine| routine.database == current_database() && routine.visible_to(txid))
             .map(|routine| routine.definition_for(txid))
             .ok_or_else(|| {
                 sql_err!(
@@ -43746,12 +43749,12 @@ impl Storage {
         self.rules
             .get(slot)
             .copied()
-            .filter(|rule| rule.database == self.current_database && rule.visible_to(txid))
+            .filter(|rule| rule.database == current_database() && rule.visible_to(txid))
     }
 
     pub(crate) fn rule_slot(&self, target: RuleTarget, name: &str, txid: u32) -> Option<usize> {
         self.rules.iter().position(|rule| {
-            rule.database == self.current_database
+            rule.database == current_database()
                 && rule.visible_to(txid)
                 && rule.definition_for(txid).target == target
                 && rule.definition_for(txid).name.as_str() == name
@@ -43769,7 +43772,7 @@ impl Storage {
             .copied()
             .enumerate()
             .filter(move |(_, rule)| {
-                rule.database == self.current_database
+                rule.database == current_database()
                     && rule.visible_to(txid)
                     && rule.definition_for(txid).target == target
                     && rule.definition_for(txid).event == event
@@ -43805,9 +43808,7 @@ impl Storage {
             .iter()
             .copied()
             .enumerate()
-            .filter(move |(_, rule)| {
-                rule.database == self.current_database && rule.visible_to(txid)
-            })
+            .filter(move |(_, rule)| rule.database == current_database() && rule.visible_to(txid))
     }
 
     pub(crate) fn rule_count(&self) -> usize {
@@ -43887,7 +43888,7 @@ impl Storage {
             })?;
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         self.rules[slot] = RuleDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -43941,7 +43942,7 @@ impl Storage {
             let subid = definition.target.comment_subid();
             for comment in self.comments.iter_mut().filter(|comment| {
                 comment.matches_to(
-                    Some(self.current_database),
+                    Some(current_database()),
                     CommentClass::Rule,
                     "",
                     old.name.as_str(),
@@ -44056,7 +44057,7 @@ impl Storage {
         let subid = definition.target.comment_subid();
         for comment in self.comments.iter_mut() {
             if comment.used
-                && comment.database == Some(self.current_database)
+                && comment.database == Some(current_database())
                 && comment.class == CommentClass::Rule
                 && comment.name == definition.name
                 && comment.subid == subid
@@ -44079,7 +44080,7 @@ impl Storage {
     fn commit_rules_for_table(&mut self, table: usize) {
         for slot in 0..self.rules.len() {
             let rule = self.rules[slot];
-            if rule.database != self.current_database
+            if rule.database != current_database()
                 || rule.ddl_state == CatalogDdlState::Absent
                 || rule.definition.target != RuleTarget::Table(table as u16)
             {
@@ -44088,7 +44089,7 @@ impl Storage {
             let subid = rule.definition.target.comment_subid();
             for comment in self.comments.iter_mut() {
                 if comment.used
-                    && comment.database == Some(self.current_database)
+                    && comment.database == Some(current_database())
                     && comment.class == CommentClass::Rule
                     && comment.name == rule.definition.name
                     && comment.subid == subid
@@ -44126,7 +44127,7 @@ impl Storage {
         self.validate_rule_target(definition.target, 0)?;
         if self.rules.iter().enumerate().any(|(other, rule)| {
             other != slot
-                && rule.database == self.current_database
+                && rule.database == current_database()
                 && rule.ddl_state != CatalogDdlState::Absent
                 && rule.definition.target == definition.target
                 && rule.definition.name == definition.name
@@ -44165,7 +44166,7 @@ impl Storage {
             }
         }
         self.rules[slot] = RuleDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,
@@ -44187,7 +44188,7 @@ impl Storage {
             let subid = target.comment_subid();
             for comment in self.comments.iter_mut() {
                 if comment.used
-                    && comment.database == Some(self.current_database)
+                    && comment.database == Some(current_database())
                     && comment.class == CommentClass::Rule
                     && comment.name.as_str() == name
                     && comment.subid == subid
@@ -44229,7 +44230,7 @@ impl Storage {
             })?;
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         self.event_triggers[slot] = EventTriggerDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -44360,7 +44361,7 @@ impl Storage {
             .enumerate()
             .any(|(other, candidate)| {
                 other != slot
-                    && candidate.database == self.current_database
+                    && candidate.database == current_database()
                     && candidate.ddl_state != CatalogDdlState::Absent
                     && candidate.definition.name == definition.name
             })
@@ -44373,7 +44374,7 @@ impl Storage {
         }
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.event_triggers[slot] = EventTriggerDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,
@@ -44395,7 +44396,7 @@ impl Storage {
 
     pub(crate) fn operator_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
         self.operators.iter().position(|operator| {
-            operator.database == self.current_database
+            operator.database == current_database()
                 && operator.visible_to(txid)
                 && operator.oid() == oid
         })
@@ -44726,7 +44727,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.operators[slot] = OperatorDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -44790,7 +44791,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.operators[slot] = OperatorDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,
@@ -44879,7 +44880,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, family)| {
-                family.database == self.current_database && family.visible_to(txid)
+                family.database == current_database() && family.visible_to(txid)
             })
             .map(move |(slot, family)| (slot, family.definition_for(txid)))
     }
@@ -44890,9 +44891,7 @@ impl Storage {
 
     pub(crate) fn operator_family_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
         self.operator_families.iter().position(|family| {
-            family.database == self.current_database
-                && family.visible_to(txid)
-                && family.oid() == oid
+            family.database == current_database() && family.visible_to(txid) && family.oid() == oid
         })
     }
 
@@ -45073,7 +45072,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.operator_families[slot] = OperatorFamilyDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -45124,7 +45123,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.operator_families[slot] = OperatorFamilyDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,
@@ -45209,7 +45208,7 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, class)| {
-                class.database == self.current_database && class.visible_to(txid)
+                class.database == current_database() && class.visible_to(txid)
             })
             .map(move |(slot, class)| (slot, class.definition_for(txid)))
     }
@@ -45224,7 +45223,7 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.operator_classes.iter().position(|class| {
-            class.database == self.current_database
+            class.database == current_database()
                 && class.visible_to(txid)
                 && class.oid() == oid.get()
         })
@@ -45519,7 +45518,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.operator_classes[slot] = OperatorClassDef {
-            database: self.current_database,
+            database: current_database(),
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -45572,7 +45571,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.operator_classes[slot] = OperatorClassDef {
-            database: self.current_database,
+            database: current_database(),
             created_at,
             definition,
             pending: None,

@@ -519,6 +519,9 @@ buffer. The backend-identity audit also removed Storage's shared mutable
 connection selector. Each leased workspace retains its connection identity and
 publishes it in fixed thread-local execution context; isolation and exact
 memory accounting are covered across workspace and operating-system threads.
+The database-selector audit extended that boundary through catalog access and
+WAL staging. It also found that a database without its required public schema
+could leave a failed selection active; failure now restores the prior database.
 
 | ID | Status | Found | Description | Reproducer | Blocker |
 |----|--------|-------|-------------|------------|---------|

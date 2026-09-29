@@ -13,9 +13,11 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     config.work_arena_bytes = 256;
     let mut one = config.clone();
     one.query_workspace_slots = 1;
+    let dml_workspace_bytes = core::mem::size_of::<exec::DmlScratch>()
+        + config.table_rows * core::mem::size_of::<exec::PhysicalRow>();
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
-        2 * (config.work_arena_bytes + core::mem::size_of::<Arena>())
+        2 * (config.work_arena_bytes + core::mem::size_of::<Arena>() + dml_workspace_bytes)
     );
     let bytes =
         config.query_workspace_slots * (config.work_arena_bytes + core::mem::size_of::<Arena>());
@@ -36,6 +38,32 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     assert_eq!(workspaces.used(), first_used);
     workspaces.select_for_connection(4);
     assert_eq!(workspaces.used(), first_used);
+
+    let mut budget = Budget::new(config.query_workspace_slots * dml_workspace_bytes);
+    let mut dml_workspaces = DmlWorkspaces::new(&config, &mut budget).unwrap();
+    assert_eq!(budget.remaining(), 0);
+
+    dml_workspaces.select_for_connection(1);
+    dml_workspaces
+        .push(exec::PhysicalRow::Local {
+            table_index: 1,
+            rowid: 11,
+            home: RowHome::Spilled {
+                len: 1,
+                sst: 1,
+                commit_lsn: 1,
+            },
+        })
+        .unwrap();
+    assert_eq!(dml_workspaces.len(), 1);
+    assert_eq!(dml_workspaces.capacity(), config.table_rows);
+
+    dml_workspaces.select_for_connection(2);
+    assert!(dml_workspaces.is_empty());
+    dml_workspaces.select_for_connection(1);
+    assert_eq!(dml_workspaces.len(), 1);
+    dml_workspaces.select_for_connection(4);
+    assert_eq!(dml_workspaces.len(), 1);
 }
 
 #[test]

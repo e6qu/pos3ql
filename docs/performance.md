@@ -11,9 +11,12 @@ JSON. `tools/benchmark-report.py` derives a report from those raw files.
 - One server process owns one writable database state and
   serializes query execution. Startup-sized pools bound memory and make
   saturation an explicit error. `query_workspace_slots` reserves independent
-  execution arenas and maps each connection to a stable slot; the current
-  reactor still executes one statement at a time, so additional slots provide
-  state isolation and memory accounting rather than a throughput claim.
+  execution arenas and ordinary DML row-selection buffers, then maps each
+  connection to the same stable slot in both sets. The current reactor still
+  executes one statement at a time, so additional slots provide state
+  isolation and memory accounting rather than a throughput claim.
+  Logical subscription apply and bootstrap COPY use their worker-owned arena
+  and DML scratch instead of a client workspace.
   Long-lived COPY streams keep transition rows in their connection's fixed
   startup buffer, so interleaved clients do not share statement state.
 - Object storage is durable; memory and local disk are disposable caches.

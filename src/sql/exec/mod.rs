@@ -19950,7 +19950,7 @@ impl PlpgsqlExecHost<'_> {
     fn scratch(&mut self) -> *mut DmlScratch {
         match self {
             Self::Atomic { scratch, .. } => *scratch,
-            Self::Routine { engine, .. } => &mut engine.dml_scratch,
+            Self::Routine { engine, .. } => &mut *engine.dml_scratch,
         }
     }
 
@@ -20051,7 +20051,7 @@ impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
             } => (&mut **storage, *scratch, *seq_session),
             PlpgsqlExecHost::Routine { engine, guc, .. } => (
                 &mut engine.storage,
-                &mut engine.dml_scratch as *mut _,
+                &mut *engine.dml_scratch as *mut _,
                 guc.seq_session(),
             ),
         };

@@ -30,11 +30,15 @@ fn query_workspaces_are_startup_bounded_and_isolated() {
     one.query_workspace_slots = 1;
     let dml_workspace_bytes = core::mem::size_of::<exec::DmlScratch>()
         + config.table_rows * core::mem::size_of::<exec::PhysicalRow>();
+    let role_graph_workspace_bytes = core::mem::size_of::<
+        std::cell::RefCell<crate::mem::fixed_vec::FixedVec<bool>>,
+    >() + config.max_roles * core::mem::size_of::<bool>();
     assert_eq!(
         Engine::extra_budget_bytes(&config) - Engine::extra_budget_bytes(&one),
         2 * (config.work_arena_bytes
             + core::mem::size_of::<QueryWorkspace>()
-            + dml_workspace_bytes)
+            + dml_workspace_bytes
+            + role_graph_workspace_bytes)
     );
     let bytes = config.query_workspace_slots
         * (config.work_arena_bytes + core::mem::size_of::<QueryWorkspace>());
